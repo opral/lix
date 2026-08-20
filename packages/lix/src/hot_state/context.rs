@@ -7,7 +7,6 @@ use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphContext;
-use crate::row_pk::RowPk;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, build_path_index, load_path_index_revision,
@@ -20,6 +19,7 @@ use crate::hot_state::{
     MaterializedHotStateRowRef, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
     resolve_visible_batch,
 };
+use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
@@ -223,8 +223,7 @@ impl RowColumnarLayoutCache {
         });
         entries.push(std::sync::Arc::clone(&entry));
         let mut resident_bytes = entries.iter().map(|entry| entry.bytes).sum::<usize>();
-        while resident_bytes > max_bytes || entries.len() > ROW_COLUMNAR_LAYOUT_CACHE_MAX_ENTRIES
-        {
+        while resident_bytes > max_bytes || entries.len() > ROW_COLUMNAR_LAYOUT_CACHE_MAX_ENTRIES {
             resident_bytes = resident_bytes.saturating_sub(entries.remove(0).bytes);
         }
         entry
@@ -244,8 +243,7 @@ fn estimated_row_columnar_layout_bytes(
         .saturating_add(key.schema_key.capacity())
         .saturating_add(manifest_bytes)
         .saturating_add(
-            overlay_capacity
-                .saturating_mul(size_of::<crate::hot_state::RowColumnarOverlayRow>()),
+            overlay_capacity.saturating_mul(size_of::<crate::hot_state::RowColumnarOverlayRow>()),
         )
         .saturating_add(
             overlay
@@ -299,10 +297,9 @@ impl HotStateContext {
                     std::sync::Arc::clone(&row_columnar_array_budget),
                 ),
             )),
-            row_decoded_column_cache:
-                crate::hot_state::RowDecodedColumnCache::with_array_budget(
-                    row_columnar_array_budget,
-                ),
+            row_decoded_column_cache: crate::hot_state::RowDecodedColumnCache::with_array_budget(
+                row_columnar_array_budget,
+            ),
             global_key_value_rows: std::sync::Arc::new(GlobalKeyValueRowCache::default()),
             root_base_cache: std::sync::Arc::default(),
         }
@@ -770,35 +767,35 @@ where
         // cheaper than walking an interval, so when a scan carries both the
         // equality wins and the range stays a residual predicate.
         if let Some(predicate) = request.filter.declared_column_eq.as_ref() {
-        for branch_id in &scope.storage_branch_ids {
-            let Some(control) = scope.branch_heads.get(branch_id).copied() else {
-                return Ok(Some(rewritten));
-            };
-            // A branch the control proves holds no row of this schema
-            // contributes no candidates, so it needs no witness. The bloom has
-            // no false negatives, so this skip cannot hide a row. Without it a
-            // branch that never stores the schema — the global branch, for
-            // every ordinary user collection — would be permanently
-            // unwitnessed and would veto the index for everyone.
-            if !control.may_have_schema(&predicate.schema_key) {
-                continue;
+            for branch_id in &scope.storage_branch_ids {
+                let Some(control) = scope.branch_heads.get(branch_id).copied() else {
+                    return Ok(Some(rewritten));
+                };
+                // A branch the control proves holds no row of this schema
+                // contributes no candidates, so it needs no witness. The bloom has
+                // no false negatives, so this skip cannot hide a row. Without it a
+                // branch that never stores the schema — the global branch, for
+                // every ordinary user collection — would be permanently
+                // unwitnessed and would veto the index for everyone.
+                if !control.may_have_schema(&predicate.schema_key) {
+                    continue;
+                }
+                let Some(candidates) = self
+                    .tracked_head
+                    .reader(&self.store)
+                    .scan_hot_index_candidates(
+                        branch_id,
+                        control.tracked_generation,
+                        &predicate.schema_key,
+                        predicate.ordinal,
+                        &predicate.values,
+                    )
+                    .await?
+                else {
+                    return Ok(Some(rewritten));
+                };
+                unique.extend(candidates);
             }
-            let Some(candidates) = self
-                .tracked_head
-                .reader(&self.store)
-                .scan_hot_index_candidates(
-                    branch_id,
-                    control.tracked_generation,
-                    &predicate.schema_key,
-                    predicate.ordinal,
-                    &predicate.values,
-                )
-                .await?
-            else {
-                return Ok(Some(rewritten));
-            };
-            unique.extend(candidates);
-        }
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_hot_index_equality_probe_engaged();
         } else if let Some(predicate) = request.filter.declared_column_range.as_ref() {
@@ -1798,12 +1795,12 @@ mod tests {
         ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader, CommitId,
         CommitLoadRequest,
     };
-    use crate::row_pk::RowPk;
     use crate::hot_state::{
         CurrentStateDeltaRef, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter,
         HotStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
     };
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+    use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
     use crate::tracked_state::{

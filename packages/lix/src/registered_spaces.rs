@@ -50,8 +50,7 @@ pub const HOT_FILE_SPACE: StorageSpace = crate::hot_state::FILE_SPACE;
 pub const HOT_DIFF_SPACE: StorageSpace = crate::hot_state::DIFF_SPACE;
 pub const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace =
     crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE;
-pub const CERTIFIED_ROW_BATCH_SPACE: StorageSpace =
-    crate::hot_state::CERTIFIED_ROW_BATCH_SPACE;
+pub const CERTIFIED_ROW_BATCH_SPACE: StorageSpace = crate::hot_state::CERTIFIED_ROW_BATCH_SPACE;
 pub const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = crate::branch::BRANCH_HEAD_CONTROL_SPACE;
 pub const CERTIFIED_ROW_BATCH_MANIFEST_SPACE: StorageSpace =
     crate::hot_state::CERTIFIED_ROW_BATCH_MANIFEST_SPACE;
@@ -74,6 +73,8 @@ pub const TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE: StorageSpace =
     crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE;
 pub const MUTATION_DIRECTORY_NODE_SPACE: StorageSpace =
     crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE;
+pub const TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE: StorageSpace =
+    crate::tracked_state::TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE;
 pub const CURRENT_STATE_DATA_PART_SPACE: StorageSpace =
     crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE;
 pub const CURRENT_STATE_DATA_PART_REFS_SPACE: StorageSpace =
@@ -102,6 +103,8 @@ pub const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace =
 pub const BINARY_CAS_CHUNK_SPACE: StorageSpace = crate::binary_cas::BINARY_CAS_CHUNK_SPACE;
 pub const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace =
     crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE;
+pub const BINARY_CAS_CHUNK_DEMAND_SPACE: StorageSpace =
+    crate::binary_cas::BINARY_CAS_CHUNK_DEMAND_SPACE;
 pub const COMMIT_SPACE: StorageSpace = crate::changelog::COMMIT_SPACE;
 pub const CHANGE_SPACE: StorageSpace = crate::changelog::CHANGE_SPACE;
 pub const REVISION_SPACE: StorageSpace = crate::storage_adapter::REVISION_SPACE;
@@ -109,6 +112,9 @@ pub const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace =
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE;
 pub const UPLOAD_STATE_SPACE: StorageSpace = crate::session::UPLOAD_STATE_SPACE;
 pub const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = crate::session::UPLOAD_MANIFEST_LEAF_SPACE;
+pub const SYNC_SEQUENCE_SPACE: StorageSpace = crate::sync::SYNC_SEQUENCE_SPACE;
+pub const SYNC_REPOSITORY_EVENT_SPACE: StorageSpace = crate::sync::SYNC_REPOSITORY_EVENT_SPACE;
+pub const SYNC_REPLICA_STATE_SPACE: StorageSpace = crate::sync::SYNC_REPLICA_STATE_SPACE;
 pub const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = crate::gc::CHECKPOINT_RECOVERY_REF_SPACE;
 pub const CHECKPOINT_GC_STATE_SPACE: StorageSpace = crate::gc::CHECKPOINT_GC_STATE_SPACE;
 
@@ -146,6 +152,7 @@ mod tests {
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
         MUTATION_DIRECTORY_NODE_SPACE,
+        TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
         CURRENT_STATE_DATA_PART_SPACE,
         CURRENT_STATE_DATA_PART_REFS_SPACE,
         SCOPED_RANGE_NODE_SPACE,
@@ -154,12 +161,16 @@ mod tests {
         BINARY_CAS_MANIFEST_CHUNK_SPACE,
         BINARY_CAS_CHUNK_SPACE,
         BINARY_CAS_CHUNK_PRESENCE_SPACE,
+        BINARY_CAS_CHUNK_DEMAND_SPACE,
         COMMIT_SPACE,
         CHANGE_SPACE,
         REVISION_SPACE,
         EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
         UPLOAD_STATE_SPACE,
         UPLOAD_MANIFEST_LEAF_SPACE,
+        SYNC_SEQUENCE_SPACE,
+        SYNC_REPOSITORY_EVENT_SPACE,
+        SYNC_REPLICA_STATE_SPACE,
         CHECKPOINT_RECOVERY_REF_SPACE,
         CHECKPOINT_GC_STATE_SPACE,
     ];

@@ -3,6 +3,10 @@
 	"compilerOptions": {
 		"noEmit": true,
 		"rootDir": ".",
+		"paths": {
+			"#binding": ["./src/binding.node.ts"],
+			"#worker-factory": ["./src/worker/factory.node.ts"]
+		},
 		"types": ["node", "vitest"]
 	},
 	"include": ["src/**/*.ts", "tests/**/*.ts"]

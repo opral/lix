@@ -10,6 +10,20 @@ export type RemoteLixServerOptions = {
 	fetch?: RemoteLixFetch;
 };
 
+/**
+ * Opens a local native replica that synchronizes with the server in the
+ * background. Sync mode keeps the normal local storage/read path and works
+ * with browser storage such as OPFS as well as native storage.
+ */
+export type SyncLixServerOptions = {
+	mode: "sync";
+	url: string | URL;
+	/** Resolved for every browser sync request, including reconnect handshakes. */
+	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
+	/** Browser fetch override. Functions cross the worker boundary through RPC. */
+	fetch?: RemoteLixFetch;
+};
+
 export type LixTelemetrySpan = {
 	schemaVersion: 1;
 	name: string;
@@ -33,6 +47,11 @@ export type OpenLixOptions =
 			storage?: never;
 			server: RemoteLixServerOptions;
 			telemetry?: never;
+	  }
+	| {
+			storage?: import("./storage-adapter.js").LixStorage;
+			server: SyncLixServerOptions;
+			telemetry?: LixTelemetryOptions;
 	  };
 
 /** Selects the initial context for an additional independent session. */

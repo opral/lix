@@ -1,21 +1,31 @@
 ---
-description: Lix has pluggable storage. Open Lix in memory, in browser OPFS, on the local filesystem, or against a remote server.
+description: Choose local storage for Lix and optionally connect the repository to a server.
 ---
 
 # Persistence and Storage
 
-Lix has pluggable storage. A storage adapter decides where the bytes live. The Lix API stays the same: `execute`, `createBranch`, and `mergeBranch` do not change with the adapter.
+Lix has pluggable storage. A storage adapter decides where local bytes live. The
+Lix API stays the same: `execute`, `createBranch`, and `mergeBranch` do not
+change with the adapter.
 
-`openLix()` opens a local repository or connects to a remote Lix server.
+Storage and server mode are separate choices:
 
-| Adapter            | Available in     | Use for                                        |
-| ------------------ | ---------------- | ---------------------------------------------- |
-| `Memory` (default) | JavaScript, Rust | tests, demos, and ephemeral work               |
-| `OpfsStorage`     | JavaScript       | persistent local browser repositories          |
-| `FilesystemStorage`  | JavaScript, Rust | a local directory synchronized with Lix        |
-| `RocksDB`          | Rust             | native embedded persistence                    |
-| `SlateDB`          | Rust             | object storage, for example S3                 |
-| Remote server      | any client       | shared repositories; the server owns persistence |
+| Setup  | Storage                                     | Server           | Reads and writes                       |
+| :----- | :------------------------------------------ | :--------------- | :------------------------------------- |
+| Local  | Memory, OPFS, filesystem, or native storage | None             | Local                                  |
+| Remote | None                                        | `mode: "remote"` | Server                                 |
+| Sync   | Memory, OPFS, filesystem, or native storage | `mode: "sync"`   | Local, with background synchronization |
+
+See [Collaboration and Sync](./collaboration-and-sync.md) to choose between the
+two server modes.
+
+| Adapter             | Available in     | Use for                                 |
+| ------------------- | ---------------- | --------------------------------------- |
+| `Memory` (default)  | JavaScript, Rust | tests, demos, and ephemeral work        |
+| `OpfsStorage`       | JavaScript       | persistent local browser repositories   |
+| `FilesystemStorage` | JavaScript, Rust | a local directory synchronized with Lix |
+| `RocksDB`           | Rust             | native embedded persistence             |
+| `SlateDB`           | Rust             | object storage, for example S3          |
 
 In JavaScript, `FilesystemStorage` requires Node.js. The default `Memory` storage and the separate `@lix-js/storage-opfs` package work in browsers.
 
@@ -71,8 +81,7 @@ selected paths with `storage.importPaths(paths)`.
 
 ## Browser OPFS
 
-Persist a complete local browser repository across reloads with
-`OpfsStorage`:
+Persist a local browser repository across reloads with `OpfsStorage`:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -83,17 +92,18 @@ const lix = await openLix({
 });
 ```
 
-The name identifies one Lix database within the current browser origin. Only
-one Lix handle may open that database name at a time, including from other tabs.
-The provider uses SQLite Wasm on OPFS and a cross-tab Web Lock. It implements
-the same generic storage protocol as other JavaScript providers; the Lix SDK
-does not expose OPFS-specific APIs.
+The name identifies one Lix database within the current browser origin.
+Multiple Lix workers and tabs can attach to the same name through the
+package-owned storage worker. The provider uses SQLite Wasm on OPFS and a
+cross-tab Web Lock. It implements the same generic storage protocol as other
+JavaScript providers; the Lix SDK does not expose OPFS-specific APIs.
 
 Filesystem sync handles regular files only. Symbolic links and other special entries are not imported.
 
-## Remote server
+## Connect to a server
 
-Connect to a hosted repository with `server`:
+Remote mode executes every operation on the server and does not accept local
+storage:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -107,6 +117,25 @@ const lix = await openLix({
 ```
 
 The client needs no local storage option. Files, SQL rows, and branches live on the server.
+
+Sync mode combines local storage with the same hosted repository:
+
+```ts
+import { openLix } from "@lix-js/sdk";
+import { OpfsStorage } from "@lix-js/storage-opfs";
+
+const lix = await openLix({
+  storage: new OpfsStorage({ name: "acme" }),
+  server: {
+    mode: "sync",
+    url: "https://example.com/repositories/acme",
+  },
+});
+```
+
+Reads and writes execute locally while Lix exchanges commits with the server in
+the background. See [Collaboration and Sync](./collaboration-and-sync.md) for
+offline and lazy-loading behavior.
 
 For S3, the server runs Lix with the Rust `SlateDB` storage on an S3-compatible object store. The server exposes the repository through the [Lix Server Protocol](./server-protocol.md). See [Hosting](./hosting.md). Clients do not pass S3 to `openLix()`.
 

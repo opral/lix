@@ -82,6 +82,10 @@ impl ChunkHash {
         Self(binary_blob_hash_bytes(content))
     }
 
+    pub(crate) fn from_hex(hash_hex: &str) -> Result<Self, LixError> {
+        Ok(Self(hash_hex_to_bytes(hash_hex, "binary CAS chunk")?))
+    }
+
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

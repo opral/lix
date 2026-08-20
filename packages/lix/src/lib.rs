@@ -102,6 +102,8 @@ mod schema;
 #[cfg(any(feature = "server-protocol", feature = "server-protocol-client"))]
 pub mod server_protocol;
 mod session;
+#[doc(hidden)]
+mod sync;
 pub(crate) mod sql2;
 #[cfg(feature = "storage-benches")]
 mod sql_profile;
@@ -139,7 +141,13 @@ pub mod wasm;
 pub use plugin::runtime::default::runtime as default_wasm_runtime;
 pub use handle::{
     ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction, OpenAnotherSessionBuilder,
-    OpenLixBuilder, TransactionExecuteBuilder, open_lix,
+    OpenLixBuilder, ServerMode, ServerOptions, TransactionExecuteBuilder, open_lix,
+};
+#[cfg(target_family = "wasm")]
+#[doc(hidden)]
+pub use sync::{
+    BROWSER_TRANSPORT_CONFIG_HEADER, register_browser_sync_transport,
+    unregister_browser_sync_transport,
 };
 pub use telemetry::bind_session;
 

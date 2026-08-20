@@ -210,12 +210,8 @@ impl<H: ProtocolHttp> ClientCore<H> {
             url.set_query(None);
         }
         let handshake = self.request_handshake(url.to_string(), false).await?;
-        self.apply_handshake(handshake)?;
+        self.apply_handshake(handshake);
         Ok(())
-    }
-
-    async fn handshake_resume(&self) -> Result<HandshakeResponse, LixError> {
-        self.request_handshake(self.base_url.clone(), true).await
     }
 
     async fn recover_session_once(&self) -> Result<(), LixError> {
@@ -261,12 +257,11 @@ impl<H: ProtocolHttp> ClientCore<H> {
         Ok(value)
     }
 
-    fn apply_handshake(&self, handshake: HandshakeResponse) -> Result<(), LixError> {
+    fn apply_handshake(&self, handshake: HandshakeResponse) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.session_id = Some(handshake.session_id);
         state.active_branch_id = Some(handshake.active_branch_id);
         state.active_account_id = Some(handshake.active_account_id);
-        Ok(())
     }
 
     pub async fn execute(
@@ -315,14 +310,12 @@ impl<H: ProtocolHttp> ClientCore<H> {
             let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state
                 .blobs
-                .prepare(params, |index| request_blob_slot("execute", sql, index, None))
+                .prepare(params, |index| request_blob_slot(sql, index, None))
         } else {
             PreparedRequestParams {
                 params: encode_engine_values(params)?,
                 full_params: encode_engine_values(params)?,
                 cache_updates: Vec::new(),
-                cache_blobs: false,
-                has_delta: false,
             }
         };
         let request_options = options.as_ref().and_then(|options| {
@@ -344,7 +337,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
                     sql: sql.to_owned(),
                     params: params.to_vec(),
                     options: request_options.clone(),
-                    cache_blobs: prepared.cache_blobs,
+                    cache_blobs: !prepared.cache_updates.is_empty(),
                 };
                 self.request_json(
                     "POST",
@@ -381,19 +374,18 @@ impl<H: ProtocolHttp> ClientCore<H> {
                         statement.sql.clone(),
                         statement.label.clone(),
                         state.blobs.prepare(&statement.params, |param_index| {
-                            request_blob_slot(
-                                "batch",
-                                &statement.sql,
-                                param_index,
-                                Some(statement_index),
-                            )
+                            request_blob_slot(&statement.sql, param_index, Some(statement_index))
                         }),
                     )
                 })
                 .collect()
         };
-        let cache_blobs = prepared.iter().any(|(_, _, item)| item.cache_blobs);
-        let has_delta = prepared.iter().any(|(_, _, item)| item.has_delta);
+        let cache_blobs = prepared
+            .iter()
+            .any(|(_, _, item)| !item.cache_updates.is_empty());
+        let has_delta = prepared
+            .iter()
+            .any(|(_, _, item)| request_params_have_delta(&item.params));
         let request_options = options.as_ref().and_then(|options| {
             options.origin_key.as_ref().map(|origin_key| ExecuteOptionsBody {
                 origin_key: Some(origin_key.clone()),
@@ -461,7 +453,10 @@ impl<H: ProtocolHttp> ClientCore<H> {
         Fut: Future<Output = Result<ExecuteResponseBody, LixError>>,
     {
         let result = match request(&prepared.params).await {
-            Err(error) if prepared.has_delta && error.code == BLOB_BASE_MISSING_CODE => {
+            Err(error)
+                if request_params_have_delta(&prepared.params)
+                    && error.code == BLOB_BASE_MISSING_CODE =>
+            {
                 request(&prepared.full_params).await?
             }
             other => other?,
@@ -561,7 +556,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
     }
 
     async fn resume_or_recover_handshake(&self) -> Result<(), LixError> {
-        match self.handshake_resume().await {
+        match self.request_handshake(self.base_url.clone(), true).await {
             Ok(handshake) => {
                 let current = self
                     .state
@@ -574,7 +569,8 @@ impl<H: ProtocolHttp> ClientCore<H> {
                         "Lix Server Protocol handshake changed sessionId",
                     ));
                 }
-                self.apply_handshake(handshake)
+                self.apply_handshake(handshake);
+                Ok(())
             }
             Err(error) if is_recoverable_session_error(&error) => {
                 self.recover_session_once().await
@@ -1079,6 +1075,12 @@ fn error_from_http_response(response: &ProtocolHttpResponse) -> LixError {
 
 fn is_success_status(status: u16) -> bool {
     (200..300).contains(&status)
+}
+
+fn request_params_have_delta(params: &[RequestWireValue]) -> bool {
+    params
+        .iter()
+        .any(|param| matches!(param, RequestWireValue::BlobSplice { .. }))
 }
 
 fn error_http_status(error: &LixError) -> Option<u64> {

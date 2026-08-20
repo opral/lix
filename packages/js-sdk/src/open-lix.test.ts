@@ -1,13 +1,16 @@
 import {
 	existsSync,
+	mkdtempSync,
 	mkdirSync,
 	readFileSync,
+	rmSync,
 	statSync,
 	symlinkSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { execFile } from "node:child_process";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -60,6 +63,57 @@ test("filesystem storage is owned by its adapter package", async () => {
 	expect("FilesystemStorage" in sdk).toBe(false);
 	expect("LocalFilesystem" in sdk).toBe(false);
 });
+
+test("sync mode forwards static headers through the native transport", async () => {
+	let sawStaticAuthorization = false;
+	const server = createServer((request, response) => {
+		sawStaticAuthorization ||= request.headers.authorization === "Bearer static-native";
+		response.setHeader("content-type", "application/json");
+		if (request.url?.endsWith("/lix/v1")) {
+			response.end(
+				JSON.stringify({
+					sessionId: "js-sync-test-session",
+					activeAccountId: "00000000-0000-7000-8000-000000000002",
+				}),
+			);
+			return;
+		}
+		if (request.url?.includes("/sync/pull")) {
+			response.statusCode = 503;
+			response.end(
+				JSON.stringify({
+					error: {
+						code: "LIX_TEST_STOP",
+						message: "stop after observing native sync headers",
+					},
+				}),
+			);
+			return;
+		}
+		response.statusCode = 404;
+		response.end(JSON.stringify({ error: { code: "NOT_FOUND", message: "not found" } }));
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const address = server.address();
+	if (!address || typeof address === "string") {
+		server.close();
+		throw new Error("sync test server did not expose a TCP address");
+	}
+
+	await expect(
+		openLix({
+			server: {
+				mode: "sync",
+				url: `http://127.0.0.1:${address.port}/repository`,
+				headers: { Authorization: "Bearer static-native" },
+			},
+		}),
+	).rejects.toThrow(/stop after observing native sync headers/u);
+	expect(sawStaticAuthorization).toBe(true);
+	await new Promise<void>((resolve, reject) =>
+		server.close((error) => (error ? reject(error) : resolve())),
+	);
+}, 30_000);
 
 test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 	let resolveSpan!: (span: LixTelemetrySpan) => void;

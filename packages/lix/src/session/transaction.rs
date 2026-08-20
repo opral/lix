@@ -23,10 +23,12 @@ use crate::transaction_types::{RawWriteBatch, TransactionWriteRow};
 
 use super::SessionContext;
 use super::context::{SessionWriteAccess, closed_error};
+use crate::sync::SyncModeState;
 use crate::transaction::CommitCoordinator;
 
 #[expect(missing_debug_implementations)]
 pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
+    pub(super) session: SessionContext<StorageImpl>,
     pub(super) transaction: Option<Transaction<StorageImpl>>,
     pub(super) runtime_functions: FunctionContext,
     transaction_manager: SessionTransactionManager,
@@ -36,6 +38,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     write_access: Option<SessionWriteAccess>,
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
+    pub(super) sync_mode: SyncModeState,
     pub(super) has_started_statement: bool,
     /// Reusable storage only for SQL literals containing doubled quote
     /// escapes. Ordinary warm literals continue to borrow the SQL text.
@@ -90,12 +93,17 @@ where
                 }
             };
         self.ensure_open()?;
+        opened.transaction.set_sync_role(self.sync_mode.role());
+        if self.sync_outbox_suppressed {
+            opened.transaction.suppress_ordinary_sync_event();
+        }
         opened
             .transaction
             .attach_commit_boundary(self.transaction_commit_boundary());
         self.transaction_manager()
             .mark_explicit_transaction_open()?;
         Ok(SessionTransaction {
+            session: self.clone(),
             transaction: Some(opened.transaction),
             runtime_functions: opened.runtime_functions,
             transaction_manager: self.transaction_manager(),
@@ -105,6 +113,7 @@ where
             write_access: Some(write_access),
             commit_coordinator: Arc::clone(&self.commit_coordinator),
             telemetry: self.telemetry.clone(),
+            sync_mode: self.sync_mode.clone(),
             has_started_statement: false,
             prepared_literal_escape_scratch: SmallVec::new(),
             prepared_literal_shape: crate::sql2::CachedUpdateLiteralShape::default(),
@@ -170,6 +179,14 @@ where
         drop(self.write_access.take());
         self.observe_invalidation
             .bump_if_storage_changed(&outcome.storage_stats);
+        // Explicit transactions publish the same canonical event lane as
+        // automatic writes. Wake server long-polls only after the durable
+        // commit so readers never race a still-staged event. Suppressed
+        // internal replica transactions are excluded for the same reason as
+        // automatic sync-apply sessions.
+        if !self.session.sync_outbox_suppressed {
+            self.sync_mode.notify_sync_change();
+        }
         Ok(())
     }
 

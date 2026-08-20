@@ -423,6 +423,22 @@ impl<S> ChangelogStoreWriter<'_, S>
 where
     S: ChangelogStorageRead + Send + ?Sized,
 {
+    /// Stages immutable, server-certified commit headers whose ordinary
+    /// parents may intentionally remain absent until lazy history hydration.
+    ///
+    /// This is deliberately narrower than `stage_append`: sync is the only
+    /// caller allowed to introduce a sparse graph boundary, and it may not
+    /// bypass ordinary identity collision checks. Existing parents and parents
+    /// carried in the same certificate batch are still checked.
+    pub(crate) async fn stage_certified_sparse_append(
+        &mut self,
+        append: ChangelogAppend,
+    ) -> Result<(), LixError> {
+        self.ensure_changelog_mutation_is_allowed()?;
+        self.validate_append_with_sparse_parents(&append).await?;
+        self.stage_append_records(append)
+    }
+
     /// Stages a terminal append assembled from already-prepared transaction rows.
     ///
     /// The transaction owns ID generation, parent selection, and change-ref
@@ -507,6 +523,19 @@ where
     }
 
     async fn validate_append(&mut self, append: &ChangelogAppend) -> Result<(), LixError> {
+        self.validate_append_common(append).await?;
+        self.validate_parent_commits(append, false).await
+    }
+
+    async fn validate_append_with_sparse_parents(
+        &mut self,
+        append: &ChangelogAppend,
+    ) -> Result<(), LixError> {
+        self.validate_append_common(append).await?;
+        self.validate_parent_commits(append, true).await
+    }
+
+    async fn validate_append_common(&mut self, append: &ChangelogAppend) -> Result<(), LixError> {
         validate_unique(
             append.commits.iter().map(|commit| commit.commit_id),
             "commit_id",
@@ -552,9 +581,6 @@ where
 
         self.reject_existing_id_collisions(append, &append_commit_ids, &append_changes)
             .await?;
-        self.validate_parent_commits(append, &append_commit_ids)
-            .await?;
-
         Ok(())
     }
 
@@ -643,8 +669,13 @@ where
     async fn validate_parent_commits(
         &mut self,
         append: &ChangelogAppend,
-        append_commit_ids: &HashSet<CommitId>,
+        allow_sparse_parents: bool,
     ) -> Result<(), LixError> {
+        let append_commit_ids = append
+            .commits
+            .iter()
+            .map(|commit| commit.commit_id)
+            .collect::<HashSet<_>>();
         let mut parent_ids = append
             .commits
             .iter()
@@ -668,15 +699,15 @@ where
                     let record: CommitRecord = storage_codec::decode("commit record", &bytes)?;
                     record.generation
                 }
-                None => self
-                    .staged_commits
-                    .get(parent_id)
-                    .map(|commit| commit.generation)
-                    .ok_or_else(|| {
-                        LixError::unknown(format!(
+                None => match self.staged_commits.get(parent_id) {
+                    Some(commit) => commit.generation,
+                    None if allow_sparse_parents => continue,
+                    None => {
+                        return Err(LixError::unknown(format!(
                             "changelog parent commit '{parent_id}' does not exist"
-                        ))
-                    })?,
+                        )));
+                    }
+                },
             };
             parent_generations.insert(*parent_id, generation);
         }
@@ -686,7 +717,7 @@ where
             .map(|commit| (commit.commit_id, commit.generation))
             .collect::<HashMap<_, _>>();
         for commit in &append.commits {
-            let expected_generation = commit
+            let parent_generations_for_commit = commit
                 .parent_commit_ids
                 .iter()
                 .map(|parent_id| {
@@ -694,14 +725,40 @@ where
                         .get(parent_id)
                         .or_else(|| parent_generations.get(parent_id))
                         .copied()
-                        .expect("every parent generation was resolved")
                 })
-                .max()
-                .map_or(Ok(0), |generation| {
-                    generation
-                        .checked_add(1)
-                        .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))
-                })?;
+                .collect::<Vec<_>>();
+            let known_parent_generations = parent_generations_for_commit
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            let all_parents_known =
+                known_parent_generations.len() == commit.parent_commit_ids.len();
+            let minimum_generation = match known_parent_generations.iter().copied().max() {
+                Some(generation) => generation
+                    .checked_add(1)
+                    .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))?,
+                None => u64::from(!commit.parent_commit_ids.is_empty()),
+            };
+            if commit.generation < minimum_generation {
+                return Err(LixError::unknown(format!(
+                    "changelog commit '{}' has generation {} below its known parent boundary {minimum_generation}",
+                    commit.commit_id, commit.generation
+                )));
+            }
+            if !all_parents_known {
+                debug_assert!(allow_sparse_parents);
+                continue;
+            }
+            let expected_generation =
+                known_parent_generations
+                    .into_iter()
+                    .max()
+                    .map_or(Ok(0), |generation| {
+                        generation
+                            .checked_add(1)
+                            .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))
+                    })?;
             if commit.generation != expected_generation {
                 return Err(LixError::unknown(format!(
                     "changelog commit '{}' has generation {}, expected {expected_generation}",
@@ -993,4 +1050,68 @@ where
         values,
         resume_after,
     })
+}
+
+#[cfg(test)]
+mod sparse_append_tests {
+    use super::*;
+    use crate::changelog::{COMMIT_RECORD_FORMAT_VERSION, CommitTouchedScopeDigest};
+    use crate::json_store::JsonSlot;
+    use crate::row_pk::RowPk;
+    use crate::storage_adapter::StorageReadOptions;
+
+    #[tokio::test]
+    async fn sparse_commit_and_standalone_change_share_the_normal_collision_gate() {
+        let lix = crate::open_lix().await.expect("repository should open");
+        let adapter = lix.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = adapter.new_write_set();
+        let commit_id = CommitId::for_test_label("sparse-change-collision");
+        let timestamp =
+            crate::common::LixTimestamp::expect_parse("test timestamp", "1970-01-01T00:00:00.000Z");
+        let record = CommitRecord {
+            format_version: COMMIT_RECORD_FORMAT_VERSION,
+            commit_id,
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            created_at: timestamp,
+            touched_scope_digest: CommitTouchedScopeDigest::opaque(),
+        };
+        let colliding_change = ChangeRecord {
+            format_version: 2,
+            change_id: commit_id.commit_change_id(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "lix_key_value".to_owned(),
+            row_pk: RowPk::single("collision"),
+            file_id: None,
+            snapshot: JsonSlot::from_json(r#"{"key":"collision","value":"x"}"#),
+            metadata: JsonSlot::None,
+            created_at: timestamp,
+            origin_key: None,
+        };
+
+        let error = ChangelogContext::new()
+            .writer(&mut &read, &mut writes)
+            .stage_certified_sparse_append(ChangelogAppend {
+                commits: vec![record],
+                changes: vec![colliding_change],
+            })
+            .await
+            .expect_err("sparse append must retain commit/change collision validation");
+        assert!(
+            error
+                .message
+                .contains("collides with an existing change id")
+        );
+        drop(read);
+        drop(writes);
+        drop(adapter);
+        lix.close().await.expect("repository should close");
+    }
 }

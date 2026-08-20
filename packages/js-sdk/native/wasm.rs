@@ -3,16 +3,18 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Array, Function, Reflect};
 use lix::telemetry::{CallbackTelemetrySink, TelemetrySink};
 use lix::{
-    CreateBranchOptions as RsCreateBranchOptions, ExecuteBatchStatement as RsExecuteBatchStatement,
-    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
-    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
-    SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
+    BROWSER_TRANSPORT_CONFIG_HEADER, CreateBranchOptions as RsCreateBranchOptions,
+    ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
+    Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
+    MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreviewOptions,
+    ObserveEvents as RsObserveEvents, ServerOptions, SwitchBranchOptions as RsSwitchBranchOptions,
+    Value, open_lix, register_browser_sync_transport, unregister_browser_sync_transport,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -93,6 +95,7 @@ pub struct WasmLix {
     storage: BrowserStorage,
     storage_sessions: Rc<Cell<usize>>,
     closed: Cell<bool>,
+    browser_sync_transport_id: Rc<RefCell<Option<String>>>,
 }
 
 #[wasm_bindgen]
@@ -108,18 +111,27 @@ pub struct WasmObserveEvents {
 }
 
 #[wasm_bindgen(js_name = openMemory)]
-pub async fn open_memory(telemetry_dispatch: Option<Function>) -> Result<WasmLix, JsValue> {
-    open_browser_storage(BrowserStorage::Memory(Memory::new()), telemetry_dispatch).await
+pub async fn open_memory(
+    telemetry_dispatch: Option<Function>,
+    server: Option<JsValue>,
+) -> Result<WasmLix, JsValue> {
+    open_browser_storage(
+        BrowserStorage::Memory(Memory::new()),
+        telemetry_dispatch,
+        server,
+    )
+    .await
 }
 
 #[wasm_bindgen(js_name = openJsStorage)]
 pub async fn open_js_storage(
     provider: JsStorageProvider,
     telemetry_dispatch: Option<Function>,
+    server: Option<JsValue>,
 ) -> Result<WasmLix, JsValue> {
     let storage = JsStorage::new(provider);
     let browser_storage = BrowserStorage::Js(storage);
-    match open_browser_storage(browser_storage.clone(), telemetry_dispatch).await {
+    match open_browser_storage(browser_storage.clone(), telemetry_dispatch, server).await {
         Ok(lix) => Ok(lix),
         Err(error) => {
             let _ = browser_storage.close().await;
@@ -131,6 +143,7 @@ pub async fn open_js_storage(
 async fn open_browser_storage(
     storage: BrowserStorage,
     telemetry_dispatch: Option<Function>,
+    server: Option<JsValue>,
 ) -> Result<WasmLix, JsValue> {
     console_error_panic_hook::set_once();
     let telemetry = telemetry_dispatch.map(|dispatch| {
@@ -143,22 +156,76 @@ async fn open_browser_storage(
         }));
         sink
     });
+    #[derive(Deserialize)]
+    struct BrowserSyncServerOptions {
+        url: String,
+        headers: Vec<(String, String)>,
+    }
+    static NEXT_BROWSER_SYNC_TRANSPORT_ID: AtomicU64 = AtomicU64::new(1);
+    let mut browser_sync_transport_id = None;
+    let server = match server {
+        Some(value) => {
+            let mut parsed =
+                serde_wasm_bindgen::from_value::<BrowserSyncServerOptions>(value.clone())?;
+            let header_provider = optional_function_property(&value, "headerProvider")?;
+            let fetch = optional_function_property(&value, "fetch")?;
+            if header_provider.is_some() || fetch.is_some() {
+                let id = format!(
+                    "browser-{}",
+                    NEXT_BROWSER_SYNC_TRANSPORT_ID.fetch_add(1, Ordering::Relaxed)
+                );
+                register_browser_sync_transport(id.clone(), header_provider, fetch);
+                parsed
+                    .headers
+                    .push((BROWSER_TRANSPORT_CONFIG_HEADER.to_owned(), id.clone()));
+                browser_sync_transport_id = Some(id);
+            }
+            Some(ServerOptions::sync(parsed.url).with_headers(parsed.headers))
+        }
+        None => None,
+    };
     let inner = match telemetry {
         Some(telemetry) => {
-            open_lix()
+            let builder = open_lix()
                 .with_storage(storage.clone())
-                .with_telemetry(telemetry)
-                .await
+                .with_telemetry(telemetry);
+            match server {
+                Some(server) => builder.with_server(server).await,
+                None => builder.await,
+            }
         }
-        None => open_lix().with_storage(storage.clone()).await,
+        None => {
+            let builder = open_lix().with_storage(storage.clone());
+            match server {
+                Some(server) => builder.with_server(server).await,
+                None => builder.await,
+            }
+        }
     }
-    .map_err(lix_error_to_js)?;
+    .map_err(|error| {
+        if let Some(id) = browser_sync_transport_id.as_deref() {
+            unregister_browser_sync_transport(id);
+        }
+        lix_error_to_js(error)
+    })?;
     Ok(WasmLix {
         inner,
         storage,
         storage_sessions: Rc::new(Cell::new(1)),
         closed: Cell::new(false),
+        browser_sync_transport_id: Rc::new(RefCell::new(browser_sync_transport_id)),
     })
+}
+
+fn optional_function_property(value: &JsValue, name: &str) -> Result<Option<Function>, JsValue> {
+    let property = Reflect::get(value, &name.into())?;
+    if property.is_null() || property.is_undefined() {
+        return Ok(None);
+    }
+    property
+        .dyn_into::<Function>()
+        .map(Some)
+        .map_err(Into::into)
 }
 
 struct BrowserTelemetryDispatch(Function);
@@ -190,6 +257,7 @@ impl WasmLix {
             storage: self.storage.clone(),
             storage_sessions: self.storage_sessions.clone(),
             closed: Cell::new(false),
+            browser_sync_transport_id: self.browser_sync_transport_id.clone(),
         })
     }
 
@@ -389,6 +457,9 @@ impl WasmLix {
         let remaining = self.storage_sessions.get().saturating_sub(1);
         self.storage_sessions.set(remaining);
         if remaining == 0 {
+            if let Some(id) = self.browser_sync_transport_id.borrow_mut().take() {
+                unregister_browser_sync_transport(&id);
+            }
             self.storage
                 .close()
                 .await

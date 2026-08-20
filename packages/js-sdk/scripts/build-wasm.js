@@ -57,7 +57,11 @@ async function cargoTargetDir() {
 	return metadata.target_directory;
 }
 
-const rustFlags = `${process.env.RUSTFLAGS ?? ""} --cfg getrandom_backend="wasm_js"`.trim();
+// Sync bootstrap and canonical replay use the same deep engine graph as the
+// native sync worker, which explicitly reserves a 4 MiB stack. Keep browser
+// WASM on that contract as well; the linker default can trap during the first
+// scoped pull before Rust has a chance to report an error.
+const rustFlags = `${process.env.RUSTFLAGS ?? ""} --cfg getrandom_backend="wasm_js" -C link-arg=-zstack-size=4194304`.trim();
 const cargoEnv = { ...process.env, RUSTFLAGS: rustFlags };
 if (cargoProfile === "release") {
 	// The engine pulls in DataFusion. Optimizing for raw speed produces a WASM

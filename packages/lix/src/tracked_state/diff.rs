@@ -1317,17 +1317,16 @@ mod tests {
         };
 
         let never_present = entry(None);
-        let tombstoned =
-            entry(Some(value(ChangeId::for_test_label("checkpointed-delete"), true)));
+        let tombstoned = entry(Some(value(
+            ChangeId::for_test_label("checkpointed-delete"),
+            true,
+        )));
 
         // The fixture is only meaningful if the tombstone actually survives on
         // the entry — otherwise this would pass vacuously against a before-image
         // that was already dropped upstream.
         assert!(
-            tombstoned
-                .before
-                .as_ref()
-                .is_some_and(|row| row.deleted),
+            tombstoned.before.as_ref().is_some_and(|row| row.deleted),
             "fixture must carry a tombstoned before row"
         );
         assert!(never_present.before.is_none());
@@ -1342,10 +1341,7 @@ mod tests {
 
         // Guard the other direction: normalization must not swallow a *live*
         // before row, which is a genuinely different change.
-        let modified = entry(Some(value(
-            ChangeId::for_test_label("live-before"),
-            false,
-        )));
+        let modified = entry(Some(value(ChangeId::for_test_label("live-before"), false)));
         assert_eq!(modified.kind, TrackedStateDiffKind::Modified);
         assert_ne!(
             modified.diff_id().expect("modified diff id"),
@@ -1392,8 +1388,9 @@ mod tests {
             .expect("one entry");
         assert_eq!(entry.kind, TrackedStateDiffKind::Removed);
         assert!(entry.after.as_ref().is_some_and(|row| row.deleted));
-        let sides = crate::tracked_state::decode_diff_id(&entry.diff_id().expect("removed diff id"))
-            .expect("removed diff id should decode");
+        let sides =
+            crate::tracked_state::decode_diff_id(&entry.diff_id().expect("removed diff id"))
+                .expect("removed diff id should decode");
         assert_eq!(
             sides.after,
             Some(ChangeId::for_test_label("delete-after")),
@@ -2160,6 +2157,7 @@ mod tests {
                     changed_key_count: 1,
                     row_count_estimate: result.row_count as u64,
                     tree_height: result.tree_height as u32,
+                    complete_state_fence: false,
                 },
             )
             .await
@@ -2287,12 +2285,7 @@ mod tests {
             &tracked_state,
             "unrelated",
             None,
-            &[row_with_value(
-                "row-a",
-                None,
-                "unrelated-change",
-                "value",
-            )],
+            &[row_with_value("row-a", None, "unrelated-change", "value")],
         )
         .await
         .expect("unrelated changelog should write");
@@ -2363,6 +2356,7 @@ mod tests {
                     changed_key_count: 1,
                     row_count_estimate: result.row_count as u64,
                     tree_height: result.tree_height as u32,
+                    complete_state_fence: false,
                 },
             )
             .await
@@ -3548,6 +3542,7 @@ mod tests {
                 changed_key_count,
                 row_count_estimate: result.row_count as u64,
                 tree_height: result.tree_height as u32,
+                complete_state_fence: false,
             },
         )
         .await
@@ -3589,6 +3584,7 @@ mod tests {
                 .message
                 .contains("nearest available first-parent root")
             || error.message.contains("references unexpected parent")
+            || error.message.contains("without a complete-state fence")
             || error.message.contains("missing changelog winner")
             || error.message.contains("has change")
             || error.message.contains("omits current changelog change")

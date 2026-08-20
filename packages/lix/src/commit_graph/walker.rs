@@ -96,10 +96,7 @@ impl ReachableWalk {
         let mut next_frontier = Vec::new();
         for ((commit_id, node), (_, child_generation)) in loaded.into_iter().zip(frontier.iter()) {
             let Some(node) = node else {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("commit_graph missing commit '{commit_id}'"),
-                ));
+                return Err(super::context::missing_commit_graph_error(&commit_id));
             };
             if node.generation >= *child_generation {
                 return Err(LixError::new(
@@ -240,10 +237,7 @@ where
 
     async fn load_node(&mut self, commit_id: &CommitId) -> Result<CommitGraphNode, LixError> {
         let Some(commit) = self.reader.load_node(commit_id).await? else {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("commit_graph missing commit '{commit_id}'"),
-            ));
+            return Err(super::context::missing_commit_graph_error(commit_id));
         };
         Ok(commit)
     }
@@ -789,6 +783,11 @@ mod tests {
             .await
             .expect_err("missing head should fail");
 
+        assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
+        assert_eq!(
+            error.details.as_ref().expect("missing commit details")["commit_id"],
+            missing_head.to_string()
+        );
         assert!(error.message.contains(&missing_head.to_string()));
     }
 

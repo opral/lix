@@ -5,14 +5,22 @@ import type {
 	LixTransactionBinding,
 	ObserveEventsBinding,
 } from "../binding-types.js";
-import type { LixTelemetryOptions } from "../types.js";
+import type {
+	LixTelemetryOptions,
+	RemoteLixFetch,
+	SyncLixServerOptions,
+} from "../types.js";
 import {
 	deserializeWorkerError,
+	serializeWorkerError,
 	type WorkerConnection,
 	type WorkerNotification,
 	type WorkerOperation,
 	type WorkerResponse,
+	type WorkerSyncServerOptions,
 } from "./protocol.js";
+
+type SyncServerRuntimeOptions = Omit<SyncLixServerOptions, "mode">;
 
 type PendingRequest = {
 	resolve(value: unknown): void;
@@ -31,17 +39,19 @@ export async function openLixWorker(
 	storage: LixStorageConfig,
 	onDisposed?: () => void,
 	telemetry?: LixTelemetryOptions,
+	server?: SyncServerRuntimeOptions,
 ): Promise<LixWorkerClient> {
 	let client = idleWorkers.pop();
 	while (client?.isDisposed) client = idleWorkers.pop();
 	client ??= new LixWorkerClient();
-	client.beginLease(onDisposed, telemetry);
+	client.beginLease(onDisposed, telemetry, server);
 	try {
 		await client.request(
 			{
 				kind: "open",
 				storage,
 				telemetryEnabled: telemetry !== undefined,
+				server: serializeSyncServer(server),
 			},
 			0,
 		);
@@ -57,6 +67,7 @@ export async function openLixWorkerBinding(
 	storage: LixStorageConfig,
 	onDisposed?: () => void,
 	telemetry?: LixTelemetryOptions,
+	server?: SyncServerRuntimeOptions,
 ): Promise<LixBinding> {
 	if (openDirectLixBinding) {
 		const telemetryDispatch = telemetry
@@ -68,31 +79,39 @@ export async function openLixWorkerBinding(
 					}
 				}
 			: undefined;
-		const binding = await openDirectLixBinding(storage, telemetryDispatch);
+		const binding = await openDirectLixBinding(
+			storage,
+			telemetryDispatch,
+			await resolveDirectSyncServer(server),
+		);
 		if (binding) {
 			if (!onDisposed) return binding;
-			return wrapDirectBinding(binding, new DirectBindingLease(onDisposed));
+			return wrapDirectBinding(binding, new BindingLease(onDisposed));
 		}
 	}
-	const client = await openLixWorker(storage, onDisposed, telemetry);
-	return workerBinding(client, new SharedWorkerLease(client), 0);
+	const client = await openLixWorker(storage, onDisposed, telemetry, server);
+	return workerBinding(
+		client,
+		new BindingLease(() => releaseWorker(client)),
+		0,
+	);
 }
 
-class DirectBindingLease {
+class BindingLease {
 	private references = 1;
-	constructor(private readonly onDisposed: () => void) {}
+	constructor(private readonly releaseLast: () => void | Promise<void>) {}
 	retain(): void {
 		this.references += 1;
 	}
-	release(): void {
+	async release(): Promise<void> {
 		this.references -= 1;
-		if (this.references === 0) this.onDisposed();
+		if (this.references === 0) await this.releaseLast();
 	}
 }
 
 function wrapDirectBinding(
 	binding: LixBinding,
-	lease: DirectBindingLease,
+	lease: BindingLease,
 ): LixBinding {
 	let closed = false;
 	return new Proxy(binding, {
@@ -113,7 +132,7 @@ function wrapDirectBinding(
 						await target.close();
 					} finally {
 						closed = true;
-						lease.release();
+						await lease.release();
 					}
 				};
 			}
@@ -123,21 +142,9 @@ function wrapDirectBinding(
 	});
 }
 
-class SharedWorkerLease {
-	private references = 1;
-	constructor(readonly client: LixWorkerClient) {}
-	retain(): void {
-		this.references += 1;
-	}
-	async release(): Promise<void> {
-		this.references -= 1;
-		if (this.references === 0) await releaseWorker(this.client);
-	}
-}
-
 function workerBinding(
 	client: LixWorkerClient,
-	lease: SharedWorkerLease,
+	lease: BindingLease,
 	sessionId: number,
 ): LixBinding {
 	let closed = false;
@@ -243,6 +250,8 @@ export class LixWorkerClient {
 	private leased = false;
 	private onDisposed?: () => void;
 	private telemetry?: LixTelemetryOptions;
+	private syncServer?: SyncServerRuntimeOptions;
+	private readonly syncFetchControllers = new Map<number, AbortController>();
 
 	constructor(
 		private readonly connection: WorkerConnection = createWorkerConnection(),
@@ -255,11 +264,16 @@ export class LixWorkerClient {
 		return this.disposed;
 	}
 
-	beginLease(onDisposed?: () => void, telemetry?: LixTelemetryOptions): void {
+	beginLease(
+		onDisposed?: () => void,
+		telemetry?: LixTelemetryOptions,
+		syncServer?: SyncServerRuntimeOptions,
+	): void {
 		if (this.disposed || this.leased) throw workerClosedError();
 		this.leased = true;
 		this.onDisposed = onDisposed;
 		this.telemetry = telemetry;
+		this.syncServer = syncServer;
 	}
 
 	endLease(): void {
@@ -268,6 +282,9 @@ export class LixWorkerClient {
 		const onDisposed = this.onDisposed;
 		this.onDisposed = undefined;
 		this.telemetry = undefined;
+		this.syncServer = undefined;
+		for (const controller of this.syncFetchControllers.values()) controller.abort();
+		this.syncFetchControllers.clear();
 		onDisposed?.();
 	}
 
@@ -314,11 +331,7 @@ export class LixWorkerClient {
 
 	private handleMessage(message: WorkerResponse): void {
 		if ("kind" in message) {
-			try {
-				this.telemetry?.onSpan(message.span);
-			} catch {
-				// Telemetry callbacks are isolated from Lix operation results.
-			}
+			this.handleWorkerEvent(message);
 			return;
 		}
 		const pending = this.pending.get(message.id);
@@ -327,6 +340,106 @@ export class LixWorkerClient {
 		if (this.pending.size === 0) this.connection.unref();
 		if (message.ok) pending.resolve(message.value);
 		else pending.reject(deserializeWorkerError(message.error));
+	}
+
+	private handleWorkerEvent(message: Extract<WorkerResponse, { kind: string }>): void {
+		switch (message.kind) {
+			case "telemetry":
+				try {
+					this.telemetry?.onSpan(message.span);
+				} catch {
+					// Telemetry callbacks are isolated from Lix operation results.
+				}
+				break;
+			case "sync.headers":
+				void this.resolveSyncHeaders(message.requestId);
+				break;
+			case "sync.fetch":
+				void this.resolveSyncFetch(message.requestId, message.request);
+				break;
+			case "sync.fetch.cancel":
+				this.syncFetchControllers.get(message.requestId)?.abort();
+				this.syncFetchControllers.delete(message.requestId);
+				break;
+		}
+	}
+
+	private async resolveSyncHeaders(requestId: number): Promise<void> {
+		try {
+			const source = this.syncServer?.headers;
+			const headers = typeof source === "function" ? await source() : source;
+			this.notify({
+				kind: "sync.headers.result",
+				requestId,
+				result: { ok: true, headers: headerEntries(headers) },
+			});
+		} catch (error) {
+			this.notify({
+				kind: "sync.headers.result",
+				requestId,
+				result: { ok: false, error: serializeWorkerError(error) },
+			});
+		}
+	}
+
+	private async resolveSyncFetch(
+		requestId: number,
+		request: import("./protocol.js").WorkerSyncFetchRequest,
+	): Promise<void> {
+		const fetcher: RemoteLixFetch | undefined = this.syncServer?.fetch;
+		if (!fetcher) {
+			this.notify({
+				kind: "sync.fetch.result",
+				requestId,
+				result: {
+					ok: false,
+					error: serializeWorkerError(new Error("Sync fetch bridge is unavailable")),
+				},
+			});
+			return;
+		}
+		const controller = new AbortController();
+		this.syncFetchControllers.set(requestId, controller);
+		try {
+			const response = await fetcher(request.url, {
+				method: request.method,
+				headers: request.headers,
+				body:
+					typeof request.body === "string"
+						? request.body
+						: request.body?.slice().buffer,
+				credentials: request.credentials,
+				signal: controller.signal,
+			});
+			const body = await readSyncResponseBody(
+				response,
+				request.responseLimit,
+				controller,
+			);
+			this.notify({
+				kind: "sync.fetch.result",
+				requestId,
+				result: {
+					ok: true,
+					response: {
+						status: response.status,
+						statusText: response.statusText,
+						headers: headerEntries(response.headers),
+						body,
+					},
+				},
+			});
+		} catch (error) {
+			if (!controller.signal.aborted || isSyncResponseTooLarge(error)) {
+				this.notify({
+					kind: "sync.fetch.result",
+					requestId,
+					result: { ok: false, error: serializeWorkerError(error) },
+				});
+			}
+		} finally {
+			this.syncFetchControllers.delete(requestId);
+		}
 	}
 
 	private handleFatal(error: Error): void {
@@ -346,9 +459,106 @@ export class LixWorkerClient {
 	}
 }
 
+async function readSyncResponseBody(
+	response: Response,
+	limit: number,
+	controller: AbortController,
+): Promise<Uint8Array> {
+	if (!Number.isSafeInteger(limit) || limit <= 0) {
+		throw new TypeError("Browser sync fetch has no valid response limit");
+	}
+	const declaredLength = Number(response.headers.get("content-length"));
+	if (Number.isFinite(declaredLength) && declaredLength > limit) {
+		const error = syncResponseTooLarge(limit);
+		controller.abort(error);
+		throw error;
+	}
+	const stream = response.body;
+	if (!stream) return new Uint8Array();
+
+	const reader = stream.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > limit) {
+				const error = syncResponseTooLarge(limit);
+				controller.abort(error);
+				await reader.cancel(error).catch(() => undefined);
+				throw error;
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	const body = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		body.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return body;
+}
+
+function syncResponseTooLarge(limit: number): Error & { code: string } {
+	const error = new Error(`sync fetch response exceeds ${limit} bytes`) as Error & {
+		code: string;
+	};
+	error.name = "LixError";
+	error.code = "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE";
+	return error;
+}
+
+function isSyncResponseTooLarge(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		(error as Error & { code?: string }).code ===
+			"LIX_ERROR_SYNC_RESPONSE_TOO_LARGE"
+	);
+}
+
 function workerClosedError(): Error & { code: string } {
 	const error = new Error("Lix worker is closed") as Error & { code: string };
 	error.name = "LixError";
 	error.code = "LIX_ERROR_CLOSED";
 	return error;
+}
+
+function serializeSyncServer(
+	server: SyncServerRuntimeOptions | undefined,
+): WorkerSyncServerOptions | undefined {
+	if (!server) return undefined;
+	return {
+		url: new URL(server.url).toString(),
+		headers:
+			typeof server.headers === "function"
+				? undefined
+				: headerEntries(server.headers),
+		dynamicHeaders: typeof server.headers === "function",
+		customFetch: server.fetch !== undefined,
+	};
+}
+
+function headerEntries(headers: HeadersInit | undefined): [string, string][] {
+	const entries: [string, string][] = [];
+	new Headers(headers).forEach((value, name) => entries.push([name, value]));
+	return entries;
+}
+
+async function resolveDirectSyncServer(
+	server: SyncServerRuntimeOptions | undefined,
+): Promise<import("../binding-types.js").SyncServerBindingOptions | undefined> {
+	if (!server) return undefined;
+	const source = server.headers;
+	const headers = typeof source === "function" ? await source() : source;
+	return {
+		url: new URL(server.url).toString(),
+		headers: headerEntries(headers),
+		fetch: server.fetch,
+	};
 }

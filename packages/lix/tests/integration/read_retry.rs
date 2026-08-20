@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
@@ -96,6 +97,26 @@ impl StorageRead for ExpiringRead {
 }
 
 #[tokio::test]
+async fn active_branch_id_does_not_open_a_storage_snapshot() {
+    let storage = ExpiringReadStorage::new();
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+    let expected = lix.active_branch_id().await.expect("active branch");
+
+    storage.expire_next_read_call();
+    let actual = lix.active_branch_id().await.expect("active branch");
+
+    assert_eq!(actual, expected);
+    assert_eq!(
+        storage.expired_calls(),
+        0,
+        "the in-memory session selector must not touch coherent storage",
+    );
+}
+
+#[tokio::test]
 async fn auto_commit_query_restarts_after_its_snapshot_expires() {
     let storage = ExpiringReadStorage::new();
     let lix = crate::open_lix()
@@ -118,6 +139,46 @@ async fn auto_commit_query_restarts_after_its_snapshot_expires() {
         .await
         .expect("expired read should restart transparently");
 
+    assert_eq!(
+        result.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!(42)
+    );
+    assert_eq!(storage.expired_calls(), 1);
+}
+
+#[tokio::test]
+async fn expired_read_waits_for_one_write_quiescent_retry() {
+    let storage = ExpiringReadStorage::new();
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+        &[Value::Text("read-quiescence".into()), Value::Integer(42)],
+    )
+    .await
+    .expect("seed value");
+
+    let writer = lix.lock_collaboration_writes().await;
+    storage.expire_next_read_call();
+    let params = [Value::Text("read-quiescence".into())];
+    let mut read = Box::pin(async {
+        lix.execute("SELECT value FROM lix_key_value WHERE key = $1", &params)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), read.as_mut())
+            .await
+            .is_err(),
+        "the expired read must wait until the in-flight writer releases the gate",
+    );
+
+    drop(writer);
+    let result = tokio::time::timeout(Duration::from_secs(1), read)
+        .await
+        .expect("quiescent retry should make forward progress")
+        .expect("quiescent retry should succeed");
     assert_eq!(
         result.rows()[0].get::<serde_json::Value>("value").unwrap(),
         serde_json::json!(42)

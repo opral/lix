@@ -14,6 +14,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+const MAX_EXPIRED_READ_RETRIES: usize = 16;
+
 mod checkpoint;
 mod context;
 mod create_branch;
@@ -38,8 +40,8 @@ pub(crate) use crate::common::ExecuteStatementMetadata;
 #[cfg(feature = "server-protocol")]
 pub(crate) use crate::common::VerifiedRequestBlob;
 pub use checkpoint::CreateCheckpointReceipt;
-pub(crate) use context::SessionBranch;
 pub use context::SessionContext;
+pub(crate) use context::{SessionBranch, load_default_branch_id_from_index};
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{
     CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Row, RowRef,

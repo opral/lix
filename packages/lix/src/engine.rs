@@ -16,7 +16,7 @@ use crate::plugin::runtime::{
 };
 use crate::plugin::runtime::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::row_pk::RowPk;
-use crate::session::SessionContext;
+use crate::session::{SessionBranch, SessionContext};
 use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
@@ -24,6 +24,7 @@ use crate::storage_adapter::{
     StorageReadOptions, StorageWriteOptions,
 };
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
+use crate::sync::SyncModeState;
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
@@ -43,6 +44,7 @@ pub(crate) struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     observe_coordinator: Arc<ObserveCoordinator>,
     observe_invalidation: Arc<ObserveInvalidation>,
+    sync_mode: SyncModeState,
     plugin_host: PluginRuntimeHost,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     lix_id: Arc<str>,
@@ -114,9 +116,21 @@ where
     /// construction. Call this before `Engine::new(...)` for a brand-new
     /// storage.
     pub(crate) async fn initialize(storage: StorageImpl) -> Result<InitReceipt, LixError> {
+        Self::initialize_with_main_branch_id(storage, None).await
+    }
+
+    pub(crate) async fn initialize_with_main_branch_id(
+        storage: StorageImpl,
+        requested_main_branch_id: Option<&str>,
+    ) -> Result<InitReceipt, LixError> {
         let storage = StorageAdapter::new(storage);
 
-        crate::init::initialize(storage, &TrackedStateContext::new()).await
+        crate::init::initialize_with_main_branch_id(
+            storage,
+            &TrackedStateContext::new(),
+            requested_main_branch_id,
+        )
+        .await
     }
 
     /// Creates a clean DataFusion-first engine over an initialized storage.
@@ -177,6 +191,7 @@ where
             commit_coordinator,
             observe_coordinator: Arc::new(ObserveCoordinator::new()),
             observe_invalidation,
+            sync_mode: SyncModeState::default(),
             plugin_host,
             telemetry: options.telemetry,
             lix_id,
@@ -187,8 +202,40 @@ where
         self.storage.clone()
     }
 
+    pub(crate) fn sync_mode(&self) -> SyncModeState {
+        self.sync_mode.clone()
+    }
+
+    pub(crate) fn notify_observers(&self) {
+        self.observe_invalidation.bump();
+    }
+
+    pub(crate) fn fail_observers(&self, error: LixError) {
+        self.observe_invalidation.fail_terminal(error);
+    }
+
+    pub(crate) fn collaboration_write_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.collaboration_write_gate)
+    }
+
+    pub(crate) async fn load_repository_default_branch_id(
+        &self,
+        read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    ) -> Result<String, LixError> {
+        crate::session::load_default_branch_id_from_index(
+            self.hot_state.as_ref(),
+            self.branch_ctx.as_ref(),
+            read,
+        )
+        .await
+    }
+
     pub(crate) fn lix_id(&self) -> &str {
         &self.lix_id
+    }
+
+    pub(crate) fn set_lix_id_for_sync(&mut self, lix_id: String) {
+        self.lix_id = Arc::from(lix_id);
     }
 
     pub(crate) fn telemetry(&self) -> Option<&Arc<dyn TelemetrySink>> {
@@ -233,8 +280,8 @@ where
     ) -> Result<SessionContext<StorageImpl>, LixError> {
         let active_account_id = active_account_id.into();
         self.validate_active_account(&active_account_id).await?;
-        SessionContext::open_at(
-            active_branch_id.into(),
+        Ok(SessionContext::new(
+            SessionBranch::new(active_branch_id.into()),
             active_account_id,
             self.storage(),
             Arc::clone(&self.hot_state),
@@ -248,10 +295,10 @@ where
             Arc::clone(&self.commit_coordinator),
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
+            self.sync_mode.clone(),
             self.plugin_host.clone(),
             self.telemetry.clone(),
-        )
-        .await
+        ))
     }
 
     pub(crate) async fn open_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
@@ -279,6 +326,7 @@ where
             Arc::clone(&self.commit_coordinator),
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
+            self.sync_mode.clone(),
             self.plugin_host.clone(),
             self.telemetry.clone(),
         )

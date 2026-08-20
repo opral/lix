@@ -171,7 +171,6 @@ fn envelope_error(message: impl std::fmt::Display) -> LixError {
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,12 +311,16 @@ mod tests {
     #[test]
     fn v3_readers_and_v4_records_are_mutually_undecodable() {
         for source in [replacement(), native(), columnar()] {
-            let part = scoped_range_part_from_current_state_descriptor(&scope(), &descriptor(source))
-                .expect("descriptor should encode");
+            let part =
+                scoped_range_part_from_current_state_descriptor(&scope(), &descriptor(source))
+                    .expect("descriptor should encode");
             assert_eq!(part.payload.version, LOCATOR_PAYLOAD_VERSION);
             assert!(
-                storage_codec::decode::<LocatorPayloadV3>("v3 locator payload", &part.payload.bytes)
-                    .is_err(),
+                storage_codec::decode::<LocatorPayloadV3>(
+                    "v3 locator payload",
+                    &part.payload.bytes
+                )
+                .is_err(),
                 "a v3 reader must not decode a v4 record"
             );
         }
@@ -337,8 +340,9 @@ mod tests {
     /// bytes are ever handed to a decoder.
     #[test]
     fn stale_payload_version_is_refused_before_decoding() {
-        let mut part = scoped_range_part_from_current_state_descriptor(&scope(), &descriptor(replacement()))
-            .expect("descriptor should encode");
+        let mut part =
+            scoped_range_part_from_current_state_descriptor(&scope(), &descriptor(replacement()))
+                .expect("descriptor should encode");
         part.payload.version = 3;
         assert!(current_state_descriptor_from_scoped_range_part(&part).is_err());
     }

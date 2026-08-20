@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type {
 	LixStorageConfig,
 	LixBinding,
+	SyncServerBindingOptions,
 	TelemetryDispatch,
 } from "./binding-types.js";
 
@@ -11,11 +12,15 @@ type NativeAddon = {
 	Lix: {
 		openMemory(
 			telemetry?: (spanJson: string) => void,
+			serverUrl?: string,
+			serverHeaders?: [string, string][],
 		): Promise<LixBinding>;
 		openFilesystemStorage(
 			path: string,
 			syncAllFiles: boolean,
 			telemetry?: (spanJson: string) => void,
+			serverUrl?: string,
+			serverHeaders?: [string, string][],
 		): Promise<LixBinding>;
 	};
 };
@@ -75,11 +80,12 @@ function loadNativeAddon(): NativeAddon {
 export async function openLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	server?: SyncServerBindingOptions,
 ): Promise<LixBinding> {
 	try {
-		return await openNativeLixBinding(storage, telemetry);
+		return await openNativeLixBinding(storage, telemetry, server);
 	} catch (nativeError) {
-		if (storage.kind !== "memory") throw nativeError;
+		if (storage.kind !== "memory" || server !== undefined) throw nativeError;
 		try {
 			const { openMemoryWasmBinding } = await import(
 				"./binding.node-wasm.js"
@@ -97,15 +103,29 @@ export async function openLixBinding(
 export async function openNativeLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	server?: SyncServerBindingOptions,
 ): Promise<LixBinding> {
+	if (server?.fetch) {
+		throw new TypeError("Custom sync fetch is only supported by the browser worker");
+	}
 	switch (storage.kind) {
 		case "memory": {
 			const nativeAddon = loadNativeAddon();
 			const nativeTelemetry = telemetry
 				? (spanJson: string) => telemetry(JSON.parse(spanJson))
 				: undefined;
-			if (nativeTelemetry) return nativeAddon.Lix.openMemory(nativeTelemetry);
-			return nativeAddon.Lix.openMemory();
+			if (nativeTelemetry) {
+				return nativeAddon.Lix.openMemory(
+					nativeTelemetry,
+					server?.url,
+					server?.headers,
+				);
+			}
+			return nativeAddon.Lix.openMemory(
+				undefined,
+				server?.url,
+				server?.headers,
+			);
 		}
 		case "jsStorage":
 			throw new Error("JavaScript storage providers are only available in browsers");
@@ -119,11 +139,16 @@ export async function openNativeLixBinding(
 					storage.path,
 					storage.syncAllFiles,
 					nativeTelemetry,
+					server?.url,
+					server?.headers,
 				);
 			}
 			return nativeAddon.Lix.openFilesystemStorage(
 				storage.path,
 				storage.syncAllFiles,
+				undefined,
+				server?.url,
+				server?.headers,
 			);
 		}
 	}

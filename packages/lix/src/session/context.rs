@@ -34,6 +34,7 @@ use crate::sql2::{
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageReadOptions};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
+use crate::sync::SyncModeState;
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{CertifiedHistoryStoreReader, Transaction, open_transaction};
@@ -168,6 +169,10 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) file_views: SessionFileViews,
     pub(super) observe_coordinator: Arc<ObserveCoordinator>,
     pub(super) observe_invalidation: Arc<ObserveInvalidation>,
+    pub(super) sync_mode: SyncModeState,
+    /// Internal sync sessions apply canonical rows and must not enqueue those
+    /// maintenance writes as new client proposals.
+    pub(super) sync_outbox_suppressed: bool,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     transaction_manager: SessionTransactionManager,
@@ -191,6 +196,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        sync_mode: SyncModeState,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Result<Self, LixError> {
@@ -215,50 +221,13 @@ where
             commit_coordinator,
             observe_coordinator,
             observe_invalidation,
+            sync_mode,
             plugin_host,
             telemetry,
         ))
     }
 
-    pub(crate) async fn open_at(
-        active_branch_id: String,
-        active_account_id: String,
-        storage: StorageAdapter<StorageImpl>,
-        hot_state: Arc<HotStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
-        binary_cas: Arc<BinaryCasContext>,
-        branch_ctx: Arc<BranchContext>,
-        catalog_context: Arc<CatalogContext>,
-        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
-        deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
-        collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
-        commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
-        observe_coordinator: Arc<ObserveCoordinator>,
-        observe_invalidation: Arc<ObserveInvalidation>,
-        plugin_host: PluginRuntimeHost,
-        telemetry: Option<Arc<dyn TelemetrySink>>,
-    ) -> Result<Self, LixError> {
-        Ok(Self::new(
-            SessionBranch::new(active_branch_id),
-            active_account_id,
-            storage,
-            hot_state,
-            tracked_state,
-            binary_cas,
-            branch_ctx,
-            catalog_context,
-            sql_planning_cache,
-            deterministic_runtime_gate,
-            collaboration_write_gate,
-            commit_coordinator,
-            observe_coordinator,
-            observe_invalidation,
-            plugin_host,
-            telemetry,
-        ))
-    }
-
-    pub(super) fn new(
+    pub(crate) fn new(
         branch: SessionBranch,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
@@ -273,6 +242,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        sync_mode: SyncModeState,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Self {
@@ -291,6 +261,7 @@ where
             commit_coordinator,
             observe_coordinator,
             observe_invalidation,
+            sync_mode,
             plugin_host,
             telemetry,
             SessionTransactionManager::new(),
@@ -313,6 +284,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        sync_mode: SyncModeState,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
         transaction_manager: SessionTransactionManager,
@@ -334,6 +306,8 @@ where
             file_views,
             observe_coordinator,
             observe_invalidation,
+            sync_mode,
+            sync_outbox_suppressed: false,
             plugin_host,
             telemetry,
             transaction_manager,
@@ -350,6 +324,10 @@ where
 
     pub fn is_closed(&self) -> bool {
         self.transaction_manager.is_closed()
+    }
+
+    pub(crate) fn set_sync_outbox_suppressed(&mut self, suppressed: bool) {
+        self.sync_outbox_suppressed = suppressed;
     }
 
     /// Returns the immutable account that authors every change from this session.
@@ -468,16 +446,11 @@ where
     /// it; independently opened sessions do not.
     pub async fn active_branch_id(&self) -> Result<String, LixError> {
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let result = self.active_branch_id_from_reader(&read).await;
-        match result {
-            Ok(branch_id) => Ok(branch_id),
-            Err(error) => Err(error),
-        }
+        // The selector is session-local state, not repository storage. Opening
+        // a coherent storage read here made this metadata-only operation race
+        // browser OPFS commits performed by sync bootstrap for no reason.
+        self.ensure_open()?;
+        self.branch.get()
     }
 
     pub(crate) fn active_branch_id_owned(
@@ -564,6 +537,10 @@ where
         .await?;
         self.ensure_open()?;
         let mut transaction = opened.transaction;
+        transaction.set_sync_role(self.sync_mode.role());
+        if self.sync_outbox_suppressed {
+            transaction.suppress_ordinary_sync_event();
+        }
         transaction.attach_commit_boundary(self.transaction_commit_boundary());
         if planner_validation_is_serialized {
             transaction.trust_serialized_filesystem_planner();
@@ -586,6 +563,14 @@ where
                 drop(write_access);
                 self.observe_invalidation
                     .bump_if_storage_changed(&outcome.storage_stats);
+                // The server sync endpoint long-polls on canonical-head
+                // movement. Notify only after the storage commit has crossed
+                // its boundary so a woken pull can always observe the event
+                // it was waiting for. Suppressed internal replica sessions
+                // must not wake their own worker while applying a pull.
+                if !self.sync_outbox_suppressed {
+                    self.sync_mode.notify_sync_change();
+                }
                 after_commit_result?;
                 Ok(value)
             }

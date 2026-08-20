@@ -50,9 +50,8 @@ mod alloc_census {
         let _ = ON.try_with(|on| {
             if on.get() {
                 let _ = ALLOCS.try_with(|counter| counter.set(counter.get().saturating_add(1)));
-                let _ = BYTES.try_with(|counter| {
-                    counter.set(counter.get().saturating_add(size as u64))
-                });
+                let _ = BYTES
+                    .try_with(|counter| counter.set(counter.get().saturating_add(size as u64)));
             }
         });
     }
@@ -335,15 +334,10 @@ pub(crate) mod seekable_prototype {
         /// The node summary a parent authenticates, read in O(1) from the
         /// header and the two outermost key slots.  The v1 reader recomputes
         /// the same four values by walking every entry in the node.
-        pub(crate) fn summary(
-            &self,
-            touched: &mut Touched,
-        ) -> (&'a [u8], &'a [u8], u32, u64) {
+        pub(crate) fn summary(&self, touched: &mut Touched) -> (&'a [u8], &'a [u8], u32, u64) {
             touched.bytes += 12;
-            let entry_count =
-                u32::from_le_bytes(self.bytes[13..17].try_into().unwrap());
-            let direct_row_count =
-                u64::from_le_bytes(self.bytes[17..25].try_into().unwrap());
+            let entry_count = u32::from_le_bytes(self.bytes[13..17].try_into().unwrap());
+            let direct_row_count = u64::from_le_bytes(self.bytes[17..25].try_into().unwrap());
             let first_key = self.key(0, 0, touched);
             let last_key = self.key(self.count - 1, 1, touched);
             (first_key, last_key, entry_count, direct_row_count)
@@ -376,11 +370,7 @@ pub(crate) mod seekable_prototype {
         /// Reads one child summary.  Fixed stride, so this is random access
         /// with no decoding; the only copy is the 32-byte node id, which goes
         /// on the stack.
-        pub(crate) fn child(
-            &self,
-            index: usize,
-            touched: &mut Touched,
-        ) -> ([u8; 32], u32, u64) {
+        pub(crate) fn child(&self, index: usize, touched: &mut Touched) -> ([u8; 32], u32, u64) {
             let at = HEADER + 4 * (2 * self.count + 1) + INTERNAL_STRIDE * index;
             touched.bytes += INTERNAL_STRIDE;
             let mut node_id = [0u8; 32];
@@ -2751,7 +2741,8 @@ mod tests {
         );
         println!(
             "DIRNODE_INTERNAL entries,v1_node_bytes,v2_node_bytes,v1_read_bytes,v1_allocs,v1_alloc_bytes,v2_read_bytes,v2_allocs,v2_alloc_bytes"
-        );        println!(
+        );
+        println!(
             "DIRNODE_WRITE entries,v1_node_bytes,v2_node_bytes,v1_encode_allocs,v1_encode_alloc_bytes,v2_encode_allocs,v2_encode_alloc_bytes"
         );
         for entry_count in [2u32, 8, 32, 64, 128] {
@@ -2764,12 +2755,14 @@ mod tests {
 
             let stored_entries = raw
                 .iter()
-                .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
-                    first_key: first_key.clone(),
-                    last_key: last_key.clone(),
-                    replacement_part: None,
-                    direct_row_count: *direct_row_count,
-                })
+                .map(
+                    |(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
+                        first_key: first_key.clone(),
+                        last_key: last_key.clone(),
+                        replacement_part: None,
+                        direct_row_count: *direct_row_count,
+                    },
+                )
                 .collect::<Vec<_>>();
             let v1_node = StoredNode::Leaf {
                 layout: LAYOUT_BOUNDED_DIRECT,
@@ -2784,36 +2777,37 @@ mod tests {
 
             // Arm v1: decode the whole node, then walk it for the one entry -
             // exactly what `load_mutation_part_read_plan` does at a leaf.
-            let ((v1_answer, v1_index), v1_allocs, v1_alloc_bytes) =
-                alloc_census::measure(|| {
-                    let node = decode_node(&v1_bytes).unwrap();
-                    let StoredNode::Leaf { entries, .. } = node else {
-                        unreachable!("leaf");
-                    };
-                    let mut found = None;
-                    for (index, entry) in entries.into_iter().enumerate() {
-                        if stored_entry_first_key(&entry) <= probe.as_slice()
-                            && probe.as_slice() <= stored_entry_last_key(&entry)
-                        {
-                            found = Some((runtime_entry(entry).unwrap(), index));
-                            break;
-                        }
+            let ((v1_answer, v1_index), v1_allocs, v1_alloc_bytes) = alloc_census::measure(|| {
+                let node = decode_node(&v1_bytes).unwrap();
+                let StoredNode::Leaf { entries, .. } = node else {
+                    unreachable!("leaf");
+                };
+                let mut found = None;
+                for (index, entry) in entries.into_iter().enumerate() {
+                    if stored_entry_first_key(&entry) <= probe.as_slice()
+                        && probe.as_slice() <= stored_entry_last_key(&entry)
+                    {
+                        found = Some((runtime_entry(entry).unwrap(), index));
+                        break;
                     }
-                    found.unwrap()
-                });
+                }
+                found.unwrap()
+            });
 
             // Arm v2: binary-search the key table in place, decode one entry.
             let mut touched = Touched::default();
-            let ((v2_answer, v2_index), v2_allocs, v2_alloc_bytes) =
-                alloc_census::measure(|| {
-                    let view = NodeView::new(&v2_bytes, &mut touched).unwrap();
-                    let index = view.seek(&probe, &mut touched).unwrap();
-                    (view.leaf_entry(index, &mut touched), index)
-                });
+            let ((v2_answer, v2_index), v2_allocs, v2_alloc_bytes) = alloc_census::measure(|| {
+                let view = NodeView::new(&v2_bytes, &mut touched).unwrap();
+                let index = view.seek(&probe, &mut touched).unwrap();
+                (view.leaf_entry(index, &mut touched), index)
+            });
 
             assert_eq!(v1_index, target as usize, "v1 found the wrong entry");
             assert_eq!(v2_index, target as usize, "v2 found the wrong entry");
-            assert_eq!(v1_answer, v2_answer, "arms disagree at {entry_count} entries");
+            assert_eq!(
+                v1_answer, v2_answer,
+                "arms disagree at {entry_count} entries"
+            );
 
             println!(
                 "DIRNODE_AB {},{},{},{},{},{},{},{},{},{}",
@@ -2837,12 +2831,14 @@ mod tests {
                 layout: LAYOUT_BOUNDED_DIRECT,
                 entries: raw
                     .iter()
-                    .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
-                        first_key: first_key.clone(),
-                        last_key: last_key.clone(),
-                        replacement_part: None,
-                        direct_row_count: *direct_row_count,
-                    })
+                    .map(
+                        |(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
+                            first_key: first_key.clone(),
+                            last_key: last_key.clone(),
+                            replacement_part: None,
+                            direct_row_count: *direct_row_count,
+                        },
+                    )
                     .collect(),
             };
             let (v1_out, v1_enc_allocs, v1_enc_alloc_bytes) =
@@ -2865,7 +2861,13 @@ mod tests {
                 .iter()
                 .zip(&child_ids)
                 .map(|((first_key, last_key, _), node_id)| {
-                    (first_key.clone(), last_key.clone(), *node_id, 128u32, 128u64)
+                    (
+                        first_key.clone(),
+                        last_key.clone(),
+                        *node_id,
+                        128u32,
+                        128u64,
+                    )
                 })
                 .collect::<Vec<_>>();
             let v1_internal = StoredNode::Internal {
@@ -2873,15 +2875,17 @@ mod tests {
                 level: 1,
                 children: internal_children
                     .iter()
-                    .map(|(first_key, last_key, node_id, entries, rows)| StoredChild {
-                        first_key: first_key.clone(),
-                        last_key: last_key.clone(),
-                        node_id: *node_id,
-                        entry_count: *entries,
-                        direct_row_count: *rows,
-                        level: 0,
-                        layout: LAYOUT_BOUNDED_DIRECT,
-                    })
+                    .map(
+                        |(first_key, last_key, node_id, entries, rows)| StoredChild {
+                            first_key: first_key.clone(),
+                            last_key: last_key.clone(),
+                            node_id: *node_id,
+                            entry_count: *entries,
+                            direct_row_count: *rows,
+                            level: 0,
+                            layout: LAYOUT_BOUNDED_DIRECT,
+                        },
+                    )
                     .collect(),
             };
             let v1_internal_bytes = encode_node(&v1_internal).unwrap();
@@ -2917,17 +2921,18 @@ mod tests {
                     ((node_id, entries, 128 * index as u32), index)
                 });
 
-            assert_eq!(v1_child_index, v2_child_index, "internal arms disagree on index");
+            assert_eq!(
+                v1_child_index, v2_child_index,
+                "internal arms disagree on index"
+            );
             assert_eq!(v1_child, v2_child, "internal arms disagree on child");
 
             // The keyless layouts route by entry index instead of by key.
             // Both routings must select the same child.
             let index_view = NodeView::new(&v2_internal_bytes, &mut Touched::default()).unwrap();
             assert_eq!(
-                index_view.seek_entry_index(
-                    128 * v2_child_index as u32 + 5,
-                    &mut Touched::default()
-                ),
+                index_view
+                    .seek_entry_index(128 * v2_child_index as u32 + 5, &mut Touched::default()),
                 Some(v2_child_index),
                 "index routing disagrees with key routing"
             );
@@ -2989,12 +2994,14 @@ mod tests {
                 layout: LAYOUT_BOUNDED_DIRECT,
                 entries: raw
                     .iter()
-                    .map(|(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
-                        first_key: first_key.clone(),
-                        last_key: last_key.clone(),
-                        replacement_part: None,
-                        direct_row_count: *direct_row_count,
-                    })
+                    .map(
+                        |(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
+                            first_key: first_key.clone(),
+                            last_key: last_key.clone(),
+                            replacement_part: None,
+                            direct_row_count: *direct_row_count,
+                        },
+                    )
                     .collect(),
             };
             let node_id = [7u8; 32];
@@ -3031,10 +3038,7 @@ mod tests {
         // A node whose touched region is out of order must be refused.
         let (first_key, last_key) = keys(5);
         let (later_first, later_last) = keys(9);
-        let disordered = vec![
-            (later_first, later_last, 7u16),
-            (first_key, last_key, 7u16),
-        ];
+        let disordered = vec![(later_first, later_last, 7u16), (first_key, last_key, 7u16)];
         let bad = encode_leaf(LAYOUT_BOUNDED_DIRECT, &disordered);
         let mut touched = Touched::default();
         let view = NodeView::new(&bad, &mut touched).unwrap();

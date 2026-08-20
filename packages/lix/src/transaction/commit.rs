@@ -14,17 +14,17 @@ use crate::branch::{
 };
 use crate::changelog::COMMIT_RECORD_FORMAT_VERSION;
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
-    ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest,
-    CommitRecord, CommitScanRequest, CommitTouchedScopeDigest, TransactionChangeRecordRef,
-    TransactionChangelogAppend,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangeRecordProjection, ChangeScanRequest,
+    ChangelogContext, ChangelogReader, ChangelogWriter, CommitId,
+    CommitLoadRequest as ChangelogCommitLoadRequest, CommitRecord, CommitScanRequest,
+    CommitTouchedScopeDigest, TransactionChangeRecordRef, TransactionChangelogAppend,
 };
 use crate::common::LixTimestamp;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
 use crate::hot_state::{
-    HotStateContext, HotStateRowRequest, HotTrackedSnapshot, MaterializedHotStateRow,
-    TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
+    CompleteWorkingDiffMode, HotStateContext, HotStateRowRequest, HotTrackedSnapshot,
+    MaterializedHotStateRow, TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     stage_tracked_working_diff_epoch,
 };
 use crate::json_store::{
@@ -44,6 +44,7 @@ use crate::tracked_state::{
     stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
+use crate::transaction::context::PendingRestoreIntent;
 #[cfg(test)]
 use crate::transaction::staged_commit_changes::StagedCommitChangeBatchBuilder;
 use crate::transaction::staged_commit_changes::{
@@ -52,7 +53,6 @@ use crate::transaction::staged_commit_changes::{
 use crate::transaction::staging::{
     OrderedMutationJournal, PreparedInsertSelection, PreparedWriteSet,
 };
-use crate::transaction::context::PendingRestoreIntent;
 use crate::transaction_types::{PreparedStateBatch, PreparedStateRowRef};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
@@ -166,6 +166,7 @@ pub(crate) async fn commit_prepared_writes(
         &commit_parent_heads,
         read,
         &BTreeMap::new(),
+        false,
         &BTreeMap::new(),
         prepared_writes,
     )
@@ -193,6 +194,16 @@ pub(crate) struct MaterializedCommit {
     /// from another commit alters the visible filesystem without appearing in
     /// these rows, and the caller must rebuild for those shapes.
     pub(crate) filesystem_delta_rows: Vec<MaterializedHotStateRow>,
+    /// Canonical protocol commits emitted only for an Authority transaction's
+    /// atomic transfer-size preflight. Other roles leave this empty and avoid
+    /// protocol DTO and JSON parsing work.
+    pub(crate) sync_commits: Vec<crate::sync::SyncCommit>,
+    /// Exact branch-control publications produced by the same materialization.
+    ///
+    /// Sync events consume these after materialization instead of predicting
+    /// checkpoint/restore semantics from the prepared rows a second time.
+    /// `None` is a branch deletion.
+    pub(crate) published_branch_controls: BTreeMap<String, Option<BranchHeadControl>>,
 }
 
 /// Materializes a prepared commit with branch heads already resolved from the
@@ -206,6 +217,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     read: &mut impl StorageAdapterRead,
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
+    capture_sync_commits: bool,
     restore_targets: &BTreeMap<String, PendingRestoreIntent>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<MaterializedCommit, LixError> {
@@ -588,6 +600,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             writes,
             preconditions,
             filesystem_delta_rows: Vec::new(),
+            sync_commits: Vec::new(),
+            published_branch_controls: BTreeMap::new(),
         });
     }
 
@@ -614,11 +628,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         }
     }
 
-    let checkpoint_commit_ids = prepared_writes
-        .checkpoint_publications
-        .iter()
-        .map(|publication| publication.recovery_ref.checkpoint_commit_id)
-        .collect::<BTreeSet<_>>();
     let staged_delta_index = Box::pin(stage_tracked_commit_delta_index(
         read,
         &mut writes,
@@ -633,7 +642,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &insert_selection,
         &replacement_generations,
         &ordered_replacements,
-        &checkpoint_commit_ids,
+        capture_sync_commits,
     ))
     .await?;
 
@@ -821,6 +830,10 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &mut root_backed_branch_publications,
     )
     .await?;
+    let headed_branch_controls = published_branch_controls
+        .iter()
+        .filter_map(|(branch_id, control)| control.map(|control| (branch_id.clone(), control)))
+        .collect::<BTreeMap<_, _>>();
     // The binary-CAS publication fence used to ride along with the reachability
     // delta writer. It is an authenticated root-publication fence in its own
     // right, so it stages here even when the transition only revives an
@@ -857,7 +870,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &certified_files,
-        &published_branch_controls,
+        &headed_branch_controls,
         &branch_control_observations,
         &commit_created_at,
         &root_backed_branch_publications,
@@ -881,6 +894,21 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             })
             .map(MaterializedHotStateRow::from)
             .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let sync_commits = if capture_sync_commits {
+        materialize_staged_sync_commits(
+            active_account_id,
+            &state_rows,
+            &row_index.tracked_row_indices_by_commit,
+            &staged_commits,
+            &selected_change_records,
+            &selected_change_payloads,
+            &certified_packet_root_rows,
+            &ordered_replacements,
+            &staged_delta_index,
+        )?
     } else {
         Vec::new()
     };
@@ -908,6 +936,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         writes,
         preconditions,
         filesystem_delta_rows,
+        sync_commits,
+        published_branch_controls,
     })
 }
 
@@ -1131,6 +1161,7 @@ struct StagedChangelogCommit {
 struct StagedCommitDeltaIndex {
     ordered_addressable_commits: BTreeSet<CommitId>,
     inventories: BTreeMap<CommitId, CommitStateMutationInventory>,
+    sync_ordered_change_ids: BTreeMap<CommitId, Vec<ChangeId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2185,7 +2216,22 @@ async fn load_selected_change_records(
             })
             .collect::<Vec<_>>();
         let loaded = load_commit_delta_change_records(read, source_commit_id, &keys).await?;
+        let missing_ids = change_refs
+            .iter()
+            .zip(&loaded)
+            .filter_map(|(change_ref, record)| record.is_none().then_some(change_ref.change_id))
+            .collect::<Vec<_>>();
+        let fallback = ChangelogContext::new()
+            .reader(read)
+            .load_changes(ChangeLoadRequest {
+                change_ids: &missing_ids,
+            })
+            .await?
+            .into_iter()
+            .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
+            .collect::<HashMap<_, _>>();
         for (change_ref, record) in change_refs.into_iter().zip(loaded) {
+            let record = record.or_else(|| fallback.get(&change_ref.change_id).cloned());
             let Some(record) = record else {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -2274,10 +2320,11 @@ async fn stage_tracked_commit_delta_index(
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
-    checkpoint_commit_ids: &BTreeSet<CommitId>,
+    capture_sync_commits: bool,
 ) -> Result<StagedCommitDeltaIndex, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let mut inventories = BTreeMap::new();
+    let mut sync_ordered_change_ids = BTreeMap::new();
     let commit_rows = commit_rows
         .iter()
         .map(|commit| (commit.commit_id, commit))
@@ -2364,6 +2411,10 @@ async fn stage_tracked_commit_delta_index(
                 )?
             };
             inventories.insert(root.commit_id, stage.mutation_inventory().clone());
+            if capture_sync_commits {
+                sync_ordered_change_ids
+                    .insert(root.commit_id, stage.assigned_change_ids().collect());
+            }
             ordered_addressable_commits.insert(root.commit_id);
             continue;
         }
@@ -2496,6 +2547,12 @@ async fn stage_tracked_commit_delta_index(
             };
             if let Some(ordered_stage) = ordered_stage {
                 inventories.insert(root.commit_id, ordered_stage.mutation_inventory().clone());
+                if capture_sync_commits {
+                    sync_ordered_change_ids.insert(
+                        root.commit_id,
+                        ordered_stage.assigned_change_ids().collect(),
+                    );
+                }
                 state_rows.set_ordered_addressable_change_ids(state_row_indices, ordered_stage)?;
                 ordered_addressable_commits.insert(root.commit_id);
                 continue;
@@ -2559,10 +2616,8 @@ async fn stage_tracked_commit_delta_index(
                 "lix.perf.commit_delta_selected_sources"
             );
         }
-        let is_checkpoint_commit = checkpoint_commit_ids.contains(&root.commit_id);
         let selected_source_alias = if certified_root_rows.is_empty()
             && !state_row_indices.is_empty()
-            && is_checkpoint_commit
             && selected_members_by_source.len() == 1
         {
             let source_commit_id = *selected_members_by_source
@@ -2582,49 +2637,54 @@ async fn stage_tracked_commit_delta_index(
                     {
                         return false;
                     }
-                    if source.direct_segment_row_counts.is_empty() {
-                        let selected = selected_changes(&staged.selected_change_batches)
-                            .map(|change_ref| {
-                                (
-                                    encode_key_ref(TrackedStateKeyRef {
-                                        schema_key: change_ref.schema_key(),
-                                        file_id: change_ref.file_id(),
-                                        row_pk: change_ref.row_pk(),
-                                    }),
-                                    (
-                                        change_ref.change_id,
-                                        change_ref.deleted,
-                                        change_ref.created_at,
-                                        change_ref.updated_at,
-                                    ),
-                                )
-                            })
-                            .collect::<HashMap<_, _>>();
-                        return usize::try_from(source.member_count).ok() == Some(selected.len())
-                            && source.selection_fingerprint
-                                == crate::tracked_state::selected_change_selection_fingerprint(
-                                    selected.iter().map(
-                                        |(key, (change_id, deleted, created_at, updated_at))| {
-                                            (
-                                                key.as_slice(),
-                                                *change_id,
-                                                *deleted,
-                                                *created_at,
-                                                *updated_at,
-                                            )
-                                        },
-                                    ),
-                                );
+                    let membership_certified = staged
+                        .selected_change_batches
+                        .iter()
+                        .all(StagedCommitChangeBatch::source_membership_certified);
+                    if !source.direct_segment_row_counts.is_empty() && membership_certified {
+                        return dense_selected_source_is_exact(
+                            source_commit_id,
+                            &source.direct_segment_row_counts,
+                            true,
+                            selected_changes(&staged.selected_change_batches),
+                        );
                     }
-                    dense_selected_source_is_exact(
-                        source_commit_id,
-                        &source.direct_segment_row_counts,
-                        staged
-                            .selected_change_batches
-                            .iter()
-                            .all(StagedCommitChangeBatch::source_membership_certified),
-                        selected_changes(&staged.selected_change_batches),
-                    )
+                    // Ordinary merge analysis already supplies exact selected
+                    // identities but does not carry the checkpoint-only dense
+                    // membership certificate. Prove the same fact against the
+                    // source manifest's count and order-independent fingerprint.
+                    let selected = selected_changes(&staged.selected_change_batches)
+                        .map(|change_ref| {
+                            (
+                                encode_key_ref(TrackedStateKeyRef {
+                                    schema_key: change_ref.schema_key(),
+                                    file_id: change_ref.file_id(),
+                                    row_pk: change_ref.row_pk(),
+                                }),
+                                (
+                                    change_ref.change_id,
+                                    change_ref.deleted,
+                                    change_ref.created_at,
+                                    change_ref.updated_at,
+                                ),
+                            )
+                        })
+                        .collect::<HashMap<_, _>>();
+                    usize::try_from(source.member_count).ok() == Some(selected.len())
+                        && source.selection_fingerprint
+                            == crate::tracked_state::selected_change_selection_fingerprint(
+                                selected.iter().map(
+                                    |(key, (change_id, deleted, created_at, updated_at))| {
+                                        (
+                                            key.as_slice(),
+                                            *change_id,
+                                            *deleted,
+                                            *created_at,
+                                            *updated_at,
+                                        )
+                                    },
+                                ),
+                            )
                 })
                 .then_some(source_commit_id)
         } else {
@@ -2685,7 +2745,191 @@ async fn stage_tracked_commit_delta_index(
     Ok(StagedCommitDeltaIndex {
         ordered_addressable_commits,
         inventories,
+        sync_ordered_change_ids,
     })
+}
+
+#[expect(clippy::too_many_arguments)]
+fn materialize_staged_sync_commits(
+    active_account_id: &str,
+    state_rows: &PreparedStateBatch,
+    tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
+    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
+    selected_change_payloads: &HashMap<
+        SelectedChangeKey,
+        crate::changelog::MaterializedChangePayload,
+    >,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
+    ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
+    staged_delta_index: &StagedCommitDeltaIndex,
+) -> Result<Vec<crate::sync::SyncCommit>, LixError> {
+    use crate::sync::{SyncCommit, SyncCommitMemberRef, encode_sync_commit_member};
+
+    let mut commits = Vec::with_capacity(staged_commits.len());
+    for (commit_id, staged) in staged_commits {
+        let mut members = Vec::with_capacity(staged.change_count);
+
+        for &row_index in tracked_row_indices_by_commit
+            .get(commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let row = state_rows.row(row_index);
+            let delta = tracked_delta_from_state_row(row)?;
+            members.push(encode_sync_commit_member(SyncCommitMemberRef {
+                change_id: delta.change_id,
+                authored: true,
+                schema_key: delta.schema_key,
+                file_id: delta.file_id,
+                row_pk: delta.row_pk,
+                deleted: delta.deleted,
+                snapshot_json: row
+                    .snapshot
+                    .map(crate::transaction_types::StageJson::normalized),
+                metadata_json: row
+                    .metadata
+                    .map(crate::transaction_types::StageJson::normalized),
+                row_created_at: delta.created_at,
+                row_updated_at: delta.updated_at,
+                change_account_id: active_account_id,
+                change_created_at: row.updated_at,
+                origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
+            })?);
+        }
+
+        if let Some(journal) = ordered_replacements.get(commit_id) {
+            let change_ids = staged_delta_index
+                .sync_ordered_change_ids
+                .get(commit_id)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("sync preflight lacks ordered addresses for commit '{commit_id}'"),
+                    )
+                })?;
+            if change_ids.len() != journal.row_count() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "sync preflight ordered address count disagrees for commit '{commit_id}'"
+                    ),
+                ));
+            }
+            let lifecycle_created_at = staged_delta_index
+                .inventories
+                .get(commit_id)
+                .and_then(|inventory| inventory.lifecycle_summary.as_ref())
+                .map(|summary| summary.uniform_created_at)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "sync preflight ordered commit '{commit_id}' lacks lifecycle authority"
+                        ),
+                    )
+                })?;
+            for (row, &change_id) in journal.iter().zip(change_ids) {
+                let row_pk = RowPk::single(row.identity());
+                members.push(encode_sync_commit_member(SyncCommitMemberRef {
+                    change_id,
+                    authored: true,
+                    schema_key: journal.schema_key(),
+                    file_id: None,
+                    row_pk: &row_pk,
+                    deleted: false,
+                    snapshot_json: Some(row.snapshot()),
+                    metadata_json: None,
+                    row_created_at: lifecycle_created_at,
+                    row_updated_at: journal.timestamp(),
+                    change_account_id: active_account_id,
+                    change_created_at: journal.timestamp(),
+                    origin_key: None,
+                })?);
+            }
+        }
+
+        for row in certified_packet_root_rows
+            .get(commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let change_id = row.change_id.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync preflight certified row lacks a change id",
+                )
+            })?;
+            members.push(encode_sync_commit_member(SyncCommitMemberRef {
+                change_id,
+                authored: true,
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                row_pk: &row.row_pk,
+                deleted: row.deleted,
+                snapshot_json: row.snapshot_content.as_deref(),
+                metadata_json: row.metadata.as_deref(),
+                row_created_at: row.created_at,
+                row_updated_at: row.updated_at,
+                change_account_id: active_account_id,
+                change_created_at: row.updated_at,
+                origin_key: None,
+            })?);
+        }
+
+        for change_ref in selected_changes(&staged.selected_change_batches) {
+            let key = selected_change_key(change_ref);
+            let record = selected_change_records.get(&key);
+            let payload = selected_change_payloads.get(&key);
+            members.push(encode_sync_commit_member(SyncCommitMemberRef {
+                change_id: change_ref.change_id,
+                authored: false,
+                schema_key: change_ref.schema_key(),
+                file_id: change_ref.file_id(),
+                row_pk: change_ref.row_pk(),
+                deleted: change_ref.deleted,
+                snapshot_json: payload.and_then(|payload| payload.snapshot_content.as_deref()),
+                metadata_json: payload.and_then(|payload| payload.metadata.as_deref()),
+                row_created_at: change_ref.created_at,
+                row_updated_at: change_ref.updated_at,
+                change_account_id: record.map_or(active_account_id, |record| &record.account_id),
+                change_created_at: record.map_or(change_ref.updated_at, |record| record.created_at),
+                origin_key: record.and_then(|record| record.origin_key.as_deref()),
+            })?);
+        }
+
+        members.sort_unstable_by(|left, right| {
+            let left_row_pk = RowPk::from_typed_json_array_value(&left.row_pk)
+                .expect("staged sync member primary key was just encoded");
+            let right_row_pk = RowPk::from_typed_json_array_value(&right.row_pk)
+                .expect("staged sync member primary key was just encoded");
+            (&left.schema_key, &left.file_id, left_row_pk).cmp(&(
+                &right.schema_key,
+                &right.file_id,
+                right_row_pk,
+            ))
+        });
+        let has_selected_members = members.iter().any(|member| !member.authored);
+        let selected_source_commit_id = (has_selected_members
+            && staged.record.parent_commit_ids.len() > 1)
+            .then(|| staged.record.parent_commit_ids[1]);
+        let commit = SyncCommit {
+            commit_id: staged.record.commit_id.to_string(),
+            parent_commit_ids: staged
+                .record
+                .parent_commit_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            account_id: staged.record.account_id.clone(),
+            created_at: staged.record.created_at.to_string(),
+            selected_source_commit_id: selected_source_commit_id.map(|id| id.to_string()),
+            members,
+        };
+        commit.validate()?;
+        commits.push(commit);
+    }
+    Ok(commits)
 }
 
 fn try_stage_lossless_columnar_mutations(
@@ -3662,6 +3906,61 @@ fn global_branch_schema_keys(
     Some(schema_keys)
 }
 
+async fn load_working_diff_epoch_for_publication(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    checkpoint_commit_id: Option<CommitId>,
+    parent_commit_id: Option<CommitId>,
+    parent_control: Option<BranchHeadControl>,
+    parent_generation: Option<CommitId>,
+) -> Result<Option<TrackedWorkingDiffEpoch>, LixError> {
+    if checkpoint_commit_id.is_some() {
+        return Ok(None);
+    }
+    let (Some(parent_commit_id), Some(control), Some(parent_generation)) =
+        (parent_commit_id, parent_control, parent_generation)
+    else {
+        return Ok(None);
+    };
+    if control.head_commit_id != parent_commit_id {
+        return Ok(None);
+    }
+
+    let epoch = TrackedHeadContext::new()
+        .reader(read)
+        .working_diff_epoch(branch_id)
+        .await?;
+    match (control.working_diff_checkpoint_commit_id, epoch) {
+        (None, None) => Ok(None),
+        (Some(checkpoint_commit_id), Some(epoch))
+            if epoch.checkpoint_commit_id == checkpoint_commit_id
+                && epoch.generation == parent_generation =>
+        {
+            Ok(Some(epoch))
+        }
+        (Some(checkpoint_commit_id), None) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "branch '{branch_id}' checkpoint cursor '{checkpoint_commit_id}' has no working-diff epoch"
+            ),
+        )),
+        (None, Some(epoch)) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "branch '{branch_id}' has working-diff epoch '{}' without a checkpoint cursor",
+                epoch.checkpoint_commit_id
+            ),
+        )),
+        (Some(checkpoint_commit_id), Some(epoch)) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "branch '{branch_id}' checkpoint cursor '{checkpoint_commit_id}' in generation '{parent_generation}' does not match working-diff epoch '{}' in generation '{}'",
+                epoch.checkpoint_commit_id, epoch.generation
+            ),
+        )),
+    }
+}
+
 async fn stage_tracked_head(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -4025,7 +4324,23 @@ async fn stage_tracked_head(
             }
             _ => None,
         };
-
+        // Every publication route advances the same private working-diff
+        // epoch. Resolve it before selecting a physical current-state route
+        // so complete lifecycle snapshots cannot bypass cursor carry-forward.
+        let working_diff_epoch = load_working_diff_epoch_for_publication(
+            read,
+            &root.branch_id,
+            checkpoint_commit_id,
+            root.parent_commit_id,
+            parent_control,
+            parent_generation,
+        )
+        .await?;
+        let working_diff_capture_checkpoint_commit_id = working_diff_epoch
+            .as_ref()
+            .map(|epoch| epoch.checkpoint_commit_id);
+        let working_diff_checkpoint_commit_id =
+            checkpoint_commit_id.or(working_diff_capture_checkpoint_commit_id);
         if !staged.selected_change_batches.is_empty() {
             reject_selected_tracked_refs_with_untracked_rows(
                 read,
@@ -4043,6 +4358,24 @@ async fn stage_tracked_head(
                 lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
             let mut coverage = WorkingDiffIndexCoverage::default();
             let owned_absence_guards = owned_absence_guards(&absence_guards);
+            let working_diff_mode = match (checkpoint_commit_id, working_diff_epoch.as_ref()) {
+                (Some(_), _) => CompleteWorkingDiffMode::ResetClean,
+                (None, Some(epoch)) => {
+                    let checkpoint = load_persisted_lifecycle_tracked_snapshot(
+                        read,
+                        &root.branch_id,
+                        epoch.checkpoint_commit_id,
+                    )
+                    .await?;
+                    CompleteWorkingDiffMode::Rebase {
+                        checkpoint_commit_id: epoch.checkpoint_commit_id,
+                        checkpoint: HotTrackedSnapshot::from_materialized_rows(
+                            checkpoint.into_values().collect(),
+                        )?,
+                    }
+                }
+                (None, None) => CompleteWorkingDiffMode::Disabled,
+            };
             // One generation carries both retentions, so the branch's
             // history-free rows are preserved from — and republished into —
             // that same complete snapshot. There is no second root to advance.
@@ -4056,12 +4389,27 @@ async fn stage_tracked_head(
                     &[],
                     &untracked_deltas,
                     &owned_absence_guards,
-                    checkpoint_commit_id,
+                    working_diff_mode,
                     &mut coverage,
                 )
                 .await?;
-            let mut control =
-                normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?;
+            if let Some(epoch) = &working_diff_epoch {
+                stage_tracked_working_diff_epoch(
+                    writes,
+                    &root.branch_id,
+                    TrackedWorkingDiffEpoch {
+                        checkpoint_commit_id: epoch.checkpoint_commit_id,
+                        generation,
+                        coverage,
+                    },
+                )?;
+            }
+            let mut control = normal_branch_head_control(
+                root,
+                parent_control,
+                generation,
+                working_diff_checkpoint_commit_id,
+            )?;
             control.reset_schema_presence();
             control.note_schemas(schema_keys.iter().map(String::as_str));
             tracked_snapshots.insert(root.commit_id, final_tracked);
@@ -4078,36 +4426,6 @@ async fn stage_tracked_head(
                 ),
             )
         })?;
-        let working_diff_epoch = if checkpoint_commit_id.is_some() {
-            None
-        } else {
-            match (root.parent_commit_id, parent_control) {
-                (Some(parent_commit_id), Some(control))
-                    if control.head_commit_id == parent_commit_id =>
-                {
-                    match tracked_head
-                        .reader(read)
-                        .working_diff_epoch(&root.branch_id)
-                        .await
-                    {
-                        Ok(Some(epoch))
-                            if epoch.generation == parent_generation
-                                && control.working_diff_checkpoint_commit_id
-                                    == Some(epoch.checkpoint_commit_id) =>
-                        {
-                            Some(epoch)
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        };
-        let working_diff_capture_checkpoint_commit_id = working_diff_epoch
-            .as_ref()
-            .map(|epoch| epoch.checkpoint_commit_id);
-        let working_diff_checkpoint_commit_id =
-            checkpoint_commit_id.or(working_diff_capture_checkpoint_commit_id);
         let mut coverage = working_diff_epoch
             .as_ref()
             .map(|epoch| epoch.coverage)
@@ -5289,7 +5607,7 @@ async fn stage_root_backed_branch_publication(
                         &[],
                         &untracked_deltas,
                         &absence_guards,
-                        Some(head_commit_id),
+                        CompleteWorkingDiffMode::ResetClean,
                         &mut coverage,
                     )
                     .await?;
@@ -5298,6 +5616,55 @@ async fn stage_root_backed_branch_publication(
                     branch_id,
                     TrackedWorkingDiffEpoch {
                         checkpoint_commit_id: head_commit_id,
+                        generation,
+                        coverage,
+                    },
+                )?;
+            } else if let Some(checkpoint_commit_id) =
+                previous_control.and_then(|control| control.working_diff_checkpoint_commit_id)
+            {
+                // Moving an existing branch to another immutable root changes
+                // its serving generation but not its private checkpoint. Build
+                // the new generation and its sparse dirty index together so a
+                // later ordinary write cannot observe a cursor bound to the
+                // retired generation.
+                let current =
+                    load_persisted_lifecycle_tracked_snapshot(read, branch_id, head_commit_id)
+                        .await?;
+                let checkpoint = load_persisted_lifecycle_tracked_snapshot(
+                    read,
+                    branch_id,
+                    checkpoint_commit_id,
+                )
+                .await?;
+                let mut coverage = WorkingDiffIndexCoverage::default();
+                let empty_guards = BTreeSet::new();
+                tracked_head
+                    .writer(read, writes)
+                    .stage_complete_current_state_with_working_diff(
+                        branch_id,
+                        generation,
+                        HotTrackedSnapshot::from_materialized_rows(
+                            current.into_values().collect(),
+                        )?,
+                        None,
+                        &[],
+                        &[],
+                        &empty_guards,
+                        CompleteWorkingDiffMode::Rebase {
+                            checkpoint_commit_id,
+                            checkpoint: HotTrackedSnapshot::from_materialized_rows(
+                                checkpoint.into_values().collect(),
+                            )?,
+                        },
+                        &mut coverage,
+                    )
+                    .await?;
+                stage_tracked_working_diff_epoch(
+                    writes,
+                    branch_id,
+                    TrackedWorkingDiffEpoch {
+                        checkpoint_commit_id,
                         generation,
                         coverage,
                     },
@@ -5389,7 +5756,7 @@ async fn stage_branch_head_control_publications(
     preconditions: &mut Vec<StoragePrecondition>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     root_backed_branch_publications: &mut BTreeSet<String>,
-) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
+) -> Result<BTreeMap<String, Option<BranchHeadControl>>, LixError> {
     let checkpoint_epochs = checkpoint_epoch_bindings(checkpoint_publications)?;
     if let Some(branch_id) = branch_checkpoint_bridges
         .keys()
@@ -5553,10 +5920,7 @@ async fn stage_branch_head_control_publications(
             }
         }
     }
-    Ok(publications
-        .into_iter()
-        .filter_map(|(branch_id, control)| control.map(|control| (branch_id, control)))
-        .collect())
+    Ok(publications)
 }
 
 fn checkpoint_epoch_bindings(
@@ -5834,14 +6198,11 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
 ) -> Result<(), LixError> {
     let current_state = TrackedHeadContext::new().reader(read);
     for (branch_id, target) in explicit_branch_targets {
-        if target
-            .head_commit_id
-            .is_some_and(|commit_id| {
-                restore_targets
-                    .get(branch_id)
-                    .is_some_and(|intent| intent.target_commit_id == commit_id)
-            })
-        {
+        if target.head_commit_id.is_some_and(|commit_id| {
+            restore_targets
+                .get(branch_id)
+                .is_some_and(|intent| intent.target_commit_id == commit_id)
+        }) {
             continue;
         }
         let Some(existing) = observations
@@ -7086,6 +7447,7 @@ mod tests {
         let control = controls
             .get(branch_id)
             .copied()
+            .flatten()
             .expect("created branch should have a complete control");
         assert_eq!(control.head_commit_id, recovered_head);
         assert_eq!(control.working_diff_checkpoint_commit_id, Some(checkpoint));
@@ -7635,6 +7997,113 @@ mod tests {
         }
     }
 
+    struct FailingWorkingDiffEpochRead {
+        inner: MemoryRead,
+    }
+
+    impl StorageRead for FailingWorkingDiffEpochRead {
+        async fn get_many(
+            &self,
+            requests: &[crate::storage::GetManyRequest<'_>],
+        ) -> Result<GetManyResult, StorageError> {
+            if requests
+                .iter()
+                .any(|request| request.space == crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE)
+            {
+                return Err(StorageError::Io(
+                    "injected working-diff epoch read failure".to_owned(),
+                ));
+            }
+            self.inner.get_many(requests).await
+        }
+
+        async fn begin_scan(
+            &self,
+            space: StorageSpace,
+            range: KeyRange,
+            opts: BeginScanOptions,
+        ) -> Result<ScanCursor<'_>, StorageError> {
+            self.inner.begin_scan(space, range, opts).await
+        }
+    }
+
+    fn working_diff_epoch_test_control(
+        head_commit_id: CommitId,
+        generation: CommitId,
+        checkpoint_commit_id: Option<CommitId>,
+    ) -> BranchHeadControl {
+        BranchHeadControl {
+            head_commit_id,
+            tracked_generation: generation,
+            current_state_revision: 1,
+            working_diff_checkpoint_commit_id: checkpoint_commit_id,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+            ref_change_id: change_id("working-diff-epoch-test-ref"),
+            schema_presence_bloom: [0; 4],
+        }
+    }
+
+    #[tokio::test]
+    async fn working_diff_epoch_storage_error_fails_publication_closed() {
+        let memory = Memory::new();
+        let read = StorageAdapterReadScope::new(FailingWorkingDiffEpochRead {
+            inner: memory
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("failing epoch read should open"),
+        });
+        let head = commit_id("epoch-read-error-head");
+        let checkpoint = commit_id("epoch-read-error-checkpoint");
+        let error = load_working_diff_epoch_for_publication(
+            &read,
+            "epoch-read-error-branch",
+            None,
+            Some(head),
+            Some(working_diff_epoch_test_control(
+                head,
+                head,
+                Some(checkpoint),
+            )),
+            Some(head),
+        )
+        .await
+        .expect_err("storage errors must not be downgraded to an absent epoch");
+        assert!(
+            error
+                .message
+                .contains("injected working-diff epoch read failure"),
+            "unexpected propagated storage error: {error:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_working_diff_epoch_fails_publication_closed() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("missing epoch read should open");
+        let head = commit_id("missing-epoch-head");
+        let checkpoint = commit_id("missing-epoch-checkpoint");
+        let error = load_working_diff_epoch_for_publication(
+            &read,
+            "missing-epoch-branch",
+            None,
+            Some(head),
+            Some(working_diff_epoch_test_control(
+                head,
+                head,
+                Some(checkpoint),
+            )),
+            Some(head),
+        )
+        .await
+        .expect_err("a checkpoint cursor without its epoch must fail closed");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("has no working-diff epoch"));
+    }
+
     #[test]
     fn selected_change_refs_reject_overlap_with_normal_rows() {
         let row = tracked_global_row("normal-change");
@@ -7765,7 +8234,7 @@ mod tests {
             &PreparedInsertSelection::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            false,
         )
         .await
         .expect("mixed certified delta should stage");
@@ -7941,7 +8410,7 @@ mod tests {
         assert_eq!(change.schema_key, "test_schema");
         let change_ids = [change_id("change-1"), record.change_id()];
         let changes = changelog_reader
-            .load_changes(crate::changelog::ChangeLoadRequest {
+            .load_changes(ChangeLoadRequest {
                 change_ids: &change_ids,
             })
             .await
@@ -9518,7 +9987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_working_diff_epoch_is_not_promoted_into_the_next_head() {
+    async fn mismatched_working_diff_epoch_fails_publication_closed() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -9561,6 +10030,30 @@ mod tests {
             .await
             .expect("first commit should persist");
 
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open checkpoint cursor seed read");
+        let mut control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load("01920000-0000-7000-8000-0000000000a1")
+            .await
+            .expect("load checkpoint cursor seed control")
+            .expect("checkpoint cursor seed control must exist");
+        control.working_diff_checkpoint_commit_id = Some(first_commit);
+        let mut cursor_writes = StorageWriteSet::new();
+        stage_branch_head_control(
+            &mut cursor_writes,
+            "01920000-0000-7000-8000-0000000000a1",
+            control,
+        )
+        .expect("stage checkpoint cursor seed");
+        drop(read);
+        storage
+            .commit_write_set(cursor_writes, StorageWriteOptions::default())
+            .await
+            .expect("persist checkpoint cursor seed");
+
         // This deliberately names the right serving generation but a
         // checkpoint that the marker never bound. It models a stale or
         // corrupted auxiliary epoch; the next serial commit must not turn it
@@ -9591,7 +10084,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open second commit read");
-        let (writes, _) = commit_prepared_writes(
+        let error = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
             None,
@@ -9615,11 +10108,12 @@ mod tests {
             },
         )
         .await
-        .expect("second commit should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("second commit should persist");
+        .expect_err("a mismatched working-diff marker must fail publication closed");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(
+            error.message.contains("does not match working-diff epoch"),
+            "unexpected mismatched epoch error: {error:?}",
+        );
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -9631,19 +10125,9 @@ mod tests {
             .await
             .expect("load branch control")
             .expect("branch control must exist");
-        assert_eq!(control.head_commit_id, second_commit);
-        assert!(
-            TrackedHeadContext::new()
-                .reader(read)
-                .working_diff_for_control(
-                    "01920000-0000-7000-8000-0000000000a1",
-                    control,
-                    &crate::tracked_state::TrackedStateDiffRequest::default(),
-                )
-                .await
-                .expect("stale epoch must select fallback, not error")
-                .is_none(),
-            "a stale epoch must not be rebound by a later serial commit"
+        assert_eq!(
+            control.head_commit_id, first_commit,
+            "a rejected publication must leave the prior head intact",
         );
     }
 
@@ -10179,7 +10663,7 @@ mod tests {
         );
         let change_ids = [change_id("change-untracked")];
         let changes = changelog_reader
-            .load_changes(crate::changelog::ChangeLoadRequest {
+            .load_changes(ChangeLoadRequest {
                 change_ids: &change_ids,
             })
             .await

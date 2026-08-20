@@ -1,5 +1,5 @@
 ---
-description: "Reference for opening local and remote Lix instances, running SQL, using transactions, and working with branches."
+description: "Reference for opening local, remote, and synchronized Lix instances, running SQL, using transactions, and working with branches."
 ---
 
 # JavaScript API Reference
@@ -7,7 +7,8 @@ description: "Reference for opening local and remote Lix instances, running SQL,
 `@lix-js/sdk` exports `openLix()`, the generic JavaScript storage protocol,
 `Row`, `Value`, and `bundledPluginArchives`. `@lix-js/storage-opfs` and
 `@lix-js/storage-filesystem` provide concrete storage implementations.
-`openLix()` returns a `Lix` instance connected to a local or remote repository.
+`openLix()` returns a local repository, a thin remote client, or a synchronized
+local replica.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -23,11 +24,11 @@ const lix = await openLix(options?);
 
 Options:
 
-| Option      | Type                                  | Description                                                                         |
-| ----------- | ------------------------------------- | ----------------------------------------------------------------------------------- |
-| `storage`   | `LixStorage`                          | Local storage selected by a provider package. Omit it for memory. |
-| `server`    | `RemoteLixServerOptions`              | Connect to a remote Lix server. Remote mode does not accept local storage. |
-| `telemetry` | `LixTelemetryOptions`                 | Optional `onSpan(span)` callback that receives telemetry spans. Local mode only.    |
+| Option      | Type                                             | Description                                                                                |
+| ----------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| `storage`   | `LixStorage`                                     | Local storage selected by a provider package. Omit it for memory.                          |
+| `server`    | `RemoteLixServerOptions \| SyncLixServerOptions` | Connect directly to a server or synchronize a local replica.                               |
+| `telemetry` | `LixTelemetryOptions`                            | Optional `onSpan(span)` callback that receives telemetry spans. Local and sync modes only. |
 
 Connect to a remote server:
 
@@ -43,7 +44,26 @@ const lix = await openLix({
 
 Remote file content, SQL rows, and branches live on the server. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
 
-Use `OpfsStorage` to persist a complete local browser Lix across reloads:
+Open a synchronized local replica by combining storage with sync mode:
+
+```ts
+import { OpfsStorage } from "@lix-js/storage-opfs";
+
+const lix = await openLix({
+  storage: new OpfsStorage({ name: "atelier" }),
+  server: {
+    mode: "sync",
+    url: "https://example.com/repositories/acme",
+    headers: () => ({ Authorization: `Bearer ${token}` }),
+  },
+});
+```
+
+In sync mode, `execute()` resolves when the local transaction commits. Server
+synchronization continues in the background. See
+[Collaboration and Sync](./collaboration-and-sync.md) for the complete behavior.
+
+Use `OpfsStorage` to persist a local browser Lix across reloads:
 
 ```ts
 import { openLix } from "@lix-js/sdk";

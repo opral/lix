@@ -34,14 +34,13 @@ use futures_util::TryStreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::Instrument as _;
 
-use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::{SessionTransaction, transaction_state_error};
+use super::{ExecuteIdempotency, MAX_EXPIRED_READ_RETRIES};
 use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
-const MAX_EXPIRED_READ_RETRIES: usize = 16;
 const MAX_AUTO_COMMIT_RETRIES: usize = 16;
 
 enum LiteralParameterBuilder {
@@ -247,6 +246,7 @@ impl ExecuteResult {
         Self::from_query_parts(columns, rows, rows_affected, notices)
     }
 
+    #[cfg(feature = "server-protocol-client")]
     pub(crate) fn from_protocol_response(
         statement_index: Option<usize>,
         label: Option<String>,
@@ -1187,12 +1187,21 @@ where
         let paths = BTreeSet::from([path]);
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let mut expired_read_retries = 0;
+        let mut read_quiescence_guard = None;
         loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
                 Ok(read_scope) => read_scope,
                 Err(error) => {
                     let error: LixError = error.into();
-                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     return Err(error);
@@ -1219,7 +1228,7 @@ where
                         // A raw file download delivers the same bytes as a direct
                         // `lix_file.content` read, so it must acknowledge rendered
                         // plugin state for subsequent collaborative writes.
-                        let file_view_collector = sql2::SessionFileViews::default();
+                        let file_view_collector = self.file_views.fork_for_read();
                         let result = sql2::execute_exact_lix_file_batch_read(
                             &active_branch_id,
                             hot_state,
@@ -1245,10 +1254,20 @@ where
                     self.file_views.apply_mutations(file_view_mutations);
                     return Ok(content);
                 }
-                Err(error) if consume_expired_read_retry(&mut expired_read_retries, &error) => {
-                    continue;
+                Err(error) => {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             }
         }
     }
@@ -1313,7 +1332,8 @@ where
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
         let statement = self.sql_planning_cache.parse_statement(sql)?;
-        if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
+        let route = sql2::bind_statement_route(&statement)?;
+        if route == sql2::BoundStatementRoute::Write {
             if require_idempotency_for_writes && idempotency.is_none() {
                 return Err(LixError::new(
                     LixError::CODE_IDEMPOTENCY_KEY_REQUIRED,
@@ -1422,12 +1442,22 @@ where
             None
         };
         let mut expired_read_retries = 0;
+        let mut read_quiescence_guard = None;
+        let reads_already_quiesced = runtime_write_access.is_some();
         let (mut read_result, file_view_mutations, _provider_rows_examined) = loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
                 Ok(read_scope) => read_scope,
                 Err(error) => {
                     let error: LixError = error.into();
-                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        reads_already_quiesced,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     return Err(normalize_sql_surface_error(error, sql));
@@ -1463,7 +1493,15 @@ where
                 Ok(result) => break result,
                 Err(error) => {
                     let error = normalize_sql_surface_error(error, sql);
-                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        reads_already_quiesced,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     return Err(error);
@@ -1614,6 +1652,16 @@ where
         };
         Self::require_matching_idempotency_receipt(&durable, idempotency)?;
         Ok(IdempotencyReceiptResolution::Replay(durable))
+    }
+
+    pub(crate) async fn replay_execute_idempotency_result(
+        &self,
+        idempotency: &ExecuteIdempotency,
+    ) -> Result<Option<ExecuteResult>, LixError> {
+        match self.resolve_idempotency_receipt(idempotency).await? {
+            IdempotencyReceiptResolution::Absent => Ok(None),
+            IdempotencyReceiptResolution::Replay(receipt) => receipt.into_single_result().map(Some),
+        }
     }
 
     async fn load_idempotency_receipt(
@@ -2105,15 +2153,25 @@ where
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let acknowledge_file_views = parsed.iter().zip(statements).all(|(parsed, statement)| {
             is_acknowledgeable_file_content_read(parsed, &statement.params)
+                || late_materialized_lix_file_content_read(parsed).is_some()
         });
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let mut expired_read_retries = 0;
+        let mut read_quiescence_guard = None;
         loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
                 Ok(read_scope) => read_scope,
                 Err(error) => {
                     let error: LixError = error.into();
-                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     return Err(error);
@@ -2125,7 +2183,7 @@ where
                     let parsed = parsed.clone();
                     async move {
                         let file_view_collector =
-                            acknowledge_file_views.then(sql2::SessionFileViews::default);
+                            acknowledge_file_views.then(|| self.file_views.fork_for_read());
                         let active_branch_id =
                             self.active_branch_id_from_reader(&read_store).await?;
                         let ctx = SessionSqlExecutionContext {
@@ -2192,10 +2250,20 @@ where
                     self.file_views.apply_mutations(file_view_mutations);
                     return Ok(results);
                 }
-                Err(error) if consume_expired_read_retry(&mut expired_read_retries, &error) => {
-                    continue;
+                Err(error) => {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             }
         }
     }
@@ -2264,19 +2332,28 @@ where
                 }
             })
             .collect::<Result<Vec<_>, LixError>>()?;
-        let acknowledge_file_views = parsed
-            .iter()
-            .zip(statements)
-            .all(|(parsed, (_, params))| is_acknowledgeable_file_content_read(parsed, params));
+        let acknowledge_file_views = parsed.iter().zip(statements).all(|(parsed, (_, params))| {
+            is_acknowledgeable_file_content_read(parsed, params)
+                || late_materialized_lix_file_content_read(parsed).is_some()
+        });
 
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let mut expired_read_retries = 0;
+        let mut read_quiescence_guard = None;
         loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
                 Ok(read_scope) => read_scope,
                 Err(error) => {
                     let error: LixError = error.into();
-                    if consume_expired_read_retry(&mut expired_read_retries, &error) {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     return Err(error);
@@ -2288,7 +2365,7 @@ where
                     let parsed = parsed.clone();
                     async move {
                         let file_view_collector =
-                            acknowledge_file_views.then(sql2::SessionFileViews::default);
+                            acknowledge_file_views.then(|| self.file_views.fork_for_read());
                         let active_branch_id =
                             self.active_branch_id_from_reader(&read_store).await?;
                         let active_branch_head = self
@@ -2390,10 +2467,20 @@ where
                     self.file_views.apply_mutations(file_view_mutations);
                     return Ok(batch);
                 }
-                Err(error) if consume_expired_read_retry(&mut expired_read_retries, &error) => {
-                    continue;
+                Err(error) => {
+                    if retry_expired_read_with_write_quiescence(
+                        &mut expired_read_retries,
+                        &error,
+                        &self.collaboration_write_gate,
+                        &mut read_quiescence_guard,
+                        false,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             }
         }
     }
@@ -2500,7 +2587,7 @@ where
         ),
         LixError,
     > {
-        let file_view_collector = acknowledge_file_views.then(sql2::SessionFileViews::default);
+        let file_view_collector = acknowledge_file_views.then(|| self.file_views.fork_for_read());
         let active_branch_id = self
             .active_branch_id_from_reader(&read_store)
             .instrument(tracing::debug_span!(
@@ -3260,6 +3347,7 @@ where
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
+        self.ensure_session_open()?;
         let telemetry =
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, "transaction", None);
         let may_reuse_literal_shape = self.has_started_statement;
@@ -5170,6 +5258,31 @@ fn consume_expired_read_retry(retries: &mut usize, error: &LixError) -> bool {
         return false;
     }
     *retries += 1;
+    true
+}
+
+/// A storage such as browser OPFS may preserve coherent reads by expiring a
+/// multi-call snapshot when a commit lands between calls. Retry once on the
+/// optimistic path, then hold the same collaboration gate used by every Lix
+/// writer so a busy sync bootstrap cannot invalidate all bounded retries.
+async fn retry_expired_read_with_write_quiescence(
+    retries: &mut usize,
+    error: &LixError,
+    write_gate: &Arc<tokio::sync::Mutex<()>>,
+    guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
+    already_quiesced: bool,
+) -> bool {
+    if !consume_expired_read_retry(retries, error) {
+        return false;
+    }
+    // Cross-context stores such as OPFS can invalidate a read while another
+    // tab is committing or transferring ownership. Yield before reopening so
+    // that handoff can finish; otherwise all bounded retries can run in one
+    // event-loop turn against the same transient generation.
+    tokio::task::yield_now().await;
+    if !already_quiesced && guard.is_none() {
+        *guard = Some(Arc::clone(write_gate).lock_owned().await);
+    }
     true
 }
 

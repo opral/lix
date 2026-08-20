@@ -182,12 +182,26 @@ impl Storage for RocksDB {
         opts: ReadOptions,
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
+            // Capture the sequence first, then fence the WAL. A flush-before-
+            // snapshot ordering has a race where a concurrent write can land
+            // between the fence and snapshot and be returned by a supposedly
+            // durable read before its WAL is synced. The snapshot-before-
+            // fence order makes the read view immutable while the fence
+            // guarantees every write visible in that view has crossed the
+            // backend's durable boundary.
+            let snapshot = self.inner.db.snapshot();
             if opts.durability == ReadDurability::Durable {
-                return Err(StorageError::Durability);
+                // RocksDB's durable write boundary is its synced WAL. A
+                // durable read must fence the WAL before returning its
+                // snapshot; otherwise an idempotency receipt that was
+                // published with `await_durable` would still be treated as
+                // unknowable by retry recovery on the FilesystemStorage
+                // adapter.
+                self.inner.db.flush_wal(true).map_err(rocksdb_error)?;
             }
             Ok(RocksDBRead {
                 db: &self.inner.db,
-                snapshot: self.inner.db.snapshot(),
+                snapshot,
             })
         }
     }

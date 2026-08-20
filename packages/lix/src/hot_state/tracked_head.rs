@@ -12,6 +12,12 @@ mod hot;
 pub(crate) use hot::hot_decode_row_pk_probe;
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
+#[cfg(test)]
+pub(crate) use hot::WORKING_DIFF_PATH_HITS;
+#[cfg(test)]
+pub(crate) use hot::encode_hot_row_key_for_test;
+#[cfg(test)]
+pub(crate) use hot::hot_generation_scope_prefix;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use hot::{
     BROAD_CANONICAL_CREATED_AT_HITS, BROAD_CANONICAL_CREATED_AT_KEYS,
@@ -21,21 +27,16 @@ pub(crate) use hot::{
     INTERVAL_LOCAL_TOMBSTONE_CANDIDATES, INTERVAL_LOCAL_TOMBSTONE_ELIDED,
     INTERVAL_LOCAL_TOMBSTONE_OFFERED, INTERVAL_LOCAL_TOMBSTONE_ROUTES,
 };
-#[cfg(test)]
-pub(crate) use hot::WORKING_DIFF_PATH_HITS;
-#[cfg(test)]
-pub(crate) use hot::hot_generation_scope_prefix;
 pub(crate) use hot::{
-    RootBaseBatchCache,
-    CERTIFIED_ROW_BATCH_MANIFEST_SPACE, CERTIFIED_ROW_BATCH_PAGE_SPACE,
-    CERTIFIED_ROW_BATCH_SPACE, COLLECTION_CONTROL_SPACE, CertifiedRowBatchFileRef,
-    DIFF_SPACE, DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows,
-    RowColumnarOverlayRow, FILE_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache,
-    HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
+    CERTIFIED_ROW_BATCH_MANIFEST_SPACE, CERTIFIED_ROW_BATCH_PAGE_SPACE, CERTIFIED_ROW_BATCH_SPACE,
+    COLLECTION_CONTROL_SPACE, CertifiedRowBatchFileRef, CompleteWorkingDiffMode, DIFF_SPACE,
+    DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows, FILE_SPACE, HotIndexEntry,
+    HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot, INDEX_SPACE,
+    PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
-    ROW_SPACE, load_certified_rows_at_commit, materialize_certified_root_rows,
-    scan_certified_history_rows, stage_certified_row_batches, stage_hot_index_entries,
-    stage_retire_hot_generation,
+    ROW_SPACE, RootBaseBatchCache, RowColumnarOverlayRow, load_certified_rows_at_commit,
+    materialize_certified_root_rows, scan_certified_history_rows, stage_certified_row_batches,
+    stage_hot_index_entries, stage_retire_hot_generation,
 };
 
 /// Stable physical address of a row in an immutable columnar base.
@@ -62,7 +63,6 @@ use crate::branch::stage_branch_head_control;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability};
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
-use crate::row_pk::RowPk;
 use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch,
     MaterializedHotStateRow, MaterializedHotStateRowRef,
@@ -70,6 +70,7 @@ use crate::hot_state::{
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
 };
+use crate::row_pk::RowPk;
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
     StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageSpace,
@@ -1000,15 +1001,12 @@ fn read_row_pk(bytes: &[u8], offset: &mut usize) -> Result<RowPk, LixError> {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
             _ => {
-                return Err(key_codec_error(
-                    "row primary key has an invalid terminator",
-                ));
+                return Err(key_codec_error("row primary key has an invalid terminator"));
             }
         }
     }
-    RowPk::from_components(components).map_err(|error| {
-        key_codec_error(&format!("contains an invalid row primary key: {error}"))
-    })
+    RowPk::from_components(components)
+        .map_err(|error| key_codec_error(&format!("contains an invalid row primary key: {error}")))
 }
 
 fn read_row_pk_part(
@@ -1054,10 +1052,7 @@ fn read_row_pk_part(
                 ));
             }
             *offset = uuid_end + 1;
-            Ok((
-                crate::row_pk::RowPkComponent::Uuid(uuid_bytes),
-                terminator,
-            ))
+            Ok((crate::row_pk::RowPkComponent::Uuid(uuid_bytes), terminator))
         }
         ROW_PK_INTEGER => {
             let integer_end = offset
@@ -1085,9 +1080,7 @@ fn read_row_pk_part(
                 terminator,
             ))
         }
-        _ => Err(key_codec_error(
-            "has an unknown row primary key part tag",
-        )),
+        _ => Err(key_codec_error("has an unknown row primary key part tag")),
     }
 }
 
@@ -1469,10 +1462,7 @@ fn effective_hot_created_at(
     value: HeadValueView<'_>,
     active_checkpoint_commit_id: Option<CommitId>,
 ) -> LixTimestamp {
-    match (
-        active_checkpoint_commit_id,
-        value.working_diff_baseline,
-    ) {
+    match (active_checkpoint_commit_id, value.working_diff_baseline) {
         (
             Some(active),
             WorkingDiffBaseline::BeforeAbsent {

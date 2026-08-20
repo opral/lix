@@ -4,6 +4,7 @@ import type {
 	LixBinding,
 	LixStorageConfig,
 	TelemetryDispatch,
+	SyncServerBindingOptions,
 } from "../binding-types.js";
 import type {
 	WorkerConnection,
@@ -15,6 +16,7 @@ import type {
 export const openDirectLixBinding: undefined | ((
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	server?: SyncServerBindingOptions,
 ) => Promise<LixBinding>) = undefined;
 
 export function createWorkerConnection(): WorkerConnection {

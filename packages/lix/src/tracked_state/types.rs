@@ -154,6 +154,10 @@ pub(crate) struct TrackedStateCommitRoot {
     pub(crate) changed_key_count: u64,
     pub(crate) row_count_estimate: u64,
     pub(crate) tree_height: u32,
+    /// Certifies that this root contains the commit's complete logical state
+    /// even though its semantic first parent is not retained as physical tree
+    /// ancestry. Ordinary roots must leave this false.
+    pub(crate) complete_state_fence: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
@@ -537,11 +541,10 @@ pub(crate) fn row_pk_satisfies_bounds(
     lower: Option<&RowPkRangeBound>,
     upper: Option<&RowPkRangeBound>,
 ) -> bool {
-    lower.is_none_or(|bound| {
-        row_pk > &bound.row_pk || (bound.inclusive && row_pk == &bound.row_pk)
-    }) && upper.is_none_or(|bound| {
-        row_pk < &bound.row_pk || (bound.inclusive && row_pk == &bound.row_pk)
-    })
+    lower.is_none_or(|bound| row_pk > &bound.row_pk || (bound.inclusive && row_pk == &bound.row_pk))
+        && upper.is_none_or(|bound| {
+            row_pk < &bound.row_pk || (bound.inclusive && row_pk == &bound.row_pk)
+        })
 }
 
 /// Requested property set for a tracked-state scan.

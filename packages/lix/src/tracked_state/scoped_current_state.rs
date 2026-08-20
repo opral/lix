@@ -923,8 +923,8 @@ mod tests {
 
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::row_pk::RowPk;
     use crate::json_store::JsonSlotRef;
+    use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::codec::encode_key_ref;
     use crate::tracked_state::scoped_range::{

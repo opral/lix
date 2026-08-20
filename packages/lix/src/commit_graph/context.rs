@@ -770,11 +770,8 @@ fn validate_first_parent_jump(
     Ok(())
 }
 
-fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("commit_graph missing commit '{commit_id}'"),
-    )
+pub(super) fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
+    LixError::commit_not_found(commit_id.to_string(), "walk_commit_graph", "graph_node")
 }
 
 fn full_value_bytes(value: Option<StorageProjectedValue>) -> Option<Bytes> {

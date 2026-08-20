@@ -6,14 +6,14 @@ use std::ops::Range;
 
 use crate::LixError;
 use crate::changelog::{
-    ChangeId, ChangeRecordProjection, CommitId, MaterializedChangePayload,
-    materialize_known_change_payloads,
+    ChangeId, ChangeLoadRequest, ChangeRecordProjection, ChangelogContext, ChangelogReader,
+    CommitId, MaterializedChangePayload, materialize_known_change_payloads,
 };
 use crate::common::{LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder};
 use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
+use crate::tracked_state::{MaterializedTrackedStateRow, load_commit_state_manifest};
 
 #[derive(Debug)]
 struct MaterializedTrackedStateDescriptor {
@@ -409,8 +409,34 @@ where
             .collect::<Vec<_>>();
         let loaded =
             super::storage::load_commit_delta_change_records(store, commit_id, &keys).await?;
+        let missing_ids = expected
+            .iter()
+            .zip(&loaded)
+            .filter_map(|((_, change_id, _), record)| record.is_none().then_some(*change_id))
+            .collect::<Vec<_>>();
+        // A hot sync snapshot stores live change payloads standalone while its
+        // cold owning commit remains absent. Only use that representation when
+        // no local commit-state authority exists; a present-but-incomplete
+        // authority is corruption and must still fail below.
+        let mut snapshot_records = if missing_ids.is_empty()
+            || load_commit_state_manifest(store, commit_id)
+                .await?
+                .is_some()
+        {
+            HashMap::new()
+        } else {
+            ChangelogContext::new()
+                .reader(store)
+                .load_changes(ChangeLoadRequest {
+                    change_ids: &missing_ids,
+                })
+                .await?
+                .into_iter()
+                .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
+                .collect::<HashMap<_, _>>()
+        };
         for ((key, change_id, updated_at), record) in expected.into_iter().zip(loaded) {
-            let record = record.ok_or_else(|| {
+            let record = record.or_else(|| snapshot_records.remove(&change_id)).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
@@ -444,8 +470,8 @@ where
 ///
 /// Every tracked index value carries its payload-owning commit. Hydration
 /// routes exact identities to those packed deltas and retains the decoded
-/// records through JSON materialization; there is no global changelog
-/// fallback.
+/// records through JSON materialization. Sync snapshot rows may instead use
+/// the standalone hot-state payload installed while cold history stays lazy.
 pub(crate) async fn materialize_batch_from_index_entries<S>(
     store: &S,
     entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
@@ -588,12 +614,86 @@ fn shared_payload_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::changelog::MaterializedChangeIdentity;
+    use crate::changelog::{
+        ChangeRecord, ChangelogAppend, ChangelogWriter, MaterializedChangeIdentity,
+    };
+    use crate::json_store::JsonSlot;
     use crate::row_pk::{RowPk, RowPkComponent};
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     fn integer_row_pk(value: i64) -> RowPk {
         RowPk::from_components(smallvec::smallvec![RowPkComponent::Integer(value)])
             .expect("one integer is a valid row primary key")
+    }
+
+    #[tokio::test]
+    async fn sparse_sync_snapshot_materializes_standalone_hot_row_payload() {
+        let storage = StorageAdapter::new(Memory::new());
+        let key = TrackedStateKey {
+            schema_key: "message".to_owned(),
+            file_id: Some("untitled.md".to_owned()),
+            row_pk: RowPk::single("heading"),
+        };
+        let change_id = ChangeId::for_test_label("snapshot-change");
+        let omitted_owner = CommitId::for_test_label("omitted-cold-owner");
+        let updated_at = LixTimestamp::from_unix_millis_utc_lossy(1_700_000_000_000);
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("snapshot staging read should open");
+        let mut writes = storage.new_write_set();
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(ChangelogAppend {
+                changes: vec![ChangeRecord {
+                    format_version: 2,
+                    change_id,
+                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                    row_pk: key.row_pk.clone(),
+                    schema_key: key.schema_key.clone(),
+                    file_id: key.file_id.clone(),
+                    snapshot: JsonSlot::from_json(r#"{"text":"Hello worlds"}"#),
+                    metadata: JsonSlot::None,
+                    created_at: updated_at,
+                    origin_key: None,
+                }],
+                ..ChangelogAppend::default()
+            })
+            .await
+            .expect("standalone hot snapshot change should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("standalone hot snapshot change should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("snapshot read should open");
+        let batch = materialize_batch_from_index_entries(
+            &read,
+            vec![(
+                key,
+                TrackedStateIndexValue {
+                    change_id,
+                    commit_id: omitted_owner,
+                    deleted: false,
+                    created_at: updated_at,
+                    updated_at,
+                },
+            )],
+            &ChangeRecordProjection::full(),
+        )
+        .await
+        .expect("hot row should not require its omitted cold owning commit");
+
+        assert_eq!(
+            batch.row(0).snapshot_content().map(SharedStr::as_str),
+            Some(r#"{"text":"Hello worlds"}"#)
+        );
+        assert_eq!(batch.row(0).commit_id(), omitted_owner);
     }
 
     /// Which `RowPk` shapes survive the JSON identity round trip that the
@@ -893,8 +993,7 @@ mod tests {
         let metadata = SharedStr::from_static(r#"{"impact":"format"}"#);
         let mut builder = MaterializedTrackedStateBatchBuilder::with_capacity(ROW_COUNT);
         for index in 0..ROW_COUNT {
-            let row_pk =
-                integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
+            let row_pk = integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
             builder.push_ref(
                 TrackedStateKeyRef {
                     schema_key: "shared_schema",
@@ -952,8 +1051,7 @@ mod tests {
         let mut builder =
             MaterializedTrackedStateBatchBuilder::with_capacities(ROW_COUNT, ROW_COUNT * 2, 0);
         for index in 0..ROW_COUNT {
-            let row_pk =
-                integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
+            let row_pk = integer_row_pk(i64::try_from(index).expect("test row index fits i64"));
             let file_id = format!("file-{index:05}");
             builder.push_ref(
                 TrackedStateKeyRef {

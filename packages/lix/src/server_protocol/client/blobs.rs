@@ -45,10 +45,6 @@ impl BlobCache {
         for (index, value) in values.iter().enumerate() {
             prepared.push(prepare_param(self, value, &slot(index)));
         }
-        let cache_blobs = prepared.iter().any(|param| param.cache_update.is_some());
-        let has_delta = prepared
-            .iter()
-            .any(|param| matches!(param.value, RequestWireValue::BlobSplice { .. }));
         PreparedRequestParams {
             params: prepared.iter().map(|param| param.value.clone()).collect(),
             full_params: prepared.iter().map(|param| param.full.clone()).collect(),
@@ -56,8 +52,6 @@ impl BlobCache {
                 .into_iter()
                 .filter_map(|param| param.cache_update)
                 .collect(),
-            cache_blobs,
-            has_delta,
         }
     }
 
@@ -96,8 +90,6 @@ pub struct PreparedRequestParams {
     pub params: Vec<RequestWireValue>,
     pub full_params: Vec<RequestWireValue>,
     pub cache_updates: Vec<BlobCacheUpdate>,
-    pub cache_blobs: bool,
-    pub has_delta: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,13 +100,12 @@ struct PreparedRequestParam {
 }
 
 pub fn request_blob_slot(
-    kind: &str,
     sql: &str,
     param_index: usize,
     statement_index: Option<usize>,
 ) -> String {
-    serde_json::to_string(&(kind, statement_index, sql, param_index))
-        .unwrap_or_else(|_| format!("{kind}:{statement_index:?}:{sql}:{param_index}"))
+    serde_json::to_string(&(statement_index, sql, param_index))
+        .unwrap_or_else(|_| format!("{statement_index:?}:{sql}:{param_index}"))
 }
 
 fn prepare_param(cache: &BlobCache, value: &Value, slot: &str) -> PreparedRequestParam {
@@ -156,13 +147,7 @@ fn prepare_param(cache: &BlobCache, value: &Value, slot: &str) -> PreparedReques
             cache_update: Some(cache_update),
         };
     };
-    let Some(delta) = plan_blob_splice(&base.bytes, bytes, &base.sha256, &result_sha256) else {
-        return PreparedRequestParam {
-            value: full.clone(),
-            full,
-            cache_update: Some(cache_update),
-        };
-    };
+    let delta = plan_blob_splice(&base.bytes, bytes, &base.sha256, &result_sha256);
     if !blob_splice_is_smaller(&delta, bytes.len()) {
         return PreparedRequestParam {
             value: full.clone(),
@@ -197,7 +182,7 @@ fn plan_blob_splice(
     result: &[u8],
     base_sha256: &str,
     result_sha256: &str,
-) -> Option<BlobSplicePlan> {
+) -> BlobSplicePlan {
     let mut prefix_bytes = 0;
     let prefix_limit = base.len().min(result.len());
     while prefix_limit - prefix_bytes >= REQUEST_BLOB_COMPARE_WORD_BYTES
@@ -228,13 +213,13 @@ fn plan_blob_splice(
         suffix_bytes += 1;
     }
 
-    Some(BlobSplicePlan {
+    BlobSplicePlan {
         base_sha256: base_sha256.to_owned(),
         result_sha256: result_sha256.to_owned(),
         prefix_bytes,
         suffix_bytes,
         insert: result[prefix_bytes..result.len() - suffix_bytes].to_vec(),
-    })
+    }
 }
 
 fn blob_splice_is_smaller(delta: &BlobSplicePlan, full_len: usize) -> bool {

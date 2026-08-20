@@ -1,6 +1,11 @@
 import { Worker } from "node:worker_threads";
 import { openNativeLixBinding } from "../binding.node.js";
-import type { LixBinding, LixStorageConfig, TelemetryDispatch } from "../binding-types.js";
+import type {
+	LixBinding,
+	LixStorageConfig,
+	SyncServerBindingOptions,
+	TelemetryDispatch,
+} from "../binding-types.js";
 import type {
 	WorkerConnection,
 	WorkerInput,
@@ -61,10 +66,12 @@ export function workerExecArgv(execArgv: readonly string[]): string[] {
 export const openDirectLixBinding = async (
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	server?: SyncServerBindingOptions,
 ): Promise<LixBinding | undefined> => {
 	try {
-		return await openNativeLixBinding(storage, telemetry);
+		return await openNativeLixBinding(storage, telemetry, server);
 	} catch (error) {
+		if (server !== undefined) throw error;
 		if (storage.kind === "memory") return undefined;
 		throw error;
 	}

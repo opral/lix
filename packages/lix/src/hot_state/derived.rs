@@ -5,14 +5,16 @@
 //! point lookup themselves. Adding a derived relation therefore requires an
 //! explicit schema, retention, file-identity, and access-path declaration.
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use tracing::Instrument;
 
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::{ChangeId, CommitId};
 use crate::commit_graph::{CommitGraphContext, CommitGraphEdge, CommitGraphNode, commit_edges};
-use crate::row_pk::{RowPk, RowPkComponent};
 use crate::hot_state::{HotStateRowFilter, HotStateScanRequest, MaterializedHotStateRow};
+use crate::row_pk::{RowPk, RowPkComponent};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
@@ -180,7 +182,7 @@ where
         let commit_ids = row_pks
             .iter()
             .filter_map(commit_id_from_row_pk)
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         if commit_ids.is_empty() {
@@ -252,13 +254,13 @@ where
         let edge_ids = row_pks
             .iter()
             .filter_map(commit_edge_id_from_row_pk)
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         let child_ids = edge_ids
             .iter()
             .map(|(child_commit_id, _)| *child_commit_id)
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         let mut graph_reader = reads.commit_graph.reader(reads.store);
@@ -345,7 +347,7 @@ where
         let branch_ids = row_pks
             .iter()
             .filter_map(uuid_string_from_row_pk)
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         if branch_ids.is_empty() {

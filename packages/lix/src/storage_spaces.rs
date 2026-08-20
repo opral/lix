@@ -52,6 +52,7 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
     crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
     crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+    crate::tracked_state::TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
     crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
     crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
     crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
@@ -60,12 +61,16 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
     crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
     crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
+    crate::binary_cas::BINARY_CAS_CHUNK_DEMAND_SPACE,
     crate::changelog::COMMIT_SPACE,
     crate::changelog::CHANGE_SPACE,
     crate::storage_adapter::REVISION_SPACE,
     crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
     crate::session::UPLOAD_STATE_SPACE,
     crate::session::UPLOAD_MANIFEST_LEAF_SPACE,
+    crate::sync::SYNC_SEQUENCE_SPACE,
+    crate::sync::SYNC_REPOSITORY_EVENT_SPACE,
+    crate::sync::SYNC_REPLICA_STATE_SPACE,
     // `gc.rs` declares these through the checked constructors rather than
     // `StorageSpace::declare`, so referencing its constants here would make
     // `may_declare` read a registry it is in the middle of evaluating. The
@@ -236,6 +241,7 @@ mod tests {
             crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
             crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
             crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
+            crate::binary_cas::BINARY_CAS_CHUNK_DEMAND_SPACE,
         ] {
             assert_eq!(
                 space.value_integrity,

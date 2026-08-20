@@ -22,6 +22,32 @@ console.log(result.rows[0]?.get("message"));
 await lix.close();
 ```
 
+## Synchronized local repositories
+
+Use sync mode when reads and writes should execute locally while Lix exchanges
+commits with a hosted repository in the background:
+
+```ts
+import { openLix } from "@lix-js/sdk";
+import { OpfsStorage } from "@lix-js/storage-opfs";
+
+const lix = await openLix({
+  storage: new OpfsStorage({ name: "acme" }),
+  server: {
+    mode: "sync",
+    url: "https://example.com/repositories/acme",
+    headers: async () => ({
+      Authorization: `Bearer ${await accessToken()}`,
+    }),
+  },
+});
+```
+
+`await lix.execute(...)` means that the local transaction committed. It does
+not mean that the server has received the commit. Current data and new commits
+synchronize automatically; older history and binary content load when needed.
+See [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
+
 ## Remote repositories
 
 Use the same Lix client as a thin client against a hosted repository:

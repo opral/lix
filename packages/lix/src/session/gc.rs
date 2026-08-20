@@ -1,5 +1,4 @@
 use crate::LixError;
-use std::sync::atomic::{AtomicU64, Ordering};
 use crate::gc::{
     RepositoryGcPlan, load_checkpoint_gc_state, stage_checkpoint_gc_state,
     stage_repository_gc_with_preconditions,
@@ -8,6 +7,7 @@ use crate::storage_adapter::{
     SharedStorageAdapterRead, Storage, StorageReadOptions, StorageWriteOptions,
 };
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::SessionContext;
 use super::checkpoint::checkpoint_gc_due;
@@ -149,7 +149,9 @@ mod tests {
     use crate::gc::{load_checkpoint_gc_state, stage_repository_gc_with_preconditions};
     use crate::session::SessionContext;
     use crate::storage::Memory;
-    use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::{
+        SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions,
+    };
     use crate::{LixError, Value};
 
     /// Checkpoints a fresh repository must accumulate before the staleness
@@ -203,7 +205,6 @@ mod tests {
         present
     }
 
-
     /// End-to-end engagement for the ratio trigger's two estimates.
     ///
     /// Both are produced by the sweep and written in its write set, so
@@ -235,9 +236,7 @@ mod tests {
                 .expect("round checkpoint succeeds");
         }
 
-        async fn committed_state(
-            session: &SessionContext<Memory>,
-        ) -> crate::gc::CheckpointGcState {
+        async fn committed_state(session: &SessionContext<Memory>) -> crate::gc::CheckpointGcState {
             let read = SharedStorageAdapterRead::new(
                 session
                     .storage
@@ -256,7 +255,10 @@ mod tests {
         // below could pass against a default-constructed state.
         let before = committed_state(&session).await;
         assert_eq!(
-            (before.live_manifest_estimate, before.yield_per_interval_estimate),
+            (
+                before.live_manifest_estimate,
+                before.yield_per_interval_estimate
+            ),
             (0, 0),
             "estimates must be unset before any sweep, or this proves nothing"
         );

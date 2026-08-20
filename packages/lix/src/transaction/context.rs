@@ -368,7 +368,9 @@ fn common_registry_column_merger(
         (Some(opening), Some(current)) if opening == current => Ok(Some(current.clone())),
         _ => Err(LixError::new(
             LixError::CODE_MERGE_CONFLICT,
-            format!("column merger generation for schema '{schema_key}' changed during the transaction"),
+            format!(
+                "column merger generation for schema '{schema_key}' changed during the transaction"
+            ),
         )
         .with_hint("commit the plugin generation change before retrying the row edit")),
     }
@@ -700,6 +702,8 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// uses this lane for its completed manifest and upload receipt.
     atomic_metadata_writes: Option<StorageWriteSet>,
     atomic_metadata_preconditions: Vec<StoragePrecondition>,
+    suppress_ordinary_sync_event: bool,
+    sync_role: crate::sync::SyncRole,
     await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
@@ -1595,6 +1599,8 @@ where
                     idempotency_receipt: None,
                     atomic_metadata_writes: None,
                     atomic_metadata_preconditions: Vec::new(),
+                    suppress_ordinary_sync_event: false,
+                    sync_role: crate::sync::SyncRole::Disabled,
                     await_durable_commit: false,
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
@@ -1767,47 +1773,97 @@ where
         };
         let filesystem_delta_projectable = loaded_filesystem_revision.is_some();
         let previous_filesystem_revision = loaded_filesystem_revision.flatten();
-        let (mut writes, materialization_preconditions, filesystem_delta_rows) =
-            match commit::commit_prepared_writes_with_parent_heads(
-                &transaction.binary_cas,
-                &transaction.tracked_state,
-                Some(transaction.sql_schema_snapshot.as_ref()),
-                Some(runtime_functions),
-                &transaction.active_account_id,
-                &commit_parent_heads,
-                &mut read,
-                &branch_checkpoint_bridges,
-                &restore_targets,
-                prepared_writes,
+        let mut automatic_sync_writes = transaction.storage.new_write_set();
+        let mut automatic_sync_preconditions = Vec::new();
+        let capture_sync_commits = !transaction.suppress_ordinary_sync_event
+            && transaction.sync_role == crate::sync::SyncRole::Authority;
+        if !transaction.suppress_ordinary_sync_event
+            && transaction.sync_role == crate::sync::SyncRole::Replica
+        {
+            // The immutable commit and ref are the durable outbox.
+            // `build_sync_push` discovers unpublished local heads; no second
+            // row-pack queue is maintained.
+            transaction.await_durable_commit = true;
+        }
+        let materialized = match commit::commit_prepared_writes_with_parent_heads(
+            &transaction.binary_cas,
+            &transaction.tracked_state,
+            Some(transaction.sql_schema_snapshot.as_ref()),
+            Some(runtime_functions),
+            &transaction.active_account_id,
+            &commit_parent_heads,
+            &mut read,
+            &branch_checkpoint_bridges,
+            capture_sync_commits,
+            &restore_targets,
+            prepared_writes,
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.transaction_materialization"
+        ))
+        .await
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(error);
+            }
+        };
+        let staged_sync_event = if capture_sync_commits {
+            // Consume the exact controls produced by materialization instead
+            // of predicting checkpoint/restore semantics from prepared rows.
+            // The event still joins the same atomic storage commit below.
+            match crate::sync::stage_repository_transaction_event(
+                &read,
+                &mut automatic_sync_writes,
+                &mut automatic_sync_preconditions,
+                &materialized.sync_commits,
+                &materialized.published_branch_controls,
             )
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.transaction_materialization"
-            ))
             .await
             {
-                Ok(commit) => (
-                    commit.writes,
-                    commit.preconditions,
-                    if filesystem_delta_projectable {
-                        commit.filesystem_delta_rows
-                    } else {
-                        Vec::new()
-                    },
-                ),
+                Ok(event) => event,
                 Err(error) => {
                     transaction
                         .discard_pending_plugin_actor_publications()
                         .await;
                     return Err(error);
                 }
-            };
+            }
+        } else {
+            None
+        };
+        if staged_sync_event.is_some() {
+            transaction.await_durable_commit = true;
+        }
+        if let Some(staged_sync_event) = &staged_sync_event
+            && let Err(error) = crate::sync::validate_repository_transaction_event_transfer(
+                staged_sync_event,
+                &materialized.sync_commits,
+            )
+        {
+            transaction
+                .discard_pending_plugin_actor_publications()
+                .await;
+            return Err(error);
+        }
+        let mut writes = materialized.writes;
+        let materialization_preconditions = materialized.preconditions;
+        let filesystem_delta_rows = if filesystem_delta_projectable {
+            materialized.filesystem_delta_rows
+        } else {
+            Vec::new()
+        };
         if catalog_revision_changed {
             stage_catalog_revision(&mut writes);
         }
         if tracked_state_changed {
             StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
         }
+        writes.extend(automatic_sync_writes);
         if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
             writes.extend(metadata_writes);
         }
@@ -1816,6 +1872,9 @@ where
         write_options
             .preconditions
             .extend(materialization_preconditions);
+        write_options
+            .preconditions
+            .append(&mut automatic_sync_preconditions);
         write_options
             .preconditions
             .append(&mut transaction.atomic_metadata_preconditions);
@@ -1832,6 +1891,7 @@ where
             // A protocol acknowledgement may replay only from a durable
             // receipt, so ask the storage to cross its durability boundary
             // before it reports this commit as successful.
+            write_options.await_durable = true;
             write_options.idempotency_key = Some(key.0.clone());
             write_options
                 .preconditions
@@ -1965,6 +2025,10 @@ where
 
     pub(crate) fn attach_commit_boundary(&mut self, boundary: TransactionCommitBoundary) {
         self.commit_boundary = Some(boundary);
+    }
+
+    pub(crate) fn set_sync_role(&mut self, role: crate::sync::SyncRole) {
+        self.sync_role = role;
     }
 
     pub(crate) fn trust_serialized_filesystem_planner(&mut self) {
@@ -6652,7 +6716,6 @@ where
     }
 
     /// Convenience helper for programmatic APIs that only stage state rows.
-    #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn stage_rows(
         &mut self,
         rows: RawWriteBatch,
@@ -6749,6 +6812,10 @@ where
         }
         self.idempotency_receipt = Some(encode_receipt(idempotency, receipt)?);
         Ok(())
+    }
+
+    pub(crate) fn suppress_ordinary_sync_event(&mut self) {
+        self.suppress_ordinary_sync_event = true;
     }
 
     /// Returns the content identity of the SQL schema catalog captured when
@@ -8925,12 +8992,8 @@ fn push_prepared_state_row_from_planned_parts(
     let global = row.global;
     let untracked = row.untracked;
     let branch_id = row.branch_id.clone();
-    let snapshot = rows
-        .take_snapshot(row_index)
-        .map(stage_json_from_value);
-    let metadata = rows
-        .take_metadata(row_index)
-        .map(stage_json_from_value);
+    let snapshot = rows.take_snapshot(row_index).map(stage_json_from_value);
+    let metadata = rows.take_metadata(row_index).map(stage_json_from_value);
     let row_pk = rows.take_row_pk(row_index).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",

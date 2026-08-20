@@ -4,10 +4,19 @@ description: Run Lix against the official host at lixray.com, or host repositori
 
 # Hosting
 
-A hosted repository lives on a server. Clients connect over HTTP and hold no
-local copy. The server owns storage, authentication, and real-time updates.
+A hosted repository lives on a server. The server owns its storage and
+authentication. Clients can execute directly on the server or keep a
+synchronized local replica.
 
-Clients connect with the `server` option:
+| Client mode | Use for                                                             |
+| :---------- | :------------------------------------------------------------------ |
+| `remote`    | The simplest setup. Every operation executes on the server.         |
+| `sync`      | Responsive and offline apps. Operations execute on a local replica. |
+
+Both modes use the same repository URL and server protocol. See
+[Collaboration and Sync](./collaboration-and-sync.md) to choose a mode.
+
+The simplest client uses remote mode:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -52,7 +61,7 @@ The URL is the repository URL, `https://lixray.com/@<namespace>/<repository>`.
 It must be absolute and carry no query or fragment.
 
 Files, SQL, branches, history, and `observe()` work the same way they do
-locally. See [Real-time Collaboration](./realtime-collaboration.md).
+locally. See [Collaboration and Sync](./collaboration-and-sync.md).
 
 ## Host it yourself
 

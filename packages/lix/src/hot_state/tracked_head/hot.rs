@@ -21,12 +21,12 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 use tracing::Instrument as _;
 
+use crate::plugin::runtime::WasmCertifiedRowBatch;
 use crate::storage_adapter::{
     BufferRange, DeferredFinalPutPage, DeferredFinalPutSource, EncodedMutationBatch, EncodedPut,
     PutBatch, PutEntry,
 };
 use crate::tracked_state::TrackedStateReadColumns;
-use crate::plugin::runtime::WasmCertifiedRowBatch;
 
 use super::*;
 
@@ -1719,8 +1719,8 @@ fn decode_certified_row_batch_rows(
     };
     // Exact reads from a generated-id row segment compare compact local
     // references before materializing an `RowPk` or snapshot.
-    let selected_schema_row_local_refs = (format == 1 && !request.filter.row_pks.is_empty())
-        .then(|| {
+    let selected_schema_row_local_refs =
+        (format == 1 && !request.filter.row_pks.is_empty()).then(|| {
             let high = creates.high.to_be_bytes();
             let low = creates.low.to_be_bytes();
             request
@@ -1797,9 +1797,8 @@ fn decode_certified_row_batch_rows(
             }
             continue;
         }
-        let row_page = crate::plugin::wire::Page::decode(page).map_err(|error| {
-            head_value_error(format!("invalid certified row page: {error:?}"))
-        })?;
+        let row_page = crate::plugin::wire::Page::decode(page)
+            .map_err(|error| head_value_error(format!("invalid certified row page: {error:?}")))?;
         let section = row_page.section().map_err(|error| {
             head_value_error(format!("invalid certified row-page section: {error:?}"))
         })?;
@@ -2983,8 +2982,7 @@ async fn restage_exact_closure_collection_control(
         schema_key: EXACT_CLOSURE_SCHEMA_KEY,
         file_id: None,
     };
-    let marker_row_pk =
-        RowPk::single(crate::collection_generation::collection_scope_key(scope));
+    let marker_row_pk = RowPk::single(crate::collection_generation::collection_scope_key(scope));
     let filter = TrackedStateFilter {
         schema_keys: vec![
             EXACT_CLOSURE_SCHEMA_KEY.to_owned(),
@@ -3621,8 +3619,7 @@ async fn scan_root_current_base_rows(
             }
             let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
             let produced = Arc::new(
-                Box::pin(reader.scan_batch_at_commit(&base_commit_id.to_string(), request))
-                    .await?,
+                Box::pin(reader.scan_batch_at_commit(&base_commit_id.to_string(), request)).await?,
             );
             if let Some(cache) = cache {
                 cache.insert(base_commit_id, request.clone(), Arc::clone(&produced));
@@ -3643,12 +3640,18 @@ async fn scan_root_current_base_rows(
         if row.schema_key() == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
             continue;
         }
-        if previous_scope.as_ref().is_some_and(|(schema_key, file_id)| {
-            schema_key == row.schema_key() && file_id.as_deref() == row.file_id()
-        }) {
+        if previous_scope
+            .as_ref()
+            .is_some_and(|(schema_key, file_id)| {
+                schema_key == row.schema_key() && file_id.as_deref() == row.file_id()
+            })
+        {
             continue;
         }
-        let scope = (row.schema_key().to_owned(), row.file_id().map(str::to_owned));
+        let scope = (
+            row.schema_key().to_owned(),
+            row.file_id().map(str::to_owned),
+        );
         scopes.insert((scope.0.clone(), None));
         if scope.1.is_some() {
             scopes.insert(scope.clone());
@@ -4095,9 +4098,7 @@ fn root_tracked_row_is_active(
     if verdict.disqualified {
         return false;
     }
-    verdict
-        .floor
-        .is_none_or(|floor| row.created_at() >= floor)
+    verdict.floor.is_none_or(|floor| row.created_at() >= floor)
 }
 
 fn materialize_packed_slot(
@@ -5027,9 +5028,11 @@ impl RootBaseBatchCache {
             return;
         }
         let mut entries = self.entries();
-        if let Some(index) = entries.resident.iter().position(|entry| {
-            entry.base_commit_id == base_commit_id && entry.request == request
-        }) {
+        if let Some(index) = entries
+            .resident
+            .iter()
+            .position(|entry| entry.base_commit_id == base_commit_id && entry.request == request)
+        {
             let previous = entries.resident.remove(index);
             entries.rows = entries.rows.saturating_sub(previous.batch.len());
         }
@@ -5508,9 +5511,7 @@ where
                         head_value_error(format!("hot index entry is not utf-8: {error}"))
                     })?;
                     candidates.push(RowPk::from_json_array_text(text).map_err(|error| {
-                        head_value_error(format!(
-                            "hot index entry has an invalid row pk: {error}"
-                        ))
+                        head_value_error(format!("hot index entry has an invalid row pk: {error}"))
                     })?);
                 }
                 if candidates.len() > budget {
@@ -5547,10 +5548,7 @@ where
             return Ok(None);
         }
         let witness = StorageKey(Bytes::from(encode_hot_index_witness_key(
-            branch_id,
-            generation,
-            schema_key,
-            ordinal,
+            branch_id, generation, schema_key, ordinal,
         )));
         let present = PointReadPlan::new(INDEX_SPACE, &[witness])
             .materialize(&self.store, StorageGetOptions::default())
@@ -5753,13 +5751,55 @@ where
         row_pks: &[RowPk],
         limit: Option<usize>,
     ) -> Result<Vec<Option<Bytes>>, LixError> {
-        if row_pks.is_empty()
-            && limit.is_none()
-            && let Some(snapshots) = self
-                .scan_exclusive_row_snapshots(branch_id, control, schema_key)
-                .await?
-        {
+        // A keyed current-state request is already an exact identity read.
+        // Do not lower it to the broad live scan: on a replica the initial
+        // bootstrap root is present, and scanning that root just to discard
+        // every row makes a cached point query proportional to the whole
+        // collection.  The exact route resolves HOT, packed, root, and
+        // certified winners while retaining the same visibility semantics.
+        if !row_pks.is_empty() {
+            let keys = row_pks
+                .iter()
+                .map(|row_pk| TrackedStateKeyRef {
+                    schema_key,
+                    file_id: None,
+                    row_pk,
+                })
+                .collect::<Vec<_>>();
+            let exact = self
+                .load_projected_live_batch_refs(
+                    branch_id,
+                    control,
+                    &keys,
+                    &ChangeRecordProjection {
+                        snapshot_content: true,
+                        metadata: false,
+                    },
+                )
+                .await?;
+            let mut snapshots = BTreeMap::<RowPk, Bytes>::new();
+            for index in 0..exact.len() {
+                let Some(row) = exact.row(index).filter(|row| !row.deleted()) else {
+                    continue;
+                };
+                let Some(snapshot) = row.snapshot_content() else {
+                    continue;
+                };
+                snapshots.insert(row.row_pk().clone(), snapshot.clone().into_bytes());
+            }
+            let mut snapshots = snapshots.into_values().map(Some).collect::<Vec<_>>();
+            if let Some(limit) = limit {
+                snapshots.truncate(limit);
+            }
             return Ok(snapshots);
+        }
+        if row_pks.is_empty() && limit.is_none() {
+            let exclusive = self
+                .scan_exclusive_row_snapshots(branch_id, control, schema_key)
+                .await?;
+            if let Some(snapshots) = exclusive {
+                return Ok(snapshots);
+            }
         }
         self.scan_row_snapshots_for_generation(
             branch_id,
@@ -6541,29 +6581,40 @@ where
             self.transaction_cache.as_deref(),
         )
         .await?;
-        let root_backed = load_root_current_base_commit(&self.store, branch_id, generation)
-            .await?
-            .is_some();
-        let root = if root_backed {
+        // A HOT or packed identity is already an authoritative overlay over
+        // the root base. Only unresolved identities can fall through to the
+        // root, so a warm point read does not pay an indexed root lookup for
+        // every key in the request.
+        let mut root_keys = Vec::new();
+        let mut root_slots = vec![None; keys.len()];
+        for (index, key) in keys.iter().copied().enumerate() {
+            if slots[index].is_none() && packed.row(index).is_none() {
+                root_slots[index] = Some(root_keys.len());
+                root_keys.push(key);
+            }
+        }
+        let root_backed = !root_keys.is_empty()
+            && load_root_current_base_commit(&self.store, branch_id, generation)
+                .await?
+                .is_some();
+        let root = if !root_backed {
+            MaterializedHotStateExactBatch::default()
+        } else {
             Box::pin(load_root_current_base_exact(
                 &self.store,
                 branch_id,
                 generation,
                 active_checkpoint_commit_id,
-                keys,
+                &root_keys,
                 *projection,
             ))
             .await?
-        } else {
-            MaterializedHotStateExactBatch::new(
-                MaterializedHotStateBatch::default(),
-                vec![None; keys.len()],
-            )?
         };
         let mut resolved = Vec::with_capacity(keys.len());
         for (index, slot) in slots.into_iter().enumerate() {
             let mut row = slot.and_then(|slot| rows.get(slot as usize));
-            for candidate in [packed.row(index), root.row(index)].into_iter().flatten() {
+            let root_row = root_slots[index].and_then(|root_index| root.row(root_index));
+            for candidate in [packed.row(index), root_row].into_iter().flatten() {
                 if row.is_none_or(
                     |current| match (current.commit_id(), candidate.commit_id()) {
                         (Some(current), Some(candidate)) => candidate > current,
@@ -6841,6 +6892,15 @@ type HotRowMap = BTreeMap<HeadRowIdentity, Bytes>;
 #[derive(Clone, Default)]
 pub(crate) struct HotTrackedSnapshot {
     rows: HotRowMap,
+}
+
+pub(crate) enum CompleteWorkingDiffMode {
+    Disabled,
+    ResetClean,
+    Rebase {
+        checkpoint_commit_id: CommitId,
+        checkpoint: HotTrackedSnapshot,
+    },
 }
 
 impl HotTrackedSnapshot {
@@ -7315,10 +7375,7 @@ where
         {
             return Ok(None);
         }
-        let mut row_pks = deltas
-            .iter()
-            .map(|delta| delta.row_pk)
-            .collect::<Vec<_>>();
+        let mut row_pks = deltas.iter().map(|delta| delta.row_pk).collect::<Vec<_>>();
         row_pks.sort_unstable();
         if row_pks.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(head_value_error(
@@ -7407,10 +7464,7 @@ where
         {
             return Ok(None);
         }
-        let mut row_pks = deltas
-            .iter()
-            .map(|delta| delta.row_pk)
-            .collect::<Vec<_>>();
+        let mut row_pks = deltas.iter().map(|delta| delta.row_pk).collect::<Vec<_>>();
         row_pks.sort_unstable();
         if row_pks.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(head_value_error(
@@ -7524,8 +7578,7 @@ where
         if rows.len() != expected_row_pks.len() {
             return Ok(false);
         }
-        let mut authoritative_row_pks =
-            rows.iter().map(|row| row.row_pk()).collect::<Vec<_>>();
+        let mut authoritative_row_pks = rows.iter().map(|row| row.row_pk()).collect::<Vec<_>>();
         authoritative_row_pks.sort_unstable();
         if authoritative_row_pks.as_slice() != expected_row_pks {
             return Ok(false);
@@ -8456,9 +8509,12 @@ where
             }
             #[cfg(any(test, feature = "storage-benches"))]
             if !unresolved.is_empty() {
-                BROAD_CANONICAL_CREATED_AT_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                BROAD_CANONICAL_CREATED_AT_KEYS
-                    .fetch_add(unresolved.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                BROAD_CANONICAL_CREATED_AT_LOOKUPS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                BROAD_CANONICAL_CREATED_AT_KEYS.fetch_add(
+                    unresolved.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             if !unresolved.is_empty()
                 && let Some(control) = BranchHeadControlContext::new()
@@ -8482,7 +8538,8 @@ where
                 .flatten()
                 .is_some()
             {
-                let mut reader = crate::tracked_state::TrackedStateContext::new().reader(self.store);
+                let mut reader =
+                    crate::tracked_state::TrackedStateContext::new().reader(self.store);
                 let canonical = reader
                     .load_projected_batch_at_commit_refs(
                         &control.head_commit_id.to_string(),
@@ -8932,7 +8989,7 @@ where
         tracked_deltas: &[CurrentStateDeltaRef<'_>],
         untracked_deltas: &[CurrentStateDeltaRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        working_diff_mode: CompleteWorkingDiffMode,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(HotTrackedSnapshot, BTreeSet<String>), LixError> {
         let mut rows = parent_tracked.rows;
@@ -8955,16 +9012,26 @@ where
             apply_complete_hot_snapshot_delta(&mut rows, delta, absence_guards)?;
         }
 
-        // A replacement generation cannot inherit a checkpoint baseline from
-        // its source: that before image belongs to the retired generation.
-        // The one exception is publishing the checkpoint itself, where every
-        // final tracked row is the clean baseline by definition.
-        let tracked_baseline = if working_diff_capture_checkpoint_commit_id.is_some() {
-            WorkingDiffBaseline::Clean
-        } else {
-            WorkingDiffBaseline::Disabled
-        };
-        normalize_complete_hot_snapshot_baselines(&mut rows, tracked_baseline)?;
+        match working_diff_mode {
+            CompleteWorkingDiffMode::Disabled => {
+                normalize_complete_hot_snapshot_baselines(&mut rows, WorkingDiffBaseline::Disabled)?
+            }
+            CompleteWorkingDiffMode::ResetClean => {
+                normalize_complete_hot_snapshot_baselines(&mut rows, WorkingDiffBaseline::Clean)?
+            }
+            CompleteWorkingDiffMode::Rebase {
+                checkpoint_commit_id,
+                checkpoint,
+            } => rebase_complete_hot_snapshot_working_diff(
+                self.writes,
+                branch_id,
+                generation,
+                checkpoint_commit_id,
+                &mut rows,
+                checkpoint.rows,
+                coverage,
+            )?,
+        }
 
         let mut final_tracked = BTreeMap::new();
         let mut schema_keys = BTreeSet::new();
@@ -8977,7 +9044,6 @@ where
 
         stage_complete_collection_controls(self.writes, branch_id, generation, &rows)?;
         stage_complete_hot_rows(self.writes, branch_id, generation, rows);
-        *coverage = WorkingDiffIndexCoverage::default();
         Ok((
             HotTrackedSnapshot {
                 rows: final_tracked,
@@ -8985,6 +9051,73 @@ where
             schema_keys,
         ))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebase_complete_hot_snapshot_working_diff(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    checkpoint_commit_id: CommitId,
+    rows: &mut HotRowMap,
+    checkpoint_rows: HotRowMap,
+    coverage: &mut WorkingDiffIndexCoverage,
+) -> Result<(), LixError> {
+    *coverage = WorkingDiffIndexCoverage::default();
+    let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
+    let mut diff_key_bytes = Vec::new();
+    let mut diff_puts = Vec::new();
+
+    for (identity, bytes) in rows.iter_mut() {
+        let after = decode_head_value(bytes.as_ref())?;
+        if after.untracked {
+            continue;
+        }
+        let before = checkpoint_rows
+            .get(identity)
+            .map(|bytes| decode_head_value(bytes.as_ref()))
+            .transpose()?;
+        let before_version = before.and_then(HeadValueView::working_diff_version);
+        let after_version = after
+            .working_diff_version()
+            .ok_or_else(|| head_value_error("complete tracked row has no working-diff version"))?;
+        let (baseline, dirty) = match before_version {
+            Some(before) if before.change_id == after_version.change_id => {
+                (WorkingDiffBaseline::Clean, false)
+            }
+            Some(before) => (
+                WorkingDiffBaseline::BeforePresent {
+                    checkpoint_commit_id,
+                    version: before,
+                },
+                true,
+            ),
+            None => (
+                WorkingDiffBaseline::BeforeAbsent {
+                    checkpoint_commit_id,
+                },
+                !after.deleted,
+            ),
+        };
+        *bytes = Bytes::from(reencode_head_value_with_baseline(after, baseline)?);
+        if dirty {
+            let key = append_hot_diff_key_parts(
+                &mut diff_key_bytes,
+                &scope,
+                &identity.schema_key,
+                &identity.row_pk,
+                identity.file_id.as_deref(),
+            );
+            coverage
+                .add_encoded_group_key(&diff_key_bytes[key.clone()])
+                .ok_or_else(|| head_value_error("hot working-diff index count exceeds u64"))?;
+            diff_puts.push(EncodedPut {
+                key: buffer_range(&key),
+                value: BufferRange::default(),
+            });
+        }
+    }
+    stage_hot_diff_batch(writes, &scope, diff_key_bytes, diff_puts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9250,7 +9383,8 @@ fn next_cascade_working_diff_baseline(
             let mut before = previous
                 .working_diff_version()
                 .ok_or_else(|| head_value_error("tracked cascade member has no version"))?;
-            before.created_at = effective_hot_created_at(previous, Some(active_checkpoint_commit_id));
+            before.created_at =
+                effective_hot_created_at(previous, Some(active_checkpoint_commit_id));
             before.commit_id = active_checkpoint_commit_id;
             Ok((
                 WorkingDiffBaseline::BeforePresent {
@@ -9330,7 +9464,8 @@ fn next_hot_working_diff_baseline(
             let mut before = previous
                 .working_diff_version()
                 .ok_or_else(|| head_value_error("tracked mutation has no working-diff version"))?;
-            before.created_at = effective_hot_created_at(previous, Some(active_checkpoint_commit_id));
+            before.created_at =
+                effective_hot_created_at(previous, Some(active_checkpoint_commit_id));
             before.commit_id = active_checkpoint_commit_id;
             Ok((
                 WorkingDiffBaseline::BeforePresent {
@@ -9659,12 +9794,8 @@ fn encoded_hot_mutation_identity_capacity(
     deltas: &[&CurrentStateDeltaRef<'_>],
 ) -> Option<usize> {
     deltas.iter().try_fold(0_usize, |total, delta| {
-        let key_len = encoded_hot_identity_key_len(
-            scope_len,
-            delta.schema_key,
-            delta.row_pk,
-            delta.file_id,
-        )?;
+        let key_len =
+            encoded_hot_identity_key_len(scope_len, delta.schema_key, delta.row_pk, delta.file_id)?;
         let marker_len = if delta.file_id.is_some() {
             scope_len.checked_add(encoded_key_bytes_len(delta.schema_key.as_bytes())?)?
         } else {
@@ -12174,8 +12305,7 @@ async fn hot_scan_entries<'a>(
                     let value = full_value_bytes(entry.value)?;
                     #[cfg(any(test, feature = "storage-benches"))]
                     {
-                        HOT_SCAN_MATCHED_ENTRIES
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        HOT_SCAN_MATCHED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if value.len() > 1 && value[1] & 0b0000_0001 != 0 {
                             HOT_SCAN_TOMBSTONE_ENTRIES
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12485,8 +12615,7 @@ async fn scan_hot_file_entries(
                     let value = full_value_bytes(entry.value)?;
                     #[cfg(any(test, feature = "storage-benches"))]
                     {
-                        HOT_SCAN_MATCHED_ENTRIES
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        HOT_SCAN_MATCHED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if value.len() > 1 && value[1] & 0b0000_0001 != 0 {
                             HOT_SCAN_TOMBSTONE_ENTRIES
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12539,10 +12668,8 @@ fn hot_file_row_pk_range(
         }
         range.upper = std::ops::Bound::Excluded(StorageKey(Bytes::from(key)));
     }
-    if let (
-        std::ops::Bound::Included(lower),
-        std::ops::Bound::Excluded(upper),
-    ) = (&range.lower, &range.upper)
+    if let (std::ops::Bound::Included(lower), std::ops::Bound::Excluded(upper)) =
+        (&range.lower, &range.upper)
         && lower >= upper
     {
         return Ok(None);
@@ -12603,6 +12730,17 @@ pub(super) fn encode_hot_row_key(identity: &HeadIdentity) -> Vec<u8> {
         &identity.row_pk,
         identity.file_id.as_deref(),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn encode_hot_row_key_for_test(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    row_pk: &RowPk,
+    file_id: Option<&str>,
+) -> Vec<u8> {
+    encode_hot_row_key_parts(branch_id, generation, schema_key, row_pk, file_id)
 }
 
 fn encode_hot_row_key_parts(
@@ -12914,15 +13052,12 @@ fn read_hot_scan_row_pk(bytes: &Bytes, offset: &mut usize) -> Result<RowPk, LixE
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
             _ => {
-                return Err(key_codec_error(
-                    "row primary key has an invalid terminator",
-                ));
+                return Err(key_codec_error("row primary key has an invalid terminator"));
             }
         }
     }
-    RowPk::from_components(components).map_err(|error| {
-        key_codec_error(&format!("contains an invalid row primary key: {error}"))
-    })
+    RowPk::from_components(components)
+        .map_err(|error| key_codec_error(&format!("contains an invalid row primary key: {error}")))
 }
 
 fn read_hot_scan_row_pk_part(
@@ -12936,8 +13071,7 @@ fn read_hot_scan_row_pk_part(
     *offset += 1;
     match tag {
         ROW_PK_STRING => {
-            let (value, terminator) =
-                read_hot_scan_key_string(bytes, offset, "row primary key")?;
+            let (value, terminator) = read_hot_scan_key_string(bytes, offset, "row primary key")?;
             Ok((
                 crate::row_pk::RowPkComponent::String(value.into_shared_str(bytes)),
                 terminator,
@@ -12946,10 +13080,7 @@ fn read_hot_scan_row_pk_part(
         ROW_PK_BYTES => {
             let (value, terminator) =
                 read_hot_scan_shared_bytes(bytes, offset, "row primary key bytes")?;
-            Ok((
-                crate::row_pk::RowPkComponent::Bytes(value),
-                terminator,
-            ))
+            Ok((crate::row_pk::RowPkComponent::Bytes(value), terminator))
         }
         ROW_PK_UUID => {
             let uuid_end = offset
@@ -12970,10 +13101,7 @@ fn read_hot_scan_row_pk_part(
                 ));
             }
             *offset = uuid_end + 1;
-            Ok((
-                crate::row_pk::RowPkComponent::Uuid(uuid_bytes),
-                terminator,
-            ))
+            Ok((crate::row_pk::RowPkComponent::Uuid(uuid_bytes), terminator))
         }
         ROW_PK_INTEGER => {
             let integer_end = offset
@@ -13001,9 +13129,7 @@ fn read_hot_scan_row_pk_part(
                 terminator,
             ))
         }
-        _ => Err(key_codec_error(
-            "has an unknown row primary key part tag",
-        )),
+        _ => Err(key_codec_error("has an unknown row primary key part tag")),
     }
 }
 
@@ -13841,8 +13967,8 @@ mod tests {
         let cache = RootBaseBatchCache::default();
         let first = CommitId::for_test_label("root-base-cache-first");
         let second = CommitId::for_test_label("root-base-cache-second");
-        let request = |schema_key: &str, columns: &[&str], limit: Option<usize>| {
-            TrackedStateScanRequest {
+        let request =
+            |schema_key: &str, columns: &[&str], limit: Option<usize>| TrackedStateScanRequest {
                 filter: TrackedStateFilter {
                     schema_keys: vec![schema_key.to_owned()],
                     ..TrackedStateFilter::default()
@@ -13851,8 +13977,7 @@ mod tests {
                     columns: columns.iter().map(|column| (*column).to_owned()).collect(),
                 },
                 limit,
-            }
-        };
+            };
         let batch = Arc::new(crate::tracked_state::MaterializedTrackedStateBatch::default());
 
         let stored = request("s", &["change_id"], None);
@@ -13864,15 +13989,21 @@ mod tests {
             "a different base commit must miss"
         );
         assert!(
-            cache.get(first, &request("other", &["change_id"], None)).is_none(),
+            cache
+                .get(first, &request("other", &["change_id"], None))
+                .is_none(),
             "a different schema filter must miss"
         );
         assert!(
-            cache.get(first, &request("s", &["snapshot_content"], None)).is_none(),
+            cache
+                .get(first, &request("s", &["snapshot_content"], None))
+                .is_none(),
             "a different projection must miss"
         );
         assert!(
-            cache.get(first, &request("s", &["change_id"], Some(1))).is_none(),
+            cache
+                .get(first, &request("s", &["change_id"], Some(1)))
+                .is_none(),
             "a different limit must miss"
         );
     }
@@ -13925,31 +14056,32 @@ mod tests {
         let filed = ("s".to_owned(), Some("f".to_owned()));
 
         // Reference implementation: the pre-memo predicate, verbatim.
-        let reference = |created_at: LixTimestamp,
-                         file_id: Option<&str>,
-                         active: &BTreeMap<(String, Option<String>), RootCollectionGeneration>,
-                         stored: &BTreeMap<(String, Option<String>), HotCollectionControl>| {
-            [
-                Some(("s".to_owned(), None)),
-                file_id.map(|file_id| ("s".to_owned(), Some(file_id.to_owned()))),
-            ]
-            .into_iter()
-            .flatten()
-            .all(|scope| {
-                let root = active
-                    .get(&scope)
-                    .map_or(branch_generation, |generation| generation.commit_id);
-                if stored
-                    .get(&scope)
-                    .is_some_and(|control| control.active_generation != root)
-                {
-                    return false;
-                }
-                active
-                    .get(&scope)
-                    .is_none_or(|generation| created_at >= generation.created_at)
-            })
-        };
+        let reference =
+            |created_at: LixTimestamp,
+             file_id: Option<&str>,
+             active: &BTreeMap<(String, Option<String>), RootCollectionGeneration>,
+             stored: &BTreeMap<(String, Option<String>), HotCollectionControl>| {
+                [
+                    Some(("s".to_owned(), None)),
+                    file_id.map(|file_id| ("s".to_owned(), Some(file_id.to_owned()))),
+                ]
+                .into_iter()
+                .flatten()
+                .all(|scope| {
+                    let root = active
+                        .get(&scope)
+                        .map_or(branch_generation, |generation| generation.commit_id);
+                    if stored
+                        .get(&scope)
+                        .is_some_and(|control| control.active_generation != root)
+                    {
+                        return false;
+                    }
+                    active
+                        .get(&scope)
+                        .is_none_or(|generation| created_at >= generation.created_at)
+                })
+            };
 
         let stamp = |text: &str| LixTimestamp::expect_parse("memo test timestamp", text);
         let low = stamp("2026-01-01T00:00:00Z");
@@ -13999,8 +14131,7 @@ mod tests {
                     stamp("2026-03-01T00:00:00Z"),
                     stamp("2027-01-01T00:00:00Z"),
                 ] {
-                    let verdict =
-                        memo.verdict("s", file_id, branch_generation, active, stored);
+                    let verdict = memo.verdict("s", file_id, branch_generation, active, stored);
                     let actual = !verdict.disqualified
                         && verdict.floor.is_none_or(|floor| created_at >= floor);
                     assert_eq!(
@@ -14037,11 +14168,7 @@ mod tests {
             Ok(_) => panic!("legacy CEB1 input must fail closed"),
             Err(error) => error,
         };
-        assert!(
-            error
-                .message
-                .contains("invalid certified row batch magic")
-        );
+        assert!(error.message.contains("invalid certified row batch magic"));
     }
 
     #[tokio::test]
@@ -14085,8 +14212,7 @@ mod tests {
         let commit_id = CommitId::for_test_label("keyed-certified-change");
         let row_pk = RowPk::single("same-key");
         let first = certified_keyed_change_id(commit_id, "test_schema", "first.csv", &row_pk, 1);
-        let second =
-            certified_keyed_change_id(commit_id, "test_schema", "second.csv", &row_pk, 1);
+        let second = certified_keyed_change_id(commit_id, "test_schema", "second.csv", &row_pk, 1);
         assert_ne!(first, second);
         assert_eq!(
             first,
@@ -15019,11 +15145,7 @@ mod tests {
         assert_eq!(
             filtered
                 .iter()
-                .map(|row| {
-                    row.row_pk()
-                        .as_single_string_owned()
-                        .expect("single key")
-                })
+                .map(|row| { row.row_pk().as_single_string_owned().expect("single key") })
                 .collect::<Vec<_>>(),
             ["b", "d"]
         );
@@ -15725,7 +15847,9 @@ mod tests {
             append_batch_text(&mut value, file_id).unwrap();
             value.extend_from_slice(commit_id.as_uuid().as_bytes());
             append_batch_text(&mut value, "2026-01-01T00:00:00Z").unwrap();
-            value.extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT.to_le_bytes());
+            value.extend_from_slice(
+                &crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT.to_le_bytes(),
+            );
             value.extend_from_slice(&0_u64.to_le_bytes());
             value.extend_from_slice(&0_u64.to_le_bytes());
             value.extend_from_slice(&0_u32.to_le_bytes());
@@ -15835,8 +15959,9 @@ mod tests {
         let malformed_content_key = StorageKey(Bytes::from_static(b"malformed-content"));
         let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
         append_batch_text(&mut manifest_key, "unrelated.md").unwrap();
-        manifest_key
-            .extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
+        manifest_key.extend_from_slice(
+            &crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes(),
+        );
         manifest_key.extend_from_slice(
             CommitId::for_test_label("unrelated-certified-commit")
                 .as_uuid()
@@ -15919,8 +16044,9 @@ mod tests {
         let malformed_content_key = StorageKey(Bytes::from_static(b"matching-malformed-content"));
         let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
         append_batch_text(&mut manifest_key, FILE_ID).unwrap();
-        manifest_key
-            .extend_from_slice(&crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
+        manifest_key.extend_from_slice(
+            &crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes(),
+        );
         manifest_key.extend_from_slice(
             CommitId::for_test_label("matching-certified-commit")
                 .as_uuid()
@@ -17948,10 +18074,7 @@ mod tests {
             "branch",
             generation,
             "schema",
-            requested
-                .iter()
-                .map(|identity| &identity.row_pk)
-                .collect(),
+            requested.iter().map(|identity| &identity.row_pk).collect(),
             vec![None],
         )
         .expect("dense identity count is representable");
@@ -18004,10 +18127,7 @@ mod tests {
             "branch",
             generation,
             "schema",
-            requested
-                .iter()
-                .map(|identity| &identity.row_pk)
-                .collect(),
+            requested.iter().map(|identity| &identity.row_pk).collect(),
             vec![None],
         )
         .expect("sparse identity count is representable");

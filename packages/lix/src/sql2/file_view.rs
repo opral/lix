@@ -59,6 +59,13 @@ pub(crate) enum SessionFileViewMutation {
 }
 
 impl SessionFileViews {
+    /// Creates an isolated read collector. Plugin acknowledgements are
+    /// collected in a fresh map and applied to the session only after the read
+    /// succeeds; sharing the cache would make a failed read publish state.
+    pub(crate) fn fork_for_read(&self) -> Self {
+        Self::default()
+    }
+
     pub(crate) fn has_plugin_file_at_path(&self, branch_id: &str, path: &str) -> bool {
         self.lock()
             .plugin_files
@@ -116,7 +123,8 @@ impl SessionFileViews {
     /// before its post-commit actor publications and view updates ran; a cold
     /// open on the next exact read is safer than retaining stale state.
     pub(crate) fn clear(&self) {
-        self.lock().plugin_files.clear();
+        let mut state = self.lock();
+        state.plugin_files.clear();
     }
 
     pub(crate) fn plugin_file_mutations(&self) -> Vec<SessionFileViewMutation> {

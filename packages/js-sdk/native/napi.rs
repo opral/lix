@@ -6,8 +6,9 @@ use lix::{
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
-    ObserveEvents as RsObserveEvents, RedoReceipt, SwitchBranchOptions as RsSwitchBranchOptions,
-    SwitchBranchReceipt, UndoReceipt, Value, open_lix,
+    ObserveEvents as RsObserveEvents, RedoReceipt, ServerOptions,
+    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
+    open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
 use napi::JsDeferred;
@@ -869,11 +870,15 @@ pub struct OpenFilesystemStorageTask {
     path: String,
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
+    server_url: Option<String>,
+    server_headers: Vec<(String, String)>,
 }
 
 #[expect(missing_debug_implementations)]
 pub struct OpenMemoryTask {
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
+    server_url: Option<String>,
+    server_headers: Vec<(String, String)>,
 }
 
 impl Task for OpenFilesystemStorageTask {
@@ -885,6 +890,8 @@ impl Task for OpenFilesystemStorageTask {
             std::mem::take(&mut self.path),
             self.sync_all_files,
             self.telemetry_dispatch.take(),
+            self.server_url.take(),
+            std::mem::take(&mut self.server_headers),
         ))
     }
 
@@ -898,7 +905,11 @@ impl Task for OpenMemoryTask {
     type JsValue = NativeLix;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        Ok(open_memory_native(self.telemetry_dispatch.take()))
+        Ok(open_memory_native(
+            self.telemetry_dispatch.take(),
+            self.server_url.take(),
+            std::mem::take(&mut self.server_headers),
+        ))
     }
 
     fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
@@ -916,17 +927,50 @@ fn telemetry_sink(dispatch: SharedJsTelemetryDispatch) -> Arc<dyn TelemetrySink>
     }))
 }
 
+fn parse_server_headers(headers: Option<Vec<Vec<String>>>) -> Result<Vec<(String, String)>> {
+    headers
+        .unwrap_or_default()
+        .into_iter()
+        .map(|pair| match pair.as_slice() {
+            [name, value] => Ok((name.clone(), value.clone())),
+            _ => Err(Error::from_reason(
+                "sync server headers must contain [name, value] pairs",
+            )),
+        })
+        .collect()
+}
+
 fn open_memory_native(
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
+    server_url: Option<String>,
+    server_headers: Vec<(String, String)>,
 ) -> std::result::Result<NativeLix, LixError> {
     let rt = Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
     let lix = match telemetry_dispatch.map(telemetry_sink) {
-        Some(telemetry) => rt.block_on(async { open_lix().with_telemetry(telemetry).await })?,
-        None => rt.block_on(async { open_lix().await })?,
+        Some(telemetry) => {
+            let builder = open_lix().with_telemetry(telemetry);
+            let builder = match server_url {
+                Some(url) => builder
+                    .with_server(ServerOptions::sync(url).with_headers(server_headers.clone())),
+                None => builder,
+            };
+            rt.block_on(async { builder.await })
+        }
+        None => {
+            let builder = open_lix();
+            let builder = match server_url {
+                Some(url) => {
+                    builder.with_server(ServerOptions::sync(url).with_headers(server_headers))
+                }
+                None => builder,
+            };
+            rt.block_on(async { builder.await })
+        }
     };
+    let lix = lix?;
     NativeLix::new(NativeLixInner::Memory(lix))
 }
 
@@ -934,6 +978,8 @@ fn open_filesystem_storage_native(
     path: String,
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
+    server_url: Option<String>,
+    server_headers: Vec<(String, String)>,
 ) -> std::result::Result<NativeLix, LixError> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -943,14 +989,29 @@ fn open_filesystem_storage_native(
         .sync_all_files(sync_all_files)
         .open()?;
     let lix = match telemetry_dispatch.map(telemetry_sink) {
-        Some(telemetry) => rt.block_on(async {
-            open_lix()
+        Some(telemetry) => {
+            let builder = open_lix()
                 .with_storage(storage.clone())
-                .with_telemetry(telemetry)
-                .await
-        })?,
-        None => rt.block_on(async { open_lix().with_storage(storage.clone()).await })?,
+                .with_telemetry(telemetry);
+            let builder = match server_url {
+                Some(url) => builder
+                    .with_server(ServerOptions::sync(url).with_headers(server_headers.clone())),
+                None => builder,
+            };
+            rt.block_on(async { builder.await })
+        }
+        None => {
+            let builder = open_lix().with_storage(storage.clone());
+            let builder = match server_url {
+                Some(url) => {
+                    builder.with_server(ServerOptions::sync(url).with_headers(server_headers))
+                }
+                None => builder,
+            };
+            rt.block_on(async { builder.await })
+        }
     };
+    let lix = lix?;
     rt.block_on(storage.start_sync(&lix))?;
     NativeLix::new(NativeLixInner::FilesystemStorage(
         lix,
@@ -964,9 +1025,13 @@ impl NativeLix {
     #[napi(js_name = "openMemory")]
     pub fn open_memory(
         telemetry_dispatch: Option<Function<'_, String, ()>>,
+        server_url: Option<String>,
+        server_headers: Option<Vec<Vec<String>>>,
     ) -> Result<AsyncTask<OpenMemoryTask>> {
         Ok(AsyncTask::new(OpenMemoryTask {
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
+            server_url,
+            server_headers: parse_server_headers(server_headers)?,
         }))
     }
 
@@ -975,11 +1040,15 @@ impl NativeLix {
         path: String,
         sync_all_files: bool,
         telemetry_dispatch: Option<Function<'_, String, ()>>,
+        server_url: Option<String>,
+        server_headers: Option<Vec<Vec<String>>>,
     ) -> Result<AsyncTask<OpenFilesystemStorageTask>> {
         Ok(AsyncTask::new(OpenFilesystemStorageTask {
             path,
             sync_all_files,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
+            server_url,
+            server_headers: parse_server_headers(server_headers)?,
         }))
     }
 

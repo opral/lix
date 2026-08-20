@@ -1,4 +1,4 @@
-import { OpfsBackend, type SqliteChanges } from "./provider.js";
+import { OpfsBackend } from "./provider.js";
 import {
 	OPFS_RPC_CHANNEL,
 	serializeError,
@@ -23,6 +23,7 @@ type BackendEntry = {
 const backends = new Map<string, BackendEntry>();
 const channel = new BroadcastChannel(OPFS_RPC_CHANNEL);
 const inFlightRequests = new Map<string, Promise<void>>();
+const MAX_WARM_IDLE_BACKENDS = 2;
 
 setInterval(() => {
 	const cutoff = Date.now() - 15_000;
@@ -117,10 +118,12 @@ async function dispatch(request: OpfsRpcRequest): Promise<void> {
 				assertOwnerEpoch(entry, payload.ownerEpoch);
 				return backend.scanPage(payload);
 			}
-			case "commit":
-				backend.commitChanges(request.payload as SqliteChanges);
+			case "commit": {
+				const payload = request.payload as OpfsCommitPayload;
+				backend.commitChanges(payload);
 				announceState(request.storageName, entry, backend);
-				return { stats: (request.payload as OpfsCommitPayload).stats };
+				return { stats: payload.stats };
+			}
 		}
 	});
 	entry.queue = operation.then(
@@ -204,14 +207,26 @@ function isAlreadyOwned(error: unknown): boolean {
 function scheduleIdleClose(name: string, entry: BackendEntry): void {
 	if (entry.clients.size > 0 || entry.idleTimer) return;
 	// Keep the SQLite/OPFS handle warm for the common close/reopen path, but
-	// release the Web Lock after a short idle period so an abandoned tab does
-	// not pin a repository forever.
+	// bound that cache: every distinct SAH-pool VFS owns browser resources, and
+	// a burst across repositories must not stall the next open.
+	const warmIdle = [...backends].filter(
+		([otherName, other]) => otherName !== name && other.idleTimer,
+	);
+	while (warmIdle.length >= MAX_WARM_IDLE_BACKENDS) {
+		const oldest = warmIdle.shift();
+		if (oldest) closeIdleBackend(...oldest);
+	}
 	entry.idleTimer = setTimeout(() => {
-		entry.idleTimer = undefined;
-		if (entry.clients.size > 0) return;
-		if (entry.backend) void entry.backend.close().catch(() => undefined);
-		backends.delete(name);
+		closeIdleBackend(name, entry);
 	}, 30_000);
+}
+
+function closeIdleBackend(name: string, entry: BackendEntry): void {
+	if (entry.clients.size > 0) return;
+	if (entry.idleTimer) clearTimeout(entry.idleTimer);
+	entry.idleTimer = undefined;
+	backends.delete(name);
+	if (entry.backend) void entry.backend.close().catch(() => undefined);
 }
 
 function postResponse(response: OpfsRpcResponse): void {

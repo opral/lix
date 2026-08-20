@@ -19,7 +19,7 @@ const EXTERNAL_MUTATION_REVISION_POLL_INTERVAL: Duration = Duration::from_millis
 #[derive(Clone, Debug)]
 pub(crate) enum ObserveInvalidationEvent {
     Generation(u64),
-    TerminalStorageError(LixError),
+    TerminalError(LixError),
 }
 
 #[derive(Debug)]
@@ -42,7 +42,7 @@ impl ObserveInvalidation {
     pub(crate) fn bump(&self) -> u64 {
         let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.sender.send_modify(|event| {
-            if matches!(event, ObserveInvalidationEvent::TerminalStorageError(_)) {
+            if matches!(event, ObserveInvalidationEvent::TerminalError(_)) {
                 return;
             }
             *event = ObserveInvalidationEvent::Generation(next);
@@ -50,10 +50,10 @@ impl ObserveInvalidation {
         next
     }
 
-    fn fail_terminal_storage(&self, error: LixError) {
+    pub(crate) fn fail_terminal(&self, error: LixError) {
         self.sender.send_modify(|event| {
-            if !matches!(event, ObserveInvalidationEvent::TerminalStorageError(_)) {
-                *event = ObserveInvalidationEvent::TerminalStorageError(error);
+            if !matches!(event, ObserveInvalidationEvent::TerminalError(_)) {
+                *event = ObserveInvalidationEvent::TerminalError(error);
             }
         });
     }
@@ -81,7 +81,7 @@ impl ObserveInvalidation {
         // gate so a contender can retry startup.
         let mut watcher_started = self.external_watcher_started.lock().await;
         let event = self.sender.borrow().clone();
-        if let ObserveInvalidationEvent::TerminalStorageError(error) = event {
+        if let ObserveInvalidationEvent::TerminalError(error) = event {
             return Err(error);
         }
         if *watcher_started {
@@ -102,7 +102,7 @@ impl ObserveInvalidation {
                             }
                             Err(error) => {
                                 if matches!(error, StorageError::Fenced | StorageError::Closed(_)) {
-                                    invalidation.fail_terminal_storage(error.into());
+                                    invalidation.fail_terminal(error.into());
                                 } else {
                                     // Wake observers so the stable-read loop can retry and
                                     // reopen the adapter watch after a transient failure.
@@ -124,7 +124,7 @@ impl ObserveInvalidation {
                     error.code.as_str(),
                     LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED
                 ) {
-                    self.fail_terminal_storage(error.clone());
+                    self.fail_terminal(error.clone());
                 }
                 return Err(error);
             }
@@ -148,7 +148,7 @@ impl ObserveInvalidation {
                         error.code.as_str(),
                         LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED
                     ) {
-                        self.fail_terminal_storage(error.clone());
+                        self.fail_terminal(error.clone());
                     }
                     return Err(error);
                 }
@@ -182,7 +182,7 @@ impl ObserveInvalidation {
                                 error.code.as_str(),
                                 LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED
                             ) {
-                                invalidation.fail_terminal_storage(error);
+                                invalidation.fail_terminal(error);
                                 break;
                             }
                             continue;
@@ -208,6 +208,27 @@ mod tests {
         StorageError, WriteOptions,
     };
     use crate::storage_adapter::StorageAdapter;
+
+    #[tokio::test]
+    async fn terminal_runtime_error_is_sticky_for_observers() {
+        let invalidation = ObserveInvalidation::new();
+        let mut observer = invalidation.subscribe();
+        invalidation.fail_terminal(LixError::new(
+            "LIX_ERROR_SYNC_ITEM_TOO_LARGE",
+            "sync cannot make progress",
+        ));
+
+        observer
+            .changed()
+            .await
+            .expect("terminal runtime error should notify observers");
+        invalidation.bump();
+        assert!(matches!(
+            observer.borrow_and_update().clone(),
+            ObserveInvalidationEvent::TerminalError(error)
+                if error.code == "LIX_ERROR_SYNC_ITEM_TOO_LARGE"
+        ));
+    }
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::AtomicBool;
@@ -355,7 +376,7 @@ mod tests {
             .expect("initial terminal error should notify observers");
         assert!(matches!(
             observer.borrow_and_update().clone(),
-            ObserveInvalidationEvent::TerminalStorageError(error)
+            ObserveInvalidationEvent::TerminalError(error)
                 if error.code == LixError::CODE_STORAGE_FENCED
         ));
 
@@ -383,7 +404,7 @@ mod tests {
             .expect("watch channel should remain open");
         assert!(matches!(
             observer.borrow_and_update().clone(),
-            ObserveInvalidationEvent::TerminalStorageError(error)
+            ObserveInvalidationEvent::TerminalError(error)
                 if error.code == LixError::CODE_STORAGE_FENCED
         ));
     }

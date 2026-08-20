@@ -78,7 +78,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1.15"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["std"] }
@@ -97,6 +97,8 @@ plugin_markdown = { path = "../../plugins/markdown", lib = true, artifact = "cdy
 plugin_text = { path = "../../plugins/text", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 http = "1"
 http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [[example]]
 name = "e1_json_leak"
@@ -497,6 +499,11 @@ required-features = ["sdk-tests", "storage-benches", "slatedb"]
 name = "semantic_merge"
 path = "tests/semantic_merge.rs"
 required-features = ["sdk-tests"]
+
+[[test]]
+name = "sync_mode"
+path = "tests/sync_mode.rs"
+required-features = ["sdk-tests", "server-protocol"]
 
 [[test]]
 name = "plugin_gc"

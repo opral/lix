@@ -397,12 +397,7 @@ impl TrackedStateMutationBatchBuilder {
         value: TrackedStateIndexValueRef,
     ) -> MutationSpan {
         let key_start = self.key_arena.len();
-        encode_key_parts_into(
-            &mut self.key_arena,
-            key.schema_key,
-            key.file_id,
-            key.row_pk,
-        );
+        encode_key_parts_into(&mut self.key_arena, key.schema_key, key.file_id, key.row_pk);
         let key_end = self.key_arena.len();
         let value_start = self.value_arena.len();
         encode_value_ref_into(&mut self.value_arena, value);
@@ -735,10 +730,7 @@ fn read_file_id_shared(bytes: &Bytes, offset: &mut usize) -> Result<Option<Share
     }
 }
 
-fn read_row_pk_shared(
-    bytes: &Bytes,
-    offset: &mut usize,
-) -> Result<crate::row_pk::RowPk, LixError> {
+fn read_row_pk_shared(bytes: &Bytes, offset: &mut usize) -> Result<crate::row_pk::RowPk, LixError> {
     let version = bytes
         .get(*offset)
         .copied()
@@ -795,18 +787,12 @@ fn read_row_pk_part_shared(
         ROW_PK_STRING => {
             let (value, terminator) =
                 read_key_string_shared(bytes, offset, "row primary-key part")?;
-            Ok((
-                crate::row_pk::RowPkComponent::String(value),
-                terminator,
-            ))
+            Ok((crate::row_pk::RowPkComponent::String(value), terminator))
         }
         ROW_PK_BYTES => {
             let (value, terminator) =
                 read_key_bytes_shared(bytes, offset, "row primary-key bytes")?;
-            Ok((
-                crate::row_pk::RowPkComponent::Bytes(value),
-                terminator,
-            ))
+            Ok((crate::row_pk::RowPkComponent::Bytes(value), terminator))
         }
         ROW_PK_UUID => {
             let uuid_end = offset
@@ -827,10 +813,7 @@ fn read_row_pk_part_shared(
                 )));
             }
             *offset = uuid_end + 1;
-            Ok((
-                crate::row_pk::RowPkComponent::Uuid(uuid_bytes),
-                terminator,
-            ))
+            Ok((crate::row_pk::RowPkComponent::Uuid(uuid_bytes), terminator))
         }
         ROW_PK_INTEGER => {
             let integer_end = offset
@@ -866,19 +849,14 @@ fn read_row_pk_part_shared(
 
 /// Test-only shim; see `crate::order_preserving_key::tests`.
 #[cfg(test)]
-pub(crate) fn tree_decode_row_pk_probe(
-    bytes: &[u8],
-) -> Option<(crate::row_pk::RowPk, usize)> {
+pub(crate) fn tree_decode_row_pk_probe(bytes: &[u8]) -> Option<(crate::row_pk::RowPk, usize)> {
     let mut offset = 0usize;
     read_row_pk(bytes, &mut offset)
         .ok()
         .map(|row_pk| (row_pk, offset))
 }
 
-fn read_row_pk(
-    bytes: &[u8],
-    offset: &mut usize,
-) -> Result<crate::row_pk::RowPk, LixError> {
+fn read_row_pk(bytes: &[u8], offset: &mut usize) -> Result<crate::row_pk::RowPk, LixError> {
     let version = bytes
         .get(*offset)
         .copied()
@@ -963,10 +941,7 @@ fn read_row_pk_part(
                 )));
             }
             *offset = uuid_end + 1;
-            Ok((
-                crate::row_pk::RowPkComponent::Uuid(uuid_bytes),
-                terminator,
-            ))
+            Ok((crate::row_pk::RowPkComponent::Uuid(uuid_bytes), terminator))
         }
         ROW_PK_INTEGER => {
             let integer_end = offset
@@ -2235,8 +2210,7 @@ mod tests {
 
     #[test]
     fn internal_node_rejects_inverted_child_range() {
-        let encoded =
-            encode_unchecked_internal_boundaries(&[(b"schema-z/z", b"schema-z/a")]);
+        let encoded = encode_unchecked_internal_boundaries(&[(b"schema-z/z", b"schema-z/a")]);
         let error = decode_node_ref(&encoded).expect_err("inverted range must fail closed");
         assert!(error.message.contains("inverted key range"));
     }
@@ -2270,9 +2244,7 @@ mod tests {
         };
         assert_eq!(decoded.len(), entries.len());
         for (index, (key, value)) in entries.iter().enumerate() {
-            let entry = decoded
-                .entry(index)
-                .expect("entry should exist");
+            let entry = decoded.entry(index).expect("entry should exist");
             assert_eq!(entry.key, key.as_slice(), "key {index}");
             assert_eq!(entry.value, value.as_slice(), "value {index}");
         }
@@ -2747,10 +2719,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: Some("file".to_string()),
-            row_pk: RowPk::from_parts_unchecked(vec![
-                "namespace".to_string(),
-                "id".to_string(),
-            ]),
+            row_pk: RowPk::from_parts_unchecked(vec!["namespace".to_string(), "id".to_string()]),
         };
         let encoded = encode_key(&key);
         let prefix = encode_schema_file_prefix("schema", Some("file"));
@@ -3352,9 +3321,7 @@ mod tests {
         };
         assert_eq!(leaf.len(), 2);
         assert_eq!(leaf.key(1), Some(b"bravo".as_ref()));
-        let second = leaf
-            .entry(1)
-            .expect("second entry exists");
+        let second = leaf.entry(1).expect("second entry exists");
         assert_eq!(second.key, b"bravo");
         assert_eq!(second.value, raw_value(4, 5, 6));
 

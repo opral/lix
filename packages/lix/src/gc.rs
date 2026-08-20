@@ -1158,7 +1158,14 @@ async fn load_authenticated_repository_retention<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
-    let control_reachability = authenticated_control_commit_reachability(store, controls).await?;
+    let mut control_reachability =
+        authenticated_control_commit_reachability(store, controls).await?;
+    // The ordered sync log and its commit bodies are one replayable unit. A
+    // deleted branch can make an event's commit unreachable from every live
+    // ref while an old replica can still request that event by cursor.
+    control_reachability
+        .history_dependencies
+        .extend(crate::sync::load_replayable_repository_event_commit_ids(store).await?);
     let mut chronology_roots = control_reachability.chronology_roots;
     chronology_roots.extend(
         load_recovery_refs(store)
@@ -2418,20 +2425,19 @@ mod tests {
         ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest, CommitRecord, GcRoot,
     };
     use crate::common::LixTimestamp;
-    use crate::row_pk::RowPk;
     use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::json_store::{
         JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
         NormalizedJsonRef,
     };
-    use crate::storage_adapter::{
-        MAX_SCAN_PAGE_ROWS, Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter,
-        StorageBeginScanOptions, StorageGetOptions, StorageKey,
-        StoragePrefix, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
-        StorageWriteSet,
-    };
+    use crate::row_pk::RowPk;
     #[cfg(feature = "storage-benches")]
     use crate::storage_adapter::StorageCoreProjection;
+    use crate::storage_adapter::{
+        MAX_SCAN_PAGE_ROWS, Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter,
+        StorageBeginScanOptions, StorageGetOptions, StorageKey, StoragePrefix, StorageReadOptions,
+        StorageSpace, StorageValue, StorageWriteOptions, StorageWriteSet,
+    };
     use crate::tracked_state::{
         CommitDeltaLifecycleSummary, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
@@ -2650,6 +2656,85 @@ mod tests {
         assert_eq!(
             plan.profile.history_manifests_missing, 1,
             "the commit whose delta a pre-fix sweep reclaimed must be counted, not swallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_preserves_detached_snapshot_without_semantic_parent_manifest() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp =
+            LixTimestamp::expect_parse("detached snapshot timestamp", "2026-01-01T00:00:00Z");
+        let semantic_parent = replay_commit_record("detached-snapshot-parent", 0, None, timestamp);
+        let active = replay_commit_record(
+            "detached-snapshot-active",
+            1,
+            Some(semantic_parent.commit_id),
+            timestamp,
+        );
+        let mut active_manifest =
+            test_commit_state_manifest(&active, CommitStateMutationInventory::default());
+        active_manifest.replay_debt = CommitStateReplayDebt::default();
+        let mut active_snapshot = test_snapshot_root(active.commit_id);
+        active_snapshot.complete_state_fence = true;
+        assert!(
+            active_snapshot.parent_roots.is_empty(),
+            "the complete snapshot must be physically detached from its semantic parent"
+        );
+        let active_root_id = active_snapshot.root_id.clone();
+        active_manifest.snapshot_root = Some(Box::new(active_snapshot));
+
+        let mut writes = storage.new_write_set();
+        stage_branch_head_control(
+            &mut writes,
+            "main",
+            replay_branch_control(
+                active.commit_id,
+                ChangeId::for_test_label("detached-snapshot-control"),
+                timestamp,
+            ),
+        )
+        .expect("detached snapshot branch control should stage");
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            &[semantic_parent.clone(), active.clone()],
+            std::slice::from_ref(&active_manifest),
+        )
+        .await;
+
+        let plan = run_ordinary_repository_gc(&storage).await;
+        assert_eq!(
+            plan.profile.history_manifests_missing, 1,
+            "semantic history may remain available without becoming physical snapshot ancestry"
+        );
+        assert!(
+            !plan.sweep.tracked_commit_roots.contains(&active.commit_id),
+            "the active detached snapshot must not be retired"
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-GC detached snapshot read should open");
+        let retained =
+            crate::tracked_state::load_snapshot_commit_root(&read, &active.commit_id.to_string())
+                .await
+                .expect("detached snapshot metadata should load after GC")
+                .expect("detached snapshot metadata must survive GC");
+        assert!(retained.parent_roots.is_empty());
+        assert!(retained.complete_state_fence);
+        let chunk = PointReadPlan::new(
+            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+            &[StorageKey(Bytes::copy_from_slice(
+                active_root_id.as_bytes(),
+            ))],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("detached snapshot root chunk should load after GC");
+        assert!(
+            chunk.value[0].is_some(),
+            "the active detached snapshot's complete-state chunk must survive GC"
         );
     }
 
@@ -3857,6 +3942,7 @@ mod tests {
                 changed_key_count: 0,
                 row_count_estimate: 0,
                 tree_height: 1,
+                complete_state_fence: false,
             })),
         };
         let control = BranchHeadControl {
@@ -3962,6 +4048,7 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
+            complete_state_fence: false,
         };
         let active_root = TrackedStateCommitRoot {
             commit_id: active,
@@ -3973,6 +4060,7 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
+            complete_state_fence: false,
         };
         let manifest = |commit_id, snapshot_root| CommitStateManifest {
             commit_id,
@@ -6389,6 +6477,7 @@ mod tests {
             changed_key_count: 1,
             row_count_estimate: 1,
             tree_height: 1,
+            complete_state_fence: false,
         }
     }
 

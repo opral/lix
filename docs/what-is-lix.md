@@ -36,13 +36,13 @@ import { FilesystemStorage } from "@lix-js/storage-filesystem";
 const lix = await openLix({
   storage: new FilesystemStorage({ path: "./project" }),
   server: {
-    mode: "remote",
+    mode: "sync",
     url: "https://lixray.com/@acme/project",
   },
 });
 ```
 
-See [Hosting](./hosting.md).
+See [Collaboration and Sync](./collaboration-and-sync.md).
 
 ### File-based apps with SQL and version control
 
@@ -67,15 +67,16 @@ Run Lix in memory, on the local filesystem, or against a server backed by S3. Se
 
 <img src="../website/public/assets/pluggable-storage.svg" alt="Lix runs in your app on a storage adapter: in memory, local filesystem, or S3 bucket" width="760" />
 
-## Local and remote
+## Local, remote, and sync
 
-Lix supports local and remote repositories with the same API. Run it in your
-process for a local repository or connect to a Lix server for a shared
-repository. See [Persistence and Storage](./persistence.md) for setup examples.
+Lix supports local repositories, direct remote clients, and synchronized local
+replicas with the same API. See [Persistence and Storage](./persistence.md) for
+setup examples.
 
-Remote clients use the same files, SQL, and branches. Clients on the same
-server see each other's changes through `lix.observe()`. See
-[Real-time Collaboration](./realtime-collaboration.md) for a two-client example.
+Clients can execute directly on a server or use a synchronized local replica.
+Both modes use the same files, SQL, and branches. Clients on the same server
+see each other's changes through `lix.observe()`. See
+[Collaboration and Sync](./collaboration-and-sync.md).
 
 ## Permissions (planned)
 
@@ -88,5 +89,5 @@ Permissions will live inside the repository: per file, per group, and versioned 
 - [Schemas](./schemas.md): define app rows and plugin rows.
 - [Diffs](./diffs.md): track changes inside files.
 - [Files and Media](./files-and-media.md): store text, binary files, and large media.
-- [Real-time Collaboration](./realtime-collaboration.md): connect two clients to one repository.
+- [Collaboration and Sync](./collaboration-and-sync.md): connect clients directly or through local replicas.
 - [Persistence](./persistence.md): choose a local or remote setup.

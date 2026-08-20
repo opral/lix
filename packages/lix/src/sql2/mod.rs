@@ -6,9 +6,6 @@ mod change_materialization;
 mod context;
 mod dialect;
 mod dml;
-mod row_batch;
-mod row_columnar_layout;
-mod row_projection;
 mod error;
 mod exec;
 mod file_view;
@@ -22,6 +19,9 @@ mod predicate_typecheck;
 mod providers;
 mod read_only;
 mod result_metadata;
+mod row_batch;
+mod row_columnar_layout;
+mod row_projection;
 mod runtime;
 mod script;
 mod session;
@@ -41,7 +41,7 @@ pub(crate) use bind::{
     statement_has_durable_runtime_function,
 };
 pub(crate) use catalog::{
-    PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec, PublicCatalog,
+    PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec,
     derive_schema_surface_spec_from_schema, row_visible_fields,
 };
 pub(crate) use change_materialization::MaterializedChange;
@@ -52,15 +52,6 @@ pub(crate) use context::{
     SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
     WriteContextBranchRefReader, WriteContextHotStateReader,
 };
-pub(crate) use row_batch::{CurrentRowSnapshotReader, RowSnapshotReader};
-pub(crate) use row_columnar_layout::{
-    ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ROW_COLUMNAR_ROW_PK_FIELD,
-    ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
-    ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, EncodedRowGroups, RowColumnarRowRef,
-    RowGroupLocations, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
-    encode_registered_row_groups, encode_unclustered_registered_row_groups,
-};
-pub(crate) use row_projection::RowProjectionDecoder;
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 #[cfg(feature = "storage-benches")]
 pub(crate) use exec::{
@@ -86,10 +77,10 @@ pub(crate) use exec::{
     WriteExecutorMode, WriteExecutorPath, create_write_logical_plan, execute_write_logical_plan,
     execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
     execute_write_logical_plan_with_mode_and_trace_result,
-    execute_write_logical_plan_with_mode_result, take_certified_row_insert_batch_executions,
-    take_certified_row_insert_parameter_batch_executions,
-    take_certified_generation_identity_replacements,
+    execute_write_logical_plan_with_mode_result, take_certified_generation_identity_replacements,
     take_certified_replacement_parameter_batch_executions,
+    take_certified_row_insert_batch_executions,
+    take_certified_row_insert_parameter_batch_executions,
     take_certified_single_path_value_replacements, take_row_update_parameter_batch_executions,
 };
 pub(crate) use file_view::{
@@ -106,8 +97,15 @@ pub(crate) use providers::{
     execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
     execute_exact_lix_file_id_manifest_batch_read, execute_exact_lix_file_read,
     execute_exact_lix_file_root_listing, execute_exact_schema_batch_read,
-    execute_exact_schema_point_read,
-    execute_fast_lix_file_path_writes,
+    execute_exact_schema_point_read, execute_fast_lix_file_path_writes,
     execute_fast_lix_file_prepared_path_write,
 };
+pub(crate) use row_batch::{CurrentRowSnapshotReader, RowSnapshotReader};
+pub(crate) use row_columnar_layout::{
+    EncodedRowGroups, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
+    ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
+    ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, ROW_COLUMNAR_ROW_PK_FIELD, RowColumnarRowRef,
+    RowGroupLocations, encode_registered_row_groups, encode_unclustered_registered_row_groups,
+};
+pub(crate) use row_projection::RowProjectionDecoder;
 mod aggregate_statistics;

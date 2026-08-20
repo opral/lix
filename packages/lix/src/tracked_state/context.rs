@@ -850,10 +850,7 @@ impl EncodedReplayFileIdDictionary {
     }
 }
 
-fn append_single_row_pk_external(
-    arena: &mut String,
-    row_pk: &RowPk,
-) -> Result<(), LixError> {
+fn append_single_row_pk_external(arena: &mut String, row_pk: &RowPk) -> Result<(), LixError> {
     let [component] = row_pk.components.as_slice() else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -1076,7 +1073,35 @@ where
         commit_id: &str,
         request: &TrackedStateScanRequest,
     ) -> Result<MaterializedTrackedStateBatch, LixError> {
-        let tree_request = tree_scan_request_from_tracked(request);
+        self.scan_batch_at_commit_inner(commit_id, request, None, false)
+            .await
+    }
+
+    /// Reads one bounded canonical page, excluding the complete identity in
+    /// `exclusive_after`. Durable trees prune preceding subtrees before row
+    /// materialization, making page cost proportional to the page plus tree
+    /// depth instead of all preceding rows.
+    pub(crate) async fn scan_batch_at_commit_page(
+        &mut self,
+        commit_id: &str,
+        request: &TrackedStateScanRequest,
+        exclusive_after: Option<&TrackedStateKey>,
+    ) -> Result<MaterializedTrackedStateBatch, LixError> {
+        self.scan_batch_at_commit_inner(commit_id, request, exclusive_after, true)
+            .await
+    }
+
+    async fn scan_batch_at_commit_inner(
+        &mut self,
+        commit_id: &str,
+        request: &TrackedStateScanRequest,
+        exclusive_after: Option<&TrackedStateKey>,
+        bounded_tree_page: bool,
+    ) -> Result<MaterializedTrackedStateBatch, LixError> {
+        let mut tree_request = tree_scan_request_from_tracked(request);
+        if bounded_tree_page {
+            tree_request.limit = request.limit;
+        }
         let materialization = ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let durable_root = self.tree.load_root(&self.store, commit_id).await?;
         if request_has_exact_keys(&tree_request) || durable_root.is_some() {
@@ -1086,13 +1111,21 @@ where
             } else {
                 crate::storage_bench::record_tracked_scan_exact_keys();
             }
-            let mut entries = self
-                .index_entries_from_exact_or_durable_root(
+            let mut entries = if bounded_tree_page
+                && !request_has_exact_keys(&tree_request)
+                && let Some(root_id) = durable_root.as_ref()
+            {
+                self.tree
+                    .scan_after(&self.store, root_id, &tree_request, exclusive_after)
+                    .await?
+            } else {
+                self.index_entries_from_exact_or_durable_root(
                     commit_id,
                     &tree_request,
                     durable_root.as_ref(),
                 )
-                .await?;
+                .await?
+            };
             if !request.filter.include_tombstones {
                 entries.retain(|(_, value)| !value.deleted());
             }
@@ -1122,6 +1155,18 @@ where
                 break;
             }
             let key = decode_key_shared(replay.encoded_key_owned(ordinal))?;
+            if exclusive_after.is_some_and(|after| {
+                compare_tracked_state_key_refs(
+                    key.as_ref(),
+                    TrackedStateKeyRef {
+                        schema_key: &after.schema_key,
+                        file_id: after.file_id.as_deref(),
+                        row_pk: &after.row_pk,
+                    },
+                ) != std::cmp::Ordering::Greater
+            }) {
+                continue;
+            }
             if !tree_request.matches_ref(key.as_ref(), replay.value(ordinal)) {
                 continue;
             }
@@ -1151,6 +1196,18 @@ where
             })
             .collect::<Vec<_>>();
         self.load_projected_batch_at_commit_refs(commit_id, &key_refs, projection)
+            .await
+    }
+
+    /// Resolves exact index facts at a commit without materializing payloads.
+    /// Tombstones are returned rather than filtered so admission code can
+    /// validate selected merge members in one batched point read.
+    pub(crate) async fn index_values_at_commit(
+        &mut self,
+        commit_id: &str,
+        keys: &[TrackedStateKey],
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        self.replay_index_values_for_keys_at_commit(commit_id, keys)
             .await
     }
 
@@ -1659,10 +1716,24 @@ where
                 )
                 .await?;
                 let Some(parent) = metadata.parent_roots.first() else {
-                    return Err(LixError::unknown(format!(
-                        "tracked-state diff row references changelog change '{}' that is not the first-parent winner for commit '{}' and identity {:?}",
-                        row.change_id, root_commit_id, winner_identity
-                    )));
+                    if !metadata.complete_state_fence {
+                        return Err(LixError::unknown(format!(
+                            "tracked-state commit-root metadata for commit '{current_commit_id}' omits physical ancestry without a complete-state fence"
+                        )));
+                    }
+                    // A rooted commit with a semantic first parent but no
+                    // physical parent root is a complete-state fence. The row
+                    // was already authenticated against this snapshot and its
+                    // changelog change, so there is no inherited physical
+                    // ancestry left to prove beyond the fence.
+                    self.validate_diff_row_created_at(
+                        row,
+                        &key,
+                        &current_commit_id,
+                        change_created_at,
+                    )
+                    .await?;
+                    return Ok(());
                 };
                 let parent_value = self
                     .load_cached_tree_value(&parent.root_id, &key, cache)
@@ -1769,8 +1840,12 @@ where
                 "tracked-state commit-root metadata for commit '{}' references parent '{}' but its first parent is '{}'",
                 commit_id, parent.commit_id, expected_parent_id
             ))),
+            // Empty physical ancestry is an explicit complete-state fence.
+            // The changelog parent remains the semantic history edge; it does
+            // not require the snapshot to retain that parent's root.
+            (Some((_expected_parent_id, _)), None) if metadata.complete_state_fence => Ok(()),
             (Some((expected_parent_id, _)), None) => Err(LixError::unknown(format!(
-                "tracked-state commit-root metadata for commit '{commit_id}' is missing commit-root parent '{expected_parent_id}'"
+                "tracked-state commit-root metadata for commit '{commit_id}' omits first-parent root '{expected_parent_id}' without a complete-state fence"
             ))),
             (None, Some(parent)) => Err(LixError::unknown(format!(
                 "tracked-state commit-root metadata for root commit '{}' references unexpected parent '{}'",
@@ -1829,16 +1904,19 @@ where
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root rows"
             )));
         };
-        let topology = storage::load_published_commit_state_topology(&self.store, commit_id_typed)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state commit_state_manifest is missing for commit '{commit_id}'"
-                    ),
-                )
-            })?;
+        let topology =
+            match storage::load_published_commit_state_topology(&self.store, commit_id_typed)
+                .await?
+            {
+                Some(topology) => topology,
+                None => {
+                    return Err(storage::missing_commit_state_manifest_error(
+                        &self.store,
+                        commit_id_typed,
+                    )
+                    .await);
+                }
+            };
         if topology.mutation_member_count() == 0 {
             cache
                 .commit_delta_winners
@@ -3472,12 +3550,14 @@ where
                 format!("cannot point-replay tracked_state for unknown commit '{commit_id}'"),
             )
         })?;
-        let manifest = manifest.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("tracked_state commit_state_manifest is missing for commit '{commit_id}'"),
-            )
-        })?;
+        let manifest = match manifest {
+            Some(manifest) => manifest,
+            None => {
+                return Err(
+                    storage::missing_commit_state_manifest_error(&self.store, commit_id).await,
+                );
+            }
+        };
         let rootless = manifest.replay_debt.depth > 0;
         let root_id = manifest
             .snapshot_root
@@ -3914,6 +3994,28 @@ where
         self.staged_roots.values()
     }
 
+    /// Reads exact identities from a root staged in this write set, or from an
+    /// already-published root in the coherent base snapshot.
+    pub(crate) async fn root_values_at_commit(
+        &self,
+        commit_id: CommitId,
+        keys: &[TrackedStateKey],
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        let root = match self.staged_roots.get(&commit_id.to_string()) {
+            Some(root) => root.clone(),
+            None => storage::load_snapshot_commit_root(self.store, &commit_id.to_string())
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_COMMIT_NOT_FOUND,
+                        format!("commit '{commit_id}' has no tracked-state root"),
+                    )
+                })?,
+        };
+        let staged_read = storage::TrackedStateStagedRead::new(self.store, &self.chunk_overlay);
+        self.tree.get_many(&staged_read, &root.root_id, keys).await
+    }
+
     pub(crate) async fn validate_staged_commit_root_against_changelog(
         &self,
         commit_id: &str,
@@ -4030,6 +4132,7 @@ where
                 changed_key_count: 0,
                 row_count_estimate: parent_metadata.row_count_estimate,
                 tree_height: parent_metadata.tree_height,
+                complete_state_fence: false,
             };
             self.staged_roots.insert(commit_id.to_string(), metadata);
             return Ok(TrackedStateWriteReport {
@@ -4042,9 +4145,10 @@ where
         let mut cascade_mutations = BTreeMap::<Vec<u8>, Vec<u8>>::new();
         if let Some(base_root) = base_root.as_ref() {
             let staged_read = storage::TrackedStateStagedRead::new(self.store, &self.chunk_overlay);
-            if deltas.iter().any(|delta| {
-                delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && delta.deleted
-            }) {
+            if deltas
+                .iter()
+                .any(|delta| delta.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && delta.deleted)
+            {
                 cascade_mutations = self
                     .file_cascade_mutations(&staged_read, base_root, &deltas)
                     .await?;
@@ -4070,9 +4174,7 @@ where
                     })
             }) {
                 let (schema_key, file_id) =
-                    crate::collection_generation::collection_scope_from_row_pk(
-                        marker.row_pk,
-                    )?;
+                    crate::collection_generation::collection_scope_from_row_pk(marker.row_pk)?;
                 let rows = self
                     .tree
                     .scan(
@@ -4278,6 +4380,7 @@ where
                     "tracked_state commit_root tree height exceeds u32",
                 )
             })?,
+            complete_state_fence: false,
         };
         self.staged_roots.insert(commit_id.to_string(), metadata);
 
@@ -4468,6 +4571,7 @@ where
                     "tracked_state commit_root tree height exceeds u32",
                 )
             })?,
+            complete_state_fence: false,
         };
         self.staged_roots.insert(commit_id.to_string(), metadata);
 
@@ -4795,8 +4899,7 @@ fn cascade_payload_key(file_id: &str) -> TrackedStateKey {
     TrackedStateKey {
         schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
         file_id: Some(file_id.to_string()),
-        row_pk: RowPk::uuid_from_canonical(file_id)
-            .unwrap_or_else(|_| RowPk::single(file_id)),
+        row_pk: RowPk::uuid_from_canonical(file_id).unwrap_or_else(|_| RowPk::single(file_id)),
     }
 }
 
@@ -4902,9 +5005,9 @@ mod tests {
     use crate::branch::BranchHeadControl;
     use crate::changelog::CommitRecord;
     use crate::hot_state::CertifiedRowBatchFileRef;
+    use crate::plugin::runtime::{WasmCertifiedRowBatch, WasmCreateContext};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
-    use crate::plugin::runtime::{WasmCertifiedRowBatch, WasmCreateContext};
 
     #[test]
     fn exact_current_state_diff_scope_requires_one_schema_and_concrete_file_lane() {
@@ -5707,16 +5810,8 @@ mod tests {
     #[test]
     fn ordered_root_batch_rejects_duplicate_encoded_keys() {
         let rows = [
-            row(
-                "row-duplicate",
-                "change-duplicate-a",
-                "ordered-duplicate",
-            ),
-            row(
-                "row-duplicate",
-                "change-duplicate-b",
-                "ordered-duplicate",
-            ),
+            row("row-duplicate", "change-duplicate-a", "ordered-duplicate"),
+            row("row-duplicate", "change-duplicate-b", "ordered-duplicate"),
         ];
         let error = build_ordered_root_mutation_batch(
             rows.len(),
@@ -6686,12 +6781,7 @@ mod tests {
         let (storage, tracked_state) = seed_merge_roots(
             &[row_with_value("row-a", "change-base", "base", "base")],
             &[row_with_value("row-a", "change-base", "base", "base")],
-            &[row_with_value(
-                "row-a",
-                "change-source",
-                "source",
-                "source",
-            )],
+            &[row_with_value("row-a", "change-source", "source", "source")],
         )
         .await;
 
@@ -6748,18 +6838,8 @@ mod tests {
     async fn plan_merge_from_roots_reports_divergent_modification_conflict() {
         let (storage, tracked_state) = seed_merge_roots(
             &[row_with_value("row-a", "change-base", "base", "base")],
-            &[row_with_value(
-                "row-a",
-                "change-target",
-                "target",
-                "target",
-            )],
-            &[row_with_value(
-                "row-a",
-                "change-source",
-                "source",
-                "source",
-            )],
+            &[row_with_value("row-a", "change-target", "target", "target")],
+            &[row_with_value("row-a", "change-source", "source", "source")],
         )
         .await;
 
@@ -6864,6 +6944,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_complete_snapshot_fences_inherited_row_proof_and_accepts_child_writes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(&storage, &tracked_state, "base", None, &[])
+            .await
+            .expect("empty base root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "parent",
+            Some("base"),
+            &[row("row-parent", "change-parent", "parent")],
+        )
+        .await
+        .expect("semantic parent root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "fence",
+            Some("parent"),
+            &[row("row-fence", "change-fence", "fence")],
+        )
+        .await
+        .expect("fence root should write");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fence manifest read should open");
+        let fence_id = CommitId::for_test_label("fence");
+        let mut fence_manifest = storage::load_commit_state_manifest(&read, fence_id)
+            .await
+            .expect("fence manifest should load")
+            .expect("fence manifest should exist");
+        fence_manifest
+            .snapshot_root
+            .as_mut()
+            .expect("fence snapshot root should exist")
+            .parent_roots
+            .clear();
+        let mut writes = storage.new_write_set();
+        storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &fence_manifest)
+            .expect("detached fence manifest should reseal");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("uncertified detached root should commit as corrupt test input");
+
+        let error = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("uncertified proof read should open"),
+            )
+            .validate_commit_root_against_changelog("fence")
+            .await
+            .expect_err("an empty physical parent chain needs an explicit complete-state fence");
+        assert!(error.message.contains("without a complete-state fence"));
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("uncertified fence read should open");
+        let mut fence_manifest = storage::load_commit_state_manifest(&read, fence_id)
+            .await
+            .expect("uncertified fence manifest should load")
+            .expect("uncertified fence manifest should exist");
+        fence_manifest
+            .snapshot_root
+            .as_mut()
+            .expect("fence snapshot root should exist")
+            .complete_state_fence = true;
+        let mut writes = storage.new_write_set();
+        storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &fence_manifest)
+            .expect("certified detached fence manifest should reseal");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("certified detached fence should commit");
+
+        // A normal write can extend the detached full-state snapshot. Its new
+        // physical parent is the fence, while the fence's semantic parent is
+        // deliberately not a physical dependency.
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("fence"),
+            &[row("row-child", "change-child", "child")],
+        )
+        .await
+        .expect("child write should extend the detached fence");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("detached fence verification read should open");
+        let mut reader = tracked_state.reader(read);
+        let rows = reader
+            .scan_batch_at_commit("child", &test_schema_scan_request())
+            .await
+            .expect("child state should scan through the detached fence")
+            .into_rows();
+        assert_eq!(rows.len(), 3);
+        let diff = reader
+            .diff_commits("base", "child", &test_schema_diff_request())
+            .await
+            .expect("inherited rows should authenticate at the detached fence");
+        assert_eq!(diff.entries.len(), 3);
+    }
+
+    #[tokio::test]
     async fn diff_allows_repaired_root_with_rebuilt_ancestor_chain() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
@@ -6881,12 +7076,7 @@ mod tests {
             &tracked_state,
             "middle",
             Some("base"),
-            &[row_with_value(
-                "row-a",
-                "change-middle",
-                "middle",
-                "middle",
-            )],
+            &[row_with_value("row-a", "change-middle", "middle", "middle")],
         )
         .await
         .expect("middle root should write");
@@ -6956,12 +7146,7 @@ mod tests {
             &tracked_state,
             "middle",
             Some("base"),
-            &[row_with_value(
-                "row-a",
-                "change-middle",
-                "middle",
-                "middle",
-            )],
+            &[row_with_value("row-a", "change-middle", "middle", "middle")],
         )
         .await
         .expect("middle root should write");
@@ -7014,12 +7199,7 @@ mod tests {
             &tracked_state,
             "commit-a",
             None,
-            &[row_with_value(
-                "row-a",
-                "commit-a:change",
-                "commit-a",
-                "a",
-            )],
+            &[row_with_value("row-a", "commit-a:change", "commit-a", "a")],
         )
         .await
         .expect("commit-a should commit");
@@ -7028,12 +7208,7 @@ mod tests {
             &tracked_state,
             "commit-b",
             Some("commit-a"),
-            &[row_with_value(
-                "row-b",
-                "commit-b:change",
-                "commit-b",
-                "b",
-            )],
+            &[row_with_value("row-b", "commit-b:change", "commit-b", "b")],
         )
         .await
         .expect("commit-b should commit");
@@ -7337,10 +7512,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0]
-                .row_pk
-                .as_single_string_owned()
-                .expect("row pk"),
+            rows[0].row_pk.as_single_string_owned().expect("row pk"),
             "row-a"
         );
         assert_eq!(
@@ -7451,10 +7623,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0]
-                .row_pk
-                .as_single_string_owned()
-                .expect("row pk"),
+            rows[0].row_pk.as_single_string_owned().expect("row pk"),
             "row-a"
         );
     }
@@ -7560,10 +7729,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0]
-                .row_pk
-                .as_single_string_owned()
-                .expect("row pk"),
+            rows[0].row_pk.as_single_string_owned().expect("row pk"),
             "row-live"
         );
     }
@@ -7715,10 +7881,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0]
-                .row_pk
-                .as_single_string_owned()
-                .expect("row pk"),
+            rows[0].row_pk.as_single_string_owned().expect("row pk"),
             "row-b"
         );
     }
@@ -7763,10 +7926,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0]
-                .row_pk
-                .as_single_string_owned()
-                .expect("row pk"),
+            rows[0].row_pk.as_single_string_owned().expect("row pk"),
             "row-b"
         );
     }
@@ -7884,12 +8044,7 @@ mod tests {
         let at_len = crate::json_store::JSON_INLINE_MAX_BYTES;
         let over_len = at_len + 1;
         let rows = [
-            row_with_value(
-                "row-at",
-                "change-at",
-                "commit-1",
-                &"a".repeat(at_len - 12),
-            ),
+            row_with_value("row-at", "change-at", "commit-1", &"a".repeat(at_len - 12)),
             row_with_value(
                 "row-over",
                 "change-over",
@@ -7944,10 +8099,7 @@ mod tests {
                 .clone()
         };
         assert_eq!(by_pk("row-at").as_deref(), Some(at_threshold.as_str()));
-        assert_eq!(
-            by_pk("row-over").as_deref(),
-            Some(over_threshold.as_str())
-        );
+        assert_eq!(by_pk("row-over").as_deref(), Some(over_threshold.as_str()));
     }
 
     #[tokio::test]
@@ -8252,12 +8404,7 @@ mod tests {
             &storage,
             "rootless",
             "base",
-            &[row_with_value(
-                "row-a",
-                "rootless-a",
-                "rootless",
-                "updated",
-            )],
+            &[row_with_value("row-a", "rootless-a", "rootless", "updated")],
         )
         .await;
 
@@ -8306,12 +8453,7 @@ mod tests {
             &storage,
             "child",
             "rootless",
-            &[row_with_value(
-                "row-0150",
-                "child-0150",
-                "child",
-                "child",
-            )],
+            &[row_with_value("row-0150", "child-0150", "child", "child")],
         )
         .await;
         let read = storage
@@ -9874,6 +10016,7 @@ mod tests {
             changed_key_count: rows.len() as u64,
             row_count_estimate: result.row_count as u64,
             tree_height: result.tree_height as u32,
+            complete_state_fence: false,
         };
         let published = storage::load_published_commit_state_manifest(&read, typed_commit_id)
             .await
