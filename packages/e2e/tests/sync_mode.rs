@@ -336,7 +336,7 @@ async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_p
 
     let history = replica
         .execute(
-            "SELECT content FROM lix_file_history($1) WHERE id = $2 ORDER BY lixcol_depth",
+            "SELECT content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth",
             &[Value::Text(head.clone()), Value::Text(file_id.clone())],
         )
         .await
@@ -356,7 +356,7 @@ async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_p
 
     replica
         .execute(
-            "SELECT content FROM lix_file_history($1) WHERE id = $2 ORDER BY lixcol_depth",
+            "SELECT content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth",
             &[Value::Text(head), Value::Text(file_id)],
         )
         .await
