@@ -512,9 +512,9 @@ where
         }
         pending_demands.retain(|demand| !demand.response.is_closed());
         if !pending_demands.is_empty() {
-            let results = hydrate_sync_demands(lix, transport, pending_demands).await;
             let demands = std::mem::take(pending_demands);
-            let (retry, retry_error) = resolve_sync_demands(demands, results);
+            let (retry, retry_error) =
+                hydrate_and_resolve_sync_demands(lix, transport, demands).await;
             *pending_demands = retry;
             if let Some(error) = retry_error {
                 return Err(error);
@@ -834,18 +834,18 @@ where
     }
 }
 
-async fn hydrate_sync_demands<StorageImpl, Transport>(
+async fn hydrate_and_resolve_sync_demands<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
-    demands: &[SyncDemand],
-) -> Vec<Result<(), LixError>>
+    demands: Vec<SyncDemand>,
+) -> (Vec<SyncDemand>, Option<LixError>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
     let mut history_ids = BTreeSet::new();
     let mut chunk_ids = BTreeSet::new();
-    for demand in demands {
+    for demand in &demands {
         match &demand.request {
             SyncDemandRequest::History(ids) => history_ids.extend(ids),
             SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
@@ -861,25 +861,16 @@ where
     } else {
         hydrate_chunk_ids(lix, transport, chunk_ids.into_iter().cloned().collect()).await
     };
-    demands
-        .iter()
-        .map(|demand| match &demand.request {
-            SyncDemandRequest::History(_) => history_result.clone(),
-            SyncDemandRequest::Chunks(_) => chunk_result.clone(),
-        })
-        .collect()
-}
-
-fn resolve_sync_demands(
-    demands: Vec<SyncDemand>,
-    results: Vec<Result<(), LixError>>,
-) -> (Vec<SyncDemand>, Option<LixError>) {
     let mut retry = Vec::new();
     let mut retry_error = None;
-    for (demand, result) in demands.into_iter().zip(results) {
+    for demand in demands {
         if demand.response.is_closed() {
             continue;
         }
+        let result = match &demand.request {
+            SyncDemandRequest::History(_) => history_result.clone(),
+            SyncDemandRequest::Chunks(_) => chunk_result.clone(),
+        };
         match result {
             Err(error) if is_retryable_sync_transport_error(&error) => {
                 retry_error.get_or_insert(error);
@@ -2527,12 +2518,12 @@ mod tests {
             .map(|id| id.as_str().expect("chunk id string").to_owned())
             .collect::<BTreeSet<_>>();
         let chunk_ids = demanded.iter().cloned().collect::<Vec<_>>();
-        let (first_response, _first_done) = tokio::sync::oneshot::channel();
-        let (second_response, _second_done) = tokio::sync::oneshot::channel();
-        let results = hydrate_sync_demands(
+        let (first_response, first_done) = tokio::sync::oneshot::channel();
+        let (second_response, second_done) = tokio::sync::oneshot::channel();
+        let (retry, retry_error) = hydrate_and_resolve_sync_demands(
             &lix,
             &transport,
-            &[
+            vec![
                 SyncDemand {
                     request: SyncDemandRequest::Chunks(chunk_ids.clone()),
                     response: first_response,
@@ -2544,7 +2535,16 @@ mod tests {
             ],
         )
         .await;
-        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert!(retry.is_empty());
+        assert!(retry_error.is_none());
+        first_done
+            .await
+            .expect("first demand response arrives")
+            .expect("first demand hydrates");
+        second_done
+            .await
+            .expect("second demand response arrives")
+            .expect("second demand hydrates");
         let first_call_count = chunk_calls.lock().expect("chunk calls lock").len();
         assert_eq!(
             first_call_count,
@@ -2694,12 +2694,12 @@ mod tests {
             chunks: BTreeMap::new(),
             chunk_calls: Arc::new(Mutex::new(Vec::new())),
         };
-        let (first_response, _first_done) = tokio::sync::oneshot::channel();
-        let (second_response, _second_done) = tokio::sync::oneshot::channel();
-        let results = hydrate_sync_demands(
+        let (first_response, first_done) = tokio::sync::oneshot::channel();
+        let (second_response, second_done) = tokio::sync::oneshot::channel();
+        let (retry, retry_error) = hydrate_and_resolve_sync_demands(
             &replica,
             &transport,
-            &[
+            vec![
                 SyncDemand {
                     request: SyncDemandRequest::History(vec![parent.clone()]),
                     response: first_response,
@@ -2711,7 +2711,16 @@ mod tests {
             ],
         )
         .await;
-        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert!(retry.is_empty());
+        assert!(retry_error.is_none());
+        first_done
+            .await
+            .expect("first demand response arrives")
+            .expect("first demand hydrates");
+        second_done
+            .await
+            .expect("second demand response arrives")
+            .expect("second demand hydrates");
         let parent_requests = calls
             .lock()
             .expect("history calls lock")
@@ -2721,17 +2730,22 @@ mod tests {
             .count();
         assert_eq!(parent_requests, 1, "concurrent demands share one fetch");
         let calls_after_first_hydration = calls.lock().expect("history calls lock").len();
-        let (repeat_response, _repeat_done) = tokio::sync::oneshot::channel();
-        let results = hydrate_sync_demands(
+        let (repeat_response, repeat_done) = tokio::sync::oneshot::channel();
+        let (retry, retry_error) = hydrate_and_resolve_sync_demands(
             &replica,
             &transport,
-            &[SyncDemand {
+            vec![SyncDemand {
                 request: SyncDemandRequest::History(vec![parent.clone()]),
                 response: repeat_response,
             }],
         )
         .await;
-        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert!(retry.is_empty());
+        assert!(retry_error.is_none());
+        repeat_done
+            .await
+            .expect("repeat demand response arrives")
+            .expect("repeat demand hydrates");
         assert_eq!(
             calls.lock().expect("history calls lock").len(),
             calls_after_first_hydration,
@@ -2923,18 +2937,13 @@ mod tests {
             let hydrate = retry.hydrate_for_retry(Some(&demand_tx), error);
             let serve = async {
                 let demand = demand_rx.recv().await.expect("history demand arrives");
-                let mut results =
-                    hydrate_sync_demands(&replica, &transport, std::slice::from_ref(&demand)).await;
-                let result = results.pop().expect("one demand result");
-                demand
-                    .response
-                    .send(result.clone())
-                    .expect("retry waiter remains live");
-                result
+                let (pending, retry_error) =
+                    hydrate_and_resolve_sync_demands(&replica, &transport, vec![demand]).await;
+                assert!(pending.is_empty());
+                assert!(retry_error.is_none());
             };
-            let (retry_result, hydration_result) = tokio::join!(hydrate, serve);
+            let (retry_result, _hydration_result) = tokio::join!(hydrate, serve);
             retry_result.expect("shared retry accepts the graph miss");
-            hydration_result.expect("history boundary hydrates");
             match replica.execute(sql, &[]).await {
                 Ok(_) => break,
                 Err(next) => error = next,
@@ -2994,20 +3003,21 @@ mod tests {
             chunks: BTreeMap::new(),
             chunk_calls: Arc::new(Mutex::new(Vec::new())),
         };
-        let (response, _done) = tokio::sync::oneshot::channel();
-        let errors = hydrate_sync_demands(
+        let (response, done) = tokio::sync::oneshot::channel();
+        let (retry, retry_error) = hydrate_and_resolve_sync_demands(
             &replica,
             &transport,
-            &[SyncDemand {
+            vec![SyncDemand {
                 request: SyncDemandRequest::History(vec![parent.clone()]),
                 response,
             }],
         )
         .await;
-        let error = errors
-            .into_iter()
-            .next()
-            .expect("one result")
+        assert!(retry.is_empty());
+        assert!(retry_error.is_none());
+        let error = done
+            .await
+            .expect("demand response arrives")
             .expect_err("missing authority history fails");
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
         assert_eq!(
