@@ -2473,12 +2473,8 @@ where
     );
     response.headers_mut().insert(
         CONTENT_LENGTH,
-        http::HeaderValue::from_str(&content_length.to_string()).map_err(|_| {
-            ApiError::from(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "sync chunk response length cannot be encoded",
-            ))
-        })?,
+        http::HeaderValue::from_str(&content_length.to_string())
+            .expect("decimal chunk length is a valid HTTP header"),
     );
     response.headers_mut().insert(
         CACHE_CONTROL,
@@ -2644,7 +2640,7 @@ where
                 response.headers_mut().insert(
                     RANGE,
                     http::HeaderValue::from_str(&format!("bytes=0-{}", progress.next_offset - 1))
-                        .map_err(|_| ApiError::bad_request("upload offset cannot be encoded"))?,
+                        .expect("decimal upload offset is a valid HTTP header"),
                 );
             }
         }
@@ -2966,7 +2962,7 @@ where
         headers.insert(
             CONTENT_LENGTH,
             http::HeaderValue::from_str(&body_length.to_string())
-                .map_err(|_| ApiError::bad_request("file range length is invalid"))?,
+                .expect("decimal file range length is a valid HTTP header"),
         );
         if partial {
             let value = format!(
@@ -2978,7 +2974,7 @@ where
             headers.insert(
                 CONTENT_RANGE,
                 http::HeaderValue::from_str(&value)
-                    .map_err(|_| ApiError::bad_request("file content range is invalid"))?,
+                    .expect("numeric file content range is a valid HTTP header"),
             );
         }
     }
