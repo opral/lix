@@ -217,7 +217,11 @@ where
                 &format!("/sync/blob?blobId={}", encode_query(blob_id)),
                 "load sync blob manifest",
             );
-            decode_optional_response(self.client.send(request).await?, "load sync blob manifest")
+            let response = self.client.send(request).await?;
+            if response.status == 404 {
+                return Ok(None);
+            }
+            decode_response(response, "load sync blob manifest").map(Some)
         })
     }
 
@@ -303,19 +307,6 @@ where
             format!("decode {operation} response: {error}"),
         )
     })
-}
-
-fn decode_optional_response<T>(
-    response: RawHttpResponse,
-    operation: &str,
-) -> Result<Option<T>, LixError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    if response.status == 404 {
-        return Ok(None);
-    }
-    decode_response(response, operation).map(Some)
 }
 
 fn ensure_success(response: &RawHttpResponse, operation: &str) -> Result<(), LixError> {
