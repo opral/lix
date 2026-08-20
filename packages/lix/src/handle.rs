@@ -1610,7 +1610,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "activeAccountId": crate::ANONYMOUS_ACCOUNT_ID,
                 "cursor": 0,
-                "authoritativeHeads": {},
+                "authoritativeBranches": {},
                 "authorityKnownCommitIds": []
             }))
             .expect("replica state should encode"),

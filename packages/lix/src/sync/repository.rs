@@ -296,8 +296,8 @@ pub(crate) const SYNC_REPOSITORY_EVENT_SPACE: StorageSpace = StorageSpace::decla
 );
 
 pub(crate) const SYNC_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::declare(
-    StorageSpaceId(0x0007_0013),
-    "sync.replica_state.v2",
+    StorageSpaceId(0x0007_0014),
+    "sync.replica_state.v3",
     ValueSemantics::Mutable,
 );
 
@@ -315,9 +315,7 @@ pub(crate) struct RepositoryEventRecord {
 struct SyncReplicaState {
     active_account_id: String,
     cursor: u64,
-    authoritative_heads: BTreeMap<String, Option<String>>,
-    #[serde(default)]
-    authoritative_checkpoints: BTreeMap<String, Option<String>>,
+    authoritative_branches: BTreeMap<String, AuthoritativeBranchCoordinate>,
     /// Commit objects observed from the authority but not yet made reachable
     /// from a fully converged set of authority refs.
     ///
@@ -325,6 +323,63 @@ struct SyncReplicaState {
     /// their final ref update. Remembering those acknowledgements makes the
     /// next batch advance instead of rebuilding the same first 512 commits.
     authority_known_commit_ids: BTreeSet<String>,
+}
+
+/// The authority's complete coordinate for one known branch.
+///
+/// Absence from `SyncReplicaState::authoritative_branches` means the branch has
+/// never been observed. A present `Deleted` value is a durable deletion. A
+/// headed branch always carries its checkpoint, making the invalid split-map
+/// state "head without checkpoint" unrepresentable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "state"
+)]
+enum AuthoritativeBranchCoordinate {
+    Deleted,
+    Headed {
+        head_commit_id: String,
+        checkpoint_commit_id: String,
+    },
+}
+
+impl AuthoritativeBranchCoordinate {
+    fn from_wire(
+        head_commit_id: Option<String>,
+        checkpoint_commit_id: Option<String>,
+        context: &str,
+    ) -> Result<Self, LixError> {
+        match (head_commit_id, checkpoint_commit_id) {
+            (None, None) => Ok(Self::Deleted),
+            (Some(head_commit_id), Some(checkpoint_commit_id)) => Ok(Self::Headed {
+                head_commit_id,
+                checkpoint_commit_id,
+            }),
+            _ => Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("{context} head and checkpoint must be paired"),
+            )),
+        }
+    }
+
+    fn head_commit_id(&self) -> Option<&str> {
+        match self {
+            Self::Deleted => None,
+            Self::Headed { head_commit_id, .. } => Some(head_commit_id),
+        }
+    }
+
+    fn checkpoint_commit_id(&self) -> Option<&str> {
+        match self {
+            Self::Deleted => None,
+            Self::Headed {
+                checkpoint_commit_id,
+                ..
+            } => Some(checkpoint_commit_id),
+        }
+    }
 }
 
 fn replica_state_key(remote_id: &str) -> StorageKey {
@@ -1388,21 +1443,22 @@ where
                 .await?
                 .into_iter()
                 .collect::<BTreeMap<_, _>>();
-            let mut known = state
-                .authoritative_heads
-                .values()
-                .filter_map(|head| head.as_deref())
-                .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            for checkpoint in state
-                .authoritative_checkpoints
-                .values()
-                .filter_map(|checkpoint| checkpoint.as_deref())
-            {
-                known.insert(CommitId::parse_lix(
-                    checkpoint,
-                    "sync authoritative checkpoint",
-                )?);
+            let mut known = BTreeSet::new();
+            for coordinate in state.authoritative_branches.values() {
+                if let AuthoritativeBranchCoordinate::Headed {
+                    head_commit_id,
+                    checkpoint_commit_id,
+                } = coordinate
+                {
+                    known.insert(CommitId::parse_lix(
+                        head_commit_id,
+                        "sync authoritative head",
+                    )?);
+                    known.insert(CommitId::parse_lix(
+                        checkpoint_commit_id,
+                        "sync authoritative checkpoint",
+                    )?);
+                }
             }
             for commit_id in &state.authority_known_commit_ids {
                 known.insert(CommitId::parse_lix(
@@ -1415,8 +1471,7 @@ where
             let mut ref_updates_without_payload = BTreeSet::new();
             let branch_ids = local_controls
                 .keys()
-                .chain(state.authoritative_heads.keys())
-                .chain(state.authoritative_checkpoints.keys())
+                .chain(state.authoritative_branches.keys())
                 .cloned()
                 .collect::<BTreeSet<_>>();
             remaining_reconciliations.get_or_insert(branch_ids.len());
@@ -1434,10 +1489,12 @@ where
                 else {
                     continue;
                 };
-                let Some(authoritative) = state
-                    .authoritative_heads
-                    .get(branch_id)
-                    .and_then(|head| head.as_deref())
+                let Some(authoritative_coordinate) = state.authoritative_branches.get(branch_id)
+                else {
+                    continue;
+                };
+                let Some(authoritative) = authoritative_coordinate
+                    .head_commit_id()
                     .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
                     .transpose()?
                 else {
@@ -1446,10 +1503,8 @@ where
                 let local_checkpoint = local_controls
                     .get(branch_id)
                     .and_then(|control| control.working_diff_checkpoint_commit_id);
-                let authoritative_checkpoint = state
-                    .authoritative_checkpoints
-                    .get(branch_id)
-                    .and_then(|checkpoint| checkpoint.as_deref())
+                let authoritative_checkpoint = authoritative_coordinate
+                    .checkpoint_commit_id()
                     .map(|checkpoint| {
                         CommitId::parse_lix(checkpoint, "sync authoritative checkpoint")
                     })
@@ -1492,16 +1547,13 @@ where
                         })
                     })
                     .transpose()?;
-                let authoritative = state
-                    .authoritative_heads
-                    .get(&branch_id)
-                    .and_then(|head| head.as_deref())
+                let authoritative_coordinate = state.authoritative_branches.get(&branch_id);
+                let authoritative = authoritative_coordinate
+                    .and_then(AuthoritativeBranchCoordinate::head_commit_id)
                     .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
                     .transpose()?;
-                let authoritative_checkpoint = state
-                    .authoritative_checkpoints
-                    .get(&branch_id)
-                    .and_then(|checkpoint| checkpoint.as_deref())
+                let authoritative_checkpoint = authoritative_coordinate
+                    .and_then(AuthoritativeBranchCoordinate::checkpoint_commit_id)
                     .map(|checkpoint| {
                         CommitId::parse_lix(checkpoint, "sync authoritative checkpoint")
                     })
@@ -1525,11 +1577,9 @@ where
                         ref_updates.push(SyncRefUpdate {
                             branch_id: branch_id.clone(),
                             expected_head_commit_id: Some(authority_head.to_string()),
-                            expected_checkpoint_commit_id: state
-                                .authoritative_checkpoints
-                                .get(&branch_id)
-                                .cloned()
-                                .flatten(),
+                            expected_checkpoint_commit_id: authoritative_coordinate
+                                .and_then(AuthoritativeBranchCoordinate::checkpoint_commit_id)
+                                .map(str::to_owned),
                             head_commit_id: Some(local_head.to_string()),
                             checkpoint_commit_id: Some(
                                 local_checkpoint
@@ -1570,11 +1620,9 @@ where
                 ref_updates.push(SyncRefUpdate {
                     branch_id: branch_id.clone(),
                     expected_head_commit_id: authoritative.map(|head| head.to_string()),
-                    expected_checkpoint_commit_id: state
-                        .authoritative_checkpoints
-                        .get(&branch_id)
-                        .cloned()
-                        .flatten(),
+                    expected_checkpoint_commit_id: authoritative_coordinate
+                        .and_then(AuthoritativeBranchCoordinate::checkpoint_commit_id)
+                        .map(str::to_owned),
                     head_commit_id: local.map(|head| head.to_string()),
                     checkpoint_commit_id: local_checkpoint.map(|checkpoint| checkpoint.to_string()),
                 });
@@ -1608,9 +1656,9 @@ where
                 }
                 drop(read);
                 let authoritative_checkpoint = state
-                    .authoritative_checkpoints
+                    .authoritative_branches
                     .get(&branch_id)
-                    .and_then(|checkpoint| checkpoint.as_deref())
+                    .and_then(AuthoritativeBranchCoordinate::checkpoint_commit_id)
                     .ok_or_else(|| {
                         LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
@@ -1753,7 +1801,7 @@ where
                     // Only unattached acknowledgement frontiers are needed to
                     // continue a dependency-closed multi-page upload. Parents
                     // are superseded by their children, and a ref-attached tip
-                    // is already represented by authoritative_heads. Keeping
+                    // is already represented by authoritative_branches. Keeping
                     // every observed authority commit made this set grow with
                     // remote traffic whenever one local branch stayed
                     // divergent.
@@ -1763,18 +1811,15 @@ where
                         }
                     }
                     for (update, observation) in event.ref_updates.iter().zip(observed) {
-                        let authoritative = state
-                            .authoritative_heads
-                            .get(&update.branch_id)
-                            .cloned()
-                            .flatten();
-                        let authoritative_checkpoint = state
-                            .authoritative_checkpoints
-                            .get(&update.branch_id)
-                            .cloned()
-                            .flatten();
-                        if update.expected_head_commit_id != authoritative
-                            || update.expected_checkpoint_commit_id != authoritative_checkpoint
+                        let authoritative_coordinate =
+                            state.authoritative_branches.get(&update.branch_id);
+                        let authoritative = authoritative_coordinate
+                            .and_then(AuthoritativeBranchCoordinate::head_commit_id);
+                        let authoritative_checkpoint = authoritative_coordinate
+                            .and_then(AuthoritativeBranchCoordinate::checkpoint_commit_id);
+                        if update.expected_head_commit_id.as_deref() != authoritative
+                            || update.expected_checkpoint_commit_id.as_deref()
+                                != authoritative_checkpoint
                         {
                             return Err(LixError::new(
                                 LixError::CODE_INVALID_PARAM,
@@ -1784,13 +1829,11 @@ where
                                 ),
                             ));
                         }
-                        if update.head_commit_id.is_some() != update.checkpoint_commit_id.is_some()
-                        {
-                            return Err(LixError::new(
-                                LixError::CODE_INVALID_PARAM,
-                                "sync delta ref head and checkpoint must be paired",
-                            ));
-                        }
+                        let next_authoritative = AuthoritativeBranchCoordinate::from_wire(
+                            update.head_commit_id.clone(),
+                            update.checkpoint_commit_id.clone(),
+                            "sync delta ref",
+                        )?;
                         let local = observation
                             .control
                             .map(|control| control.head_commit_id.to_string());
@@ -1798,18 +1841,20 @@ where
                             .control
                             .and_then(|control| control.working_diff_checkpoint_commit_id)
                             .map(|checkpoint| checkpoint.to_string());
-                        if local == authoritative && local_checkpoint == authoritative_checkpoint {
+                        if local.as_deref() == authoritative
+                            && local_checkpoint.as_deref() == authoritative_checkpoint
+                        {
                             applicable_refs.push(SyncRefUpdate {
                                 branch_id: update.branch_id.clone(),
-                                expected_head_commit_id: local,
-                                expected_checkpoint_commit_id: local_checkpoint,
+                                expected_head_commit_id: local.clone(),
+                                expected_checkpoint_commit_id: local_checkpoint.clone(),
                                 head_commit_id: update.head_commit_id.clone(),
                                 checkpoint_commit_id: update.checkpoint_commit_id.clone(),
                             });
-                        } else if (local.as_ref(), local_checkpoint.as_ref())
+                        } else if (local.as_deref(), local_checkpoint.as_deref())
                             != (
-                                update.head_commit_id.as_ref(),
-                                update.checkpoint_commit_id.as_ref(),
+                                update.head_commit_id.as_deref(),
+                                update.checkpoint_commit_id.as_deref(),
                             )
                             && let Some(head) = update.head_commit_id.as_deref()
                         {
@@ -1833,12 +1878,8 @@ where
                             ));
                         }
                         state
-                            .authoritative_heads
-                            .insert(update.branch_id.clone(), update.head_commit_id.clone());
-                        state.authoritative_checkpoints.insert(
-                            update.branch_id.clone(),
-                            update.checkpoint_commit_id.clone(),
-                        );
+                            .authoritative_branches
+                            .insert(update.branch_id.clone(), next_authoritative);
                         if let Some(head) = update.head_commit_id.as_ref() {
                             state.authority_known_commit_ids.remove(head);
                         }
@@ -1874,41 +1915,43 @@ where
                 }
                 let adapter = self.storage_adapter();
                 let read = adapter.begin_read(StorageReadOptions::default()).await?;
-                let local_controls = BranchHeadControlContext::new()
+                let local_coordinates = BranchHeadControlContext::new()
                     .reader(&read)
                     .scan()
                     .await?
                     .into_iter()
                     .map(|(branch_id, control)| {
-                        (
+                        let checkpoint_commit_id =
+                            control.working_diff_checkpoint_commit_id.ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "local sync branch '{branch_id}' has no checkpoint cursor"
+                                    ),
+                                )
+                            })?;
+                        Ok((
                             branch_id,
-                            (
-                                control.head_commit_id.to_string(),
-                                control
-                                    .working_diff_checkpoint_commit_id
-                                    .map(|checkpoint| checkpoint.to_string()),
-                            ),
-                        )
+                            AuthoritativeBranchCoordinate::Headed {
+                                head_commit_id: control.head_commit_id.to_string(),
+                                checkpoint_commit_id: checkpoint_commit_id.to_string(),
+                            },
+                        ))
                     })
-                    .collect::<BTreeMap<_, _>>();
-                let all_branches = local_controls
+                    .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+                let all_branches = local_coordinates
                     .keys()
-                    .chain(state.authoritative_heads.keys())
-                    .chain(state.authoritative_checkpoints.keys())
+                    .chain(state.authoritative_branches.keys())
                     .collect::<BTreeSet<_>>();
                 if all_branches.into_iter().all(|branch_id| {
-                    local_controls.get(branch_id).map(|(head, _)| head)
-                        == state
-                            .authoritative_heads
-                            .get(branch_id)
-                            .and_then(Option::as_ref)
-                        && local_controls
-                            .get(branch_id)
-                            .and_then(|(_, checkpoint)| checkpoint.as_ref())
-                            == state
-                                .authoritative_checkpoints
-                                .get(branch_id)
-                                .and_then(Option::as_ref)
+                    match (
+                        local_coordinates.get(branch_id),
+                        state.authoritative_branches.get(branch_id),
+                    ) {
+                        (Some(local), Some(authoritative)) => local == authoritative,
+                        (None, Some(AuthoritativeBranchCoordinate::Deleted)) => true,
+                        _ => false,
+                    }
                 }) {
                     state.authority_known_commit_ids.clear();
                 }
@@ -2661,6 +2704,19 @@ where
             control.note_schemas(schemas.iter().map(String::as_str));
             stage_branch_head_control(&mut writes, &branch.branch_id, control)?;
         }
+        let authoritative_branches = branches
+            .iter()
+            .map(|branch| {
+                Ok((
+                    branch.branch_id.clone(),
+                    AuthoritativeBranchCoordinate::from_wire(
+                        branch.head_commit_id.clone(),
+                        branch.checkpoint_commit_id.clone(),
+                        "sync snapshot branch",
+                    )?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
         stage_replica_state(
             &mut writes,
             &mut preconditions,
@@ -2668,19 +2724,7 @@ where
             &SyncReplicaState {
                 active_account_id: active_account_id.to_owned(),
                 cursor,
-                authoritative_heads: branches
-                    .iter()
-                    .map(|branch| (branch.branch_id.clone(), branch.head_commit_id.clone()))
-                    .collect(),
-                authoritative_checkpoints: branches
-                    .iter()
-                    .map(|branch| {
-                        (
-                            branch.branch_id.clone(),
-                            branch.checkpoint_commit_id.clone(),
-                        )
-                    })
-                    .collect(),
+                authoritative_branches,
                 authority_known_commit_ids: BTreeSet::new(),
             },
             None,
@@ -4689,11 +4733,13 @@ mod tests {
                 SyncReplicaState {
                     active_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     cursor: 0,
-                    authoritative_heads: BTreeMap::from([(
+                    authoritative_branches: BTreeMap::from([(
                         receipt.main_branch_id,
-                        Some(receipt.initial_commit_id),
+                        AuthoritativeBranchCoordinate::Headed {
+                            head_commit_id: receipt.initial_commit_id.clone(),
+                            checkpoint_commit_id: receipt.initial_commit_id,
+                        },
                     )]),
-                    authoritative_checkpoints: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -4791,6 +4837,25 @@ mod tests {
             .and_then(|branch| branch.head_commit_id.clone())
             .expect("default branch must have a head");
         (default_branch_id.clone(), head)
+    }
+
+    fn authoritative_coordinates(
+        branches: &[SyncBranchHead],
+    ) -> BTreeMap<String, AuthoritativeBranchCoordinate> {
+        branches
+            .iter()
+            .map(|branch| {
+                (
+                    branch.branch_id.clone(),
+                    AuthoritativeBranchCoordinate::from_wire(
+                        branch.head_commit_id.clone(),
+                        branch.checkpoint_commit_id.clone(),
+                        "test snapshot branch",
+                    )
+                    .expect("snapshot branch coordinate should be complete"),
+                )
+            })
+            .collect()
     }
 
     async fn snapshot_parts(
@@ -6856,27 +6921,25 @@ mod tests {
         let SyncRepositoryPullResponse::Snapshot { branches, .. } = &snapshot else {
             unreachable!("fixture response is a snapshot");
         };
-        let mut authoritative_heads = branches
-            .iter()
-            .map(|branch| (branch.branch_id.clone(), branch.head_commit_id.clone()))
-            .collect::<BTreeMap<_, _>>();
-        authoritative_heads.insert(branch_id.clone(), Some(authority_head.clone()));
+        let mut authoritative_branches = authoritative_coordinates(branches);
+        let checkpoint_commit_id = authoritative_branches[&branch_id]
+            .checkpoint_commit_id()
+            .expect("authority branch should have a checkpoint")
+            .to_owned();
+        authoritative_branches.insert(
+            branch_id.clone(),
+            AuthoritativeBranchCoordinate::Headed {
+                head_commit_id: authority_head.clone(),
+                checkpoint_commit_id,
+            },
+        );
         local
             .store_replica_state(
                 TEST_REMOTE,
                 SyncReplicaState {
                     active_account_id: local.active_account_id().to_owned(),
                     cursor: 1,
-                    authoritative_heads,
-                    authoritative_checkpoints: branches
-                        .iter()
-                        .map(|branch| {
-                            (
-                                branch.branch_id.clone(),
-                                branch.checkpoint_commit_id.clone(),
-                            )
-                        })
-                        .collect(),
+                    authoritative_branches,
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -6967,27 +7030,25 @@ mod tests {
         let SyncRepositoryPullResponse::Snapshot { branches, .. } = &snapshot else {
             unreachable!("fixture response is a snapshot");
         };
-        let mut authoritative_heads = branches
-            .iter()
-            .map(|branch| (branch.branch_id.clone(), branch.head_commit_id.clone()))
-            .collect::<BTreeMap<_, _>>();
-        authoritative_heads.insert(divergent_branch_id.clone(), Some(authority_head));
+        let mut authoritative_branches = authoritative_coordinates(branches);
+        let checkpoint_commit_id = authoritative_branches[&divergent_branch_id]
+            .checkpoint_commit_id()
+            .expect("authority branch should have a checkpoint")
+            .to_owned();
+        authoritative_branches.insert(
+            divergent_branch_id.clone(),
+            AuthoritativeBranchCoordinate::Headed {
+                head_commit_id: authority_head,
+                checkpoint_commit_id,
+            },
+        );
         local
             .store_replica_state(
                 TEST_REMOTE,
                 SyncReplicaState {
                     active_account_id: local.active_account_id().to_owned(),
                     cursor: 1,
-                    authoritative_heads,
-                    authoritative_checkpoints: branches
-                        .iter()
-                        .map(|branch| {
-                            (
-                                branch.branch_id.clone(),
-                                branch.checkpoint_commit_id.clone(),
-                            )
-                        })
-                        .collect(),
+                    authoritative_branches,
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -7032,6 +7093,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authoritative_branch_coordinate_is_complete_and_round_trips() {
+        let headed = AuthoritativeBranchCoordinate::from_wire(
+            Some("head".to_owned()),
+            Some("checkpoint".to_owned()),
+            "test coordinate",
+        )
+        .expect("a complete headed coordinate should parse");
+        assert_eq!(
+            serde_json::to_value(&headed).expect("headed coordinate should encode"),
+            serde_json::json!({
+                "state": "headed",
+                "headCommitId": "head",
+                "checkpointCommitId": "checkpoint",
+            }),
+        );
+        assert_eq!(
+            serde_json::from_value::<AuthoritativeBranchCoordinate>(
+                serde_json::to_value(&headed).expect("headed coordinate should encode"),
+            )
+            .expect("headed coordinate should decode"),
+            headed,
+        );
+        assert_eq!(
+            AuthoritativeBranchCoordinate::from_wire(None, None, "test coordinate")
+                .expect("a deleted coordinate should parse"),
+            AuthoritativeBranchCoordinate::Deleted,
+        );
+        for (head, checkpoint) in [
+            (Some("head".to_owned()), None),
+            (None, Some("checkpoint".to_owned())),
+        ] {
+            assert_eq!(
+                AuthoritativeBranchCoordinate::from_wire(head, checkpoint, "test coordinate")
+                    .expect_err("a partial coordinate must be rejected")
+                    .code,
+                LixError::CODE_INVALID_PARAM,
+            );
+        }
+        assert!(
+            serde_json::from_value::<AuthoritativeBranchCoordinate>(serde_json::json!({
+                "state": "headed",
+                "headCommitId": "head",
+            }))
+            .is_err(),
+            "persisted headed coordinates require a checkpoint",
+        );
+    }
+
     #[tokio::test]
     async fn replica_state_persists_and_enforces_the_authority_account() {
         let replica = open_lix().await.expect("replica should open");
@@ -7041,8 +7151,7 @@ mod tests {
                 SyncReplicaState {
                     active_account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
                     cursor: 7,
-                    authoritative_heads: BTreeMap::new(),
-                    authoritative_checkpoints: BTreeMap::new(),
+                    authoritative_branches: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
