@@ -153,6 +153,12 @@ pub struct CreateCheckpointResponseBody {
     pub commit_id: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreRequestBody<'a> {
+    pub commit_id: &'a str,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UndoResponseBody {

@@ -47,6 +47,7 @@ export type WorkerOperation =
 	| { kind: "activeAccountId" }
 	| { kind: "createBranch"; options: CreateBranchOptions }
 	| { kind: "createCheckpoint" }
+	| { kind: "restore"; commitId: string }
 	| { kind: "undo" }
 	| { kind: "redo" }
 	| { kind: "switchBranch"; options: SwitchBranchOptions }

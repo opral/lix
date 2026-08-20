@@ -311,6 +311,122 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn checkpoint_gc_eventually_reclaims_a_commit_orphaned_by_restore() {
+        let (engine, session) = open().await;
+        let branch_id = session.branch.get().expect("session branch resolves");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('restore-gc', 'c')",
+                &[],
+            )
+            .await
+            .expect("C commits");
+        let commit_c = head(&engine, &branch_id).await;
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'd' WHERE key = 'restore-gc'",
+                &[],
+            )
+            .await
+            .expect("D commits");
+        let commit_d = head(&engine, &branch_id).await;
+        let commit_d_id = CommitId::parse_lix(&commit_d, "restore GC commit D")
+            .expect("D commit id parses");
+
+        session
+            .restore(commit_c.clone())
+            .await
+            .expect("restore to C succeeds");
+        assert_eq!(head(&engine, &branch_id).await, commit_c);
+        assert_eq!(
+            present(&session, std::slice::from_ref(&commit_d)).await,
+            [commit_d.clone()],
+            "restore must leave D stored until a later garbage-collection sweep"
+        );
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("pre-GC read opens");
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, commit_d_id)
+                .await
+                .expect("pre-GC D manifest lookup succeeds")
+                .is_some(),
+            "D must own physical tracked state before this test can prove it is reclaimed"
+        );
+        drop(read);
+
+        // Two non-empty checkpoint intervals make collection debt durable.
+        // Empty checkpoints then cross the staleness backstop deterministically;
+        // they do not manufacture additional garbage or change D's reachability.
+        for round in 0..2 {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ('restore-gc-live', $1) \
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    &[Value::Jsonb(json!(round).into())],
+                )
+                .await
+                .expect("post-restore write commits");
+            session
+                .create_checkpoint()
+                .await
+                .expect("non-empty checkpoint succeeds");
+        }
+        for _ in 0..RECLAIM_MAX_STALENESS {
+            session
+                .create_checkpoint()
+                .await
+                .expect("padding checkpoint succeeds");
+        }
+
+        // Production schedules this sweep in the background. The explicit
+        // call takes the same repository write gate, so it either performs the
+        // sweep or observes that the scheduled collector already completed it.
+        session
+            .collect_checkpoint_garbage()
+            .await
+            .expect("checkpoint garbage collection succeeds");
+        assert!(
+            present(&session, std::slice::from_ref(&commit_d))
+                .await
+                .is_empty(),
+            "checkpoint GC must reclaim orphaned commit D '{commit_d}'"
+        );
+
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-GC read opens");
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(&read, commit_d_id)
+                .await
+                .expect("D manifest lookup succeeds")
+                .is_none(),
+            "garbage collection must reclaim D's physical tracked-state manifest too"
+        );
+        drop(read);
+
+        let restored = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'restore-gc'",
+                &[],
+            )
+            .await
+            .expect("live restored state reads after GC");
+        assert_eq!(
+            restored.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("restored value is JSON"),
+            json!("c"),
+            "collecting D must not damage the live branch descended from C"
+        );
+    }
+
     /// Deletes one commit's physical delta the way the sweep that shipped
     /// before the history-retention fix did, leaving the commit record itself
     /// in place. This is `pub(crate)` on purpose and stays that way: a

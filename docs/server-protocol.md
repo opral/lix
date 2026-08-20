@@ -27,7 +27,7 @@ and authentication and forwards requests to it. See [Hosting](./hosting.md).
 | SQL         | `/lix/v1/execute`, `/lix/v1/execute-batch`                                                    |
 | Transaction | `/lix/v1/transaction/{begin,execute,commit,rollback}`                                         |
 | Files       | `/lix/v1/file`, `/lix/v1/file/upsert`, `/lix/v1/file/upsert-batch`                            |
-| Versioning  | `/lix/v1/branch/{create,switch}`, `/lix/v1/checkpoint/create`, `/lix/v1/undo`, `/lix/v1/redo` |
+| Versioning  | `/lix/v1/branch/{create,switch}`, `/lix/v1/checkpoint/create`, `/lix/v1/restore`, `/lix/v1/undo`, `/lix/v1/redo` |
 | Observation | `/lix/v1/observe`, `/lix/v1/observe/multiplex`                                                |
 
 Clients do not construct these paths. `openLix()` appends `/lix/v1/` to the
