@@ -128,14 +128,11 @@ where
         request
     }
 
-    async fn send_json<T>(
-        &self,
-        request: RawHttpRequest,
-        operation: &'static str,
-    ) -> Result<T, LixError>
+    async fn send_json<T>(&self, request: RawHttpRequest) -> Result<T, LixError>
     where
         T: serde::de::DeserializeOwned,
     {
+        let operation = request.operation;
         decode_response(self.client.send(request).await?, operation)
     }
 }
@@ -157,7 +154,7 @@ where
             let mut request = self.request(Method::Post, "/sync/push", "push sync commits");
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode sync push")?);
-            self.send_json(request, "push sync commits").await
+            self.send_json(request).await
         })
     }
 
@@ -172,7 +169,7 @@ where
                 None => format!("/sync/pull?limit={limit}"),
             };
             let request = self.request(Method::Get, &path, "pull sync repository");
-            self.send_json(request, "pull sync repository").await
+            self.send_json(request).await
         })
     }
 
@@ -194,7 +191,7 @@ where
                 path.push_str(&encode_query(continuation));
             }
             let request = self.request(Method::Get, &path, "load sync snapshot rows");
-            self.send_json(request, "load sync snapshot rows").await
+            self.send_json(request).await
         })
     }
 
@@ -218,7 +215,7 @@ where
                 &format!("/sync/history?{query}"),
                 "load sync history",
             );
-            self.send_json(request, "load sync history").await
+            self.send_json(request).await
         })
     }
 
@@ -247,7 +244,7 @@ where
                 self.request(Method::Post, "/sync/blob", "register sync blob manifest");
             request.headers.push(json_content_type());
             request.body = Some(json_body(manifest, "encode sync blob manifest")?);
-            self.send_json(request, "register sync blob manifest").await
+            self.send_json(request).await
         })
     }
 
