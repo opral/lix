@@ -270,18 +270,6 @@ type CreateCheckpointReceipt = {
 };
 ```
 
-### restore()
-
-```ts
-await lix.restore(commitId);
-```
-
-Moves the active branch HEAD to `commitId`, which must exist and be an ancestor
-of the current HEAD. Restoring the current HEAD is a no-op. Restore does not
-create a commit and is not an undo/redo operation; commits abandoned by the
-move may remain stored until checkpoint-driven garbage collection reclaims
-them.
-
 ### undo() / redo()
 
 ```ts

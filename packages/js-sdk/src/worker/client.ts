@@ -195,7 +195,6 @@ function workerBinding(
 		activeAccountId: () => request({ kind: "activeAccountId" }),
 		createBranch: (options) => request({ kind: "createBranch", options }),
 		createCheckpoint: () => request({ kind: "createCheckpoint" }),
-		restore: (commitId) => request({ kind: "restore", commitId }),
 		undo: () => request({ kind: "undo" }),
 		redo: () => request({ kind: "redo" }),
 		switchBranch: (options) => request({ kind: "switchBranch", options }),

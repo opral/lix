@@ -368,11 +368,6 @@ impl WasmLix {
         })
     }
 
-    #[wasm_bindgen(js_name = restore)]
-    pub async fn restore(&self, commit_id: String) -> Result<(), JsValue> {
-        self.inner.restore(commit_id).await.map_err(lix_error_to_js)
-    }
-
     #[wasm_bindgen(js_name = undo)]
     pub async fn undo(&self) -> Result<JsValue, JsValue> {
         let receipt = self.inner.undo().await.map_err(lix_error_to_js)?;

@@ -54,11 +54,49 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
     let arity = function_arity(&function.args);
 
     match name {
-        "current_timestamp"
-        | "uuidv7"
-        | "lix_active_branch_id"
-        | "lix_active_branch_commit_id" => expect_exact_arity(name, arity, 0),
+        "current_timestamp" | "uuidv7" | "lix_active_branch_id" | "lix_active_branch_commit_id" => {
+            expect_exact_arity(name, arity, 0)
+        }
+        "lix_restore" => expect_exact_arity(name, arity, 1),
         _ => Ok(()),
+    }
+}
+
+pub(crate) fn statement_has_restore_function(statement: &DataFusionStatement) -> bool {
+    let mut visitor = RestoreFunctionVisitor { found: false };
+    visit_datafusion_statement_for_restore_function(statement, &mut visitor);
+    visitor.found
+}
+
+struct RestoreFunctionVisitor {
+    found: bool,
+}
+
+impl Visitor for RestoreFunctionVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if matches!(expr, Expr::Function(function) if public_lix_function_name(function) == Some("lix_restore"))
+        {
+            self.found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn visit_datafusion_statement_for_restore_function(
+    statement: &DataFusionStatement,
+    visitor: &mut RestoreFunctionVisitor,
+) {
+    match statement {
+        DataFusionStatement::Statement(statement) => {
+            let _ = statement.visit(visitor);
+        }
+        DataFusionStatement::Explain(explain) => {
+            visit_datafusion_statement_for_restore_function(explain.statement.as_ref(), visitor);
+        }
+        _ => {}
     }
 }
 
@@ -156,6 +194,7 @@ fn public_lix_function_name(function: &Function) -> Option<&'static str> {
         "uuidv7" => Some("uuidv7"),
         "lix_active_branch_id" => Some("lix_active_branch_id"),
         "lix_active_branch_commit_id" => Some("lix_active_branch_commit_id"),
+        "lix_restore" => Some("lix_restore"),
         _ => None,
     }
 }

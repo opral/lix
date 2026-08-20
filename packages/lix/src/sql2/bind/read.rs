@@ -17,6 +17,9 @@ pub(crate) enum BoundStatementRoute {
 pub(crate) fn bind_statement_route(
     statement: &DataFusionStatement,
 ) -> Result<BoundStatementRoute, LixError> {
+    if super::public_udf::statement_has_restore_function(statement) {
+        return Ok(BoundStatementRoute::Write);
+    }
     match super::classify::classify_datafusion_statement(statement) {
         super::classify::SqlStatementKind::Read => Ok(BoundStatementRoute::Read),
         super::classify::SqlStatementKind::Write => Ok(BoundStatementRoute::Write),
@@ -31,9 +34,7 @@ pub(crate) fn bind_read_statement(
     _sql: &str,
     statement: &DataFusionStatement,
 ) -> Result<(), LixError> {
-    if super::classify::classify_datafusion_statement(statement)
-        == super::classify::SqlStatementKind::Write
-    {
+    if bind_statement_route(statement)? == BoundStatementRoute::Write {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "SQL writes must use the bound write planning path",

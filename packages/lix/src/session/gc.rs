@@ -338,7 +338,7 @@ mod tests {
             .expect("D commit id parses");
 
         session
-            .restore(commit_c.clone())
+            .execute("SELECT lix_restore($1)", &[Value::Text(commit_c.clone())])
             .await
             .expect("restore to C succeeds");
         assert_eq!(head(&engine, &branch_id).await, commit_c);

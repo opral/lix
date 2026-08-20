@@ -148,10 +148,6 @@ enum LixCommand {
         deferred: NativeCreateBranchDeferred,
     },
     CreateCheckpoint(NativeCreateCheckpointDeferred),
-    Restore {
-        commit_id: String,
-        deferred: NativeUnitDeferred,
-    },
     Undo(NativeUndoDeferred),
     Redo(NativeRedoDeferred),
     SwitchBranch {
@@ -323,7 +319,6 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std:
             LixCommand::ActiveAccountId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateCheckpoint(deferred) => deferred.reject(to_napi_error(&error)),
-            LixCommand::Restore { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::Undo(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::Redo(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::SwitchBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
@@ -423,14 +418,6 @@ fn handle_lix_command(
             let result = rt
                 .block_on(state.lix.create_checkpoint())
                 .map(CreateCheckpointReceiptDto::from);
-            settle_deferred(deferred, result);
-            false
-        }
-        LixCommand::Restore {
-            commit_id,
-            deferred,
-        } => {
-            let result = rt.block_on(state.lix.restore(commit_id));
             settle_deferred(deferred, result);
             false
         }
@@ -572,9 +559,6 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::CreateCheckpoint(deferred) => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
-        LixCommand::Restore { deferred, .. } => {
-            settle_deferred(deferred, Err(lix_closed_error()));
-        }
         LixCommand::Undo(deferred) => settle_deferred(deferred, Err(lix_closed_error())),
         LixCommand::Redo(deferred) => settle_deferred(deferred, Err(lix_closed_error())),
         LixCommand::SwitchBranch { deferred, .. } => {
@@ -708,13 +692,6 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.create_checkpoint().await,
             Self::FilesystemStorage(lix, _, _) => lix.create_checkpoint().await,
-        }
-    }
-
-    async fn restore(&self, commit_id: String) -> std::result::Result<(), LixError> {
-        match self {
-            Self::Memory(lix) => lix.restore(commit_id).await,
-            Self::FilesystemStorage(lix, _, _) => lix.restore(commit_id).await,
         }
     }
 
@@ -1236,17 +1213,6 @@ impl NativeLix {
             env.create_deferred()?;
         self.actor
             .send_with_deferred(deferred, LixCommand::CreateCheckpoint);
-        Ok(promise)
-    }
-
-    #[napi(js_name = "restore")]
-    pub fn restore<'env>(&self, env: &'env Env, commit_id: String) -> Result<Object<'env>> {
-        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
-        self.actor
-            .send_with_deferred(deferred, |deferred| LixCommand::Restore {
-                commit_id,
-                deferred,
-            });
         Ok(promise)
     }
 

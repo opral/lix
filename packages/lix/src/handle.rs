@@ -1000,11 +1000,6 @@ where
         self.session.create_checkpoint().await
     }
 
-    /// Restores the active branch to `commit_id`, which must be an ancestor of HEAD.
-    pub async fn restore(&self, commit_id: impl Into<String>) -> Result<(), LixError> {
-        self.session.restore(commit_id.into()).await
-    }
-
     /// Reverses the latest undoable tracked commit on this handle's active branch.
     pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
         self.retry_sync_demands(|| self.session.undo()).await
