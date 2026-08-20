@@ -16,7 +16,8 @@ mod protocol;
 mod repository;
 mod runtime;
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use crate::LixError;
@@ -88,7 +89,8 @@ pub(crate) fn validate_sync_branch_id(branch_id: &str) -> Result<(), LixError> {
 }
 
 /// Process-wide role shared by every session on one repository engine.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub(crate) enum SyncRole {
     #[default]
     Disabled,
@@ -104,31 +106,31 @@ pub(crate) enum SyncRole {
 /// runtime worker serializes remote repository events.
 #[derive(Clone, Debug)]
 pub(crate) struct SyncModeState {
-    role: Arc<RwLock<SyncRole>>,
+    role: Arc<AtomicU8>,
     change_watch: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl Default for SyncModeState {
     fn default() -> Self {
         Self {
-            role: Arc::new(RwLock::new(SyncRole::Disabled)),
+            role: Arc::new(AtomicU8::new(SyncRole::Disabled as u8)),
             change_watch: Arc::new(tokio::sync::watch::channel(0).0),
         }
     }
 }
 
 impl SyncModeState {
-    pub(crate) fn role(&self) -> Result<SyncRole, LixError> {
-        self.role.read().map(|role| role.clone()).map_err(|_| {
-            LixError::new(LixError::CODE_INTERNAL_ERROR, "sync mode state is poisoned")
-        })
+    pub(crate) fn role(&self) -> SyncRole {
+        match self.role.load(Ordering::Acquire) {
+            value if value == SyncRole::Disabled as u8 => SyncRole::Disabled,
+            value if value == SyncRole::Authority as u8 => SyncRole::Authority,
+            value if value == SyncRole::Replica as u8 => SyncRole::Replica,
+            _ => unreachable!("sync role stores only enum discriminants"),
+        }
     }
 
-    pub(crate) fn set_role(&self, role: SyncRole) -> Result<(), LixError> {
-        *self.role.write().map_err(|_| {
-            LixError::new(LixError::CODE_INTERNAL_ERROR, "sync mode state is poisoned")
-        })? = role;
-        Ok(())
+    pub(crate) fn set_role(&self, role: SyncRole) {
+        self.role.store(role as u8, Ordering::Release);
     }
 
     pub(crate) fn change_watcher(&self) -> tokio::sync::watch::Receiver<u64> {

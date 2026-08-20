@@ -577,7 +577,7 @@ where
         .await?;
         self.ensure_open()?;
         let mut transaction = opened.transaction;
-        transaction.set_sync_role(self.sync_mode.role()?);
+        transaction.set_sync_role(self.sync_mode.role());
         if self.sync_outbox_suppressed {
             transaction.suppress_ordinary_sync_event();
         }

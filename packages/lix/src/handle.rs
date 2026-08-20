@@ -1011,7 +1011,8 @@ where
     }
 
     pub(crate) fn set_sync_role(&self, role: crate::sync::SyncRole) -> Result<(), LixError> {
-        self.engine.sync_mode().set_role(role)
+        self.engine.sync_mode().set_role(role);
+        Ok(())
     }
 
     pub(crate) async fn align_primary_account_for_sync(

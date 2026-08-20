@@ -93,7 +93,7 @@ where
                 }
             };
         self.ensure_open()?;
-        opened.transaction.set_sync_role(self.sync_mode.role()?);
+        opened.transaction.set_sync_role(self.sync_mode.role());
         if self.sync_outbox_suppressed {
             opened.transaction.suppress_ordinary_sync_event();
         }
