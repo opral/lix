@@ -476,7 +476,6 @@ where
     options: ServerProtocolOptions,
     registry: AsyncMutex<SessionRegistry<S>>,
     request_blob_budget: Arc<RequestBlobCacheBudget>,
-    sync_push_gate: Arc<AsyncMutex<()>>,
     session_open_gate: Arc<SessionOpenGate>,
     close_started: Once,
     close_result: watch::Sender<Option<Result<(), LixError>>>,
@@ -1471,7 +1470,6 @@ where
                 request_blob_budget: Arc::new(RequestBlobCacheBudget::new(
                     options.max_request_blob_cache_bytes,
                 )),
-                sync_push_gate: Arc::new(AsyncMutex::new(())),
                 session_open_gate: Arc::new(SessionOpenGate::default()),
                 close_started: Once::new(),
                 close_result,
@@ -1620,9 +1618,9 @@ where
                 )
                 .await,
             ),
-            (&Method::POST, "/lix/v1/sync/push") => result_response(
-                sync_push(self.clone(), lease, json_request!(SyncPushRequest)).await,
-            ),
+            (&Method::POST, "/lix/v1/sync/push") => {
+                result_response(sync_push(lease, json_request!(SyncPushRequest)).await)
+            }
             (&Method::GET, "/lix/v1/sync/pull") => {
                 let query = match decode_query::<SyncPullRequest>(parts.uri.query()) {
                     Ok(query) => query,
@@ -2302,7 +2300,6 @@ where
 }
 
 async fn sync_push<S>(
-    server: LixServerProtocol<S>,
     lease: SessionLease<S>,
     Json(request): Json<SyncPushRequest>,
 ) -> Result<Json<SyncPushResponse>, ApiError>
@@ -2333,17 +2330,12 @@ where
         return Err(ApiError::account_mismatch());
     }
     ensure_sync_push_event_fits(&request, MAX_SYNC_PULL_RESPONSE_BYTES)?;
-    let push_gate = Arc::clone(&server.inner.sync_push_gate);
     let response = lease
-        .run_durable(move |lix| {
-            let push_gate = Arc::clone(&push_gate);
-            async move {
-                // Cancellation cannot release repository ordering while the
-                // immutable objects, refs, and event cursor are committing.
-                let _guard = push_gate.lock().await;
-                lix.push_sync_repository(&request).await
-            }
-        })
+        // The engine-scoped collaboration gate inside
+        // `push_sync_repository` keeps immutable objects, refs, and the event
+        // cursor ordered. It is acquired inside this detached durable task,
+        // so request cancellation cannot release it early.
+        .run_durable(move |lix| async move { lix.push_sync_repository(&request).await })
         .await?;
     Ok(Json(response))
 }
