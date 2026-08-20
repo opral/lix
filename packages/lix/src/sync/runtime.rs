@@ -443,11 +443,11 @@ async fn run_sync_worker<StorageImpl>(
             }
         };
         match result {
-            Ok(IterationResult::Applied | IterationResult::LocalChange) => {
+            Ok(None) => {
                 internal_demand_retry = SyncDemandRetry::default();
                 retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
             }
-            Ok(IterationResult::Demand(first)) => {
+            Ok(Some(first)) => {
                 internal_demand_retry = SyncDemandRetry::default();
                 let mut demands = vec![first];
                 while let Ok(demand) = demand_rx.try_recv() {
@@ -519,13 +519,6 @@ async fn run_sync_worker<StorageImpl>(
     let _ = lix.close().await;
 }
 
-#[derive(Debug)]
-enum IterationResult {
-    Applied,
-    LocalChange,
-    Demand(SyncDemand),
-}
-
 async fn sync_iteration<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     remote_id: &str,
@@ -534,7 +527,7 @@ async fn sync_iteration<StorageImpl, Transport>(
     delta_pull_limit: &mut usize,
     change_watcher: &mut tokio::sync::watch::Receiver<u64>,
     demand_rx: &mut tokio::sync::mpsc::Receiver<SyncDemand>,
-) -> Result<IterationResult, LixError>
+) -> Result<Option<SyncDemand>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
@@ -561,7 +554,7 @@ where
             &snapshot.checkpoint_roots,
         )
         .await?;
-        return Ok(IterationResult::Applied);
+        return Ok(None);
     }
 
     // Publish completed local commits before waiting for remote work. Commit
@@ -600,23 +593,23 @@ where
         validate_delta_after(cursor, &response)?;
         prepare_pull(lix, transport, &response).await?;
         lix.apply_sync_repository_pull(remote_id, &response).await?;
-        return Ok(IterationResult::Applied);
+        return Ok(None);
     }
     let local_changed = change_watcher.changed().fuse();
     let pull = pull_delta_adaptive(transport, cursor, delta_pull_limit).fuse();
     let demand = demand_rx.recv().fuse();
     futures_util::pin_mut!(local_changed, pull, demand);
     select_biased! {
-        demand = demand => demand.map(IterationResult::Demand).ok_or_else(|| {
+        demand = demand => demand.map(Some).ok_or_else(|| {
             LixError::new(LixError::CODE_CLOSED, "sync demand channel closed")
         }),
-        _ = local_changed => Ok(IterationResult::LocalChange),
+        _ = local_changed => Ok(None),
         response = pull => {
             let response = response?;
             validate_delta_after(cursor, &response)?;
             prepare_pull(lix, transport, &response).await?;
             lix.apply_sync_repository_pull(remote_id, &response).await?;
-            Ok(IterationResult::Applied)
+            Ok(None)
         }
     }
 }
