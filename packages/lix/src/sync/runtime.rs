@@ -528,12 +528,12 @@ where
 
     // Publish completed local commits before waiting for remote work. Commit
     // identity and ref compare-and-swap make retry after a lost response safe.
-    loop {
+    let ref_conflicted = loop {
         let Some(request) = lix
             .build_sync_push(remote_id, *push_item_limit)
             .await?
         else {
-            break;
+            break false;
         };
         push_request_blobs(lix, transport, &request).await?;
         match transport.push(&request).await {
@@ -543,13 +543,13 @@ where
             // A ref moved concurrently. Pulling the authority's intervening
             // events lets the importer reconcile local refs/outbox state; an
             // immediate reconnect/re-push would repeat the same conflict.
-            Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => break,
+            Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => break true,
             Err(error) if is_request_too_large(&error) => {
                 reduce_push_limit_after_too_large(push_item_limit, error)?;
             }
             Err(error) => return Err(error),
         }
-    }
+    };
 
     let cursor = lix
         .load_sync_repository_cursor(remote_id)
@@ -560,6 +560,13 @@ where
                 "sync repository cursor disappeared after bootstrap",
             )
         })?;
+    if ref_conflicted {
+        let response = pull_delta_adaptive(transport, cursor, delta_pull_limit).await?;
+        validate_delta_after(cursor, &response)?;
+        register_pull_blob_manifests(lix, transport, &response).await?;
+        lix.apply_sync_repository_pull(remote_id, &response).await?;
+        return Ok(IterationResult::Applied);
+    }
     let local_changed = change_watcher.changed().fuse();
     let pull = pull_delta_adaptive(transport, cursor, delta_pull_limit).fuse();
     let demand = demand_rx.recv().fuse();
