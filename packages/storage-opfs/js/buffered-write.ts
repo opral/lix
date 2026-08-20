@@ -160,9 +160,9 @@ export function immutableValueError(): LixStorageError {
 }
 
 function storageKey(space: number, key: Uint8Array): string {
-	return `${space}:${Array.from(key, (byte) =>
-		byte.toString(16).padStart(2, "0"),
-	).join("")}`;
+	let encoded = `${space}:`;
+	for (const byte of key) encoded += byte.toString(16).padStart(2, "0");
+	return encoded;
 }
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {
