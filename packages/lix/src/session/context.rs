@@ -32,7 +32,7 @@ use crate::sql2::{
     SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
 };
 use crate::storage_adapter::Storage;
-use crate::storage_adapter::{Memory, StorageReadOptions};
+use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteSetStats};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::sync::SyncModeState;
 use crate::telemetry::TelemetrySink;
@@ -414,8 +414,8 @@ where
             Some(
                 Arc::clone(&self.collaboration_write_gate)
                     .lock_owned()
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
+                    .instrument(tracing::info_span!(
+                        target: "lix_sql",
                         "lix.perf.collaboration_gate_wait"
                     ))
                     .await,
@@ -530,8 +530,8 @@ where
             Arc::clone(&self.sql_planning_cache),
             self.file_views.clone(),
         ))
-        .instrument(tracing::debug_span!(
-            target: "lix_perf",
+        .instrument(tracing::info_span!(
+            target: "lix_sql",
             "lix.perf.transaction_open"
         ))
         .await?;
@@ -548,8 +548,8 @@ where
         let runtime_functions = opened.runtime_functions;
 
         match f(&mut transaction)
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
+            .instrument(tracing::info_span!(
+                target: "lix_sql",
                 "lix.perf.transaction_plan_and_stage"
             ))
             .await
@@ -561,16 +561,7 @@ where
                 crate::storage_bench::record_crud_physical_writes(outcome.storage_stats);
                 let after_commit_result = after_commit(&value);
                 drop(write_access);
-                self.observe_invalidation
-                    .bump_if_storage_changed(&outcome.storage_stats);
-                // The server sync endpoint long-polls on canonical-head
-                // movement. Notify only after the storage commit has crossed
-                // its boundary so a woken pull can always observe the event
-                // it was waiting for. Suppressed internal replica sessions
-                // must not wake their own worker while applying a pull.
-                if !self.sync_outbox_suppressed {
-                    self.sync_mode.notify_sync_change();
-                }
+                self.notify_after_storage_commit(&outcome.storage_stats);
                 after_commit_result?;
                 Ok(value)
             }
@@ -587,6 +578,28 @@ where
         &self,
     ) -> crate::transaction::TransactionCommitBoundary {
         self.transaction_manager.transaction_commit_boundary()
+    }
+
+    /// Wakes observers and sync long-polls after a durable storage commit.
+    ///
+    /// Named so this work cannot hide inside `transaction.commit()` self-time
+    /// on the production-exported `lix_sql` plane.
+    pub(super) fn notify_after_storage_commit(&self, storage_stats: &StorageWriteSetStats) {
+        let _span = tracing::info_span!(
+            target: "lix_sql",
+            "lix.perf.transaction_notify"
+        )
+        .entered();
+        self.observe_invalidation
+            .bump_if_storage_changed(storage_stats);
+        // The server sync endpoint long-polls on canonical-head movement.
+        // Notify only after the storage commit has crossed its boundary so a
+        // woken pull can always observe the event it was waiting for.
+        // Suppressed internal replica sessions must not wake their own worker
+        // while applying a pull.
+        if !self.sync_outbox_suppressed {
+            self.sync_mode.notify_sync_change();
+        }
     }
 }
 
@@ -608,8 +621,8 @@ impl SessionWriteAccess {
             self.collaboration_write_guard = Some(
                 Arc::clone(collaboration_write_gate)
                     .lock_owned()
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
+                    .instrument(tracing::info_span!(
+                        target: "lix_sql",
                         "lix.perf.collaboration_gate_wait"
                     ))
                     .await,

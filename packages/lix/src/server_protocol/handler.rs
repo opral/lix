@@ -1633,7 +1633,9 @@ where
                 observe_multiplex(lease, json_request!(MultiplexObserveRequest)).await,
             ),
             (_, known)
-                if SERVER_PROTOCOL_ENDPOINTS.iter().any(|(_, path)| *path == known) =>
+                if SERVER_PROTOCOL_ENDPOINTS
+                    .iter()
+                    .any(|(_, path)| *path == known) =>
             {
                 method_not_allowed()
             }
@@ -2238,11 +2240,8 @@ fn ensure_sync_push_event_fits(
     max_bytes: usize,
 ) -> Result<(), ApiError> {
     let commits = request.commits.iter().collect::<Vec<_>>();
-    let encoded_len = crate::sync::encoded_delta_event_len(
-        u64::MAX,
-        &commits,
-        &request.ref_updates,
-    )?;
+    let encoded_len =
+        crate::sync::encoded_delta_event_len(u64::MAX, &commits, &request.ref_updates)?;
     if encoded_len > max_bytes {
         return Err(ApiError::sync_push_event_too_large(max_bytes));
     }
@@ -2436,8 +2435,7 @@ async fn sync_register_blob<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    validate_sync_blob_manifest(&manifest)
-        .map_err(|error| ApiError::bad_request(error.message))?;
+    validate_sync_blob_manifest(&manifest).map_err(|error| ApiError::bad_request(error.message))?;
     let registration = lease
         .run_durable(move |lix| async move { lix.register_sync_blob_manifest(&manifest).await })
         .await?;
@@ -4797,6 +4795,7 @@ mod tests {
     };
     use lix::{Blob, Memory, open_lix};
     use serde_json::{Value as JsonValue, json};
+    use std::collections::BTreeMap;
     use std::io::Write as _;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
     use tracing::Subscriber;
@@ -5087,13 +5086,31 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct CapturedSpan {
+        id: tracing::span::Id,
         parent: Option<tracing::span::Id>,
         name: &'static str,
+        fields: BTreeMap<String, String>,
     }
 
     #[derive(Clone, Default)]
     struct CaptureLayer {
         spans: Arc<Mutex<Vec<CapturedSpan>>>,
+    }
+
+    struct FieldVisitor<'a> {
+        fields: &'a mut BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
     }
 
     impl<S> Layer<S> for CaptureLayer
@@ -5103,7 +5120,7 @@ mod tests {
         fn on_new_span(
             &self,
             attributes: &tracing::span::Attributes<'_>,
-            _id: &tracing::span::Id,
+            id: &tracing::span::Id,
             context: LayerContext<'_, S>,
         ) {
             let parent = attributes.parent().cloned().or_else(|| {
@@ -5112,13 +5129,33 @@ mod tests {
                     .then(|| context.current_span().id().cloned())
                     .flatten()
             });
+            let mut fields = BTreeMap::new();
+            attributes.record(&mut FieldVisitor {
+                fields: &mut fields,
+            });
             self.spans
                 .lock()
                 .expect("capture spans")
                 .push(CapturedSpan {
+                    id: id.clone(),
                     parent,
                     name: attributes.metadata().name(),
+                    fields,
                 });
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _context: LayerContext<'_, S>,
+        ) {
+            let mut spans = self.spans.lock().expect("capture spans");
+            if let Some(span) = spans.iter_mut().rev().find(|span| span.id == *id) {
+                values.record(&mut FieldVisitor {
+                    fields: &mut span.fields,
+                });
+            }
         }
     }
 
@@ -9116,10 +9153,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(error_code(response).await, LixError::CODE_BRANCH_NOT_FOUND);
-        assert_eq!(
-            app.server.inner.registry.lock().await.len(),
-            before
-        );
+        assert_eq!(app.server.inner.registry.lock().await.len(), before);
     }
 
     #[tokio::test]
@@ -10841,6 +10875,169 @@ mod tests {
         assert_eq!(sql_span.parent.as_ref(), Some(&protocol_span_id));
     }
 
+    fn require_span<'a>(spans: &'a [CapturedSpan], name: &str) -> &'a CapturedSpan {
+        spans
+            .iter()
+            .find(|span| span.name == name)
+            .unwrap_or_else(|| {
+                let names = spans.iter().map(|span| span.name).collect::<Vec<_>>();
+                panic!("missing exported span {name}, captured {names:?}")
+            })
+    }
+
+    fn assert_no_bound_parameter_or_bytea_fields(spans: &[CapturedSpan]) {
+        for span in spans {
+            for (key, value) in &span.fields {
+                assert!(
+                    !key.contains("param") && !key.contains("bytea") && !key.contains("BYTEA"),
+                    "span {} leaked parameter/byte field {key}={value}",
+                    span.name
+                );
+                assert!(
+                    !value.contains("BYTEA") && !key.ends_with(".parameters"),
+                    "span {} leaked parameter/byte value {key}={value}",
+                    span.name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_batch_write_exports_materialize_storage_and_notify() {
+        let capture = CaptureLayer::default();
+        let spans = Arc::clone(&capture.spans);
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let app = app_with_tracing_telemetry().await;
+        let (session_id, _) = new_session(&app.router).await;
+        spans.lock().expect("capture spans").clear();
+
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            Some(json!({
+                "statements": [
+                    {
+                        "sql": "INSERT INTO lix_key_value (key, value) VALUES ('exported-span', '1')",
+                        "params": []
+                    }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let spans = spans.lock().expect("capture spans");
+        let batch = require_span(&spans, "lix.sql.batch");
+        require_span(&spans, "lix.sql.query");
+        let materialize = require_span(&spans, "lix.perf.transaction_materialization");
+        let storage_commit = require_span(&spans, "lix.perf.transaction_storage_commit");
+        require_span(&spans, "lix.perf.storage_commit_accepted_visible");
+        let notify = require_span(&spans, "lix.perf.transaction_notify");
+        assert_eq!(materialize.parent.as_ref(), Some(&batch.id));
+        assert_eq!(storage_commit.parent.as_ref(), Some(&batch.id));
+        assert_eq!(notify.parent.as_ref(), Some(&batch.id));
+        assert_no_bound_parameter_or_bytea_fields(&spans);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_create_exports_engine_parent_commit_children_and_commit_id() {
+        let capture = CaptureLayer::default();
+        let spans = Arc::clone(&capture.spans);
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let app = app_with_tracing_telemetry().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let write = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-span', '1')",
+                "params": []
+            })),
+        )
+        .await;
+        assert_eq!(write.status(), StatusCode::OK);
+        spans.lock().expect("capture spans").clear();
+
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/checkpoint/create",
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let commit_id = response_json(response).await["commitId"]
+            .as_str()
+            .expect("commitId")
+            .to_string();
+
+        let spans = spans.lock().expect("capture spans");
+        let checkpoint = require_span(&spans, "lix.checkpoint.create");
+        assert_eq!(
+            checkpoint.fields.get("lix.commit_id").map(String::as_str),
+            Some(commit_id.as_str())
+        );
+        assert!(
+            checkpoint
+                .fields
+                .get("lix.parent_commit_id")
+                .is_some_and(|parent| !parent.is_empty() && parent != &commit_id),
+            "checkpoint span should record the parent commit, got {:?}",
+            checkpoint.fields.get("lix.parent_commit_id")
+        );
+        let materialize = require_span(&spans, "lix.perf.transaction_materialization");
+        let storage_commit = require_span(&spans, "lix.perf.transaction_storage_commit");
+        assert_eq!(materialize.parent.as_ref(), Some(&checkpoint.id));
+        assert_eq!(storage_commit.parent.as_ref(), Some(&checkpoint.id));
+        assert_no_bound_parameter_or_bytea_fields(&spans);
+    }
+
+    #[tokio::test]
+    async fn handshake_exports_session_open_separate_from_opened_bind() {
+        let capture = CaptureLayer::default();
+        let spans = Arc::clone(&capture.spans);
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let app = app_with_tracing_telemetry().await;
+        spans.lock().expect("capture spans").clear();
+
+        let (session_id, _) = new_session(&app.router).await;
+        assert!(!session_id.is_empty());
+
+        let spans = spans.lock().expect("capture spans");
+        require_span(&spans, "lix.session.open");
+        assert!(
+            spans.iter().all(|span| span.name != "lix.engine.open"),
+            "warm handshake must not reopen the protocol-root engine"
+        );
+        assert_no_bound_parameter_or_bytea_fields(&spans);
+    }
+
+    #[tokio::test]
+    async fn cold_open_lix_exports_engine_and_session_open() {
+        let capture = CaptureLayer::default();
+        let spans = Arc::clone(&capture.spans);
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let _lix = open_lix().await.expect("open lix");
+
+        let spans = spans.lock().expect("capture spans");
+        require_span(&spans, "lix.engine.open");
+        require_span(&spans, "lix.session.open");
+        assert!(
+            spans.iter().all(|span| span.name != "lix.opened"),
+            "lix.opened stays bind-only and requires an attached sink"
+        );
+        assert_no_bound_parameter_or_bytea_fields(&spans);
+    }
+
     #[tokio::test]
     async fn idle_timeout_expires_a_session_with_gone() {
         let app = app_with_options(ServerProtocolOptions {
@@ -10894,7 +11091,11 @@ mod tests {
             ..ServerProtocolOptions::default()
         })
         .await;
-        let pending = app.server.inner.session_open_gate.reserve(1)
+        let pending = app
+            .server
+            .inner
+            .session_open_gate
+            .reserve(1)
             .expect("reserve pending session open");
         assert!(!app.server.is_idle());
 
@@ -10906,7 +11107,10 @@ mod tests {
         drop(pending);
         assert!(app.server.is_idle());
         drop(
-            app.server.inner.session_open_gate.reserve(1)
+            app.server
+                .inner
+                .session_open_gate
+                .reserve(1)
                 .expect("released reservation can be reused"),
         );
     }
@@ -10914,7 +11118,11 @@ mod tests {
     #[tokio::test]
     async fn close_waits_for_pending_session_opens_before_closing_the_root() {
         let app = app().await;
-        let pending = app.server.inner.session_open_gate.reserve(1)
+        let pending = app
+            .server
+            .inner
+            .session_open_gate
+            .reserve(1)
             .expect("reserve pending session open");
         let server = app.server.clone();
         let closing = tokio::spawn(async move { server.close().await });
@@ -11015,7 +11223,11 @@ mod tests {
     #[tokio::test]
     async fn cancelled_close_caller_does_not_cancel_server_shutdown() {
         let app = app().await;
-        let pending = app.server.inner.session_open_gate.reserve(1)
+        let pending = app
+            .server
+            .inner
+            .session_open_gate
+            .reserve(1)
             .expect("reserve pending session open");
         let server = app.server.clone();
         let closing = tokio::spawn(async move { server.close().await });
@@ -11082,10 +11294,7 @@ mod tests {
         })
         .await
         .expect("all session opens should reach the storage barrier concurrently");
-        assert_eq!(
-            server.inner.registry.lock().await.len(),
-            SESSION_COUNT
-        );
+        assert_eq!(server.inner.registry.lock().await.len(), SESSION_COUNT);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -11790,12 +11999,7 @@ mod tests {
         let (session_id, _) = new_session(&app.router).await;
         let child = {
             let registry = app.server.inner.registry.lock().await;
-            Arc::clone(
-                &registry
-                    .get(&session_id)
-                    .expect("registered child")
-                    .lix,
-            )
+            Arc::clone(&registry.get(&session_id).expect("registered child").lix)
         };
         let root = Arc::clone(&app.server.inner.root);
 

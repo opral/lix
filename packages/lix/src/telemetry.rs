@@ -139,6 +139,12 @@ impl TelemetrySpanHandle for CallbackTelemetrySpan {
 }
 
 /// Explicit adapter from engine telemetry into the Rust `tracing` ecosystem.
+///
+/// Production subscribers export INFO `lix_sql` (SQL batch / query) and INFO
+/// `lix` (`lix.opened`). Commit, storage, notify, checkpoint, and session /
+/// engine-open phases that can take tens of milliseconds use those same
+/// targets at INFO so they appear in the same tree. Debug-only `lix_perf`
+/// micro-phases stay off the production plane.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TracingTelemetrySink;
 
@@ -455,10 +461,12 @@ mod tests {
             attribute_string(&started[0], "lix.account_id"),
             Some("account-id")
         );
-        assert!(started[0]
-            .attributes
-            .iter()
-            .all(|attribute| attribute.key.starts_with("lix.")));
+        assert!(
+            started[0]
+                .attributes
+                .iter()
+                .all(|attribute| attribute.key.starts_with("lix."))
+        );
     }
 
     #[test]

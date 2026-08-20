@@ -1798,8 +1798,8 @@ where
             &restore_targets,
             prepared_writes,
         )
-        .instrument(tracing::debug_span!(
-            target: "lix_perf",
+        .instrument(tracing::info_span!(
+            target: "lix_sql",
             "lix.perf.transaction_materialization"
         ))
         .await
@@ -1908,8 +1908,8 @@ where
         crate::storage_bench::record_crud_write_set_arena(&writes);
         let prepared_commit = match commit_storage
             .prepare_write_set(writes, write_options)
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
+            .instrument(tracing::info_span!(
+                target: "lix_sql",
                 "lix.perf.transaction_storage_prepare"
             ))
             .await
@@ -1936,8 +1936,8 @@ where
             );
             Ok(stats)
         })
-        .instrument(tracing::debug_span!(
-            target: "lix_perf",
+        .instrument(tracing::info_span!(
+            target: "lix_sql",
             "lix.perf.transaction_storage_commit"
         ))
         .await?;

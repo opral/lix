@@ -6,6 +6,7 @@ use crate::storage_adapter::Storage;
 use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow};
 use crate::transaction::StagedCommitChangeBatchBuilder;
 use crate::transaction_types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
+use tracing::Instrument as _;
 
 use super::context::SessionContext;
 
@@ -34,6 +35,7 @@ const RECLAIM_MAX_STALENESS: u64 = 64;
 
 struct CreateCheckpointOutcome {
     receipt: CreateCheckpointReceipt,
+    parent_commit_id: String,
     gc_due: bool,
 }
 
@@ -50,6 +52,12 @@ where
     /// collection runs asynchronously so a history-sized sweep cannot extend
     /// the foreground checkpoint latency.
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
+        let span = tracing::info_span!(
+            target: "lix",
+            "lix.checkpoint.create",
+            "lix.commit_id" = tracing::field::Empty,
+            "lix.parent_commit_id" = tracing::field::Empty,
+        );
         let outcome = self
             .with_write_transaction_lending(async move |transaction| {
                 let branch_id = transaction.active_branch_id().to_string();
@@ -160,10 +168,14 @@ where
                         commit_id,
                         change_id,
                     },
+                    parent_commit_id: previous_checkpoint_commit_id.to_string(),
                     gc_due,
                 })
             })
+            .instrument(span.clone())
             .await?;
+        span.record("lix.commit_id", outcome.receipt.commit_id.as_str());
+        span.record("lix.parent_commit_id", outcome.parent_commit_id.as_str());
         if outcome.gc_due {
             // GC debt is durable in the checkpoint transaction. The sweep is
             // therefore safely retryable and does not need to delay the user

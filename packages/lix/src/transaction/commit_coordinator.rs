@@ -221,6 +221,11 @@ where
             }
             let mut outcomes = Box::pin(commit_transaction_cohort(inputs)).await;
             if let Some(outcome) = outcomes.iter().find_map(|result| result.as_ref().ok()) {
+                let _span = tracing::info_span!(
+                    target: "lix_sql",
+                    "lix.perf.transaction_notify"
+                )
+                .entered();
                 self.inner
                     .observe_invalidation
                     .bump_if_storage_changed(&outcome.storage_stats);

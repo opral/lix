@@ -177,15 +177,22 @@ where
         drop(operation_guard);
         let outcome = result?;
         drop(self.write_access.take());
-        self.observe_invalidation
-            .bump_if_storage_changed(&outcome.storage_stats);
-        // Explicit transactions publish the same canonical event lane as
-        // automatic writes. Wake server long-polls only after the durable
-        // commit so readers never race a still-staged event. Suppressed
-        // internal replica transactions are excluded for the same reason as
-        // automatic sync-apply sessions.
-        if !self.session.sync_outbox_suppressed {
-            self.sync_mode.notify_sync_change();
+        {
+            let _span = tracing::info_span!(
+                target: "lix_sql",
+                "lix.perf.transaction_notify"
+            )
+            .entered();
+            self.observe_invalidation
+                .bump_if_storage_changed(&outcome.storage_stats);
+            // Explicit transactions publish the same canonical event lane as
+            // automatic writes. Wake server long-polls only after the durable
+            // commit so readers never race a still-staged event. Suppressed
+            // internal replica transactions are excluded for the same reason as
+            // automatic sync-apply sessions.
+            if !self.session.sync_outbox_suppressed {
+                self.sync_mode.notify_sync_change();
+            }
         }
         Ok(())
     }

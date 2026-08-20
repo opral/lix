@@ -97,8 +97,8 @@ where
         let mut write = self
             .storage
             .begin_write(opts)
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
+            .instrument(tracing::info_span!(
+                target: "lix_sql",
                 "lix.perf.storage_writer_wait"
             ))
             .await
@@ -116,8 +116,8 @@ where
             }
             Ok::<_, StorageWriteSetError>(stats)
         }
-        .instrument(tracing::debug_span!(
-            target: "lix_perf",
+        .instrument(tracing::info_span!(
+            target: "lix_sql",
             "lix.perf.storage_lowering"
         ))
         .await;
@@ -243,8 +243,8 @@ where
         let result = self
             .write
             .commit()
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
+            .instrument(tracing::info_span!(
+                target: "lix_sql",
                 "lix.perf.storage_commit_accepted_visible"
             ))
             .await?;
