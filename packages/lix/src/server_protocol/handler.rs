@@ -827,10 +827,6 @@ where
         }
     }
 
-    fn acquire(&self) {
-        self.activity.acquire_lease();
-    }
-
     fn release(&self, now: Instant) {
         *self
             .last_used
@@ -895,7 +891,7 @@ where
         record: Arc<SessionRecord<S>>,
         durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Self {
-        record.acquire();
+        record.activity.acquire_lease();
         Self {
             session_id,
             record,
