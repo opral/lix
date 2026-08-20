@@ -4344,9 +4344,9 @@ where
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
         let (head_cursor, _) = load_sequence(&read).await?;
-        drop(read);
 
         let Some(after) = after else {
+            drop(read);
             return self.build_sync_snapshot().await;
         };
         if after > head_cursor {
@@ -4358,7 +4358,6 @@ where
         let count = usize::try_from(head_cursor - after)
             .unwrap_or(usize::MAX)
             .min(limit);
-        let read = adapter.begin_read(StorageReadOptions::default()).await?;
         let keys = (1..=count)
             .map(|offset| event_key(after + u64::try_from(offset).expect("pull limit fits u64")))
             .collect::<Vec<_>>();
