@@ -382,6 +382,12 @@ impl AuthoritativeBranchCoordinate {
     }
 }
 
+struct ReplicaStatePublication<'a> {
+    remote_id: &'a str,
+    expected_cursor: u64,
+    state: &'a SyncReplicaState,
+}
+
 fn replica_state_key(remote_id: &str) -> StorageKey {
     StorageKey(Bytes::copy_from_slice(remote_id.as_bytes()))
 }
@@ -1776,7 +1782,11 @@ where
                     return Ok(());
                 }
                 for event in events {
-                    if event.cursor != state.cursor.saturating_add(1) {
+                    let expected_cursor = state.cursor;
+                    let next_cursor = expected_cursor
+                        .checked_add(1)
+                        .ok_or_else(|| LixError::unknown("sync replica cursor overflow"))?;
+                    if event.cursor != next_cursor {
                         return Err(LixError::new(
                             LixError::CODE_INVALID_PARAM,
                             "sync delta event cursor is not contiguous",
@@ -1884,6 +1894,7 @@ where
                             state.authority_known_commit_ids.remove(head);
                         }
                     }
+                    state.cursor = event.cursor;
                     drop(read);
                     self.import_sync_repository(
                         &SyncPushRequest {
@@ -1892,6 +1903,11 @@ where
                         },
                         SyncImportPurpose::ReplicaDelta,
                         None,
+                        Some(ReplicaStatePublication {
+                            remote_id,
+                            expected_cursor,
+                            state: &state,
+                        }),
                     )
                     .await?;
                     for (branch_id, local_head, authority_head, authority_checkpoint) in
@@ -1905,7 +1921,6 @@ where
                         )
                         .await?;
                     }
-                    state.cursor = event.cursor;
                 }
                 if state.cursor != *cursor {
                     return Err(LixError::new(
@@ -1913,49 +1928,7 @@ where
                         "sync delta cursor does not match its final event",
                     ));
                 }
-                let adapter = self.storage_adapter();
-                let read = adapter.begin_read(StorageReadOptions::default()).await?;
-                let local_coordinates = BranchHeadControlContext::new()
-                    .reader(&read)
-                    .scan()
-                    .await?
-                    .into_iter()
-                    .map(|(branch_id, control)| {
-                        let checkpoint_commit_id =
-                            control.working_diff_checkpoint_commit_id.ok_or_else(|| {
-                                LixError::new(
-                                    LixError::CODE_INTERNAL_ERROR,
-                                    format!(
-                                        "local sync branch '{branch_id}' has no checkpoint cursor"
-                                    ),
-                                )
-                            })?;
-                        Ok((
-                            branch_id,
-                            AuthoritativeBranchCoordinate::Headed {
-                                head_commit_id: control.head_commit_id.to_string(),
-                                checkpoint_commit_id: checkpoint_commit_id.to_string(),
-                            },
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>, LixError>>()?;
-                let all_branches = local_coordinates
-                    .keys()
-                    .chain(state.authoritative_branches.keys())
-                    .collect::<BTreeSet<_>>();
-                if all_branches.into_iter().all(|branch_id| {
-                    match (
-                        local_coordinates.get(branch_id),
-                        state.authoritative_branches.get(branch_id),
-                    ) {
-                        (Some(local), Some(authoritative)) => local == authoritative,
-                        (None, Some(AuthoritativeBranchCoordinate::Deleted)) => true,
-                        _ => false,
-                    }
-                }) {
-                    state.authority_known_commit_ids.clear();
-                }
-                self.store_replica_state(remote_id, state).await
+                Ok(())
             }
         }
     }
@@ -2054,11 +2027,13 @@ where
             },
             SyncImportPurpose::ReplicaDelta,
             None,
+            None,
         )
         .await
         .map(|_| ())
     }
 
+    #[cfg(test)]
     async fn store_replica_state(
         &self,
         remote_id: &str,
@@ -2751,7 +2726,7 @@ where
         &self,
         request: &SyncPushRequest,
     ) -> Result<SyncPushResponse, LixError> {
-        self.import_sync_repository(request, SyncImportPurpose::AuthorityPush, None)
+        self.import_sync_repository(request, SyncImportPurpose::AuthorityPush, None, None)
             .await
     }
 
@@ -2768,6 +2743,7 @@ where
             },
             SyncImportPurpose::History,
             Some((boundaries, rows)),
+            None,
         )
         .await?;
         Ok(())
@@ -2840,6 +2816,7 @@ where
         request: &SyncPushRequest,
         purpose: SyncImportPurpose,
         history_boundaries: Option<(&[SyncHistoryBoundary], &[SyncSnapshotRow])>,
+        replica_publication: Option<ReplicaStatePublication<'_>>,
     ) -> Result<SyncPushResponse, LixError> {
         // Sync imports publish the same repository state that foreground
         // auto-commit and checkpoint transactions read. Serialize at this
@@ -4055,10 +4032,37 @@ where
             published_ref_updates.push(update.clone());
         }
 
+        if let Some(publication) = &replica_publication {
+            if publication.expected_cursor.checked_add(1) != Some(publication.state.cursor) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync replica publication must advance exactly one event cursor",
+                ));
+            }
+            let (stored_state, previous) = load_replica_state(&read, publication.remote_id).await?;
+            if stored_state.as_ref().map(|state| state.cursor) != Some(publication.expected_cursor)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    "sync replica cursor changed while its repository event was admitted",
+                ));
+            }
+            stage_replica_state(
+                &mut writes,
+                &mut preconditions,
+                publication.remote_id,
+                publication.state,
+                previous,
+            )?;
+        }
         crate::json_store::stage_json_publication_fence(&read, &mut writes, &mut preconditions)
             .await?;
         let (current_cursor, _) = load_sequence(&read).await?;
-        if newly_imported.is_empty() && published_ref_updates.is_empty() && !hydrated_history {
+        if newly_imported.is_empty()
+            && published_ref_updates.is_empty()
+            && !hydrated_history
+            && replica_publication.is_none()
+        {
             return Ok(SyncPushResponse {
                 cursor: current_cursor,
             });
@@ -4501,8 +4505,9 @@ mod tests {
     use crate::engine::Engine;
     use crate::hot_state::{HotStateContext, HotStateRowRequest};
     use crate::storage::{
-        BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
-        ReadOptions, ScanCursor, Storage, StorageError, StorageRead, StorageSpace, WriteOptions,
+        BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory,
+        MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage, StorageError,
+        StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
     use crate::storage_adapter::SharedStorageAdapterRead;
     use crate::{
@@ -4520,6 +4525,9 @@ mod tests {
         inner: Memory,
         forbidden_operations: Arc<AtomicU64>,
         branch_control_scans: Arc<AtomicU64>,
+        write_transactions: Arc<AtomicU64>,
+        atomic_ref_receipts: Arc<AtomicU64>,
+        branch_publications_without_receipt: Arc<AtomicU64>,
     }
 
     struct SyncAccountingRead {
@@ -4528,10 +4536,23 @@ mod tests {
         branch_control_scans: Arc<AtomicU64>,
     }
 
+    struct SyncAccountingWrite {
+        inner: MemoryWrite,
+        write_transactions: Arc<AtomicU64>,
+        atomic_ref_receipts: Arc<AtomicU64>,
+        branch_publications_without_receipt: Arc<AtomicU64>,
+        touches_branch_control: bool,
+        touches_replica_state: bool,
+    }
+
     impl SyncAccountingStorage {
         fn reset(&self) {
             self.forbidden_operations.store(0, Ordering::Relaxed);
             self.branch_control_scans.store(0, Ordering::Relaxed);
+            self.write_transactions.store(0, Ordering::Relaxed);
+            self.atomic_ref_receipts.store(0, Ordering::Relaxed);
+            self.branch_publications_without_receipt
+                .store(0, Ordering::Relaxed);
         }
 
         fn forbidden_operation_count(&self) -> u64 {
@@ -4541,6 +4562,19 @@ mod tests {
         fn branch_control_scan_count(&self) -> u64 {
             self.branch_control_scans.load(Ordering::Relaxed)
         }
+
+        fn write_transaction_count(&self) -> u64 {
+            self.write_transactions.load(Ordering::Relaxed)
+        }
+
+        fn atomic_ref_receipt_count(&self) -> u64 {
+            self.atomic_ref_receipts.load(Ordering::Relaxed)
+        }
+
+        fn branch_publication_without_receipt_count(&self) -> u64 {
+            self.branch_publications_without_receipt
+                .load(Ordering::Relaxed)
+        }
     }
 
     impl Storage for SyncAccountingStorage {
@@ -4549,7 +4583,7 @@ mod tests {
         where
             Self: 'a;
         type Write<'a>
-            = MemoryWrite
+            = SyncAccountingWrite
         where
             Self: 'a;
 
@@ -4566,7 +4600,63 @@ mod tests {
             options: WriteOptions,
         ) -> Result<Self::Write<'_>, StorageError> {
             self.forbidden_operations.fetch_add(1, Ordering::Relaxed);
-            self.inner.begin_write(options).await
+            Ok(SyncAccountingWrite {
+                inner: self.inner.begin_write(options).await?,
+                write_transactions: Arc::clone(&self.write_transactions),
+                atomic_ref_receipts: Arc::clone(&self.atomic_ref_receipts),
+                branch_publications_without_receipt: Arc::clone(
+                    &self.branch_publications_without_receipt,
+                ),
+                touches_branch_control: false,
+                touches_replica_state: false,
+            })
+        }
+    }
+
+    impl StorageWrite for SyncAccountingWrite {
+        async fn put_many(
+            &mut self,
+            space: StorageSpace,
+            entries: PutBatch,
+        ) -> Result<(), StorageError> {
+            self.touches_branch_control |= space == crate::branch::BRANCH_HEAD_CONTROL_SPACE;
+            self.touches_replica_state |= space == SYNC_REPLICA_STATE_SPACE;
+            self.inner.put_many(space, entries).await
+        }
+
+        async fn delete_many(
+            &mut self,
+            space: StorageSpace,
+            keys: &[Key],
+        ) -> Result<(), StorageError> {
+            self.touches_branch_control |= space == crate::branch::BRANCH_HEAD_CONTROL_SPACE;
+            self.touches_replica_state |= space == SYNC_REPLICA_STATE_SPACE;
+            self.inner.delete_many(space, keys).await
+        }
+
+        async fn delete_range(
+            &mut self,
+            space: StorageSpace,
+            range: KeyRange,
+        ) -> Result<(), StorageError> {
+            self.touches_branch_control |= space == crate::branch::BRANCH_HEAD_CONTROL_SPACE;
+            self.touches_replica_state |= space == SYNC_REPLICA_STATE_SPACE;
+            self.inner.delete_range(space, range).await
+        }
+
+        async fn commit(self) -> Result<CommitResult, StorageError> {
+            self.write_transactions.fetch_add(1, Ordering::Relaxed);
+            if self.touches_branch_control && self.touches_replica_state {
+                self.atomic_ref_receipts.fetch_add(1, Ordering::Relaxed);
+            } else if self.touches_branch_control {
+                self.branch_publications_without_receipt
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.commit().await
+        }
+
+        async fn rollback(self) -> Result<(), StorageError> {
+            self.inner.rollback().await
         }
     }
 
@@ -4766,7 +4856,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonempty_sync_delta_scans_branch_controls_once_for_convergence() {
+    async fn delta_ref_and_cursor_publish_atomically_without_post_scan() {
         let authority = open_lix().await.expect("authority should open");
         authority
             .set_sync_role(super::super::SyncRole::Authority)
@@ -4804,11 +4894,40 @@ mod tests {
             .await
             .expect("snapshot should initialize replica");
 
-        write_key_value(&authority, "one-scan-delta", "after").await;
+        write_key_value(&authority, "scan-free-delta", "after").await;
         let delta = authority
             .pull_sync_repository(Some(cursor), 128)
             .await
             .expect("authority delta should load");
+        let SyncRepositoryPullResponse::Delta {
+            cursor: delta_cursor,
+            events,
+        } = &delta
+        else {
+            panic!("incremental pull should return a delta");
+        };
+        let [event] = events.as_slice() else {
+            panic!("one authority transaction should publish one event");
+        };
+        let [update] = event.ref_updates.as_slice() else {
+            panic!("the authority write should publish one ref update");
+        };
+        let expected_head = update
+            .head_commit_id
+            .clone()
+            .expect("the updated branch should remain headed");
+        replica
+            .import_sync_repository(
+                &SyncPushRequest {
+                    commits: event.commits.clone(),
+                    ref_updates: Vec::new(),
+                },
+                SyncImportPurpose::ReplicaDelta,
+                None,
+                None,
+            )
+            .await
+            .expect("fixture should preload immutable commit bodies");
         storage.reset();
         replica
             .apply_sync_repository_pull(TEST_REMOTE, &delta)
@@ -4817,9 +4936,42 @@ mod tests {
 
         assert_eq!(
             storage.branch_control_scan_count(),
-            1,
-            "nonempty delta convergence should scan branch controls exactly once",
+            0,
+            "the atomic event receipt needs no post-publication convergence scan",
         );
+        assert_eq!(
+            storage.write_transaction_count(),
+            1,
+            "a ready ref event should need one storage publication",
+        );
+        assert_eq!(
+            storage.atomic_ref_receipt_count(),
+            1,
+            "the branch ref and replica receipt must share that publication",
+        );
+        assert_eq!(
+            storage.branch_publication_without_receipt_count(),
+            0,
+            "the imported ref must never become visible without its cursor",
+        );
+        let adapter = replica.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("atomic publication read should open");
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("published branch should load")
+            .expect("published branch should exist");
+        let stored_state = load_replica_state(&read, TEST_REMOTE)
+            .await
+            .expect("published receipt should load")
+            .0
+            .expect("published receipt should exist");
+        assert_eq!(control.head_commit_id.to_string(), expected_head);
+        assert_eq!(stored_state.cursor, *delta_cursor);
     }
 
     fn default_head(snapshot: &SyncRepositoryPullResponse) -> (String, String) {
@@ -6912,6 +7064,7 @@ mod tests {
                 },
                 SyncImportPurpose::ReplicaDelta,
                 None,
+                None,
             )
             .await
             .expect("consumed delta commits should be locally available");
@@ -7022,6 +7175,7 @@ mod tests {
                     ref_updates: Vec::new(),
                 },
                 SyncImportPurpose::ReplicaDelta,
+                None,
                 None,
             )
             .await
