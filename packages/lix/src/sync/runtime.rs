@@ -2734,6 +2734,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_hydration_waits_for_collaboration_read_quiescence() {
+        let (replica, parent, head, commits, commit_headers, history_boundaries, boundary_rows) =
+            history_fixture().await;
+        let transport = HistoryTransport {
+            commits,
+            missing: BTreeSet::new(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            max_history_items: None,
+            fail_first_history: false,
+            commit_headers,
+            history_boundaries,
+            boundary_rows,
+            blobs: BTreeMap::new(),
+            blob_calls: Arc::new(Mutex::new(Vec::new())),
+            chunks: BTreeMap::new(),
+            chunk_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        // Expired auto-commit reads acquire this gate before their final
+        // retry. Once they do, sync is allowed to finish fetching immutable
+        // transport data, but it must not publish more storage revisions and
+        // exhaust the read's bounded retry budget.
+        let read_quiescence = replica.lock_collaboration_writes().await;
+        let worker_replica = replica.clone();
+        let worker_parent = parent.clone();
+        let (response, done) = tokio::sync::oneshot::channel();
+        let mut hydration = tokio::spawn(async move {
+            hydrate_and_resolve_sync_demands(
+                &worker_replica,
+                &transport,
+                vec![SyncDemand {
+                    request: SyncDemandRequest::History(vec![worker_parent]),
+                    response,
+                }],
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut hydration)
+                .await
+                .is_err(),
+            "sync history publication must wait behind read quiescence",
+        );
+        let error = replica
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2)",
+                &[Value::Text(parent.clone()), Value::Text(head.clone())],
+            )
+            .await
+            .expect_err("history remains deferred while publication is gated");
+        assert_eq!(error.code, "LIX_SYNC_HISTORY_REQUIRED");
+
+        drop(read_quiescence);
+        let (retry, retry_error) = hydration.await.expect("hydration task joins");
+        assert!(retry.is_empty());
+        assert!(retry_error.is_none());
+        done.await
+            .expect("history demand response arrives")
+            .expect("history demand succeeds");
+        replica
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2)",
+                &[Value::Text(parent), Value::Text(head)],
+            )
+            .await
+            .expect("history read succeeds after serialized publication");
+    }
+
+    #[tokio::test]
     async fn transient_history_hydration_keeps_the_sql_waiter_for_worker_retry() {
         let (replica, parent, _head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture().await;

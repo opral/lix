@@ -118,6 +118,22 @@ where
         &self,
         blob_id: &str,
     ) -> Result<Option<SyncBlobManifest>, LixError> {
+        // Canonicalization can publish missing raw chunks on first transfer.
+        // Keep that conditional write in the collaboration serialization
+        // domain even though the common path is read-only.
+        let _collaboration_guard = self.lock_collaboration_writes().await;
+        self.get_sync_blob_manifest_with_collaboration_guard(blob_id)
+            .await
+    }
+
+    /// Same operation for a sync import that already owns the collaboration
+    /// write gate. Keeping this explicit avoids recursively acquiring the
+    /// non-reentrant gate while authority admission validates referenced
+    /// blobs.
+    pub(crate) async fn get_sync_blob_manifest_with_collaboration_guard(
+        &self,
+        blob_id: &str,
+    ) -> Result<Option<SyncBlobManifest>, LixError> {
         let blob_id = BlobId::from_hex(blob_id)?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
@@ -172,6 +188,7 @@ where
         chunk_id: &str,
         bytes: &[u8],
     ) -> Result<(), LixError> {
+        let _collaboration_guard = self.lock_collaboration_writes().await;
         let chunk_id = ChunkHash::from_hex(chunk_id)?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
@@ -202,6 +219,7 @@ where
         if wire.inline_bytes_base64.is_some() {
             return self.register_deferred_sync_blob_manifest(wire).await;
         }
+        let _collaboration_guard = self.lock_collaboration_writes().await;
         let manifest = decode_manifest(wire)?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
@@ -253,6 +271,7 @@ where
         &self,
         wire: &SyncBlobManifest,
     ) -> Result<SyncBlobRegistration, LixError> {
+        let _collaboration_guard = self.lock_collaboration_writes().await;
         let manifest = decode_manifest(wire)?;
         let inline = decode_inline_bytes(wire)?;
         let adapter = self.storage_adapter();

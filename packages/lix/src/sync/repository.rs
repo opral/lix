@@ -1933,6 +1933,7 @@ where
         rows: &[SyncSnapshotRow],
         checkpoint_roots: &BTreeMap<String, String>,
     ) -> Result<(), LixError> {
+        let _collaboration_guard = self.lock_collaboration_writes().await;
         let SyncRepositoryPullResponse::Snapshot {
             cursor,
             lix_id,
@@ -2026,6 +2027,7 @@ where
         remote_id: &str,
         state: SyncReplicaState,
     ) -> Result<(), LixError> {
+        let _collaboration_guard = self.lock_collaboration_writes().await;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
         let (_, previous) = load_replica_state(&read, remote_id).await?;
@@ -2801,6 +2803,14 @@ where
         purpose: SyncImportPurpose,
         history_boundaries: Option<(&[SyncHistoryBoundary], &[SyncSnapshotRow])>,
     ) -> Result<SyncPushResponse, LixError> {
+        // Sync imports publish the same repository state that foreground
+        // auto-commit and checkpoint transactions read. Serialize at this
+        // direct writer boundary so a read that has entered its quiescent
+        // retry cannot be expired repeatedly by the sync worker. Do not hold
+        // this guard across `apply_sync_repository_pull`: divergent branch
+        // reconciliation deliberately returns to the ordinary transaction
+        // machinery, which acquires this gate for its merge commit.
+        let _collaboration_guard = self.lock_collaboration_writes().await;
         if purpose == SyncImportPurpose::History && !request.ref_updates.is_empty() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -3014,7 +3024,9 @@ where
                     })?;
                 let available = match purpose {
                     SyncImportPurpose::AuthorityPush => {
-                        self.get_sync_blob_manifest(&blob_hash).await?.is_some()
+                        self.get_sync_blob_manifest_with_collaboration_guard(&blob_hash)
+                            .await?
+                            .is_some()
                     }
                     SyncImportPurpose::ReplicaDelta | SyncImportPurpose::History => {
                         self.has_sync_blob_manifest(&blob_hash).await?
