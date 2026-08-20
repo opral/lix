@@ -196,14 +196,6 @@ function workerBinding(
 			request({ kind: "mergeBranchPreview", options }),
 		mergeBranch: (options) => request({ kind: "mergeBranch", options }),
 		syncDiskToLix: () => request({ kind: "syncDiskToLix" }),
-		beginClose: () => {
-			void request({ kind: "beginClose" }).catch(() => undefined);
-		},
-		terminateForPageUnload: () => {
-			if (closed) return;
-			closed = true;
-			client.terminateImmediately();
-		},
 		close: async () => {
 			if (closed) return;
 			await request({ kind: "close" });
@@ -332,21 +324,6 @@ export class LixWorkerClient {
 		this.rejectPending(workerClosedError());
 		try {
 			await this.connection.terminate();
-		} finally {
-			this.endLease();
-		}
-	}
-
-	terminateImmediately(): void {
-		if (this.disposed) return;
-		this.disposed = true;
-		// The document realm is being discarded. Rejecting pending observations
-		// schedules application error handlers during pagehide and creates noisy
-		// false failures; abandoning them is safe because their realm cannot resume.
-		this.pending.clear();
-		this.connection.unref();
-		try {
-			this.connection.terminateImmediately();
 		} finally {
 			this.endLease();
 		}

@@ -381,12 +381,6 @@ impl SyncSessionLease {
         }
         Ok(())
     }
-
-    fn stop_if_only_session(&self) {
-        if self.active_sessions.load(Ordering::Acquire) == 1 {
-            self.runtime.stop();
-        }
-    }
 }
 
 async fn open_lix_inner<StorageImpl>(
@@ -1060,15 +1054,6 @@ where
         }
         Ok(())
     }
-    /// Abruptly stops background synchronization during host teardown. Normal
-    /// close deliberately does not call this: it drains accepted sync work.
-    #[doc(hidden)]
-    pub fn begin_close(&self) {
-        if let Some(lease) = &self.sync_lease {
-            lease.stop_if_only_session();
-        }
-    }
-
     pub(crate) fn set_sync_role(&self, role: crate::sync::SyncRole) -> Result<(), LixError> {
         self.engine.sync_mode().set_role(role);
         Ok(())

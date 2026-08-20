@@ -84,7 +84,6 @@ export type WorkerOperation =
 	| { kind: "syncDiskToLix" }
 	| { kind: "observe"; sql: string; params: BindingParam[] }
 	| { kind: "observe.next"; observeId: number }
-	| { kind: "beginClose" }
 	| { kind: "close" };
 
 export type WorkerNotification =
@@ -113,7 +112,6 @@ export type WorkerConnection = {
 	onFatal(listener: (error: Error) => void): void;
 	ref(): void;
 	unref(): void;
-	terminateImmediately(): void;
 	terminate(): Promise<void>;
 };
 

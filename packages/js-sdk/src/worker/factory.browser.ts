@@ -38,9 +38,6 @@ export function createWorkerConnection(): WorkerConnection {
 		},
 		ref() {},
 		unref() {},
-		terminateImmediately() {
-			worker.terminate();
-		},
 		async terminate() {
 			worker.terminate();
 		},

@@ -20,7 +20,6 @@ function fakeConnection() {
 		onFatal() {},
 		ref() {},
 		unref() {},
-		terminateImmediately() {},
 		async terminate() {},
 	};
 	return { connection, sent, emit: (message: WorkerResponse) => onMessage(message) };

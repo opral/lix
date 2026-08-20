@@ -60,7 +60,6 @@ export class Lix {
 	#transactionsOpening = 0;
 	#activeTransactions = 0;
 	#acceptingOperations = true;
-	#terminatedForPageUnload = false;
 
 	constructor(private readonly binding: LixBinding) {}
 
@@ -245,32 +244,6 @@ export class Lix {
 			})();
 		}
 		await this.closePromise;
-	}
-
-	/** @internal Abruptly stops background work for host teardown. */
-	beginClose(): void {
-		this.binding.beginClose?.();
-	}
-
-	/**
-	 * Immediately tears down the browser worker during a real page unload.
-	 * Normal application lifecycle must use close() so pending work is drained.
-	 * @internal
-	 */
-	terminateForPageUnload(): void {
-		if (this.#terminatedForPageUnload) return;
-		this.#terminatedForPageUnload = true;
-		this.#acceptingOperations = false;
-		for (const observation of this.#observations.values()) {
-			observation.deref()?.close();
-		}
-		this.#observations.clear();
-		this.#activeBranchListeners.clear();
-		if (this.binding.terminateForPageUnload) {
-			this.binding.terminateForPageUnload();
-		} else {
-			this.binding.beginClose?.();
-		}
 	}
 
 	#runOperation<T>(operation: () => Promise<T>): Promise<T> {
