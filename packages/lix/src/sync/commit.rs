@@ -220,22 +220,6 @@ where
     load_sync_commit(&read, commit_id).await
 }
 
-/// Exports one complete logical commit from a pinned repository snapshot.
-async fn export_sync_commit_from_store<S>(
-    store: &S,
-    commit_id: CommitId,
-) -> Result<SyncCommit, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    load_sync_commit(store, commit_id).await?.ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            format!("sync commit '{commit_id}' does not exist"),
-        )
-    })
-}
-
 pub(crate) async fn load_sync_commit<S>(
     store: &S,
     commit_id: CommitId,
@@ -340,30 +324,6 @@ fn parse_materialized_json(
     .transpose()
 }
 
-/// Returns whether an incoming commit is already stored byte-for-byte at the
-/// logical protocol level. A reused commit id with different content fails
-/// closed instead of being mistaken for an idempotent retry.
-pub(crate) async fn sync_commit_already_present<S>(
-    store: &S,
-    incoming: &SyncCommit,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    incoming.validate()?;
-    let commit_id = CommitId::parse_lix(&incoming.commit_id, "sync commit id")?;
-    let Some(existing) = load_sync_commit(store, commit_id).await? else {
-        return Ok(false);
-    };
-    if existing == *incoming {
-        return Ok(true);
-    }
-    invalid(format!(
-        "sync commit id '{}' already exists with different content",
-        incoming.commit_id
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,12 +352,13 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open export snapshot");
-        let exported = export_sync_commit_from_store(
+        let exported = load_sync_commit(
             &read,
             CommitId::parse_lix(&commit_id, "test commit").expect("parse fixture head"),
         )
         .await
-        .expect("export fixture commit");
+        .expect("export fixture commit")
+        .expect("fixture commit exists");
         (lix, exported)
     }
 
@@ -417,17 +378,13 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open comparison snapshot");
-        assert!(
-            sync_commit_already_present(&read, &exported)
-                .await
-                .expect("compare existing commit")
-        );
-        let again = export_sync_commit_from_store(
+        let again = load_sync_commit(
             &read,
             CommitId::parse_lix(&exported.commit_id, "test commit").expect("parse fixture commit"),
         )
         .await
-        .expect("re-export fixture commit");
+        .expect("re-export fixture commit")
+        .expect("fixture commit still exists");
         assert_eq!(exported, again);
         assert_eq!(
             export_sync_commit(&lix, &exported.commit_id)
@@ -435,22 +392,6 @@ mod tests {
                 .expect("repository export"),
             Some(exported)
         );
-        lix.close().await.expect("close fixture");
-    }
-
-    #[tokio::test]
-    async fn same_id_with_different_content_is_not_an_idempotent_retry() {
-        let (lix, mut incoming) = exported_key_value_commit().await;
-        incoming.members[0].snapshot = Some(serde_json::json!({"different": true}));
-        let adapter = lix.storage_adapter();
-        let read = adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open comparison snapshot");
-        let error = sync_commit_already_present(&read, &incoming)
-            .await
-            .expect_err("different content must fail");
-        assert!(error.message.contains("different content"));
         lix.close().await.expect("close fixture");
     }
 

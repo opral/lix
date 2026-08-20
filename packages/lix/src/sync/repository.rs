@@ -2235,19 +2235,6 @@ where
             .await
     }
 
-    pub(crate) async fn import_sync_history(&self, commits: &[SyncCommit]) -> Result<(), LixError> {
-        self.import_sync_repository(
-            &SyncPushRequest {
-                commits: commits.to_vec(),
-                ref_updates: Vec::new(),
-            },
-            SyncImportPurpose::History,
-            None,
-        )
-        .await?;
-        Ok(())
-    }
-
     pub(crate) async fn import_sync_history_boundaries(
         &self,
         commits: &[SyncCommit],
@@ -4560,7 +4547,7 @@ mod tests {
                             .await
                             .expect("checkpoint dependency headers should import");
                         replica
-                            .import_sync_history(&history.commits)
+                            .import_sync_history_boundaries(&history.commits, &[], &[])
                             .await
                             .expect("checkpoint dependency bodies should import");
                     }
@@ -4669,6 +4656,14 @@ mod tests {
             .await
             .expect("exact replay should be idempotent");
         assert_eq!(second.cursor, first.cursor);
+        let mut conflicting = request.clone();
+        conflicting.commits[0].members[0].snapshot =
+            Some(serde_json::json!({"different": true}));
+        let error = target
+            .push_sync_repository(&conflicting)
+            .await
+            .expect_err("same commit id with different content must fail");
+        assert!(error.message.contains("different content"));
         assert_eq!(
             target
                 .sync_history(&source_head, 1)
