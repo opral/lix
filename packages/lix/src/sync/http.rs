@@ -111,10 +111,6 @@ where
         })
     }
 
-    pub(crate) fn active_account_id(&self) -> &str {
-        &self.active_account_id
-    }
-
     fn request(&self, method: Method, path: &str, operation: &'static str) -> RawHttpRequest {
         let mut request = raw_request(method, format!("{}{path}", self.protocol_url), operation);
         request
