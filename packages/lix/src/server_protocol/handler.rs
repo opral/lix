@@ -11012,10 +11012,63 @@ mod tests {
         assert!(!session_id.is_empty());
 
         let spans = spans.lock().expect("capture spans");
-        require_span(&spans, "lix.session.open");
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.name == "lix.session.open")
+                .count(),
+            1,
+            "one protocol handshake must open exactly one internal session"
+        );
         assert!(
             spans.iter().all(|span| span.name != "lix.engine.open"),
             "warm handshake must not reopen the protocol-root engine"
+        );
+        assert_no_bound_parameter_or_bytea_fields(&spans);
+    }
+
+    #[tokio::test]
+    async fn explicit_transaction_exports_one_transaction_notify_span() {
+        let capture = CaptureLayer::default();
+        let spans = Arc::clone(&capture.spans);
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let app = app_with_tracing_telemetry().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let transaction_id = begin_remote_transaction(&app.router, &session_id).await;
+        let staged = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/execute",
+            &session_id,
+            &transaction_id,
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('notify-span', '1')"
+            })),
+        )
+        .await;
+        assert_eq!(staged.status(), StatusCode::OK);
+        spans.lock().expect("capture spans").clear();
+
+        let committed = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/commit",
+            &session_id,
+            &transaction_id,
+            None,
+        )
+        .await;
+        assert_eq!(committed.status(), StatusCode::NO_CONTENT);
+
+        let spans = spans.lock().expect("capture spans");
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.name == "lix.perf.transaction_notify")
+                .count(),
+            1,
+            "an explicit transaction must emit one per-transaction notify span"
         );
         assert_no_bound_parameter_or_bytea_fields(&spans);
     }

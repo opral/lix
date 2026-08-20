@@ -223,7 +223,7 @@ where
             if let Some(outcome) = outcomes.iter().find_map(|result| result.as_ref().ok()) {
                 let _span = tracing::info_span!(
                     target: "lix_sql",
-                    "lix.perf.transaction_notify"
+                    "lix.perf.transaction_cohort_notify"
                 )
                 .entered();
                 self.inner

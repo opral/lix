@@ -610,46 +610,38 @@ where
         active_account_id: impl Into<String>,
         suppress_sync_outbox: bool,
     ) -> Result<Self, LixError> {
-        use tracing::Instrument as _;
-        async move {
-            if self.session.is_closed() {
-                return Err(LixError::new(
-                    LixError::CODE_CLOSED,
-                    "cannot open a session from a closed Lix handle",
-                ));
-            }
-            let active_branch_id = active_branch_id.into();
-            if self
-                .engine
-                .load_branch_head_commit_id(&active_branch_id)
-                .await?
-                .is_none()
-            {
-                return Err(LixError::branch_not_found(
-                    active_branch_id,
-                    "open_another_session",
-                    "target",
-                ));
-            }
-            let session = self
-                .engine
-                .open_session_at_with_account(active_branch_id, active_account_id)
-                .await?;
-            let mut session = session;
-            session.set_sync_outbox_suppressed(suppress_sync_outbox);
-            Ok(Self {
-                engine: self.engine.clone(),
-                session: Arc::new(session),
-                primary_switch_gate: None,
-                sync_lease: None,
-                sync_demand_tx: self.sync_demand_tx.clone(),
-            })
+        if self.session.is_closed() {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "cannot open a session from a closed Lix handle",
+            ));
         }
-        .instrument(tracing::info_span!(
-            target: "lix",
-            "lix.session.open"
-        ))
-        .await
+        let active_branch_id = active_branch_id.into();
+        if self
+            .engine
+            .load_branch_head_commit_id(&active_branch_id)
+            .await?
+            .is_none()
+        {
+            return Err(LixError::branch_not_found(
+                active_branch_id,
+                "open_another_session",
+                "target",
+            ));
+        }
+        let session = self
+            .engine
+            .open_session_at_with_account(active_branch_id, active_account_id)
+            .await?;
+        let mut session = session;
+        session.set_sync_outbox_suppressed(suppress_sync_outbox);
+        Ok(Self {
+            engine: self.engine.clone(),
+            session: Arc::new(session),
+            primary_switch_gate: None,
+            sync_lease: None,
+            sync_demand_tx: self.sync_demand_tx.clone(),
+        })
     }
 
     /// Executes one PostgreSQL-dialect SQL statement against this Lix session.
