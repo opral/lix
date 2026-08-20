@@ -264,7 +264,6 @@ where
                 return Ok(None);
             }
             ensure_success(&response, "load sync chunk")?;
-            ensure_response_bound(&response, "load sync chunk")?;
             Ok(Some(response.body))
         })
     }
@@ -315,7 +314,6 @@ where
     T: serde::de::DeserializeOwned,
 {
     ensure_success(&response, operation)?;
-    ensure_response_bound(&response, operation)?;
     serde_json::from_slice(&response.body).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
