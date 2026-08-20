@@ -175,15 +175,15 @@ impl SyncRuntime {
 }
 
 fn sync_demand_request_for_error(error: &LixError) -> Result<Option<SyncDemandRequest>, LixError> {
-    let (field, context) = match error.code.as_str() {
-        "LIX_SYNC_HISTORY_REQUIRED" => ("commitIds", "history"),
-        "LIX_SYNC_CHUNKS_REQUIRED" => ("chunkIds", "chunk"),
+    let (field, context, constructor): (_, _, fn(Vec<String>) -> _) = match error.code.as_str() {
+        "LIX_SYNC_HISTORY_REQUIRED" => ("commitIds", "history", SyncDemandRequest::History),
+        "LIX_SYNC_CHUNKS_REQUIRED" => ("chunkIds", "chunk", SyncDemandRequest::Chunks),
         // A sparse replica deliberately has no record for the parent just
         // beyond its bounded header frontier. Commit-graph readers report the
         // same structured absence as every other missing commit; sync mode is
         // the only layer that needs to reinterpret it as a history fetch.
         LixError::CODE_COMMIT_NOT_FOUND if is_sparse_commit_graph_miss(error) => {
-            ("commit_id", "history")
+            ("commit_id", "history", SyncDemandRequest::History)
         }
         _ => return Ok(None),
     };
@@ -223,13 +223,7 @@ fn sync_demand_request_for_error(error: &LixError) -> Result<Option<SyncDemandRe
             format!("sync {context} demand error contained no {field}"),
         ));
     }
-    Ok(Some(match error.code.as_str() {
-        "LIX_SYNC_CHUNKS_REQUIRED" => SyncDemandRequest::Chunks(ids),
-        "LIX_SYNC_HISTORY_REQUIRED" | LixError::CODE_COMMIT_NOT_FOUND => {
-            SyncDemandRequest::History(ids)
-        }
-        _ => unreachable!("demand error code was classified above"),
-    }))
+    Ok(Some(constructor(ids)))
 }
 
 async fn send_sync_demand(

@@ -466,7 +466,6 @@ where
 enum ServerLifecycle {
     Open,
     Closing,
-    Closed,
 }
 
 struct SessionRegistry<S>
@@ -1737,8 +1736,6 @@ where
         {
             first_error = Some(error);
         }
-        let mut registry = self.inner.registry.lock().await;
-        registry.lifecycle = ServerLifecycle::Closed;
         first_error.map_or(Ok(()), Err)
     }
 
@@ -10994,7 +10991,7 @@ mod tests {
             .expect("close server");
         assert_eq!(
             app.server.inner.registry.lock().await.lifecycle,
-            ServerLifecycle::Closed
+            ServerLifecycle::Closing
         );
     }
 
@@ -11102,7 +11099,7 @@ mod tests {
             .expect("detached server close should complete");
         assert_eq!(
             app.server.inner.registry.lock().await.lifecycle,
-            ServerLifecycle::Closed
+            ServerLifecycle::Closing
         );
     }
 
