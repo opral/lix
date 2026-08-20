@@ -6,16 +6,14 @@ import type {
 	LixStorageKeyRange,
 	LixStorageProjectedValue,
 	LixStorageProvider,
-	LixStoragePutEntry,
 	LixStorageRead,
 	LixStorageReadOptions,
 	LixStorageScanOrder,
 	LixStorageScanSource,
 	LixStorageSpace,
-	LixStorageWrite,
 	LixStorageWriteOptions,
-	LixStorageWriteStats,
 } from "@lix-js/sdk";
+import { BufferedOpfsWrite } from "./buffered-write.js";
 import { StorageChangeNotifier } from "./change-watch.js";
 import { deserializeError, OPFS_RPC_CHANNEL, type OpfsChannelMessage, type OpfsCommitPayload, type OpfsOpenResult, type OpfsRpcRequest, type OpfsScanPagePayload } from "./rpc.js";
 
@@ -89,7 +87,7 @@ export class OpfsStorageClient implements LixStorageProvider {
 
 	async beginWrite(options: LixStorageWriteOptions) {
 		this.#assertOpen();
-		return new RemoteWrite(this, options);
+		return new BufferedOpfsWrite(options, (payload) => this.commit(payload));
 	}
 
 	async watchForChanges(): Promise<LixStorageChangeWatch> {
@@ -197,64 +195,4 @@ class RemoteScan implements LixStorageScanSource {
 	}
 }
 
-class RemoteWrite implements LixStorageWrite {
-	readonly #puts = new Map<string, { space: LixStorageSpace; key: Uint8Array; value: Uint8Array }>();
-	readonly #deletes = new Map<string, { space: LixStorageSpace; key: Uint8Array }>();
-	readonly #deleteRanges: Array<{ space: LixStorageSpace; range: LixStorageKeyRange }> = [];
-	readonly #immutablePuts = new Map<string, { space: LixStorageSpace; key: Uint8Array; value: Uint8Array }>();
-	readonly #stats: LixStorageWriteStats = { putEntries: 0, deletedEntries: 0, deletedRanges: 0, writtenBytes: 0, storageCalls: 0 };
-	#closed = false;
-	constructor(private readonly client: OpfsStorageClient, private readonly options: LixStorageWriteOptions) {}
-	async putMany(space: LixStorageSpace, entries: LixStoragePutEntry[]) {
-		this.#assertOpen();
-		for (const entry of entries) {
-			const id = storageKey(space.id, entry.key);
-			const staged = { space, key: new Uint8Array(entry.key), value: new Uint8Array(entry.value) };
-			if (space.valueSemantics === "immutable") {
-				const existing = this.#immutablePuts.get(id);
-				if (existing) {
-					if (!bytesEqual(existing.value, entry.value)) throw immutableValueError();
-					continue;
-				}
-				this.#immutablePuts.set(id, staged);
-			}
-			this.#stats.putEntries += 1; this.#stats.writtenBytes += entry.value.byteLength;
-			this.#deletes.delete(id); this.#puts.set(id, staged);
-		}
-		this.#stats.storageCalls += 1;
-	}
-	async deleteMany(space: LixStorageSpace, keys: Uint8Array[]) {
-		this.#assertOpen();
-		for (const key of keys) { const id = storageKey(space.id, key); this.#puts.delete(id); this.#deletes.set(id, { space, key: new Uint8Array(key) }); }
-		this.#stats.deletedEntries += keys.length; this.#stats.storageCalls += 1;
-	}
-	async deleteRange(space: LixStorageSpace, range: LixStorageKeyRange) {
-		this.#assertOpen();
-		let removedPuts = 0;
-		for (const [id, entry] of this.#puts) {
-			if (entry.space.id === space.id && rangeContains(range, entry.key)) {
-				this.#puts.delete(id);
-				removedPuts += 1;
-			}
-		}
-		this.#stats.deletedEntries += removedPuts;
-		this.#stats.deletedRanges += 1; this.#stats.storageCalls += 1; this.#deleteRanges.push({ space, range });
-	}
-	async commit() {
-		this.#assertOpen(); this.#closed = true;
-		return this.client.commit({ deletes: [...this.#deletes.values()], puts: [...this.#puts.values()], deleteRanges: this.#deleteRanges, immutablePuts: [...this.#immutablePuts.values()], preconditions: this.options.preconditions, strictDurability: this.options.awaitDurable, stats: { ...this.#stats } });
-	}
-	async rollback() { this.#assertOpen(); this.#closed = true; }
-	#assertOpen() { if (this.#closed) throw storageError("LIX_STORAGE_CLOSED", "storage write is closed"); }
-}
-
-function storageKey(space: number, key: Uint8Array) { return `${space}:${Array.from(key, (byte) => byte.toString(16).padStart(2, "0")).join("")}`; }
-function bytesEqual(left: Uint8Array, right: Uint8Array) { return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index]); }
-function compareBytes(left: Uint8Array, right: Uint8Array) { for (let i = 0; i < Math.min(left.length, right.length); i += 1) if (left[i] !== right[i]) return left[i]! - right[i]!; return left.length - right.length; }
-function rangeContains(range: LixStorageKeyRange, key: Uint8Array) {
-	const lower = range.lower.kind === "unbounded" || (range.lower.kind === "included" ? compareBytes(key, range.lower.key) >= 0 : compareBytes(key, range.lower.key) > 0);
-	const upper = range.upper.kind === "unbounded" || (range.upper.kind === "included" ? compareBytes(key, range.upper.key) <= 0 : compareBytes(key, range.upper.key) < 0);
-	return lower && upper;
-}
-function immutableValueError() { return storageError("LIX_STORAGE_CORRUPTION", "immutable identity was assigned different bytes"); }
 function storageError(code: LixStorageErrorCode, message: string, details?: unknown) { const error = new Error(message) as Error & { code: LixStorageErrorCode; details?: unknown }; error.name = "LixStorageError"; Object.assign(error, { code, details }); return error; }

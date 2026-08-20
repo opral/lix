@@ -2,13 +2,11 @@ import type {
 	LixStorageCommitResult,
 	LixStorageGetManyRequest,
 	LixStorageKeyRange,
-	LixStoragePrecondition,
-	LixStorageProjectedValue,
 	LixStorageReadOptions,
 	LixStorageScanOrder,
 	LixStorageSpace,
-	LixStorageWriteStats,
 } from "@lix-js/sdk";
+import type { OpfsWritePayload } from "./buffered-write.js";
 
 /** Internal protocol shared by the package-owned owner worker and its clients. */
 export const OPFS_RPC_CHANNEL = "lix-js:storage-opfs:v1";
@@ -85,19 +83,7 @@ export type OpfsScanPagePayload = {
 	generation: number;
 	ownerEpoch: string;
 };
-export type OpfsCommitPayload = {
-	deletes: Array<{ space: LixStorageSpace; key: Uint8Array }>;
-	puts: Array<{ space: LixStorageSpace; key: Uint8Array; value: Uint8Array }>;
-	deleteRanges: Array<{ space: LixStorageSpace; range: LixStorageKeyRange }>;
-	immutablePuts: Array<{
-		space: LixStorageSpace;
-		key: Uint8Array;
-		value: Uint8Array;
-	}>;
-	preconditions: LixStoragePrecondition[];
-	strictDurability: boolean;
-	stats: LixStorageWriteStats;
-};
+export type OpfsCommitPayload = OpfsWritePayload;
 
 export type OpfsBeginReadResult = {
 	generation: number;
@@ -105,8 +91,6 @@ export type OpfsBeginReadResult = {
 	ownerEpoch: string;
 };
 export type OpfsCommitResult = LixStorageCommitResult;
-export type OpfsWriteStats = LixStorageWriteStats;
-
 export function serializeError(error: unknown): SerializedError {
 	if (error instanceof Error) {
 		const value = error as Error & {

@@ -1,4 +1,4 @@
-import { OpfsBackend, type SqliteChanges } from "./provider.js";
+import { OpfsBackend } from "./provider.js";
 import {
 	OPFS_RPC_CHANNEL,
 	serializeError,
@@ -117,10 +117,12 @@ async function dispatch(request: OpfsRpcRequest): Promise<void> {
 				assertOwnerEpoch(entry, payload.ownerEpoch);
 				return backend.scanPage(payload);
 			}
-			case "commit":
-				backend.commitChanges(request.payload as SqliteChanges);
+			case "commit": {
+				const payload = request.payload as OpfsCommitPayload;
+				backend.commitChanges(payload);
 				announceState(request.storageName, entry, backend);
-				return { stats: (request.payload as OpfsCommitPayload).stats };
+				return { stats: payload.stats };
+			}
 		}
 	});
 	entry.queue = operation.then(
