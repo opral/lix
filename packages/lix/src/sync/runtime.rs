@@ -415,40 +415,6 @@ async fn run_sync_worker<StorageImpl>(
         let Some(current) = transport.clone() else {
             continue;
         };
-        if !pending_demands.is_empty() {
-            while let Ok(demand) = demand_rx.try_recv() {
-                pending_demands.push(demand);
-            }
-            let demands = std::mem::take(&mut pending_demands);
-            let results = {
-                let hydration = hydrate_sync_demands(&lix, &current, &demands).fuse();
-                let shutdown = shutdown_rx.changed().fuse();
-                futures_util::pin_mut!(hydration, shutdown);
-                select_biased! {
-                    _ = shutdown => None,
-                    results = hydration => Some(results),
-                }
-            };
-            let Some(results) = results else {
-                pending_demands = demands;
-                break;
-            };
-            let retry_error = results.iter().find_map(|result| match result {
-                Err(error) if is_retryable_sync_transport_error(error) => Some(error.clone()),
-                _ => None,
-            });
-            pending_demands = resolve_sync_demands(demands, results);
-            if let Some(error) = retry_error {
-                tracing::warn!(error = ?error, "sync demand hydration failed");
-                transport = None;
-                if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
-                    break;
-                }
-            } else {
-                retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
-            }
-            continue;
-        }
         // This outer race covers every phase, including connect, CAS transfer,
         // and push. Dropping an in-flight transport future invokes the
         // adapter's cancellation mechanism.
@@ -461,6 +427,7 @@ async fn run_sync_worker<StorageImpl>(
                 &mut delta_pull_limit,
                 &mut change_watcher,
                 &mut demand_rx,
+                &mut pending_demands,
             )
             .fuse();
             let shutdown = shutdown_rx.changed().fuse();
@@ -533,11 +500,28 @@ async fn sync_iteration<StorageImpl, Transport>(
     delta_pull_limit: &mut usize,
     change_watcher: &mut tokio::sync::watch::Receiver<u64>,
     demand_rx: &mut tokio::sync::mpsc::Receiver<SyncDemand>,
+    pending_demands: &mut Vec<SyncDemand>,
 ) -> Result<Option<SyncDemand>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
+    if !pending_demands.is_empty() {
+        while let Ok(demand) = demand_rx.try_recv() {
+            pending_demands.push(demand);
+        }
+        pending_demands.retain(|demand| !demand.response.is_closed());
+        if !pending_demands.is_empty() {
+            let results = hydrate_sync_demands(lix, transport, pending_demands).await;
+            let demands = std::mem::take(pending_demands);
+            let (retry, retry_error) = resolve_sync_demands(demands, results);
+            *pending_demands = retry;
+            if let Some(error) = retry_error {
+                return Err(error);
+            }
+        }
+    }
+
     // Establish the generation before inspecting the outbox. A commit racing
     // with outbox construction then wakes the select below and cannot remain
     // hidden behind an already-held long poll.
@@ -889,19 +873,24 @@ where
 fn resolve_sync_demands(
     demands: Vec<SyncDemand>,
     results: Vec<Result<(), LixError>>,
-) -> Vec<SyncDemand> {
+) -> (Vec<SyncDemand>, Option<LixError>) {
     let mut retry = Vec::new();
+    let mut retry_error = None;
     for (demand, result) in demands.into_iter().zip(results) {
-        if result
-            .as_ref()
-            .is_err_and(is_retryable_sync_transport_error)
-        {
-            retry.push(demand);
-        } else {
-            let _ = demand.response.send(result);
+        if demand.response.is_closed() {
+            continue;
+        }
+        match result {
+            Err(error) if is_retryable_sync_transport_error(&error) => {
+                retry_error.get_or_insert(error);
+                retry.push(demand);
+            }
+            result => {
+                let _ = demand.response.send(result);
+            }
         }
     }
-    retry
+    (retry, retry_error)
 }
 
 fn fail_pending_sync_demands(
@@ -2759,7 +2748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_history_hydration_reconnect_keeps_the_sql_waiter_alive() {
+    async fn transient_history_hydration_keeps_the_sql_waiter_for_worker_retry() {
         let (replica, parent, _head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture().await;
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -2778,13 +2767,28 @@ mod tests {
             chunk_calls: Arc::new(Mutex::new(Vec::new())),
         };
         let (response, mut done) = tokio::sync::oneshot::channel();
-        let demands = vec![SyncDemand {
+        let mut demands = vec![SyncDemand {
             request: SyncDemandRequest::History(vec![parent]),
             response,
         }];
+        let (_demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        let mut push_item_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
+        let mut delta_pull_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
+        let mut change_watcher = replica.sync_mode_state().change_watcher();
 
-        let first = hydrate_sync_demands(&replica, &transport, &demands).await;
-        let demands = resolve_sync_demands(demands, first);
+        let error = sync_iteration(
+            &replica,
+            "https://sync.test/repository",
+            &transport,
+            &mut push_item_limit,
+            &mut delta_pull_limit,
+            &mut change_watcher,
+            &mut demand_rx,
+            &mut demands,
+        )
+        .await
+        .expect_err("transport failure returns to the worker retry path");
+        assert!(is_retryable_sync_transport_error(&error));
         assert_eq!(demands.len(), 1, "transport failure remains pending");
         assert!(
             matches!(
@@ -2794,13 +2798,71 @@ mod tests {
             "the SQL caller must not see the transient fetch error",
         );
 
-        let second = hydrate_sync_demands(&replica, &transport, &demands).await;
-        let demands = resolve_sync_demands(demands, second);
+        let error = sync_iteration(
+            &replica,
+            "https://sync.test/repository",
+            &transport,
+            &mut push_item_limit,
+            &mut delta_pull_limit,
+            &mut change_watcher,
+            &mut demand_rx,
+            &mut demands,
+        )
+        .await
+        .expect_err("the test transport stops after servicing the demand");
+        assert!(error.message.contains("unused history test pull"));
         assert!(demands.is_empty());
         done.await
             .expect("SQL waiter receives the retry result")
             .expect("second history fetch succeeds");
         assert_eq!(calls.lock().expect("history calls lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn canceled_demand_does_not_block_or_fetch_before_the_next_iteration() {
+        let (replica, parent, _head, commits, commit_headers, history_boundaries, boundary_rows) =
+            history_fixture().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = HistoryTransport {
+            commits,
+            missing: BTreeSet::new(),
+            calls: Arc::clone(&calls),
+            max_history_items: None,
+            fail_first_history: false,
+            commit_headers,
+            history_boundaries,
+            boundary_rows,
+            blobs: BTreeMap::new(),
+            blob_calls: Arc::new(Mutex::new(Vec::new())),
+            chunks: BTreeMap::new(),
+            chunk_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (response, done) = tokio::sync::oneshot::channel();
+        drop(done);
+        let mut demands = vec![SyncDemand {
+            request: SyncDemandRequest::History(vec![parent]),
+            response,
+        }];
+        let (_demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        let mut push_item_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
+        let mut delta_pull_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
+        let mut change_watcher = replica.sync_mode_state().change_watcher();
+
+        let error = sync_iteration(
+            &replica,
+            "https://sync.test/repository",
+            &transport,
+            &mut push_item_limit,
+            &mut delta_pull_limit,
+            &mut change_watcher,
+            &mut demand_rx,
+            &mut demands,
+        )
+        .await
+        .expect_err("the test transport stops after pruning the canceled demand");
+        assert!(error.message.contains("unused history test pull"));
+        assert!(demands.is_empty());
+        assert!(calls.lock().expect("history calls lock").is_empty());
     }
 
     #[test]
