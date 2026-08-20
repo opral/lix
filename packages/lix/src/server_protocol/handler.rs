@@ -2146,9 +2146,7 @@ where
     let active_branch_id = lease
         .run_cancellable_read(|lix| async move { lix.active_branch_id().await })
         .await?;
-    let active_account_id = lease
-        .run_cancellable_read(|lix| async move { Ok(lix.active_account_id().to_string()) })
-        .await?;
+    let active_account_id = lease.record.principal.account_id().to_owned();
     Ok((
         [(CACHE_CONTROL, "no-store")],
         Json(HandshakeResponse {
@@ -2326,9 +2324,7 @@ where
             "sync push accepts at most {MAX_SYNC_REQUEST_ITEMS} total commits and ref updates",
         )));
     }
-    let active_account_id = lease
-        .run_cancellable_read(|lix| async move { Ok(lix.active_account_id().to_string()) })
-        .await?;
+    let active_account_id = lease.record.principal.account_id();
     if request
         .commits
         .iter()
