@@ -199,30 +199,12 @@ where
         &self,
         wire: &SyncBlobManifest,
     ) -> Result<SyncBlobRegistration, LixError> {
+        if wire.inline_bytes_base64.is_some() {
+            return self.register_deferred_sync_blob_manifest(wire).await;
+        }
         let manifest = decode_manifest(wire)?;
-        let inline = decode_inline_bytes(wire)?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        if let Some(bytes) = inline {
-            let mut writes = adapter.new_write_set();
-            let mut preconditions = Vec::new();
-            stage_verified_inline_canonical_blob(&mut writes, &manifest, &bytes)?;
-            stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
-            drop(read);
-            adapter
-                .commit_write_set(
-                    writes,
-                    StorageWriteOptions {
-                        preconditions,
-                        await_durable: true,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await?;
-            return Ok(SyncBlobRegistration {
-                missing_chunk_ids: Vec::new(),
-            });
-        }
         let presence = chunk_presence_many(
             &read,
             &manifest
