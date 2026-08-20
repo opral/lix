@@ -7,12 +7,7 @@ use super::super::http::{
 use crate::LixError;
 use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
 
-#[derive(Debug)]
-pub(crate) struct NativeHttpClient {
-    client: reqwest::Client,
-}
-
-impl HttpSyncTransport<NativeHttpClient> {
+impl HttpSyncTransport<reqwest::Client> {
     /// Opens an authentication/session capability for one repository.
     pub(crate) async fn connect(
         repository_url: &str,
@@ -40,14 +35,14 @@ impl HttpSyncTransport<NativeHttpClient> {
             .timeout(HTTP_TIMEOUT)
             .build()
             .map_err(|error| transport_error("configure sync transport", error))?;
-        Self::connect_with(NativeHttpClient { client }, repository_url).await
+        Self::connect_with(client, repository_url).await
     }
 }
 
-impl RawHttpClient for NativeHttpClient {
+impl RawHttpClient for reqwest::Client {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
-            let mut builder = self.client.request(request.method, &request.url);
+            let mut builder = self.request(request.method, &request.url);
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
             }
