@@ -5962,6 +5962,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_remote_write_preserves_the_shared_checkpoint_baseline() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/shared.md".to_owned()),
+                    Value::Text("baseline".to_owned()),
+                ],
+            )
+            .await
+            .expect("baseline file should commit");
+        let checkpoint = authority
+            .create_checkpoint()
+            .await
+            .expect("explicit checkpoint should commit");
+        let checkpoint = CommitId::parse_lix(&checkpoint.commit_id, "baseline checkpoint")
+            .expect("checkpoint id should parse");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = &snapshot else {
+            panic!("initial pull should return a snapshot");
+        };
+        let cursor = *cursor;
+        let (branch_id, _) = default_head(&snapshot);
+        let origin = replica_from_snapshot(&authority, &snapshot).await;
+        let peer = replica_from_snapshot(&authority, &snapshot).await;
+
+        origin
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2",
+                &[
+                    Value::Text("ordinary write".to_owned()),
+                    Value::Text("/shared.md".to_owned()),
+                ],
+            )
+            .await
+            .expect("ordinary file write should commit locally");
+        publish_pending_with_blobs(&origin, &authority).await;
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("published write should load as a delta");
+        let SyncRepositoryPullResponse::Delta { events, .. } = &delta else {
+            panic!("cursor pull should return a delta");
+        };
+        for event in events {
+            transfer_commit_blobs(&authority, &origin, &event.commits).await;
+            transfer_commit_blobs(&authority, &peer, &event.commits).await;
+        }
+        origin
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("origin should acknowledge its published write");
+        peer.apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("peer should apply the published write");
+
+        for (name, replica) in [("origin", &origin), ("peer", &peer)] {
+            let adapter = replica.storage_adapter();
+            let read = adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("branch control read should open");
+            let control = BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&branch_id)
+                .await
+                .expect("branch control should load")
+                .expect("branch control should exist");
+            assert_eq!(
+                control.working_diff_checkpoint_commit_id,
+                Some(checkpoint),
+                "{name} must retain the explicit checkpoint as its working-diff cursor",
+            );
+            drop(read);
+            assert!(
+                working_diff_count(replica).await > 0,
+                "{name} must keep the ordinary write dirty against the explicit checkpoint",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn divergent_same_row_deterministically_keeps_local_pending_value() {
         let authority = open_lix().await.expect("authority should open");
         write_key_value(&authority, "base", "non-root").await;
