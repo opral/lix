@@ -1047,7 +1047,12 @@ where
         let manifest = lix
             .get_sync_blob_manifest(&blob_id)
             .await?
-            .ok_or_else(|| missing_blob_error(&blob_id, "local push"))?;
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("local push references missing sync blob '{blob_id}'"),
+                )
+            })?;
         let mut registration = transport.register_blob(&manifest).await?;
         for chunk_id in registration
             .missing_chunk_ids
@@ -1204,13 +1209,6 @@ fn blob_ids_from_rows<'a>(
         blob_ids.insert(blob_id.to_owned());
     }
     Ok(blob_ids)
-}
-
-fn missing_blob_error(blob_id: &str, direction: &str) -> LixError {
-    LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
-        format!("{direction} references missing sync blob '{blob_id}'"),
-    )
 }
 
 fn missing_chunk_error(chunk_id: &str, blob_id: &str, direction: &str) -> LixError {
