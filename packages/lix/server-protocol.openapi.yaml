@@ -197,21 +197,6 @@ paths:
       responses:
         "200": { description: Checkpoint created. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/restore:
-    post:
-      operationId: restore
-      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [commitId]
-              properties: { commitId: { type: string, minLength: 1 } }
-      responses:
-        "204": { description: Branch restored. }
-        default: { $ref: "#/components/responses/Error" }
   /lix/v1/undo:
     post:
       operationId: undo

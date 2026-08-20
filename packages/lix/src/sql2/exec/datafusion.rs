@@ -639,6 +639,7 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     statement: DataFusionStatement,
     params: &[Value],
 ) -> Result<SqlQueryResult, LixError> {
+    write_ctx.ensure_statement_allowed_after_restore()?;
     // Same fence as session reads, with the transaction overlay available
     // during planning/execution but not returned to the caller.
     let planning_environment = read_ctx.sql_planning_environment().await?;
@@ -2662,6 +2663,10 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
         BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => {
             Ok("lix_create_checkpoint".to_string())
         }
+        BoundWriteTarget::Restore { .. } => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "lix_restore reached the DataFusion write executor",
+        )),
         BoundWriteTarget::Row(_) => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "sql2 DataFusion reference writer does not support this row write",

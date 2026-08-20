@@ -116,7 +116,7 @@ test("createCheckpoint returns the new active head through browser WASM", async 
 	}
 });
 
-test("restore moves the active branch to an ancestor through browser WASM", async () => {
+test("lix_restore moves the active branch to an ancestor through browser WASM", async () => {
 	const { openLix } = await import("@lix-js/sdk");
 	const lix = await openLix();
 	try {
@@ -128,7 +128,7 @@ test("restore moves the active branch to an ancestor through browser WASM", asyn
 			["restore-test", "later"],
 		);
 
-		await lix.restore(initial);
+		await lix.execute("SELECT lix_restore($1)", [initial]);
 
 		expect(
 			(
