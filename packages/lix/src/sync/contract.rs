@@ -50,11 +50,11 @@ pub trait SyncTransport: SyncTransportBounds {
         limit: usize,
     ) -> SyncTransportFuture<'a, SyncHistoryResponse>;
 
-    /// Loads one canonical flat blob manifest, if it is registered.
-    fn get_blob<'a>(
+    /// Loads one bounded batch of canonical flat blob manifests.
+    fn get_blobs<'a>(
         &'a self,
-        blob_id: &'a str,
-    ) -> SyncTransportFuture<'a, Option<SyncBlobManifest>>;
+        blob_ids: &'a [String],
+    ) -> SyncTransportFuture<'a, Vec<SyncBlobManifest>>;
 
     /// Negotiates missing chunks and atomically registers a verified manifest.
     fn register_blob<'a>(

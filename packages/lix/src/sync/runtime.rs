@@ -309,10 +309,13 @@ where
     // Reopens remain local. A fresh open hands in the already-fetched snapshot
     // used to choose the repository's default branch during initialization.
     let initial_transport = if let Some(prepared) = prepared {
-        register_commit_blob_manifests(lix, &prepared.transport, &prepared.snapshot.commits)
-            .await?;
-        register_snapshot_row_blob_manifests(lix, &prepared.transport, &prepared.snapshot.rows)
-            .await?;
+        register_blob_manifests(
+            lix,
+            &prepared.transport,
+            &prepared.snapshot.commits,
+            &prepared.snapshot.rows,
+        )
+        .await?;
         let authority_lix_id = prepared.lix_id.clone();
         lix.apply_sync_repository_snapshot(
             &remote_id,
@@ -536,8 +539,7 @@ where
     // being mistaken for user-authored repository history.
     if lix.load_sync_repository_cursor(remote_id).await?.is_none() {
         let (snapshot, _lix_id, _default_branch_id) = fetch_repository_snapshot(transport).await?;
-        register_commit_blob_manifests(lix, transport, &snapshot.commits).await?;
-        register_snapshot_row_blob_manifests(lix, transport, &snapshot.rows).await?;
+        register_blob_manifests(lix, transport, &snapshot.commits, &snapshot.rows).await?;
         lix.apply_sync_repository_snapshot(
             remote_id,
             transport.active_account_id(),
@@ -894,8 +896,7 @@ where
         })
         .collect::<Vec<_>>();
     let rows = fetch_snapshot_rows(transport, &boundaries).await?;
-    register_commit_blob_manifests(lix, transport, &fetched.commits).await?;
-    register_snapshot_row_blob_manifests(lix, transport, &rows).await?;
+    register_blob_manifests(lix, transport, &fetched.commits, &rows).await?;
     lix.import_sync_history_headers(&fetched.commit_headers)
         .await?;
     lix.import_sync_history_boundaries(&fetched.commits, &fetched.boundaries, &rows)
@@ -1027,37 +1028,22 @@ where
     Ok(response)
 }
 
-async fn register_commit_blob_manifests<StorageImpl, Transport>(
+async fn register_blob_manifests<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
     commits: &[super::SyncCommit],
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-    Transport: SyncTransport,
-{
-    let blob_ids = blob_ids_from_commits(commits)?;
-    ensure_blob_manifests(lix, transport, blob_ids).await
-}
-
-async fn register_snapshot_row_blob_manifests<StorageImpl, Transport>(
-    lix: &Lix<StorageImpl>,
-    transport: &Transport,
     rows: &[super::SyncSnapshotRow],
 ) -> Result<(), LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    ensure_blob_manifests(
-        lix,
-        transport,
-        blob_ids_from_rows(
-            rows.iter()
-                .map(|row| (row.schema_key.as_str(), row.snapshot.as_ref())),
-        )?,
-    )
-    .await
+    let mut blob_ids = blob_ids_from_commits(commits)?;
+    blob_ids.extend(blob_ids_from_rows(
+        rows.iter()
+            .map(|row| (row.schema_key.as_str(), row.snapshot.as_ref())),
+    )?);
+    ensure_blob_manifests(lix, transport, blob_ids).await
 }
 
 async fn hydrate_chunk_ids<StorageImpl, Transport>(
@@ -1170,24 +1156,33 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
+    let mut missing = Vec::new();
     for blob_id in blob_ids {
         if lix.has_sync_blob_manifest(&blob_id).await? {
             continue;
         }
-        let manifest = transport
-            .get_blob(&blob_id)
-            .await?
-            .ok_or_else(|| missing_blob_error(&blob_id, "remote pull"))?;
-        if manifest.blob_id != blob_id {
+        missing.push(blob_id);
+    }
+    for requested in missing.chunks(super::MAX_SYNC_BLOB_BATCH_ITEMS) {
+        let manifests = transport.get_blobs(requested).await?;
+        if manifests.len() != requested.len() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "sync blob request '{blob_id}' returned manifest '{}'",
-                    manifest.blob_id
-                ),
+                "sync blob batch response omitted or added manifests",
             ));
         }
-        lix.register_deferred_sync_blob_manifest(&manifest).await?;
+        for (blob_id, manifest) in requested.iter().zip(manifests) {
+            if manifest.blob_id != *blob_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "sync blob request '{blob_id}' returned manifest '{}'",
+                        manifest.blob_id
+                    ),
+                ));
+            }
+            lix.register_deferred_sync_blob_manifest(&manifest).await?;
+        }
     }
     Ok(())
 }
@@ -1317,7 +1312,7 @@ mod tests {
         history_boundaries: BTreeMap<String, super::super::SyncHistoryBoundary>,
         boundary_rows: BTreeMap<String, Vec<super::super::SyncSnapshotRow>>,
         blobs: BTreeMap<String, super::super::SyncBlobManifest>,
-        blob_calls: Arc<Mutex<Vec<String>>>,
+        blob_calls: Arc<Mutex<Vec<Vec<String>>>>,
         chunks: BTreeMap<String, Vec<u8>>,
         chunk_calls: Arc<Mutex<Vec<String>>>,
     }
@@ -1427,16 +1422,19 @@ mod tests {
             })
         }
 
-        fn get_blob<'a>(
+        fn get_blobs<'a>(
             &'a self,
-            blob_id: &'a str,
-        ) -> super::super::SyncTransportFuture<'a, Option<super::super::SyncBlobManifest>> {
+            blob_ids: &'a [String],
+        ) -> super::super::SyncTransportFuture<'a, Vec<super::super::SyncBlobManifest>> {
             Box::pin(async move {
                 self.blob_calls
                     .lock()
                     .expect("blob calls lock")
-                    .push(blob_id.to_owned());
-                Ok(self.blobs.get(blob_id).cloned())
+                    .push(blob_ids.to_vec());
+                Ok(blob_ids
+                    .iter()
+                    .filter_map(|blob_id| self.blobs.get(blob_id).cloned())
+                    .collect())
             })
         }
 
@@ -1530,10 +1528,10 @@ mod tests {
             Box::pin(async { Err(LixError::unknown("unused capped-pull history")) })
         }
 
-        fn get_blob<'a>(
+        fn get_blobs<'a>(
             &'a self,
-            _blob_id: &'a str,
-        ) -> super::super::SyncTransportFuture<'a, Option<super::super::SyncBlobManifest>> {
+            _blob_ids: &'a [String],
+        ) -> super::super::SyncTransportFuture<'a, Vec<super::super::SyncBlobManifest>> {
             Box::pin(async { Err(LixError::unknown("unused capped-pull blob get")) })
         }
 
@@ -1650,10 +1648,10 @@ mod tests {
             Box::pin(async { Err(LixError::unknown("unused paged-snapshot history")) })
         }
 
-        fn get_blob<'a>(
+        fn get_blobs<'a>(
             &'a self,
-            _blob_id: &'a str,
-        ) -> super::super::SyncTransportFuture<'a, Option<super::super::SyncBlobManifest>> {
+            _blob_ids: &'a [String],
+        ) -> super::super::SyncTransportFuture<'a, Vec<super::super::SyncBlobManifest>> {
             Box::pin(async { Err(LixError::unknown("unused paged-snapshot blob get")) })
         }
 
@@ -2482,6 +2480,59 @@ mod tests {
             first_call_count,
             "already-present chunks must not be fetched twice",
         );
+    }
+
+    #[tokio::test]
+    async fn blob_manifest_fetches_use_bounded_batches() {
+        let lix = open_lix().await.expect("replica opens");
+        let mut blobs = BTreeMap::new();
+        for index in 0..40 {
+            let canonical = crate::binary_cas::CanonicalBlobManifest::from_bytes(
+                format!("batch manifest {index}").as_bytes(),
+            );
+            blobs.insert(
+                canonical.blob_id.to_hex(),
+                super::super::SyncBlobManifest {
+                    blob_id: canonical.blob_id.to_hex(),
+                    size_bytes: canonical.size_bytes,
+                    chunks: canonical
+                        .chunks
+                        .iter()
+                        .map(|chunk| super::super::SyncBlobChunk {
+                            chunk_id: chunk.hash.to_hex(),
+                            size_bytes: chunk.size_bytes,
+                        })
+                        .collect(),
+                    inline_bytes_base64: None,
+                },
+            );
+        }
+        let blob_calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = HistoryTransport {
+            commits: BTreeMap::new(),
+            missing: BTreeSet::new(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            max_history_items: None,
+            commit_headers: Vec::new(),
+            history_boundaries: BTreeMap::new(),
+            boundary_rows: BTreeMap::new(),
+            blobs: blobs.clone(),
+            blob_calls: Arc::clone(&blob_calls),
+            chunks: BTreeMap::new(),
+            chunk_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        ensure_blob_manifests(&lix, &transport, blobs.into_keys().collect())
+            .await
+            .expect("all manifest batches register");
+
+        let batch_sizes = blob_calls
+            .lock()
+            .expect("blob calls lock")
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>();
+        assert_eq!(batch_sizes, vec![16, 16, 8]);
     }
 
     #[tokio::test]

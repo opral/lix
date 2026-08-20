@@ -49,6 +49,7 @@ pub(crate) use runtime::{
 
 pub(crate) const MAX_SYNC_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
+pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SYNC_REMOTE_ID_BYTES: usize = 4 * 1024;

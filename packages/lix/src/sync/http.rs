@@ -6,10 +6,11 @@
 use serde::Deserialize;
 
 use super::{
-    MAX_SYNC_HISTORY_PAGE_SIZE, MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT,
-    SyncBlobManifest, SyncBlobRegistration, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
-    SyncRepositoryPullResponse, SyncSnapshotRowPage, SyncTransport, SyncTransportBounds,
-    SyncTransportFuture, validate_blake3_id, validate_sync_remote_id,
+    MAX_SYNC_BLOB_BATCH_ITEMS, MAX_SYNC_HISTORY_PAGE_SIZE, MAX_SYNC_PULL_RESPONSE_BYTES,
+    SYNC_LONG_POLL_TIMEOUT, SyncBlobManifest, SyncBlobRegistration, SyncHistoryResponse,
+    SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse, SyncSnapshotRowPage,
+    SyncTransport, SyncTransportBounds, SyncTransportFuture, validate_blake3_id,
+    validate_sync_remote_id,
 };
 use crate::LixError;
 
@@ -206,22 +207,33 @@ where
         })
     }
 
-    fn get_blob<'a>(
+    fn get_blobs<'a>(
         &'a self,
-        blob_id: &'a str,
-    ) -> SyncTransportFuture<'a, Option<SyncBlobManifest>> {
+        blob_ids: &'a [String],
+    ) -> SyncTransportFuture<'a, Vec<SyncBlobManifest>> {
         Box::pin(async move {
-            validate_blake3_id(blob_id, "blob ID")?;
+            if blob_ids.is_empty() || blob_ids.len() > MAX_SYNC_BLOB_BATCH_ITEMS {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "sync blob reads require 1 through {MAX_SYNC_BLOB_BATCH_ITEMS} blob IDs"
+                    ),
+                ));
+            }
+            for blob_id in blob_ids {
+                validate_blake3_id(blob_id, "blob ID")?;
+            }
+            let blob_ids = blob_ids
+                .iter()
+                .map(|blob_id| encode_query(blob_id))
+                .collect::<Vec<_>>()
+                .join(",");
             let request = self.request(
                 Method::Get,
-                &format!("/sync/blob?blobId={}", encode_query(blob_id)),
-                "load sync blob manifest",
+                &format!("/sync/blob?blobIds={blob_ids}"),
+                "load sync blob manifests",
             );
-            let response = self.client.send(request).await?;
-            if response.status == 404 {
-                return Ok(None);
-            }
-            decode_response(response, "load sync blob manifest").map(Some)
+            self.send_json(request).await
         })
     }
 

@@ -158,15 +158,21 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/sync/blob:
     get:
-      operationId: syncGetBlob
-      description: Loads one canonical FastCDC manifest by its BLAKE3-derived blob identity.
+      operationId: syncGetBlobs
+      description: Loads up to 16 canonical FastCDC manifests by their BLAKE3-derived blob identities.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
-        - $ref: "#/components/parameters/BlobId"
+        - $ref: "#/components/parameters/BlobIds"
       responses:
         "200":
-          description: Canonical flat manifest for the registered blob.
-          content: { application/json: { schema: { $ref: "#/components/schemas/SyncBlobManifest" } } }
+          description: Canonical flat manifests in the requested order.
+          content:
+            application/json:
+              schema:
+                type: array
+                minItems: 1
+                maxItems: 16
+                items: { $ref: "#/components/schemas/SyncBlobManifest" }
         "404": { $ref: "#/components/responses/Error" }
         default: { $ref: "#/components/responses/Error" }
     post:
@@ -432,11 +438,12 @@ components:
       in: query
       required: true
       schema: { type: string, minLength: 1 }
-    BlobId:
-      name: blobId
+    BlobIds:
+      name: blobIds
       in: query
       required: true
-      schema: { type: string, pattern: "^[0-9a-f]{64}$" }
+      description: One through 16 distinct lowercase BLAKE3 identities separated by commas.
+      schema: { type: string, pattern: "^[0-9a-f]{64}(,[0-9a-f]{64}){0,15}$" }
     ChunkId:
       name: chunkId
       in: query
@@ -696,6 +703,9 @@ components:
           type: array
           maxItems: 16384
           items: { $ref: "#/components/schemas/SyncBlobChunk" }
+        inlineBytesBase64:
+          type: string
+          maxLength: 87384
     SyncBlobRegistration:
       type: object
       required: [missingChunkIds, complete]

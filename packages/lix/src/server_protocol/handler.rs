@@ -6,8 +6,9 @@ use crate::session::ExecuteOptions;
 #[cfg(test)]
 use crate::session::media_upload::FILE_UPLOAD_PART_BYTES;
 use crate::sync::{
-    MAX_SYNC_PULL_RESPONSE_BYTES, MAX_SYNC_REQUEST_ITEMS, SYNC_LONG_POLL_TIMEOUT, SyncBlobManifest,
-    SyncBlobRegistration, SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse,
+    MAX_SYNC_BLOB_BATCH_ITEMS, MAX_SYNC_PULL_RESPONSE_BYTES, MAX_SYNC_REQUEST_ITEMS,
+    SYNC_LONG_POLL_TIMEOUT, SyncBlobManifest, SyncBlobRegistration, SyncPushRequest,
+    SyncPushResponse, SyncRepositoryPullResponse,
 };
 use bytes::Bytes;
 use futures_core::Stream;
@@ -1641,7 +1642,7 @@ where
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
-                result_response(sync_get_blob(lease, query).await)
+                result_response(sync_get_blobs(lease, query).await)
             }
             (&Method::POST, "/lix/v1/sync/blob") => {
                 if parts.uri.query().is_some() {
@@ -2499,22 +2500,49 @@ where
         .expect("static sync response headers are valid"))
 }
 
-async fn sync_get_blob<S>(
+async fn sync_get_blobs<S>(
     lease: SessionLease<S>,
     request: SyncBlobQuery,
-) -> Result<Json<SyncBlobManifest>, ApiError>
+) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let blob_id = required_sync_cas_id(request.blob_id, "blobId")?;
-    let requested_blob_id = blob_id.clone();
-    let manifest = lease
+    let encoded = request
+        .blob_ids
+        .ok_or_else(|| ApiError::bad_request("blobIds is required"))?;
+    let blob_ids = encoded
+        .split(',')
+        .map(|blob_id| required_sync_cas_id(Some(blob_id.to_owned()), "blobIds[]"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if blob_ids.is_empty() || blob_ids.len() > MAX_SYNC_BLOB_BATCH_ITEMS {
+        return Err(ApiError::bad_request(format!(
+            "sync blob reads require 1 through {MAX_SYNC_BLOB_BATCH_ITEMS} blob IDs",
+        )));
+    }
+    if blob_ids.iter().collect::<HashSet<_>>().len() != blob_ids.len() {
+        return Err(ApiError::bad_request(
+            "sync blob reads require distinct blob IDs",
+        ));
+    }
+    let requested = blob_ids.clone();
+    let manifests = lease
         .run_cancellable_read(move |lix| async move {
-            lix.get_sync_blob_manifest(&requested_blob_id).await
+            let mut manifests = Vec::with_capacity(requested.len());
+            for blob_id in requested {
+                manifests.push(lix.get_sync_blob_manifest(&blob_id).await?);
+            }
+            Ok(manifests)
         })
-        .await?
-        .ok_or_else(|| sync_cas_not_found("blob", &blob_id))?;
-    Ok(Json(manifest))
+        .await?;
+    let mut complete = Vec::with_capacity(manifests.len());
+    for (blob_id, manifest) in blob_ids.into_iter().zip(manifests) {
+        complete.push(manifest.ok_or_else(|| sync_cas_not_found("blob", &blob_id))?);
+    }
+    bounded_sync_json_response(
+        complete,
+        "sync blob manifests",
+        MAX_SYNC_PULL_RESPONSE_BYTES,
+    )
 }
 
 async fn sync_register_blob<S>(
@@ -4128,7 +4156,7 @@ struct SyncHistoryQuery {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncBlobQuery {
-    blob_id: Option<String>,
+    blob_ids: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -4943,7 +4971,7 @@ mod tests {
                 ("POST", "/lix/v1/sync/push") => "syncPush",
                 ("GET", "/lix/v1/sync/pull") => "syncPull",
                 ("GET", "/lix/v1/sync/history") => "syncHistory",
-                ("GET", "/lix/v1/sync/blob") => "syncGetBlob",
+                ("GET", "/lix/v1/sync/blob") => "syncGetBlobs",
                 ("POST", "/lix/v1/sync/blob") => "syncRegisterBlob",
                 ("GET", "/lix/v1/sync/chunk") => "syncGetChunk",
                 ("PUT", "/lix/v1/sync/chunk") => "syncPutChunk",
@@ -7712,6 +7740,7 @@ mod tests {
         for path in [
             "/lix/v1/sync/blob?sha256=legacy",
             "/lix/v1/sync/blob?blobId=ABC",
+            "/lix/v1/sync/blob?blobIds=ABC",
             "/lix/v1/sync/chunk?chunkId=ABC",
         ] {
             let response = request(&app.router, "GET", path, Some(&session_id), None).await;
@@ -7736,7 +7765,7 @@ mod tests {
         .await;
         assert_eq!(dynamic_path.status(), StatusCode::NOT_FOUND);
         for path in [
-            format!("/lix/v1/sync/blob?blobId={digest}"),
+            format!("/lix/v1/sync/blob?blobIds={digest}"),
             format!("/lix/v1/sync/chunk?chunkId={digest}"),
         ] {
             let response = request(&app.router, "GET", &path, Some(&session_id), None).await;
@@ -7820,6 +7849,23 @@ mod tests {
         )
         .await;
         assert_eq!(invalid_manifest.status(), StatusCode::BAD_REQUEST);
+
+        for blob_ids in [
+            format!("{digest},{digest}"),
+            std::iter::repeat_n(digest.as_str(), MAX_SYNC_BLOB_BATCH_ITEMS + 1)
+                .collect::<Vec<_>>()
+                .join(","),
+        ] {
+            let response = request(
+                &app.router,
+                "GET",
+                &format!("/lix/v1/sync/blob?blobIds={blob_ids}"),
+                Some(&session_id),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test]
@@ -7878,16 +7924,38 @@ mod tests {
                 .is_empty()
         );
 
-        let blob = request(
+        let empty_id = blake3::hash(&[]).to_hex().to_string();
+        let empty_manifest = json!({
+            "blobId": empty_id,
+            "sizeBytes": 0,
+            "chunks": []
+        });
+        let empty_registration = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/blob",
+            Some(&session_id),
+            Some(empty_manifest.clone()),
+        )
+        .await;
+        assert_eq!(empty_registration.status(), StatusCode::OK);
+
+        let blobs = request(
             &app.router,
             "GET",
-            &format!("/lix/v1/sync/blob?blobId={chunk_id}"),
+            &format!("/lix/v1/sync/blob?blobIds={chunk_id},{empty_id}"),
             Some(&session_id),
             None,
         )
         .await;
-        assert_eq!(blob.status(), StatusCode::OK);
-        assert_eq!(response_json(blob).await, manifest);
+        assert_eq!(blobs.status(), StatusCode::OK);
+        let blobs = response_json(blobs).await;
+        assert_eq!(blobs.as_array().unwrap().len(), 2);
+        assert_eq!(blobs[0]["blobId"], manifest["blobId"]);
+        assert_eq!(blobs[0]["sizeBytes"], manifest["sizeBytes"]);
+        assert_eq!(blobs[0]["chunks"], manifest["chunks"]);
+        assert!(blobs[0]["inlineBytesBase64"].as_str().is_some());
+        assert_eq!(blobs[1], empty_manifest);
 
         let chunk = request(
             &app.router,
