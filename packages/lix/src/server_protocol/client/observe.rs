@@ -457,13 +457,16 @@ impl<T: ObserveTransport> ObservationHub<T> {
     async fn recover_session_or_fail(&self, error: &LixError) -> Result<(), LixError> {
         let mut joined_recovery = false;
         loop {
-            let recovery_finished = self.recovery_finished.notified();
             let mut state = self.state.lock().await;
             match &state.session_recovery {
                 SessionRecoveryState::Idle => {
                     state.session_recovery = SessionRecoveryState::Recovering;
                     drop(state);
                     joined_recovery = true;
+                    // Register before spawn: `notify_waiters()` does not keep a
+                    // permit, so a finished recovery would otherwise hang us.
+                    let mut recovery_finished = std::pin::pin!(self.recovery_finished.notified());
+                    recovery_finished.as_mut().enable();
                     let hub = self.clone();
                     let transport = self.transport.clone();
                     self.transport.spawn(Box::pin(async move {
@@ -481,6 +484,14 @@ impl<T: ObserveTransport> ObservationHub<T> {
                 SessionRecoveryState::Recovering => {
                     joined_recovery = true;
                     drop(state);
+                    let mut recovery_finished = std::pin::pin!(self.recovery_finished.notified());
+                    recovery_finished.as_mut().enable();
+                    {
+                        let state = self.state.lock().await;
+                        if !matches!(state.session_recovery, SessionRecoveryState::Recovering) {
+                            continue;
+                        }
+                    }
                     recovery_finished.await;
                 }
                 SessionRecoveryState::Succeeded if joined_recovery => return Ok(()),
