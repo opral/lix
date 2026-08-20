@@ -107,14 +107,14 @@ pub(crate) enum SyncRole {
 #[derive(Clone, Debug)]
 pub(crate) struct SyncModeState {
     role: Arc<AtomicU8>,
-    change_watch: Arc<tokio::sync::watch::Sender<u64>>,
+    change_watch: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for SyncModeState {
     fn default() -> Self {
         Self {
             role: Arc::new(AtomicU8::new(SyncRole::Disabled as u8)),
-            change_watch: Arc::new(tokio::sync::watch::channel(0).0),
+            change_watch: tokio::sync::watch::channel(0).0,
         }
     }
 }
