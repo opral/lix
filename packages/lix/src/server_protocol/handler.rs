@@ -1336,12 +1336,6 @@ fn not_found() -> Response {
     .into_response()
 }
 
-fn is_known_protocol_path(path: &str) -> bool {
-    SERVER_PROTOCOL_ENDPOINTS
-        .iter()
-        .any(|(_, endpoint_path)| *endpoint_path == path)
-}
-
 impl<S> LixServerProtocol<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1638,7 +1632,11 @@ where
             (&Method::POST, "/lix/v1/observe/multiplex") => result_response(
                 observe_multiplex(lease, json_request!(MultiplexObserveRequest)).await,
             ),
-            (_, known) if is_known_protocol_path(known) => method_not_allowed(),
+            (_, known)
+                if SERVER_PROTOCOL_ENDPOINTS.iter().any(|(_, path)| *path == known) =>
+            {
+                method_not_allowed()
+            }
             _ => not_found(),
         }
     }

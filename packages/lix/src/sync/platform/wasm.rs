@@ -32,13 +32,13 @@ where
 impl SyncTask {
     pub(in crate::sync) async fn join(&self) -> Result<(), LixError> {
         while !self.finished.load(Ordering::Acquire) {
-            sleep(Duration::from_millis(10)).await?;
+            sleep(Duration::from_millis(10)).await;
         }
         Ok(())
     }
 }
 
-pub(in crate::sync) async fn sleep(duration: Duration) -> Result<(), LixError> {
+pub(in crate::sync) async fn sleep(duration: Duration) {
     let promise = Promise::new(&mut |resolve, _reject| {
         let global = js_sys::global();
         if let Ok(timer) = Reflect::get(&global, &"setTimeout".into())
@@ -51,11 +51,5 @@ pub(in crate::sync) async fn sleep(duration: Duration) -> Result<(), LixError> {
             );
         }
     });
-    JsFuture::from(promise).await.map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("browser sync timer failed: {error:?}"),
-        )
-    })?;
-    Ok(())
+    let _ = JsFuture::from(promise).await;
 }

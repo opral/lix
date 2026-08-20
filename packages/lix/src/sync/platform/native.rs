@@ -83,9 +83,8 @@ impl SyncTask {
     }
 }
 
-pub(in crate::sync) async fn sleep(duration: Duration) -> Result<(), LixError> {
+pub(in crate::sync) async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
-    Ok(())
 }
 
 struct WorkerDone {

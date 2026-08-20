@@ -1262,7 +1262,7 @@ async fn wait_for_sync_retry(
     futures_util::pin_mut!(timer, changed);
     let elapsed = select_biased! {
         _ = changed => false,
-        result = timer => result.is_ok(),
+        _ = timer => true,
     };
     if !elapsed {
         return false;
