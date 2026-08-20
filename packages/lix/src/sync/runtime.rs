@@ -553,7 +553,7 @@ where
             // events lets the importer reconcile local refs/outbox state; an
             // immediate reconnect/re-push would repeat the same conflict.
             Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => break true,
-            Err(error) if is_request_too_large(&error) => {
+            Err(error) if error.code == SYNC_REQUEST_TOO_LARGE_CODE => {
                 reduce_push_limit_after_too_large(push_item_limit, error)?;
             }
             Err(error) => return Err(error),
@@ -740,10 +740,6 @@ fn is_response_too_large(error: &LixError) -> bool {
         || error.code == SYNC_REQUEST_TOO_LARGE_CODE
         || (error.code == LixError::CODE_INVALID_PARAM
             && error.message.contains("response exceeds"))
-}
-
-fn is_request_too_large(error: &LixError) -> bool {
-    error.code == SYNC_REQUEST_TOO_LARGE_CODE
 }
 
 fn reduce_push_limit_after_too_large(limit: &mut usize, error: LixError) -> Result<(), LixError> {
@@ -1090,7 +1086,10 @@ where
 {
     push_request_blobs(lix, transport, request).await?;
     let first = transport.push(request).await;
-    if first.as_ref().is_err_and(is_request_too_large) && !request.inline_blobs.is_empty() {
+    let request_too_large = first
+        .as_ref()
+        .is_err_and(|error| error.code == SYNC_REQUEST_TOO_LARGE_CODE);
+    if request_too_large && !request.inline_blobs.is_empty() {
         // A server may configure a lower request-body cap than the protocol
         // default. Inline blobs are optional acceleration: retry the exact
         // commit/ref request once through the ordinary manifest lane.
