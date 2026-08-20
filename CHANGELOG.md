@@ -4,8 +4,8 @@
 
 ### Breaking
 
-- Removed the `@lix-js/sdk/workerd` entry point and the underlying direct
-  in-isolate WASM snapshot bindings.
+- Removed the `@lix-js/sdk/workerd` entry point, its direct in-isolate WASM
+  snapshot bindings, and the now-unused synchronous WASM initializer.
 - Removed the public SQL script-parsing API (`parse_sql_script` /
   `parseSqlScript`, `SqlScriptPlan`, `SqlScriptStatement`) from the Rust and
   JavaScript SDKs. Hosts pass an array of statements to `executeBatch`;
