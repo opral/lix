@@ -2524,18 +2524,18 @@ where
             "sync blob reads require distinct blob IDs",
         ));
     }
-    let requested = blob_ids.clone();
     let manifests = lease
         .run_cancellable_read(move |lix| async move {
-            let mut manifests = Vec::with_capacity(requested.len());
-            for blob_id in requested {
-                manifests.push(lix.get_sync_blob_manifest(&blob_id).await?);
+            let mut manifests = Vec::with_capacity(blob_ids.len());
+            for blob_id in blob_ids {
+                let manifest = lix.get_sync_blob_manifest(&blob_id).await?;
+                manifests.push((blob_id, manifest));
             }
             Ok(manifests)
         })
         .await?;
     let mut complete = Vec::with_capacity(manifests.len());
-    for (blob_id, manifest) in blob_ids.into_iter().zip(manifests) {
+    for (blob_id, manifest) in manifests {
         complete.push(manifest.ok_or_else(|| sync_cas_not_found("blob", &blob_id))?);
     }
     bounded_sync_json_response(
@@ -6615,10 +6615,22 @@ mod tests {
             .await
             .expect("write second historical version");
 
-        let snapshot = authority
+        let mut snapshot = authority
             .pull_sync_repository(None, 1)
             .await
             .expect("load sparse snapshot metadata");
+        let SyncRepositoryPullResponse::Snapshot { branches, .. } = &mut snapshot else {
+            panic!("initial pull must be a snapshot")
+        };
+        // This fixture isolates lazy history hydration. Pin each working-diff
+        // checkpoint to its hot head so the exact head body is sufficient for
+        // bootstrap while its first parent remains intentionally deferred.
+        for branch in branches {
+            if let Some(head) = branch.head_commit_id.clone() {
+                branch.checkpoint_commit_id = Some(head);
+                branch.checkpoint_state_root_id = branch.hot_state_root_id.clone();
+            }
+        }
         let SyncRepositoryPullResponse::Snapshot {
             default_branch_id,
             branches,
