@@ -634,8 +634,7 @@ where
             return Ok(());
         }
         let response = pull_delta_adaptive(transport, cursor, delta_pull_limit).await?;
-        validate_delta_after(cursor, &response)?;
-        let next = repository_cursor(&response);
+        let next = validate_delta_after(cursor, &response)?;
         if next <= cursor {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -1264,17 +1263,10 @@ fn missing_chunk_error(chunk_id: &str, blob_id: &str, direction: &str) -> LixErr
     )
 }
 
-fn repository_cursor(response: &SyncRepositoryPullResponse) -> u64 {
-    match response {
-        SyncRepositoryPullResponse::Snapshot { cursor, .. }
-        | SyncRepositoryPullResponse::Delta { cursor, .. } => *cursor,
-    }
-}
-
 fn validate_delta_after(
     previous_cursor: u64,
     response: &SyncRepositoryPullResponse,
-) -> Result<(), LixError> {
+) -> Result<u64, LixError> {
     let SyncRepositoryPullResponse::Delta { cursor, events } = response else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -1297,7 +1289,7 @@ fn validate_delta_after(
             "sync pull returned a non-monotonic repository cursor",
         ));
     }
-    Ok(())
+    Ok(*cursor)
 }
 
 async fn wait_for_retry_or_shutdown(
