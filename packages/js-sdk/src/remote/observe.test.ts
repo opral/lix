@@ -197,11 +197,12 @@ test("remote observe applies sequential row deltas before coalescing delivery", 
 	await lix.close();
 });
 
-test("remote observe multiplexes more than six subscriptions without blocking execute", async () => {
+test("remote observe shards more than 32 subscriptions without blocking execute", async () => {
 	const observeRequests: Request[] = [];
 	let headerResolutions = 0;
 	let liveObserveRequests = 0;
 	let maximumLiveObserveRequests = 0;
+	let rebalanced = false;
 	const lix = await openLix({
 		server: {
 			mode: "remote",
@@ -219,7 +220,9 @@ test("remote observe multiplexes more than six subscriptions without blocking ex
 					const body = (await request.json()) as { sql: string };
 					const value = /SELECT (\d+) AS value/.exec(body.sql)?.[1];
 					return executeValueResponse(
-						value === undefined ? "executed" : `value-${value}`,
+						value === undefined
+							? "executed"
+							: `${rebalanced ? "rebalanced" : "value"}-${value}`,
 					);
 				}
 
@@ -244,6 +247,18 @@ test("remote observe multiplexes more than six subscriptions without blocking ex
 				const body = (await request.clone().json()) as {
 					subscriptions: Array<{ id: string }>;
 				};
+				if (body.subscriptions.length > 32) {
+					release();
+					return Response.json(
+						{
+							error: {
+								code: "LIX_SERVER_PROTOCOL_ERROR",
+								message: "subscriptions must contain at most 32 entries",
+							},
+						},
+						{ status: 400 },
+					);
+				}
 				return heldSseResponse(
 					body.subscriptions
 						.map((subscription, index) =>
@@ -265,38 +280,69 @@ test("remote observe multiplexes more than six subscriptions without blocking ex
 	});
 	headerResolutions = 0;
 
-	const observations = Array.from({ length: 8 }, (_, index) =>
+	const observations = Array.from({ length: 33 }, (_, index) =>
 		lix.observe(`SELECT ${index} AS value`),
 	);
 	const initial = await Promise.all(
 		observations.map((observation) => observation.next()),
 	);
 	expect(initial.map((event) => event?.result.rows[0]?.get("value"))).toEqual(
-		Array.from({ length: 8 }, (_, index) => `value-${index}`),
+		Array.from({ length: 33 }, (_, index) => `value-${index}`),
 	);
-	expect(liveObserveRequests).toBe(1);
-	expect(maximumLiveObserveRequests).toBe(1);
-	expect(observeRequests).toHaveLength(1);
-	expect(headerResolutions).toBe(9);
+	expect(liveObserveRequests).toBe(2);
+	expect(maximumLiveObserveRequests).toBe(2);
+	const activeObserveRequests = observeRequests.filter(
+		(request) => !request.signal.aborted,
+	);
+	expect(activeObserveRequests).toHaveLength(2);
+	expect(headerResolutions).toBeGreaterThanOrEqual(35);
 	let submittedSubscriptions = 0;
-	for (const request of observeRequests) {
+	for (const request of activeObserveRequests) {
 		const body = (await request.clone().json()) as { subscriptions: unknown[] };
 		submittedSubscriptions += body.subscriptions.length;
 	}
-	expect(submittedSubscriptions).toBe(8);
+	expect(submittedSubscriptions).toBe(33);
+	for (const request of observeRequests) {
+		const body = (await request.clone().json()) as {
+			subscriptions: unknown[];
+		};
+		expect(body.subscriptions.length).toBeLessThanOrEqual(32);
+	}
 	expect(
 		observeRequests.every((request) =>
 			new URL(request.url).pathname.endsWith("/observe/multiplex"),
 		),
 	).toBe(true);
-	const latestBody = (await observeRequests.at(-1)?.json()) as {
+	const latestBody = (await activeObserveRequests.at(-1)?.json()) as {
 		subscriptions: unknown[];
 	};
-	expect(latestBody.subscriptions).toHaveLength(8);
+	expect(latestBody.subscriptions).toHaveLength(1);
 
 	const executed = await lix.execute("SELECT 'executed' AS value");
 	expect(executed.rows[0]?.get("value")).toBe("executed");
+	expect(liveObserveRequests).toBe(2);
+
+	rebalanced = true;
+	observations[0]?.close();
+	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(liveObserveRequests).toBe(1);
+	const rebalancedRequests = observeRequests.filter(
+		(request) => !request.signal.aborted,
+	);
+	expect(rebalancedRequests).toHaveLength(1);
+	const rebalancedBody = (await rebalancedRequests[0]?.json()) as {
+		subscriptions: Array<{ id: string }>;
+	};
+	expect(rebalancedBody.subscriptions).toHaveLength(32);
+	expect(rebalancedBody.subscriptions.map(({ id }) => id)).not.toContain(
+		"observe-1",
+	);
+	expect(rebalancedBody.subscriptions.map(({ id }) => id)).toContain(
+		"observe-33",
+	);
+	expect(
+		(await observations[32]?.next())?.result.rows[0]?.get("value"),
+	).toBe("rebalanced-32");
 
 	await lix.close();
 	expect(liveObserveRequests).toBe(0);
@@ -656,6 +702,98 @@ test("remote observe reconnects after a gone protocol session instead of failing
 	).toEqual(["session-1", "session-2"]);
 
 	events.close();
+	await lix.close();
+});
+
+test("remote observe recovers multiple expired shards with one handshake", async () => {
+	let handshakeCalls = 0;
+	let expiredShardResponses = 0;
+	let observeCalls = 0;
+	let valuePrefix = "value";
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/repository",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					handshakeCalls += 1;
+					return Response.json({
+						protocolVersion: 2,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${handshakeCalls}`,
+					});
+				}
+				if (request.method === "DELETE") return closedSession();
+				if (pathname.endsWith("/execute")) {
+					const body = (await request.json()) as { sql: string };
+					const value = /SELECT (\d+) AS value/.exec(body.sql)?.[1] ?? "0";
+					return executeValueResponse(`${valuePrefix}-${value}`);
+				}
+				observeCalls += 1;
+				const body = (await request.clone().json()) as {
+					subscriptions: Array<{ id: string }>;
+				};
+				if (expiredShardResponses > 0) {
+					expiredShardResponses -= 1;
+					return sseResponse(
+						sseFrame("error", {
+							error: {
+								code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
+								message: "the protocol session expired",
+							},
+						}),
+					);
+				}
+				return heldSseResponse(
+					body.subscriptions
+						.map((subscription, index) =>
+							sseFrame(
+								"next",
+								multiplexObservePayload(
+									subscription.id,
+									`stale-${index}`,
+									0,
+									1,
+								),
+							),
+						)
+						.join(""),
+					request.signal,
+				);
+			},
+		},
+	});
+
+	const observations = Array.from({ length: 33 }, (_, index) =>
+		lix.observe(`SELECT ${index} AS value`),
+	);
+	const initial = await Promise.all(
+		observations.map((observation) => observation.next()),
+	);
+	expect(initial.map((event) => event?.result.rows[0]?.get("value"))).toEqual(
+		Array.from({ length: 33 }, (_, index) => `value-${index}`),
+	);
+	const observeCallsBeforeExpiry = observeCalls;
+	expiredShardResponses = 2;
+	valuePrefix = "recovered";
+	observations[0]?.close();
+	const replacement = lix.observe("SELECT 33 AS value");
+	const recovered = await Promise.all([
+		...observations
+			.slice(1)
+			.map((observation) => observation.next()),
+		replacement.next(),
+	]);
+	expect(recovered.map((event) => event?.result.rows[0]?.get("value"))).toEqual(
+		Array.from({ length: 33 }, (_, index) => `recovered-${index + 1}`),
+	);
+	expect(expiredShardResponses).toBe(0);
+	expect(observeCalls - observeCallsBeforeExpiry).toBe(4);
+	expect(handshakeCalls).toBe(2);
+
 	await lix.close();
 });
 

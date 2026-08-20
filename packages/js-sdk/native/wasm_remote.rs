@@ -49,6 +49,16 @@ struct JsHttp {
     headers: JsValue,
 }
 
+struct JsCancelOnDrop(Option<Arc<dyn Fn()>>);
+
+impl Drop for JsCancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel();
+        }
+    }
+}
+
 impl ProtocolHttp for JsHttp {
     async fn request(
         &self,
@@ -494,9 +504,11 @@ async fn send_js_http_cancellable(
         .fetch
         .call2(&JsValue::UNDEFINED, &JsValue::from_str(&request.url), &init)
         .map_err(|error| fetch_unavailable(error))?;
+    let mut cancel_on_drop = JsCancelOnDrop(Some(cancel.clone()));
     let response = JsFuture::from(Promise::from(promise))
         .await
         .map_err(fetch_unavailable)?;
+    cancel_on_drop.0 = None;
     Ok((response, cancel))
 }
 
