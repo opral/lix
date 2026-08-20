@@ -728,10 +728,10 @@ impl RequestBlobCache {
         self.entries.get(sha256).cloned()
     }
 
-    fn insert(&mut self, candidate: CachedRequestBlob) {
-        let candidate_bytes = candidate.blob.blob().len();
+    fn insert(&mut self, candidate: VerifiedRequestBlob) {
+        let candidate_bytes = candidate.blob().len();
         if !is_request_blob_cacheable(candidate_bytes)
-            || self.entries.contains_key(candidate.blob.sha256())
+            || self.entries.contains_key(candidate.sha256())
         {
             return;
         }
@@ -790,9 +790,9 @@ impl RequestBlobCache {
             .total_bytes
             .checked_add(candidate_bytes)
             .expect("the per-session cache limit bounds retained bytes");
-        let sha256 = candidate.blob.sha256().to_owned();
+        let sha256 = candidate.sha256().to_owned();
         self.insertion_order.push_back(sha256.clone());
-        self.entries.insert(sha256, candidate.blob);
+        self.entries.insert(sha256, candidate);
         if evicted_bytes > candidate_bytes {
             self.budget.release(evicted_bytes - candidate_bytes);
         }
@@ -803,10 +803,6 @@ impl Drop for RequestBlobCache {
     fn drop(&mut self) {
         self.budget.release(self.total_bytes);
     }
-}
-
-struct CachedRequestBlob {
-    blob: VerifiedRequestBlob,
 }
 
 impl<S> SessionRecord<S>
@@ -870,7 +866,7 @@ where
             .get(sha256)
     }
 
-    fn cache_request_blobs(&self, candidates: Vec<CachedRequestBlob>) {
+    fn cache_request_blobs(&self, candidates: Vec<VerifiedRequestBlob>) {
         let mut cache = self
             .request_blobs
             .lock()
@@ -3396,7 +3392,7 @@ fn decode_request_params(
     reconstructed_bytes_limit: usize,
     reconstructed_bytes_remaining: &mut usize,
     cache_candidate_bytes_remaining: &mut usize,
-    cache_candidates: &mut Vec<CachedRequestBlob>,
+    cache_candidates: &mut Vec<VerifiedRequestBlob>,
     lookup_blob: impl Fn(&str) -> Option<VerifiedRequestBlob>,
 ) -> Result<DecodedRequestParams, ApiError> {
     let mut values = Vec::with_capacity(params.len());
@@ -3548,18 +3544,18 @@ fn decode_request_params(
 fn prepare_cache_candidate(
     blob: VerifiedRequestBlob,
     bytes_remaining: &mut usize,
-    candidates: &mut Vec<CachedRequestBlob>,
+    candidates: &mut Vec<VerifiedRequestBlob>,
 ) {
     if !is_request_blob_cacheable(blob.blob().len())
         || blob.blob().len() > *bytes_remaining
         || candidates
             .iter()
-            .any(|candidate| candidate.blob.sha256() == blob.sha256())
+            .any(|candidate| candidate.sha256() == blob.sha256())
     {
         return;
     }
     *bytes_remaining -= blob.blob().len();
-    candidates.push(CachedRequestBlob { blob });
+    candidates.push(blob);
 }
 
 fn invalid_parameter_error(
@@ -7073,9 +7069,9 @@ mod tests {
             DEFAULT_MAX_REQUEST_BODY_BYTES - EXACT_CSV_BYTES
         );
         assert_eq!(cache_candidates.len(), 1);
-        assert_eq!(cache_candidates[0].blob.blob().as_ref(), result.as_slice());
+        assert_eq!(cache_candidates[0].blob().as_ref(), result.as_slice());
         assert_eq!(
-            cache_candidates[0].blob.blob().as_ptr(),
+            cache_candidates[0].blob().as_ptr(),
             reconstructed.as_ptr(),
             "SQL, provenance, and the successor cache must share one reconstructed payload"
         );
@@ -9913,7 +9909,7 @@ mod tests {
                 .into(),
             );
             inserted.push(blob.sha256().to_owned());
-            cache.insert(CachedRequestBlob { blob });
+            cache.insert(blob);
         }
         assert_eq!(cache.entries.len(), MAX_REQUEST_BLOB_CACHE_ENTRIES);
         assert!(cache.get(&inserted[0]).is_none());
@@ -9926,14 +9922,14 @@ mod tests {
         let too_large =
             VerifiedRequestBlob::verify(vec![0_u8; MAX_REQUEST_BLOB_CACHE_BYTES + 1].into());
         let too_large_sha256 = too_large.sha256().to_owned();
-        cache.insert(CachedRequestBlob { blob: too_large });
+        cache.insert(too_large);
         assert!(cache.get(&too_large_sha256).is_none());
         assert!(cache.total_bytes <= MAX_REQUEST_BLOB_CACHE_BYTES);
 
         let too_small =
             VerifiedRequestBlob::verify(vec![0_u8; MIN_REQUEST_BLOB_CACHE_BYTES - 1].into());
         let too_small_sha256 = too_small.sha256().to_owned();
-        cache.insert(CachedRequestBlob { blob: too_small });
+        cache.insert(too_small);
         assert!(cache.get(&too_small_sha256).is_none());
     }
 
@@ -9947,7 +9943,7 @@ mod tests {
             DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES,
         )));
 
-        cache.insert(CachedRequestBlob { blob: verified });
+        cache.insert(verified);
 
         let cached = cache.get(&sha256).expect("full blob should be retained");
         assert_eq!(cached.blob().as_ptr(), source_ptr);
@@ -9966,7 +9962,7 @@ mod tests {
 
         let base = VerifiedRequestBlob::verify(vec![b'a'; EXACT_CSV_BYTES].into());
         let base_sha256 = base.sha256().to_owned();
-        cache.insert(CachedRequestBlob { blob: base });
+        cache.insert(base);
         assert_eq!(
             cache.get(&base_sha256).map(|blob| blob.blob().len()),
             Some(EXACT_CSV_BYTES)
@@ -9974,7 +9970,7 @@ mod tests {
 
         let successor = VerifiedRequestBlob::verify(vec![b'b'; EXACT_CSV_BYTES].into());
         let successor_sha256 = successor.sha256().to_owned();
-        cache.insert(CachedRequestBlob { blob: successor });
+        cache.insert(successor);
         assert!(cache.get(&base_sha256).is_none());
         assert_eq!(
             cache.get(&successor_sha256).map(|blob| blob.blob().len()),
@@ -10003,11 +9999,9 @@ mod tests {
         let third_blob = blob(b'3');
         let third_sha256 = third_blob.sha256().to_owned();
 
-        first.insert(CachedRequestBlob { blob: first_blob });
-        second.insert(CachedRequestBlob { blob: second_blob });
-        third.insert(CachedRequestBlob {
-            blob: third_blob.clone(),
-        });
+        first.insert(first_blob);
+        second.insert(second_blob);
+        third.insert(third_blob.clone());
         assert!(first.get(&first_sha256).is_some());
         assert!(second.get(&second_sha256).is_some());
         assert!(
@@ -10021,9 +10015,7 @@ mod tests {
 
         let first_successor = blob(b'4');
         let first_successor_sha256 = first_successor.sha256().to_owned();
-        first.insert(CachedRequestBlob {
-            blob: first_successor,
-        });
+        first.insert(first_successor);
         assert!(first.get(&first_sha256).is_none());
         assert!(first.get(&first_successor_sha256).is_some());
         assert_eq!(
@@ -10033,7 +10025,7 @@ mod tests {
         );
 
         drop(first);
-        third.insert(CachedRequestBlob { blob: third_blob });
+        third.insert(third_blob);
         assert!(
             third.get(&third_sha256).is_some(),
             "dropping a session cache must release its repository budget"
