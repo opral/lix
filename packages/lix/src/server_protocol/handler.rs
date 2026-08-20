@@ -1769,7 +1769,7 @@ where
             return Err(error);
         }
         let session_id = loop {
-            let candidate = match generate_session_id() {
+            let candidate = match generate_capability_id().map_err(ApiError::from) {
                 Ok(candidate) => candidate,
                 Err(error) => {
                     drop(registry);
@@ -1909,10 +1909,6 @@ where
             "failed to close an unregistered Lix protocol session"
         );
     }
-}
-
-fn generate_session_id() -> Result<String, ApiError> {
-    generate_capability_id().map_err(ApiError::from)
 }
 
 fn generate_capability_id() -> Result<String, LixError> {

@@ -435,16 +435,9 @@ async fn run_sync_worker<StorageImpl>(
             }
         };
         match result {
-            Ok(None) => {
+            Ok(()) => {
                 internal_demand_retry = SyncDemandRetry::default();
                 retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
-            }
-            Ok(Some(first)) => {
-                internal_demand_retry = SyncDemandRetry::default();
-                pending_demands.push(first);
-                while let Ok(demand) = demand_rx.try_recv() {
-                    pending_demands.push(demand);
-                }
             }
             Err(error) => {
                 let error = match internal_demand_retry.admit(error) {
@@ -499,7 +492,7 @@ async fn sync_iteration<StorageImpl, Transport>(
     change_watcher: &mut tokio::sync::watch::Receiver<u64>,
     demand_rx: &mut tokio::sync::mpsc::Receiver<SyncDemand>,
     pending_demands: &mut Vec<SyncDemand>,
-) -> Result<Option<SyncDemand>, LixError>
+) -> Result<(), LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
@@ -561,23 +554,26 @@ where
         validate_delta_after(cursor, &response)?;
         prepare_pull(lix, transport, &response).await?;
         lix.apply_sync_repository_pull(remote_id, &response).await?;
-        return Ok(None);
+        return Ok(());
     }
     let local_changed = change_watcher.changed().fuse();
     let pull = pull_delta_adaptive(transport, cursor, delta_pull_limit).fuse();
     let demand = demand_rx.recv().fuse();
     futures_util::pin_mut!(local_changed, pull, demand);
     select_biased! {
-        demand = demand => demand.map(Some).ok_or_else(|| {
-            LixError::new(LixError::CODE_CLOSED, "sync demand channel closed")
-        }),
-        _ = local_changed => Ok(None),
+        demand = demand => {
+            pending_demands.push(demand.ok_or_else(|| {
+                LixError::new(LixError::CODE_CLOSED, "sync demand channel closed")
+            })?);
+            Ok(())
+        },
+        _ = local_changed => Ok(()),
         response = pull => {
             let response = response?;
             validate_delta_after(cursor, &response)?;
             prepare_pull(lix, transport, &response).await?;
             lix.apply_sync_repository_pull(remote_id, &response).await?;
-            Ok(None)
+            Ok(())
         }
     }
 }
