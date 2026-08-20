@@ -1728,7 +1728,10 @@ where
         principal: Option<ServerProtocolPrincipal>,
         durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Result<SessionLease<S>, ApiError> {
-        let _pending_open = self.reserve_session_open()?;
+        let _pending_open = self
+            .inner
+            .session_open_gate
+            .reserve(self.inner.options.max_sessions)?;
 
         let active_branch_id = match initial_active_branch_id {
             Some(active_branch_id) => active_branch_id,
@@ -1828,12 +1831,6 @@ where
         }
         lease.record.lix.bind_session();
         Ok(lease)
-    }
-
-    fn reserve_session_open(&self) -> Result<PendingSessionOpen, ApiError> {
-        self.inner
-            .session_open_gate
-            .reserve(self.inner.options.max_sessions)
     }
 
     async fn lease(
@@ -10903,13 +10900,11 @@ mod tests {
             ..ServerProtocolOptions::default()
         })
         .await;
-        let pending = app
-            .server
-            .reserve_session_open()
+        let pending = app.server.inner.session_open_gate.reserve(1)
             .expect("reserve pending session open");
         assert!(!app.server.is_idle());
 
-        let Err(at_capacity) = app.server.reserve_session_open() else {
+        let Err(at_capacity) = app.server.inner.session_open_gate.reserve(1) else {
             panic!("pending opens must be bounded");
         };
         assert_eq!(at_capacity.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -10917,8 +10912,7 @@ mod tests {
         drop(pending);
         assert!(app.server.is_idle());
         drop(
-            app.server
-                .reserve_session_open()
+            app.server.inner.session_open_gate.reserve(1)
                 .expect("released reservation can be reused"),
         );
     }
@@ -10926,9 +10920,7 @@ mod tests {
     #[tokio::test]
     async fn close_waits_for_pending_session_opens_before_closing_the_root() {
         let app = app().await;
-        let pending = app
-            .server
-            .reserve_session_open()
+        let pending = app.server.inner.session_open_gate.reserve(1)
             .expect("reserve pending session open");
         let server = app.server.clone();
         let closing = tokio::spawn(async move { server.close().await });
@@ -10940,7 +10932,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(!closing.is_finished());
-        let Err(closed) = app.server.reserve_session_open() else {
+        let Err(closed) = app.server.inner.session_open_gate.reserve(1) else {
             panic!("closing server must reject new reservations");
         };
         assert_eq!(closed.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -11029,9 +11021,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_close_caller_does_not_cancel_server_shutdown() {
         let app = app().await;
-        let pending = app
-            .server
-            .reserve_session_open()
+        let pending = app.server.inner.session_open_gate.reserve(1)
             .expect("reserve pending session open");
         let server = app.server.clone();
         let closing = tokio::spawn(async move { server.close().await });
