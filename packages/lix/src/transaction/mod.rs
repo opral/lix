@@ -38,6 +38,7 @@ pub(crate) use context::CertifiedHistoryStoreReader;
 #[cfg(test)]
 pub(crate) use context::CommitBoundaryGuard;
 pub(crate) use context::CommitBoundaryState;
+pub(crate) use context::PendingRestoreIntent;
 pub(crate) use context::Transaction;
 pub(crate) use context::TransactionCommitBoundary;
 pub(crate) use context::TransactionCommitOutcome;

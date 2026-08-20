@@ -49,7 +49,7 @@ use crate::tracked_state::{
     stage_commit_state_manifest_with_handle, stage_current_state_scoped_ranges_from_topology,
     stage_imported_addressable_commit_deltas,
 };
-use crate::transaction::PreparedWriteSet;
+use crate::transaction::{PendingRestoreIntent, PreparedWriteSet};
 use crate::{Lix, LixError};
 
 use super::commit::{SyncCommit, SyncCommitMember, export_sync_commit, load_sync_commit};
@@ -962,6 +962,7 @@ pub(crate) async fn stage_repository_transaction_event<R>(
     preconditions: &mut Vec<StoragePrecondition>,
     prepared: &PreparedWriteSet,
     parent_heads: &BTreeMap<String, Option<CommitId>>,
+    restore_targets: &BTreeMap<String, PendingRestoreIntent>,
 ) -> Result<Option<StagedRepositoryTransactionEvent>, LixError>
 where
     R: StorageAdapterRead + ?Sized,
@@ -986,6 +987,22 @@ where
                 .flatten()
                 .map(|parent| parent.to_string()),
             head_commit_id: Some(commit_id),
+        });
+    }
+    for (branch_id, restore) in restore_targets {
+        if ref_updates
+            .iter()
+            .any(|update| update.branch_id == *branch_id)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("restore for branch '{branch_id}' produced a duplicate sync ref update"),
+            ));
+        }
+        ref_updates.push(SyncRefUpdate {
+            branch_id: branch_id.clone(),
+            expected_head_commit_id: Some(restore.expected_head_commit_id.to_string()),
+            head_commit_id: Some(restore.target_commit_id.to_string()),
         });
     }
     if commit_ids.is_empty() && ref_updates.is_empty() {
@@ -4213,6 +4230,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authority_restore_publishes_a_ref_event_and_converges_a_replica() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        write_key_value(&authority, "restore-sync", "target").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("target snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let (branch_id, target_head) = default_head(&snapshot);
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+
+        write_key_value(&authority, "restore-sync", "abandoned").await;
+        let abandoned_head = authority
+            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .await
+            .expect("abandoned head should read")
+            .rows()[0]
+            .get::<String>("id")
+            .expect("abandoned head should decode");
+        authority
+            .restore(target_head.clone())
+            .await
+            .expect("ancestor restore should succeed");
+
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 16)
+            .await
+            .expect("write and restore events should be pullable");
+        let SyncRepositoryPullResponse::Delta { events, .. } = &delta else {
+            panic!("cursor pull should be a delta");
+        };
+        assert!(events.iter().any(|event| {
+            event.ref_updates.iter().any(|update| {
+                update.branch_id == branch_id
+                    && update.expected_head_commit_id.as_deref() == Some(abandoned_head.as_str())
+                    && update.head_commit_id.as_deref() == Some(target_head.as_str())
+            })
+        }));
+
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("replica should apply restore delta");
+        assert_eq!(read_key_value(&replica, "restore-sync").await, "target");
+        assert_eq!(working_diff_count(&replica).await, 0);
+    }
+
+    #[tokio::test]
     async fn oversized_ordinary_authority_event_is_rejected_atomically() {
         let authority = open_lix().await.expect("authority should open");
         authority
@@ -4651,8 +4721,7 @@ mod tests {
             .expect("exact replay should be idempotent");
         assert_eq!(second.cursor, first.cursor);
         let mut conflicting = request.clone();
-        conflicting.commits[0].members[0].snapshot =
-            Some(serde_json::json!({"different": true}));
+        conflicting.commits[0].members[0].snapshot = Some(serde_json::json!({"different": true}));
         let error = target
             .push_sync_repository(&conflicting)
             .await

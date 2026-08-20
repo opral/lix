@@ -44,6 +44,7 @@ use crate::tracked_state::{
     stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
+use crate::transaction::context::PendingRestoreIntent;
 #[cfg(test)]
 use crate::transaction::staged_commit_changes::StagedCommitChangeBatchBuilder;
 use crate::transaction::staged_commit_changes::{
@@ -166,6 +167,7 @@ pub(crate) async fn commit_prepared_writes(
         read,
         &BTreeMap::new(),
         false,
+        &BTreeMap::new(),
         prepared_writes,
     )
     .await?;
@@ -210,6 +212,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     read: &mut impl StorageAdapterRead,
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     capture_sync_commits: bool,
+    restore_targets: &BTreeMap<String, PendingRestoreIntent>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<MaterializedCommit, LixError> {
     Box::pin(validate_active_account_and_account_rows(
@@ -332,6 +335,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     // shared parsed column; every later materialization stage consumes this
     // map plus canonical arena slices.
     let explicit_branch_targets = explicit_branch_head_targets(&state_rows)?;
+    validate_restore_targets(&explicit_branch_targets, restore_targets)?;
     let deleted_checkpoint_branches = explicit_branch_targets
         .iter()
         .filter_map(|(branch_id, target)| target.head_commit_id.is_none().then_some(branch_id))
@@ -709,11 +713,14 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let branch_control_observations =
         observe_branch_head_controls(read, &tracked_roots, &state_rows, &engine_rows).await?;
 
+    validate_restore_observed_heads(restore_targets, &branch_control_observations)?;
+
     reject_explicit_branch_ref_lifecycle_with_untracked_rows(
         read,
         &state_rows,
         &engine_rows,
         &explicit_branch_targets,
+        restore_targets,
         &branch_control_observations,
     )
     .await?;
@@ -807,6 +814,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &state_rows,
         &engine_rows,
         &explicit_branch_targets,
+        restore_targets,
         &insert_selection,
         &prepared_writes.checkpoint_publications,
         branch_checkpoint_bridges,
@@ -5489,29 +5497,103 @@ async fn stage_root_backed_branch_publication(
     head_commit_id: CommitId,
     target: &ExplicitBranchHeadTarget,
     previous_control: Option<BranchHeadControl>,
+    restore: bool,
     stage_initial_working_diff_epoch: bool,
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
     insert_selection: &PreparedInsertSelection,
 ) -> Result<BranchHeadControl, LixError> {
     let tracked_head = TrackedHeadContext::new();
+    let untracked_deltas = state_rows
+        .iter()
+        .filter(|row| {
+            row.untracked
+                && row.branch_id.as_str() == branch_id
+                && row.schema_key != BRANCH_REF_SCHEMA_KEY
+        })
+        .map(current_state_delta_from_state_row)
+        .chain(
+            engine_rows
+                .iter()
+                .filter(|row| row.branch_id == branch_id)
+                .map(|row| Ok(current_state_delta_from_engine_row(row))),
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    let absence_guards = if insert_selection.is_empty() {
+        BTreeSet::new()
+    } else {
+        state_rows
+            .iter()
+            .enumerate()
+            .filter(|(row_index, row)| {
+                row.untracked
+                    && row.branch_id.as_str() == branch_id
+                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                    && row.snapshot.is_some()
+                    && insert_selection.contains(*row_index)
+            })
+            .map(|(_, row)| TrackedStateKey {
+                schema_key: row.schema_key.to_string(),
+                file_id: row.file_id.map(ToString::to_string),
+                row_pk: row.row_pk.clone(),
+            })
+            .collect()
+    };
     // Tracked and untracked rows share one serving generation, so minting a
     // fresh one strands the branch's history-free rows in the old one. A
     // republication that does not move the head therefore keeps its
     // generation; there is nothing new to serve and nothing to copy.
     //
-    // A publication that *does* move the head (or deletes the branch) is
-    // destructive, and `reject_explicit_branch_ref_lifecycle_with_untracked_rows`
-    // already refuses it while branch-local untracked rows exist — so a fresh
-    // generation there is only ever reached with no untracked rows to lose.
-    let reused_generation = previous_control
+    // Generic lifecycle repoints reject branch-local untracked rows. Restore
+    // is the deliberate exception: it publishes the historical tracked
+    // snapshot and copies those history-free rows into one fresh generation.
+    let reused_generation = (!restore)
+        .then_some(previous_control)
+        .flatten()
         .filter(|previous| previous.head_commit_id == head_commit_id)
         .map(|previous| previous.tracked_generation);
     let generation = match reused_generation {
         Some(generation) => generation,
         None => {
             let generation = lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
-            if let Some(checkpoint_commit_id) =
+            if restore {
+                let previous = previous_control.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("restore publication for branch '{branch_id}' has no prior head"),
+                    )
+                })?;
+                let target_rows =
+                    load_persisted_lifecycle_tracked_snapshot(read, branch_id, head_commit_id)
+                        .await?
+                        .into_values()
+                        .collect();
+                let target_snapshot = HotTrackedSnapshot::from_materialized_rows(target_rows)?;
+                let mut coverage = WorkingDiffIndexCoverage::default();
+                tracked_head
+                    .writer(read, writes)
+                    .stage_complete_current_state_with_working_diff(
+                        branch_id,
+                        generation,
+                        target_snapshot,
+                        Some(previous.tracked_generation),
+                        &[],
+                        &untracked_deltas,
+                        &absence_guards,
+                        CompleteWorkingDiffMode::ResetClean,
+                        &mut coverage,
+                    )
+                    .await?;
+                stage_tracked_working_diff_epoch(
+                    writes,
+                    branch_id,
+                    TrackedWorkingDiffEpoch {
+                        checkpoint_commit_id: head_commit_id,
+                        generation,
+                        coverage,
+                    },
+                )?;
+            } else if let Some(checkpoint_commit_id) =
                 previous_control.and_then(|control| control.working_diff_checkpoint_commit_id)
             {
                 // Moving an existing branch to another immutable root changes
@@ -5590,14 +5672,13 @@ async fn stage_root_backed_branch_publication(
             // revision for every reader holding the previous one.
             Some(control) => next_current_state_revision(control.current_state_revision)?,
         },
-        // A branch is born at a complete authenticated root. Its private
-        // working interval therefore starts at that exact head; no logical
-        // checkpoint row or history scan is needed to recover the cursor.
-        // Explicit lifecycle moves of an existing branch instead keep that
-        // branch's own compaction baseline.
-        working_diff_checkpoint_commit_id: match previous_control {
-            None => Some(head_commit_id),
-            Some(control) => control.working_diff_checkpoint_commit_id,
+        // A branch born at a complete authenticated root and an existing
+        // branch restored to one both start a private working interval at the
+        // exact target. Generic lifecycle moves keep the existing baseline.
+        working_diff_checkpoint_commit_id: match (restore, previous_control) {
+            (true, _) => Some(head_commit_id),
+            (false, None) => Some(head_commit_id),
+            (false, Some(control)) => control.working_diff_checkpoint_commit_id,
         },
         created_at: previous_control.map_or(target.created_at, |control| control.created_at),
         updated_at: target.updated_at,
@@ -5606,47 +5687,12 @@ async fn stage_root_backed_branch_publication(
         // conservative until immutable roots carry schema summaries.
         schema_presence_bloom: [u64::MAX; 4],
     };
-    let untracked_deltas = state_rows
-        .iter()
-        .filter(|row| {
-            row.untracked
-                && row.branch_id.as_str() == branch_id
-                && row.schema_key != BRANCH_REF_SCHEMA_KEY
-        })
-        .map(current_state_delta_from_state_row)
-        .chain(
-            engine_rows
-                .iter()
-                .filter(|row| row.branch_id == branch_id)
-                .map(|row| Ok(current_state_delta_from_engine_row(row))),
-        )
-        .collect::<Result<Vec<_>, _>>()?;
-    if !untracked_deltas.is_empty() {
+    if !restore && !untracked_deltas.is_empty() {
         // A new branch has not consumed its revision yet; an existing branch
         // already advanced one above for this same publication.
         let revision = match previous_control {
             None => next_current_state_revision(control.current_state_revision)?,
             Some(_) => control.current_state_revision,
-        };
-        let absence_guards = if insert_selection.is_empty() {
-            BTreeSet::new()
-        } else {
-            state_rows
-                .iter()
-                .enumerate()
-                .filter(|(row_index, row)| {
-                    row.untracked
-                        && row.branch_id.as_str() == branch_id
-                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                        && row.snapshot.is_some()
-                        && insert_selection.contains(*row_index)
-                })
-                .map(|(_, row)| TrackedStateKey {
-                    schema_key: row.schema_key.to_string(),
-                    file_id: row.file_id.map(ToString::to_string),
-                    row_pk: row.row_pk.clone(),
-                })
-                .collect()
         };
         let mut untracked_coverage = WorkingDiffIndexCoverage::default();
         tracked_head
@@ -5676,6 +5722,7 @@ async fn stage_branch_head_control_publications(
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
+    restore_targets: &BTreeMap<String, PendingRestoreIntent>,
     insert_selection: &PreparedInsertSelection,
     checkpoint_publications: &[crate::gc::CheckpointPublication],
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
@@ -5734,6 +5781,9 @@ async fn stage_branch_head_control_publications(
                     head_commit_id,
                     target,
                     existing,
+                    restore_targets
+                        .get(branch_id)
+                        .is_some_and(|intent| intent.target_commit_id == head_commit_id),
                     existing.is_none() && !branch_checkpoint_bridges.contains_key(branch_id),
                     state_rows,
                     engine_rows,
@@ -6064,6 +6114,48 @@ fn explicit_branch_head_targets(
     Ok(targets)
 }
 
+fn validate_restore_targets(
+    explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
+    restore_targets: &BTreeMap<String, PendingRestoreIntent>,
+) -> Result<(), LixError> {
+    for (branch_id, intent) in restore_targets {
+        let explicit_commit_id = explicit_branch_targets
+            .get(branch_id)
+            .and_then(|target| target.head_commit_id);
+        if explicit_commit_id != Some(intent.target_commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "restore intent for branch '{branch_id}' does not match its staged branch ref"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_restore_observed_heads(
+    restore_targets: &BTreeMap<String, PendingRestoreIntent>,
+    observations: &BTreeMap<String, BranchHeadControlObservation>,
+) -> Result<(), LixError> {
+    for (branch_id, intent) in restore_targets {
+        let observed_head = observations
+            .get(branch_id)
+            .and_then(|observation| observation.control)
+            .map(|control| control.head_commit_id);
+        if observed_head != Some(intent.expected_head_commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                format!(
+                    "branch '{branch_id}' HEAD changed while restoring from '{}' to '{}'",
+                    intent.expected_head_commit_id, intent.target_commit_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A destructive branch-ref change cannot preserve branch-local untracked
 /// rows. Deletion would orphan their only serving scope and repointing would
 /// attach them to unrelated tracked history. Assigning the already-published
@@ -6077,10 +6169,18 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
+    restore_targets: &BTreeMap<String, PendingRestoreIntent>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
 ) -> Result<(), LixError> {
     let current_state = TrackedHeadContext::new().reader(read);
     for (branch_id, target) in explicit_branch_targets {
+        if target.head_commit_id.is_some_and(|commit_id| {
+            restore_targets
+                .get(branch_id)
+                .is_some_and(|intent| intent.target_commit_id == commit_id)
+        }) {
+            continue;
+        }
         let Some(existing) = observations
             .get(branch_id)
             .and_then(|observation| observation.control)
@@ -7237,6 +7337,41 @@ mod tests {
         LixTimestamp::expect_parse("timestamp", value)
     }
 
+    #[test]
+    fn restore_rejects_a_commit_time_head_that_differs_from_the_validated_head() {
+        let branch_id = "01960000-0000-7000-8000-0000000000a1";
+        let expected_head = commit_id("restore-validated-head");
+        let target = commit_id("restore-validated-target");
+        let concurrent_head = commit_id("restore-concurrent-head");
+        let restore_targets = BTreeMap::from([(
+            branch_id.to_owned(),
+            PendingRestoreIntent {
+                expected_head_commit_id: expected_head,
+                target_commit_id: target,
+            },
+        )]);
+        let observations = BTreeMap::from([(
+            branch_id.to_owned(),
+            BranchHeadControlObservation {
+                control: Some(BranchHeadControl {
+                    head_commit_id: concurrent_head,
+                    tracked_generation: concurrent_head,
+                    current_state_revision: 1,
+                    working_diff_checkpoint_commit_id: Some(concurrent_head),
+                    created_at: ts("2026-01-01T00:00:00Z"),
+                    updated_at: ts("2026-01-02T00:00:00Z"),
+                    ref_change_id: change_id("restore-concurrent-ref"),
+                    schema_presence_bloom: [0; 4],
+                }),
+                raw_token: None,
+            },
+        )]);
+
+        let error = validate_restore_observed_heads(&restore_targets, &observations)
+            .expect_err("a concurrent branch move must invalidate restore ancestry validation");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+    }
+
     #[tokio::test]
     async fn branch_creation_owner_publishes_checkpoint_serving_context() {
         let storage = StorageAdapter::new(Memory::new());
@@ -7269,6 +7404,7 @@ mod tests {
             &PreparedStateBatch::new(),
             &[],
             &BTreeMap::from([(branch_id.to_owned(), target)]),
+            &BTreeMap::new(),
             &PreparedInsertSelection::new(),
             &[],
             &BTreeMap::from([(branch_id.to_owned(), bridge.clone())]),

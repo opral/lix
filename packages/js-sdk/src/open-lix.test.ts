@@ -321,6 +321,25 @@ test("createCheckpoint returns the new active head through the local worker", as
 	await lix.close();
 });
 
+test("restore moves the active branch to an ancestor through the local worker", async () => {
+	const lix = await openLix();
+	const initial = await activeHeadCommitId(lix);
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+		["restore-test", "later"],
+	);
+
+	await lix.restore(initial);
+
+	expect(await activeHeadCommitId(lix)).toBe(initial);
+	expect(
+		(await lix.execute("SELECT * FROM lix_key_value WHERE key = $1", [
+			"restore-test",
+		])).rows,
+	).toHaveLength(0);
+	await lix.close();
+});
+
 test("undo and redo roundtrip tracked state through the local worker", async () => {
 	const lix = await openLix();
 	await lix.execute(

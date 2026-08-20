@@ -25,6 +25,7 @@ pub(crate) mod idempotency;
 pub(crate) mod media_upload;
 mod merge;
 pub(crate) mod observe;
+mod restore;
 mod switch_branch;
 mod transaction;
 mod undo_redo;

@@ -68,6 +68,7 @@ export type LixBinding = {
 	activeAccountId(): Promise<string>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
 	createCheckpoint(): Promise<CreateCheckpointReceipt>;
+	restore(commitId: string): Promise<void>;
 	undo(): Promise<UndoReceipt>;
 	redo(): Promise<RedoReceipt>;
 	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchReceipt>;
