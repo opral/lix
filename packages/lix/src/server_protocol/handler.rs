@@ -7827,7 +7827,6 @@ mod tests {
         .await;
         assert_eq!(missing.status(), StatusCode::OK);
         let missing = response_json(missing).await;
-        assert_eq!(missing["complete"], false);
         assert_eq!(missing["missingChunkIds"], json!([chunk_id]));
 
         let put = Request::builder()
@@ -7855,7 +7854,6 @@ mod tests {
         .await;
         assert_eq!(registration.status(), StatusCode::OK);
         let registration = response_json(registration).await;
-        assert_eq!(registration["complete"], true);
         assert!(
             registration["missingChunkIds"]
                 .as_array()

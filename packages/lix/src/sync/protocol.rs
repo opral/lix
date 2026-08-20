@@ -215,7 +215,6 @@ pub struct SyncBlobManifest {
 #[serde(rename_all = "camelCase")]
 pub struct SyncBlobRegistration {
     pub missing_chunk_ids: Vec<String>,
-    pub complete: bool,
 }
 
 #[cfg(test)]

@@ -1104,10 +1104,17 @@ where
                 .ok_or_else(|| missing_chunk_error(chunk_id, &blob_id, "local push"))?;
             transport.put_chunk(chunk_id, &bytes).await?;
         }
-        if !registration.complete {
+        if !registration.missing_chunk_ids.is_empty() {
             registration = transport.register_blob(&manifest).await?;
         }
-        require_complete_registration(&blob_id, &registration)?;
+        if !registration.missing_chunk_ids.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "sync blob '{blob_id}' remained incomplete after uploading requested chunks"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -1202,19 +1209,6 @@ fn blob_ids_from_rows<'a>(
         blob_ids.insert(blob_id.to_owned());
     }
     Ok(blob_ids)
-}
-
-fn require_complete_registration(
-    blob_id: &str,
-    registration: &super::SyncBlobRegistration,
-) -> Result<(), LixError> {
-    if registration.complete && registration.missing_chunk_ids.is_empty() {
-        return Ok(());
-    }
-    Err(LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
-        format!("sync blob '{blob_id}' remained incomplete after uploading requested chunks"),
-    ))
 }
 
 fn missing_blob_error(blob_id: &str, direction: &str) -> LixError {
@@ -2471,18 +2465,6 @@ mod tests {
         let error = blob_ids_from_rows([("lix_binary_blob_ref", Some(&snapshot))])
             .expect_err("invalid content identity must fail");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-    }
-
-    #[test]
-    fn complete_blob_registration_is_accepted() {
-        require_complete_registration(
-            &"a".repeat(64),
-            &super::super::SyncBlobRegistration {
-                missing_chunk_ids: Vec::new(),
-                complete: true,
-            },
-        )
-        .expect("complete manifest registration");
     }
 
     #[tokio::test]

@@ -196,7 +196,6 @@ where
         if !missing_chunk_ids.is_empty() {
             return Ok(SyncBlobRegistration {
                 missing_chunk_ids,
-                complete: false,
             });
         }
         let mut writes = adapter.new_write_set();
@@ -216,17 +215,15 @@ where
             .await?;
         Ok(SyncBlobRegistration {
             missing_chunk_ids: Vec::new(),
-            complete: true,
         })
     }
 
     /// Durably registers a validated canonical manifest immediately, marking
     /// absent chunks for lazy hydration in the same atomic publication.
     ///
-    /// `complete` reports whether every payload was already local at commit
-    /// time. A false result does not roll back the manifest: reads name the
-    /// exact missing chunks with `LIX_SYNC_CHUNKS_REQUIRED`, and each later
-    /// [`Self::put_sync_chunk`] clears its marker atomically with the payload.
+    /// Missing chunks do not roll back the manifest: reads name them with
+    /// `LIX_SYNC_CHUNKS_REQUIRED`, and each later [`Self::put_sync_chunk`]
+    /// clears its marker atomically with the payload.
     pub(crate) async fn register_deferred_sync_blob_manifest(
         &self,
         manifest: &SyncBlobManifest,
@@ -253,10 +250,7 @@ where
                 },
             )
             .await?;
-        Ok(SyncBlobRegistration {
-            complete: missing_chunk_ids.is_empty(),
-            missing_chunk_ids,
-        })
+        Ok(SyncBlobRegistration { missing_chunk_ids })
     }
 }
 
@@ -324,7 +318,6 @@ mod tests {
             .register_deferred_sync_blob_manifest(&manifest)
             .await
             .expect("deferred registration should commit");
-        assert!(!registration.complete);
         let expected_missing = canonical
             .chunks
             .iter()
