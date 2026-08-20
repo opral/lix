@@ -856,22 +856,14 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    let history_ids = demands
-        .iter()
-        .filter_map(|demand| match &demand.request {
-            SyncDemandRequest::History(ids) => Some(ids.as_slice()),
-            SyncDemandRequest::Chunks(_) => None,
-        })
-        .flatten()
-        .collect::<BTreeSet<_>>();
-    let chunk_ids = demands
-        .iter()
-        .filter_map(|demand| match &demand.request {
-            SyncDemandRequest::Chunks(ids) => Some(ids.as_slice()),
-            SyncDemandRequest::History(_) => None,
-        })
-        .flatten()
-        .collect::<BTreeSet<_>>();
+    let mut history_ids = BTreeSet::new();
+    let mut chunk_ids = BTreeSet::new();
+    for demand in demands {
+        match &demand.request {
+            SyncDemandRequest::History(ids) => history_ids.extend(ids),
+            SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
+        }
+    }
     let history_result = if history_ids.is_empty() {
         Ok(())
     } else {
