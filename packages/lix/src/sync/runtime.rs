@@ -65,12 +65,12 @@ pub(crate) struct PreparedSync {
 }
 
 #[derive(Debug)]
-struct PreparedRepositorySnapshot {
-    metadata: SyncRepositoryPullResponse,
-    commits: Vec<super::SyncCommit>,
-    commit_headers: Vec<super::SyncCommitHeader>,
-    rows: Vec<super::SyncSnapshotRow>,
-    checkpoint_roots: BTreeMap<String, String>,
+pub(super) struct PreparedRepositorySnapshot {
+    pub(super) metadata: SyncRepositoryPullResponse,
+    pub(super) commits: Vec<super::SyncCommit>,
+    pub(super) commit_headers: Vec<super::SyncCommitHeader>,
+    pub(super) rows: Vec<super::SyncSnapshotRow>,
+    pub(super) checkpoint_roots: BTreeMap<String, String>,
 }
 
 /// Performs the fresh-store bootstrap network operation exactly once.
@@ -88,7 +88,7 @@ pub(crate) async fn prepare_sync_mode(
     })
 }
 
-async fn fetch_repository_snapshot<Transport>(
+pub(super) async fn fetch_repository_snapshot<Transport>(
     transport: &Transport,
 ) -> Result<(PreparedRepositorySnapshot, String, String), LixError>
 where
@@ -583,7 +583,7 @@ where
     }
 }
 
-async fn sync_iteration<StorageImpl, Transport>(
+pub(super) async fn sync_iteration<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     remote_id: &str,
     transport: &Transport,
@@ -1082,7 +1082,7 @@ where
     Ok(response)
 }
 
-async fn register_blob_manifests<StorageImpl, Transport>(
+pub(super) async fn register_blob_manifests<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
     commits: &[super::SyncCommit],
@@ -1121,6 +1121,30 @@ where
         lix.put_sync_chunk(&chunk_id, &bytes).await?;
     }
     Ok(())
+}
+
+/// Drives the same lazy history/blob hydration path as a live sync worker.
+/// Kept test-only so deterministic simulations can advance without spawning
+/// background tasks or introducing a second demand implementation.
+#[cfg(test)]
+pub(super) async fn hydrate_error_for_test<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    error: LixError,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    match sync_demand_request_for_error(&error)? {
+        Some(SyncDemandRequest::History(ids)) => {
+            hydrate_history_ids(lix, transport, ids.into_iter().collect()).await
+        }
+        Some(SyncDemandRequest::Chunks(ids)) => {
+            hydrate_chunk_ids(lix, transport, ids.into_iter().collect()).await
+        }
+        None => Err(error),
+    }
 }
 
 async fn push_request_blobs<StorageImpl, Transport>(
