@@ -902,11 +902,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    let pending = lix
-        .sync_history_demand_ids(&requested)
-        .await?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let pending = lix.sync_history_demand_ids(requested).await?;
     if pending.is_empty() {
         return Ok(());
     }
@@ -2998,20 +2994,20 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
         assert_eq!(
             replica
-                .sync_history_demand_ids(&BTreeSet::from([parent.clone()]))
+                .sync_history_demand_ids(BTreeSet::from([parent.clone()]))
                 .await
                 .expect("marker query"),
-            vec![parent],
+            BTreeSet::from([parent]),
             "a missing history response must not clear the local demand marker",
         );
 
         let sparse_boundary = uuid::Uuid::now_v7().to_string();
         assert_eq!(
             replica
-                .sync_history_demand_ids(&BTreeSet::from([sparse_boundary.clone()]))
+                .sync_history_demand_ids(BTreeSet::from([sparse_boundary.clone()]))
                 .await
                 .expect("missing record query"),
-            vec![sparse_boundary],
+            BTreeSet::from([sparse_boundary]),
             "a commit beyond the bounded header frontier must remain demandable",
         );
     }

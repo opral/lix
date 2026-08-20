@@ -4062,17 +4062,17 @@ where
 
     pub(crate) async fn sync_history_demand_ids(
         &self,
-        commit_ids: &BTreeSet<String>,
-    ) -> Result<Vec<String>, LixError> {
+        commit_ids: BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, LixError> {
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let mut pending = Vec::new();
+        let mut pending = BTreeSet::new();
         for commit_id in commit_ids {
-            let parsed = CommitId::parse_lix(commit_id, "sync history demand commit id")?;
+            let parsed = CommitId::parse_lix(&commit_id, "sync history demand commit id")?;
             if load_commit_record(&read, parsed).await?.is_none()
                 || commit_history_is_deferred(&read, parsed).await?
             {
-                pending.push(commit_id.clone());
+                pending.insert(commit_id);
             }
         }
         Ok(pending)
