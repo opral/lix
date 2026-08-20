@@ -39,10 +39,11 @@ use crate::storage_adapter::{
     StorageWriteSet, ValueSemantics, exact_get_many,
 };
 use crate::tracked_state::{
-    CertifiedCommitStateTopologyParent, CommitStateManifest, CommitStateReplayDebt,
-    MaterializedTrackedStateRow, StagedCommitStateManifest, TrackedStateCommitDeltaRef,
-    TrackedStateContext, TrackedStateDeltaRef, TrackedStateDiffRequest, TrackedStateFilter,
-    TrackedStateKey, TrackedStateReadColumns, TrackedStateRootId, TrackedStateScanRequest,
+    CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitStateManifest,
+    CommitStateReplayDebt, MaterializedTrackedStateRow, StagedCommitStateManifest,
+    TRACKED_STATE_CHANGE_LOCATOR_SPACE, TrackedStateCommitDeltaRef, TrackedStateContext,
+    TrackedStateDeltaRef, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateKey,
+    TrackedStateReadColumns, TrackedStateRootId, TrackedStateScanRequest,
     commit_delta_member_scopes, commit_history_is_deferred, direct_change_locator,
     incomplete_touched_scope_filter, load_change_record_by_id, load_commit_state_manifest,
     load_published_commit_state_topology, stage_certified_commit_state_manifest_with_handle,
@@ -86,6 +87,68 @@ async fn load_existing_sync_change(
         Some(change) => Ok(Some(change)),
         None => load_change_record_by_id(read, change_id).await,
     }
+}
+
+fn collect_imported_change_locators(
+    selected_fallbacks: &mut BTreeMap<ChangeId, CommitDeltaChangeLocator>,
+    authored: &mut BTreeMap<ChangeId, CommitDeltaChangeLocator>,
+    staged: impl IntoIterator<Item = CommitDeltaChangeLocator>,
+    authored_change_ids: &BTreeSet<ChangeId>,
+) {
+    for locator in staged {
+        if authored_change_ids.contains(&locator.change_id) {
+            authored.insert(locator.change_id, locator);
+        } else {
+            selected_fallbacks
+                .entry(locator.change_id)
+                .or_insert(locator);
+        }
+    }
+}
+
+async fn stage_missing_selected_change_locators(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+    selected_fallbacks: BTreeMap<ChangeId, CommitDeltaChangeLocator>,
+) -> Result<(), LixError> {
+    if selected_fallbacks.is_empty() {
+        return Ok(());
+    }
+    let locators = selected_fallbacks.into_values().collect::<Vec<_>>();
+    let keys = locators
+        .iter()
+        .map(|locator| {
+            StorageKey(Bytes::copy_from_slice(
+                locator.change_id.as_uuid().as_bytes(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let existing = exact_get_many(
+        read,
+        &[StorageGetManyRequest {
+            space: TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            keys: &keys,
+            opts: StorageGetOptions::default(),
+        }],
+    )
+    .await?;
+    let missing = locators
+        .into_iter()
+        .zip(keys)
+        .zip(existing.values)
+        .filter_map(|((locator, key), existing)| {
+            existing.is_none().then(|| {
+                preconditions.push(StoragePrecondition::KeyAbsent {
+                    space: TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+                    key,
+                });
+                locator
+            })
+        })
+        .collect::<Vec<_>>();
+    stage_change_locators(writes, &missing);
+    Ok(())
 }
 
 fn format_sync_state_root_id(root_id: &TrackedStateRootId) -> String {
@@ -2427,15 +2490,12 @@ where
                 .filter(|member| member.authored)
                 .map(|member| member.change_id)
                 .collect::<BTreeSet<_>>();
-            for locator in staged.locators.iter().cloned() {
-                if authored_change_ids.contains(&locator.change_id) {
-                    authored_locators.insert(locator.change_id, locator);
-                } else {
-                    selected_fallback_locators
-                        .entry(locator.change_id)
-                        .or_insert(locator);
-                }
-            }
+            collect_imported_change_locators(
+                &mut selected_fallback_locators,
+                &mut authored_locators,
+                staged.locators.iter().cloned(),
+                &authored_change_ids,
+            );
             head_mutations.insert(commit.commit_id, staged.mutation_inventory().clone());
         }
         stage_change_locators(
@@ -3431,6 +3491,8 @@ where
             }
         }
         let mut newly_imported = Vec::new();
+        let mut selected_fallback_locators = BTreeMap::new();
+        let mut authored_locators = BTreeMap::new();
         let mut remaining = parsed
             .keys()
             .filter(|commit_id| !existing.contains(commit_id))
@@ -3531,13 +3593,12 @@ where
                 .filter(|member| member.authored)
                 .map(|member| member.change_id)
                 .collect::<BTreeSet<_>>();
-            let authored_locators = staged_delta
-                .locators
-                .iter()
-                .filter(|locator| authored_change_ids.contains(&locator.change_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            stage_change_locators(&mut writes, &authored_locators);
+            collect_imported_change_locators(
+                &mut selected_fallback_locators,
+                &mut authored_locators,
+                staged_delta.locators.iter().cloned(),
+                &authored_change_ids,
+            );
             let mutations = staged_delta.mutation_inventory().clone();
 
             let staged_manifest = if boundary_rows.contains_key(&commit_id) {
@@ -3696,6 +3757,18 @@ where
             }
             remaining.remove(&commit_id);
         }
+
+        stage_missing_selected_change_locators(
+            &read,
+            &mut writes,
+            &mut preconditions,
+            selected_fallback_locators,
+        )
+        .await?;
+        stage_change_locators(
+            &mut writes,
+            &authored_locators.into_values().collect::<Vec<_>>(),
+        );
 
         for (update, head, _) in &changed_refs {
             let Some(head) = head else {
@@ -5242,7 +5315,68 @@ mod tests {
                 .commits,
             vec![forged_checkpoint],
         );
+        let mut repeated_checkpoint = authority_commit.clone();
+        repeated_checkpoint.commit_id =
+            CommitId::for_test_label("repeated-checkpoint-selected-change").to_string();
+        repeated_checkpoint.parent_commit_ids = vec![head.clone()];
+        let repeated_id = repeated_checkpoint.commit_id.clone();
+        authority
+            .push_sync_repository(&SyncPushRequest {
+                commits: vec![repeated_checkpoint.clone()],
+                ref_updates: Vec::new(),
+            })
+            .await
+            .expect("a repeated selected checkpoint should import");
+        let selected_ids = authority_commit
+            .members
+            .iter()
+            .filter(|member| !member.authored)
+            .map(|member| {
+                ChangeId::parse_lix(&member.change_id, "checkpoint selected test change")
+                    .expect("selected change id should parse")
+            })
+            .collect::<Vec<_>>();
         let replica = replica_from_snapshot(&authority, &snapshot).await;
+        let mut deleted_locators = StorageWriteSet::default();
+        crate::tracked_state::stage_delete_change_locators(
+            &mut deleted_locators,
+            selected_ids.iter().copied(),
+        );
+        replica
+            .storage_adapter()
+            .commit_write_set(deleted_locators, StorageWriteOptions::default())
+            .await
+            .expect("test should emulate a sparse replica missing selected locators");
+        let repeated_history = authority
+            .sync_history(&repeated_id, 1)
+            .await
+            .expect("detached selected history should load");
+        let mut repeated_boundary_rows = Vec::new();
+        for boundary in &repeated_history.boundaries {
+            let page = authority
+                .pull_sync_snapshot_rows(
+                    &boundary.commit_id,
+                    &boundary.commit_id,
+                    None,
+                    super::super::MAX_SYNC_REQUEST_ITEMS,
+                )
+                .await
+                .expect("detached selected boundary rows should load");
+            assert_eq!(page.continuation, None);
+            repeated_boundary_rows.extend(page.rows);
+        }
+        replica
+            .import_sync_history_headers(&repeated_history.commit_headers)
+            .await
+            .expect("detached selected headers should import");
+        replica
+            .import_sync_history_boundaries(
+                &repeated_history.commits,
+                &repeated_history.boundaries,
+                &repeated_boundary_rows,
+            )
+            .await
+            .expect("detached selected body should import");
         assert_eq!(
             working_diff_count(&replica).await,
             0,
@@ -5254,20 +5388,29 @@ mod tests {
             1,
             "only the post-checkpoint user row should be dirty",
         );
-        let selected_ids = authority_commit
-            .members
-            .iter()
-            .filter(|member| !member.authored)
-            .map(|member| {
-                ChangeId::parse_lix(&member.change_id, "checkpoint selected test change")
-                    .expect("selected change id should parse")
-            })
-            .collect::<Vec<_>>();
         let adapter = replica.storage_adapter();
         let read = adapter
             .begin_read(StorageReadOptions::default())
             .await
             .expect("replica change read should open");
+        let locator_keys = selected_ids
+            .iter()
+            .map(|change_id| StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes())))
+            .collect::<Vec<_>>();
+        let restored_locators = exact_get_many(
+            &read,
+            &[StorageGetManyRequest {
+                space: TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+                keys: &locator_keys,
+                opts: StorageGetOptions::default(),
+            }],
+        )
+        .await
+        .expect("selected locator rows should load");
+        assert!(
+            restored_locators.values.iter().all(Option::is_some),
+            "ordinary history import must restore every missing selected locator",
+        );
         let selected_records = ChangelogContext::new()
             .reader(&read)
             .load_changes(ChangeLoadRequest {
@@ -5282,6 +5425,12 @@ mod tests {
         let packed_changes = crate::tracked_state::scan_change_records_from_commit_deltas(&read)
             .await
             .expect("sparse checkpoint selections must remain readable by lix_change scans");
+        assert!(
+            selected_ids.iter().all(|change_id| packed_changes
+                .iter()
+                .any(|change| change.change_id == *change_id)),
+            "a later history import must publish selected locator fallbacks too",
+        );
         let packed_change_ids = packed_changes
             .iter()
             .map(|change| change.change_id)
@@ -7204,6 +7353,21 @@ mod tests {
             "peer checkpoint should be clean, found {:?}",
             peer_diff.rows(),
         );
+        let peer_read = peer
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("peer change scan should open");
+        let peer_changes = crate::tracked_state::scan_change_records_from_commit_deltas(&peer_read)
+            .await
+            .expect("peer must resolve every imported checkpoint member");
+        assert!(
+            peer_changes.iter().any(|change| {
+                change.schema_key == "lix_file_descriptor" && change.file_id.is_some()
+            }),
+            "peer change scan should include the synchronized file",
+        );
+        drop(peer_read);
         let read = peer
             .storage_adapter()
             .begin_read(StorageReadOptions::default())

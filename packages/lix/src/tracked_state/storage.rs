@@ -5760,9 +5760,9 @@ pub(crate) async fn load_change_record_by_id(
         super::mutation_directory::record_direct_route_explicit_fallback(1);
     }
     if let Some(locator) = load_change_locator_by_id(store, change_id).await? {
-        return load_change_record_at_locator(store, locator)
-            .await
-            .map(Some);
+        return Ok(load_explicit_change_records_at_locators(store, &[locator])
+            .await?
+            .pop());
     }
     Ok(None)
 }
@@ -6834,16 +6834,6 @@ async fn load_selected_change_records_from_state(
         .collect()
 }
 
-fn decode_change_at_locator(
-    segment: &[u8],
-    bounds: Option<&CommitDeltaSegmentBounds>,
-    locator: CommitDeltaChangeLocator,
-    account_id: &str,
-) -> Result<LoadedCommitDeltaEntry, LixError> {
-    let (leaf, payloads) = decode_commit_delta_with_payloads(segment, bounds)?;
-    decode_change_at_locator_from_decoded(&leaf, &payloads, locator, account_id)
-}
-
 fn decode_change_at_locator_from_decoded<S>(
     leaf: &DecodedLeafNodeRef,
     payloads: &CommitDeltaPayloadIndex<S>,
@@ -6906,190 +6896,6 @@ where
         base_coordinate,
         selected_ref: false,
     })
-}
-
-async fn load_change_record_at_locator(
-    store: &(impl StorageAdapterRead + ?Sized),
-    locator: CommitDeltaChangeLocator,
-) -> Result<crate::changelog::ChangeRecord, LixError> {
-    if direct_change_locator(locator.change_id) == Some(locator) {
-        match load_direct_change_authority(store, locator.commit_id).await? {
-            DirectChangeAuthority::Candidate(authority) => {
-                let route = route_direct_change_records_for_state(store, &authority, &[locator])
-                    .await?
-                    .pop()
-                    .expect("one direct locator returns one route");
-                if let DirectChangeRecordRoute::Owned(record) = route {
-                    return Ok(record);
-                }
-            }
-            DirectChangeAuthority::NotOwned(reason) => {
-                let _ = reason;
-            }
-        }
-        #[cfg(any(test, feature = "storage-benches"))]
-        super::mutation_directory::record_direct_route_explicit_fallback(1);
-    }
-    let change_id = locator.change_id;
-    let Some(manifest) = load_commit_delta_manifest(store, locator.commit_id).await? else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked_state change locator for '{change_id}' references missing commit '{}'",
-                locator.commit_id
-            ),
-        ));
-    };
-    load_change_record_at_locator_in_manifest(store, locator, &manifest).await
-}
-
-async fn load_change_record_at_locator_in_manifest(
-    store: &(impl StorageAdapterRead + ?Sized),
-    locator: CommitDeltaChangeLocator,
-    manifest: &CommitDeltaManifest,
-) -> Result<crate::changelog::ChangeRecord, LixError> {
-    let change_id = locator.change_id;
-    try_load_change_record_at_locator_in_manifest(store, locator, manifest)
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("tracked_state change locator for '{change_id}' points to the wrong row"),
-            )
-        })
-}
-
-async fn try_load_change_record_at_locator_in_manifest(
-    store: &(impl StorageAdapterRead + ?Sized),
-    locator: CommitDeltaChangeLocator,
-    manifest: &CommitDeltaManifest,
-) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
-    if let Some(parts) = manifest.columnar_parts.as_ref() {
-        return load_columnar_change_record_at_locator(store, locator, parts, &manifest.account_id)
-            .await
-            .map(Some);
-    }
-    let change_id = locator.change_id;
-    let (segment, bounds) = if let Some(inline) = manifest.inline_segment() {
-        if locator.segment_index != 0 {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state change locator for '{change_id}' references segment {} of an inline commit",
-                    locator.segment_index
-                ),
-            ));
-        }
-        (Bytes::copy_from_slice(inline), None)
-    } else {
-        let segment_index = usize::try_from(locator.segment_index).expect("u32 fits usize");
-        let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state change locator for '{change_id}' references missing segment {}",
-                    locator.segment_index
-                ),
-            )
-        })?;
-        let segment_key = StorageKey(Bytes::from(commit_delta_segment_key_for_bounds(
-            locator.commit_id,
-            segment_index,
-            bounds,
-        )?));
-        let segment = PointReadPlan::new(
-            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-            std::slice::from_ref(&segment_key),
-        )
-        .materialize(store, StorageGetOptions::default())
-        .await?
-        .value
-        .into_iter()
-        .next()
-        .flatten()
-        .and_then(full_value_bytes)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state change locator for '{change_id}' references absent segment {}",
-                    locator.segment_index
-                ),
-            )
-        })?;
-        (segment, Some(bounds))
-    };
-    Ok(Some(
-        decode_change_at_locator(&segment, bounds, locator, &manifest.account_id)?.change_record,
-    ))
-}
-
-async fn load_columnar_change_record_at_locator(
-    store: &(impl StorageAdapterRead + ?Sized),
-    locator: CommitDeltaChangeLocator,
-    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
-    account_id: &str,
-) -> Result<crate::changelog::ChangeRecord, LixError> {
-    let logical_ordinal = usize::try_from(locator.segment_index)
-        .expect("u32 segment fits usize")
-        .checked_mul(COMMIT_DELTA_SEGMENT_MAX_ROWS)
-        .and_then(|base| base.checked_add(usize::from(locator.ordinal)))
-        .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
-    if logical_ordinal >= parts.row_count as usize {
-        return Err(replacement_payload_error(
-            "columnar mutation address is outside its inventory",
-        ));
-    }
-    let expected_change_id = change_id_from_packed_address(
-        locator.commit_id,
-        u32::try_from(logical_ordinal)
-            .map_err(|_| replacement_payload_error("columnar mutation address exceeds u32"))?
-            .checked_add(1)
-            .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?,
-    );
-    if locator.change_id != expected_change_id {
-        return Err(replacement_payload_error(
-            "columnar mutation locator change id disagrees with its ordinal",
-        ));
-    }
-    let mut group_base = 0usize;
-    let (group_index, row_index) = parts
-        .group_row_counts
-        .iter()
-        .enumerate()
-        .find_map(|(group_index, &row_count)| {
-            let group_end = group_base + row_count as usize;
-            let result = (logical_ordinal < group_end)
-                .then_some((group_index, logical_ordinal - group_base));
-            group_base = group_end;
-            result
-        })
-        .ok_or_else(|| replacement_payload_error("columnar mutation group is missing"))?;
-    let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
-    let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
-        .await?
-        .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
-    validate_columnar_mutation_manifest(&manifest, parts)?;
-    let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
-    let page_index = row_index / crate::columnar_row_group::ROW_GROUP_PAGE_ROWS;
-    let page_row_index = row_index % crate::columnar_row_group::ROW_GROUP_PAGE_ROWS;
-    let batch = crate::columnar_row_group::load_row_group_page(
-        store,
-        id,
-        &manifest,
-        group_index,
-        page_index,
-        &projection,
-    )
-    .await?;
-    decode_columnar_change_record(
-        &manifest,
-        &batch,
-        page_row_index,
-        parts,
-        locator.change_id,
-        account_id,
-    )
 }
 
 pub(crate) fn validate_columnar_mutation_manifest(
@@ -10329,7 +10135,16 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                             emitted += 1;
                             continue;
                         }
-                        let canonical = load_change_record_at_locator(store, locator).await?;
+                        let canonical =
+                            load_change_records_by_ids(store, &[member.change.change_id])
+                                .await?
+                                .pop()
+                                .ok_or_else(|| {
+                                    invalid_change_locator(
+                                        member.change.change_id,
+                                        "does not resolve to a canonical record",
+                                    )
+                                })?;
                         if canonical != member.change {
                             return Err(LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
