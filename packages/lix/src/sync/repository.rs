@@ -40,10 +40,10 @@ use crate::storage_adapter::{
 };
 use crate::tracked_state::{
     CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitStateManifest,
-    CommitStateReplayDebt, MaterializedTrackedStateRow, StagedCommitStateManifest,
-    TRACKED_STATE_CHANGE_LOCATOR_SPACE, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateKey,
-    TrackedStateReadColumns, TrackedStateRootId, TrackedStateScanRequest,
+    CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
+    StagedCommitStateManifest, TRACKED_STATE_CHANGE_LOCATOR_SPACE, TrackedStateCommitDeltaRef,
+    TrackedStateContext, TrackedStateDeltaRef, TrackedStateDiffRequest, TrackedStateFilter,
+    TrackedStateKey, TrackedStateReadColumns, TrackedStateRootId, TrackedStateScanRequest,
     commit_delta_member_scopes, commit_history_is_deferred, direct_change_locator,
     incomplete_touched_scope_filter, load_change_record_by_id, load_commit_state_manifest,
     load_published_commit_state_topology, stage_certified_commit_state_manifest_with_handle,
@@ -104,6 +104,55 @@ fn collect_imported_change_locators(
                 .or_insert(locator);
         }
     }
+}
+
+fn stage_imported_commit_body(
+    writes: &mut StorageWriteSet,
+    commit: &ParsedCommit,
+    imported_authored_change_ids: &mut BTreeSet<ChangeId>,
+    selected_fallbacks: &mut BTreeMap<ChangeId, CommitDeltaChangeLocator>,
+    authored: &mut BTreeMap<ChangeId, CommitDeltaChangeLocator>,
+) -> Result<CommitStateMutationInventory, LixError> {
+    let deltas = commit
+        .members
+        .iter()
+        .map(|member| member.as_commit_delta(commit.commit_id))
+        .collect::<Vec<_>>();
+    let mut authored_change_ids = BTreeSet::new();
+    let addressable = commit
+        .members
+        .iter()
+        .map(|member| {
+            if !member.authored {
+                return false;
+            }
+            authored_change_ids.insert(member.change_id);
+            direct_change_locator(member.change_id)
+                .is_some_and(|locator| locator.commit_id == commit.commit_id)
+        })
+        .collect::<Vec<_>>();
+    let staged = stage_imported_addressable_commit_deltas(writes, &deltas, &addressable)?;
+    for ((member, assigned), addressable) in commit
+        .members
+        .iter()
+        .zip(&staged.assigned_change_ids)
+        .zip(&addressable)
+    {
+        if *addressable && member.change_id != *assigned {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync commit contains a noncanonical authored change id",
+            ));
+        }
+    }
+    imported_authored_change_ids.extend(authored_change_ids.iter().copied());
+    collect_imported_change_locators(
+        selected_fallbacks,
+        authored,
+        staged.locators.iter().cloned(),
+        &authored_change_ids,
+    );
+    Ok(staged.mutation_inventory().clone())
 }
 
 async fn stage_missing_selected_change_locators(
@@ -494,6 +543,21 @@ struct ParsedSnapshotRow {
 }
 
 impl ParsedSnapshotRow {
+    fn change_record(&self) -> ChangeRecord {
+        ChangeRecord {
+            format_version: 2,
+            change_id: self.change_id,
+            account_id: self.change_account_id.clone(),
+            schema_key: self.schema_key.clone(),
+            row_pk: self.row_pk.clone(),
+            file_id: self.file_id.clone(),
+            snapshot: self.snapshot.clone(),
+            metadata: self.metadata.clone(),
+            created_at: self.change_created_at,
+            origin_key: self.origin_key.clone(),
+        }
+    }
+
     fn as_root_delta(&self) -> TrackedStateDeltaRef<'_> {
         TrackedStateDeltaRef {
             schema_key: &self.schema_key,
@@ -535,6 +599,21 @@ fn snapshot_rows_hot_snapshot<'a>(
 }
 
 impl ParsedMember {
+    fn change_record(&self) -> ChangeRecord {
+        ChangeRecord {
+            format_version: 2,
+            change_id: self.change_id,
+            account_id: self.change_account_id.clone(),
+            schema_key: self.schema_key.clone(),
+            row_pk: self.row_pk.clone(),
+            file_id: self.file_id.clone(),
+            snapshot: self.snapshot.clone(),
+            metadata: self.metadata.clone(),
+            created_at: self.change_created_at,
+            origin_key: self.origin_key.clone(),
+        }
+    }
+
     fn as_root_delta(&self, commit_id: CommitId) -> TrackedStateDeltaRef<'_> {
         TrackedStateDeltaRef {
             schema_key: &self.schema_key,
@@ -2379,18 +2458,7 @@ where
 
         let mut changes = BTreeMap::<ChangeId, ChangeRecord>::new();
         for row in &parsed_rows {
-            let change = ChangeRecord {
-                format_version: 2,
-                change_id: row.change_id,
-                account_id: row.change_account_id.clone(),
-                schema_key: row.schema_key.clone(),
-                row_pk: row.row_pk.clone(),
-                file_id: row.file_id.clone(),
-                snapshot: row.snapshot.clone(),
-                metadata: row.metadata.clone(),
-                created_at: row.change_created_at,
-                origin_key: row.origin_key.clone(),
-            };
+            let change = row.change_record();
             if changes
                 .insert(change.change_id, change.clone())
                 .is_some_and(|existing| existing != change)
@@ -2438,44 +2506,15 @@ where
             .filter(|(commit_id, _)| snapshot_body_ids.contains(commit_id))
             .map(|(_, commit)| commit)
         {
-            let delta_members = commit.members.iter().collect::<Vec<_>>();
-            let deltas = delta_members
-                .iter()
-                .map(|member| member.as_commit_delta(commit.commit_id))
-                .collect::<Vec<_>>();
-            let addressable = delta_members
-                .iter()
-                .map(|member| {
-                    member.authored
-                        && direct_change_locator(member.change_id)
-                            .is_some_and(|locator| locator.commit_id == commit.commit_id)
-                })
-                .collect::<Vec<_>>();
-            let staged =
-                stage_imported_addressable_commit_deltas(&mut writes, &deltas, &addressable)?;
-            for ((member, assigned), addressable) in delta_members
-                .iter()
-                .zip(&staged.assigned_change_ids)
-                .zip(&addressable)
-            {
-                if *addressable && member.change_id != *assigned {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync snapshot head has a noncanonical authored change id",
-                    ));
-                }
-                let change = ChangeRecord {
-                    format_version: 2,
-                    change_id: member.change_id,
-                    account_id: member.change_account_id.clone(),
-                    schema_key: member.schema_key.clone(),
-                    row_pk: member.row_pk.clone(),
-                    file_id: member.file_id.clone(),
-                    snapshot: member.snapshot.clone(),
-                    metadata: member.metadata.clone(),
-                    created_at: member.change_created_at,
-                    origin_key: member.origin_key.clone(),
-                };
+            let mutations = stage_imported_commit_body(
+                &mut writes,
+                commit,
+                &mut imported_authored_change_ids,
+                &mut selected_fallback_locators,
+                &mut authored_locators,
+            )?;
+            for member in &commit.members {
+                let change = member.change_record();
                 if changes
                     .insert(change.change_id, change.clone())
                     .is_some_and(|existing| existing != change)
@@ -2486,19 +2525,7 @@ where
                     ));
                 }
             }
-            let authored_change_ids = delta_members
-                .iter()
-                .filter(|member| member.authored)
-                .map(|member| member.change_id)
-                .collect::<BTreeSet<_>>();
-            imported_authored_change_ids.extend(authored_change_ids.iter().copied());
-            collect_imported_change_locators(
-                &mut selected_fallback_locators,
-                &mut authored_locators,
-                staged.locators.iter().cloned(),
-                &authored_change_ids,
-            );
-            head_mutations.insert(commit.commit_id, staged.mutation_inventory().clone());
+            head_mutations.insert(commit.commit_id, mutations);
         }
         selected_fallback_locators
             .retain(|change_id, _| !imported_authored_change_ids.contains(change_id));
@@ -3453,18 +3480,7 @@ where
         let mut appended_records = Vec::new();
         let mut appended_changes = BTreeMap::<ChangeId, ChangeRecord>::new();
         for row in boundary_rows.values().flatten() {
-            let change = ChangeRecord {
-                format_version: 2,
-                change_id: row.change_id,
-                account_id: row.change_account_id.clone(),
-                schema_key: row.schema_key.clone(),
-                row_pk: row.row_pk.clone(),
-                file_id: row.file_id.clone(),
-                snapshot: row.snapshot.clone(),
-                metadata: row.metadata.clone(),
-                created_at: row.change_created_at,
-                origin_key: row.origin_key.clone(),
-            };
+            let change = row.change_record();
             match load_existing_sync_change(&read, change.change_id).await? {
                 Some(existing) if existing != change => {
                     return Err(LixError::new(
@@ -3523,47 +3539,15 @@ where
                 ));
             };
             let commit = &parsed[&commit_id];
-            let delta_members = commit.members.iter().collect::<Vec<_>>();
-            let deltas = delta_members
-                .iter()
-                .map(|member| member.as_commit_delta(commit_id))
-                .collect::<Vec<_>>();
-            let addressable = delta_members
-                .iter()
-                .map(|member| {
-                    member.authored
-                        && direct_change_locator(member.change_id)
-                            .is_some_and(|locator| locator.commit_id == commit_id)
-                })
-                .collect::<Vec<_>>();
-            let staged_delta =
-                stage_imported_addressable_commit_deltas(&mut writes, &deltas, &addressable)?;
-            for ((member, assigned), addressable) in delta_members
-                .iter()
-                .zip(&staged_delta.assigned_change_ids)
-                .zip(&addressable)
-            {
-                if *addressable && member.change_id != *assigned {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "sync commit '{commit_id}' change id '{}' is not its canonical address",
-                            member.change_id
-                        ),
-                    ));
-                }
-                let change = ChangeRecord {
-                    format_version: 2,
-                    change_id: member.change_id,
-                    account_id: member.change_account_id.clone(),
-                    schema_key: member.schema_key.clone(),
-                    row_pk: member.row_pk.clone(),
-                    file_id: member.file_id.clone(),
-                    snapshot: member.snapshot.clone(),
-                    metadata: member.metadata.clone(),
-                    created_at: member.change_created_at,
-                    origin_key: member.origin_key.clone(),
-                };
+            let mutations = stage_imported_commit_body(
+                &mut writes,
+                commit,
+                &mut imported_authored_change_ids,
+                &mut selected_fallback_locators,
+                &mut authored_locators,
+            )?;
+            for member in &commit.members {
+                let change = member.change_record();
                 match load_existing_sync_change(&read, change.change_id).await? {
                     Some(existing) if existing != change => {
                         return Err(LixError::new(
@@ -3593,20 +3577,10 @@ where
                     },
                 }
             }
-            let authored_change_ids = delta_members
-                .iter()
-                .filter(|member| member.authored)
-                .map(|member| member.change_id)
-                .collect::<BTreeSet<_>>();
-            imported_authored_change_ids.extend(authored_change_ids.iter().copied());
-            collect_imported_change_locators(
-                &mut selected_fallback_locators,
-                &mut authored_locators,
-                staged_delta.locators.iter().cloned(),
-                &authored_change_ids,
-            );
-            let mutations = staged_delta.mutation_inventory().clone();
-
+            let touched_scope_digest = match commit_delta_member_scopes(commit_id, &mutations)? {
+                Some(scopes) => CommitTouchedScopeDigest::exact(scopes.iter()),
+                None => CommitTouchedScopeDigest::opaque(),
+            };
             let staged_manifest = if boundary_rows.contains_key(&commit_id) {
                 stage_commit_state_manifest_with_handle(
                     &mut writes,
@@ -3714,11 +3688,6 @@ where
                 parent_record,
                 parent_jump,
             )?;
-            let touched_scope_digest =
-                match commit_delta_member_scopes(commit_id, staged_delta.mutation_inventory())? {
-                    Some(scopes) => CommitTouchedScopeDigest::exact(scopes.iter()),
-                    None => CommitTouchedScopeDigest::opaque(),
-                };
             let record = CommitRecord {
                 format_version: COMMIT_RECORD_FORMAT_VERSION,
                 commit_id,
