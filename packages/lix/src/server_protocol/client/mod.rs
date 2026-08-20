@@ -210,7 +210,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
             url.set_query(None);
         }
         let handshake = self.request_handshake(url.to_string(), false).await?;
-        self.apply_handshake(handshake)?;
+        self.apply_handshake(handshake);
         Ok(())
     }
 
@@ -257,12 +257,11 @@ impl<H: ProtocolHttp> ClientCore<H> {
         Ok(value)
     }
 
-    fn apply_handshake(&self, handshake: HandshakeResponse) -> Result<(), LixError> {
+    fn apply_handshake(&self, handshake: HandshakeResponse) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.session_id = Some(handshake.session_id);
         state.active_branch_id = Some(handshake.active_branch_id);
         state.active_account_id = Some(handshake.active_account_id);
-        Ok(())
     }
 
     pub async fn execute(
@@ -570,7 +569,8 @@ impl<H: ProtocolHttp> ClientCore<H> {
                         "Lix Server Protocol handshake changed sessionId",
                     ));
                 }
-                self.apply_handshake(handshake)
+                self.apply_handshake(handshake);
+                Ok(())
             }
             Err(error) if is_recoverable_session_error(&error) => {
                 self.recover_session_once().await
