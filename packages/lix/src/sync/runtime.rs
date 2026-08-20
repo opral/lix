@@ -1011,28 +1011,11 @@ where
         }
     }
 
-    let mut ordered = Vec::with_capacity(commits.len());
-    let mut remaining = commits;
-    while !remaining.is_empty() {
-        let ready = remaining
-            .iter()
-            .find(|(_, commit)| {
-                commit
-                    .parent_commit_ids
-                    .iter()
-                    .all(|dependency| !remaining.contains_key(dependency))
-            })
-            .map(|(commit_id, _)| commit_id.clone())
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync history dependency graph contains a cycle",
-                )
-            })?;
-        ordered.push(remaining.remove(&ready).expect("ready commit exists"));
-    }
     Ok(FetchedHistory {
-        commits: ordered,
+        // Both import paths canonicalize and dependency-order this set before
+        // staging it. Keep fetch responsible only for validating and merging
+        // transport responses instead of sorting the same graph twice.
+        commits: commits.into_values().collect(),
         commit_headers: commit_headers.into_values().collect(),
         boundaries: boundaries.into_values().collect(),
     })
