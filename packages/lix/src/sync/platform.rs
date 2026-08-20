@@ -4,8 +4,6 @@
 //! browser implementations intentionally contain no synchronization policy.
 
 use crate::LixError;
-use std::future::Future;
-use std::pin::Pin;
 
 #[cfg(not(target_family = "wasm"))]
 mod native;
@@ -38,9 +36,9 @@ pub use wasm_http::{
 /// here so the shared transport contract has one definition.
 #[cfg(not(target_family = "wasm"))]
 pub type SyncTransportFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, LixError>> + Send + 'a>>;
+    futures_util::future::BoxFuture<'a, Result<T, LixError>>;
 #[cfg(target_family = "wasm")]
-pub type SyncTransportFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LixError>> + 'a>>;
+pub type SyncTransportFuture<'a, T> = futures_util::future::LocalBoxFuture<'a, Result<T, LixError>>;
 
 /// Target-appropriate marker bound for transport handles.
 #[doc(hidden)]
