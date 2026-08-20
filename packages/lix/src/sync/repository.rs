@@ -1487,59 +1487,6 @@ where
             // dependency-ready push. One conflicted branch must not hold the
             // repository's other refs behind its merge.
             let mut pending_reconciliation = None;
-            let mut divergent_branch_ids = BTreeSet::new();
-            for branch_id in &branch_ids {
-                let Some(local) = local_controls
-                    .get(branch_id)
-                    .map(|control| control.head_commit_id)
-                else {
-                    continue;
-                };
-                let Some(authoritative_coordinate) = state.authoritative_branches.get(branch_id)
-                else {
-                    continue;
-                };
-                let Some(authoritative) = authoritative_coordinate
-                    .head_commit_id()
-                    .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
-                    .transpose()?
-                else {
-                    continue;
-                };
-                let local_checkpoint = local_controls
-                    .get(branch_id)
-                    .and_then(|control| control.working_diff_checkpoint_commit_id);
-                let authoritative_checkpoint = authoritative_coordinate
-                    .checkpoint_commit_id()
-                    .map(|checkpoint| {
-                        CommitId::parse_lix(checkpoint, "sync authoritative checkpoint")
-                    })
-                    .transpose()?;
-                let checkpoint_advances_authority =
-                    match (local_checkpoint, authoritative_checkpoint) {
-                        (Some(local_checkpoint), Some(authoritative_checkpoint)) => {
-                            local_checkpoint != authoritative_checkpoint
-                                && commit_reaches_ancestor(
-                                    &read,
-                                    local_checkpoint,
-                                    authoritative_checkpoint,
-                                )
-                                .await?
-                        }
-                        _ => false,
-                    };
-                if local == authoritative
-                    || commit_reaches_ancestor(&read, local, authoritative).await?
-                    || commit_reaches_ancestor(&read, authoritative, local).await?
-                    || checkpoint_advances_authority
-                {
-                    continue;
-                }
-                if pending_reconciliation.is_none() {
-                    pending_reconciliation = Some((branch_id.clone(), local, authoritative));
-                }
-                divergent_branch_ids.insert(branch_id.clone());
-            }
             for branch_id in branch_ids {
                 let local_control = local_controls.get(&branch_id).copied();
                 let local = local_control.map(|control| control.head_commit_id);
@@ -1570,12 +1517,47 @@ where
                 // Authority-known ancestry is enough to make a commit payload
                 // dependency-complete, but it does not make a stale ref update
                 // safe. Reconciliation owns every truly divergent ref.
-                if divergent_branch_ids.contains(&branch_id) {
-                    continue;
-                }
+                let authority_reaches_local = match (local, authoritative) {
+                    (Some(local), Some(authoritative)) if local == authoritative => true,
+                    (Some(local), Some(authoritative)) => {
+                        let local_reaches_authority =
+                            commit_reaches_ancestor(&read, local, authoritative).await?;
+                        let authority_reaches_local = !local_reaches_authority
+                            && commit_reaches_ancestor(&read, authoritative, local).await?;
+                        let checkpoint_advances_authority =
+                            if local_reaches_authority || authority_reaches_local {
+                                false
+                            } else {
+                                match (local_checkpoint, authoritative_checkpoint) {
+                                    (Some(local_checkpoint), Some(authoritative_checkpoint)) => {
+                                        local_checkpoint != authoritative_checkpoint
+                                            && commit_reaches_ancestor(
+                                                &read,
+                                                local_checkpoint,
+                                                authoritative_checkpoint,
+                                            )
+                                            .await?
+                                    }
+                                    _ => false,
+                                }
+                            };
+                        if !local_reaches_authority
+                            && !authority_reaches_local
+                            && !checkpoint_advances_authority
+                        {
+                            if pending_reconciliation.is_none() {
+                                pending_reconciliation =
+                                    Some((branch_id.clone(), local, authoritative));
+                            }
+                            continue;
+                        }
+                        authority_reaches_local
+                    }
+                    _ => false,
+                };
                 if let Some(local_head) = local {
                     if let Some(authority_head) = authoritative
-                        && commit_reaches_ancestor(&read, authority_head, local_head).await?
+                        && authority_reaches_local
                     {
                         // A deliberate reset to a historical authority commit has
                         // no commit payload to upload; the ref CAS itself is the
