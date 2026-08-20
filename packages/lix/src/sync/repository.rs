@@ -1730,6 +1730,19 @@ where
                             )
                         })?
                 };
+                // A long-poll timeout carries no new repository state. The
+                // persisted cursor already proves this heartbeat was applied,
+                // so do not rescan branches or durably rewrite identical
+                // replica state every time an idle poll expires.
+                if events.is_empty() {
+                    if state.cursor != *cursor {
+                        return Err(LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "sync delta cursor does not match its final event",
+                        ));
+                    }
+                    return Ok(());
+                }
                 for event in events {
                     if event.cursor != state.cursor.saturating_add(1) {
                         return Err(LixError::new(
@@ -4461,15 +4474,86 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
     use crate::hot_state::{HotStateContext, HotStateRowRequest};
-    use crate::storage::Memory;
+    use crate::storage::{
+        BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
+        ReadOptions, ScanCursor, Storage, StorageError, StorageRead, StorageSpace, WriteOptions,
+    };
     use crate::storage_adapter::SharedStorageAdapterRead;
     use crate::{
         CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, NullableKeyFilter, SwitchBranchOptions, Value,
         open_lix,
     };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     const TEST_REMOTE: &str = "https://sync.example/repository";
+
+    #[derive(Clone, Default)]
+    struct SyncAccountingStorage {
+        inner: Memory,
+        forbidden_operations: Arc<AtomicU64>,
+    }
+
+    struct SyncAccountingRead {
+        inner: MemoryRead,
+        forbidden_operations: Arc<AtomicU64>,
+    }
+
+    impl SyncAccountingStorage {
+        fn reset(&self) {
+            self.forbidden_operations.store(0, Ordering::Relaxed);
+        }
+
+        fn forbidden_operation_count(&self) -> u64 {
+            self.forbidden_operations.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Storage for SyncAccountingStorage {
+        type Read<'a>
+            = SyncAccountingRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            Ok(SyncAccountingRead {
+                inner: self.inner.begin_read(options).await?,
+                forbidden_operations: Arc::clone(&self.forbidden_operations),
+            })
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.forbidden_operations.fetch_add(1, Ordering::Relaxed);
+            self.inner.begin_write(options).await
+        }
+    }
+
+    impl StorageRead for SyncAccountingRead {
+        async fn get_many(
+            &self,
+            requests: &[GetManyRequest<'_>],
+        ) -> Result<GetManyResult, StorageError> {
+            self.inner.get_many(requests).await
+        }
+
+        async fn begin_scan(
+            &self,
+            space: StorageSpace,
+            range: KeyRange,
+            options: BeginScanOptions,
+        ) -> Result<ScanCursor<'_>, StorageError> {
+            self.forbidden_operations.fetch_add(1, Ordering::Relaxed);
+            self.inner.begin_scan(space, range, options).await
+        }
+    }
 
     #[tokio::test]
     async fn ancestry_walk_stops_at_an_absent_lazy_history_boundary() {
@@ -4590,6 +4674,55 @@ mod tests {
                 .get::<serde_json::Value>("value")
                 .expect("observed value decodes"),
             serde_json::json!("after"),
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_sync_delta_does_not_scan_or_open_a_write_transaction() {
+        let storage = SyncAccountingStorage::default();
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("replica storage should initialize");
+        let replica = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("replica should open");
+        replica
+            .set_sync_role(super::super::SyncRole::Replica)
+            .expect("replica role should install");
+        replica
+            .store_replica_state(
+                TEST_REMOTE,
+                SyncReplicaState {
+                    active_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                    cursor: 0,
+                    authoritative_heads: BTreeMap::from([(
+                        receipt.main_branch_id,
+                        Some(receipt.initial_commit_id),
+                    )]),
+                    authoritative_checkpoints: BTreeMap::new(),
+                    authority_known_commit_ids: BTreeSet::new(),
+                },
+            )
+            .await
+            .expect("replica cursor should initialize");
+        storage.reset();
+
+        replica
+            .apply_sync_repository_pull(
+                TEST_REMOTE,
+                &SyncRepositoryPullResponse::Delta {
+                    cursor: 0,
+                    events: Vec::new(),
+                },
+            )
+            .await
+            .expect("an unchanged heartbeat should be accepted");
+
+        assert_eq!(
+            storage.forbidden_operation_count(),
+            0,
+            "an unchanged heartbeat must not scan branches or open a write transaction",
         );
     }
 
