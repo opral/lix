@@ -1,53 +1,7 @@
 use lix::{LixError, Value};
 
 simulation_test!(
-    read_only_branch_components_reject_direct_row_writes,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine.open_session().await.expect("session should open"),
-            &engine,
-        );
-
-        assert_read_only_error(
-            session
-                .execute(
-                    "INSERT INTO lix_branch_descriptor (id, name, hidden) \
-                     VALUES ('orphan-descriptor', 'Orphan', false)",
-                    &[],
-                )
-                .await
-                .expect_err("descriptor insert should be read-only"),
-            "lix_branch_descriptor",
-            "lix_branch",
-        );
-
-        assert_read_only_error(
-            session
-                .execute(
-                    "UPDATE lix_branch_descriptor SET name = 'Renamed' \
-                     WHERE id = 'main'",
-                    &[],
-                )
-                .await
-                .expect_err("descriptor update should be read-only"),
-            "lix_branch_descriptor",
-            "lix_branch",
-        );
-
-        assert_read_only_error(
-            session
-                .execute("DELETE FROM lix_branch_ref WHERE id = 'main'", &[])
-                .await
-                .expect_err("ref delete should be read-only"),
-            "lix_branch_ref",
-            "lix_branch",
-        );
-    }
-);
-
-simulation_test!(
-    state_and_filesystem_storage_relations_are_not_public,
+    internal_storage_relations_are_not_public,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -68,6 +22,12 @@ simulation_test!(
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",
             "lix_binary_blob_ref_history",
+            "lix_branch_descriptor",
+            "lix_branch_descriptor_by_branch",
+            "lix_branch_descriptor_history",
+            "lix_branch_ref",
+            "lix_branch_ref_by_branch",
+            "lix_branch_ref_history",
             "lix_directory_descriptor",
             "lix_directory_descriptor_by_branch",
             "lix_directory_descriptor_history",
@@ -203,18 +163,3 @@ simulation_test!(
         );
     }
 );
-
-fn assert_read_only_error(error: LixError, schema_key: &str, hint_fragment: &str) {
-    assert_eq!(error.code, LixError::CODE_READ_ONLY);
-    assert!(
-        error.message.contains(schema_key),
-        "read-only error should name {schema_key}: {error:?}"
-    );
-    assert!(
-        error
-            .hint
-            .as_deref()
-            .is_some_and(|hint| hint.contains(hint_fragment)),
-        "read-only error should guide callers toward {hint_fragment}: {error:?}"
-    );
-}

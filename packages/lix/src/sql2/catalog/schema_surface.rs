@@ -296,6 +296,8 @@ pub(crate) fn schema_exposed_as_schema_surface(schema_key: &str) -> bool {
     !matches!(
         schema_key,
         "lix_binary_blob_ref"
+            | "lix_branch_descriptor"
+            | "lix_branch_ref"
             | "lix_change"
             | "lix_directory_descriptor"
             | "lix_file_descriptor"
