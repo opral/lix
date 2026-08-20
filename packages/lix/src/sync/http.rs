@@ -31,6 +31,7 @@ pub(super) struct RawHttpRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
+    pub cache_immutable: bool,
     pub operation: &'static str,
 }
 
@@ -233,11 +234,12 @@ where
 
     fn get_chunk<'a>(&'a self, chunk_id: &'a str) -> SyncTransportFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
-            let request = self.request(
+            let mut request = self.request(
                 Method::Get,
                 &format!("/sync/chunk?chunkId={}", encode_query(chunk_id)),
                 "load sync chunk",
             );
+            request.cache_immutable = true;
             let response = self.client.send(request).await?;
             if response.status == 404 {
                 return Ok(None);
@@ -269,6 +271,7 @@ fn raw_request(method: Method, url: String, operation: &'static str) -> RawHttpR
         url,
         headers: Vec::new(),
         body: None,
+        cache_immutable: false,
         operation,
     }
 }

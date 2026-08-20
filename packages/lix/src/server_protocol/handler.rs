@@ -1488,7 +1488,14 @@ where
         context: ServerProtocolContext,
     ) -> impl Future<Output = ServerProtocolResponse> + 'static {
         let server = self.clone();
-        async move { Box::pin(server.dispatch(request, context)).await }
+        async move {
+            let mut response = Box::pin(server.dispatch(request, context)).await;
+            response
+                .headers_mut()
+                .entry(CACHE_CONTROL)
+                .or_insert(http::HeaderValue::from_static("no-store"));
+            response
+        }
     }
 
     async fn dispatch(
@@ -7483,6 +7490,10 @@ mod tests {
         )
         .await;
         let status = response.status();
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&http::HeaderValue::from_static("no-store"))
+        );
         let snapshot = response_json(response).await;
         assert_eq!(status, StatusCode::OK, "{snapshot}");
         assert_eq!(snapshot["kind"], "snapshot");
@@ -8038,6 +8049,12 @@ mod tests {
             Some(&http::HeaderValue::from_static("application/octet-stream"))
         );
         assert_eq!(
+            chunk.headers().get(CACHE_CONTROL),
+            Some(&http::HeaderValue::from_static(
+                "private, max-age=31536000, immutable"
+            ))
+        );
+        assert_eq!(
             chunk.into_body().collect().await.unwrap().to_bytes(),
             &bytes[..]
         );
@@ -8228,13 +8245,17 @@ mod tests {
         let unknown = "0".repeat(SESSION_TOKEN_HEX_LEN);
         let gone = request(
             &app.router,
-            "POST",
-            "/lix/v1/execute",
+            "GET",
+            "/lix/v1/sync/pull?after=393&limit=512",
             Some(&unknown),
-            Some(json!({ "sql": "SELECT 1" })),
+            None,
         )
         .await;
         assert_eq!(gone.status(), StatusCode::GONE);
+        assert_eq!(
+            gone.headers().get(CACHE_CONTROL),
+            Some(&http::HeaderValue::from_static("no-store"))
+        );
         assert_eq!(error_code(gone).await, "LIX_ERROR_PROTOCOL_SESSION_GONE");
     }
 

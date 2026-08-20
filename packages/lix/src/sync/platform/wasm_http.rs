@@ -117,6 +117,7 @@ impl RawHttpClient for BrowserHttpClient {
                 },
                 &headers,
                 request.body,
+                request.cache_immutable,
                 self.fetch.as_ref(),
                 request.operation,
             )
@@ -175,6 +176,7 @@ async fn fetch(
     method: &str,
     headers: &[(String, String)],
     body: Option<Vec<u8>>,
+    cache_immutable: bool,
     fetch_override: Option<&Function>,
     operation: &str,
 ) -> Result<RawHttpResponse, LixError> {
@@ -217,6 +219,9 @@ async fn fetch(
     };
     Reflect::set(&init, &"method".into(), &method.into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"credentials".into(), &"include".into()).map_err(js_transport_error)?;
+    if !cache_immutable {
+        Reflect::set(&init, &"cache".into(), &"no-store".into()).map_err(js_transport_error)?;
+    }
     Reflect::set(
         &init,
         &"lixResponseLimit".into(),
