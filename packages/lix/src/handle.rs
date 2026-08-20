@@ -377,7 +377,7 @@ impl SyncSessionLease {
             return Ok(());
         }
         if self.active_sessions.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.runtime.stop_and_join().await?;
+            self.runtime.drain_and_join().await?;
         }
         Ok(())
     }
@@ -1060,9 +1060,8 @@ where
         }
         Ok(())
     }
-    /// Signals background synchronization to stop before asynchronous close
-    /// drainage begins. Browser hosts use this during page teardown so the
-    /// active fetch can be aborted while the document is still alive.
+    /// Abruptly stops background synchronization during host teardown. Normal
+    /// close deliberately does not call this: it drains accepted sync work.
     #[doc(hidden)]
     pub fn begin_close(&self) {
         if let Some(lease) = &self.sync_lease {

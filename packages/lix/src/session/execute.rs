@@ -5275,6 +5275,11 @@ async fn retry_expired_read_with_write_quiescence(
     if !consume_expired_read_retry(retries, error) {
         return false;
     }
+    // Cross-context stores such as OPFS can invalidate a read while another
+    // tab is committing or transferring ownership. Yield before reopening so
+    // that handoff can finish; otherwise all bounded retries can run in one
+    // event-loop turn against the same transient generation.
+    tokio::task::yield_now().await;
     if !already_quiesced && guard.is_none() {
         *guard = Some(Arc::clone(write_gate).lock_owned().await);
     }

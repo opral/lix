@@ -511,6 +511,52 @@ pub(crate) async fn has_any_sync_replica_state(
     Ok(!cursor.next_page(1).await?.is_empty())
 }
 
+/// Commit bodies named by retained repository events remain part of the
+/// authority's replay contract until those events expire.
+pub(crate) async fn load_replayable_repository_event_commit_ids(
+    read: &(impl StorageAdapterRead + ?Sized),
+) -> Result<BTreeSet<CommitId>, LixError> {
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
+    let mut cursor = read
+        .begin_scan(
+            SYNC_REPOSITORY_EVENT_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    let mut commit_ids = BTreeSet::new();
+    while let Some(entries) = cursor.next_chunk().await? {
+        for entry in entries {
+            let StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "repository sync event scan omitted its value",
+                ));
+            };
+            let record: RepositoryEventRecord =
+                serde_json::from_slice(&value).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("decode repository sync event for GC retention: {error}"),
+                    )
+                })?;
+            for commit_id in record.commit_ids {
+                commit_ids.insert(CommitId::parse_lix(
+                    &commit_id,
+                    "repository sync event commit id",
+                )?);
+            }
+        }
+    }
+    Ok(commit_ids)
+}
+
 fn stage_replica_state(
     writes: &mut StorageWriteSet,
     preconditions: &mut Vec<StoragePrecondition>,
@@ -2195,7 +2241,7 @@ where
                     format!("sync branch '{branch_id}' disappeared during reconciliation"),
                 )
             })?;
-        if control.head_commit_id.to_string() != expected_head_commit_id {
+        if control.head_commit_id != expected_head_commit_id {
             return Err(LixError::new(
                 LixError::CODE_TRANSACTION_CONFLICT,
                 format!("sync branch '{branch_id}' changed during reconciliation"),
@@ -2822,7 +2868,7 @@ where
             } else {
                 parsed_rows
                     .iter()
-                    .filter(|row| row.branch_id == checkpoint.to_string())
+                    .filter(|row| row.branch_id == checkpoint)
                     .collect::<Vec<_>>()
             };
             let current_snapshot =
@@ -7790,6 +7836,84 @@ mod tests {
             .await
             .expect("snapshot should remain readable");
         assert_eq!(default_head(&after), (default_branch_id, default_head_id));
+    }
+
+    #[tokio::test]
+    async fn repository_events_keep_deleted_branch_commit_bodies_replayable_after_gc() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let main_branch_id = authority
+            .active_branch_id()
+            .await
+            .expect("main branch should load");
+        let branch = authority
+            .create_branch(CreateBranchOptions {
+                id: Some("01920000-0000-7000-8000-000000001778".to_owned()),
+                name: "event-retention".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("disposable branch should be created");
+        authority
+            .switch_branch(SwitchBranchOptions {
+                branch_id: branch.id.clone(),
+            })
+            .await
+            .expect("disposable branch should become active");
+        write_key_value(&authority, "event-retention", "must-survive-gc").await;
+        authority
+            .switch_branch(SwitchBranchOptions {
+                branch_id: main_branch_id,
+            })
+            .await
+            .expect("main branch should become active again");
+        authority
+            .execute(
+                "DELETE FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch.id)],
+            )
+            .await
+            .expect("disposable branch should be deleted");
+
+        let adapter = authority.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("GC read should open");
+        let mut writes = adapter.new_write_set();
+        crate::gc::stage_repository_gc(SharedStorageAdapterRead::new(read), &mut writes)
+            .await
+            .expect("repository GC should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("repository GC should commit");
+
+        let replay = authority
+            .pull_sync_repository(Some(0), super::super::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("every retained event must still export its commit bodies");
+        let SyncRepositoryPullResponse::Delta { events, .. } = replay else {
+            panic!("cursor pull should return a delta");
+        };
+        assert!(
+            events.iter().any(|event| {
+                event.commits.iter().any(|commit| {
+                    commit.members.iter().any(|member| {
+                        member.schema_key == "lix_key_value"
+                            && member
+                                .snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.get("key"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some("event-retention")
+                    })
+                })
+            }),
+            "the deleted branch's replayable event body disappeared",
+        );
     }
 
     #[tokio::test]

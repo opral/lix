@@ -42,7 +42,8 @@ pub(crate) use protocol::{
 };
 pub(crate) use repository::{
     SYNC_REPLICA_STATE_SPACE, SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE,
-    has_any_sync_replica_state, load_sync_replica_account, stage_repository_transaction_event,
+    has_any_sync_replica_state, load_replayable_repository_event_commit_ids,
+    load_sync_replica_account, stage_repository_transaction_event,
     validate_repository_transaction_event_transfer,
 };
 pub(crate) use runtime::{

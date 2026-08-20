@@ -75,7 +75,7 @@ export type LixBinding = {
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
 	syncDiskToLix(): Promise<void>;
-	/** Signals background work to stop before asynchronous close drainage. */
+	/** Abruptly stops background work during host teardown. */
 	beginClose?(): void;
 	/** Immediately tears down the execution transport during document unload. */
 	terminateForPageUnload?(): void;

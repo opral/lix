@@ -1158,7 +1158,14 @@ async fn load_authenticated_repository_retention<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
-    let control_reachability = authenticated_control_commit_reachability(store, controls).await?;
+    let mut control_reachability =
+        authenticated_control_commit_reachability(store, controls).await?;
+    // The ordered sync log and its commit bodies are one replayable unit. A
+    // deleted branch can make an event's commit unreachable from every live
+    // ref while an old replica can still request that event by cursor.
+    control_reachability
+        .history_dependencies
+        .extend(crate::sync::load_replayable_repository_event_commit_ids(store).await?);
     let mut chronology_roots = control_reachability.chronology_roots;
     chronology_roots.extend(
         load_recovery_refs(store)

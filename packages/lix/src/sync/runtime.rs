@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use futures_util::{FutureExt, select_biased};
@@ -23,9 +24,17 @@ const SYNC_DEMAND_STALLED_CODE: &str = "LIX_ERROR_SYNC_DEMAND_STALLED";
 
 #[derive(Debug)]
 pub(crate) struct SyncRuntime {
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: tokio::sync::watch::Sender<SyncShutdown>,
     pub(crate) demand_tx: tokio::sync::mpsc::Sender<SyncDemand>,
+    completion_rx: Mutex<Option<tokio::sync::oneshot::Receiver<Result<(), LixError>>>>,
     task: SyncTask,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncShutdown {
+    Running,
+    Drain,
+    Stop,
 }
 
 #[derive(Debug)]
@@ -165,12 +174,23 @@ where
 
 impl SyncRuntime {
     pub(crate) fn stop(&self) {
-        self.shutdown_tx.send_replace(true);
+        self.shutdown_tx.send_replace(SyncShutdown::Stop);
     }
 
-    pub(crate) async fn stop_and_join(&self) -> Result<(), LixError> {
-        self.stop();
-        self.task.join().await
+    pub(crate) async fn drain_and_join(&self) -> Result<(), LixError> {
+        self.shutdown_tx.send_replace(SyncShutdown::Drain);
+        let completion = self
+            .completion_rx
+            .lock()
+            .map_err(|_| LixError::unknown("sync completion lock is poisoned"))?
+            .take();
+        self.task.join().await?;
+        match completion {
+            Some(completion) => completion.await.map_err(|_| {
+                LixError::unknown("sync worker stopped without reporting its completion")
+            })?,
+            None => Ok(()),
+        }
     }
 }
 
@@ -332,13 +352,14 @@ where
         None
     };
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(SyncShutdown::Running);
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
     let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(64);
     let worker_lix = lix
         .open_internal_session_suppressed(lix.active_branch_id().await?, lix.active_account_id())
         .await?;
     let task = spawn_sync_task(async move {
-        run_sync_worker(
+        let result = run_sync_worker(
             worker_lix,
             remote_id,
             headers,
@@ -347,11 +368,13 @@ where
             demand_rx,
         )
         .await;
+        let _ = completion_tx.send(result);
     })?;
 
     Ok(Arc::new(SyncRuntime {
         shutdown_tx,
         demand_tx,
+        completion_rx: Mutex::new(Some(completion_rx)),
         task,
     }))
 }
@@ -364,9 +387,10 @@ async fn run_sync_worker<StorageImpl>(
     remote_id: String,
     headers: Vec<(String, String)>,
     mut transport: Option<HttpSyncTransport>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<SyncShutdown>,
     mut demand_rx: tokio::sync::mpsc::Receiver<SyncDemand>,
-) where
+) -> Result<(), LixError>
+where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let mut retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
@@ -376,7 +400,8 @@ async fn run_sync_worker<StorageImpl>(
     let mut internal_demand_retry = SyncDemandRetry::default();
     let mut pending_demands = Vec::new();
 
-    while !*shutdown_rx.borrow() {
+    let mut terminal_error = None;
+    while *shutdown_rx.borrow() == SyncShutdown::Running {
         if transport.is_none() {
             let connected = {
                 let connect = HttpSyncTransport::connect(&remote_id, &headers).fuse();
@@ -487,7 +512,8 @@ async fn run_sync_worker<StorageImpl>(
                 internal_demand_retry = SyncDemandRetry::default();
                 if is_terminal_sync_error(&error) {
                     tracing::error!(error = ?error, "sync repository cannot make progress");
-                    lix.fail_observers_for_sync(error);
+                    lix.fail_observers_for_sync(error.clone());
+                    terminal_error = Some(error);
                     break;
                 }
                 tracing::warn!(error = ?error, "sync repository iteration failed");
@@ -498,9 +524,64 @@ async fn run_sync_worker<StorageImpl>(
             }
         }
     }
+    let result = if let Some(error) = terminal_error {
+        Err(error)
+    } else if *shutdown_rx.borrow() == SyncShutdown::Drain {
+        drain_sync_outbox(
+            &lix,
+            &remote_id,
+            &headers,
+            &mut transport,
+            &mut push_item_limit,
+            &mut delta_pull_limit,
+        )
+        .await
+    } else {
+        Ok(())
+    };
     drop(pending_demands);
     drop(demand_rx);
-    let _ = lix.close().await;
+    let close_result = lix.close().await;
+    result.and(close_result)
+}
+
+async fn drain_sync_outbox<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    remote_id: &str,
+    headers: &[(String, String)],
+    transport: &mut Option<HttpSyncTransport>,
+    push_item_limit: &mut usize,
+    delta_pull_limit: &mut usize,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    if transport.is_none() {
+        *transport = Some(HttpSyncTransport::connect(remote_id, headers).await?);
+    }
+    let transport = transport
+        .as_ref()
+        .expect("drain establishes a transport before publishing");
+    loop {
+        if !push_pending_outbox(lix, remote_id, transport, push_item_limit, delta_pull_limit)
+            .await?
+        {
+            return Ok(());
+        }
+        let cursor = lix
+            .load_sync_repository_cursor(remote_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync repository cursor disappeared while draining",
+                )
+            })?;
+        let response = pull_delta_adaptive(transport, cursor, delta_pull_limit).await?;
+        validate_delta_after(cursor, &response)?;
+        prepare_pull(lix, transport, &response).await?;
+        lix.apply_sync_repository_pull(remote_id, &response).await?;
+    }
 }
 
 async fn sync_iteration<StorageImpl, Transport>(
@@ -540,25 +621,8 @@ where
 
     // Publish completed local commits before waiting for remote work. Commit
     // identity and ref compare-and-swap make retry after a lost response safe.
-    let ref_conflicted = loop {
-        let Some(mut request) = lix.build_sync_push(remote_id, *push_item_limit).await? else {
-            break false;
-        };
-        let result = push_with_inline_fallback(lix, transport, &mut request).await;
-        match result {
-            Ok(receipt) => {
-                catch_up_to(lix, remote_id, transport, receipt.cursor, delta_pull_limit).await?;
-            }
-            // A ref moved concurrently. Pulling the authority's intervening
-            // events lets the importer reconcile local refs/outbox state; an
-            // immediate reconnect/re-push would repeat the same conflict.
-            Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => break true,
-            Err(error) if error.code == SYNC_REQUEST_TOO_LARGE_CODE => {
-                reduce_push_limit_after_too_large(push_item_limit, error)?;
-            }
-            Err(error) => return Err(error),
-        }
-    };
+    let ref_conflicted =
+        push_pending_outbox(lix, remote_id, transport, push_item_limit, delta_pull_limit).await?;
 
     let cursor = lix
         .load_sync_repository_cursor(remote_id)
@@ -594,6 +658,40 @@ where
             prepare_pull(lix, transport, &response).await?;
             lix.apply_sync_repository_pull(remote_id, &response).await?;
             Ok(())
+        }
+    }
+}
+
+/// Publishes every currently admitted outbox batch. Returns `true` when a ref
+/// conflict requires one pull/reconciliation pass before publication resumes.
+async fn push_pending_outbox<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    remote_id: &str,
+    transport: &Transport,
+    push_item_limit: &mut usize,
+    delta_pull_limit: &mut usize,
+) -> Result<bool, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    loop {
+        let Some(mut request) = lix.build_sync_push(remote_id, *push_item_limit).await? else {
+            return Ok(false);
+        };
+        let result = push_with_inline_fallback(lix, transport, &mut request).await;
+        match result {
+            Ok(receipt) => {
+                catch_up_to(lix, remote_id, transport, receipt.cursor, delta_pull_limit).await?;
+            }
+            // A ref moved concurrently. Pulling the authority's intervening
+            // events lets the importer reconcile local refs/outbox state; an
+            // immediate reconnect/re-push would repeat the same conflict.
+            Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => return Ok(true),
+            Err(error) if error.code == SYNC_REQUEST_TOO_LARGE_CODE => {
+                reduce_push_limit_after_too_large(push_item_limit, error)?;
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -1249,9 +1347,9 @@ fn validate_delta_after(
 
 async fn wait_for_sync_retry(
     retry_backoff: &mut Duration,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<SyncShutdown>,
 ) -> bool {
-    if *shutdown_rx.borrow() {
+    if *shutdown_rx.borrow() != SyncShutdown::Running {
         return false;
     }
     let timer = sleep(*retry_backoff).fuse();
@@ -1282,9 +1380,9 @@ fn stopped_error() -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use std::sync::Mutex;
 
-    use base64::Engine as _;
     use crate::engine::Engine;
     use crate::storage::Memory;
     use crate::{Value, open_lix};
