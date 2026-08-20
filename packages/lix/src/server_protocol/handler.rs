@@ -455,18 +455,11 @@ where
 {
     root: Arc<Lix<S>>,
     options: ServerProtocolOptions,
-    registry: AsyncMutex<SessionRegistry<S>>,
+    registry: AsyncMutex<HashMap<String, Arc<SessionRecord<S>>>>,
     request_blob_budget: Arc<RequestBlobCacheBudget>,
     session_open_gate: Arc<SessionOpenGate>,
     close_started: Once,
     close_result: watch::Sender<Option<Result<(), LixError>>>,
-}
-
-struct SessionRegistry<S>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    sessions: HashMap<String, Arc<SessionRecord<S>>>,
 }
 
 #[derive(Default)]
@@ -1406,9 +1399,7 @@ where
             inner: Arc::new(ServerInner {
                 root,
                 options,
-                registry: AsyncMutex::new(SessionRegistry {
-                    sessions: HashMap::new(),
-                }),
+                registry: AsyncMutex::new(HashMap::new()),
                 request_blob_budget: Arc::new(RequestBlobCacheBudget::new(
                     options.max_request_blob_cache_bytes,
                 )),
@@ -1675,7 +1666,6 @@ where
         }
         let now = Instant::now();
         registry
-            .sessions
             .values()
             .all(|record| record.is_idle_expired(now, self.inner.options.session_idle_timeout))
     }
@@ -1719,7 +1709,6 @@ where
         let sessions = {
             let mut registry = self.inner.registry.lock().await;
             registry
-                .sessions
                 .drain()
                 .map(|(_, record)| record)
                 .collect::<Vec<_>>()
@@ -1796,13 +1785,12 @@ where
                     return Err(error);
                 }
             };
-            if !registry.sessions.contains_key(&candidate) {
+            if !registry.contains_key(&candidate) {
                 break candidate;
             }
         };
         let now = Instant::now();
         let expired_ids = registry
-            .sessions
             .iter()
             .filter(|(_, record)| {
                 record.is_idle_expired(now, self.inner.options.session_idle_timeout)
@@ -1811,13 +1799,12 @@ where
             .collect::<Vec<_>>();
         let mut removed_sessions = Vec::with_capacity(expired_ids.len().saturating_add(1));
         for session_id in expired_ids {
-            if let Some(record) = registry.sessions.remove(&session_id) {
+            if let Some(record) = registry.remove(&session_id) {
                 removed_sessions.push(record);
             }
         }
-        if registry.sessions.len() >= self.inner.options.max_sessions {
+        if registry.len() >= self.inner.options.max_sessions {
             let lru_idle_id = registry
-                .sessions
                 .iter()
                 .filter(|(_, record)| record.is_idle())
                 .min_by_key(|(_, record)| record.last_used())
@@ -1830,7 +1817,7 @@ where
                 close_unregistered_session(child).await;
                 return Err(ApiError::capacity());
             };
-            if let Some(record) = registry.sessions.remove(&lru_idle_id) {
+            if let Some(record) = registry.remove(&lru_idle_id) {
                 removed_sessions.push(record);
             }
         }
@@ -1841,9 +1828,7 @@ where
             self.inner.options.max_request_body_bytes,
             Arc::clone(&self.inner.request_blob_budget),
         ));
-        registry
-            .sessions
-            .insert(session_id.clone(), Arc::clone(&record));
+        registry.insert(session_id.clone(), Arc::clone(&record));
         let lease = SessionLease::new(session_id, record, durable_terminal_storage_notifier);
         drop(registry);
         for record in removed_sessions {
@@ -1866,11 +1851,11 @@ where
     ) -> Result<SessionLease<S>, ApiError> {
         let mut registry = self.inner.registry.lock().await;
         self.inner.session_open_gate.ensure_open()?;
-        let Some(record) = registry.sessions.get(session_id).cloned() else {
+        let Some(record) = registry.get(session_id).cloned() else {
             return Err(ApiError::session_gone());
         };
         if record.is_idle_expired(Instant::now(), self.inner.options.session_idle_timeout) {
-            let removed = registry.sessions.remove(session_id);
+            let removed = registry.remove(session_id);
             drop(registry);
             if let Some(removed) = removed {
                 close_removed_session(removed).await;
@@ -1887,7 +1872,7 @@ where
     async fn delete_session(&self, session_id: &str) -> Result<(), ApiError> {
         let mut registry = self.inner.registry.lock().await;
         self.inner.session_open_gate.ensure_open()?;
-        let record = registry.sessions.remove(session_id);
+        let record = registry.remove(session_id);
         drop(registry);
         if let Some(record) = record {
             close_session_record(&record).await?;
@@ -9141,7 +9126,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_initial_branch_does_not_create_a_protocol_session() {
         let app = app().await;
-        let before = app.server.inner.registry.lock().await.sessions.len();
+        let before = app.server.inner.registry.lock().await.len();
         let response = request(
             &app.router,
             "GET",
@@ -9153,7 +9138,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(error_code(response).await, LixError::CODE_BRANCH_NOT_FOUND);
         assert_eq!(
-            app.server.inner.registry.lock().await.sessions.len(),
+            app.server.inner.registry.lock().await.len(),
             before
         );
     }
@@ -11021,7 +11006,7 @@ mod tests {
         loop {
             let replaced = {
                 let registry = app.server.inner.registry.lock().await;
-                registry.sessions.len() == 1 && !registry.sessions.contains_key(&first_session_id)
+                registry.len() == 1 && !registry.contains_key(&first_session_id)
             };
             if replaced {
                 break;
@@ -11130,7 +11115,7 @@ mod tests {
         .await
         .expect("all session opens should reach the storage barrier concurrently");
         assert_eq!(
-            server.inner.registry.lock().await.sessions.len(),
+            server.inner.registry.lock().await.len(),
             SESSION_COUNT
         );
     }
@@ -11243,7 +11228,6 @@ mod tests {
             .registry
             .lock()
             .await
-            .sessions
             .get(&session_id)
             .cloned()
             .expect("transaction session should remain registered");
@@ -11340,7 +11324,7 @@ mod tests {
         assert_eq!(visible.rows()[0].get::<i64>("count").unwrap(), 0);
 
         app.server.close().await.expect("server should close");
-        assert!(app.server.inner.registry.lock().await.sessions.is_empty());
+        assert!(app.server.inner.registry.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -11620,7 +11604,6 @@ mod tests {
             .registry
             .lock()
             .await
-            .sessions
             .get(&session_id)
             .cloned()
             .expect("transaction session remains registered");
@@ -11682,7 +11665,6 @@ mod tests {
             .registry
             .lock()
             .await
-            .sessions
             .get(&session_id)
             .cloned()
             .expect("transaction session remains registered");
@@ -11842,7 +11824,6 @@ mod tests {
             let registry = app.server.inner.registry.lock().await;
             Arc::clone(
                 &registry
-                    .sessions
                     .get(&session_id)
                     .expect("registered child")
                     .lix,
