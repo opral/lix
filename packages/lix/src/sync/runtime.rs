@@ -13,8 +13,6 @@ use crate::{Lix, LixError};
 use super::platform::{HttpSyncTransport, SyncTask, sleep, spawn_sync_task};
 use super::{SyncPushRequest, SyncRepositoryPullResponse, SyncTransport};
 
-const SYNC_DELTA_PULL_LIMIT: usize = 512;
-const SYNC_SNAPSHOT_ROW_LIMIT: usize = 512;
 const SYNC_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const SYNC_MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const SYNC_RESPONSE_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE";
@@ -87,7 +85,7 @@ where
     Transport: SyncTransport,
 {
     let metadata = transport
-        .pull(None, SYNC_DELTA_PULL_LIMIT)
+        .pull(None, super::MAX_SYNC_REQUEST_ITEMS)
         .await
         .map_err(snapshot_pull_error)?;
     let (lix_id, default_branch_id) = snapshot_repository_identity(&metadata)?;
@@ -374,7 +372,7 @@ async fn run_sync_worker<StorageImpl>(
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let mut retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
-    let mut delta_pull_limit = SYNC_DELTA_PULL_LIMIT;
+    let mut delta_pull_limit = super::MAX_SYNC_REQUEST_ITEMS;
     let mut push_item_limit = super::MAX_SYNC_REQUEST_ITEMS;
     let mut change_watcher = lix.sync_mode_state().change_watcher();
     let mut internal_demand_retry = SyncDemandRetry::default();
@@ -682,7 +680,7 @@ where
         })
         .collect::<Vec<_>>();
     let mut rows = Vec::new();
-    let mut page_limit = SYNC_SNAPSHOT_ROW_LIMIT;
+    let mut page_limit = super::MAX_SYNC_REQUEST_ITEMS;
     for (branch_id, head_commit_id) in targets {
         let mut continuation = None;
         let mut seen_continuations = BTreeSet::new();
@@ -1978,7 +1976,7 @@ mod tests {
             max_items: 20,
             calls: Arc::clone(&calls),
         };
-        let mut limit = SYNC_DELTA_PULL_LIMIT;
+        let mut limit = super::super::MAX_SYNC_REQUEST_ITEMS;
         let response = pull_delta_adaptive(&transport, 9, &mut limit)
             .await
             .expect("a smaller delta page fits");
@@ -2014,10 +2012,11 @@ mod tests {
 
     #[test]
     fn live_history_and_snapshot_use_distinct_protocol_limits() {
-        assert_eq!(SYNC_DELTA_PULL_LIMIT, 512);
-        assert_eq!(SYNC_SNAPSHOT_ROW_LIMIT, 512);
+        assert_eq!(super::super::MAX_SYNC_REQUEST_ITEMS, 512);
         assert_eq!(crate::sync::MAX_SYNC_HISTORY_PAGE_SIZE, 100);
-        assert!(crate::sync::MAX_SYNC_HISTORY_PAGE_SIZE < SYNC_DELTA_PULL_LIMIT);
+        assert!(
+            crate::sync::MAX_SYNC_HISTORY_PAGE_SIZE < super::super::MAX_SYNC_REQUEST_ITEMS
+        );
     }
 
     #[tokio::test]
@@ -2182,7 +2181,7 @@ mod tests {
     async fn metadata_only_snapshot_loads_pinned_stateless_row_pages() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let transport = PagedSnapshotTransport {
-            max_items: SYNC_SNAPSHOT_ROW_LIMIT,
+            max_items: super::super::MAX_SYNC_REQUEST_ITEMS,
             calls: Arc::clone(&calls),
             behavior: SnapshotPageBehavior::Normal,
         };
@@ -2210,8 +2209,11 @@ mod tests {
         assert_eq!(
             *calls.lock().expect("snapshot calls lock"),
             vec![
-                (None, SYNC_SNAPSHOT_ROW_LIMIT),
-                (Some("next".to_owned()), SYNC_SNAPSHOT_ROW_LIMIT)
+                (None, super::super::MAX_SYNC_REQUEST_ITEMS),
+                (
+                    Some("next".to_owned()),
+                    super::super::MAX_SYNC_REQUEST_ITEMS,
+                )
             ]
         );
     }
@@ -2228,7 +2230,7 @@ mod tests {
             SnapshotPageBehavior::EmptyContinuation,
         ] {
             let transport = PagedSnapshotTransport {
-                max_items: SYNC_SNAPSHOT_ROW_LIMIT,
+                max_items: super::super::MAX_SYNC_REQUEST_ITEMS,
                 calls: Arc::new(Mutex::new(Vec::new())),
                 behavior,
             };

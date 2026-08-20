@@ -204,8 +204,6 @@ pub(crate) const SYNC_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::declare(
 );
 
 const SEQUENCE_KEY: &[u8] = b"repository";
-pub(crate) const MAX_REPOSITORY_PULL_LIMIT: usize = 512;
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RepositoryEventRecord {
@@ -3544,11 +3542,12 @@ where
         limit: usize,
     ) -> Result<SyncSnapshotRowPage, LixError> {
         super::validate_sync_branch_id(branch_id)?;
-        if limit == 0 || limit > MAX_REPOSITORY_PULL_LIMIT {
+        if limit == 0 || limit > super::MAX_SYNC_REQUEST_ITEMS {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 format!(
-                    "sync snapshot row limit must be between 1 and {MAX_REPOSITORY_PULL_LIMIT}"
+                    "sync snapshot row limit must be between 1 and {}",
+                    super::MAX_SYNC_REQUEST_ITEMS
                 ),
             ));
         }
@@ -3649,10 +3648,13 @@ where
         after: Option<u64>,
         limit: usize,
     ) -> Result<SyncRepositoryPullResponse, LixError> {
-        if limit == 0 || limit > MAX_REPOSITORY_PULL_LIMIT {
+        if limit == 0 || limit > super::MAX_SYNC_REQUEST_ITEMS {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                format!("sync pull limit must be between 1 and {MAX_REPOSITORY_PULL_LIMIT}"),
+                format!(
+                    "sync pull limit must be between 1 and {}",
+                    super::MAX_SYNC_REQUEST_ITEMS
+                ),
             ));
         }
         let adapter = self.storage_adapter();
@@ -3954,7 +3956,7 @@ mod tests {
                         &branch.branch_id,
                         head,
                         continuation.as_deref(),
-                        MAX_REPOSITORY_PULL_LIMIT,
+                        super::super::MAX_SYNC_REQUEST_ITEMS,
                     )
                     .await
                     .expect("snapshot row page should load");
@@ -5152,7 +5154,12 @@ mod tests {
             .expect("snapshot metadata should load");
         let (branch_id, head) = default_head(&snapshot);
         let complete = authority
-            .pull_sync_snapshot_rows(&branch_id, &head, None, MAX_REPOSITORY_PULL_LIMIT)
+            .pull_sync_snapshot_rows(
+                &branch_id,
+                &head,
+                None,
+                super::super::MAX_SYNC_REQUEST_ITEMS,
+            )
             .await
             .expect("complete page should load");
         assert!(complete.continuation.is_none());
@@ -5253,7 +5260,7 @@ mod tests {
                         &boundary.commit_id,
                         &boundary.commit_id,
                         continuation.as_deref(),
-                        MAX_REPOSITORY_PULL_LIMIT,
+                        super::super::MAX_SYNC_REQUEST_ITEMS,
                     )
                     .await
                     .expect("boundary snapshot rows should load");
