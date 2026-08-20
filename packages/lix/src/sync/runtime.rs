@@ -88,7 +88,18 @@ where
         .pull(None, super::MAX_SYNC_REQUEST_ITEMS)
         .await
         .map_err(snapshot_pull_error)?;
-    let (lix_id, default_branch_id) = snapshot_repository_identity(&metadata)?;
+    let SyncRepositoryPullResponse::Snapshot {
+        lix_id,
+        default_branch_id,
+        branches,
+        ..
+    } = &metadata
+    else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "initial sync pull did not return a repository snapshot",
+        ));
+    };
     let lix_id = lix_id.to_owned();
     let default_branch_id = default_branch_id.to_owned();
     if crate::storage_codec::id_string::uuid_bytes_from_canonical(&lix_id).is_none() {
@@ -98,39 +109,6 @@ where
         ));
     }
     super::validate_sync_branch_id(&default_branch_id)?;
-    let snapshot = prepare_repository_snapshot(transport, metadata).await?;
-    Ok((snapshot, lix_id, default_branch_id))
-}
-
-fn snapshot_repository_identity(
-    response: &SyncRepositoryPullResponse,
-) -> Result<(&str, &str), LixError> {
-    match response {
-        SyncRepositoryPullResponse::Snapshot {
-            lix_id,
-            default_branch_id,
-            ..
-        } => Ok((lix_id, default_branch_id)),
-        SyncRepositoryPullResponse::Delta { .. } => Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "initial sync pull did not return a repository snapshot",
-        )),
-    }
-}
-
-async fn prepare_repository_snapshot<Transport>(
-    transport: &Transport,
-    metadata: SyncRepositoryPullResponse,
-) -> Result<PreparedRepositorySnapshot, LixError>
-where
-    Transport: SyncTransport,
-{
-    let SyncRepositoryPullResponse::Snapshot { branches, .. } = &metadata else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "repository bootstrap metadata was not a snapshot",
-        ));
-    };
     let head_ids = branches
         .iter()
         .filter_map(|branch| branch.head_commit_id.clone())
@@ -139,12 +117,13 @@ where
         fetch_history_objects(transport, head_ids, 1),
         fetch_snapshot_rows(transport, branches),
     )?;
-    Ok(PreparedRepositorySnapshot {
+    let snapshot = PreparedRepositorySnapshot {
         metadata,
         commits: history.commits,
         commit_headers: history.commit_headers,
         rows,
-    })
+    };
+    Ok((snapshot, lix_id, default_branch_id))
 }
 
 impl SyncRuntime {
@@ -2508,22 +2487,6 @@ mod tests {
             },
         )
         .expect("complete manifest registration");
-    }
-
-    #[test]
-    fn prepared_snapshot_uses_explicit_repository_identity() {
-        let lix_id = uuid::Uuid::now_v7().to_string();
-        let default_branch_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = SyncRepositoryPullResponse::Snapshot {
-            cursor: 3,
-            lix_id: lix_id.clone(),
-            default_branch_id: default_branch_id.clone(),
-            branches: Vec::new(),
-        };
-        assert_eq!(
-            snapshot_repository_identity(&snapshot).expect("snapshot identity"),
-            (lix_id.as_str(), default_branch_id.as_str())
-        );
     }
 
     #[tokio::test]
