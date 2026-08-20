@@ -11,7 +11,7 @@ use super::super::http::{
     response_too_large,
 };
 use crate::LixError;
-use crate::sync::SyncTransportFuture;
+use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
 
 #[doc(hidden)]
 pub const BROWSER_TRANSPORT_CONFIG_HEADER: &str = "x-lix-internal-browser-transport";
@@ -119,7 +119,6 @@ impl RawHttpClient for BrowserHttpClient {
                 request.body,
                 self.fetch.as_ref(),
                 request.operation,
-                request.response_limit,
             )
             .await
         })
@@ -178,7 +177,6 @@ async fn fetch(
     body: Option<Vec<u8>>,
     fetch_override: Option<&Function>,
     operation: &str,
-    response_limit: usize,
 ) -> Result<RawHttpResponse, LixError> {
     let init = Object::new();
     let global = js_sys::global();
@@ -222,7 +220,7 @@ async fn fetch(
     Reflect::set(
         &init,
         &"lixResponseLimit".into(),
-        &JsValue::from_f64(response_limit as f64),
+        &JsValue::from_f64(MAX_SYNC_PULL_RESPONSE_BYTES as f64),
     )
     .map_err(js_transport_error)?;
     let header_pairs = Array::new();
@@ -264,7 +262,7 @@ async fn fetch(
         .map_err(js_transport_error)?
         .as_string()
         .unwrap_or_default();
-    let body = read_response_body(&response, response_limit, operation, &controller).await?;
+    let body = read_response_body(&response, operation, &controller).await?;
     abort_on_drop.disarm();
     Ok(RawHttpResponse {
         status,
@@ -275,7 +273,6 @@ async fn fetch(
 
 async fn read_response_body(
     response: &JsValue,
-    response_limit: usize,
     operation: &str,
     controller: &Object,
 ) -> Result<Vec<u8>, LixError> {
@@ -319,7 +316,7 @@ async fn read_response_body(
                 "browser sync response chunk length exceeds usize",
             )
         })?;
-        if body.len().saturating_add(chunk_len) > response_limit {
+        if body.len().saturating_add(chunk_len) > MAX_SYNC_PULL_RESPONSE_BYTES {
             abort_controller(controller);
             cancel_reader(&reader);
             return Err(response_too_large(operation));

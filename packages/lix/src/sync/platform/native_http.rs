@@ -5,7 +5,7 @@ use super::super::http::{
     response_too_large,
 };
 use crate::LixError;
-use crate::sync::SyncTransportFuture;
+use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeHttpClient {
@@ -70,7 +70,7 @@ impl RawHttpClient for NativeHttpClient {
                 .unwrap_or_default();
             if response
                 .content_length()
-                .is_some_and(|length| length > request.response_limit as u64)
+                .is_some_and(|length| length > MAX_SYNC_PULL_RESPONSE_BYTES as u64)
             {
                 return Err(response_too_large(request.operation));
             }
@@ -80,7 +80,7 @@ impl RawHttpClient for NativeHttpClient {
                 .await
                 .map_err(|error| transport_error(request.operation, error))?
             {
-                if body.len().saturating_add(chunk.len()) > request.response_limit {
+                if body.len().saturating_add(chunk.len()) > MAX_SYNC_PULL_RESPONSE_BYTES {
                     return Err(response_too_large(request.operation));
                 }
                 body.extend_from_slice(&chunk);

@@ -31,9 +31,6 @@ pub(super) struct RawHttpRequest {
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
     pub operation: &'static str,
-    /// The adapter must stop collecting the response once this many bytes
-    /// have been exceeded. This applies to success and error bodies alike.
-    pub response_limit: usize,
 }
 
 #[derive(Debug)]
@@ -289,7 +286,6 @@ fn raw_request(method: Method, url: String, operation: &'static str) -> RawHttpR
         headers: Vec::new(),
         body: None,
         operation,
-        response_limit: MAX_SYNC_PULL_RESPONSE_BYTES,
     }
 }
 
