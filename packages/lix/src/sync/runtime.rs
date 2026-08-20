@@ -137,17 +137,6 @@ impl SyncRuntime {
     }
 }
 
-pub(crate) async fn demand_sync_for_error(
-    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
-    error: &LixError,
-) -> Result<bool, LixError> {
-    let Some(request) = sync_demand_request_for_error(error)? else {
-        return Ok(false);
-    };
-    send_sync_demand(demand_tx, request).await?;
-    Ok(true)
-}
-
 fn sync_demand_request_for_error(error: &LixError) -> Result<Option<SyncDemandRequest>, LixError> {
     let (field, context) = match error.code.as_str() {
         "LIX_SYNC_HISTORY_REQUIRED" => ("commitIds", "history"),
@@ -2253,7 +2242,10 @@ mod tests {
         let error = LixError::new("LIX_SYNC_HISTORY_REQUIRED", "history is deferred")
             .with_details(serde_json::json!({ "commitIds": [commit_id.clone()] }));
         let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
-        let waiter = demand_sync_for_error(&demand_tx, &error);
+        let request = sync_demand_request_for_error(&error)
+            .expect("history demand is valid")
+            .expect("history demand is classified");
+        let waiter = send_sync_demand(&demand_tx, request);
         let responder = async {
             let demand = demand_rx.recv().await.expect("history demand arrives");
             assert!(matches!(
@@ -2263,7 +2255,7 @@ mod tests {
             demand.response.send(Ok(())).expect("waiter remains live");
         };
         let (hydrated, ()) = tokio::join!(waiter, responder);
-        assert!(hydrated.expect("history response succeeds"));
+        hydrated.expect("history response succeeds");
     }
 
     #[tokio::test]
@@ -2272,7 +2264,10 @@ mod tests {
         let error =
             LixError::commit_not_found(commit_id.clone(), "walk_commit_graph", "graph_node");
         let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
-        let waiter = demand_sync_for_error(&demand_tx, &error);
+        let request = sync_demand_request_for_error(&error)
+            .expect("sparse graph demand is valid")
+            .expect("sparse graph demand is classified");
+        let waiter = send_sync_demand(&demand_tx, request);
         let responder = async {
             let demand = demand_rx.recv().await.expect("history demand arrives");
             assert!(matches!(
@@ -2282,21 +2277,18 @@ mod tests {
             demand.response.send(Ok(())).expect("waiter remains live");
         };
         let (hydrated, ()) = tokio::join!(waiter, responder);
-        assert!(hydrated.expect("history response succeeds"));
+        hydrated.expect("history response succeeds");
     }
 
     #[tokio::test]
     async fn unrelated_missing_commit_is_not_reclassified_as_lazy_history() {
         let commit_id = uuid::Uuid::now_v7().to_string();
         let error = LixError::commit_not_found(commit_id, "load_branch_head", "head");
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
-
         assert!(
-            !demand_sync_for_error(&demand_tx, &error)
-                .await
+            sync_demand_request_for_error(&error)
                 .expect("unrelated missing commit remains unrelated")
+                .is_none()
         );
-        assert!(demand_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2305,7 +2297,10 @@ mod tests {
         let error = LixError::new("LIX_SYNC_CHUNKS_REQUIRED", "chunks are deferred")
             .with_details(serde_json::json!({ "chunkIds": [chunk_id.clone()] }));
         let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
-        let waiter = demand_sync_for_error(&demand_tx, &error);
+        let request = sync_demand_request_for_error(&error)
+            .expect("chunk demand is valid")
+            .expect("chunk demand is classified");
+        let waiter = send_sync_demand(&demand_tx, request);
         let responder = async {
             let demand = demand_rx.recv().await.expect("chunk demand arrives");
             assert!(matches!(
@@ -2315,7 +2310,7 @@ mod tests {
             demand.response.send(Ok(())).expect("waiter remains live");
         };
         let (hydrated, ()) = tokio::join!(waiter, responder);
-        assert!(hydrated.expect("chunk response succeeds"));
+        hydrated.expect("chunk response succeeds");
     }
 
     #[tokio::test]
@@ -2323,7 +2318,10 @@ mod tests {
         let error = LixError::new("LIX_SYNC_CHUNKS_REQUIRED", "chunks are deferred")
             .with_details(serde_json::json!({ "chunkIds": ["a".repeat(64)] }));
         let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
-        let waiter = demand_sync_for_error(&demand_tx, &error);
+        let request = sync_demand_request_for_error(&error)
+            .expect("chunk demand is valid")
+            .expect("chunk demand is classified");
+        let waiter = send_sync_demand(&demand_tx, request);
         let responder = async {
             let demand = demand_rx.recv().await.expect("pending demand arrives");
             demand
@@ -2442,16 +2440,14 @@ mod tests {
 
     #[tokio::test]
     async fn unrelated_error_does_not_enqueue_demand() {
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
         assert!(
-            !demand_sync_for_error(
-                &demand_tx,
-                &LixError::new(LixError::CODE_INVALID_PARAM, "not history"),
-            )
-            .await
-            .expect("unrelated error classification succeeds"),
+            sync_demand_request_for_error(&LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "not history",
+            ))
+            .expect("unrelated error classification succeeds")
+            .is_none(),
         );
-        assert!(demand_rx.try_recv().is_err());
     }
 
     #[test]
