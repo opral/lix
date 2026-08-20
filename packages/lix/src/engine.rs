@@ -16,7 +16,7 @@ use crate::plugin::runtime::{
 };
 use crate::plugin::runtime::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::row_pk::RowPk;
-use crate::session::SessionContext;
+use crate::session::{SessionBranch, SessionContext};
 use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
@@ -280,8 +280,8 @@ where
     ) -> Result<SessionContext<StorageImpl>, LixError> {
         let active_account_id = active_account_id.into();
         self.validate_active_account(&active_account_id).await?;
-        SessionContext::open_at(
-            active_branch_id.into(),
+        Ok(SessionContext::new(
+            SessionBranch::new(active_branch_id.into()),
             active_account_id,
             self.storage(),
             Arc::clone(&self.hot_state),
@@ -298,8 +298,7 @@ where
             self.sync_mode.clone(),
             self.plugin_host.clone(),
             self.telemetry.clone(),
-        )
-        .await
+        ))
     }
 
     pub(crate) async fn open_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {

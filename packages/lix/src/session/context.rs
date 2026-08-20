@@ -227,47 +227,7 @@ where
         ))
     }
 
-    pub(crate) async fn open_at(
-        active_branch_id: String,
-        active_account_id: String,
-        storage: StorageAdapter<StorageImpl>,
-        hot_state: Arc<HotStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
-        binary_cas: Arc<BinaryCasContext>,
-        branch_ctx: Arc<BranchContext>,
-        catalog_context: Arc<CatalogContext>,
-        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
-        deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
-        collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
-        commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
-        observe_coordinator: Arc<ObserveCoordinator>,
-        observe_invalidation: Arc<ObserveInvalidation>,
-        sync_mode: SyncModeState,
-        plugin_host: PluginRuntimeHost,
-        telemetry: Option<Arc<dyn TelemetrySink>>,
-    ) -> Result<Self, LixError> {
-        Ok(Self::new(
-            SessionBranch::new(active_branch_id),
-            active_account_id,
-            storage,
-            hot_state,
-            tracked_state,
-            binary_cas,
-            branch_ctx,
-            catalog_context,
-            sql_planning_cache,
-            deterministic_runtime_gate,
-            collaboration_write_gate,
-            commit_coordinator,
-            observe_coordinator,
-            observe_invalidation,
-            sync_mode,
-            plugin_host,
-            telemetry,
-        ))
-    }
-
-    pub(super) fn new(
+    pub(crate) fn new(
         branch: SessionBranch,
         active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
