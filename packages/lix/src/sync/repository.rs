@@ -304,13 +304,7 @@ pub(crate) const SYNC_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::declare(
 const SEQUENCE_KEY: &[u8] = b"repository";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RepositoryEventRecord {
-    cursor: u64,
-    commit_ids: Vec<String>,
-    ref_updates: Vec<SyncRefUpdate>,
-}
-
-pub(crate) struct StagedRepositoryTransactionEvent {
+pub(crate) struct RepositoryEventRecord {
     cursor: u64,
     commit_ids: Vec<String>,
     ref_updates: Vec<SyncRefUpdate>,
@@ -1130,7 +1124,7 @@ pub(crate) async fn stage_repository_transaction_event<R>(
     preconditions: &mut Vec<StoragePrecondition>,
     commits: &[SyncCommit],
     published_controls: &BTreeMap<String, Option<BranchHeadControl>>,
-) -> Result<Option<StagedRepositoryTransactionEvent>, LixError>
+) -> Result<Option<RepositoryEventRecord>, LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -1195,19 +1189,9 @@ where
     commit_ids.dedup();
     ref_updates.sort_by(|left, right| left.branch_id.cmp(&right.branch_id));
 
-    let cursor = stage_repository_event(
-        read,
-        writes,
-        preconditions,
-        commit_ids.clone(),
-        ref_updates.clone(),
-    )
-    .await?;
-    Ok(Some(StagedRepositoryTransactionEvent {
-        cursor,
-        commit_ids,
-        ref_updates,
-    }))
+    Ok(Some(
+        stage_repository_event(read, writes, preconditions, commit_ids, ref_updates).await?,
+    ))
 }
 
 /// Rejects an Authority transaction before its atomic storage commit when the
@@ -1215,7 +1199,7 @@ where
 /// The borrowed projection is byte-for-byte the public JSON shape without
 /// cloning large member payloads merely to measure it.
 pub(crate) fn validate_repository_transaction_event_transfer(
-    event: &StagedRepositoryTransactionEvent,
+    event: &RepositoryEventRecord,
     materialized_commits: &[SyncCommit],
 ) -> Result<(), LixError> {
     let commits_by_id = materialized_commits
@@ -1294,7 +1278,7 @@ async fn stage_repository_event<R>(
     preconditions: &mut Vec<StoragePrecondition>,
     mut commit_ids: Vec<String>,
     mut ref_updates: Vec<SyncRefUpdate>,
-) -> Result<u64, LixError>
+) -> Result<RepositoryEventRecord, LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -1337,7 +1321,7 @@ where
             key,
         },
     });
-    Ok(cursor)
+    Ok(record)
 }
 
 impl<StorageImpl> Lix<StorageImpl>
@@ -4063,6 +4047,7 @@ where
                 published_ref_updates,
             )
             .await?
+            .cursor
         } else {
             current_cursor
         };
