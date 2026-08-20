@@ -4898,6 +4898,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consecutive_file_deltas_reach_an_active_joined_content_observer() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("authority snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/remote.md".to_owned()),
+                    Value::Text(String::new()),
+                ],
+            )
+            .await
+            .expect("remote file create should commit");
+        let created = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("file-create delta should load");
+        let SyncRepositoryPullResponse::Delta {
+            cursor: created_cursor,
+            events: _,
+        } = &created
+        else {
+            panic!("file-create pull should be a delta");
+        };
+        hydrate_delta_blobs(&authority, &replica, &created).await;
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &created)
+            .await
+            .expect("replica should apply file create");
+
+        let file_id = authority
+            .execute(
+                "SELECT id FROM lix_file WHERE path = $1",
+                &[Value::Text("/remote.md".to_owned())],
+            )
+            .await
+            .expect("remote file id should load")
+            .rows()[0]
+            .get::<String>("id")
+            .expect("remote file id should decode");
+        let params = [
+            Value::Text(file_id.clone()),
+            Value::Text(default_head(&snapshot).0),
+        ];
+        let mut observed = replica
+            .observe(
+                "SELECT file.id AS id, file.content AS content, file.path AS path, \
+                 file.lixcol_change_id AS change_id, change.origin_key AS origin_key, \
+                 $2 AS active_branch_id FROM lix_file AS file \
+                 LEFT JOIN lix_change AS change ON change.id = file.lixcol_change_id \
+                 AND change.file_id = file.id WHERE file.id = $1",
+                &params,
+            )
+            .expect("joined Atelier file observer should open");
+        let initial = observed
+            .next()
+            .await
+            .expect("initial file observation should succeed")
+            .expect("initial file observation should exist");
+        assert_eq!(
+            initial.rows.rows()[0]
+                .get::<Vec<u8>>("content")
+                .expect("initial content should decode"),
+            Vec::<u8>::new(),
+        );
+
+        authority
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
+                &[
+                    Value::Text("# right-marker\n".to_owned()),
+                    Value::Text(file_id),
+                ],
+            )
+            .await
+            .expect("remote editor write should commit");
+        let edited = authority
+            .pull_sync_repository(Some(*created_cursor), 128)
+            .await
+            .expect("file-edit delta should load");
+        hydrate_delta_blobs(&authority, &replica, &edited).await;
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &edited)
+            .await
+            .expect("replica should apply file edit");
+
+        let next = tokio::time::timeout(Duration::from_millis(100), observed.next())
+            .await
+            .expect("file edit should wake the active observer")
+            .expect("file edit observation should succeed")
+            .expect("file edit observation should exist");
+        assert_eq!(
+            next.rows.rows()[0]
+                .get::<Vec<u8>>("content")
+                .expect("updated content should decode"),
+            b"# right-marker\n",
+        );
+    }
+
+    #[tokio::test]
     async fn empty_sync_delta_does_not_scan_or_open_a_write_transaction() {
         let storage = SyncAccountingStorage::default();
         let receipt = Engine::initialize(storage.clone())
@@ -5551,6 +5662,40 @@ mod tests {
             .await
             .expect("snapshot should initialize replica");
         replica
+    }
+
+    async fn hydrate_delta_blobs(
+        authority: &Lix<Memory>,
+        replica: &Lix<Memory>,
+        response: &SyncRepositoryPullResponse,
+    ) {
+        let SyncRepositoryPullResponse::Delta { events, .. } = response else {
+            panic!("blob hydration requires a delta");
+        };
+        let blob_ids = events
+            .iter()
+            .flat_map(|event| &event.commits)
+            .flat_map(|commit| &commit.members)
+            .filter(|member| member.schema_key == "lix_binary_blob_ref" && !member.deleted)
+            .filter_map(|member| {
+                member
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.get("blob_hash"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect::<BTreeSet<_>>();
+        for blob_id in blob_ids {
+            let manifest = authority
+                .get_sync_blob_manifest(blob_id)
+                .await
+                .expect("delta blob manifest should load")
+                .expect("delta blob manifest should exist");
+            replica
+                .register_deferred_sync_blob_manifest(&manifest)
+                .await
+                .expect("delta blob should hydrate inline");
+        }
     }
 
     async fn accounting_replica_from_snapshot(
