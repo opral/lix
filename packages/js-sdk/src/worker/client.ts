@@ -86,28 +86,32 @@ export async function openLixWorkerBinding(
 		);
 		if (binding) {
 			if (!onDisposed) return binding;
-			return wrapDirectBinding(binding, new DirectBindingLease(onDisposed));
+			return wrapDirectBinding(binding, new BindingLease(onDisposed));
 		}
 	}
 	const client = await openLixWorker(storage, onDisposed, telemetry, server);
-	return workerBinding(client, new SharedWorkerLease(client), 0);
+	return workerBinding(
+		client,
+		new BindingLease(() => releaseWorker(client)),
+		0,
+	);
 }
 
-class DirectBindingLease {
+class BindingLease {
 	private references = 1;
-	constructor(private readonly onDisposed: () => void) {}
+	constructor(private readonly releaseLast: () => void | Promise<void>) {}
 	retain(): void {
 		this.references += 1;
 	}
-	release(): void {
+	async release(): Promise<void> {
 		this.references -= 1;
-		if (this.references === 0) this.onDisposed();
+		if (this.references === 0) await this.releaseLast();
 	}
 }
 
 function wrapDirectBinding(
 	binding: LixBinding,
-	lease: DirectBindingLease,
+	lease: BindingLease,
 ): LixBinding {
 	let closed = false;
 	return new Proxy(binding, {
@@ -128,7 +132,7 @@ function wrapDirectBinding(
 						await target.close();
 					} finally {
 						closed = true;
-						lease.release();
+						await lease.release();
 					}
 				};
 			}
@@ -138,21 +142,9 @@ function wrapDirectBinding(
 	});
 }
 
-class SharedWorkerLease {
-	private references = 1;
-	constructor(readonly client: LixWorkerClient) {}
-	retain(): void {
-		this.references += 1;
-	}
-	async release(): Promise<void> {
-		this.references -= 1;
-		if (this.references === 0) await releaseWorker(this.client);
-	}
-}
-
 function workerBinding(
 	client: LixWorkerClient,
-	lease: SharedWorkerLease,
+	lease: BindingLease,
 	sessionId: number,
 ): LixBinding {
 	let closed = false;
