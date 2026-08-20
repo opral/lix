@@ -16,9 +16,6 @@ use super::{
 /// use their independent BLAKE3/FastCDC CAS and are transferred only when a
 /// commit references content absent on the receiving side.
 pub trait SyncTransport: SyncTransportBounds {
-    /// Stable identity of the remote repository (normally its canonical URL).
-    fn remote_id(&self) -> &str;
-
     /// Account authenticated by the authority handshake for this session.
     fn active_account_id(&self) -> &str;
 

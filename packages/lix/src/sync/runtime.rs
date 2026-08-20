@@ -309,12 +309,6 @@ where
     // Reopens remain local. A fresh open hands in the already-fetched snapshot
     // used to choose the repository's default branch during initialization.
     let initial_transport = if let Some(prepared) = prepared {
-        if prepared.transport.remote_id() != remote_id {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "prepared sync repository does not match ServerOptions",
-            ));
-        }
         register_commit_blob_manifests(lix, &prepared.transport, &prepared.snapshot.commits)
             .await?;
         register_snapshot_row_blob_manifests(lix, &prepared.transport, &prepared.snapshot.rows)
@@ -1366,10 +1360,6 @@ mod tests {
     }
 
     impl SyncTransport for HistoryTransport {
-        fn remote_id(&self) -> &str {
-            "https://sync.example/history"
-        }
-
         fn active_account_id(&self) -> &str {
             crate::ANONYMOUS_ACCOUNT_ID
         }
@@ -1523,10 +1513,6 @@ mod tests {
     }
 
     impl SyncTransport for CappedPullTransport {
-        fn remote_id(&self) -> &str {
-            "https://sync.example/capped-pull"
-        }
-
         fn active_account_id(&self) -> &str {
             crate::ANONYMOUS_ACCOUNT_ID
         }
@@ -1626,10 +1612,6 @@ mod tests {
     }
 
     impl SyncTransport for PagedSnapshotTransport {
-        fn remote_id(&self) -> &str {
-            "https://sync.example/paged-snapshot"
-        }
-
         fn active_account_id(&self) -> &str {
             crate::ANONYMOUS_ACCOUNT_ID
         }

@@ -67,7 +67,6 @@ struct ErrorBody {
 #[derive(Clone, Debug)]
 pub(crate) struct HttpSyncTransport<Client> {
     client: Client,
-    repository_url: String,
     protocol_url: String,
     session_id: String,
     active_account_id: String,
@@ -81,8 +80,8 @@ where
         client: Client,
         repository_url: &str,
     ) -> Result<Self, LixError> {
-        let repository_url = repository_url.trim_end_matches('/').to_owned();
-        validate_sync_remote_id(&repository_url)?;
+        let repository_url = repository_url.trim_end_matches('/');
+        validate_sync_remote_id(repository_url)?;
         let protocol_url = format!("{repository_url}/lix/v1");
         let response = client
             .send(raw_request(
@@ -106,7 +105,6 @@ where
         })?;
         Ok(Self {
             client,
-            repository_url,
             protocol_url,
             session_id: handshake.session_id,
             active_account_id: handshake.active_account_id,
@@ -138,10 +136,6 @@ impl<Client> SyncTransport for HttpSyncTransport<Client>
 where
     Client: RawHttpClient,
 {
-    fn remote_id(&self) -> &str {
-        &self.repository_url
-    }
-
     fn active_account_id(&self) -> &str {
         &self.active_account_id
     }
