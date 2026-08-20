@@ -2361,6 +2361,14 @@ where
             }
         }
         let mut head_mutations = BTreeMap::new();
+        // A sparse bootstrap can include a checkpoint/head selection while the
+        // commit that originally authored one of its changes remains deferred.
+        // The selected payload is self-contained, so let it temporarily own
+        // the canonical locator. If an authored body is present in the same
+        // snapshot it wins; later history hydration replaces the fallback with
+        // the original authored locator.
+        let mut selected_fallback_locators = BTreeMap::new();
+        let mut authored_locators = BTreeMap::new();
         for commit in parsed_heads
             .iter()
             .filter(|(commit_id, _)| snapshot_body_ids.contains(commit_id))
@@ -2419,15 +2427,25 @@ where
                 .filter(|member| member.authored)
                 .map(|member| member.change_id)
                 .collect::<BTreeSet<_>>();
-            let authored_locators = staged
-                .locators
-                .iter()
-                .filter(|locator| authored_change_ids.contains(&locator.change_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            stage_change_locators(&mut writes, &authored_locators);
+            for locator in staged.locators.iter().cloned() {
+                if authored_change_ids.contains(&locator.change_id) {
+                    authored_locators.insert(locator.change_id, locator);
+                } else {
+                    selected_fallback_locators
+                        .entry(locator.change_id)
+                        .or_insert(locator);
+                }
+            }
             head_mutations.insert(commit.commit_id, staged.mutation_inventory().clone());
         }
+        stage_change_locators(
+            &mut writes,
+            &selected_fallback_locators.into_values().collect::<Vec<_>>(),
+        );
+        stage_change_locators(
+            &mut writes,
+            &authored_locators.into_values().collect::<Vec<_>>(),
+        );
         ChangelogContext::new()
             .writer(&mut &read, &mut writes)
             .stage_certified_sparse_append(ChangelogAppend {
@@ -4931,7 +4949,10 @@ mod tests {
             .get::<String>("id")
             .expect("abandoned head should decode");
         authority
-            .restore(target_head.clone())
+            .execute(
+                "SELECT lix_restore($1)",
+                &[Value::Text(target_head.clone())],
+            )
             .await
             .expect("ancestor restore should succeed");
 
@@ -5258,8 +5279,29 @@ mod tests {
             selected_records.iter().all(|(_, record)| record.is_some()),
             "checkpoint snapshot must persist selected change payloads"
         );
+        let packed_changes = crate::tracked_state::scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("sparse checkpoint selections must remain readable by lix_change scans");
+        let packed_change_ids = packed_changes
+            .iter()
+            .map(|change| change.change_id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            selected_ids
+                .iter()
+                .all(|change_id| packed_change_ids.contains(change_id)),
+            "deferred authored bodies must use the selected checkpoint payload as a locator fallback",
+        );
         let head_id = CommitId::parse_lix(&head, "checkpoint test head")
             .expect("checkpoint head should parse");
+        let authored_commits = selected_ids
+            .iter()
+            .map(|change_id| {
+                direct_change_locator(*change_id)
+                    .expect("test change should encode its authored commit")
+                    .commit_id
+            })
+            .collect::<BTreeSet<_>>();
         let checkpoint_authority =
             crate::tracked_state::load_commit_delta_selection_certificate(&read, head_id)
                 .await
@@ -5307,6 +5349,72 @@ mod tests {
             }
         };
         assert_eq!(replica_commit, authority_commit);
+
+        for authored_commit in authored_commits {
+            let history = authority
+                .sync_history(&authored_commit.to_string(), 1)
+                .await
+                .expect("authored history should load");
+            let mut boundary_rows = Vec::new();
+            for boundary in &history.boundaries {
+                let mut continuation = None;
+                loop {
+                    let page = authority
+                        .pull_sync_snapshot_rows(
+                            &boundary.commit_id,
+                            &boundary.commit_id,
+                            continuation.as_deref(),
+                            super::super::MAX_SYNC_REQUEST_ITEMS,
+                        )
+                        .await
+                        .expect("authored history boundary rows should load");
+                    boundary_rows.extend(page.rows);
+                    let Some(next) = page.continuation else {
+                        break;
+                    };
+                    continuation = Some(next);
+                }
+            }
+            replica
+                .import_sync_history_headers(&history.commit_headers)
+                .await
+                .expect("authored headers should import");
+            replica
+                .import_sync_history_boundaries(
+                    &history.commits,
+                    &history.boundaries,
+                    &boundary_rows,
+                )
+                .await
+                .expect("authored body should replace the selected locator fallback");
+        }
+        let read = replica
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("hydrated replica change read should open");
+        let hydrated_changes = crate::tracked_state::scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("hydrating authored bodies must preserve canonical change scans");
+        for change_id in &selected_ids {
+            assert_eq!(
+                hydrated_changes
+                    .iter()
+                    .filter(|change| change.change_id == *change_id)
+                    .count(),
+                1,
+                "history hydration must replace, not duplicate, the selected locator fallback",
+            );
+            assert_eq!(
+                hydrated_changes
+                    .iter()
+                    .find(|change| change.change_id == *change_id),
+                packed_changes
+                    .iter()
+                    .find(|change| change.change_id == *change_id),
+                "history hydration must preserve the checkpoint-certified selected payload",
+            );
+        }
     }
 
     #[tokio::test]
