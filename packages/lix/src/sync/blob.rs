@@ -3,8 +3,8 @@
 use base64::Engine as _;
 
 use crate::binary_cas::{
-    BlobChunkReceipt, BlobId, CanonicalBlobManifest, ChunkHash, chunk_presence_many,
-    load_canonical_blob_chunks, load_metadata_many, load_verified_chunk,
+    BlobChunkReceipt, BlobId, CanonicalBlobChunk, CanonicalBlobManifest, ChunkHash,
+    chunk_presence_many, load_canonical_blob_chunks, load_metadata_many, load_verified_chunk,
     stage_deferred_canonical_manifest, stage_transfer_publication_fence,
     stage_verified_canonical_manifest, stage_verified_inline_canonical_blob,
     stage_verified_raw_chunk,
@@ -42,22 +42,26 @@ fn decode_manifest(manifest: &SyncBlobManifest) -> Result<CanonicalBlobManifest,
 }
 
 fn encode_manifest(
-    manifest: CanonicalBlobManifest,
-    inline_bytes_base64: Option<String>,
-) -> SyncBlobManifest {
-    SyncBlobManifest {
-        blob_id: manifest.blob_id.to_hex(),
-        size_bytes: manifest.size_bytes,
-        chunks: manifest
-            .chunks
-            .into_iter()
+    blob_id: BlobId,
+    chunks: &[CanonicalBlobChunk],
+) -> Result<SyncBlobManifest, LixError> {
+    let size_bytes = chunks.iter().try_fold(0_u64, |size, chunk| {
+        size.checked_add(chunk.receipt.size_bytes)
+            .ok_or_else(|| LixError::unknown("canonical sync blob size overflow"))
+    })?;
+    Ok(SyncBlobManifest {
+        blob_id: blob_id.to_hex(),
+        size_bytes,
+        chunks: chunks
+            .iter()
             .map(|chunk| SyncBlobChunk {
-                chunk_id: chunk.hash.to_hex(),
-                size_bytes: chunk.size_bytes,
+                chunk_id: chunk.receipt.hash.to_hex(),
+                size_bytes: chunk.receipt.size_bytes,
             })
             .collect(),
-        inline_bytes_base64,
-    }
+        inline_bytes_base64: (size_bytes <= MAX_INLINE_SYNC_BLOB_BYTES as u64 && chunks.len() == 1)
+            .then(|| base64::engine::general_purpose::STANDARD.encode(&chunks[0].bytes)),
+    })
 }
 
 fn decode_inline_bytes(wire: &SyncBlobManifest) -> Result<Option<Vec<u8>>, LixError> {
@@ -85,21 +89,6 @@ fn decode_inline_bytes(wire: &SyncBlobManifest) -> Result<Option<Vec<u8>>, LixEr
         ));
     }
     Ok(Some(bytes))
-}
-
-fn manifest_from_canonical_chunks(
-    blob_id: BlobId,
-    chunks: &[crate::binary_cas::CanonicalBlobChunk],
-) -> Result<CanonicalBlobManifest, LixError> {
-    let size_bytes = chunks.iter().try_fold(0_u64, |size, chunk| {
-        size.checked_add(chunk.receipt.size_bytes)
-            .ok_or_else(|| LixError::unknown("canonical sync blob size overflow"))
-    })?;
-    Ok(CanonicalBlobManifest {
-        blob_id,
-        size_bytes,
-        chunks: chunks.iter().map(|chunk| chunk.receipt).collect(),
-    })
 }
 
 impl<StorageImpl> Lix<StorageImpl>
@@ -138,10 +127,7 @@ where
         // `load_canonical_blob_chunks` has already materialized, rechunked,
         // and authenticated the complete blob. Derive its manifest from those
         // receipts instead of loading and materializing the blob a second time.
-        let manifest = manifest_from_canonical_chunks(blob_id, &chunks)?;
-        let inline_bytes_base64 = (manifest.size_bytes <= MAX_INLINE_SYNC_BLOB_BYTES as u64
-            && chunks.len() == 1)
-            .then(|| base64::engine::general_purpose::STANDARD.encode(&chunks[0].bytes));
+        let manifest = encode_manifest(blob_id, &chunks)?;
         let present = chunk_presence_many(
             &read,
             &chunks
@@ -171,7 +157,7 @@ where
                 )
                 .await?;
         }
-        Ok(Some(encode_manifest(manifest, inline_bytes_base64)))
+        Ok(Some(manifest))
     }
 
     pub(crate) async fn get_sync_chunk(&self, chunk_id: &str) -> Result<Option<Vec<u8>>, LixError> {
@@ -320,8 +306,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binary_cas::CanonicalBlobChunk;
     use crate::storage_adapter::StorageReadOptions;
+
+    fn wire_manifest(
+        manifest: CanonicalBlobManifest,
+        inline_bytes: Option<&[u8]>,
+    ) -> SyncBlobManifest {
+        SyncBlobManifest {
+            blob_id: manifest.blob_id.to_hex(),
+            size_bytes: manifest.size_bytes,
+            chunks: manifest
+                .chunks
+                .into_iter()
+                .map(|chunk| SyncBlobChunk {
+                    chunk_id: chunk.hash.to_hex(),
+                    size_bytes: chunk.size_bytes,
+                })
+                .collect(),
+            inline_bytes_base64: inline_bytes
+                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+        }
+    }
 
     #[test]
     fn canonical_chunk_materialization_already_contains_the_complete_manifest() {
@@ -354,15 +359,22 @@ mod tests {
                 .map(|chunk| (chunk.receipt.hash, chunk.receipt.size_bytes)),
         );
 
-        let manifest = manifest_from_canonical_chunks(blob_id, &chunks)
-            .expect("canonical receipts derive a manifest without another blob read");
+        let manifest = encode_manifest(blob_id, &chunks)
+            .expect("canonical chunks encode without another blob read");
 
-        assert_eq!(manifest.blob_id, blob_id);
+        assert_eq!(manifest.blob_id, blob_id.to_hex());
         assert_eq!(manifest.size_bytes, expected_size);
         assert_eq!(
             manifest.chunks,
-            chunks.iter().map(|chunk| chunk.receipt).collect::<Vec<_>>()
+            chunks
+                .iter()
+                .map(|chunk| SyncBlobChunk {
+                    chunk_id: chunk.receipt.hash.to_hex(),
+                    size_bytes: chunk.receipt.size_bytes,
+                })
+                .collect::<Vec<_>>()
         );
+        assert!(manifest.inline_bytes_base64.is_none());
     }
 
     #[tokio::test]
@@ -373,12 +385,9 @@ mod tests {
         let bytes = b"small realtime markdown payload".to_vec();
         let canonical = CanonicalBlobManifest::from_bytes(&bytes);
         assert_eq!(canonical.chunks.len(), 1);
-        let manifest = encode_manifest(
-            canonical.clone(),
-            Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
-        );
+        let manifest = wire_manifest(canonical.clone(), Some(&bytes));
 
-        let deferred = encode_manifest(canonical.clone(), None);
+        let deferred = wire_manifest(canonical.clone(), None);
         let registration = lix
             .register_deferred_sync_blob_manifest(&deferred)
             .await
@@ -438,10 +447,7 @@ mod tests {
             .expect("test repository should open");
         let bytes = b"authenticated inline payload".to_vec();
         let canonical = CanonicalBlobManifest::from_bytes(&bytes);
-        let manifest = encode_manifest(
-            canonical,
-            Some(base64::engine::general_purpose::STANDARD.encode(b"xuthenticated inline payload")),
-        );
+        let manifest = wire_manifest(canonical, Some(b"xuthenticated inline payload"));
 
         let error = lix
             .register_sync_blob_manifest(&manifest)
@@ -458,10 +464,7 @@ mod tests {
         let at_limit = vec![7; MAX_INLINE_SYNC_BLOB_BYTES];
         let canonical = CanonicalBlobManifest::from_bytes(&at_limit);
         assert_eq!(canonical.chunks.len(), 1);
-        let manifest = encode_manifest(
-            canonical,
-            Some(base64::engine::general_purpose::STANDARD.encode(&at_limit)),
-        );
+        let manifest = wire_manifest(canonical, Some(&at_limit));
         lix.register_sync_blob_manifest(&manifest)
             .await
             .expect("an exact-cap one-chunk payload should register inline");
@@ -469,10 +472,7 @@ mod tests {
         let over_limit = vec![7; MAX_INLINE_SYNC_BLOB_BYTES + 1];
         let canonical = CanonicalBlobManifest::from_bytes(&over_limit);
         assert_eq!(canonical.chunks.len(), 1);
-        let manifest = encode_manifest(
-            canonical,
-            Some(base64::engine::general_purpose::STANDARD.encode(&over_limit)),
-        );
+        let manifest = wire_manifest(canonical, Some(&over_limit));
         let error = lix
             .register_sync_blob_manifest(&manifest)
             .await
@@ -490,7 +490,7 @@ mod tests {
             .collect::<Vec<_>>();
         let canonical = CanonicalBlobManifest::from_bytes(&bytes);
         assert!(canonical.chunks.len() > 1);
-        let manifest = encode_manifest(canonical.clone(), None);
+        let manifest = wire_manifest(canonical.clone(), None);
 
         let registration = lix
             .register_deferred_sync_blob_manifest(&manifest)
