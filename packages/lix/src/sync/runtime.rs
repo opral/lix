@@ -683,13 +683,9 @@ where
         let mut continuation = None;
         let mut seen_continuations = BTreeSet::new();
         loop {
-            let page = fetch_snapshot_row_page_adaptive(
-                transport,
-                &branch_id,
-                &head_commit_id,
-                continuation.as_deref(),
-                &mut page_limit,
-            )
+            let page = fetch_adaptive(&mut page_limit, "snapshot row", |limit| {
+                transport.snapshot_rows(&branch_id, &head_commit_id, continuation.as_deref(), limit)
+            })
             .await?;
             if page.branch_id != branch_id || page.head_commit_id != head_commit_id {
                 return Err(LixError::new(
@@ -729,22 +725,6 @@ where
         }
     }
     Ok(rows)
-}
-
-async fn fetch_snapshot_row_page_adaptive<Transport>(
-    transport: &Transport,
-    branch_id: &str,
-    head_commit_id: &str,
-    continuation: Option<&str>,
-    limit: &mut usize,
-) -> Result<super::SyncSnapshotRowPage, LixError>
-where
-    Transport: SyncTransport,
-{
-    fetch_adaptive(limit, "snapshot row", |limit| {
-        transport.snapshot_rows(branch_id, head_commit_id, continuation, limit)
-    })
-    .await
 }
 
 async fn fetch_adaptive<T, Fetch, FetchFuture>(
@@ -2174,9 +2154,11 @@ mod tests {
             behavior: SnapshotPageBehavior::Normal,
         };
         let mut limit = 4;
-        let page = fetch_snapshot_row_page_adaptive(&transport, "branch", "head", None, &mut limit)
-            .await
-            .expect("a smaller snapshot row page fits");
+        let page = fetch_adaptive(&mut limit, "snapshot row", |limit| {
+            transport.snapshot_rows("branch", "head", None, limit)
+        })
+        .await
+        .expect("a smaller snapshot row page fits");
         assert_eq!(page.rows.len(), 1);
         assert_eq!(limit, 2);
         assert_eq!(
