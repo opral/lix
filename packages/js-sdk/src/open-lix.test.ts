@@ -267,7 +267,7 @@ test("createCheckpoint returns the new active head through the local worker", as
 	await lix.close();
 });
 
-test("restore moves the active branch to an ancestor through the local worker", async () => {
+test("lix_restore moves the active branch to an ancestor through the local worker", async () => {
 	const lix = await openLix();
 	const initial = await activeHeadCommitId(lix);
 	await lix.execute(
@@ -275,7 +275,7 @@ test("restore moves the active branch to an ancestor through the local worker", 
 		["restore-test", "later"],
 	);
 
-	await lix.restore(initial);
+	await lix.execute("SELECT lix_restore($1)", [initial]);
 
 	expect(await activeHeadCommitId(lix)).toBe(initial);
 	expect(

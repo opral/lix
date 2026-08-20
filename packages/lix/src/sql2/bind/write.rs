@@ -40,6 +40,7 @@ pub(crate) enum BoundWriteTarget {
     Directory(DirectoryWriteSurface),
     Branch,
     DiffCommand(crate::sql2::DiffCommand),
+    Restore { commit_id: BoundExpr },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

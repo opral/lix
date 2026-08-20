@@ -96,6 +96,7 @@ pub(crate) fn take_certified_single_path_value_replacements() -> usize {
 #[cfg(test)]
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     match &plan.bound.target {
+        BoundWriteTarget::Restore { .. } => true,
         BoundWriteTarget::Row(_) => bound_public_write_shape_supported(plan),
         BoundWriteTarget::File(surface) => {
             fast_file_path_write_shape(plan, surface).is_some()
@@ -1787,6 +1788,20 @@ pub(crate) async fn try_execute_bound_public_write(
     metadata: &ExecuteStatementMetadata,
 ) -> Result<BoundPublicWriteExecution, LixError> {
     match &plan.bound.target {
+        BoundWriteTarget::Restore { commit_id } => {
+            let commit_id = eval_restore_commit_id(commit_id, params)?;
+            ctx.restore_active_branch(commit_id.clone()).await?;
+            Ok(BoundPublicWriteExecution::Executed(
+                SqlWriteResult::returning(
+                    0,
+                    crate::SqlQueryResult {
+                        columns: vec!["lix_restore".to_string()],
+                        rows: vec![vec![Value::Text(commit_id)]],
+                        notices: Vec::new(),
+                    },
+                ),
+            ))
+        }
         BoundWriteTarget::Row(surface) if bound_public_write_shape_supported(plan) => {
             execute_row_write(ctx, plan, surface, params)
                 .await
@@ -1809,6 +1824,27 @@ pub(crate) async fn try_execute_bound_public_write(
             }
         }
         _ => Ok(BoundPublicWriteExecution::Unsupported),
+    }
+}
+
+fn eval_restore_commit_id(expr: &BoundExpr, params: &[Value]) -> Result<String, LixError> {
+    match expr {
+        BoundExpr::Literal(BoundLiteral::Text(value)) => Ok(value.clone()),
+        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+            Some(Value::Text(value)) => Ok(value.clone()),
+            Some(_) => Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "lix_restore commit id must be text",
+            )),
+            None => Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("missing SQL parameter ${}", param.index),
+            )),
+        },
+        _ => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "lix_restore commit id must be a text literal or parameter",
+        )),
     }
 }
 

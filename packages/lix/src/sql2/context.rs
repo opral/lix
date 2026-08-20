@@ -168,6 +168,10 @@ pub(crate) trait SqlExecutionContext: Sync {
 /// authority without adding another translation layer.
 #[async_trait]
 pub(crate) trait SqlWriteExecutionContext: Send {
+    fn ensure_statement_allowed_after_restore(&self) -> Result<(), LixError> {
+        Ok(())
+    }
+
     fn active_branch_id(&self) -> &str;
     /// Revocation token for this context's borrow.
     ///
@@ -313,6 +317,13 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "diff commands are not supported by this write context",
+        ))
+    }
+
+    async fn restore_active_branch(&mut self, _commit_id: String) -> Result<(), LixError> {
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "lix_restore is not supported by this write context",
         ))
     }
 

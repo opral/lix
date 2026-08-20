@@ -188,14 +188,6 @@ impl SimSession {
         result
     }
 
-    pub async fn restore(&self, commit_id: impl Into<String>) -> Result<(), LixError> {
-        let result = self.session.restore(commit_id.into()).await;
-        if result.is_ok() {
-            self.sim.rebuild_tracked_state.after_successful_write();
-        }
-        result
-    }
-
     pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
         let result = self.session.undo().await;
         if result.is_ok() {
@@ -450,8 +442,16 @@ fn classify_statement(sql: &str) -> StatementKind {
         return classify_statement(inner);
     }
 
-    let (keyword, _rest) = first_keyword_and_rest(sql);
+    let (keyword, rest) = first_keyword_and_rest(sql);
     match keyword.as_str() {
+        "SELECT"
+            if rest
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("lix_restore") =>
+        {
+            StatementKind::Write
+        }
         "SELECT" | "WITH" | "VALUES" | "FROM" | "TABLE" | "EXPLAIN" => StatementKind::Read,
         "INSERT" | "UPDATE" | "DELETE" => StatementKind::Write,
         _ => StatementKind::Utility,
@@ -535,6 +535,10 @@ mod tests {
     #[test]
     fn classify_statement_splits_reads_writes_and_utility() {
         assert_eq!(classify_statement("SELECT 1"), StatementKind::Read);
+        assert_eq!(
+            classify_statement("SELECT lix_restore($1)"),
+            StatementKind::Write
+        );
         assert_eq!(
             classify_statement("  WITH x AS (...) SELECT 1"),
             StatementKind::Read

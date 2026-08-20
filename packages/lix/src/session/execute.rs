@@ -11,6 +11,7 @@ use crate::common::ExecuteStatementMetadata;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
 use crate::sql2;
+use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
@@ -3220,6 +3221,7 @@ where
         }
         self.has_started_statement = true;
         let transaction = self.transaction_mut()?;
+        transaction.ensure_statement_allowed_after_restore()?;
         transaction.flush_prepared_mutations().await?;
         let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
         let checkpoint = transaction.begin_sql_statement_checkpoint()?;
@@ -3681,6 +3683,7 @@ async fn execute_transaction_write_auto<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    transaction.ensure_statement_allowed_after_restore()?;
     let previous_origin_key = transaction.replace_origin_key(options.origin_key);
     let result = async {
         match transaction.try_execute_prepared_mutation(sql, params).await {

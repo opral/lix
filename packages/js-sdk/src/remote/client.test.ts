@@ -775,7 +775,7 @@ test("remote createCheckpoint posts no body and decodes the receipt", async () =
 	await lix.close();
 });
 
-test("remote restore posts the commit id", async () => {
+test("remote lix_restore uses the existing execute endpoint", async () => {
 	const requests: Request[] = [];
 	const lix = await openLix({
 		server: {
@@ -793,8 +793,13 @@ test("remote restore posts the commit id", async () => {
 						sessionId: "session-1",
 					});
 				}
-				if (pathname.endsWith("/restore")) {
-					return new Response(null, { status: 204 });
+				if (pathname.endsWith("/execute")) {
+					return Response.json({
+						columns: ["lix_restore"],
+						rows: [[{ kind: "text", value: "target-commit-id" }]],
+						rowsAffected: 0,
+						notices: [],
+					});
 				}
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
@@ -804,13 +809,18 @@ test("remote restore posts the commit id", async () => {
 		},
 	});
 
-	await expect(lix.restore("target-commit-id")).resolves.toBeUndefined();
+	await expect(
+		lix.execute("SELECT lix_restore($1)", ["target-commit-id"]),
+	).resolves.toBeDefined();
 	const request = requests.find((candidate) =>
-		new URL(candidate.url).pathname.endsWith("/restore"),
+		new URL(candidate.url).pathname.endsWith("/execute"),
 	);
 	expect(request?.method).toBe("POST");
 	expect(request?.headers.get("lix-session-id")).toBe("session-1");
-	expect(await request?.json()).toEqual({ commitId: "target-commit-id" });
+	expect(await request?.json()).toMatchObject({
+		sql: "SELECT lix_restore($1)",
+		params: [{ kind: "text", value: "target-commit-id" }],
+	});
 
 	await lix.close();
 });

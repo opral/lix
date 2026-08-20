@@ -21,8 +21,8 @@ use tracing::Instrument as _;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
 use crate::branch::{
-    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchRefReader,
-    branch_ref_stage_row,
+    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchLifecycle,
+    BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
 };
 use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogRevision, CatalogSnapshot, SchemaPlanId,
@@ -7625,23 +7625,20 @@ where
         expected_head_commit_id: CommitId,
         target_commit_id: CommitId,
     ) -> Result<(), LixError> {
-        self.advance_branch_ref(branch_id, target_commit_id).await?;
-        if self
-            .pending_restore_targets
-            .insert(
-                branch_id.to_owned(),
-                PendingRestoreIntent {
-                    expected_head_commit_id,
-                    target_commit_id,
-                },
-            )
-            .is_some()
-        {
+        if self.pending_restore_targets.contains_key(branch_id) {
             return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
+                "LIX_INVALID_TRANSACTION_STATE",
                 format!("branch '{branch_id}' staged more than one restore"),
             ));
         }
+        self.advance_branch_ref(branch_id, target_commit_id).await?;
+        self.pending_restore_targets.insert(
+            branch_id.to_owned(),
+            PendingRestoreIntent {
+                expected_head_commit_id,
+                target_commit_id,
+            },
+        );
         Ok(())
     }
 
@@ -9144,6 +9141,16 @@ impl<StorageImpl> SqlWriteExecutionContext for Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    fn ensure_statement_allowed_after_restore(&self) -> Result<(), LixError> {
+        if self.pending_restore_targets.is_empty() {
+            return Ok(());
+        }
+        Err(LixError::new(
+            "LIX_INVALID_TRANSACTION_STATE",
+            "lix_restore must be the final statement before commit or rollback",
+        ))
+    }
+
     fn write_context_liveness(&self) -> crate::sql2::WriteContextLiveness {
         self.write_context_liveness.clone()
     }
@@ -9638,6 +9645,62 @@ where
             }
             DiffCommand::CreateCheckpoint => self.execute_checkpoint_selection(diff_ids).await,
         }
+    }
+
+    async fn restore_active_branch(&mut self, commit_id: String) -> Result<(), LixError> {
+        let branch_id = self.active_branch_id().to_string();
+        self.ensure_statement_allowed_after_restore()?;
+        if self.staged_writes.has_staged_state_rows()? {
+            return Err(LixError::new(
+                "LIX_INVALID_TRANSACTION_STATE",
+                "lix_restore cannot follow another write in the same transaction",
+            ));
+        }
+        let target_commit_id = BranchLifecycle::parse_commit_id(
+            &commit_id,
+            BranchOperation::Restore,
+            BranchReferenceRole::Target,
+        )?;
+        let head_commit_id = {
+            let reader = self.branch_ref_reader().await;
+            BranchLifecycle::new(&reader)
+                .require_existing_commit_id(
+                    &branch_id,
+                    BranchOperation::Restore,
+                    BranchReferenceRole::Source,
+                )
+                .await?
+        };
+
+        let mut commit_graph = self.commit_graph_reader().await;
+        BranchLifecycle::require_existing_commit(
+            &mut commit_graph,
+            target_commit_id,
+            BranchOperation::Restore,
+            BranchReferenceRole::Target,
+        )
+        .await?;
+
+        if target_commit_id == head_commit_id {
+            return Ok(());
+        }
+        let target_is_ancestor = commit_graph
+            .reachable_nodes(&head_commit_id)
+            .await?
+            .iter()
+            .any(|reachable| reachable.commit.commit_id == target_commit_id);
+        if !target_is_ancestor {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "restore target commit '{target_commit_id}' is not an ancestor of branch '{branch_id}' HEAD '{head_commit_id}'"
+                ),
+            ));
+        }
+        drop(commit_graph);
+
+        self.restore_branch_ref(&branch_id, head_commit_id, target_commit_id)
+            .await
     }
 
     fn staged_commit_id(&self, branch_id: &str) -> Result<Option<String>, LixError> {

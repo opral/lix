@@ -23,7 +23,6 @@ pub(crate) mod idempotency;
 pub(crate) mod media_upload;
 mod merge;
 pub(crate) mod observe;
-mod restore;
 mod switch_branch;
 mod transaction;
 mod undo_redo;
@@ -99,7 +98,6 @@ where
         unsafe { self.map_unchecked_mut(|wrapped| &mut wrapped.0) }.poll(context)
     }
 }
-
 
 /// A storage adapter whose `Read<'a>` genuinely borrows `'a`.
 ///
