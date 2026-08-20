@@ -89,23 +89,6 @@ async fn load_existing_sync_change(
     }
 }
 
-fn collect_imported_change_locators(
-    selected_fallbacks: &mut BTreeMap<ChangeId, CommitDeltaChangeLocator>,
-    authored: &mut BTreeMap<ChangeId, CommitDeltaChangeLocator>,
-    staged: impl IntoIterator<Item = CommitDeltaChangeLocator>,
-    authored_change_ids: &BTreeSet<ChangeId>,
-) {
-    for locator in staged {
-        if authored_change_ids.contains(&locator.change_id) {
-            authored.insert(locator.change_id, locator);
-        } else {
-            selected_fallbacks
-                .entry(locator.change_id)
-                .or_insert(locator);
-        }
-    }
-}
-
 fn stage_imported_commit_body(
     writes: &mut StorageWriteSet,
     commit: &ParsedCommit,
@@ -146,12 +129,15 @@ fn stage_imported_commit_body(
         }
     }
     imported_authored_change_ids.extend(authored_change_ids.iter().copied());
-    collect_imported_change_locators(
-        selected_fallbacks,
-        authored,
-        staged.locators.iter().cloned(),
-        &authored_change_ids,
-    );
+    for locator in staged.locators.iter().cloned() {
+        if authored_change_ids.contains(&locator.change_id) {
+            authored.insert(locator.change_id, locator);
+        } else {
+            selected_fallbacks
+                .entry(locator.change_id)
+                .or_insert(locator);
+        }
+    }
     Ok(staged.mutation_inventory().clone())
 }
 
