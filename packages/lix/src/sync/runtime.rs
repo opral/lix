@@ -26,7 +26,7 @@ const SYNC_DEMAND_STALLED_CODE: &str = "LIX_ERROR_SYNC_DEMAND_STALLED";
 #[derive(Debug)]
 pub(crate) struct SyncRuntime {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
-    demand_tx: tokio::sync::mpsc::Sender<SyncDemand>,
+    pub(crate) demand_tx: tokio::sync::mpsc::Sender<SyncDemand>,
     task: SyncTask,
 }
 
@@ -157,10 +157,6 @@ impl SyncRuntime {
     pub(crate) async fn stop_and_join(&self) -> Result<(), LixError> {
         self.stop();
         self.task.join().await
-    }
-
-    pub(crate) fn demand_sender(&self) -> tokio::sync::mpsc::Sender<SyncDemand> {
-        self.demand_tx.clone()
     }
 }
 

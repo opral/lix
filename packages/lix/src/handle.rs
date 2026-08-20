@@ -409,7 +409,7 @@ where
                 let runtime =
                     crate::sync::activate_sync_mode(&mut lix, &server, prepared_sync.take())
                         .await?;
-                lix.sync_demand_tx = Some(runtime.demand_sender());
+                lix.sync_demand_tx = Some(runtime.demand_tx.clone());
                 lix.sync_runtime = Some(runtime);
             }
         }
