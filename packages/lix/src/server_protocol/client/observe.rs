@@ -512,7 +512,7 @@ impl<T: ObserveTransport> ObservationHub<T> {
         if !self.is_current(generation).await {
             return ConsumeResult::Stop;
         }
-        if !is_success_status(stream.status) {
+        if !super::is_success_status(stream.status) {
             let mut body = Vec::new();
             while let Some(chunk) = stream.body.next().await {
                 if !self.is_current(generation).await {
@@ -1127,10 +1127,6 @@ fn reconnect_delay(state: &HubState) -> Duration {
             .min(OBSERVE_RETRY_MAX_MS),
     };
     Duration::from_millis(ms)
-}
-
-fn is_success_status(status: u16) -> bool {
-    (200..300).contains(&status)
 }
 
 fn is_retryable_observe_status(status: u16) -> bool {
