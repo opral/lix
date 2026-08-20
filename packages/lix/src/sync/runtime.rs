@@ -1158,18 +1158,6 @@ where
     Ok(())
 }
 
-async fn register_pull_blob_manifests<StorageImpl, Transport>(
-    lix: &Lix<StorageImpl>,
-    transport: &Transport,
-    response: &SyncRepositoryPullResponse,
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-    Transport: SyncTransport,
-{
-    ensure_blob_manifests(lix, transport, blob_ids_from_pull(response)?).await
-}
-
 async fn prepare_pull<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
@@ -1179,7 +1167,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    register_pull_blob_manifests(lix, transport, response).await?;
+    ensure_blob_manifests(lix, transport, blob_ids_from_pull(response)?).await?;
     let SyncRepositoryPullResponse::Delta { events, .. } = response else {
         return Ok(());
     };
