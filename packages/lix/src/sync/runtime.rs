@@ -530,8 +530,7 @@ where
         drain_sync_outbox(
             &lix,
             &remote_id,
-            &headers,
-            &mut transport,
+            transport.as_ref(),
             &mut push_item_limit,
             &mut delta_pull_limit,
         )
@@ -548,20 +547,20 @@ where
 async fn drain_sync_outbox<StorageImpl>(
     lix: &Lix<StorageImpl>,
     remote_id: &str,
-    headers: &[(String, String)],
-    transport: &mut Option<HttpSyncTransport>,
+    transport: Option<&HttpSyncTransport>,
     push_item_limit: &mut usize,
     delta_pull_limit: &mut usize,
 ) -> Result<(), LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    if transport.is_none() {
-        *transport = Some(HttpSyncTransport::connect(remote_id, headers).await?);
-    }
-    let transport = transport
-        .as_ref()
-        .expect("drain establishes a transport before publishing");
+    // A disconnected persistent replica already has a durable outbox. Do not
+    // turn close into an unbounded reconnect attempt; the next warm open will
+    // resume it. Fresh in-memory replicas retain their bootstrap transport, so
+    // their accepted work still takes this drain path before the store dies.
+    let Some(transport) = transport else {
+        return Ok(());
+    };
     loop {
         if !push_pending_outbox(lix, remote_id, transport, push_item_limit, delta_pull_limit)
             .await?
