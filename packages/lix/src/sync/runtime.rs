@@ -566,7 +566,7 @@ where
     // identity and ref compare-and-swap make retry after a lost response safe.
     loop {
         let Some(request) = lix
-            .build_sync_push_bounded(remote_id, *push_item_limit)
+            .build_sync_push(remote_id, *push_item_limit)
             .await?
         else {
             break;

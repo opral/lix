@@ -1181,14 +1181,6 @@ where
     pub(crate) async fn build_sync_push(
         &self,
         remote_id: &str,
-    ) -> Result<Option<SyncPushRequest>, LixError> {
-        self.build_sync_push_bounded(remote_id, super::MAX_SYNC_REQUEST_ITEMS)
-            .await
-    }
-
-    pub(crate) async fn build_sync_push_bounded(
-        &self,
-        remote_id: &str,
         max_items: usize,
     ) -> Result<Option<SyncPushRequest>, LixError> {
         if max_items == 0 || max_items > super::MAX_SYNC_REQUEST_ITEMS {
@@ -4094,7 +4086,7 @@ mod tests {
 
     async fn publish_pending(replica: &Lix<Memory>, authority: &Lix<Memory>) -> SyncPushRequest {
         let request = replica
-            .build_sync_push(TEST_REMOTE)
+            .build_sync_push(TEST_REMOTE, super::MAX_SYNC_REQUEST_ITEMS)
             .await
             .expect("pending push should build")
             .expect("replica should have pending work");
@@ -4146,7 +4138,7 @@ mod tests {
         authority: &Lix<Memory>,
     ) -> SyncPushRequest {
         let request = replica
-            .build_sync_push(TEST_REMOTE)
+            .build_sync_push(TEST_REMOTE, super::MAX_SYNC_REQUEST_ITEMS)
             .await
             .expect("pending push should build")
             .expect("replica should have pending work");
@@ -4721,7 +4713,7 @@ mod tests {
         let mut push_count = 0usize;
         loop {
             let Some(request) = replica
-                .build_sync_push_bounded(TEST_REMOTE, super::super::MAX_SYNC_REQUEST_ITEMS)
+                .build_sync_push(TEST_REMOTE, super::super::MAX_SYNC_REQUEST_ITEMS)
                 .await
                 .expect("bounded offline push should build")
             else {
@@ -5440,7 +5432,7 @@ mod tests {
         .await;
 
         let push = replica
-            .build_sync_push(TEST_REMOTE)
+            .build_sync_push(TEST_REMOTE, super::MAX_SYNC_REQUEST_ITEMS)
             .await
             .expect("push should build")
             .expect("reset and unrelated branch should both remain publishable");
@@ -5519,7 +5511,7 @@ mod tests {
             .expect("authority receipt should store");
 
         let push = local
-            .build_sync_push(TEST_REMOTE)
+            .build_sync_push(TEST_REMOTE, super::MAX_SYNC_REQUEST_ITEMS)
             .await
             .expect("build should proactively reconcile")
             .expect("reconciled merge should be publishable");
@@ -5621,7 +5613,7 @@ mod tests {
             .expect("authority receipt should store");
 
         let push = local
-            .build_sync_push(TEST_REMOTE)
+            .build_sync_push(TEST_REMOTE, super::MAX_SYNC_REQUEST_ITEMS)
             .await
             .expect("independent push should build")
             .expect("independent branch ref should be ready");
@@ -5712,7 +5704,7 @@ mod tests {
         write_key_value(&left, "left", "from-left").await;
         write_key_value(&right, "right", "from-right").await;
         let right_pending = right
-            .build_sync_push(TEST_REMOTE)
+            .build_sync_push(TEST_REMOTE, super::MAX_SYNC_REQUEST_ITEMS)
             .await
             .expect("right pending push should build")
             .expect("right should have pending work");
@@ -5734,7 +5726,7 @@ mod tests {
             .await
             .expect("right replica should reconcile divergence");
         let right_push = right
-            .build_sync_push(TEST_REMOTE)
+            .build_sync_push(TEST_REMOTE, super::MAX_SYNC_REQUEST_ITEMS)
             .await
             .expect("reconciled push should build")
             .expect("merge commit should remain pending");
@@ -5870,7 +5862,7 @@ mod tests {
         );
 
         let retry = inserting_replica
-            .build_sync_push(TEST_REMOTE)
+            .build_sync_push(TEST_REMOTE, super::MAX_SYNC_REQUEST_ITEMS)
             .await
             .expect("reconciled push should build")
             .expect("created file should remain pending");
@@ -5907,7 +5899,7 @@ mod tests {
         write_key_value(&left, "shared", "authority-first").await;
         write_key_value(&right, "shared", "local-pending").await;
         let right_pending = right
-            .build_sync_push(TEST_REMOTE)
+            .build_sync_push(TEST_REMOTE, super::MAX_SYNC_REQUEST_ITEMS)
             .await
             .expect("right pending push should build")
             .expect("right should have pending work");
