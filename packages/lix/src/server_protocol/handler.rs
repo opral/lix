@@ -4795,7 +4795,6 @@ mod tests {
     };
     use lix::{Blob, Memory, open_lix};
     use serde_json::{Value as JsonValue, json};
-    use std::collections::BTreeMap;
     use std::io::Write as _;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
     use tracing::Subscriber;
@@ -5089,7 +5088,7 @@ mod tests {
         id: tracing::span::Id,
         parent: Option<tracing::span::Id>,
         name: &'static str,
-        fields: BTreeMap<String, String>,
+        fields: std::collections::BTreeMap<String, String>,
     }
 
     #[derive(Clone, Default)]
@@ -5098,7 +5097,7 @@ mod tests {
     }
 
     struct FieldVisitor<'a> {
-        fields: &'a mut BTreeMap<String, String>,
+        fields: &'a mut std::collections::BTreeMap<String, String>,
     }
 
     impl tracing::field::Visit for FieldVisitor<'_> {
@@ -5129,7 +5128,7 @@ mod tests {
                     .then(|| context.current_span().id().cloned())
                     .flatten()
             });
-            let mut fields = BTreeMap::new();
+            let mut fields = std::collections::BTreeMap::new();
             attributes.record(&mut FieldVisitor {
                 fields: &mut fields,
             });
