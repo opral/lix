@@ -1781,9 +1781,42 @@ where
                     }
                     return Ok(());
                 }
+
+                let expected_cursor = state.cursor;
+                let branch_ids = events
+                    .iter()
+                    .flat_map(|event| event.ref_updates.iter())
+                    .map(|update| update.branch_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let local_coordinates = {
+                    let adapter = self.storage_adapter();
+                    let read = adapter.begin_read(StorageReadOptions::default()).await?;
+                    BranchHeadControlContext::new()
+                        .reader(&read)
+                        .load_observed(&branch_ids)
+                        .await?
+                        .into_iter()
+                        .zip(&branch_ids)
+                        .map(|(observation, branch_id)| {
+                            let head = observation
+                                .control
+                                .map(|control| control.head_commit_id.to_string());
+                            let checkpoint = observation
+                                .control
+                                .and_then(|control| control.working_diff_checkpoint_commit_id)
+                                .map(|checkpoint| checkpoint.to_string());
+                            (branch_id.clone(), (head, checkpoint))
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                };
+                let mut commits = BTreeMap::new();
+                let mut branch_chains =
+                    BTreeMap::<String, (Option<String>, Option<String>, bool)>::new();
                 for event in events {
-                    let expected_cursor = state.cursor;
-                    let next_cursor = expected_cursor
+                    let next_cursor = state
+                        .cursor
                         .checked_add(1)
                         .ok_or_else(|| LixError::unknown("sync replica cursor overflow"))?;
                     if event.cursor != next_cursor {
@@ -1792,19 +1825,20 @@ where
                             "sync delta event cursor is not contiguous",
                         ));
                     }
-                    let adapter = self.storage_adapter();
-                    let read = adapter.begin_read(StorageReadOptions::default()).await?;
-                    let ids = event
-                        .ref_updates
-                        .iter()
-                        .map(|update| update.branch_id.clone())
-                        .collect::<Vec<_>>();
-                    let observed = BranchHeadControlContext::new()
-                        .reader(&read)
-                        .load_observed(&ids)
-                        .await?;
-                    let mut applicable_refs = Vec::new();
-                    let mut divergent_refs = Vec::new();
+                    for commit in &event.commits {
+                        if let Some(existing) =
+                            commits.insert(commit.commit_id.clone(), commit.clone())
+                            && existing != *commit
+                        {
+                            return Err(LixError::new(
+                                LixError::CODE_INVALID_PARAM,
+                                format!(
+                                    "sync delta repeats commit '{}' with different content",
+                                    commit.commit_id
+                                ),
+                            ));
+                        }
+                    }
                     state
                         .authority_known_commit_ids
                         .extend(event.commits.iter().map(|commit| commit.commit_id.clone()));
@@ -1820,7 +1854,7 @@ where
                             state.authority_known_commit_ids.remove(parent);
                         }
                     }
-                    for (update, observation) in event.ref_updates.iter().zip(observed) {
+                    for update in &event.ref_updates {
                         let authoritative_coordinate =
                             state.authoritative_branches.get(&update.branch_id);
                         let authoritative = authoritative_coordinate
@@ -1844,49 +1878,26 @@ where
                             update.checkpoint_commit_id.clone(),
                             "sync delta ref",
                         )?;
-                        let local = observation
-                            .control
-                            .map(|control| control.head_commit_id.to_string());
-                        let local_checkpoint = observation
-                            .control
-                            .and_then(|control| control.working_diff_checkpoint_commit_id)
-                            .map(|checkpoint| checkpoint.to_string());
-                        if local.as_deref() == authoritative
-                            && local_checkpoint.as_deref() == authoritative_checkpoint
-                        {
-                            applicable_refs.push(SyncRefUpdate {
-                                branch_id: update.branch_id.clone(),
-                                expected_head_commit_id: local.clone(),
-                                expected_checkpoint_commit_id: local_checkpoint.clone(),
-                                head_commit_id: update.head_commit_id.clone(),
-                                checkpoint_commit_id: update.checkpoint_commit_id.clone(),
+                        let local = local_coordinates
+                            .get(&update.branch_id)
+                            .expect("delta branch was loaded once");
+                        let chain = branch_chains
+                            .entry(update.branch_id.clone())
+                            .or_insert_with(|| {
+                                (
+                                    update.head_commit_id.clone(),
+                                    update.checkpoint_commit_id.clone(),
+                                    (local.0.as_deref(), local.1.as_deref())
+                                        == (authoritative, authoritative_checkpoint),
+                                )
                             });
-                        } else if (local.as_deref(), local_checkpoint.as_deref())
-                            != (
+                        chain.0 = update.head_commit_id.clone();
+                        chain.1 = update.checkpoint_commit_id.clone();
+                        chain.2 |= (local.0.as_deref(), local.1.as_deref())
+                            == (
                                 update.head_commit_id.as_deref(),
                                 update.checkpoint_commit_id.as_deref(),
-                            )
-                            && let Some(head) = update.head_commit_id.as_deref()
-                        {
-                            let checkpoint =
-                                update.checkpoint_commit_id.clone().ok_or_else(|| {
-                                    LixError::new(
-                                        LixError::CODE_INVALID_PARAM,
-                                        "headed sync ref has no checkpoint",
-                                    )
-                                })?;
-                            divergent_refs.push((
-                                update.branch_id.clone(),
-                                local.ok_or_else(|| {
-                                    LixError::new(
-                                        LixError::CODE_TRANSACTION_CONFLICT,
-                                        "sync cannot reconcile a deleted local branch in place",
-                                    )
-                                })?,
-                                head.to_owned(),
-                                checkpoint,
-                            ));
-                        }
+                            );
                         state
                             .authoritative_branches
                             .insert(update.branch_id.clone(), next_authoritative);
@@ -1895,10 +1906,55 @@ where
                         }
                     }
                     state.cursor = event.cursor;
-                    drop(read);
+                }
+                if state.cursor != *cursor {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync delta cursor does not match its final event",
+                    ));
+                }
+
+                let mut applicable_refs = Vec::new();
+                let mut divergent_refs = Vec::new();
+                for (branch_id, (head, checkpoint, joins_authority)) in branch_chains {
+                    let local = local_coordinates
+                        .get(&branch_id)
+                        .expect("folded delta branch was loaded once");
+                    if joins_authority {
+                        applicable_refs.push(SyncRefUpdate {
+                            branch_id,
+                            expected_head_commit_id: local.0.clone(),
+                            expected_checkpoint_commit_id: local.1.clone(),
+                            head_commit_id: head,
+                            checkpoint_commit_id: checkpoint,
+                        });
+                    } else if (local.0.as_ref(), local.1.as_ref())
+                        != (head.as_ref(), checkpoint.as_ref())
+                        && let Some(head) = head
+                    {
+                        divergent_refs.push((
+                            branch_id,
+                            local.0.clone().ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_TRANSACTION_CONFLICT,
+                                    "sync cannot reconcile a deleted local branch in place",
+                                )
+                            })?,
+                            head,
+                            checkpoint.ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INVALID_PARAM,
+                                    "headed sync ref has no checkpoint",
+                                )
+                            })?,
+                        ));
+                    }
+                }
+                let commits = commits.into_values().collect::<Vec<_>>();
+                if divergent_refs.is_empty() {
                     self.import_sync_repository(
                         &SyncPushRequest {
-                            commits: event.commits.clone(),
+                            commits,
                             ref_updates: applicable_refs,
                         },
                         SyncImportPurpose::ReplicaDelta,
@@ -1908,6 +1964,21 @@ where
                             expected_cursor,
                             state: &state,
                         }),
+                    )
+                    .await?;
+                } else {
+                    // A receipt must never outrun reconciliation. Immutable
+                    // objects are idempotent, and sync merges are already-up-to-date
+                    // on replay, so a crash anywhere before the final publication
+                    // leaves the old cursor and safely repeats this sequence.
+                    self.import_sync_repository(
+                        &SyncPushRequest {
+                            commits,
+                            ref_updates: Vec::new(),
+                        },
+                        SyncImportPurpose::ReplicaDelta,
+                        None,
+                        None,
                     )
                     .await?;
                     for (branch_id, local_head, authority_head, authority_checkpoint) in
@@ -1921,12 +1992,20 @@ where
                         )
                         .await?;
                     }
-                }
-                if state.cursor != *cursor {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync delta cursor does not match its final event",
-                    ));
+                    self.import_sync_repository(
+                        &SyncPushRequest {
+                            commits: Vec::new(),
+                            ref_updates: applicable_refs,
+                        },
+                        SyncImportPurpose::ReplicaDelta,
+                        None,
+                        Some(ReplicaStatePublication {
+                            remote_id,
+                            expected_cursor,
+                            state: &state,
+                        }),
+                    )
+                    .await?;
                 }
                 Ok(())
             }
@@ -4033,10 +4112,10 @@ where
         }
 
         if let Some(publication) = &replica_publication {
-            if publication.expected_cursor.checked_add(1) != Some(publication.state.cursor) {
+            if publication.state.cursor <= publication.expected_cursor {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "sync replica publication must advance exactly one event cursor",
+                    "sync replica publication must advance its event cursor",
                 ));
             }
             let (stored_state, previous) = load_replica_state(&read, publication.remote_id).await?;
@@ -4528,6 +4607,7 @@ mod tests {
         write_transactions: Arc<AtomicU64>,
         atomic_ref_receipts: Arc<AtomicU64>,
         branch_publications_without_receipt: Arc<AtomicU64>,
+        fail_next_replica_receipt: Arc<AtomicU64>,
     }
 
     struct SyncAccountingRead {
@@ -4541,6 +4621,7 @@ mod tests {
         write_transactions: Arc<AtomicU64>,
         atomic_ref_receipts: Arc<AtomicU64>,
         branch_publications_without_receipt: Arc<AtomicU64>,
+        fail_next_replica_receipt: Arc<AtomicU64>,
         touches_branch_control: bool,
         touches_replica_state: bool,
     }
@@ -4575,6 +4656,10 @@ mod tests {
             self.branch_publications_without_receipt
                 .load(Ordering::Relaxed)
         }
+
+        fn fail_next_replica_receipt(&self) {
+            self.fail_next_replica_receipt.store(1, Ordering::Relaxed);
+        }
     }
 
     impl Storage for SyncAccountingStorage {
@@ -4607,6 +4692,7 @@ mod tests {
                 branch_publications_without_receipt: Arc::clone(
                     &self.branch_publications_without_receipt,
                 ),
+                fail_next_replica_receipt: Arc::clone(&self.fail_next_replica_receipt),
                 touches_branch_control: false,
                 touches_replica_state: false,
             })
@@ -4646,6 +4732,13 @@ mod tests {
 
         async fn commit(self) -> Result<CommitResult, StorageError> {
             self.write_transactions.fetch_add(1, Ordering::Relaxed);
+            if self.touches_replica_state
+                && self.fail_next_replica_receipt.swap(0, Ordering::Relaxed) != 0
+            {
+                return Err(StorageError::Io(
+                    "injected replica receipt failure".to_owned(),
+                ));
+            }
             if self.touches_branch_control && self.touches_replica_state {
                 self.atomic_ref_receipts.fetch_add(1, Ordering::Relaxed);
             } else if self.touches_branch_control {
@@ -4974,6 +5067,307 @@ mod tests {
         assert_eq!(stored_state.cursor, *delta_cursor);
     }
 
+    #[tokio::test]
+    async fn one_delta_page_folds_a_same_branch_chain_into_one_receipt_publication() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("initial snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let storage = SyncAccountingStorage::default();
+        let replica =
+            accounting_replica_from_snapshot(&authority, &snapshot, storage.clone()).await;
+        let params = [Value::Text("folded-chain".to_owned())];
+        let mut observed = replica
+            .observe("SELECT value FROM lix_key_value WHERE key = $1", &params)
+            .expect("observe folded value");
+        observed
+            .next()
+            .await
+            .expect("initial observer evaluation succeeds")
+            .expect("initial observer event exists");
+
+        write_key_value(&authority, "folded-chain", "first").await;
+        write_key_value(&authority, "folded-chain", "final").await;
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("two-event delta should load");
+        let SyncRepositoryPullResponse::Delta { events, cursor, .. } = &delta else {
+            panic!("incremental pull should be a delta");
+        };
+        assert_eq!(events.len(), 2, "fixture must cross two authority events");
+        storage.reset();
+
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("folded page should apply");
+
+        assert_eq!(
+            storage.write_transaction_count(),
+            2,
+            "all immutable bodies share one publication and the final ref/receipt share one publication",
+        );
+        assert_eq!(storage.atomic_ref_receipt_count(), 1);
+        assert_eq!(storage.branch_publication_without_receipt_count(), 0);
+        assert_eq!(
+            replica
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .expect("cursor should load"),
+            Some(*cursor),
+        );
+        assert_eq!(read_key_value(&replica, "folded-chain").await, "final");
+        let event = observed
+            .next()
+            .await
+            .expect("folded observer evaluation succeeds")
+            .expect("folded observer event exists");
+        assert_eq!(
+            event.rows.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("observed value decodes"),
+            serde_json::json!("final"),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), observed.next())
+                .await
+                .is_err(),
+            "one folded page should emit one observer delivery",
+        );
+    }
+
+    #[tokio::test]
+    async fn one_delta_page_folds_independent_branch_updates() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let main_branch_id = authority
+            .active_branch_id()
+            .await
+            .expect("main branch should load");
+        let secondary = authority
+            .create_branch(CreateBranchOptions {
+                id: Some("01920000-0000-7000-8000-000000001777".to_owned()),
+                name: "folded-secondary".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("secondary branch should be created");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("branch-complete snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let storage = SyncAccountingStorage::default();
+        let replica =
+            accounting_replica_from_snapshot(&authority, &snapshot, storage.clone()).await;
+
+        authority
+            .switch_branch(SwitchBranchOptions {
+                branch_id: secondary.id.clone(),
+            })
+            .await
+            .expect("authority should select secondary branch");
+        write_key_value(&authority, "secondary-fold", "secondary").await;
+        authority
+            .switch_branch(SwitchBranchOptions {
+                branch_id: main_branch_id.clone(),
+            })
+            .await
+            .expect("authority should restore main branch");
+        write_key_value(&authority, "main-fold", "main").await;
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("independent branch delta should load");
+        let SyncRepositoryPullResponse::Delta { events, .. } = &delta else {
+            panic!("incremental pull should be a delta");
+        };
+        assert_eq!(events.len(), 2, "fixture must contain one event per branch");
+        storage.reset();
+
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("independent branch page should apply");
+
+        assert_eq!(storage.write_transaction_count(), 2);
+        assert_eq!(storage.atomic_ref_receipt_count(), 1);
+        assert_eq!(read_key_value(&replica, "main-fold").await, "main");
+        replica
+            .switch_branch(SwitchBranchOptions {
+                branch_id: secondary.id,
+            })
+            .await
+            .expect("replica should select synchronized secondary branch");
+        assert_eq!(
+            read_key_value(&replica, "secondary-fold").await,
+            "secondary",
+        );
+    }
+
+    #[tokio::test]
+    async fn divergent_page_does_not_advance_receipt_until_reconciliation_is_durable() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        write_key_value(&authority, "divergent-base", "base").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("initial snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let storage = SyncAccountingStorage::default();
+        let replica =
+            accounting_replica_from_snapshot(&authority, &snapshot, storage.clone()).await;
+        write_key_value(&replica, "local-divergent", "local").await;
+        write_key_value(&authority, "remote-divergent-a", "remote-a").await;
+        write_key_value(&authority, "remote-divergent-b", "remote-b").await;
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("divergent page should load");
+        let SyncRepositoryPullResponse::Delta {
+            cursor: final_cursor,
+            events,
+        } = &delta
+        else {
+            panic!("incremental pull should be a delta");
+        };
+        assert_eq!(events.len(), 2);
+        storage.fail_next_replica_receipt();
+
+        let error = replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect_err("injected final receipt failure should interrupt apply");
+        assert!(error.message.contains("injected replica receipt failure"));
+        assert_eq!(
+            replica
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .expect("old cursor should remain readable"),
+            Some(cursor),
+            "a failed final receipt must leave the page replayable",
+        );
+        assert_eq!(read_key_value(&replica, "local-divergent").await, "local");
+        assert_eq!(
+            read_key_value(&replica, "remote-divergent-b").await,
+            "remote-b",
+        );
+        let merged_head = replica
+            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .await
+            .expect("merged head should load")
+            .rows()[0]
+            .get::<String>("id")
+            .expect("merged head should decode");
+
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("replaying the interrupted page should complete");
+
+        assert_eq!(
+            replica
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .expect("final cursor should load"),
+            Some(*final_cursor),
+        );
+        let replayed_head = replica
+            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .await
+            .expect("replayed head should load")
+            .rows()[0]
+            .get::<String>("id")
+            .expect("replayed head should decode");
+        assert_eq!(
+            replayed_head, merged_head,
+            "replay must recognize the durable merge instead of creating another one",
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_only_delta_page_uses_one_durable_publication() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("initial snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let uploader = replica_from_snapshot(&authority, &snapshot).await;
+        for value in ["first", "second"] {
+            write_key_value(&uploader, "commit-only", value).await;
+            let mut request = uploader
+                .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                .await
+                .expect("commit-only push should build")
+                .expect("uploader should have pending commits");
+            request.ref_updates.clear();
+            authority
+                .push_sync_repository(&request)
+                .await
+                .expect("authority should admit immutable commits without a ref");
+        }
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("commit-only delta should load");
+        let SyncRepositoryPullResponse::Delta { events, cursor, .. } = &delta else {
+            panic!("incremental pull should be a delta");
+        };
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.ref_updates.is_empty()));
+        let storage = SyncAccountingStorage::default();
+        let replica =
+            accounting_replica_from_snapshot(&authority, &snapshot, storage.clone()).await;
+        let (_, original_head) = default_head(&snapshot);
+        storage.reset();
+
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("commit-only page should apply");
+
+        assert_eq!(storage.write_transaction_count(), 1);
+        assert_eq!(storage.atomic_ref_receipt_count(), 0);
+        assert_eq!(
+            replica
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .expect("cursor should load"),
+            Some(*cursor),
+        );
+        let local_head = replica
+            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .await
+            .expect("unchanged branch head should load")
+            .rows()[0]
+            .get::<String>("id")
+            .expect("head should decode");
+        assert_eq!(local_head, original_head);
+    }
+
     fn default_head(snapshot: &SyncRepositoryPullResponse) -> (String, String) {
         let SyncRepositoryPullResponse::Snapshot {
             default_branch_id,
@@ -5159,7 +5553,42 @@ mod tests {
         replica
     }
 
-    async fn write_key_value(lix: &Lix<Memory>, key: &str, value: &str) {
+    async fn accounting_replica_from_snapshot(
+        authority: &Lix<Memory>,
+        snapshot: &SyncRepositoryPullResponse,
+        storage: SyncAccountingStorage,
+    ) -> Lix<SyncAccountingStorage> {
+        let (branch_id, _) = default_head(snapshot);
+        let (history, rows, checkpoint_roots) = snapshot_parts(authority, snapshot).await;
+        Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
+            .await
+            .expect("replica storage should initialize");
+        let replica = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("replica should open");
+        replica
+            .set_sync_role(super::super::SyncRole::Replica)
+            .expect("replica role should install");
+        replica
+            .apply_sync_repository_snapshot(
+                TEST_REMOTE,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                snapshot,
+                &history.commits,
+                &history.commit_headers,
+                &rows,
+                &checkpoint_roots,
+            )
+            .await
+            .expect("snapshot should initialize replica");
+        replica
+    }
+
+    async fn write_key_value<StorageImpl>(lix: &Lix<StorageImpl>, key: &str, value: &str)
+    where
+        StorageImpl: Storage + Clone + Send + Sync + 'static,
+    {
         lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -5201,7 +5630,10 @@ mod tests {
             .expect("reset control should commit");
     }
 
-    async fn read_key_value(lix: &Lix<Memory>, key: &str) -> String {
+    async fn read_key_value<StorageImpl>(lix: &Lix<StorageImpl>, key: &str) -> String
+    where
+        StorageImpl: Storage + Clone + Send + Sync + 'static,
+    {
         let value = lix
             .execute(
                 "SELECT value FROM lix_key_value WHERE key = $1",
