@@ -2609,11 +2609,12 @@ mod tests {
                 Err(next) => error = next,
             }
         }
-        let calls = calls.lock().expect("history calls lock");
-        assert!(!calls.is_empty());
-        assert!(calls.iter().all(|request| request.len() == 1));
-        let hydrated_ids = calls.iter().flatten().cloned().collect::<BTreeSet<_>>();
-        drop(calls);
+        let hydrated_ids = {
+            let calls = calls.lock().expect("history calls lock");
+            assert!(!calls.is_empty());
+            assert!(calls.iter().all(|request| request.len() == 1));
+            calls.iter().flatten().cloned().collect::<BTreeSet<_>>()
+        };
 
         let adapter = replica.storage_adapter();
         let read = adapter

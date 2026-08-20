@@ -73,6 +73,7 @@ test("sync mode forwards static headers through the native transport", async () 
 			response.end(
 				JSON.stringify({
 					sessionId: "js-sync-test-session",
+					activeAccountId: "00000000-0000-7000-8000-000000000002",
 				}),
 			);
 			return;
