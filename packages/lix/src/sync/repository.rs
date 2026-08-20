@@ -2432,6 +2432,7 @@ where
         // the original authored locator.
         let mut selected_fallback_locators = BTreeMap::new();
         let mut authored_locators = BTreeMap::new();
+        let mut imported_authored_change_ids = BTreeSet::new();
         for commit in parsed_heads
             .iter()
             .filter(|(commit_id, _)| snapshot_body_ids.contains(commit_id))
@@ -2490,6 +2491,7 @@ where
                 .filter(|member| member.authored)
                 .map(|member| member.change_id)
                 .collect::<BTreeSet<_>>();
+            imported_authored_change_ids.extend(authored_change_ids.iter().copied());
             collect_imported_change_locators(
                 &mut selected_fallback_locators,
                 &mut authored_locators,
@@ -2498,6 +2500,8 @@ where
             );
             head_mutations.insert(commit.commit_id, staged.mutation_inventory().clone());
         }
+        selected_fallback_locators
+            .retain(|change_id, _| !imported_authored_change_ids.contains(change_id));
         stage_change_locators(
             &mut writes,
             &selected_fallback_locators.into_values().collect::<Vec<_>>(),
@@ -3493,6 +3497,7 @@ where
         let mut newly_imported = Vec::new();
         let mut selected_fallback_locators = BTreeMap::new();
         let mut authored_locators = BTreeMap::new();
+        let mut imported_authored_change_ids = BTreeSet::new();
         let mut remaining = parsed
             .keys()
             .filter(|commit_id| !existing.contains(commit_id))
@@ -3593,6 +3598,7 @@ where
                 .filter(|member| member.authored)
                 .map(|member| member.change_id)
                 .collect::<BTreeSet<_>>();
+            imported_authored_change_ids.extend(authored_change_ids.iter().copied());
             collect_imported_change_locators(
                 &mut selected_fallback_locators,
                 &mut authored_locators,
@@ -3758,6 +3764,8 @@ where
             remaining.remove(&commit_id);
         }
 
+        selected_fallback_locators
+            .retain(|change_id, _| !imported_authored_change_ids.contains(change_id));
         stage_missing_selected_change_locators(
             &read,
             &mut writes,
@@ -5564,6 +5572,108 @@ mod tests {
                 "history hydration must preserve the checkpoint-certified selected payload",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn history_batch_prefers_authored_locator_over_selected_fallback() {
+        let authority = open_lix().await.expect("authority should open");
+        let baseline = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("baseline snapshot should load");
+        let replica = replica_from_snapshot(&authority, &baseline).await;
+
+        write_key_value(&authority, "same-batch-locator", "authored").await;
+        authority
+            .create_checkpoint()
+            .await
+            .expect("authority checkpoint should succeed");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("checkpoint snapshot should load");
+        let (_, head) = default_head(&snapshot);
+        let checkpoint_history = authority
+            .sync_history(&head, 1)
+            .await
+            .expect("checkpoint body should load");
+        let shared_change_id = checkpoint_history
+            .commits
+            .iter()
+            .flat_map(|commit| commit.members.iter())
+            .find(|member| !member.authored)
+            .map(|member| member.change_id.clone())
+            .expect("checkpoint should select the authored working change");
+        let shared_change_id_parsed =
+            ChangeId::parse_lix(&shared_change_id, "same-batch shared change")
+                .expect("shared change id should parse");
+        let authored_commit_id = direct_change_locator(shared_change_id_parsed)
+            .expect("locally authored change should encode its commit address")
+            .commit_id;
+        let authored_history = authority
+            .sync_history(&authored_commit_id.to_string(), 1)
+            .await
+            .expect("selected change's authored body should load");
+        assert!(
+            authored_history.commits[0]
+                .members
+                .iter()
+                .any(|member| { member.authored && member.change_id == shared_change_id })
+        );
+        replica
+            .import_sync_history_headers(&authored_history.commit_headers)
+            .await
+            .expect("authored headers should import");
+        replica
+            .import_sync_history_headers(&checkpoint_history.commit_headers)
+            .await
+            .expect("checkpoint headers should import");
+        let commits = authored_history
+            .commits
+            .into_iter()
+            .chain(checkpoint_history.commits)
+            .collect::<Vec<_>>();
+        let boundaries = authored_history
+            .boundaries
+            .into_iter()
+            .chain(checkpoint_history.boundaries)
+            .collect::<Vec<_>>();
+        let mut boundary_rows = Vec::new();
+        for boundary in &boundaries {
+            let page = authority
+                .pull_sync_snapshot_rows(
+                    &boundary.commit_id,
+                    &boundary.commit_id,
+                    None,
+                    super::super::MAX_SYNC_REQUEST_ITEMS,
+                )
+                .await
+                .expect("history boundary rows should load");
+            assert_eq!(page.continuation, None);
+            boundary_rows.extend(page.rows);
+        }
+
+        replica
+            .import_sync_history_boundaries(&commits, &boundaries, &boundary_rows)
+            .await
+            .expect("one batch may contain selected and authored copies of one change");
+
+        let read = replica
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replica change scan should open");
+        let changes = crate::tracked_state::scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("imported changes should scan");
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|change| change.change_id == shared_change_id_parsed)
+                .count(),
+            1,
+            "selected fallback must not duplicate an authored change imported in the same batch",
+        );
     }
 
     #[tokio::test]
