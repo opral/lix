@@ -220,8 +220,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
 
     async fn recover_session_once(&self) -> Result<(), LixError> {
         let branch_id = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            state.session_id = None;
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.active_branch_id.clone()
         };
         self.handshake_create(branch_id.as_deref()).await
