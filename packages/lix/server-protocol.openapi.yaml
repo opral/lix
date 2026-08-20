@@ -586,11 +586,15 @@ components:
         members: { type: array, items: { $ref: "#/components/schemas/SyncCommitMember" } }
     SyncRefUpdate:
       type: object
-      required: [branchId, expectedHeadCommitId, headCommitId]
+      required: [branchId, expectedHeadCommitId, expectedCheckpointCommitId, headCommitId, checkpointCommitId]
       properties:
         branchId: { type: string, minLength: 1 }
         expectedHeadCommitId: { type: [string, "null"] }
+        expectedCheckpointCommitId: { type: [string, "null"] }
         headCommitId: { type: [string, "null"] }
+        checkpointCommitId:
+          type: [string, "null"]
+          description: Branch working-diff checkpoint at headCommitId. Required and non-null for a headed update; null only when deleting the branch.
     SyncPushRequest:
       type: object
       required: [commits, refUpdates]
@@ -632,10 +636,17 @@ components:
         originKey: { type: [string, "null"] }
     SyncBranchHead:
       type: object
-      required: [branchId, headCommitId, hotStateRootId]
+      required: [branchId, headCommitId, checkpointCommitId, checkpointStateRootId, hotStateRootId]
       properties:
         branchId: { type: string }
         headCommitId: { type: [string, "null"] }
+        checkpointCommitId:
+          type: [string, "null"]
+          description: Branch working-diff checkpoint whose baseline is installed with this snapshot. Non-null exactly when headCommitId is non-null.
+        checkpointStateRootId:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: BLAKE3 root of the live tombstone-filtered snapshot rows at checkpointCommitId.
         hotStateRootId:
           type: string
           pattern: "^[0-9a-f]{64}$"

@@ -14,10 +14,10 @@ use crate::branch::{
 };
 use crate::changelog::COMMIT_RECORD_FORMAT_VERSION;
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
-    ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest,
-    CommitRecord, CommitScanRequest, CommitTouchedScopeDigest, TransactionChangeRecordRef,
-    TransactionChangelogAppend,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangeRecordProjection, ChangeScanRequest,
+    ChangelogContext, ChangelogReader, ChangelogWriter, CommitId,
+    CommitLoadRequest as ChangelogCommitLoadRequest, CommitRecord, CommitScanRequest,
+    CommitTouchedScopeDigest, TransactionChangeRecordRef, TransactionChangelogAppend,
 };
 use crate::common::LixTimestamp;
 use crate::filesystem::stage_path_index_revision;
@@ -198,6 +198,12 @@ pub(crate) struct MaterializedCommit {
     /// atomic transfer-size preflight. Other roles leave this empty and avoid
     /// protocol DTO and JSON parsing work.
     pub(crate) sync_commits: Vec<crate::sync::SyncCommit>,
+    /// Exact branch-control publications produced by the same materialization.
+    ///
+    /// Sync events consume these after materialization instead of predicting
+    /// checkpoint/restore semantics from the prepared rows a second time.
+    /// `None` is a branch deletion.
+    pub(crate) published_branch_controls: BTreeMap<String, Option<BranchHeadControl>>,
 }
 
 /// Materializes a prepared commit with branch heads already resolved from the
@@ -595,6 +601,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             preconditions,
             filesystem_delta_rows: Vec::new(),
             sync_commits: Vec::new(),
+            published_branch_controls: BTreeMap::new(),
         });
     }
 
@@ -823,6 +830,10 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &mut root_backed_branch_publications,
     )
     .await?;
+    let headed_branch_controls = published_branch_controls
+        .iter()
+        .filter_map(|(branch_id, control)| control.map(|control| (branch_id.clone(), control)))
+        .collect::<BTreeMap<_, _>>();
     // The binary-CAS publication fence used to ride along with the reachability
     // delta writer. It is an authenticated root-publication fence in its own
     // right, so it stages here even when the transition only revives an
@@ -859,7 +870,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &certified_files,
-        &published_branch_controls,
+        &headed_branch_controls,
         &branch_control_observations,
         &commit_created_at,
         &root_backed_branch_publications,
@@ -926,6 +937,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         preconditions,
         filesystem_delta_rows,
         sync_commits,
+        published_branch_controls,
     })
 }
 
@@ -2204,7 +2216,22 @@ async fn load_selected_change_records(
             })
             .collect::<Vec<_>>();
         let loaded = load_commit_delta_change_records(read, source_commit_id, &keys).await?;
+        let missing_ids = change_refs
+            .iter()
+            .zip(&loaded)
+            .filter_map(|(change_ref, record)| record.is_none().then_some(change_ref.change_id))
+            .collect::<Vec<_>>();
+        let fallback = ChangelogContext::new()
+            .reader(read)
+            .load_changes(ChangeLoadRequest {
+                change_ids: &missing_ids,
+            })
+            .await?
+            .into_iter()
+            .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
+            .collect::<HashMap<_, _>>();
         for (change_ref, record) in change_refs.into_iter().zip(loaded) {
+            let record = record.or_else(|| fallback.get(&change_ref.change_id).cloned());
             let Some(record) = record else {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -5729,7 +5756,7 @@ async fn stage_branch_head_control_publications(
     preconditions: &mut Vec<StoragePrecondition>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     root_backed_branch_publications: &mut BTreeSet<String>,
-) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
+) -> Result<BTreeMap<String, Option<BranchHeadControl>>, LixError> {
     let checkpoint_epochs = checkpoint_epoch_bindings(checkpoint_publications)?;
     if let Some(branch_id) = branch_checkpoint_bridges
         .keys()
@@ -5893,10 +5920,7 @@ async fn stage_branch_head_control_publications(
             }
         }
     }
-    Ok(publications
-        .into_iter()
-        .filter_map(|(branch_id, control)| control.map(|control| (branch_id, control)))
-        .collect())
+    Ok(publications)
 }
 
 fn checkpoint_epoch_bindings(
@@ -7423,6 +7447,7 @@ mod tests {
         let control = controls
             .get(branch_id)
             .copied()
+            .flatten()
             .expect("created branch should have a complete control");
         assert_eq!(control.head_commit_id, recovered_head);
         assert_eq!(control.working_diff_checkpoint_commit_id, Some(checkpoint));
@@ -8385,7 +8410,7 @@ mod tests {
         assert_eq!(change.schema_key, "test_schema");
         let change_ids = [change_id("change-1"), record.change_id()];
         let changes = changelog_reader
-            .load_changes(crate::changelog::ChangeLoadRequest {
+            .load_changes(ChangeLoadRequest {
                 change_ids: &change_ids,
             })
             .await
@@ -10638,7 +10663,7 @@ mod tests {
         );
         let change_ids = [change_id("change-untracked")];
         let changes = changelog_reader
-            .load_changes(crate::changelog::ChangeLoadRequest {
+            .load_changes(ChangeLoadRequest {
                 change_ids: &change_ids,
             })
             .await

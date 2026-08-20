@@ -4,7 +4,7 @@
 //! updates. They deliberately contain no query scopes, file projections,
 //! admission metadata, or per-branch cursors.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use super::commit::SyncCommit;
 
@@ -51,12 +51,53 @@ pub(crate) fn encoded_delta_event_len(
 }
 
 /// One atomic compare-and-swap update to a repository branch ref.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncRefUpdate {
     pub branch_id: String,
     pub expected_head_commit_id: Option<String>,
+    /// Checkpoint coordinate paired with `expected_head_commit_id` for CAS.
+    pub expected_checkpoint_commit_id: Option<String>,
     pub head_commit_id: Option<String>,
+    /// The branch-specific checkpoint against which working changes are read.
+    /// It is null only when `head_commit_id` is null for a ref deletion.
+    pub checkpoint_commit_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncRefUpdateWire {
+    branch_id: String,
+    expected_head_commit_id: Option<String>,
+    expected_checkpoint_commit_id: RequiredOption<String>,
+    head_commit_id: Option<String>,
+    checkpoint_commit_id: RequiredOption<String>,
+}
+
+impl<'de> Deserialize<'de> for SyncRefUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SyncRefUpdateWire::deserialize(deserializer)?;
+        validate_checkpoint_coordinate(
+            wire.expected_head_commit_id.as_deref(),
+            wire.expected_checkpoint_commit_id.0.as_deref(),
+        )
+        .map_err(D::Error::custom)?;
+        validate_checkpoint_coordinate(
+            wire.head_commit_id.as_deref(),
+            wire.checkpoint_commit_id.0.as_deref(),
+        )
+        .map_err(D::Error::custom)?;
+        Ok(Self {
+            branch_id: wire.branch_id,
+            expected_head_commit_id: wire.expected_head_commit_id,
+            expected_checkpoint_commit_id: wire.expected_checkpoint_commit_id.0,
+            head_commit_id: wire.head_commit_id,
+            checkpoint_commit_id: wire.checkpoint_commit_id.0,
+        })
+    }
 }
 
 /// Publishes complete immutable commits and their ref updates atomically.
@@ -126,14 +167,75 @@ pub struct SyncSnapshotRowPage {
 }
 
 /// Current server branch ref included in a hot-state bootstrap.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncBranchHead {
     pub branch_id: String,
     pub head_commit_id: Option<String>,
+    /// The branch-specific checkpoint against which working changes are read.
+    /// It is null only when `head_commit_id` is null.
+    pub checkpoint_commit_id: Option<String>,
+    /// BLAKE3 root of the live checkpoint row stream.
+    pub checkpoint_state_root_id: String,
     /// BLAKE3 root of the live, tombstone-filtered row stream at this head.
     /// This is distinct from a commit header's physical state root.
     pub hot_state_root_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncBranchHeadWire {
+    branch_id: String,
+    head_commit_id: Option<String>,
+    checkpoint_commit_id: RequiredOption<String>,
+    checkpoint_state_root_id: String,
+    hot_state_root_id: String,
+}
+
+impl<'de> Deserialize<'de> for SyncBranchHead {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SyncBranchHeadWire::deserialize(deserializer)?;
+        validate_checkpoint_coordinate(
+            wire.head_commit_id.as_deref(),
+            wire.checkpoint_commit_id.0.as_deref(),
+        )
+        .map_err(D::Error::custom)?;
+        Ok(Self {
+            branch_id: wire.branch_id,
+            head_commit_id: wire.head_commit_id,
+            checkpoint_commit_id: wire.checkpoint_commit_id.0,
+            checkpoint_state_root_id: wire.checkpoint_state_root_id,
+            hot_state_root_id: wire.hot_state_root_id,
+        })
+    }
+}
+
+struct RequiredOption<T>(Option<T>);
+
+impl<'de, T> Deserialize<'de> for RequiredOption<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(Self)
+    }
+}
+
+fn validate_checkpoint_coordinate(
+    head_commit_id: Option<&str>,
+    checkpoint_commit_id: Option<&str>,
+) -> Result<(), &'static str> {
+    if head_commit_id.is_some() == checkpoint_commit_id.is_some() {
+        Ok(())
+    } else {
+        Err("sync branch head and checkpoint must either both be present or both be null")
+    }
 }
 
 /// One item in the repository-wide live stream.
@@ -255,6 +357,8 @@ mod tests {
             .map(|index| SyncBranchHead {
                 branch_id: format!("branch-{index}"),
                 head_commit_id: Some(format!("head-{index}")),
+                checkpoint_commit_id: Some(format!("checkpoint-{index}")),
+                checkpoint_state_root_id: format!("{:064x}", index),
                 hot_state_root_id: format!("{:064x}", index),
             })
             .collect();
@@ -276,6 +380,93 @@ mod tests {
                 .map(str::to_owned)
                 .collect(),
         );
-        assert!(serde_json::to_vec(&value).unwrap().len() < 2 * 1024 * 1024);
+        assert!(serde_json::to_vec(&value).unwrap().len() < 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn checkpoint_coordinate_is_required_and_matches_ref_presence() {
+        let update = SyncRefUpdate {
+            branch_id: "branch".to_owned(),
+            expected_head_commit_id: Some("old-head".to_owned()),
+            expected_checkpoint_commit_id: Some("old-checkpoint".to_owned()),
+            head_commit_id: Some("head".to_owned()),
+            checkpoint_commit_id: Some("checkpoint".to_owned()),
+        };
+        let value = serde_json::to_value(&update).expect("serialize ref update");
+        assert_eq!(value["checkpointCommitId"], "checkpoint");
+        assert!(
+            serde_json::from_value::<SyncRefUpdate>(serde_json::json!({
+                "branchId": "branch",
+                "expectedHeadCommitId": null,
+                "expectedCheckpointCommitId": null,
+                "headCommitId": "head"
+            }))
+            .is_err(),
+            "omitting the checkpoint coordinate must be rejected"
+        );
+        assert!(
+            serde_json::from_value::<SyncRefUpdate>(serde_json::json!({
+                "branchId": "branch",
+                "expectedHeadCommitId": null,
+                "expectedCheckpointCommitId": null,
+                "headCommitId": "head",
+                "checkpointCommitId": null
+            }))
+            .is_err(),
+            "a live ref must carry a live checkpoint coordinate"
+        );
+        serde_json::from_value::<SyncRefUpdate>(serde_json::json!({
+            "branchId": "branch",
+            "expectedHeadCommitId": "head",
+            "expectedCheckpointCommitId": "checkpoint",
+            "headCommitId": null,
+            "checkpointCommitId": null
+        }))
+        .expect("ref deletion carries an explicit null checkpoint coordinate");
+
+        let branch = SyncBranchHead {
+            branch_id: "branch".to_owned(),
+            head_commit_id: Some("head".to_owned()),
+            checkpoint_commit_id: Some("checkpoint".to_owned()),
+            checkpoint_state_root_id: "1".repeat(64),
+            hot_state_root_id: "0".repeat(64),
+        };
+        let value = serde_json::to_value(&branch).expect("serialize branch head");
+        assert_eq!(value["checkpointCommitId"], "checkpoint");
+        assert!(
+            serde_json::from_value::<SyncBranchHead>(serde_json::json!({
+                "branchId": "branch",
+                "headCommitId": "head",
+                "checkpointStateRootId": "1".repeat(64),
+                "hotStateRootId": "0".repeat(64)
+            }))
+            .is_err(),
+            "snapshot metadata must not omit the checkpoint coordinate"
+        );
+    }
+
+    #[test]
+    fn encoded_delta_size_includes_checkpoint_coordinate() {
+        let ref_updates = vec![SyncRefUpdate {
+            branch_id: "branch".to_owned(),
+            expected_head_commit_id: Some("old-head".to_owned()),
+            expected_checkpoint_commit_id: Some("old-checkpoint".to_owned()),
+            head_commit_id: Some("head".to_owned()),
+            checkpoint_commit_id: Some("checkpoint".to_owned()),
+        }];
+        let expected = serde_json::to_vec(&SyncRepositoryPullResponse::Delta {
+            cursor: 3,
+            events: vec![SyncEvent {
+                cursor: 3,
+                commits: Vec::new(),
+                ref_updates: ref_updates.clone(),
+            }],
+        })
+        .expect("serialize delta response")
+        .len();
+        assert_eq!(
+            encoded_delta_event_len(3, &[], &ref_updates).expect("measure delta response"),
+            expected
+        );
     }
 }

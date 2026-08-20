@@ -61,6 +61,7 @@ struct PreparedRepositorySnapshot {
     commits: Vec<super::SyncCommit>,
     commit_headers: Vec<super::SyncCommitHeader>,
     rows: Vec<super::SyncSnapshotRow>,
+    checkpoint_roots: BTreeMap<String, String>,
 }
 
 /// Performs the fresh-store bootstrap network operation exactly once.
@@ -111,17 +112,49 @@ where
     super::validate_sync_branch_id(&default_branch_id)?;
     let head_ids = branches
         .iter()
-        .filter_map(|branch| branch.head_commit_id.clone())
+        .flat_map(|branch| {
+            [
+                branch.head_commit_id.clone(),
+                branch.checkpoint_commit_id.clone(),
+            ]
+        })
+        .flatten()
         .collect::<BTreeSet<_>>();
-    let (history, rows) = futures_util::try_join!(
+    let (history, mut rows) = futures_util::try_join!(
         fetch_history_objects(transport, head_ids, 1),
         fetch_snapshot_rows(transport, branches),
     )?;
+    let mut checkpoint_targets = Vec::new();
+    let mut seen_checkpoints = BTreeSet::new();
+    for branch in branches {
+        let (Some(head), Some(checkpoint)) = (
+            branch.head_commit_id.as_deref(),
+            branch.checkpoint_commit_id.as_deref(),
+        ) else {
+            continue;
+        };
+        if head == checkpoint || !seen_checkpoints.insert(checkpoint.to_owned()) {
+            continue;
+        }
+        checkpoint_targets.push(super::SyncBranchHead {
+            branch_id: checkpoint.to_owned(),
+            head_commit_id: Some(checkpoint.to_owned()),
+            checkpoint_commit_id: Some(checkpoint.to_owned()),
+            checkpoint_state_root_id: branch.checkpoint_state_root_id.clone(),
+            hot_state_root_id: branch.checkpoint_state_root_id.clone(),
+        });
+    }
+    let checkpoint_roots = checkpoint_targets
+        .iter()
+        .map(|target| (target.branch_id.clone(), target.hot_state_root_id.clone()))
+        .collect();
+    rows.extend(fetch_snapshot_rows(transport, &checkpoint_targets).await?);
     let snapshot = PreparedRepositorySnapshot {
         metadata,
         commits: history.commits,
         commit_headers: history.commit_headers,
         rows,
+        checkpoint_roots,
     };
     Ok((snapshot, lix_id, default_branch_id))
 }
@@ -294,6 +327,7 @@ where
             &prepared.snapshot.commits,
             &prepared.snapshot.commit_headers,
             &prepared.snapshot.rows,
+            &prepared.snapshot.checkpoint_roots,
         )
         .await?;
         lix.align_repository_identity_for_sync(authority_lix_id)?;
@@ -524,6 +558,7 @@ where
             &snapshot.commits,
             &snapshot.commit_headers,
             &snapshot.rows,
+            &snapshot.checkpoint_roots,
         )
         .await?;
         return Ok(IterationResult::Applied);
@@ -563,7 +598,7 @@ where
     if ref_conflicted {
         let response = pull_delta_adaptive(transport, cursor, delta_pull_limit).await?;
         validate_delta_after(cursor, &response)?;
-        register_pull_blob_manifests(lix, transport, &response).await?;
+        prepare_pull(lix, transport, &response).await?;
         lix.apply_sync_repository_pull(remote_id, &response).await?;
         return Ok(IterationResult::Applied);
     }
@@ -579,7 +614,7 @@ where
         response = pull => {
             let response = response?;
             validate_delta_after(cursor, &response)?;
-            register_pull_blob_manifests(lix, transport, &response).await?;
+            prepare_pull(lix, transport, &response).await?;
             lix.apply_sync_repository_pull(remote_id, &response).await?;
             Ok(IterationResult::Applied)
         }
@@ -620,7 +655,7 @@ where
                 ),
             ));
         }
-        register_pull_blob_manifests(lix, transport, &response).await?;
+        prepare_pull(lix, transport, &response).await?;
         lix.apply_sync_repository_pull(remote_id, &response).await?;
     }
 }
@@ -894,6 +929,8 @@ where
         .map(|boundary| super::SyncBranchHead {
             branch_id: boundary.commit_id.clone(),
             head_commit_id: Some(boundary.commit_id.clone()),
+            checkpoint_commit_id: Some(boundary.commit_id.clone()),
+            checkpoint_state_root_id: boundary.live_state_root_id.clone(),
             hot_state_root_id: boundary.live_state_root_id.clone(),
         })
         .collect::<Vec<_>>();
@@ -1138,6 +1175,39 @@ where
     Transport: SyncTransport,
 {
     ensure_blob_manifests(lix, transport, blob_ids_from_pull(response)?).await
+}
+
+async fn prepare_pull<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    response: &SyncRepositoryPullResponse,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    register_pull_blob_manifests(lix, transport, response).await?;
+    let SyncRepositoryPullResponse::Delta { events, .. } = response else {
+        return Ok(());
+    };
+    let included = events
+        .iter()
+        .flat_map(|event| event.commits.iter().map(|commit| commit.commit_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let targets = events
+        .iter()
+        .flat_map(|event| &event.ref_updates)
+        .flat_map(|update| {
+            [
+                update.head_commit_id.as_ref(),
+                update.checkpoint_commit_id.as_ref(),
+            ]
+        })
+        .flatten()
+        .filter(|commit_id| !included.contains(commit_id.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    hydrate_history_ids(lix, transport, targets).await
 }
 
 async fn ensure_blob_manifests<StorageImpl, Transport>(
@@ -1844,6 +1914,27 @@ mod tests {
             assert!(page.continuation.is_none(), "test fixture fits one page");
             rows.extend(page.rows);
         }
+        let checkpoint_roots = branches
+            .iter()
+            .filter_map(|branch| {
+                let head = branch.head_commit_id.as_deref()?;
+                let checkpoint = branch.checkpoint_commit_id.as_deref()?;
+                (head != checkpoint).then(|| {
+                    (
+                        checkpoint.to_owned(),
+                        branch.checkpoint_state_root_id.clone(),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        for checkpoint in checkpoint_roots.keys() {
+            let page = authority
+                .pull_sync_snapshot_rows(checkpoint, checkpoint, None, 512)
+                .await
+                .expect("authority checkpoint snapshot rows");
+            assert!(page.continuation.is_none(), "test checkpoint fits one page");
+            rows.extend(page.rows);
+        }
 
         let storage = Memory::new();
         Engine::initialize_with_main_branch_id(storage.clone(), Some(default_branch_id))
@@ -1864,6 +1955,7 @@ mod tests {
                 &history.commits,
                 &history.commit_headers,
                 &rows,
+                &checkpoint_roots,
             )
             .await
             .expect("snapshot installs");
@@ -2153,6 +2245,8 @@ mod tests {
             branches: vec![super::super::SyncBranchHead {
                 branch_id: "branch".to_owned(),
                 head_commit_id: Some("head".to_owned()),
+                checkpoint_commit_id: Some("head".to_owned()),
+                checkpoint_state_root_id: "0".repeat(64),
                 hot_state_root_id: "0".repeat(64),
             }],
         };
@@ -2184,6 +2278,8 @@ mod tests {
         let branches = vec![super::super::SyncBranchHead {
             branch_id: "branch".to_owned(),
             head_commit_id: Some("head".to_owned()),
+            checkpoint_commit_id: Some("head".to_owned()),
+            checkpoint_state_root_id: "0".repeat(64),
             hot_state_root_id: "0".repeat(64),
         }];
         for behavior in [

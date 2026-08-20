@@ -1775,37 +1775,16 @@ where
         let previous_filesystem_revision = loaded_filesystem_revision.flatten();
         let mut automatic_sync_writes = transaction.storage.new_write_set();
         let mut automatic_sync_preconditions = Vec::new();
-        let mut staged_sync_event = None;
-        if !transaction.suppress_ordinary_sync_event {
-            match &transaction.sync_role {
-                crate::sync::SyncRole::Disabled => {}
-                crate::sync::SyncRole::Authority => {
-                    // Publish the repository-wide commit/ref event from the
-                    // same storage commit as the ordinary Lix transaction.
-                    // Commit bodies remain in the changelog; the event is
-                    // only an ordered list of immutable identities.
-                    staged_sync_event = crate::sync::stage_repository_transaction_event(
-                        &read,
-                        &mut automatic_sync_writes,
-                        &mut automatic_sync_preconditions,
-                        &prepared_writes,
-                        &commit_parent_heads,
-                        &restore_targets,
-                    )
-                    .await?;
-                    if staged_sync_event.is_some() {
-                        transaction.await_durable_commit = true;
-                    }
-                }
-                crate::sync::SyncRole::Replica => {
-                    // The immutable commit and ref are the durable outbox.
-                    // `build_sync_push` discovers unpublished local heads; no
-                    // second row-pack queue is maintained.
-                    transaction.await_durable_commit = true;
-                }
-            }
+        let capture_sync_commits = !transaction.suppress_ordinary_sync_event
+            && transaction.sync_role == crate::sync::SyncRole::Authority;
+        if !transaction.suppress_ordinary_sync_event
+            && transaction.sync_role == crate::sync::SyncRole::Replica
+        {
+            // The immutable commit and ref are the durable outbox.
+            // `build_sync_push` discovers unpublished local heads; no second
+            // row-pack queue is maintained.
+            transaction.await_durable_commit = true;
         }
-        let capture_sync_commits = staged_sync_event.is_some();
         let materialized = match commit::commit_prepared_writes_with_parent_heads(
             &transaction.binary_cas,
             &transaction.tracked_state,
@@ -1833,6 +1812,33 @@ where
                 return Err(error);
             }
         };
+        let staged_sync_event = if capture_sync_commits {
+            // Consume the exact controls produced by materialization instead
+            // of predicting checkpoint/restore semantics from prepared rows.
+            // The event still joins the same atomic storage commit below.
+            match crate::sync::stage_repository_transaction_event(
+                &read,
+                &mut automatic_sync_writes,
+                &mut automatic_sync_preconditions,
+                &materialized.sync_commits,
+                &materialized.published_branch_controls,
+            )
+            .await
+            {
+                Ok(event) => event,
+                Err(error) => {
+                    transaction
+                        .discard_pending_plugin_actor_publications()
+                        .await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if staged_sync_event.is_some() {
+            transaction.await_durable_commit = true;
+        }
         if let Some(staged_sync_event) = &staged_sync_event
             && let Err(error) = crate::sync::validate_repository_transaction_event_transfer(
                 staged_sync_event,

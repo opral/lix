@@ -40,8 +40,9 @@ use crate::storage_adapter::{
 };
 use crate::tracked_state::{
     CertifiedCommitStateTopologyParent, CommitStateManifest, CommitStateReplayDebt,
-    StagedCommitStateManifest, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef, TrackedStateKey, TrackedStateRootId, TrackedStateScanRequest,
+    MaterializedTrackedStateRow, StagedCommitStateManifest, TrackedStateCommitDeltaRef,
+    TrackedStateContext, TrackedStateDeltaRef, TrackedStateDiffRequest, TrackedStateFilter,
+    TrackedStateKey, TrackedStateReadColumns, TrackedStateRootId, TrackedStateScanRequest,
     commit_delta_member_scopes, commit_history_is_deferred, direct_change_locator,
     incomplete_touched_scope_filter, load_change_record_by_id, load_commit_state_manifest,
     load_published_commit_state_topology, stage_certified_commit_state_manifest_with_handle,
@@ -49,7 +50,6 @@ use crate::tracked_state::{
     stage_commit_state_manifest_with_handle, stage_current_state_scoped_ranges_from_topology,
     stage_imported_addressable_commit_deltas,
 };
-use crate::transaction::{PendingRestoreIntent, PreparedWriteSet};
 use crate::{Lix, LixError};
 
 use super::commit::{SyncCommit, SyncCommitMember, export_sync_commit, load_sync_commit};
@@ -198,8 +198,8 @@ pub(crate) const SYNC_REPOSITORY_EVENT_SPACE: StorageSpace = StorageSpace::decla
 );
 
 pub(crate) const SYNC_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::declare(
-    StorageSpaceId(0x0007_0012),
-    "sync.replica_state.v1",
+    StorageSpaceId(0x0007_0013),
+    "sync.replica_state.v2",
     ValueSemantics::Mutable,
 );
 
@@ -224,6 +224,8 @@ struct SyncReplicaState {
     active_account_id: String,
     cursor: u64,
     authoritative_heads: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    authoritative_checkpoints: BTreeMap<String, Option<String>>,
     /// Commit objects observed from the authority but not yet made reachable
     /// from a fully converged set of authority refs.
     ///
@@ -441,23 +443,32 @@ impl ParsedSnapshotRow {
             updated_at: self.updated_at,
         }
     }
+}
 
-    fn as_current_delta(&self) -> CurrentStateDeltaRef<'_> {
-        CurrentStateDeltaRef {
-            schema_key: &self.schema_key,
-            file_id: self.file_id.as_deref(),
-            row_pk: &self.row_pk,
-            change_id: Some(self.change_id),
-            commit_id: Some(self.commit_id),
-            untracked: false,
-            deleted: false,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            snapshot: self.snapshot.as_ref_slot(),
-            metadata: self.metadata.as_ref_slot(),
-            columnar_base_coordinate: None,
-        }
-    }
+fn snapshot_rows_hot_snapshot<'a>(
+    branch_id: &str,
+    rows: impl IntoIterator<Item = &'a ParsedSnapshotRow>,
+) -> Result<HotTrackedSnapshot, LixError> {
+    HotTrackedSnapshot::from_materialized_rows(
+        rows.into_iter()
+            .filter(|row| {
+                branch_id == crate::GLOBAL_BRANCH_ID
+                    || row.schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+            })
+            .map(|row| MaterializedTrackedStateRow {
+                row_pk: row.row_pk.clone(),
+                schema_key: row.schema_key.clone(),
+                file_id: row.file_id.clone(),
+                snapshot_content: Some(row.snapshot_json.clone().into()),
+                metadata: row.metadata_json.clone().map(Into::into),
+                deleted: false,
+                created_at: row.created_at.to_string(),
+                updated_at: row.updated_at.to_string(),
+                change_id: row.change_id,
+                commit_id: row.commit_id,
+            })
+            .collect(),
+    )
 }
 
 impl ParsedMember {
@@ -954,57 +965,101 @@ fn stage_large_json_payloads<'a>(
     Ok(())
 }
 
+async fn load_sync_hot_snapshot(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    commit_id: CommitId,
+) -> Result<HotTrackedSnapshot, LixError> {
+    let rows = TrackedStateContext::new()
+        .reader(read)
+        .scan_batch_at_commit(
+            &commit_id.to_string(),
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns::default(),
+                limit: None,
+            },
+        )
+        .await?
+        .into_rows()
+        .into_iter()
+        .filter(|row| {
+            branch_id == crate::GLOBAL_BRANCH_ID
+                || row.schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+        })
+        .collect();
+    HotTrackedSnapshot::from_materialized_rows(rows)
+}
+
 /// Stages the only authority-side sync metadata needed by an ordinary Lix
 /// transaction. Commit bodies remain in their native immutable stores.
 pub(crate) async fn stage_repository_transaction_event<R>(
     read: &R,
     writes: &mut StorageWriteSet,
     preconditions: &mut Vec<StoragePrecondition>,
-    prepared: &PreparedWriteSet,
-    parent_heads: &BTreeMap<String, Option<CommitId>>,
-    restore_targets: &BTreeMap<String, PendingRestoreIntent>,
+    commits: &[SyncCommit],
+    published_controls: &BTreeMap<String, Option<BranchHeadControl>>,
 ) -> Result<Option<StagedRepositoryTransactionEvent>, LixError>
 where
     R: StorageAdapterRead + ?Sized,
 {
-    let mut commit_ids = prepared
-        .intermediate_commits
+    let mut commit_ids = commits
         .iter()
-        .map(|commit| commit.change_refs.commit_id.to_string())
+        .map(|commit| commit.commit_id.clone())
         .collect::<Vec<_>>();
-    let mut ref_updates = Vec::new();
-    for (branch_id, refs) in &prepared.commit_change_refs_by_branch {
-        if refs.is_empty() && !refs.allow_empty {
-            continue;
-        }
-        let commit_id = refs.commit_id.to_string();
-        commit_ids.push(commit_id.clone());
-        ref_updates.push(SyncRefUpdate {
-            branch_id: branch_id.clone(),
-            expected_head_commit_id: parent_heads
-                .get(branch_id)
-                .copied()
-                .flatten()
-                .map(|parent| parent.to_string()),
-            head_commit_id: Some(commit_id),
-        });
-    }
-    for (branch_id, restore) in restore_targets {
-        if ref_updates
-            .iter()
-            .any(|update| update.branch_id == *branch_id)
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("restore for branch '{branch_id}' produced a duplicate sync ref update"),
-            ));
-        }
-        ref_updates.push(SyncRefUpdate {
-            branch_id: branch_id.clone(),
-            expected_head_commit_id: Some(restore.expected_head_commit_id.to_string()),
-            head_commit_id: Some(restore.target_commit_id.to_string()),
-        });
-    }
+    let branch_ids = published_controls.keys().cloned().collect::<Vec<_>>();
+    let observed = BranchHeadControlContext::new()
+        .reader(read)
+        .load_many(&branch_ids)
+        .await?;
+    let mut ref_updates = branch_ids
+        .into_iter()
+        .zip(observed)
+        .filter_map(|(branch_id, before)| {
+            let after = published_controls[&branch_id];
+            let checkpoint_commit_id = after
+                .map(|control| {
+                    control.working_diff_checkpoint_commit_id.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("published sync branch '{branch_id}' has no checkpoint cursor"),
+                        )
+                    })
+                })
+                .transpose();
+            let checkpoint_commit_id = match checkpoint_commit_id {
+                Ok(checkpoint_commit_id) => checkpoint_commit_id,
+                Err(error) => return Some(Err(error)),
+            };
+            let before_coordinate = before.map(|control| {
+                (
+                    control.head_commit_id,
+                    control.working_diff_checkpoint_commit_id,
+                )
+            });
+            let after_coordinate = after.map(|control| {
+                (
+                    control.head_commit_id,
+                    control.working_diff_checkpoint_commit_id,
+                )
+            });
+            if before_coordinate == after_coordinate {
+                return None;
+            }
+            Some(Ok(SyncRefUpdate {
+                branch_id,
+                expected_head_commit_id: before.map(|control| control.head_commit_id.to_string()),
+                expected_checkpoint_commit_id: before
+                    .and_then(|control| control.working_diff_checkpoint_commit_id)
+                    .map(|checkpoint| checkpoint.to_string()),
+                head_commit_id: after.map(|control| control.head_commit_id.to_string()),
+                checkpoint_commit_id: checkpoint_commit_id.map(|checkpoint| checkpoint.to_string()),
+            }))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
     if commit_ids.is_empty() && ref_updates.is_empty() {
         return Ok(None);
     }
@@ -1215,10 +1270,11 @@ where
             let Some(state) = load_replica_state(&read, remote_id).await?.0 else {
                 return Ok(None);
             };
-            let controls = BranchHeadControlContext::new().reader(&read).scan().await?;
-            let local_heads = controls
+            let local_controls = BranchHeadControlContext::new()
+                .reader(&read)
+                .scan()
+                .await?
                 .into_iter()
-                .map(|(branch_id, control)| (branch_id, control.head_commit_id))
                 .collect::<BTreeMap<_, _>>();
             let mut known = state
                 .authoritative_heads
@@ -1226,6 +1282,16 @@ where
                 .filter_map(|head| head.as_deref())
                 .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
                 .collect::<Result<BTreeSet<_>, _>>()?;
+            for checkpoint in state
+                .authoritative_checkpoints
+                .values()
+                .filter_map(|checkpoint| checkpoint.as_deref())
+            {
+                known.insert(CommitId::parse_lix(
+                    checkpoint,
+                    "sync authoritative checkpoint",
+                )?);
+            }
             for commit_id in &state.authority_known_commit_ids {
                 known.insert(CommitId::parse_lix(
                     commit_id,
@@ -1235,9 +1301,10 @@ where
             let mut commit_ids = BTreeSet::new();
             let mut ref_updates = Vec::new();
             let mut ref_updates_without_payload = BTreeSet::new();
-            let branch_ids = local_heads
+            let branch_ids = local_controls
                 .keys()
                 .chain(state.authoritative_heads.keys())
+                .chain(state.authoritative_checkpoints.keys())
                 .cloned()
                 .collect::<BTreeSet<_>>();
             remaining_reconciliations.get_or_insert(branch_ids.len());
@@ -1249,7 +1316,10 @@ where
             let mut pending_reconciliation = None;
             let mut divergent_branch_ids = BTreeSet::new();
             for branch_id in &branch_ids {
-                let Some(local) = local_heads.get(branch_id).copied() else {
+                let Some(local) = local_controls
+                    .get(branch_id)
+                    .map(|control| control.head_commit_id)
+                else {
                     continue;
                 };
                 let Some(authoritative) = state
@@ -1261,9 +1331,34 @@ where
                 else {
                     continue;
                 };
+                let local_checkpoint = local_controls
+                    .get(branch_id)
+                    .and_then(|control| control.working_diff_checkpoint_commit_id);
+                let authoritative_checkpoint = state
+                    .authoritative_checkpoints
+                    .get(branch_id)
+                    .and_then(|checkpoint| checkpoint.as_deref())
+                    .map(|checkpoint| {
+                        CommitId::parse_lix(checkpoint, "sync authoritative checkpoint")
+                    })
+                    .transpose()?;
+                let checkpoint_advances_authority =
+                    match (local_checkpoint, authoritative_checkpoint) {
+                        (Some(local_checkpoint), Some(authoritative_checkpoint)) => {
+                            local_checkpoint != authoritative_checkpoint
+                                && commit_reaches_ancestor(
+                                    &read,
+                                    local_checkpoint,
+                                    authoritative_checkpoint,
+                                )
+                                .await?
+                        }
+                        _ => false,
+                    };
                 if local == authoritative
                     || commit_reaches_ancestor(&read, local, authoritative).await?
                     || commit_reaches_ancestor(&read, authoritative, local).await?
+                    || checkpoint_advances_authority
                 {
                     continue;
                 }
@@ -1273,14 +1368,33 @@ where
                 divergent_branch_ids.insert(branch_id.clone());
             }
             for branch_id in branch_ids {
-                let local = local_heads.get(&branch_id).copied();
+                let local_control = local_controls.get(&branch_id).copied();
+                let local = local_control.map(|control| control.head_commit_id);
+                let local_checkpoint = local_control
+                    .map(|control| {
+                        control.working_diff_checkpoint_commit_id.ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!("local sync branch '{branch_id}' has no checkpoint cursor"),
+                            )
+                        })
+                    })
+                    .transpose()?;
                 let authoritative = state
                     .authoritative_heads
                     .get(&branch_id)
                     .and_then(|head| head.as_deref())
                     .map(|head| CommitId::parse_lix(head, "sync authoritative head"))
                     .transpose()?;
-                if local == authoritative {
+                let authoritative_checkpoint = state
+                    .authoritative_checkpoints
+                    .get(&branch_id)
+                    .and_then(|checkpoint| checkpoint.as_deref())
+                    .map(|checkpoint| {
+                        CommitId::parse_lix(checkpoint, "sync authoritative checkpoint")
+                    })
+                    .transpose()?;
+                if local == authoritative && local_checkpoint == authoritative_checkpoint {
                     continue;
                 }
                 // Authority-known ancestry is enough to make a commit payload
@@ -1299,7 +1413,17 @@ where
                         ref_updates.push(SyncRefUpdate {
                             branch_id: branch_id.clone(),
                             expected_head_commit_id: Some(authority_head.to_string()),
+                            expected_checkpoint_commit_id: state
+                                .authoritative_checkpoints
+                                .get(&branch_id)
+                                .cloned()
+                                .flatten(),
                             head_commit_id: Some(local_head.to_string()),
+                            checkpoint_commit_id: Some(
+                                local_checkpoint
+                                    .expect("headed local control has a checkpoint")
+                                    .to_string(),
+                            ),
                         });
                         ref_updates_without_payload.insert(branch_id);
                         continue;
@@ -1332,9 +1456,15 @@ where
                     commit_ids.extend(branch_commit_ids);
                 }
                 ref_updates.push(SyncRefUpdate {
-                    branch_id,
+                    branch_id: branch_id.clone(),
                     expected_head_commit_id: authoritative.map(|head| head.to_string()),
+                    expected_checkpoint_commit_id: state
+                        .authoritative_checkpoints
+                        .get(&branch_id)
+                        .cloned()
+                        .flatten(),
                     head_commit_id: local.map(|head| head.to_string()),
+                    checkpoint_commit_id: local_checkpoint.map(|checkpoint| checkpoint.to_string()),
                 });
             }
             if ref_updates.is_empty() {
@@ -1365,8 +1495,23 @@ where
                     ));
                 }
                 drop(read);
-                self.reconcile_sync_branch(&branch_id, &authoritative_head.to_string())
-                    .await?;
+                let authoritative_checkpoint = state
+                    .authoritative_checkpoints
+                    .get(&branch_id)
+                    .and_then(|checkpoint| checkpoint.as_deref())
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("sync authority branch '{branch_id}' has no checkpoint"),
+                        )
+                    })?;
+                self.reconcile_sync_branch(
+                    &branch_id,
+                    &local_head.to_string(),
+                    &authoritative_head.to_string(),
+                    authoritative_checkpoint,
+                )
+                .await?;
                 continue;
             }
             let mut remaining = BTreeMap::new();
@@ -1498,23 +1643,77 @@ where
                             .get(&update.branch_id)
                             .cloned()
                             .flatten();
+                        let authoritative_checkpoint = state
+                            .authoritative_checkpoints
+                            .get(&update.branch_id)
+                            .cloned()
+                            .flatten();
+                        if update.expected_head_commit_id != authoritative
+                            || update.expected_checkpoint_commit_id != authoritative_checkpoint
+                        {
+                            return Err(LixError::new(
+                                LixError::CODE_INVALID_PARAM,
+                                format!(
+                                    "sync delta ref '{}' does not continue its authoritative coordinate",
+                                    update.branch_id
+                                ),
+                            ));
+                        }
+                        if update.head_commit_id.is_some() != update.checkpoint_commit_id.is_some()
+                        {
+                            return Err(LixError::new(
+                                LixError::CODE_INVALID_PARAM,
+                                "sync delta ref head and checkpoint must be paired",
+                            ));
+                        }
                         let local = observation
                             .control
                             .map(|control| control.head_commit_id.to_string());
-                        if local == authoritative {
+                        let local_checkpoint = observation
+                            .control
+                            .and_then(|control| control.working_diff_checkpoint_commit_id)
+                            .map(|checkpoint| checkpoint.to_string());
+                        if local == authoritative && local_checkpoint == authoritative_checkpoint {
                             applicable_refs.push(SyncRefUpdate {
                                 branch_id: update.branch_id.clone(),
                                 expected_head_commit_id: local,
+                                expected_checkpoint_commit_id: local_checkpoint,
                                 head_commit_id: update.head_commit_id.clone(),
+                                checkpoint_commit_id: update.checkpoint_commit_id.clone(),
                             });
-                        } else if local != update.head_commit_id
+                        } else if (local.as_ref(), local_checkpoint.as_ref())
+                            != (
+                                update.head_commit_id.as_ref(),
+                                update.checkpoint_commit_id.as_ref(),
+                            )
                             && let Some(head) = update.head_commit_id.as_deref()
                         {
-                            divergent_refs.push((update.branch_id.clone(), head.to_owned()));
+                            let checkpoint =
+                                update.checkpoint_commit_id.clone().ok_or_else(|| {
+                                    LixError::new(
+                                        LixError::CODE_INVALID_PARAM,
+                                        "headed sync ref has no checkpoint",
+                                    )
+                                })?;
+                            divergent_refs.push((
+                                update.branch_id.clone(),
+                                local.ok_or_else(|| {
+                                    LixError::new(
+                                        LixError::CODE_TRANSACTION_CONFLICT,
+                                        "sync cannot reconcile a deleted local branch in place",
+                                    )
+                                })?,
+                                head.to_owned(),
+                                checkpoint,
+                            ));
                         }
                         state
                             .authoritative_heads
                             .insert(update.branch_id.clone(), update.head_commit_id.clone());
+                        state.authoritative_checkpoints.insert(
+                            update.branch_id.clone(),
+                            update.checkpoint_commit_id.clone(),
+                        );
                         if let Some(head) = update.head_commit_id.as_ref() {
                             state.authority_known_commit_ids.remove(head);
                         }
@@ -1529,9 +1728,16 @@ where
                         None,
                     )
                     .await?;
-                    for (branch_id, authority_head) in divergent_refs {
-                        self.reconcile_sync_branch(&branch_id, &authority_head)
-                            .await?;
+                    for (branch_id, local_head, authority_head, authority_checkpoint) in
+                        divergent_refs
+                    {
+                        self.reconcile_sync_branch(
+                            &branch_id,
+                            &local_head,
+                            &authority_head,
+                            &authority_checkpoint,
+                        )
+                        .await?;
                     }
                     state.cursor = event.cursor;
                 }
@@ -1552,13 +1758,35 @@ where
                         (branch_id, Some(control.head_commit_id.to_string()))
                     })
                     .collect::<BTreeMap<_, _>>();
+                let local_checkpoints = BranchHeadControlContext::new()
+                    .reader(&read)
+                    .scan()
+                    .await?
+                    .into_iter()
+                    .map(|(branch_id, control)| {
+                        (
+                            branch_id,
+                            control
+                                .working_diff_checkpoint_commit_id
+                                .map(|checkpoint| checkpoint.to_string()),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
                 let all_branches = local_heads
                     .keys()
                     .chain(state.authoritative_heads.keys())
+                    .chain(local_checkpoints.keys())
+                    .chain(state.authoritative_checkpoints.keys())
                     .collect::<BTreeSet<_>>();
                 if all_branches.into_iter().all(|branch_id| {
                     local_heads.get(branch_id).cloned().flatten()
                         == state.authoritative_heads.get(branch_id).cloned().flatten()
+                        && local_checkpoints.get(branch_id).cloned().flatten()
+                            == state
+                                .authoritative_checkpoints
+                                .get(branch_id)
+                                .cloned()
+                                .flatten()
                 }) {
                     state.authority_known_commit_ids.clear();
                 }
@@ -1575,6 +1803,7 @@ where
         head_commits: &[SyncCommit],
         commit_headers: &[SyncCommitHeader],
         rows: &[SyncSnapshotRow],
+        checkpoint_roots: &BTreeMap<String, String>,
     ) -> Result<(), LixError> {
         let SyncRepositoryPullResponse::Snapshot {
             cursor,
@@ -1604,8 +1833,64 @@ where
             head_commits,
             commit_headers,
             rows,
+            checkpoint_roots,
         )
         .await
+    }
+
+    pub(crate) async fn align_sync_branch_checkpoint(
+        &self,
+        branch_id: &str,
+        expected_head_commit_id: &str,
+        checkpoint_commit_id: &str,
+    ) -> Result<(), LixError> {
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    format!("sync branch '{branch_id}' disappeared during reconciliation"),
+                )
+            })?;
+        if control.head_commit_id.to_string() != expected_head_commit_id {
+            return Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                format!("sync branch '{branch_id}' changed during reconciliation"),
+            ));
+        }
+        let current_checkpoint = control
+            .working_diff_checkpoint_commit_id
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("sync branch '{branch_id}' has no checkpoint cursor"),
+                )
+            })?
+            .to_string();
+        drop(read);
+        if current_checkpoint == checkpoint_commit_id {
+            return Ok(());
+        }
+        self.import_sync_repository(
+            &SyncPushRequest {
+                commits: Vec::new(),
+                ref_updates: vec![SyncRefUpdate {
+                    branch_id: branch_id.to_owned(),
+                    expected_head_commit_id: Some(expected_head_commit_id.to_owned()),
+                    expected_checkpoint_commit_id: Some(current_checkpoint),
+                    head_commit_id: Some(expected_head_commit_id.to_owned()),
+                    checkpoint_commit_id: Some(checkpoint_commit_id.to_owned()),
+                }],
+            },
+            SyncImportPurpose::ReplicaDelta,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn store_replica_state(
@@ -1644,6 +1929,7 @@ where
         head_commits: &[SyncCommit],
         commit_headers: &[SyncCommitHeader],
         rows: &[SyncSnapshotRow],
+        checkpoint_roots: &BTreeMap<String, String>,
     ) -> Result<(), LixError> {
         super::validate_sync_remote_id(remote_id)?;
         let mut parsed_heads = BTreeMap::new();
@@ -1841,6 +2127,7 @@ where
             }
         }
         let mut head_ids = BTreeSet::new();
+        let mut checkpoint_ids = BTreeSet::new();
         for branch in branches {
             let head = branch
                 .head_commit_id
@@ -1859,12 +2146,39 @@ where
                 ));
             }
             head_ids.insert(head);
+            checkpoint_ids.insert(CommitId::parse_lix(
+                branch
+                    .checkpoint_commit_id
+                    .as_deref()
+                    .expect("validated checkpoint"),
+                "sync snapshot branch checkpoint",
+            )?);
+        }
+        let snapshot_body_ids = head_ids
+            .union(&checkpoint_ids)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let required_checkpoint_roots = branches
+            .iter()
+            .filter_map(|branch| {
+                let head = branch.head_commit_id.as_deref()?;
+                let checkpoint = branch.checkpoint_commit_id.as_deref()?;
+                (head != checkpoint).then_some(checkpoint.to_owned())
+            })
+            .collect::<BTreeSet<_>>();
+        if checkpoint_roots.keys().cloned().collect::<BTreeSet<_>>() != required_checkpoint_roots {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync snapshot checkpoint roots do not match its branch coordinates",
+            ));
         }
         for body_id in parsed_heads.keys() {
-            if !head_ids.contains(body_id) {
+            if !snapshot_body_ids.contains(body_id) {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
-                    format!("sync snapshot body '{body_id}' is not a branch head"),
+                    format!(
+                        "sync snapshot body '{body_id}' is neither a branch head nor checkpoint"
+                    ),
                 ));
             }
         }
@@ -1872,7 +2186,11 @@ where
         let advertised_branches = branch_ids.iter().collect::<BTreeSet<_>>();
         let mut row_coordinates = BTreeSet::new();
         for row in &parsed_rows {
-            if !advertised_branches.contains(&row.branch_id) {
+            let checkpoint_row_owner =
+                CommitId::parse_lix(&row.branch_id, "sync snapshot checkpoint row owner")
+                    .ok()
+                    .is_some_and(|commit_id| checkpoint_ids.contains(&commit_id));
+            if !advertised_branches.contains(&row.branch_id) && !checkpoint_row_owner {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     format!(
@@ -1928,11 +2246,39 @@ where
                 ));
             }
         }
+        for (checkpoint_id, root_id) in checkpoint_roots {
+            let checkpoint = CommitId::parse_lix(checkpoint_id, "sync snapshot checkpoint root")?;
+            let expected_root = parse_sync_state_root_id(root_id)?;
+            let root_deltas = parsed_rows
+                .iter()
+                .filter(|row| row.branch_id == *checkpoint_id)
+                .map(ParsedSnapshotRow::as_root_delta)
+                .collect::<Vec<_>>();
+            let mut transient_writes = adapter.new_write_set();
+            let tracked_context = TrackedStateContext::new();
+            let mut writer = tracked_context.writer(&read, &mut transient_writes);
+            writer
+                .stage_commit_root(checkpoint_id, None, root_deltas)
+                .await?;
+            let actual_root = &writer
+                .staged_commit_roots()
+                .find(|root| root.commit_id == checkpoint)
+                .expect("snapshot checkpoint verification root was staged")
+                .root_id;
+            if actual_root != &expected_root {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "sync snapshot rows for checkpoint '{checkpoint_id}' do not match its liveStateRootId"
+                    ),
+                ));
+            }
+        }
 
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
         for commit_id in header_by_id.keys().copied() {
-            if head_ids.contains(&commit_id) {
+            if snapshot_body_ids.contains(&commit_id) {
                 stage_commit_history_available(&mut writes, commit_id);
             } else {
                 stage_commit_history_deferred(&mut writes, commit_id);
@@ -1940,7 +2286,7 @@ where
         }
         let head_json = parsed_heads
             .iter()
-            .filter(|(commit_id, _)| head_ids.contains(commit_id))
+            .filter(|(commit_id, _)| snapshot_body_ids.contains(commit_id))
             .map(|(_, commit)| commit)
             .flat_map(|commit| &commit.members)
             .flat_map(|member| {
@@ -2017,7 +2363,7 @@ where
         let mut head_mutations = BTreeMap::new();
         for commit in parsed_heads
             .iter()
-            .filter(|(commit_id, _)| head_ids.contains(commit_id))
+            .filter(|(commit_id, _)| snapshot_body_ids.contains(commit_id))
             .map(|(_, commit)| commit)
         {
             let delta_members = commit.members.iter().collect::<Vec<_>>();
@@ -2090,14 +2436,15 @@ where
             })
             .await?;
 
-        for head in head_ids.iter().copied() {
-            let branch = branches
+        for head in snapshot_body_ids.iter().copied() {
+            let row_owner = branches
                 .iter()
                 .find(|branch| branch.head_commit_id.as_deref() == Some(head.to_string().as_str()))
-                .expect("validated snapshot head is referenced by a branch");
+                .map(|branch| branch.branch_id.clone())
+                .unwrap_or_else(|| head.to_string());
             let head_rows = parsed_rows
                 .iter()
-                .filter(|row| row.branch_id == branch.branch_id)
+                .filter(|row| row.branch_id == row_owner)
                 .collect::<Vec<_>>();
             let root_deltas = head_rows
                 .iter()
@@ -2153,24 +2500,46 @@ where
                 .iter()
                 .filter(|row| row.branch_id == branch.branch_id)
                 .collect::<Vec<_>>();
-            let deltas = branch_rows
-                .iter()
-                .map(|row| row.as_current_delta())
-                .collect::<Vec<_>>();
+            let checkpoint = CommitId::parse_lix(
+                branch
+                    .checkpoint_commit_id
+                    .as_deref()
+                    .expect("validated checkpoint"),
+                "sync snapshot branch checkpoint",
+            )?;
+            let checkpoint_rows = if checkpoint == head {
+                branch_rows.clone()
+            } else {
+                parsed_rows
+                    .iter()
+                    .filter(|row| row.branch_id == checkpoint.to_string())
+                    .collect::<Vec<_>>()
+            };
+            let current_snapshot =
+                snapshot_rows_hot_snapshot(&branch.branch_id, branch_rows.iter().copied())?;
+            let checkpoint_snapshot =
+                snapshot_rows_hot_snapshot(&branch.branch_id, checkpoint_rows.iter().copied())?;
             let mut coverage = WorkingDiffIndexCoverage::default();
             let (_, schemas) = TrackedHeadContext::new()
                 .writer(&read, &mut writes)
                 .stage_complete_current_state_with_working_diff(
                     &branch.branch_id,
                     head,
-                    HotTrackedSnapshot::default(),
+                    current_snapshot,
                     observation
                         .control
                         .map(|control| control.tracked_generation),
-                    &deltas,
+                    &[],
                     &[],
                     &BTreeSet::new(),
-                    CompleteWorkingDiffMode::ResetClean,
+                    if checkpoint == head {
+                        CompleteWorkingDiffMode::ResetClean
+                    } else {
+                        CompleteWorkingDiffMode::Rebase {
+                            checkpoint_commit_id: checkpoint,
+                            checkpoint: checkpoint_snapshot,
+                        }
+                    },
                     &mut coverage,
                 )
                 .await?;
@@ -2178,7 +2547,7 @@ where
                 &mut writes,
                 &branch.branch_id,
                 TrackedWorkingDiffEpoch {
-                    checkpoint_commit_id: head,
+                    checkpoint_commit_id: checkpoint,
                     generation: head,
                     coverage,
                 },
@@ -2190,7 +2559,7 @@ where
                 current_state_revision: observation.control.map_or(0, |control| {
                     control.current_state_revision.saturating_add(1)
                 }),
-                working_diff_checkpoint_commit_id: Some(head),
+                working_diff_checkpoint_commit_id: Some(checkpoint),
                 created_at: observation
                     .control
                     .map_or(record.created_at, |control| control.created_at),
@@ -2211,6 +2580,15 @@ where
                 authoritative_heads: branches
                     .iter()
                     .map(|branch| (branch.branch_id.clone(), branch.head_commit_id.clone()))
+                    .collect(),
+                authoritative_checkpoints: branches
+                    .iter()
+                    .map(|branch| {
+                        (
+                            branch.branch_id.clone(),
+                            branch.checkpoint_commit_id.clone(),
+                        )
+                    })
                     .collect(),
                 authority_known_commit_ids: BTreeSet::new(),
             },
@@ -2438,13 +2816,37 @@ where
                 .as_deref()
                 .map(|id| CommitId::parse_lix(id, "sync expected ref head"))
                 .transpose()?;
+            let expected_checkpoint = update
+                .expected_checkpoint_commit_id
+                .as_deref()
+                .map(|id| CommitId::parse_lix(id, "sync expected checkpoint"))
+                .transpose()?;
             let head = update
                 .head_commit_id
                 .as_deref()
                 .map(|id| CommitId::parse_lix(id, "sync ref head"))
                 .transpose()?;
+            let checkpoint = update
+                .checkpoint_commit_id
+                .as_deref()
+                .map(|id| CommitId::parse_lix(id, "sync ref checkpoint"))
+                .transpose()?;
+            if expected.is_some() != expected_checkpoint.is_some()
+                || head.is_some() != checkpoint.is_some()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync ref head and checkpoint coordinates must be paired",
+                ));
+            }
             branch_ids.push(update.branch_id.clone());
-            parsed_refs.push((update.clone(), expected, head));
+            parsed_refs.push((
+                update.clone(),
+                expected,
+                expected_checkpoint,
+                head,
+                checkpoint,
+            ));
         }
 
         let adapter = self.storage_adapter();
@@ -2452,7 +2854,7 @@ where
         let default_branch_id = self.repository_default_branch_id_for_sync(&read).await?;
         if parsed_refs
             .iter()
-            .any(|(update, _, head)| update.branch_id == default_branch_id && head.is_none())
+            .any(|(update, _, _, head, _)| update.branch_id == default_branch_id && head.is_none())
         {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -2464,23 +2866,30 @@ where
             .load_observed(&branch_ids)
             .await?;
         let mut changed_refs = Vec::new();
-        for ((update, expected, head), observation) in parsed_refs.iter().zip(&observations) {
+        for ((update, expected, expected_checkpoint, head, checkpoint), observation) in
+            parsed_refs.iter().zip(&observations)
+        {
             let current = observation.control.map(|control| control.head_commit_id);
-            if current == *head {
+            let current_checkpoint = observation
+                .control
+                .and_then(|control| control.working_diff_checkpoint_commit_id);
+            if current == *head && current_checkpoint == *checkpoint {
                 continue;
             }
-            if current != *expected {
+            if current != *expected || current_checkpoint != *expected_checkpoint {
                 return Err(LixError::new(
                     LixError::CODE_TRANSACTION_CONFLICT,
                     format!(
-                        "sync ref '{}' expected head {:?}, found {:?}",
+                        "sync ref '{}' expected coordinate ({:?}, {:?}), found ({:?}, {:?})",
                         update.branch_id,
                         expected.map(|id| id.to_string()),
-                        current.map(|id| id.to_string())
+                        expected_checkpoint.map(|id| id.to_string()),
+                        current.map(|id| id.to_string()),
+                        current_checkpoint.map(|id| id.to_string()),
                     ),
                 ));
             }
-            changed_refs.push((update.clone(), *head));
+            changed_refs.push((update.clone(), *head, *checkpoint));
         }
 
         // Ref CAS is the cheap, side-effect-free gate. Authority admission
@@ -2643,7 +3052,7 @@ where
                 );
             }
         }
-        for (_, _, head) in &parsed_refs {
+        for (_, _, _, head, checkpoint) in &parsed_refs {
             if let Some(head) = head
                 && !parsed.contains_key(head)
                 && !records.contains_key(head)
@@ -2656,6 +3065,22 @@ where
                             format!("sync ref target '{head}' does not exist"),
                         )
                     })?,
+                );
+            }
+            if let Some(checkpoint) = checkpoint
+                && !parsed.contains_key(checkpoint)
+                && !records.contains_key(checkpoint)
+            {
+                records.insert(
+                    *checkpoint,
+                    load_commit_record(&read, *checkpoint)
+                        .await?
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_COMMIT_NOT_FOUND,
+                                format!("sync ref checkpoint '{checkpoint}' does not exist"),
+                            )
+                        })?,
                 );
             }
         }
@@ -3254,7 +3679,7 @@ where
             remaining.remove(&commit_id);
         }
 
-        for (update, head) in &changed_refs {
+        for (update, head, _) in &changed_refs {
             let Some(head) = head else {
                 continue;
             };
@@ -3289,13 +3714,70 @@ where
                 .await?;
         }
 
+        let hydrated_history = !deferred_existing.is_empty();
+        // Immutable commits and roots are safe to publish before a ref. This
+        // makes the second transaction a small atomic `(head, checkpoint)`
+        // publication whose hash-guided hot-state diff can read both roots.
+        // A failed CAS can leave only unreachable immutable objects.
+        let (read, mut writes, mut preconditions, observations) = if !changed_refs.is_empty()
+            && (!newly_imported.is_empty() || hydrated_history)
+        {
+            crate::json_store::stage_json_publication_fence(&read, &mut writes, &mut preconditions)
+                .await?;
+            drop(read);
+            adapter
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        await_durable: true,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await?;
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            let observations = BranchHeadControlContext::new()
+                .reader(&read)
+                .load_observed(&branch_ids)
+                .await?;
+            (read, adapter.new_write_set(), Vec::new(), observations)
+        } else {
+            (read, writes, preconditions, observations)
+        };
+
         let mut published_ref_updates = Vec::new();
-        for (update, head) in &changed_refs {
+        for (update, head, checkpoint) in &changed_refs {
             let observation_index = branch_ids
                 .iter()
                 .position(|branch_id| branch_id == &update.branch_id)
                 .expect("changed ref came from request");
             let observation = &observations[observation_index];
+            let current_head = observation.control.map(|control| control.head_commit_id);
+            let current_checkpoint = observation
+                .control
+                .and_then(|control| control.working_diff_checkpoint_commit_id);
+            if current_head == *head && current_checkpoint == *checkpoint {
+                continue;
+            }
+            let expected_head = update
+                .expected_head_commit_id
+                .as_deref()
+                .map(|id| CommitId::parse_lix(id, "sync expected ref head"))
+                .transpose()?;
+            let expected_checkpoint = update
+                .expected_checkpoint_commit_id
+                .as_deref()
+                .map(|id| CommitId::parse_lix(id, "sync expected checkpoint"))
+                .transpose()?;
+            if current_head != expected_head || current_checkpoint != expected_checkpoint {
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    format!(
+                        "sync ref '{}' changed while immutable commits were admitted",
+                        update.branch_id
+                    ),
+                ));
+            }
             preconditions.push(branch_head_control_precondition(
                 &update.branch_id,
                 observation.raw_token.clone(),
@@ -3305,16 +3787,139 @@ where
                 published_ref_updates.push(update.clone());
                 continue;
             };
-            let coverage = WorkingDiffIndexCoverage::default();
-            TrackedHeadContext::new()
-                .writer(&read, &mut writes)
-                .stage_root_current_base(&update.branch_id, *head, *head);
+            let checkpoint = checkpoint.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "sync ref '{}' has a head but no checkpoint",
+                        update.branch_id
+                    ),
+                )
+            })?;
+            let previous = observation.control;
+            let (generation, coverage) = if let Some(previous) = previous
+                && previous.working_diff_checkpoint_commit_id == Some(checkpoint)
+            {
+                let epoch = TrackedHeadContext::new()
+                    .reader(&read)
+                    .working_diff_epoch(&update.branch_id)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "sync branch '{}' has a checkpoint cursor but no working-diff epoch",
+                                update.branch_id
+                            ),
+                        )
+                    })?;
+                if epoch.checkpoint_commit_id != checkpoint
+                    || epoch.generation != previous.tracked_generation
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "sync branch '{}' has a stale working-diff epoch",
+                            update.branch_id
+                        ),
+                    ));
+                }
+                let diff = TrackedStateContext::new()
+                    .reader(&read)
+                    .diff_commits(
+                        &previous.head_commit_id.to_string(),
+                        &head.to_string(),
+                        &TrackedStateDiffRequest::default(),
+                    )
+                    .await?;
+                let mut deltas = Vec::with_capacity(diff.entries.len());
+                let mut absence_guards = BTreeSet::new();
+                for entry in &diff.entries {
+                    let after = entry.after.as_ref().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "sync tracked-state diff removed a row without a tombstone",
+                        )
+                    })?;
+                    let payload = diff.payloads().get(after.change_id).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("sync diff lost payload for change '{}'", after.change_id),
+                        )
+                    })?;
+                    if entry.visible_before().is_none() {
+                        absence_guards.insert(TrackedStateKey {
+                            schema_key: entry.identity.schema_key().to_owned(),
+                            file_id: entry.identity.file_id().map(str::to_owned),
+                            row_pk: entry.identity.row_pk().clone(),
+                        });
+                    }
+                    deltas.push(CurrentStateDeltaRef {
+                        schema_key: entry.identity.schema_key(),
+                        file_id: entry.identity.file_id(),
+                        row_pk: entry.identity.row_pk(),
+                        change_id: Some(after.change_id),
+                        commit_id: Some(after.commit_id),
+                        untracked: false,
+                        deleted: after.deleted,
+                        created_at: after.created_at,
+                        updated_at: after.updated_at,
+                        snapshot: payload.snapshot.as_ref_slot(),
+                        metadata: payload.metadata.as_ref_slot(),
+                        columnar_base_coordinate: None,
+                    });
+                }
+                let mut coverage = epoch.coverage;
+                let generation = TrackedHeadContext::new()
+                    .writer(&read, &mut writes)
+                    .stage_current_state_with_working_diff(
+                        &update.branch_id,
+                        Some(previous.tracked_generation),
+                        *head,
+                        &deltas,
+                        &absence_guards,
+                        None,
+                        None,
+                        Some(checkpoint),
+                        &mut coverage,
+                    )
+                    .await?;
+                (generation, coverage)
+            } else {
+                let current = load_sync_hot_snapshot(&read, &update.branch_id, *head).await?;
+                let checkpoint_snapshot =
+                    load_sync_hot_snapshot(&read, &update.branch_id, checkpoint).await?;
+                let generation = CommitId::with_change_address_space(uuid::Uuid::now_v7());
+                let mut coverage = WorkingDiffIndexCoverage::default();
+                TrackedHeadContext::new()
+                    .writer(&read, &mut writes)
+                    .stage_complete_current_state_with_working_diff(
+                        &update.branch_id,
+                        generation,
+                        current,
+                        previous.map(|control| control.tracked_generation),
+                        &[],
+                        &[],
+                        &BTreeSet::new(),
+                        if *head == checkpoint {
+                            CompleteWorkingDiffMode::ResetClean
+                        } else {
+                            CompleteWorkingDiffMode::Rebase {
+                                checkpoint_commit_id: checkpoint,
+                                checkpoint: checkpoint_snapshot,
+                            }
+                        },
+                        &mut coverage,
+                    )
+                    .await?;
+                (generation, coverage)
+            };
             stage_tracked_working_diff_epoch(
                 &mut writes,
                 &update.branch_id,
                 TrackedWorkingDiffEpoch {
-                    checkpoint_commit_id: *head,
-                    generation: *head,
+                    checkpoint_commit_id: checkpoint,
+                    generation,
                     coverage,
                 },
             )?;
@@ -3326,14 +3931,14 @@ where
             })?;
             let mut control = BranchHeadControl {
                 head_commit_id: *head,
-                tracked_generation: *head,
+                tracked_generation: generation,
                 current_state_revision: observation.control.map_or(Ok(0), |control| {
                     control
                         .current_state_revision
                         .checked_add(1)
                         .ok_or_else(|| LixError::unknown("branch current-state revision overflow"))
                 })?,
-                working_diff_checkpoint_commit_id: Some(*head),
+                working_diff_checkpoint_commit_id: Some(checkpoint),
                 created_at: observation
                     .control
                     .map_or(head_record.created_at, |control| control.created_at),
@@ -3349,7 +3954,6 @@ where
         crate::json_store::stage_json_publication_fence(&read, &mut writes, &mut preconditions)
             .await?;
         let (current_cursor, _) = load_sequence(&read).await?;
-        let hydrated_history = !deferred_existing.is_empty();
         if newly_imported.is_empty() && published_ref_updates.is_empty() && !hydrated_history {
             return Ok(SyncPushResponse {
                 cursor: current_cursor,
@@ -3366,11 +3970,20 @@ where
         let cursor = if purpose == SyncImportPurpose::AuthorityPush
             && (!newly_imported.is_empty() || !published_ref_updates.is_empty())
         {
+            let event_commit_ids = if published_ref_updates.is_empty() {
+                newly_imported
+            } else {
+                request
+                    .commits
+                    .iter()
+                    .map(|commit| commit.commit_id.clone())
+                    .collect()
+            };
             stage_repository_event(
                 &read,
                 &mut writes,
                 &mut preconditions,
-                newly_imported,
+                event_commit_ids,
                 published_ref_updates,
             )
             .await?
@@ -3752,9 +4365,19 @@ where
             let hot_state_root_id = self
                 .complete_live_root_at_commit(&read, control.head_commit_id)
                 .await?;
+            let checkpoint = control.working_diff_checkpoint_commit_id.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("sync branch '{branch_id}' has no checkpoint cursor"),
+                )
+            })?;
+            let checkpoint_state_root_id =
+                self.complete_live_root_at_commit(&read, checkpoint).await?;
             branches.push(SyncBranchHead {
                 branch_id: branch_id.clone(),
                 head_commit_id: Some(control.head_commit_id.to_string()),
+                checkpoint_commit_id: Some(checkpoint.to_string()),
+                checkpoint_state_root_id: format_sync_state_root_id(&checkpoint_state_root_id),
                 hot_state_root_id: format_sync_state_root_id(&hot_state_root_id),
             });
         }
@@ -3925,17 +4548,28 @@ mod tests {
     async fn snapshot_parts(
         authority: &Lix<Memory>,
         snapshot: &SyncRepositoryPullResponse,
-    ) -> (SyncHistoryResponse, Vec<SyncSnapshotRow>) {
+    ) -> (
+        SyncHistoryResponse,
+        Vec<SyncSnapshotRow>,
+        BTreeMap<String, String>,
+    ) {
         let SyncRepositoryPullResponse::Snapshot { branches, .. } = snapshot else {
             unreachable!("initial pull is a snapshot");
         };
         let mut commits = BTreeMap::new();
         let mut headers = BTreeMap::new();
         let mut boundaries = BTreeMap::new();
-        for head in branches
+        let snapshot_commits = branches
             .iter()
-            .filter_map(|branch| branch.head_commit_id.as_deref())
-        {
+            .flat_map(|branch| {
+                [
+                    branch.head_commit_id.as_deref(),
+                    branch.checkpoint_commit_id.as_deref(),
+                ]
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        for head in snapshot_commits {
             let page = authority
                 .sync_history(head, 1)
                 .await
@@ -3956,6 +4590,20 @@ mod tests {
                     .map(|boundary| (boundary.commit_id.clone(), boundary)),
             );
         }
+        let checkpoint_roots = branches
+            .iter()
+            .filter_map(|branch| {
+                let head = branch.head_commit_id.as_deref()?;
+                let checkpoint = branch.checkpoint_commit_id.as_deref()?;
+                if head == checkpoint {
+                    return None;
+                }
+                Some((
+                    checkpoint.to_owned(),
+                    branch.checkpoint_state_root_id.clone(),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
         let history = SyncHistoryResponse {
             commits: commits.into_values().collect(),
             commit_headers: headers.into_values().collect(),
@@ -3984,7 +4632,34 @@ mod tests {
                 continuation = Some(next);
             }
         }
-        (history, rows)
+        let checkpoint_targets = branches
+            .iter()
+            .filter_map(|branch| {
+                let head = branch.head_commit_id.as_deref()?;
+                let checkpoint = branch.checkpoint_commit_id.as_deref()?;
+                (head != checkpoint).then_some(checkpoint)
+            })
+            .collect::<BTreeSet<_>>();
+        for checkpoint in checkpoint_targets {
+            let mut continuation = None;
+            loop {
+                let page = authority
+                    .pull_sync_snapshot_rows(
+                        checkpoint,
+                        checkpoint,
+                        continuation.as_deref(),
+                        super::super::MAX_SYNC_REQUEST_ITEMS,
+                    )
+                    .await
+                    .expect("checkpoint snapshot row page should load");
+                rows.extend(page.rows);
+                let Some(next) = page.continuation else {
+                    break;
+                };
+                continuation = Some(next);
+            }
+        }
+        (history, rows, checkpoint_roots)
     }
 
     async fn replica_from_snapshot(
@@ -3992,7 +4667,7 @@ mod tests {
         snapshot: &SyncRepositoryPullResponse,
     ) -> Lix<Memory> {
         let (branch_id, _) = default_head(snapshot);
-        let (history, rows) = snapshot_parts(authority, snapshot).await;
+        let (history, rows, checkpoint_roots) = snapshot_parts(authority, snapshot).await;
         let storage = Memory::new();
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
@@ -4012,6 +4687,7 @@ mod tests {
                 &history.commits,
                 &history.commit_headers,
                 &rows,
+                &checkpoint_roots,
             )
             .await
             .expect("snapshot should initialize replica");
@@ -4546,6 +5222,17 @@ mod tests {
             vec![forged_checkpoint],
         );
         let replica = replica_from_snapshot(&authority, &snapshot).await;
+        assert_eq!(
+            working_diff_count(&replica).await,
+            0,
+            "checkpoint metadata is not a user-visible working change",
+        );
+        write_key_value(&replica, "checkpoint-roundtrip-dirty", "one change").await;
+        assert_eq!(
+            working_diff_count(&replica).await,
+            1,
+            "only the post-checkpoint user row should be dirty",
+        );
         let selected_ids = authority_commit
             .members
             .iter()
@@ -4708,7 +5395,9 @@ mod tests {
             ref_updates: vec![SyncRefUpdate {
                 branch_id: branch_id.clone(),
                 expected_head_commit_id: None,
+                expected_checkpoint_commit_id: None,
                 head_commit_id: Some(source_head.clone()),
+                checkpoint_commit_id: Some(source_head.clone()),
             }],
         };
         let first = target
@@ -4892,7 +5581,9 @@ mod tests {
                 ref_updates: vec![SyncRefUpdate {
                     branch_id: target_branch,
                     expected_head_commit_id: None,
+                    expected_checkpoint_commit_id: None,
                     head_commit_id: Some(source_head.clone()),
+                    checkpoint_commit_id: Some(source_head.clone()),
                 }],
             })
             .await
@@ -4924,7 +5615,9 @@ mod tests {
                 ref_updates: vec![SyncRefUpdate {
                     branch_id: default_branch_id.clone(),
                     expected_head_commit_id: Some(default_head_id.clone()),
+                    expected_checkpoint_commit_id: Some(default_head_id.clone()),
                     head_commit_id: None,
+                    checkpoint_commit_id: None,
                 }],
             })
             .await
@@ -4996,7 +5689,7 @@ mod tests {
             .pull_sync_repository(None, 1)
             .await
             .expect("snapshot should load");
-        let (history, rows) = snapshot_parts(&authority, &snapshot).await;
+        let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
         let (default_branch_id, _) = default_head(&snapshot);
         let SyncRepositoryPullResponse::Snapshot { branches, .. } = &mut snapshot else {
             unreachable!("initial pull is a snapshot");
@@ -5022,6 +5715,7 @@ mod tests {
                 &history.commits,
                 &history.commit_headers,
                 &rows,
+                &checkpoint_roots,
             )
             .await
             .expect_err("default-less metadata must be rejected");
@@ -5044,7 +5738,7 @@ mod tests {
             .pull_sync_repository(None, 1)
             .await
             .expect("snapshot should load");
-        let (history, rows) = snapshot_parts(&authority, &snapshot).await;
+        let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
         let SyncRepositoryPullResponse::Snapshot {
             default_branch_id, ..
         } = &mut snapshot
@@ -5072,6 +5766,7 @@ mod tests {
                 &history.commits,
                 &history.commit_headers,
                 &rows,
+                &checkpoint_roots,
             )
             .await
             .expect_err("metadata cannot redefine the tracked repository default");
@@ -5108,7 +5803,7 @@ mod tests {
         local
             .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
-        let (history, rows) = snapshot_parts(&authority, &snapshot).await;
+        let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
 
         let error = local
             .apply_sync_repository_snapshot(
@@ -5118,6 +5813,7 @@ mod tests {
                 &history.commits,
                 &history.commit_headers,
                 &rows,
+                &checkpoint_roots,
             )
             .await
             .expect_err("snapshot must not orphan a locally advanced same-id branch");
@@ -5152,7 +5848,7 @@ mod tests {
             .await
             .expect("snapshot metadata should load");
         let (branch_id, _) = default_head(&snapshot);
-        let (history, mut rows) = snapshot_parts(&authority, &snapshot).await;
+        let (history, mut rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
         assert!(rows.len() > 1, "fixture must have more than one live row");
         let omitted = rows
             .iter()
@@ -5187,6 +5883,7 @@ mod tests {
                 &history.commits,
                 &history.commit_headers,
                 &rows,
+                &checkpoint_roots,
             )
             .await
             .expect_err("an incomplete row sequence must fail root verification");
@@ -5580,6 +6277,15 @@ mod tests {
                     active_account_id: local.active_account_id().to_owned(),
                     cursor: 1,
                     authoritative_heads,
+                    authoritative_checkpoints: branches
+                        .iter()
+                        .map(|branch| {
+                            (
+                                branch.branch_id.clone(),
+                                branch.checkpoint_commit_id.clone(),
+                            )
+                        })
+                        .collect(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -5682,6 +6388,15 @@ mod tests {
                     active_account_id: local.active_account_id().to_owned(),
                     cursor: 1,
                     authoritative_heads,
+                    authoritative_checkpoints: branches
+                        .iter()
+                        .map(|branch| {
+                            (
+                                branch.branch_id.clone(),
+                                branch.checkpoint_commit_id.clone(),
+                            )
+                        })
+                        .collect(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -5736,6 +6451,7 @@ mod tests {
                     active_account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
                     cursor: 7,
                     authoritative_heads: BTreeMap::new(),
+                    authoritative_checkpoints: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -5840,7 +6556,7 @@ mod tests {
         let (branch_id, _) = default_head(&snapshot);
         let inserting_replica = replica_from_snapshot(&authority, &snapshot).await;
         let editing_replica = replica_from_snapshot(&authority, &snapshot).await;
-        let (snapshot_history, _) = snapshot_parts(&authority, &snapshot).await;
+        let (snapshot_history, _, _) = snapshot_parts(&authority, &snapshot).await;
         transfer_commit_blobs(&authority, &inserting_replica, &snapshot_history.commits).await;
         transfer_commit_blobs(&authority, &editing_replica, &snapshot_history.commits).await;
 
@@ -5962,6 +6678,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_snapshot_preserves_dirty_state_against_the_shared_checkpoint() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "dirty-bootstrap", "baseline").await;
+        let checkpoint = authority
+            .create_checkpoint()
+            .await
+            .expect("explicit checkpoint should commit");
+        let checkpoint = CommitId::parse_lix(&checkpoint.commit_id, "bootstrap checkpoint")
+            .expect("checkpoint id should parse");
+        write_key_value(&authority, "dirty-bootstrap", "dirty after checkpoint").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("dirty snapshot should load");
+        let (branch_id, head) = default_head(&snapshot);
+        assert_ne!(head, checkpoint.to_string());
+
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        let read = replica
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replica branch read should open");
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("replica branch should load")
+            .expect("replica branch should exist");
+        assert_eq!(control.head_commit_id.to_string(), head);
+        assert_eq!(control.working_diff_checkpoint_commit_id, Some(checkpoint),);
+        drop(read);
+        assert!(working_diff_count(&replica).await > 0);
+        assert_eq!(
+            read_key_value(&replica, "dirty-bootstrap").await,
+            "dirty after checkpoint",
+        );
+    }
+
+    #[tokio::test]
     async fn ordinary_remote_write_preserves_the_shared_checkpoint_baseline() {
         let authority = open_lix().await.expect("authority should open");
         authority
@@ -6045,6 +6801,353 @@ mod tests {
                 "{name} must keep the ordinary write dirty against the explicit checkpoint",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn remote_checkpoint_advances_the_shared_baseline_and_clears_working_diff() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "checkpoint-sync", "baseline").await;
+        authority
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should commit");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (branch_id, _) = default_head(&snapshot);
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = &snapshot else {
+            panic!("initial pull should return a snapshot");
+        };
+        let mut cursor = *cursor;
+        let origin = replica_from_snapshot(&authority, &snapshot).await;
+        let peer = replica_from_snapshot(&authority, &snapshot).await;
+
+        origin
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/checkpoint-sync.md".to_owned()),
+                    Value::Text("dirty".to_owned()),
+                ],
+            )
+            .await
+            .expect("replica file write should commit");
+        publish_pending_with_blobs(&origin, &authority).await;
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("ordinary delta should load");
+        cursor = match &delta {
+            SyncRepositoryPullResponse::Delta { cursor, .. } => *cursor,
+            _ => panic!("cursor pull should return a delta"),
+        };
+        if let SyncRepositoryPullResponse::Delta { events, .. } = &delta {
+            for event in events {
+                transfer_commit_blobs(&authority, &peer, &event.commits).await;
+                transfer_commit_blobs(&authority, &origin, &event.commits).await;
+            }
+        }
+        peer.apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("peer should apply ordinary write");
+        assert!(working_diff_count(&peer).await > 0);
+
+        origin
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("origin should acknowledge ordinary write");
+        let _checkpoint = origin
+            .create_checkpoint()
+            .await
+            .expect("replica checkpoint should commit");
+        assert_eq!(
+            working_diff_count(&origin).await,
+            0,
+            "origin checkpoint should be locally clean",
+        );
+        let origin_read = origin
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("origin control read should open");
+        let origin_control = BranchHeadControlContext::new()
+            .reader(&origin_read)
+            .load(&branch_id)
+            .await
+            .expect("origin control should load")
+            .expect("origin control should exist");
+        let origin_checkpoint_diff = TrackedStateContext::new()
+            .reader(&origin_read)
+            .diff_commits(
+                &origin_control
+                    .working_diff_checkpoint_commit_id
+                    .expect("origin checkpoint")
+                    .to_string(),
+                &origin_control.head_commit_id.to_string(),
+                &TrackedStateDiffRequest::default(),
+            )
+            .await
+            .expect("origin checkpoint root diff should load");
+        assert!(
+            origin_checkpoint_diff.entries.iter().all(|entry| {
+                entry.identity.schema_key() == crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+            }),
+            "origin checkpoint child should differ only by checkpoint metadata: {:?}",
+            origin_checkpoint_diff.entries,
+        );
+        let origin_checkpoint_id = origin_control
+            .working_diff_checkpoint_commit_id
+            .expect("origin checkpoint")
+            .to_string();
+        let scanned_checkpoint = BranchHeadControlContext::new()
+            .reader(&origin_read)
+            .scan()
+            .await
+            .expect("origin controls should scan")
+            .into_iter()
+            .find(|(id, _)| id == &branch_id)
+            .and_then(|(_, control)| control.working_diff_checkpoint_commit_id)
+            .expect("scanned origin checkpoint")
+            .to_string();
+        assert_eq!(scanned_checkpoint, origin_checkpoint_id);
+        let preview_push = origin
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("checkpoint push should build")
+            .expect("checkpoint push should exist");
+        if let Some(update) = preview_push
+            .ref_updates
+            .iter()
+            .find(|update| update.branch_id == branch_id)
+        {
+            assert_eq!(
+                update.checkpoint_commit_id.as_deref(),
+                Some(origin_checkpoint_id.as_str()),
+                "first outbox build must use the exact local checkpoint coordinate",
+            );
+        }
+        drop(origin_read);
+        let mut checkpoint_ref = None;
+        for _ in 0..8 {
+            let before_push_read = origin
+                .storage_adapter()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("before push read");
+            let before_push_checkpoint = BranchHeadControlContext::new()
+                .reader(&before_push_read)
+                .scan()
+                .await
+                .expect("before push controls")
+                .into_iter()
+                .find(|(id, _)| id == &branch_id)
+                .and_then(|(_, control)| control.working_diff_checkpoint_commit_id)
+                .expect("before push checkpoint")
+                .to_string();
+            assert_eq!(before_push_checkpoint, origin_checkpoint_id);
+            drop(before_push_read);
+            let checkpoint_push = publish_pending_with_blobs(&origin, &authority).await;
+            let published_active = checkpoint_push
+                .ref_updates
+                .into_iter()
+                .find(|update| update.branch_id == branch_id);
+            if let Some(update) = &published_active {
+                assert_eq!(
+                    update.checkpoint_commit_id.as_deref(),
+                    Some(origin_checkpoint_id.as_str()),
+                    "bounded outbox ref must use the exact local checkpoint coordinate",
+                );
+            }
+            let delta = authority
+                .pull_sync_repository(Some(cursor), 128)
+                .await
+                .expect("checkpoint upload receipt should pull");
+            if let SyncRepositoryPullResponse::Delta {
+                cursor: next_cursor,
+                events,
+            } = &delta
+            {
+                for event in events {
+                    transfer_commit_blobs(&authority, &origin, &event.commits).await;
+                    transfer_commit_blobs(&authority, &peer, &event.commits).await;
+                }
+                cursor = *next_cursor;
+            }
+            origin
+                .apply_sync_repository_pull(TEST_REMOTE, &delta)
+                .await
+                .expect("origin should acknowledge checkpoint upload page");
+            peer.apply_sync_repository_pull(TEST_REMOTE, &delta)
+                .await
+                .expect("peer should apply checkpoint upload page");
+            let loop_read = origin
+                .storage_adapter()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("loop origin read");
+            let loop_control = BranchHeadControlContext::new()
+                .reader(&loop_read)
+                .load(&branch_id)
+                .await
+                .expect("loop origin control")
+                .expect("loop origin branch");
+            assert_eq!(
+                loop_control
+                    .working_diff_checkpoint_commit_id
+                    .expect("loop checkpoint")
+                    .to_string(),
+                origin_checkpoint_id,
+                "checkpoint upload acknowledgement must not rewrite local checkpoint",
+            );
+            drop(loop_read);
+            if let Some(update) = published_active {
+                checkpoint_ref = Some(update);
+                break;
+            }
+        }
+        let checkpoint_ref = checkpoint_ref
+            .expect("bounded checkpoint upload should eventually publish the active branch");
+        let pushed_head = checkpoint_ref
+            .head_commit_id
+            .as_deref()
+            .expect("headed ref");
+        let pushed_checkpoint = checkpoint_ref
+            .checkpoint_commit_id
+            .as_deref()
+            .expect("headed ref checkpoint");
+        assert_eq!(
+            pushed_checkpoint, origin_checkpoint_id,
+            "outbox must publish the exact local checkpoint coordinate",
+        );
+        let imported_checkpoint = authority
+            .sync_history(pushed_checkpoint, 1)
+            .await
+            .expect("imported checkpoint history")
+            .commits
+            .into_iter()
+            .next()
+            .expect("imported checkpoint body");
+        assert!(
+            imported_checkpoint
+                .members
+                .iter()
+                .any(|member| { member.schema_key == "lix_file_descriptor" }),
+            "checkpoint wire body lost selected file members: {:?}",
+            imported_checkpoint.members,
+        );
+        let read = authority
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("authority diff read should open");
+        let root_diff = TrackedStateContext::new()
+            .reader(&read)
+            .diff_commits(
+                pushed_checkpoint,
+                pushed_head,
+                &TrackedStateDiffRequest::default(),
+            )
+            .await
+            .expect("checkpoint-to-head diff should load");
+        assert!(
+            root_diff.entries.iter().all(
+                |entry| entry.identity.schema_key() == crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+            ),
+            "checkpoint child should differ only by checkpoint metadata: {:?}",
+            root_diff.entries,
+        );
+        drop(read);
+        let read = authority
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("authority control read should open");
+        let authority_control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("authority control should load")
+            .expect("authority control should exist");
+        assert_eq!(authority_control.head_commit_id.to_string(), pushed_head);
+        assert_eq!(
+            authority_control
+                .working_diff_checkpoint_commit_id
+                .map(|commit| commit.to_string())
+                .as_deref(),
+            Some(pushed_checkpoint),
+        );
+        drop(read);
+        assert_eq!(
+            working_diff_count(&authority).await,
+            0,
+            "authority checkpoint should be clean",
+        );
+        let peer_diff = peer
+            .execute(
+                "SELECT schema_key, diff_type, before_change_id, after_change_id FROM lix_working_diff()",
+                &[],
+            )
+            .await
+            .expect("peer working diff should load");
+        assert_eq!(
+            peer_diff.rows().len(),
+            0,
+            "peer checkpoint should be clean, found {:?}",
+            peer_diff.rows(),
+        );
+        let read = peer
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("peer branch read should open");
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("peer branch should load")
+            .expect("peer branch should exist");
+        assert_eq!(control.head_commit_id.to_string(), pushed_head);
+        assert_eq!(
+            control
+                .working_diff_checkpoint_commit_id
+                .map(|commit| commit.to_string())
+                .as_deref(),
+            Some(pushed_checkpoint),
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_rejects_a_stale_expected_checkpoint_coordinate() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "checkpoint-cas", "baseline").await;
+        authority
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should commit");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        write_key_value(&replica, "checkpoint-cas", "changed").await;
+        let mut request = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("push should build")
+            .expect("write should be pending");
+        let update = request
+            .ref_updates
+            .first_mut()
+            .expect("pending write should update a ref");
+        update.expected_checkpoint_commit_id =
+            Some(CommitId::for_test_label("stale-expected-sync-checkpoint").to_string());
+        let error = authority
+            .push_sync_repository(&request)
+            .await
+            .expect_err("stale checkpoint CAS must fail");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+        assert!(error.message.contains("expected coordinate"));
     }
 
     #[tokio::test]

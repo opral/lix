@@ -5000,7 +5000,13 @@ mod tests {
     fn openapi_sync_wire_tracks_the_exact_snapshot_and_merge_dtos() {
         let openapi = include_str!("../../server-protocol.openapi.yaml");
         assert!(openapi.contains("required: [kind, cursor, lixId, defaultBranchId, branches]"));
-        assert!(openapi.contains("required: [branchId, headCommitId, hotStateRootId]"));
+        assert!(
+            openapi
+                .contains("required: [branchId, headCommitId, checkpointCommitId, checkpointStateRootId, hotStateRootId]")
+        );
+        assert!(openapi.contains(
+            "required: [branchId, expectedHeadCommitId, expectedCheckpointCommitId, headCommitId, checkpointCommitId]"
+        ));
         assert!(openapi.contains("required: [branchId, headCommitId, rows, continuation]"));
         assert!(openapi.contains("required: [commits, commitHeaders, boundaries]"));
         assert!(!openapi.contains("headCommits:"));
@@ -5051,7 +5057,9 @@ mod tests {
             ref_updates: vec![crate::sync::SyncRefUpdate {
                 branch_id: uuid::Uuid::now_v7().to_string(),
                 expected_head_commit_id: None,
+                expected_checkpoint_commit_id: None,
                 head_commit_id: None,
+                checkpoint_commit_id: None,
             }],
         };
         ensure_sync_push_event_fits(&request, 1024)
@@ -6699,6 +6707,7 @@ mod tests {
                 &bootstrap_commits.into_values().collect::<Vec<_>>(),
                 &bootstrap_headers.into_values().collect::<Vec<_>>(),
                 &snapshot_rows,
+                &std::collections::BTreeMap::new(),
             )
             .await
             .expect("install sparse replica snapshot");
@@ -7510,6 +7519,10 @@ mod tests {
             let Some(head_commit_id) = branch["headCommitId"].as_str() else {
                 continue;
             };
+            let checkpoint_commit_id = branch["checkpointCommitId"]
+                .as_str()
+                .expect("headed snapshot branch checkpoint id");
+            assert!(!checkpoint_commit_id.is_empty());
             let branch_id = branch["branchId"].as_str().expect("branch id");
             let mut continuation = None;
             loop {
@@ -7669,7 +7682,9 @@ mod tests {
             "refUpdates": [{
                 "branchId": "01920000-0000-7000-8000-000000001503",
                 "expectedHeadCommitId": null,
+                "expectedCheckpointCommitId": null,
                 "headCommitId": merge_commit_id,
+                "checkpointCommitId": merge_commit_id,
             }]
         }))
         .expect("forged request should decode");
@@ -7686,7 +7701,9 @@ mod tests {
             "refUpdates": [{
                 "branchId": "01920000-0000-7000-8000-000000001502",
                 "expectedHeadCommitId": null,
+                "expectedCheckpointCommitId": null,
                 "headCommitId": merge_commit_id,
+                "checkpointCommitId": merge_commit_id,
             }]
         }))
         .expect("roundtrip request should decode");

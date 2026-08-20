@@ -1116,10 +1116,22 @@ where
     pub(crate) async fn reconcile_sync_branch(
         &self,
         branch_id: &str,
+        local_head_commit_id: &str,
         authority_head_commit_id: &str,
+        authority_checkpoint_commit_id: &str,
     ) -> Result<(), LixError> {
         let authority_head =
             crate::changelog::CommitId::parse_lix(authority_head_commit_id, "sync authority head")?;
+        // Adopt the authority checkpoint before merging. Both publications
+        // are independently coherent: a crash can leave the local head
+        // rebased onto the new shared checkpoint, and replay then completes
+        // the merge without ever publishing a merged head with stale C.
+        self.align_sync_branch_checkpoint(
+            branch_id,
+            local_head_commit_id,
+            authority_checkpoint_commit_id,
+        )
+        .await?;
         // Reconciliation must not change the application's session-local
         // branch selection. A short-lived session targets the affected ref and
         // shares the engine's ordinary transaction/commit machinery.
@@ -1127,21 +1139,22 @@ where
             .engine
             .open_session_with_account(self.active_account_id().to_owned())
             .await?;
-        let result: Result<(), LixError> = async {
+        let result: Result<String, LixError> = async {
             session
                 .switch_branch(SwitchBranchOptions {
                     branch_id: branch_id.to_owned(),
                 })
                 .await?;
-            session
+            let merged_head = session
                 .merge_sync_commit_into_active_branch(authority_head)
                 .await?;
-            Ok(())
+            Ok(merged_head)
         }
         .await;
         let close_result = session.close().await;
         result?;
-        close_result
+        close_result?;
+        Ok(())
     }
 }
 
