@@ -462,17 +462,10 @@ where
     close_result: watch::Sender<Option<Result<(), LixError>>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ServerLifecycle {
-    Open,
-    Closing,
-}
-
 struct SessionRegistry<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lifecycle: ServerLifecycle,
     sessions: HashMap<String, Arc<SessionRecord<S>>>,
 }
 
@@ -515,6 +508,19 @@ impl SessionOpenGate {
     fn start_closing(&self) {
         self.state
             .fetch_or(SESSION_OPEN_GATE_CLOSING, Ordering::AcqRel);
+    }
+
+    fn ensure_open(&self) -> Result<(), ApiError> {
+        if self.state.load(Ordering::Acquire) & SESSION_OPEN_GATE_CLOSING == 0 {
+            Ok(())
+        } else {
+            Err(ApiError::server_closed())
+        }
+    }
+
+    #[cfg(test)]
+    fn is_closing(&self) -> bool {
+        self.ensure_open().is_err()
     }
 
     fn pending(&self) -> usize {
@@ -1401,7 +1407,6 @@ where
                 root,
                 options,
                 registry: AsyncMutex::new(SessionRegistry {
-                    lifecycle: ServerLifecycle::Open,
                     sessions: HashMap::new(),
                 }),
                 request_blob_budget: Arc::new(RequestBlobCacheBudget::new(
@@ -1708,10 +1713,6 @@ where
     }
 
     async fn close_once(&self) -> Result<(), LixError> {
-        {
-            let mut registry = self.inner.registry.lock().await;
-            registry.lifecycle = ServerLifecycle::Closing;
-        }
         while self.inner.session_open_gate.pending() != 0 {
             self.inner.session_open_gate.drained.notified().await;
         }
@@ -1781,7 +1782,7 @@ where
         };
 
         let mut registry = self.inner.registry.lock().await;
-        if let Err(error) = ensure_server_open(registry.lifecycle) {
+        if let Err(error) = self.inner.session_open_gate.ensure_open() {
             drop(registry);
             close_unregistered_session(child).await;
             return Err(error);
@@ -1864,7 +1865,7 @@ where
         durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Result<SessionLease<S>, ApiError> {
         let mut registry = self.inner.registry.lock().await;
-        ensure_server_open(registry.lifecycle)?;
+        self.inner.session_open_gate.ensure_open()?;
         let Some(record) = registry.sessions.get(session_id).cloned() else {
             return Err(ApiError::session_gone());
         };
@@ -1885,7 +1886,7 @@ where
 
     async fn delete_session(&self, session_id: &str) -> Result<(), ApiError> {
         let mut registry = self.inner.registry.lock().await;
-        ensure_server_open(registry.lifecycle)?;
+        self.inner.session_open_gate.ensure_open()?;
         let record = registry.sessions.remove(session_id);
         drop(registry);
         if let Some(record) = record {
@@ -1951,14 +1952,6 @@ fn generate_capability_id() -> Result<String, LixError> {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     Ok(encoded)
-}
-
-fn ensure_server_open(lifecycle: ServerLifecycle) -> Result<(), ApiError> {
-    if lifecycle == ServerLifecycle::Open {
-        Ok(())
-    } else {
-        Err(ApiError::server_closed())
-    }
 }
 
 fn optional_session_id(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
@@ -10972,8 +10965,7 @@ mod tests {
         let closing = tokio::spawn(async move { server.close().await });
 
         loop {
-            let lifecycle = app.server.inner.registry.lock().await.lifecycle;
-            if lifecycle == ServerLifecycle::Closing {
+            if app.server.inner.session_open_gate.is_closing() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -10989,10 +10981,7 @@ mod tests {
             .await
             .expect("join server close")
             .expect("close server");
-        assert_eq!(
-            app.server.inner.registry.lock().await.lifecycle,
-            ServerLifecycle::Closing
-        );
+        assert!(app.server.inner.session_open_gate.is_closing());
     }
 
     #[tokio::test]
@@ -11044,7 +11033,7 @@ mod tests {
         let server = app.server.clone();
         let mut closing = tokio::spawn(async move { server.close().await });
         loop {
-            if app.server.inner.registry.lock().await.lifecycle != ServerLifecycle::Open {
+            if app.server.inner.session_open_gate.is_closing() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -11079,7 +11068,7 @@ mod tests {
         let closing = tokio::spawn(async move { server.close().await });
 
         loop {
-            if app.server.inner.registry.lock().await.lifecycle == ServerLifecycle::Closing {
+            if app.server.inner.session_open_gate.is_closing() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -11097,10 +11086,7 @@ mod tests {
             .close()
             .await
             .expect("detached server close should complete");
-        assert_eq!(
-            app.server.inner.registry.lock().await.lifecycle,
-            ServerLifecycle::Closing
-        );
+        assert!(app.server.inner.session_open_gate.is_closing());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
