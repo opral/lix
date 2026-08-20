@@ -13,8 +13,8 @@
     { "path": "./branching.md", "label": "Branching" },
     { "path": "./history.md", "label": "History" },
     {
-      "path": "./realtime-collaboration.md",
-      "label": "Real-time Collaboration"
+      "path": "./collaboration-and-sync.md",
+      "label": "Collaboration and Sync"
     },
     { "path": "./persistence.md", "label": "Persistence and Storage" }
   ],

@@ -73,5 +73,5 @@ to a server.
 - [Store application data](./schemas.md)
 - [Work with files and media](./files-and-media.md)
 - [Branch, review, and merge](./branching.md)
-- [Add real-time collaboration](./realtime-collaboration.md)
+- [Add collaboration and local sync](./collaboration-and-sync.md)
 - [Persistence and Storage](./persistence.md)

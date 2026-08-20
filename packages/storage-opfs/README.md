@@ -11,6 +11,11 @@ const lix = await openLix({
 });
 ```
 
+Combine OPFS with `server: { mode: "sync" }` to keep a durable local working
+copy of a hosted repository. Reads and writes remain local while Lix
+synchronizes commits in the background. See
+[Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
+
 `OpfsStorage` starts one package-owned dedicated worker in the page. The Lix
 engine workers use a package-internal `BroadcastChannel` RPC client, while the
 owner worker holds the SQLite Wasm OPFS SAH-pool connection. This keeps the

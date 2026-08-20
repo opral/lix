@@ -1,5 +1,6 @@
 {
   "/docs": "/docs/what-is-lix",
+  "/docs/realtime-collaboration": "/docs/collaboration-and-sync",
   "/docs/storage": "/docs/persistence",
   "/docs/versions": "/docs/branching",
   "/docs/semantic-changes": "/docs/diffs"

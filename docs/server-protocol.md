@@ -7,6 +7,10 @@ It defines the methods, wire formats, session behavior, and error envelopes.
 It does not define HTTP frameworks, authentication schemes, URLs above
 `/lix/v1`, or deployment policy.
 
+Application developers should start with
+[Collaboration and Sync](./collaboration-and-sync.md). This page documents the
+server wire contract.
+
 ## Why it exists
 
 The protocol is the interop layer between clients and hosts.
