@@ -2559,12 +2559,11 @@ mod tests {
         let (replica, _parent, _head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture_with_depth(32).await;
 
-        // This is the engine shape behind Atelier's History list: checkpoints
-        // are joined to the file-history surface to compute per-checkpoint
-        // counts. It must drive cold-history hydration on a fresh replica.
+        // A history query over the sparse graph must drive cold-history
+        // hydration on a fresh replica.
         let sql = "SELECT COUNT(DISTINCT history.id) AS entries \
                    FROM lix_checkpoint AS checkpoint \
-                   LEFT JOIN lix_file_history() AS history \
+                   LEFT JOIN lix_history('lix_file') AS history \
                      ON history.lixcol_observed_commit_id = checkpoint.commit_id";
         let mut error = replica
             .execute(sql, &[])

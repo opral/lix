@@ -4066,7 +4066,7 @@ mod tests {
     }
 
     async fn working_diff_count(lix: &Lix<Memory>) -> i64 {
-        lix.execute("SELECT COUNT(*) AS count FROM lix_working_diff", &[])
+        lix.execute("SELECT COUNT(*) AS count FROM lix_working_diff()", &[])
             .await
             .expect("working diff should remain readable")
             .rows()[0]

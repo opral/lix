@@ -6754,7 +6754,7 @@ mod tests {
             "statements": [
                 {
                     "sql": format!(
-                        "SELECT COUNT(*) AS versions FROM lix_file_history('{head}')"
+                        "SELECT COUNT(*) AS versions FROM lix_history('lix_file', '{head}')"
                     ),
                     "params": []
                 },
