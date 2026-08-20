@@ -103,7 +103,6 @@ struct HubState {
     generation: u64,
     driver_running: bool,
     failed_generation: Option<u64>,
-    stream_active: bool,
     current_cancels: Vec<super::http::StreamCancel>,
     pending_initial: std::collections::HashSet<String>,
 }
@@ -115,7 +114,6 @@ impl std::fmt::Debug for HubState {
             .field("subscription_count", &self.subscriptions.len())
             .field("generation", &self.generation)
             .field("driver_running", &self.driver_running)
-            .field("stream_active", &self.stream_active)
             .finish_non_exhaustive()
     }
 }
@@ -157,7 +155,6 @@ impl<T: ObserveTransport> ObservationHub<T> {
                 generation: 0,
                 driver_running: false,
                 failed_generation: None,
-                stream_active: false,
                 current_cancels: Vec::new(),
                 pending_initial: std::collections::HashSet::new(),
             })),
@@ -261,7 +258,6 @@ impl<T: ObserveTransport> ObservationHub<T> {
                 let mut state = self.state.lock().await;
                 if state.closed || state.subscriptions.is_empty() {
                     state.driver_running = false;
-                    state.stream_active = false;
                     return;
                 }
                 (
@@ -324,7 +320,6 @@ impl<T: ObserveTransport> ObservationHub<T> {
                     let mut state = self.state.lock().await;
                     if state.closed || state.subscriptions.is_empty() {
                         state.driver_running = false;
-                        state.stream_active = false;
                         return;
                     }
                 } else {
@@ -366,7 +361,6 @@ impl<T: ObserveTransport> ObservationHub<T> {
                         abort_current_stream(&mut state);
                         continue;
                     }
-                    state.stream_active = true;
                     state.pending_initial = subscriptions
                         .iter()
                         .map(|subscription| subscription.id.clone())
@@ -388,7 +382,6 @@ impl<T: ObserveTransport> ObservationHub<T> {
                         return;
                     }
                     abort_current_stream(&mut state);
-                    state.stream_active = false;
                 }
                 match consume {
                     ConsumeResult::Continue => {}
@@ -811,7 +804,6 @@ impl<T: ObserveTransport> ObservationHub<T> {
             state.failed_generation = Some(generation);
             state.generation += 1;
             state.driver_running = false;
-            state.stream_active = false;
             abort_current_stream(&mut state);
             state.subscription_order.clear();
             std::mem::take(&mut state.subscriptions)
