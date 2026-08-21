@@ -642,15 +642,13 @@ where
         {
             return Ok(changes.clone());
         }
-        let members = crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
+        let members = crate::tracked_state::load_commit_history_members_with_payloads_for_schemas(
             &self.store,
             commit_id,
             schema_keys,
             file_ids,
-            usize::MAX,
         )
-        .await?
-        .expect("unbounded commit member load cannot exceed its segment limit");
+        .await?;
         let mut changes = members
             .into_iter()
             .map(|member| commit_graph_change_from_change_record(member.change))

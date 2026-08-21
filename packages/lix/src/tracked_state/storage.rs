@@ -9271,8 +9271,54 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
     file_ids: &[String],
     max_segment_count: usize,
 ) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
-    if let Some(mut diff) =
-        complete_state_fence_tree_diff(store, commit_id, schema_keys, false).await?
+    load_commit_delta_members_with_payloads_for_schemas_impl(
+        store,
+        commit_id,
+        schema_keys,
+        file_ids,
+        max_segment_count,
+        false,
+    )
+    .await
+}
+
+/// Loads logical history members, including every selected row in a
+/// self-contained sparse checkpoint boundary.
+pub(crate) async fn load_commit_history_members_with_payloads_for_schemas(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+    file_ids: &[String],
+) -> Result<Vec<CommitDeltaMember>, LixError> {
+    Ok(load_commit_delta_members_with_payloads_for_schemas_impl(
+        store,
+        commit_id,
+        schema_keys,
+        file_ids,
+        usize::MAX,
+        true,
+    )
+    .await?
+    .expect("unbounded history member load cannot exceed its segment limit"))
+}
+
+async fn load_commit_delta_members_with_payloads_for_schemas_impl(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+    file_ids: &[String],
+    max_segment_count: usize,
+    expand_standalone_complete_state: bool,
+) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
+    if let Some((mut diff, standalone_complete_state)) =
+        complete_state_fence_tree_diff(
+            store,
+            commit_id,
+            schema_keys,
+            false,
+            expand_standalone_complete_state,
+        )
+        .await?
     {
         // Collection-generation deletes synthesize physical tombstones for
         // every retired row, but only the generation marker is a logical
@@ -9334,24 +9380,52 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
                 }
             }
         }
+        let canonical_fallbacks = if standalone_complete_state {
+            let missing_change_ids = rows
+                .iter()
+                .zip(&owners)
+                .filter_map(|((_, value), owner)| owner.is_none().then_some(value.change_id))
+                .collect::<Vec<_>>();
+            load_change_records_by_ids(store, &missing_change_ids)
+                .await?
+                .into_iter()
+                .map(|change| (change.change_id, change))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
         return rows
             .into_iter()
             .zip(owners)
             .enumerate()
             .map(|(ordinal, ((key, mut value), owner))| {
-                let owner = owner.ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "complete-state checkpoint member '{}' lost physical owner '{}'",
-                            value.change_id, value.commit_id
-                        ),
-                    )
-                })?;
-                if owner.value.change_id != value.change_id {
+                let change = match owner {
+                    Some(owner) => {
+                        if owner.value.change_id != value.change_id {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "complete-state checkpoint member disagrees with physical owner",
+                            ));
+                        }
+                        owner.change_record
+                    }
+                    None => canonical_fallbacks.get(&value.change_id).cloned().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "complete-state checkpoint member '{}' lost physical owner '{}'",
+                                value.change_id, value.commit_id
+                            ),
+                        )
+                    })?,
+                };
+                if change.schema_key != key.schema_key
+                    || change.file_id != key.file_id
+                    || change.row_pk != key.row_pk
+                {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "complete-state checkpoint member disagrees with physical owner",
+                        "complete-state checkpoint member disagrees with canonical change identity",
                     ));
                 }
                 value.commit_id = commit_id;
@@ -9359,7 +9433,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
                     key,
                     selected_tombstone: value.deleted,
                     value,
-                    change: owner.change_record,
+                    change,
                     segment_index: 0,
                     ordinal: u32::try_from(ordinal).map_err(|_| {
                         LixError::new(
@@ -10015,7 +10089,8 @@ async fn complete_state_fence_delta_batch(
     commit_id: CommitId,
     schema_keys: &[String],
 ) -> Result<Option<DecodedCommitDeltaBatch>, LixError> {
-    let Some(diff) = complete_state_fence_tree_diff(store, commit_id, schema_keys, false).await?
+    let Some((diff, _)) =
+        complete_state_fence_tree_diff(store, commit_id, schema_keys, false, false).await?
     else {
         return Ok(None);
     };
@@ -10039,9 +10114,9 @@ pub(crate) async fn complete_state_fence_change_owner_commit_ids(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<BTreeSet<CommitId>>, LixError> {
-    Ok(complete_state_fence_tree_diff(store, commit_id, &[], true)
+    Ok(complete_state_fence_tree_diff(store, commit_id, &[], true, false)
         .await?
-        .map(|diff| {
+        .map(|(diff, _)| {
             diff.checkpoint_delta_rows()
                 .map(|row| row.commit_id())
                 .collect()
@@ -10053,7 +10128,8 @@ async fn complete_state_fence_tree_diff(
     commit_id: CommitId,
     schema_keys: &[String],
     missing_parent_is_absent: bool,
-) -> Result<Option<super::diff::TrackedStateTreeDiffBatch>, LixError> {
+    expand_standalone_complete_state: bool,
+) -> Result<Option<(super::diff::TrackedStateTreeDiffBatch, bool)>, LixError> {
     let Some(manifest) = load_commit_state_manifest(store, commit_id).await? else {
         return Ok(None);
     };
@@ -10064,46 +10140,56 @@ async fn complete_state_fence_tree_diff(
     else {
         return Ok(None);
     };
-    if root.parent_roots.is_empty() {
-        return Ok(None);
-    }
-    let record = ChangelogContext::new()
-        .reader(store)
-        .load_commits(CommitLoadRequest {
-            commit_ids: &[commit_id],
-        })
-        .await?
-        .into_iter()
-        .next()
-        .and_then(|(_, record)| record)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("complete-state checkpoint '{commit_id}' has no commit record"),
-            )
-        })?;
-    let parent_commit_id = record.parent_commit_ids.first().copied().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("complete-state checkpoint '{commit_id}' has no prior checkpoint parent"),
-        )
-    })?;
-    let parent = load_snapshot_commit_root(store, &parent_commit_id.to_string()).await?;
-    let Some(parent) = parent else {
-        if missing_parent_is_absent {
+    let standalone_complete_state = root.parent_roots.is_empty();
+    let parent_root_id = if standalone_complete_state {
+        if !expand_standalone_complete_state {
             return Ok(None);
         }
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "complete-state checkpoint '{commit_id}' has no materialized parent root '{parent_commit_id}'"
-            ),
-        ));
+        // A sparse bootstrap publishes a self-contained complete-state root
+        // with no physical parent. Its logical checkpoint delta is therefore
+        // the full state relative to absence. Treating that root as an empty
+        // commit hides every selected row from bounded history reads.
+        None
+    } else {
+        let record = ChangelogContext::new()
+            .reader(store)
+            .load_commits(CommitLoadRequest {
+                commit_ids: &[commit_id],
+            })
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("complete-state checkpoint '{commit_id}' has no commit record"),
+                )
+            })?;
+        let parent_commit_id = record.parent_commit_ids.first().copied().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("complete-state checkpoint '{commit_id}' has no prior checkpoint parent"),
+            )
+        })?;
+        let parent = load_snapshot_commit_root(store, &parent_commit_id.to_string()).await?;
+        let Some(parent) = parent else {
+            if missing_parent_is_absent {
+                return Ok(None);
+            }
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "complete-state checkpoint '{commit_id}' has no materialized parent root '{parent_commit_id}'"
+                ),
+            ));
+        };
+        Some(parent.root_id)
     };
     let diff = super::tree::TrackedStateTree::new()
         .diff(
             &store,
-            Some(&parent.root_id),
+            parent_root_id.as_ref(),
             Some(&root.root_id),
             &TrackedStateTreeScanRequest {
                 schema_keys: schema_keys.to_vec(),
@@ -10112,7 +10198,7 @@ async fn complete_state_fence_tree_diff(
             },
         )
         .await?;
-    Ok(Some(diff))
+    Ok(Some((diff, standalone_complete_state)))
 }
 
 /// Resolves the immutable owners of finite selected members in one commit.
