@@ -10,6 +10,7 @@ import type {
 	MergeBranchOptions,
 	SwitchBranchOptions,
 	LixTelemetrySpan,
+	LixTelemetryParentContext,
 	OpenAnotherSessionOptions,
 } from "../types.js";
 
@@ -39,6 +40,7 @@ export type WorkerSyncFetchResponse = {
 export type WorkerRequest = {
 	id: number;
 	sessionId: number;
+	telemetryParent?: LixTelemetryParentContext;
 	operation: WorkerOperation;
 };
 

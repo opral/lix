@@ -27,6 +27,14 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	) {
 		throw new TypeError("openLix() telemetry requires an onSpan callback");
 	}
+	if (
+		options.telemetry?.parentContext !== undefined &&
+		typeof options.telemetry.parentContext !== "function"
+	) {
+		throw new TypeError(
+			"openLix() telemetry parentContext must be a context provider function",
+		);
+	}
 	if (options.server !== undefined) {
 		if (options.server.mode === "remote") {
 			const { openRemoteLixBinding } = await import("./remote/client.js");

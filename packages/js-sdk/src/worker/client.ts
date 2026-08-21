@@ -69,7 +69,7 @@ export async function openLixWorkerBinding(
 	telemetry?: LixTelemetryOptions,
 	server?: SyncServerRuntimeOptions,
 ): Promise<LixBinding> {
-	if (openDirectLixBinding) {
+	if (openDirectLixBinding && telemetry?.parentContext === undefined) {
 		const telemetryDispatch = telemetry
 			? (span: Parameters<LixTelemetryOptions["onSpan"]>[0]) => {
 					try {
@@ -82,6 +82,7 @@ export async function openLixWorkerBinding(
 		const binding = await openDirectLixBinding(
 			storage,
 			telemetryDispatch,
+			undefined,
 			await resolveDirectSyncServer(server),
 		);
 		if (binding) {
@@ -157,6 +158,7 @@ function workerBinding(
 	};
 
 	return {
+		setTelemetryParent: () => {},
 		openAnotherSession: async (options) => {
 			const openedSessionId = await request<number>({
 				kind: "openAnotherSession",
@@ -300,7 +302,12 @@ export class LixWorkerClient {
 				reject,
 			});
 			try {
-				this.connection.postMessage({ id, sessionId, operation });
+			this.connection.postMessage({
+				id,
+				sessionId,
+				telemetryParent: this.telemetry?.parentContext?.(),
+				operation,
+			});
 			} catch (error) {
 				this.pending.delete(id);
 				if (this.pending.size === 0) this.connection.unref();

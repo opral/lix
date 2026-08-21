@@ -1,13 +1,14 @@
 #![allow(missing_debug_implementations)]
 
 use std::cell::{Cell, RefCell};
+use std::future::{Future, IntoFuture};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Array, Function, Reflect};
-use lix::telemetry::{CallbackTelemetrySink, TelemetrySink};
+use lix::telemetry::{CallbackTelemetrySink, SpanContext, TelemetrySink, instrument_remote_parent};
 use lix::{
     BROWSER_TRANSPORT_CONFIG_HEADER, CreateBranchOptions as RsCreateBranchOptions,
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
@@ -96,11 +97,15 @@ pub struct WasmLix {
     storage_sessions: Rc<Cell<usize>>,
     closed: Cell<bool>,
     browser_sync_transport_id: Rc<RefCell<Option<String>>>,
+    telemetry_parent: Option<PendingTelemetryParent>,
 }
+
+type PendingTelemetryParent = Rc<RefCell<Option<SpanContext>>>;
 
 #[wasm_bindgen]
 pub struct WasmLixTransaction {
     inner: Option<BrowserTransaction>,
+    telemetry_parent: Option<PendingTelemetryParent>,
 }
 
 #[wasm_bindgen]
@@ -113,11 +118,13 @@ pub struct WasmObserveEvents {
 #[wasm_bindgen(js_name = openMemory)]
 pub async fn open_memory(
     telemetry_dispatch: Option<Function>,
+    telemetry_parent: Option<JsValue>,
     server: Option<JsValue>,
 ) -> Result<WasmLix, JsValue> {
     open_browser_storage(
         BrowserStorage::Memory(Memory::new()),
         telemetry_dispatch,
+        telemetry_parent,
         server,
     )
     .await
@@ -127,11 +134,19 @@ pub async fn open_memory(
 pub async fn open_js_storage(
     provider: JsStorageProvider,
     telemetry_dispatch: Option<Function>,
+    telemetry_parent: Option<JsValue>,
     server: Option<JsValue>,
 ) -> Result<WasmLix, JsValue> {
     let storage = JsStorage::new(provider);
     let browser_storage = BrowserStorage::Js(storage);
-    match open_browser_storage(browser_storage.clone(), telemetry_dispatch, server).await {
+    match open_browser_storage(
+        browser_storage.clone(),
+        telemetry_dispatch,
+        telemetry_parent,
+        server,
+    )
+    .await
+    {
         Ok(lix) => Ok(lix),
         Err(error) => {
             let _ = browser_storage.close().await;
@@ -143,17 +158,34 @@ pub async fn open_js_storage(
 async fn open_browser_storage(
     storage: BrowserStorage,
     telemetry_dispatch: Option<Function>,
+    telemetry_parent: Option<JsValue>,
     server: Option<JsValue>,
 ) -> Result<WasmLix, JsValue> {
     console_error_panic_hook::set_once();
+    let telemetry_parent = telemetry_parent
+        .map(|value| {
+            js_sys::JSON::stringify(&value)
+                .map_err(|_| JsValue::from_str("telemetry parent context must be serializable"))?
+                .as_string()
+                .ok_or_else(|| JsValue::from_str("telemetry parent context must be an object"))
+        })
+        .transpose()?
+        .map(|json| crate::telemetry::parse_parent_context_json(Some(json)))
+        .transpose()
+        .map_err(|error| JsValue::from_str(&error))?
+        .flatten();
+    let telemetry_parent_source = telemetry_dispatch
+        .as_ref()
+        .map(|_| Rc::new(RefCell::new(None)));
     let telemetry = telemetry_dispatch.map(|dispatch| {
         let dispatch = BrowserTelemetryDispatch(dispatch);
-        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+        let sink = CallbackTelemetrySink::new(move |span| {
             let Ok(span) = to_js(&crate::telemetry::TelemetrySpanDto::from(span)) else {
                 return;
             };
             let _ = dispatch.0.call1(&JsValue::UNDEFINED, &span);
-        }));
+        });
+        let sink: Arc<dyn TelemetrySink> = Arc::new(sink);
         sink
     });
     #[derive(Deserialize)]
@@ -184,36 +216,41 @@ async fn open_browser_storage(
         }
         None => None,
     };
-    let inner = match telemetry {
-        Some(telemetry) => {
-            let builder = open_lix()
-                .with_storage(storage.clone())
-                .with_telemetry(telemetry);
-            match server {
-                Some(server) => builder.with_server(server).await,
-                None => builder.await,
+    let open = async {
+        match telemetry {
+            Some(telemetry) => {
+                let builder = open_lix()
+                    .with_storage(storage.clone())
+                    .with_telemetry(telemetry);
+                match server {
+                    Some(server) => builder.with_server(server).await,
+                    None => builder.await,
+                }
+            }
+            None => {
+                let builder = open_lix().with_storage(storage.clone());
+                match server {
+                    Some(server) => builder.with_server(server).await,
+                    None => builder.await,
+                }
             }
         }
-        None => {
-            let builder = open_lix().with_storage(storage.clone());
-            match server {
-                Some(server) => builder.with_server(server).await,
-                None => builder.await,
+    };
+    let inner = instrument_remote_parent(telemetry_parent, open)
+        .await
+        .map_err(|error| {
+            if let Some(id) = browser_sync_transport_id.as_deref() {
+                unregister_browser_sync_transport(id);
             }
-        }
-    }
-    .map_err(|error| {
-        if let Some(id) = browser_sync_transport_id.as_deref() {
-            unregister_browser_sync_transport(id);
-        }
-        lix_error_to_js(error)
-    })?;
+            lix_error_to_js(error)
+        })?;
     Ok(WasmLix {
         inner,
         storage,
         storage_sessions: Rc::new(Cell::new(1)),
         closed: Cell::new(false),
         browser_sync_transport_id: Rc::new(RefCell::new(browser_sync_transport_id)),
+        telemetry_parent: telemetry_parent_source,
     })
 }
 
@@ -237,8 +274,42 @@ struct BrowserTelemetryDispatch(Function);
 unsafe impl Send for BrowserTelemetryDispatch {}
 unsafe impl Sync for BrowserTelemetryDispatch {}
 
+impl WasmLix {
+    fn instrument_operation<F: IntoFuture>(&self, future: F) -> impl Future<Output = F::Output> {
+        instrument_remote_parent(
+            self.telemetry_parent
+                .as_ref()
+                .and_then(|parent| parent.borrow_mut().take()),
+            future.into_future(),
+        )
+    }
+}
+
 #[wasm_bindgen]
 impl WasmLix {
+    #[wasm_bindgen(js_name = setTelemetryParent)]
+    pub fn set_telemetry_parent(&self, parent: Option<JsValue>) -> Result<(), JsValue> {
+        let Some(parent_source) = &self.telemetry_parent else {
+            return Ok(());
+        };
+        let parent = parent
+            .map(|value| {
+                js_sys::JSON::stringify(&value)
+                    .map_err(|_| {
+                        JsValue::from_str("telemetry parent context must be serializable")
+                    })?
+                    .as_string()
+                    .ok_or_else(|| JsValue::from_str("telemetry parent context must be an object"))
+            })
+            .transpose()?
+            .map(|json| crate::telemetry::parse_parent_context_json(Some(json)))
+            .transpose()
+            .map_err(|error| JsValue::from_str(&error))?
+            .flatten();
+        *parent_source.borrow_mut() = parent;
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = openAnotherSession)]
     pub async fn open_another_session(&self, options: JsValue) -> Result<WasmLix, JsValue> {
         let options: OpenAnotherSessionOptionsDto = from_js(options)?;
@@ -249,7 +320,10 @@ impl WasmLix {
         if let Some(account_id) = options.account_id {
             builder = builder.with_account(account_id);
         }
-        let inner = builder.await.map_err(lix_error_to_js)?;
+        let inner = self
+            .instrument_operation(builder)
+            .await
+            .map_err(lix_error_to_js)?;
         self.storage_sessions
             .set(self.storage_sessions.get().saturating_add(1));
         Ok(WasmLix {
@@ -258,6 +332,7 @@ impl WasmLix {
             storage_sessions: self.storage_sessions.clone(),
             closed: Cell::new(false),
             browser_sync_transport_id: self.browser_sync_transport_id.clone(),
+            telemetry_parent: self.telemetry_parent.clone(),
         })
     }
 
@@ -275,7 +350,10 @@ impl WasmLix {
             Some(origin_key) => execution.with_origin_key(origin_key),
             None => execution,
         };
-        let result = execution.await.map_err(lix_error_to_js)?;
+        let result = self
+            .instrument_operation(execution)
+            .await
+            .map_err(lix_error_to_js)?;
         execute_result_to_js(result)
     }
 
@@ -292,7 +370,10 @@ impl WasmLix {
             Some(origin_key) => execution.with_origin_key(origin_key),
             None => execution,
         };
-        let results = execution.await.map_err(lix_error_to_js)?;
+        let results = self
+            .instrument_operation(execution)
+            .await
+            .map_err(lix_error_to_js)?;
         let results = results
             .into_iter()
             .map(ExecuteResultDto::try_from)
@@ -308,7 +389,10 @@ impl WasmLix {
         params: JsValue,
     ) -> Result<WasmObserveEvents, JsValue> {
         let params = values_from_js(params)?;
-        let inner = self.inner.observe(&sql, &params).map_err(lix_error_to_js)?;
+        let inner = self
+            .instrument_operation(async { self.inner.observe(&sql, &params) })
+            .await
+            .map_err(lix_error_to_js)?;
         Ok(WasmObserveEvents {
             inner: RefCell::new(Some(inner)),
             closed: Cell::new(false),
@@ -319,16 +403,20 @@ impl WasmLix {
     #[wasm_bindgen(js_name = beginTransaction)]
     pub async fn begin_transaction(&self) -> Result<WasmLixTransaction, JsValue> {
         let inner = self
-            .inner
-            .begin_transaction()
+            .instrument_operation(self.inner.begin_transaction())
             .await
             .map_err(lix_error_to_js)?;
-        Ok(WasmLixTransaction { inner: Some(inner) })
+        Ok(WasmLixTransaction {
+            inner: Some(inner),
+            telemetry_parent: self.telemetry_parent.clone(),
+        })
     }
 
     #[wasm_bindgen(js_name = activeBranchId)]
     pub async fn active_branch_id(&self) -> Result<String, JsValue> {
-        self.inner.active_branch_id().await.map_err(lix_error_to_js)
+        self.instrument_operation(self.inner.active_branch_id())
+            .await
+            .map_err(lix_error_to_js)
     }
 
     #[wasm_bindgen(js_name = activeAccountId)]
@@ -340,12 +428,11 @@ impl WasmLix {
     pub async fn create_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
         let options: CreateBranchOptionsDto = from_js(options)?;
         let receipt = self
-            .inner
-            .create_branch(RsCreateBranchOptions {
+            .instrument_operation(self.inner.create_branch(RsCreateBranchOptions {
                 id: options.id,
                 name: options.name,
                 from_commit_id: options.from_commit_id,
-            })
+            }))
             .await
             .map_err(lix_error_to_js)?;
         to_js(&CreateBranchReceiptDto {
@@ -359,8 +446,7 @@ impl WasmLix {
     #[wasm_bindgen(js_name = createCheckpoint)]
     pub async fn create_checkpoint(&self) -> Result<JsValue, JsValue> {
         let receipt = self
-            .inner
-            .create_checkpoint()
+            .instrument_operation(self.inner.create_checkpoint())
             .await
             .map_err(lix_error_to_js)?;
         to_js(&CreateCheckpointReceiptDto {
@@ -370,7 +456,10 @@ impl WasmLix {
 
     #[wasm_bindgen(js_name = undo)]
     pub async fn undo(&self) -> Result<JsValue, JsValue> {
-        let receipt = self.inner.undo().await.map_err(lix_error_to_js)?;
+        let receipt = self
+            .instrument_operation(self.inner.undo())
+            .await
+            .map_err(lix_error_to_js)?;
         to_js(&UndoReceiptDto {
             branch_id: receipt.branch_id,
             target_commit_id: receipt.target_commit_id,
@@ -380,7 +469,10 @@ impl WasmLix {
 
     #[wasm_bindgen(js_name = redo)]
     pub async fn redo(&self) -> Result<JsValue, JsValue> {
-        let receipt = self.inner.redo().await.map_err(lix_error_to_js)?;
+        let receipt = self
+            .instrument_operation(self.inner.redo())
+            .await
+            .map_err(lix_error_to_js)?;
         to_js(&RedoReceiptDto {
             branch_id: receipt.branch_id,
             target_commit_id: receipt.target_commit_id,
@@ -392,10 +484,9 @@ impl WasmLix {
     pub async fn switch_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
         let options: SwitchBranchOptionsDto = from_js(options)?;
         let receipt = self
-            .inner
-            .switch_branch(RsSwitchBranchOptions {
+            .instrument_operation(self.inner.switch_branch(RsSwitchBranchOptions {
                 branch_id: options.branch_id,
-            })
+            }))
             .await
             .map_err(lix_error_to_js)?;
         to_js(&SwitchBranchReceiptDto {
@@ -415,10 +506,9 @@ impl WasmLix {
     pub async fn merge_branch_preview(&self, options: JsValue) -> Result<JsValue, JsValue> {
         let options: MergeBranchOptionsDto = from_js(options)?;
         let preview = self
-            .inner
-            .merge_branch_preview(MergeBranchPreviewOptions {
+            .instrument_operation(self.inner.merge_branch_preview(MergeBranchPreviewOptions {
                 source_branch_id: options.source_branch_id,
-            })
+            }))
             .await
             .map_err(lix_error_to_js)?;
         to_js(&MergeBranchPreviewDto::from(preview))
@@ -428,10 +518,9 @@ impl WasmLix {
     pub async fn merge_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
         let options: MergeBranchOptionsDto = from_js(options)?;
         let receipt = self
-            .inner
-            .merge_branch(RsMergeBranchOptions {
+            .instrument_operation(self.inner.merge_branch(RsMergeBranchOptions {
                 source_branch_id: options.source_branch_id,
-            })
+            }))
             .await
             .map_err(lix_error_to_js)?;
         to_js(&MergeBranchReceiptDto::from(receipt))
@@ -450,7 +539,7 @@ impl WasmLix {
         if self.closed.replace(true) {
             return Ok(());
         }
-        if let Err(error) = self.inner.close().await {
+        if let Err(error) = self.instrument_operation(self.inner.close()).await {
             self.closed.set(false);
             return Err(lix_error_to_js(error));
         }
@@ -469,6 +558,17 @@ impl WasmLix {
     }
 }
 
+impl WasmLixTransaction {
+    fn instrument_operation<F: IntoFuture>(&self, future: F) -> impl Future<Output = F::Output> {
+        instrument_remote_parent(
+            self.telemetry_parent
+                .as_ref()
+                .and_then(|parent| parent.borrow_mut().take()),
+            future.into_future(),
+        )
+    }
+}
+
 #[wasm_bindgen]
 impl WasmLixTransaction {
     #[wasm_bindgen(js_name = execute)]
@@ -480,26 +580,36 @@ impl WasmLixTransaction {
     ) -> Result<JsValue, JsValue> {
         let params = values_from_js(params)?;
         let options = execute_options_from_js(options)?;
+        let telemetry_parent = self
+            .telemetry_parent
+            .as_ref()
+            .and_then(|parent| parent.borrow_mut().take());
         let inner = self.inner.as_mut().ok_or_else(transaction_closed_error)?;
         let execution = inner.execute(&sql, &params);
         let execution = match options {
             Some(origin_key) => execution.with_origin_key(origin_key),
             None => execution,
         };
-        let result = execution.await.map_err(lix_error_to_js)?;
+        let result = instrument_remote_parent(telemetry_parent, execution.into_future())
+            .await
+            .map_err(lix_error_to_js)?;
         execute_result_to_js(result)
     }
 
     #[wasm_bindgen(js_name = commit)]
     pub async fn commit(&mut self) -> Result<(), JsValue> {
         let inner = self.inner.take().ok_or_else(transaction_closed_error)?;
-        inner.commit().await.map_err(lix_error_to_js)
+        self.instrument_operation(inner.commit())
+            .await
+            .map_err(lix_error_to_js)
     }
 
     #[wasm_bindgen(js_name = rollback)]
     pub async fn rollback(&mut self) -> Result<(), JsValue> {
         let inner = self.inner.take().ok_or_else(transaction_closed_error)?;
-        inner.rollback().await.map_err(lix_error_to_js)
+        self.instrument_operation(inner.rollback())
+            .await
+            .map_err(lix_error_to_js)
     }
 }
 

@@ -26,7 +26,7 @@ use crate::storage_adapter::{
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::sync::SyncModeState;
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetrySink, instrument_lix_result, spans,
+    ActiveTelemetrySpan, ENGINE_OPEN, SESSION_OPEN, TelemetrySink, instrument_lix_result,
 };
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
@@ -152,7 +152,7 @@ where
         options: EngineOptions,
     ) -> Result<Self, LixError> {
         let span = options.telemetry.as_ref().and_then(|sink| {
-            ActiveTelemetrySpan::start_if_enabled(sink, &spans::ENGINE_OPEN, Vec::new())
+            ActiveTelemetrySpan::start_if_enabled(sink, &ENGINE_OPEN, Vec::new())
         });
         instrument_lix_result(span, async move {
             let storage = StorageAdapter::new(storage);
@@ -288,7 +288,7 @@ where
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
         let span = self.telemetry.as_ref().and_then(|sink| {
-            ActiveTelemetrySpan::start_if_enabled(sink, &spans::SESSION_OPEN, Vec::new())
+            ActiveTelemetrySpan::start_if_enabled(sink, &SESSION_OPEN, Vec::new())
         });
         instrument_lix_result(span, async move {
             let active_account_id = active_account_id.into();
@@ -326,7 +326,7 @@ where
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
         let span = self.telemetry.as_ref().and_then(|sink| {
-            ActiveTelemetrySpan::start_if_enabled(sink, &spans::SESSION_OPEN, Vec::new())
+            ActiveTelemetrySpan::start_if_enabled(sink, &SESSION_OPEN, Vec::new())
         });
         instrument_lix_result(span, async move {
             let active_account_id = active_account_id.into();

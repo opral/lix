@@ -97,7 +97,10 @@ use crate::storage_adapter::{
     REVISION_KEY_CATALOG, REVISION_KEY_TRACKED_MUTATION, SharedStorageAdapterRead, StorageAdapter,
     StorageAdapterRead, StorageAdapterReadScope, load_revisions,
 };
-use crate::telemetry::{ActiveTelemetrySpan, instrument_lix_result, spans};
+use crate::telemetry::{
+    ActiveTelemetrySpan, Status, TRANSACTION_MATERIALIZE, TRANSACTION_STORAGE,
+    instrument_lix_result,
+};
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateKey,
     TrackedStateStoreReader,
@@ -943,6 +946,22 @@ where
     }
 }
 
+fn start_materialize_span(
+    transaction_count: usize,
+    commit_cohort_id: &str,
+) -> Option<ActiveTelemetrySpan> {
+    ActiveTelemetrySpan::start_current(
+        &TRANSACTION_MATERIALIZE,
+        vec![
+            TelemetryAttribute::i64(
+                "lix.transaction.count",
+                i64::try_from(transaction_count).unwrap_or(i64::MAX),
+            ),
+            TelemetryAttribute::string("lix.commit_cohort_id", commit_cohort_id),
+        ],
+    )
+}
+
 impl<StorageImpl> Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -1663,17 +1682,31 @@ where
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let mut transaction = self;
+        let commit_cohort_id = crate::telemetry::current_commit_cohort_id()
+            .unwrap_or_else(crate::telemetry::next_commit_cohort_id);
+        let materialize_span = start_materialize_span(1, &commit_cohort_id);
         let prepared_writes = match transaction.staged_writes.drain() {
             Ok(prepared_writes) => prepared_writes,
             Err(error) => {
                 transaction
                     .discard_pending_plugin_actor_publications()
                     .await;
+                if let Some(materialize_span) = materialize_span {
+                    materialize_span.finish(Status::error(error.code.clone()), vec![
+                        TelemetryAttribute::string("error.type", error.code.clone()),
+                    ]);
+                }
                 return Err(error);
             }
         };
         transaction
-            .commit_prepared(runtime_functions, prepared_writes, 1)
+            .commit_prepared(
+                runtime_functions,
+                prepared_writes,
+                1,
+                commit_cohort_id,
+                materialize_span,
+            )
             .await
     }
 
@@ -1682,25 +1715,15 @@ where
         runtime_functions: &FunctionContext,
         mut prepared_writes: PreparedWriteSet,
         transaction_count: usize,
+        commit_cohort_id: String,
+        materialize_span: Option<ActiveTelemetrySpan>,
     ) -> Result<TransactionCommitOutcome, LixError> {
         #[cfg(feature = "storage-benches")]
         let _phase =
             crate::storage_bench::enter_crud_phase(crate::storage_bench::CRUD_PHASE_COMMIT);
         let transaction = &mut self;
-        let commit_cohort_id = crate::telemetry::current_commit_cohort_id()
-            .unwrap_or_else(crate::telemetry::next_commit_cohort_id);
         let commit_boundary = transaction.commit_boundary.clone();
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
-        let materialize_span = ActiveTelemetrySpan::start_current(
-            &spans::TRANSACTION_MATERIALIZE,
-            vec![
-                TelemetryAttribute::u64(
-                    "lix.transaction.count",
-                    u64::try_from(transaction_count).unwrap_or(u64::MAX),
-                ),
-                TelemetryAttribute::string("lix.commit_cohort_id", commit_cohort_id.clone()),
-            ],
-        );
         let (
             writes,
             write_options,
@@ -1974,11 +1997,11 @@ where
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_crud_write_set_arena(&writes);
         let storage_span = ActiveTelemetrySpan::start_current(
-            &spans::TRANSACTION_STORAGE,
+            &TRANSACTION_STORAGE,
             vec![
-                TelemetryAttribute::u64(
+                TelemetryAttribute::i64(
                     "lix.transaction.count",
-                    u64::try_from(transaction_count).unwrap_or(u64::MAX),
+                    i64::try_from(transaction_count).unwrap_or(i64::MAX),
                 ),
                 TelemetryAttribute::string("lix.commit_cohort_id", commit_cohort_id.clone()),
             ],

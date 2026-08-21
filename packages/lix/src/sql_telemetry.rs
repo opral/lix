@@ -2,8 +2,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanStart, TelemetrySpanStatus,
-    spans,
+    ActiveTelemetrySpan, SQL_BATCH, SQL_COHERENT_READ_BATCH, SQL_QUERY, Status,
+    TelemetryAttribute, TelemetrySink, TelemetrySpanStart,
 };
 use crate::{ExecuteResult, LixError};
 
@@ -21,7 +21,7 @@ impl SqlStatementTelemetry {
         batch_index: Option<usize>,
     ) -> Option<Self> {
         let sink = sink?;
-        if !sink.enabled(&spans::SQL_QUERY) {
+        if !sink.enabled(&SQL_QUERY) {
             return None;
         }
         Some(Self {
@@ -54,8 +54,6 @@ fn statement_start(
     let operation = query_operation(&query_text);
     let fingerprint = blake3::hash(query_text.as_bytes()).to_hex().to_string();
     let mut attributes = vec![
-        TelemetryAttribute::string("otel.name", "lix.sql.query"),
-        TelemetryAttribute::string("otel.kind", "internal"),
         TelemetryAttribute::string("db.system.name", "lix"),
         TelemetryAttribute::string("db.operation.name", operation.clone()),
         TelemetryAttribute::string("db.query.summary", operation),
@@ -64,34 +62,35 @@ fn statement_start(
         TelemetryAttribute::string("lix.execution.kind", execution_kind),
     ];
     if let Some(batch_index) = batch_index {
-        attributes.push(TelemetryAttribute::u64(
+        attributes.push(TelemetryAttribute::i64(
             "lix.batch.index",
-            u64::try_from(batch_index).unwrap_or(u64::MAX),
+            i64::try_from(batch_index).unwrap_or(i64::MAX),
         ));
     }
-    TelemetrySpanStart::new(&spans::SQL_QUERY, attributes)
+    TelemetrySpanStart::new(&SQL_QUERY, attributes)
 }
 
 fn statement_end(
     result: &Result<ExecuteResult, LixError>,
-) -> (TelemetrySpanStatus, Vec<TelemetryAttribute>) {
+) -> (Status, Vec<TelemetryAttribute>) {
     match result {
         Ok(result) => (
-            TelemetrySpanStatus::Ok,
+            Status::Unset,
             vec![
-                TelemetryAttribute::u64(
+                TelemetryAttribute::i64(
                     "db.response.returned_rows",
-                    u64::try_from(result.len()).unwrap_or(u64::MAX),
+                    i64::try_from(result.len()).unwrap_or(i64::MAX),
                 ),
-                TelemetryAttribute::u64("lix.rows_affected", result.rows_affected()),
-                TelemetryAttribute::string("otel.status_code", "OK"),
+                TelemetryAttribute::i64(
+                    "lix.rows_affected",
+                    i64::try_from(result.rows_affected()).unwrap_or(i64::MAX),
+                ),
             ],
         ),
         Err(error) => (
-            TelemetrySpanStatus::Error,
+            Status::error(error.code.clone()),
             vec![
                 TelemetryAttribute::string("error.type", error.code.clone()),
-                TelemetryAttribute::string("otel.status_code", "ERROR"),
             ],
         ),
     }
@@ -106,9 +105,9 @@ pub(crate) fn start_batch(
     if !sink.enabled(descriptor) {
         return None;
     }
-    let execution_kind = if descriptor == &spans::SQL_BATCH {
+    let execution_kind = if descriptor == &SQL_BATCH {
         "batch"
-    } else if descriptor == &spans::SQL_COHERENT_READ_BATCH {
+    } else if descriptor == &SQL_COHERENT_READ_BATCH {
         "coherent_read_batch"
     } else {
         return None;
@@ -118,12 +117,10 @@ pub(crate) fn start_batch(
         TelemetrySpanStart::new(
             descriptor,
             vec![
-                TelemetryAttribute::string("otel.name", descriptor.name()),
-                TelemetryAttribute::string("otel.kind", "internal"),
                 TelemetryAttribute::string("db.system.name", "lix"),
-                TelemetryAttribute::u64(
+                TelemetryAttribute::i64(
                     "db.operation.batch.size",
-                    u64::try_from(size).unwrap_or(u64::MAX),
+                    i64::try_from(size).unwrap_or(i64::MAX),
                 ),
                 TelemetryAttribute::string("lix.execution.kind", execution_kind),
             ],
@@ -133,15 +130,11 @@ pub(crate) fn start_batch(
 
 pub(crate) fn finish_operation<T>(span: ActiveTelemetrySpan, result: &Result<T, LixError>) {
     match result {
-        Ok(_) => span.finish(
-            TelemetrySpanStatus::Ok,
-            vec![TelemetryAttribute::string("otel.status_code", "OK")],
-        ),
+        Ok(_) => span.finish(Status::Unset, Vec::new()),
         Err(error) => span.finish(
-            TelemetrySpanStatus::Error,
+            Status::error(error.code.clone()),
             vec![
                 TelemetryAttribute::string("error.type", error.code.clone()),
-                TelemetryAttribute::string("otel.status_code", "ERROR"),
             ],
         ),
     }

@@ -4,6 +4,7 @@ import type {
 	LixStorageProviderModule,
 	SyncServerBindingOptions,
 	TelemetryDispatch,
+	TelemetryParentContext,
 } from "./binding-types.js";
 
 // Generated before TypeScript compilation and emitted beside this module.
@@ -19,12 +20,13 @@ function initializeWasm(): Promise<unknown> {
 export async function openLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
 ): Promise<LixBinding> {
 	await initializeWasm();
 	switch (storage.kind) {
 		case "memory":
-			return openMemory(telemetry, server) as Promise<LixBinding>;
+			return openMemory(telemetry, telemetryParent, server) as Promise<LixBinding>;
 		case "jsStorage": {
 			const module = (await import(
 				/* @vite-ignore */ storage.moduleUrl
@@ -39,6 +41,7 @@ export async function openLixBinding(
 				const binding = (await openJsStorage(
 					provider,
 					telemetry,
+					telemetryParent,
 					server,
 				)) as unknown as LixBinding;
 				return binding;

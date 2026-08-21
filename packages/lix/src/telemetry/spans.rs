@@ -1,6 +1,7 @@
 //! Production span descriptors. Each stable name is declared once.
 
 use super::{TelemetrySpanClass, TelemetrySpanDescriptor};
+use opentelemetry::trace::SpanKind;
 
 macro_rules! define_production_spans {
     ($(
@@ -21,11 +22,7 @@ macro_rules! define_production_spans {
                         $name,
                         $($attr = tracing::field::Empty,)*
                         "error.type" = tracing::field::Empty,
-                        "otel.status_code" = tracing::field::Empty,
-                        "lix.trace_id" = tracing::field::Empty,
-                        "lix.span_id" = tracing::field::Empty,
-                        "lix.parent_span_id" = tracing::field::Empty,
-                        "lix.span.links" = tracing::field::Empty,
+                        "lix.operation.cancelled" = tracing::field::Empty,
                     )
                 }
 
@@ -33,10 +30,11 @@ macro_rules! define_production_spans {
                 pub static $ident: TelemetrySpanDescriptor = TelemetrySpanDescriptor {
                     name: $name,
                     class: TelemetrySpanClass::$class,
+                    kind: SpanKind::Internal,
                     allowed_attributes: &[
                         $($attr,)*
                         "error.type",
-                        "otel.status_code",
+                        "lix.operation.cancelled",
                     ],
                     create_tracing_span: [<create_ $ident>],
                 };
@@ -71,8 +69,6 @@ define_production_spans! {
         class: Sql,
         target: "lix_sql",
         attributes: [
-            "otel.name",
-            "otel.kind",
             "db.system.name",
             "db.operation.name",
             "db.query.summary",
@@ -89,8 +85,6 @@ define_production_spans! {
         class: Sql,
         target: "lix_sql",
         attributes: [
-            "otel.name",
-            "otel.kind",
             "db.system.name",
             "db.operation.batch.size",
             "lix.execution.kind",
@@ -101,8 +95,6 @@ define_production_spans! {
         class: Sql,
         target: "lix_sql",
         attributes: [
-            "otel.name",
-            "otel.kind",
             "db.system.name",
             "db.operation.batch.size",
             "lix.execution.kind",

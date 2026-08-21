@@ -116,12 +116,18 @@ test("sync mode forwards static headers through the native transport", async () 
 }, 30_000);
 
 test("openLix forwards opt-in SQL telemetry from the engine", async () => {
+	let activeParent = {
+		traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		spanId: "aaaaaaaaaaaaaaaa",
+		traceFlags: 1,
+	};
 	let resolveSpan!: (span: LixTelemetrySpan) => void;
 	const received = new Promise<LixTelemetrySpan>((resolve) => {
 		resolveSpan = resolve;
 	});
 	const lix = await openLix({
 		telemetry: {
+			parentContext: () => activeParent,
 			onSpan(span) {
 				if (
 					span.name === "lix.sql.query" &&
@@ -134,15 +140,24 @@ test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 		},
 	});
 
+	activeParent = {
+		traceId: "0123456789abcdef0123456789abcdef",
+		spanId: "0123456789abcdef",
+		traceFlags: 1,
+	};
 	await lix.execute("SELECT 'private-value' AS value, 42 AS number");
 	const span = await received;
 	expect(span).toMatchObject({
-		schemaVersion: 2,
+		schemaVersion: 3,
 		name: "lix.sql.query",
-		status: "ok",
+		kind: "internal",
+		traceFlags: 1,
+		status: { code: "unset" },
 	});
 	expect(span.durationMs).toBeGreaterThanOrEqual(0);
 	expect(span.traceId).toMatch(/^[0-9a-f]{32}$/u);
+	expect(span.traceId).toBe("0123456789abcdef0123456789abcdef");
+	expect(span.parentSpanId).toBe("0123456789abcdef");
 	expect(span.spanId).toMatch(/^[0-9a-f]{16}$/u);
 	expect(span.attributes["db.query.text"]).toBe(
 		"SELECT ? AS value, ? AS number",

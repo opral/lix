@@ -1,13 +1,21 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 
-pub(crate) mod spans;
+pub use opentelemetry::trace::{SpanContext, SpanKind, Status};
+use opentelemetry::trace::{TraceContextExt as _, TraceFlags, TraceState};
+use opentelemetry::Context as OpenTelemetryContext;
+use opentelemetry_sdk::trace::{IdGenerator as _, RandomIdGenerator};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+mod spans;
+pub(crate) use spans::{
+    CHECKPOINT_CREATE, ENGINE_OPEN, REPOSITORY_OPENED, SESSION_OPEN, SQL_BATCH,
+    SQL_COHERENT_READ_BATCH, SQL_QUERY, TRANSACTION_MATERIALIZE, TRANSACTION_NOTIFY,
+    TRANSACTION_STORAGE, TRANSACTION_WAIT,
+};
 
 /// A stable, coarse category that lets sinks filter telemetry without making
 /// every Lix operation a public Rust enum variant.
@@ -20,11 +28,12 @@ pub enum TelemetrySpanClass {
 
 /// Opaque production-span identity. Declared once by the internal descriptor
 /// macro: stable name, coarse class, allowed attributes, and the tracing
-/// callsite used by [`TracingTelemetrySink`].
-#[derive(Clone, Copy)]
+/// callsite used by [`OpenTelemetryTracingSink`].
+#[derive(Clone)]
 pub struct TelemetrySpanDescriptor {
     pub(crate) name: &'static str,
     pub(crate) class: TelemetrySpanClass,
+    pub(crate) kind: SpanKind,
     pub(crate) allowed_attributes: &'static [&'static str],
     pub(crate) create_tracing_span: fn() -> tracing::Span,
 }
@@ -56,6 +65,10 @@ impl TelemetrySpanDescriptor {
         self.class
     }
 
+    pub fn kind(&self) -> SpanKind {
+        self.kind.clone()
+    }
+
     fn allows(&self, key: &str) -> bool {
         self.allowed_attributes.contains(&key)
     }
@@ -76,10 +89,17 @@ impl TelemetryAttribute {
         }
     }
 
-    pub fn u64(key: &'static str, value: u64) -> Self {
+    pub fn i64(key: &'static str, value: i64) -> Self {
         Self {
             key,
-            value: TelemetryValue::U64(value),
+            value: TelemetryValue::I64(value),
+        }
+    }
+
+    pub fn boolean(key: &'static str, value: bool) -> Self {
+        Self {
+            key,
+            value: TelemetryValue::Boolean(value),
         }
     }
 }
@@ -87,15 +107,8 @@ impl TelemetryAttribute {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelemetryValue {
     String(String),
-    U64(u64),
+    I64(i64),
     Boolean(bool),
-}
-
-/// A causal link from one physical operation to a logical transaction span.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TelemetrySpanLink {
-    pub trace_id: String,
-    pub span_id: String,
 }
 
 /// Information available when an engine operation begins.
@@ -103,10 +116,12 @@ pub struct TelemetrySpanLink {
 pub struct TelemetrySpanStart {
     pub class: TelemetrySpanClass,
     pub name: &'static str,
-    pub trace_id: String,
-    pub span_id: String,
-    pub parent_span_id: Option<String>,
-    pub links: Vec<TelemetrySpanLink>,
+    pub kind: SpanKind,
+    /// The authoritative OpenTelemetry parent, including sampling flags and
+    /// trace state. Sinks must use this as the actual parent, not as attributes.
+    pub parent_span_context: Option<SpanContext>,
+    /// OpenTelemetry span links for causal parents that are not the tree parent.
+    pub links: Vec<SpanContext>,
     pub started_at_unix_ms: u64,
     pub attributes: Vec<TelemetryAttribute>,
     descriptor: &'static TelemetrySpanDescriptor,
@@ -121,9 +136,8 @@ impl TelemetrySpanStart {
         Self {
             class: descriptor.class,
             name: descriptor.name,
-            trace_id: String::new(),
-            span_id: String::new(),
-            parent_span_id: None,
+            kind: descriptor.kind.clone(),
+            parent_span_context: None,
             links: Vec::new(),
             started_at_unix_ms: unix_time_ms(),
             attributes,
@@ -136,24 +150,19 @@ impl TelemetrySpanStart {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TelemetrySpanStatus {
-    Ok,
-    Error,
-    Cancelled,
-}
-
 /// Information available when an engine operation finishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetrySpanEnd {
     pub duration_ns: u64,
-    pub status: TelemetrySpanStatus,
+    pub status: Status,
     pub attributes: Vec<TelemetryAttribute>,
 }
 
 /// A completed span used by callback and cross-runtime adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedTelemetrySpan {
+    /// The context assigned by the sink that created the span.
+    pub span_context: SpanContext,
     pub start: TelemetrySpanStart,
     pub end: TelemetrySpanEnd,
 }
@@ -172,6 +181,9 @@ pub trait TelemetrySink: Send + Sync {
 /// A live span. `enter` is used on every future poll so native tracing keeps
 /// correct async parentage without holding an entered span across an await.
 pub trait TelemetrySpanHandle: Send + Sync {
+    /// Returns the authoritative context assigned by this sink. It must be
+    /// valid according to the OpenTelemetry trace specification.
+    fn span_context(&self) -> &SpanContext;
     fn enter(&self) -> Box<dyn TelemetrySpanEnterGuard + '_>;
     fn finish(self: Box<Self>, end: TelemetrySpanEnd);
 }
@@ -184,20 +196,38 @@ impl TelemetrySpanEnterGuard for () {}
 #[expect(missing_debug_implementations)]
 pub struct CallbackTelemetrySink {
     callback: Arc<dyn Fn(CompletedTelemetrySpan) + Send + Sync>,
+    root_parent: Option<SpanContext>,
 }
 
 impl CallbackTelemetrySink {
     pub fn new(callback: impl Fn(CompletedTelemetrySpan) + Send + Sync + 'static) -> Self {
         Self {
             callback: Arc::new(callback),
+            root_parent: None,
         }
+    }
+
+    /// Uses `parent` as the remote parent of every otherwise-root span.
+    /// This is the explicit propagation boundary for hosts whose active
+    /// OpenTelemetry context cannot cross the Rust FFI boundary implicitly.
+    pub fn with_root_parent(mut self, parent: SpanContext) -> Self {
+        assert!(parent.is_valid(), "telemetry root parent must be valid");
+        self.root_parent = Some(parent);
+        self
     }
 }
 
 impl TelemetrySink for CallbackTelemetrySink {
-    fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
+    fn start_span(&self, mut start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
+        if start.parent_span_context.is_none() {
+            start.parent_span_context = self.root_parent.clone();
+        }
+        let span_context = new_span_context(start.parent_span_context.as_ref());
+        let recording = span_context.is_sampled();
         Box::new(CallbackTelemetrySpan {
             callback: Arc::clone(&self.callback),
+            span_context,
+            recording,
             start,
         })
     }
@@ -205,17 +235,27 @@ impl TelemetrySink for CallbackTelemetrySink {
 
 struct CallbackTelemetrySpan {
     callback: Arc<dyn Fn(CompletedTelemetrySpan) + Send + Sync>,
+    span_context: SpanContext,
+    recording: bool,
     start: TelemetrySpanStart,
 }
 
 impl TelemetrySpanHandle for CallbackTelemetrySpan {
+    fn span_context(&self) -> &SpanContext {
+        &self.span_context
+    }
+
     fn enter(&self) -> Box<dyn TelemetrySpanEnterGuard + '_> {
         Box::new(())
     }
 
     fn finish(self: Box<Self>, end: TelemetrySpanEnd) {
+        if !self.recording {
+            return;
+        }
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             (self.callback)(CompletedTelemetrySpan {
+                span_context: self.span_context,
                 start: self.start,
                 end,
             });
@@ -223,20 +263,40 @@ impl TelemetrySpanHandle for CallbackTelemetrySpan {
     }
 }
 
-/// Explicit adapter from engine telemetry into the Rust `tracing` ecosystem.
-///
-/// This sink is not a second source of names. It opens the callsite owned by
-/// the descriptor and records the same ids the callback plane receives.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TracingTelemetrySink;
+pub(crate) fn new_span_context(parent: Option<&SpanContext>) -> SpanContext {
+    let generator = RandomIdGenerator::default();
+    let trace_id = parent
+        .filter(|parent| parent.is_valid())
+        .map_or_else(|| generator.new_trace_id(), SpanContext::trace_id);
+    let trace_flags = parent.map_or(TraceFlags::SAMPLED, SpanContext::trace_flags);
+    let trace_state = parent
+        .map(SpanContext::trace_state)
+        .cloned()
+        .unwrap_or(TraceState::NONE);
+    SpanContext::new(
+        trace_id,
+        generator.new_span_id(),
+        trace_flags,
+        false,
+        trace_state,
+    )
+}
 
-impl TracingTelemetrySink {
+/// OpenTelemetry-compliant adapter from engine telemetry into `tracing`.
+///
+/// The active subscriber must include `tracing-opentelemetry`. This adapter
+/// sets real OpenTelemetry parents, links, attributes, and status, and returns
+/// the context assigned by that layer. It never creates shadow identifiers.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OpenTelemetryTracingSink;
+
+impl OpenTelemetryTracingSink {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl TelemetrySink for TracingTelemetrySink {
+impl TelemetrySink for OpenTelemetryTracingSink {
     fn enabled(&self, descriptor: &TelemetrySpanDescriptor) -> bool {
         match descriptor.class {
             TelemetrySpanClass::Sql | TelemetrySpanClass::Performance => {
@@ -250,65 +310,58 @@ impl TelemetrySink for TracingTelemetrySink {
 
     fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
         let span = (start.descriptor.create_tracing_span)();
-        span.record("lix.trace_id", start.trace_id.as_str());
-        span.record("lix.span_id", start.span_id.as_str());
-        if let Some(parent_span_id) = start.parent_span_id.as_deref() {
-            span.record("lix.parent_span_id", parent_span_id);
+        if let Some(parent) = start.parent_span_context.as_ref() {
+            span.set_parent(
+                OpenTelemetryContext::new().with_remote_span_context(parent.clone()),
+            )
+            .expect("tracing-opentelemetry rejected the Lix span parent");
         }
-        if !start.links.is_empty() {
-            let links = encode_links(&start.links);
-            span.record("lix.span.links", links.as_str());
+        for link in &start.links {
+            span.add_link(link.clone());
         }
         for attribute in &start.attributes {
             record_attribute(&span, attribute);
         }
-        Box::new(TracingTelemetrySpan { span })
+        let span_context = span.context().span().span_context().clone();
+        assert!(
+            span_context.is_valid(),
+            "OpenTelemetryTracingSink requires an active tracing-opentelemetry layer"
+        );
+        Box::new(OpenTelemetryTracingSpan { span, span_context })
     }
 }
 
-struct TracingTelemetrySpan {
+struct OpenTelemetryTracingSpan {
     span: tracing::Span,
+    span_context: SpanContext,
 }
 
-struct TracingTelemetrySpanEnterGuard<'a>(#[allow(dead_code)] tracing::span::Entered<'a>);
+struct OpenTelemetryTracingSpanEnterGuard<'a>(#[allow(dead_code)] tracing::span::Entered<'a>);
 
-impl TelemetrySpanEnterGuard for TracingTelemetrySpanEnterGuard<'_> {}
+impl TelemetrySpanEnterGuard for OpenTelemetryTracingSpanEnterGuard<'_> {}
 
-impl TelemetrySpanHandle for TracingTelemetrySpan {
+impl TelemetrySpanHandle for OpenTelemetryTracingSpan {
+    fn span_context(&self) -> &SpanContext {
+        &self.span_context
+    }
+
     fn enter(&self) -> Box<dyn TelemetrySpanEnterGuard + '_> {
-        Box::new(TracingTelemetrySpanEnterGuard(self.span.enter()))
+        Box::new(OpenTelemetryTracingSpanEnterGuard(self.span.enter()))
     }
 
     fn finish(self: Box<Self>, end: TelemetrySpanEnd) {
         for attribute in &end.attributes {
             record_attribute(&self.span, attribute);
         }
-        self.span.record(
-            "otel.status_code",
-            match end.status {
-                TelemetrySpanStatus::Ok => "OK",
-                TelemetrySpanStatus::Error | TelemetrySpanStatus::Cancelled => "ERROR",
-            },
-        );
-        if end.status == TelemetrySpanStatus::Cancelled {
-            self.span.record("error.type", "cancelled");
-        }
+        self.span.set_status(end.status.clone());
         drop(self);
     }
-}
-
-fn encode_links(links: &[TelemetrySpanLink]) -> String {
-    links
-        .iter()
-        .map(|link| format!("{}:{}", link.trace_id, link.span_id))
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 fn record_attribute(span: &tracing::Span, attribute: &TelemetryAttribute) {
     match &attribute.value {
         TelemetryValue::String(value) => span.record(attribute.key, value.as_str()),
-        TelemetryValue::U64(value) => span.record(attribute.key, *value),
+        TelemetryValue::I64(value) => span.record(attribute.key, *value),
         TelemetryValue::Boolean(value) => span.record(attribute.key, *value),
     };
 }
@@ -331,28 +384,62 @@ fn debug_assert_attributes(descriptor: &TelemetrySpanDescriptor, attributes: &[T
 #[derive(Clone)]
 pub(crate) struct TelemetryContext {
     sink: Arc<dyn TelemetrySink>,
-    trace_id: String,
-    span_id: String,
+    span_context: SpanContext,
     commit_cohort_id: Option<String>,
-    links: Vec<TelemetrySpanLink>,
+    links: Vec<SpanContext>,
 }
 
 thread_local! {
     static CURRENT_TELEMETRY: RefCell<Vec<TelemetryContext>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_REMOTE_PARENT: RefCell<Vec<SpanContext>> = const { RefCell::new(Vec::new()) };
 }
 
-static NEXT_TELEMETRY_ID: AtomicU64 = AtomicU64::new(1);
+struct CurrentRemoteParentGuard;
 
-fn next_span_id() -> String {
-    format!("{:016x}", NEXT_TELEMETRY_ID.fetch_add(1, Ordering::Relaxed))
+impl Drop for CurrentRemoteParentGuard {
+    fn drop(&mut self) {
+        CURRENT_REMOTE_PARENT.with(|current| {
+            current.borrow_mut().pop();
+        });
+    }
+}
+
+fn enter_remote_parent(parent: &SpanContext) -> CurrentRemoteParentGuard {
+    CURRENT_REMOTE_PARENT.with(|current| current.borrow_mut().push(parent.clone()));
+    CurrentRemoteParentGuard
+}
+
+/// Scopes an FFI-propagated remote parent to polls of one operation future.
+/// Unrelated tasks polled by the same executor do not observe this context.
+pub fn instrument_remote_parent<F>(
+    parent: Option<SpanContext>,
+    future: F,
+) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    RemoteParentFuture {
+        future: Box::pin(future),
+        parent,
+    }
+}
+
+struct RemoteParentFuture<F> {
+    future: Pin<Box<F>>,
+    parent: Option<SpanContext>,
+}
+
+impl<F: Future> Future for RemoteParentFuture<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, task: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let _entered = self.parent.as_ref().map(enter_remote_parent);
+        self.future.as_mut().poll(task)
+    }
 }
 
 pub(crate) fn next_commit_cohort_id() -> String {
-    next_span_id()
-}
-
-fn next_trace_id() -> String {
-    format!("{:016x}{}", unix_time_ms(), next_span_id())
+    RandomIdGenerator::default().new_trace_id().to_string()
 }
 
 fn current_context_for(sink: &Arc<dyn TelemetrySink>) -> Option<TelemetryContext> {
@@ -387,8 +474,7 @@ impl TelemetryContext {
     pub(crate) fn root(sink: Arc<dyn TelemetrySink>) -> Self {
         Self {
             sink,
-            trace_id: next_trace_id(),
-            span_id: String::new(),
+            span_context: SpanContext::NONE,
             commit_cohort_id: None,
             links: Vec::new(),
         }
@@ -399,24 +485,22 @@ impl TelemetryContext {
         self
     }
 
-    pub(crate) fn with_links(mut self, links: Vec<TelemetrySpanLink>) -> Self {
+    pub(crate) fn with_links(mut self, links: Vec<SpanContext>) -> Self {
         self.links = links;
         self
     }
 
-    pub(crate) fn as_link(&self) -> Option<TelemetrySpanLink> {
-        (!self.span_id.is_empty()).then(|| TelemetrySpanLink {
-            trace_id: self.trace_id.clone(),
-            span_id: self.span_id.clone(),
-        })
+    pub(crate) fn as_link(&self) -> Option<SpanContext> {
+        self.span_context
+            .is_valid()
+            .then(|| self.span_context.clone())
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(sink: Arc<dyn TelemetrySink>, trace_id: &str, span_id: &str) -> Self {
+    pub(crate) fn for_test(sink: Arc<dyn TelemetrySink>, span_context: SpanContext) -> Self {
         Self {
             sink,
-            trace_id: trace_id.to_string(),
-            span_id: span_id.to_string(),
+            span_context,
             commit_cohort_id: None,
             links: Vec::new(),
         }
@@ -446,7 +530,7 @@ pub(crate) struct TelemetryContextFuture<'a, F> {
 impl<F: Future> Future for TelemetryContextFuture<'_, F> {
     type Output = F::Output;
 
-    fn poll(mut self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, task: &mut TaskContext<'_>) -> Poll<Self::Output> {
         let _entered = self.context.enter();
         self.future.as_mut().poll(task)
     }
@@ -486,27 +570,31 @@ impl ActiveTelemetrySpan {
                 }
             }
         }
-        start.trace_id = parent
-            .as_ref()
-            .map_or_else(next_trace_id, |parent| parent.trace_id.clone());
-        start.span_id = next_span_id();
-        start.parent_span_id = parent
-            .as_ref()
-            .filter(|parent| !parent.span_id.is_empty())
-            .map(|parent| parent.span_id.clone());
+        if let Some(parent_span_context) = parent.as_ref().and_then(TelemetryContext::as_link) {
+            start.parent_span_context = Some(parent_span_context);
+        } else if start.parent_span_context.is_none() {
+            start.parent_span_context = CURRENT_REMOTE_PARENT
+                .with(|current| current.borrow().last().cloned());
+        }
+        debug_assert_attributes(start.descriptor, &start.attributes);
+        let descriptor = start.descriptor;
+        let links = start.links.clone();
+        let handle = sink.start_span(start);
+        let span_context = handle.span_context().clone();
+        assert!(
+            span_context.is_valid(),
+            "TelemetrySink returned an invalid OpenTelemetry SpanContext"
+        );
         let context = TelemetryContext {
             sink: Arc::clone(sink),
-            trace_id: start.trace_id.clone(),
-            span_id: start.span_id.clone(),
+            span_context,
             commit_cohort_id: parent
                 .as_ref()
                 .and_then(|parent| parent.commit_cohort_id.clone()),
-            links: start.links.clone(),
+            links,
         };
-        debug_assert_attributes(start.descriptor, &start.attributes);
-        let descriptor = start.descriptor;
         Self {
-            handle: Some(sink.start_span(start)),
+            handle: Some(handle),
             started: web_time::Instant::now(),
             context,
             descriptor,
@@ -540,9 +628,13 @@ impl ActiveTelemetrySpan {
         }
     }
 
+    pub(crate) fn telemetry_context(&self) -> TelemetryContext {
+        self.context.clone()
+    }
+
     pub(crate) fn finish(
         mut self,
-        status: TelemetrySpanStatus,
+        status: Status,
         attributes: Vec<TelemetryAttribute>,
     ) {
         debug_assert_attributes(self.descriptor, &attributes);
@@ -614,7 +706,7 @@ where
 {
     type Output = Result<T, crate::LixError>;
 
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let entered = this.span.as_ref().map(ActiveTelemetrySpan::enter);
         let result = this.future.as_mut().poll(context);
@@ -623,9 +715,9 @@ where
             Poll::Ready(result) => {
                 if let Some(span) = this.span.take() {
                     match &result {
-                        Ok(_) => span.finish(TelemetrySpanStatus::Ok, Vec::new()),
+                        Ok(_) => span.finish(Status::Unset, Vec::new()),
                         Err(error) => span.finish(
-                            TelemetrySpanStatus::Error,
+                            Status::error(error.code.clone()),
                             vec![TelemetryAttribute::string("error.type", error.code.clone())],
                         ),
                     }
@@ -648,7 +740,7 @@ where
 {
     type Output = T;
 
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let entered = this.span.as_ref().map(ActiveTelemetrySpan::enter);
         let result = this.future.as_mut().poll(context);
@@ -656,7 +748,7 @@ where
         match result {
             Poll::Ready(value) => {
                 if let Some(span) = this.span.take() {
-                    span.finish(TelemetrySpanStatus::Ok, Vec::new());
+                    span.finish(Status::Unset, Vec::new());
                 }
                 Poll::Ready(value)
             }
@@ -673,8 +765,8 @@ impl Drop for ActiveTelemetrySpan {
         let duration_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         handle.finish(TelemetrySpanEnd {
             duration_ns,
-            status: TelemetrySpanStatus::Cancelled,
-            attributes: Vec::new(),
+            status: Status::Unset,
+            attributes: vec![TelemetryAttribute::boolean("lix.operation.cancelled", true)],
         });
     }
 }
@@ -695,7 +787,7 @@ where
 {
     type Output = F::Output;
 
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<Self::Output> {
         let _entered = self.span.enter();
         self.future.as_mut().poll(context)
     }
@@ -730,7 +822,7 @@ pub fn bind_session(
     let Some(sink) = sink else {
         return;
     };
-    if !sink.enabled(&spans::REPOSITORY_OPENED) {
+    if !sink.enabled(&REPOSITORY_OPENED) {
         return;
     }
     let mut attributes = vec![
@@ -742,15 +834,18 @@ pub fn bind_session(
     }
     let span = ActiveTelemetrySpan::start(
         sink,
-        TelemetrySpanStart::new(&spans::REPOSITORY_OPENED, attributes),
+        TelemetrySpanStart::new(&REPOSITORY_OPENED, attributes),
     );
-    span.finish(TelemetrySpanStatus::Ok, Vec::new());
+    span.finish(Status::Unset, Vec::new());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use std::sync::Mutex;
+    use tracing_subscriber::prelude::*;
 
     struct RecordingSink {
         opened_enabled: bool,
@@ -788,13 +883,17 @@ mod tests {
 
         fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
             self.started.lock().expect("started spans").push(start);
-            Box::new(RecordingHandle)
+            Box::new(RecordingHandle(new_span_context(None)))
         }
     }
 
-    struct RecordingHandle;
+    struct RecordingHandle(SpanContext);
 
     impl TelemetrySpanHandle for RecordingHandle {
+        fn span_context(&self) -> &SpanContext {
+            &self.0
+        }
+
         fn enter(&self) -> Box<dyn TelemetrySpanEnterGuard + '_> {
             Box::new(())
         }
@@ -829,6 +928,116 @@ mod tests {
     }
 
     #[test]
+    fn callback_context_inherits_trace_flags_and_trace_state() {
+        let root = new_span_context(None);
+        let trace_state = TraceState::from_key_value([("vendor", "state")]).expect("trace state");
+        let parent = SpanContext::new(
+            root.trace_id(),
+            root.span_id(),
+            TraceFlags::NOT_SAMPLED,
+            true,
+            trace_state.clone(),
+        );
+        let child = new_span_context(Some(&parent));
+        assert_eq!(child.trace_id(), parent.trace_id());
+        assert_eq!(child.trace_flags(), TraceFlags::NOT_SAMPLED);
+        assert_eq!(child.trace_state(), &trace_state);
+        assert!(!child.is_remote());
+        assert_ne!(child.span_id(), parent.span_id());
+    }
+
+    #[test]
+    fn callback_sink_does_not_export_unsampled_spans() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink = CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("completed").push(span);
+        });
+        let root = new_span_context(None);
+        let parent = SpanContext::new(
+            root.trace_id(),
+            root.span_id(),
+            TraceFlags::NOT_SAMPLED,
+            false,
+            TraceState::NONE,
+        );
+        let mut start = TelemetrySpanStart::new(&SQL_QUERY, Vec::new());
+        start.parent_span_context = Some(parent);
+        let handle = sink.start_span(start);
+        assert!(!handle.span_context().is_sampled());
+        handle.finish(TelemetrySpanEnd {
+            duration_ns: 1,
+            status: Status::Unset,
+            attributes: Vec::new(),
+        });
+        assert!(completed.lock().expect("completed").is_empty());
+    }
+
+    #[test]
+    fn callback_sink_uses_explicit_remote_parent_for_root_spans() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let generated = new_span_context(None);
+        let parent = SpanContext::new(
+            generated.trace_id(),
+            generated.span_id(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::NONE,
+        );
+        let sink = CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("completed").push(span);
+        })
+        .with_root_parent(parent.clone());
+        let handle = sink.start_span(TelemetrySpanStart::new(&SQL_QUERY, Vec::new()));
+        assert_eq!(handle.span_context().trace_id(), parent.trace_id());
+        handle.finish(TelemetrySpanEnd {
+            duration_ns: 1,
+            status: Status::Unset,
+            attributes: Vec::new(),
+        });
+        let completed = completed.lock().expect("completed");
+        assert_eq!(completed[0].start.parent_span_context, Some(parent));
+    }
+
+    #[test]
+    fn ffi_remote_parent_is_scoped_to_one_operation_future() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("completed").push(span);
+        }));
+        let generated = new_span_context(None);
+        let parent = SpanContext::new(
+            generated.trace_id(),
+            generated.span_id(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::NONE,
+        );
+        futures_lite::future::block_on(instrument_remote_parent(
+            Some(parent.clone()),
+            async {
+                let span = ActiveTelemetrySpan::start_if_enabled(
+                    &sink,
+                    &SQL_QUERY,
+                    Vec::new(),
+                )
+                .expect("query span");
+                span.finish(Status::Unset, Vec::new());
+            },
+        ));
+        let outside = ActiveTelemetrySpan::start_if_enabled(&sink, &SQL_QUERY, Vec::new())
+            .expect("outside query span");
+        outside.finish(Status::Unset, Vec::new());
+
+        let completed = completed.lock().expect("completed");
+        assert_eq!(completed[0].start.parent_span_context, Some(parent));
+        assert!(completed[1].start.parent_span_context.is_none());
+        assert_ne!(completed[0].span_context.trace_id(), completed[1].span_context.trace_id());
+    }
+
+    #[test]
     fn absent_sink_does_no_opened_span_work() {
         bind_session(None, "lix-id", "branch-id", Some("account-id"));
     }
@@ -854,7 +1063,7 @@ mod tests {
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].class, TelemetrySpanClass::Lifecycle);
         assert_eq!(started[0].name, "lix.repository.opened");
-        assert_eq!(started[0].descriptor(), &spans::REPOSITORY_OPENED);
+        assert_eq!(started[0].descriptor(), &REPOSITORY_OPENED);
         assert_eq!(attribute_string(&started[0], "lix.id"), Some("lix-id"));
         assert_eq!(
             attribute_string(&started[0], "lix.branch_id"),
@@ -891,12 +1100,16 @@ mod tests {
         }));
         drop(ActiveTelemetrySpan::start(
             &sink,
-            TelemetrySpanStart::new(&spans::ENGINE_OPEN, Vec::new()),
+            TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()),
         ));
         let completed = completed.lock().expect("completed");
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].start.name, "lix.engine.open");
-        assert_eq!(completed[0].end.status, TelemetrySpanStatus::Cancelled);
+        assert_eq!(completed[0].end.status, Status::Unset);
+        assert!(completed[0].end.attributes.iter().any(|attribute| {
+            attribute.key == "lix.operation.cancelled"
+                && attribute.value == TelemetryValue::Boolean(true)
+        }));
     }
 
     #[test]
@@ -908,7 +1121,7 @@ mod tests {
         }));
         let span = ActiveTelemetrySpan::start(
             &sink,
-            TelemetrySpanStart::new(&spans::SESSION_OPEN, Vec::new()),
+            TelemetrySpanStart::new(&SESSION_OPEN, Vec::new()),
         );
         drop(instrument_lix_result(
             Some(span),
@@ -916,7 +1129,11 @@ mod tests {
         ));
         let completed = completed.lock().expect("completed");
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].end.status, TelemetrySpanStatus::Cancelled);
+        assert_eq!(completed[0].end.status, Status::Unset);
+        assert!(completed[0].end.attributes.iter().any(|attribute| {
+            attribute.key == "lix.operation.cancelled"
+                && attribute.value == TelemetryValue::Boolean(true)
+        }));
     }
 
     #[test]
@@ -926,26 +1143,17 @@ mod tests {
         let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
             captured.lock().expect("completed").push(span);
         }));
-        let links = vec![
-            TelemetrySpanLink {
-                trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                span_id: "1111111111111111".to_string(),
-            },
-            TelemetrySpanLink {
-                trace_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-                span_id: "2222222222222222".to_string(),
-            },
-        ];
+        let links = vec![new_span_context(None), new_span_context(None)];
         let context = TelemetryContext::root(Arc::clone(&sink))
             .with_commit_cohort_id("cohort-1".to_string())
             .with_links(links.clone());
         futures_lite::future::block_on(context.instrument(async {
             let span = ActiveTelemetrySpan::start_current(
-                &spans::TRANSACTION_MATERIALIZE,
-                vec![TelemetryAttribute::u64("lix.transaction.count", 2)],
+                &TRANSACTION_MATERIALIZE,
+                vec![TelemetryAttribute::i64("lix.transaction.count", 2)],
             )
             .expect("materialize enabled");
-            span.finish(TelemetrySpanStatus::Ok, Vec::new());
+            span.finish(Status::Unset, Vec::new());
         }));
         let completed = completed.lock().expect("completed");
         assert_eq!(completed.len(), 1);
@@ -955,5 +1163,64 @@ mod tests {
             attribute_string(&completed[0].start, "lix.commit_cohort_id"),
             Some("cohort-1")
         );
+    }
+
+    #[test]
+    fn tracing_sink_exports_real_parent_context_links_and_status() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("lix");
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(tracer)),
+        );
+        let sink: Arc<dyn TelemetrySink> = Arc::new(OpenTelemetryTracingSink::new());
+        let parent = ActiveTelemetrySpan::start(
+            &sink,
+            TelemetrySpanStart::new(&SQL_BATCH, Vec::new()),
+        );
+        let parent_context = parent.telemetry_context();
+        let parent_span_context = parent_context.span_context.clone();
+        let linked_context = new_span_context(None);
+        let child_context = parent_context.with_links(vec![linked_context.clone()]);
+        futures_lite::future::block_on(child_context.instrument(async {
+            let child = ActiveTelemetrySpan::start_current(
+                &TRANSACTION_MATERIALIZE,
+                vec![TelemetryAttribute::i64("lix.transaction.count", 2)],
+            )
+            .expect("materialize span");
+            child.finish(Status::Unset, Vec::new());
+        }));
+        parent.finish(Status::Unset, Vec::new());
+        provider.force_flush().expect("flush spans");
+
+        let spans = exporter.get_finished_spans().expect("exported spans");
+        let parent = spans
+            .iter()
+            .find(|span| span.name == "lix.sql.batch")
+            .expect("parent span");
+        let child = spans
+            .iter()
+            .find(|span| span.name == "lix.transaction.materialize")
+            .expect("child span");
+        assert_eq!(parent.span_context, parent_span_context);
+        assert_eq!(child.span_context.trace_id(), parent.span_context.trace_id());
+        assert_eq!(child.parent_span_id, parent.span_context.span_id());
+        assert_eq!(child.links.len(), 1);
+        assert_eq!(child.links[0].span_context, linked_context);
+        assert_eq!(child.span_kind, SpanKind::Internal);
+        assert_eq!(child.status, Status::Unset);
+        assert!(child.attributes.iter().all(|attribute| {
+            !matches!(
+                attribute.key.as_str(),
+                "lix.trace_id"
+                    | "lix.span_id"
+                    | "lix.parent_span_id"
+                    | "lix.span.links"
+                    | "otel.status_code"
+            )
+        }));
     }
 }

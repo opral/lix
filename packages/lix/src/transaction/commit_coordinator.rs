@@ -17,8 +17,9 @@ use crate::functions::FunctionContext;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::storage_adapter::Storage;
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetryAttribute, TelemetryContext, TelemetrySink, TelemetrySpanLink,
-    TelemetrySpanStatus, current_telemetry_context, next_commit_cohort_id, spans,
+    ActiveTelemetrySpan, SpanContext, TelemetryAttribute, TelemetryContext, TelemetrySink,
+    Status, TRANSACTION_NOTIFY, TRANSACTION_STORAGE, TRANSACTION_WAIT,
+    current_telemetry_context, next_commit_cohort_id,
 };
 
 const COMMIT_QUEUE_CAPACITY: usize = 256;
@@ -32,6 +33,7 @@ where
     result: oneshot::Sender<Result<TransactionCommitOutcome, LixError>>,
     file_cohort_eligible: bool,
     telemetry_context: Option<TelemetryContext>,
+    wait_span: Option<ActiveTelemetrySpan>,
     tracing_parent: tracing::Span,
     tracing_dispatch: tracing::Dispatch,
     _capacity: tokio::sync::OwnedSemaphorePermit,
@@ -150,17 +152,35 @@ where
         transaction: Transaction<StorageImpl>,
         runtime_functions: FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
-        let capacity = Arc::clone(&self.inner.capacity)
-            .acquire_owned()
-            .await
-            .map_err(|_| coordinator_closed())?;
-        let file_cohort_eligible = transaction_is_file_cohort_eligible(&transaction);
-        let telemetry_context = current_telemetry_context().or_else(|| {
-            self.inner
-                .telemetry
-                .as_ref()
-                .map(|sink| TelemetryContext::root(Arc::clone(sink)))
+        let wait_span = self.inner.telemetry.as_ref().and_then(|sink| {
+            ActiveTelemetrySpan::start_if_enabled(
+                sink,
+                &TRANSACTION_WAIT,
+                vec![TelemetryAttribute::string(
+                    "lix.wait.reason",
+                    "commit_coordinator",
+                )],
+            )
         });
+        let capacity_future = Arc::clone(&self.inner.capacity).acquire_owned();
+        let capacity_result = match wait_span.as_ref() {
+            Some(span) => span.instrument(capacity_future).await,
+            None => capacity_future.await,
+        };
+        let capacity = match capacity_result {
+            Ok(capacity) => capacity,
+            Err(_) => {
+                if let Some(span) = wait_span {
+                    span.finish(Status::error("commit coordinator closed"), Vec::new());
+                }
+                return Err(coordinator_closed());
+            }
+        };
+        let file_cohort_eligible = transaction_is_file_cohort_eligible(&transaction);
+        let telemetry_context = wait_span
+            .as_ref()
+            .map(ActiveTelemetrySpan::telemetry_context)
+            .or_else(current_telemetry_context);
         let (result, receive) = oneshot::channel();
         let leads = self.enqueue(CommitRequest {
             transaction,
@@ -168,17 +188,27 @@ where
             result,
             file_cohort_eligible,
             telemetry_context,
+            wait_span,
             tracing_parent: tracing::Span::current(),
             tracing_dispatch: tracing::dispatcher::get_default(Clone::clone),
             _capacity: capacity,
         });
         if leads {
             #[cfg(not(target_family = "wasm"))]
-            self.spawn_driver()?;
+            if let Err(error) = self.spawn_driver() {
+                self.fail_queued(error);
+            }
             #[cfg(target_family = "wasm")]
             self.drive().await;
         }
-        receive.await.map_err(|_| coordinator_closed())?
+        let receive_result = receive.await;
+        let outcome = match receive_result {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                return Err(coordinator_closed());
+            }
+        };
+        outcome
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -209,12 +239,34 @@ where
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn fail_queued(&self, error: LixError) {
+        let requests = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.running = false;
+            state.queue.drain(..).collect::<Vec<_>>()
+        };
+        for request in requests {
+            if let Some(span) = request.wait_span {
+                span.finish(
+                    Status::error(error.code.clone()),
+                    vec![TelemetryAttribute::string("error.type", error.code.clone())],
+                );
+            }
+            let _ = request.result.send(Err(error.clone()));
+        }
+    }
+
     async fn drive(&self) {
         let mut driver = CommitDriverGuard::new(&self.inner);
         #[cfg(target_family = "wasm")]
         tokio::task::yield_now().await;
         loop {
-            let cohort = {
+            let mut cohort = {
                 let mut state = self
                     .inner
                     .state
@@ -275,6 +327,11 @@ where
                     cohort_size = cohort.len(),
                 ))
                 .await;
+            for request in &mut cohort {
+                if let Some(span) = request.wait_span.take() {
+                    span.finish(Status::Unset, Vec::new());
+                }
+            }
             let transaction_count = cohort.len();
             let telemetry_context = cohort_telemetry_context(&cohort);
             let tracing_parent = cohort.first().map_or_else(tracing::Span::none, |request| {
@@ -293,10 +350,10 @@ where
                 let outcomes = Box::pin(commit_transaction_cohort(inputs)).await;
                 if let Some(outcome) = outcomes.iter().find_map(|result| result.as_ref().ok()) {
                     let notify = ActiveTelemetrySpan::start_current(
-                        &spans::TRANSACTION_NOTIFY,
-                        vec![TelemetryAttribute::u64(
+                        &TRANSACTION_NOTIFY,
+                        vec![TelemetryAttribute::i64(
                             "lix.transaction.count",
-                            u64::try_from(transaction_count).unwrap_or(u64::MAX),
+                            i64::try_from(transaction_count).unwrap_or(i64::MAX),
                         )],
                     );
                     let _entered = notify.as_ref().map(ActiveTelemetrySpan::enter);
@@ -305,7 +362,7 @@ where
                         .bump_if_storage_changed(&outcome.storage_stats);
                     drop(_entered);
                     if let Some(notify) = notify {
-                        notify.finish(TelemetrySpanStatus::Ok, Vec::new());
+                        notify.finish(Status::Unset, Vec::new());
                     }
                 }
                 outcomes
@@ -393,8 +450,9 @@ fn attach_cohort_parent_contexts(
     let contexts = contexts.into_iter().collect::<Vec<_>>();
     let links = contexts
         .iter()
+        .skip(1)
         .filter_map(TelemetryContext::as_link)
-        .collect::<Vec<TelemetrySpanLink>>();
+        .collect::<Vec<SpanContext>>();
     contexts.into_iter().next().map(|context| {
         context
             .with_commit_cohort_id(next_commit_cohort_id())
@@ -413,39 +471,46 @@ fn coordinator_closed() -> LixError {
 mod tests {
     use super::*;
     use crate::storage_adapter::Memory;
-    use crate::telemetry::{CallbackTelemetrySink, TelemetryContext};
+    use crate::telemetry::{CallbackTelemetrySink, TelemetryContext, new_span_context};
 
     #[test]
-    fn cohort_context_links_every_logical_transaction() {
+    fn cohort_context_uses_leader_as_parent_and_links_other_transactions() {
         let completed = Mutex::new(Vec::new());
         let captured = Arc::new(completed);
         let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new({
             let captured = Arc::clone(&captured);
             move |span| captured.lock().expect("spans").push(span)
         }));
+        let parent_a = new_span_context(None);
+        let parent_b = new_span_context(None);
         let context = attach_cohort_parent_contexts([
-            TelemetryContext::for_test(Arc::clone(&sink), "trace-a", "span-a"),
-            TelemetryContext::for_test(Arc::clone(&sink), "trace-b", "span-b"),
+            TelemetryContext::for_test(Arc::clone(&sink), parent_a.clone()),
+            TelemetryContext::for_test(Arc::clone(&sink), parent_b.clone()),
         ])
         .expect("cohort context");
         futures_lite::future::block_on(TelemetryContext::instrument(
             &context,
             async {
                 let span = ActiveTelemetrySpan::start_current(
-                    &spans::TRANSACTION_STORAGE,
-                    vec![TelemetryAttribute::u64("lix.transaction.count", 2)],
+                    &TRANSACTION_STORAGE,
+                    vec![TelemetryAttribute::i64("lix.transaction.count", 2)],
                 )
                 .expect("storage enabled");
-                span.finish(TelemetrySpanStatus::Ok, Vec::new());
+                span.finish(Status::Unset, Vec::new());
             },
         ));
         let spans = captured.lock().expect("spans");
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].start.name, "lix.transaction.storage");
-        assert_eq!(spans[0].start.parent_span_id.as_deref(), Some("span-a"));
-        assert_eq!(spans[0].start.links.len(), 2);
-        assert_eq!(spans[0].start.links[0].span_id, "span-a");
-        assert_eq!(spans[0].start.links[1].span_id, "span-b");
+        assert_eq!(
+            spans[0]
+                .start
+                .parent_span_context
+                .as_ref()
+                .map(SpanContext::span_id),
+            Some(parent_a.span_id())
+        );
+        assert_eq!(spans[0].start.links, vec![parent_b]);
         assert!(
             spans[0]
                 .start

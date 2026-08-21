@@ -1410,13 +1410,19 @@ mod tests {
                     "disabled opened spans must not be started"
                 );
                 self.started.lock().expect("started").push(start.name);
-                Box::new(NoopHandle)
+                Box::new(NoopHandle(crate::telemetry::new_span_context(
+                    start.parent_span_context.as_ref(),
+                )))
             }
         }
 
-        struct NoopHandle;
+        struct NoopHandle(opentelemetry::trace::SpanContext);
 
         impl TelemetrySpanHandle for NoopHandle {
+            fn span_context(&self) -> &opentelemetry::trace::SpanContext {
+                &self.0
+            }
+
             fn enter(&self) -> Box<dyn crate::telemetry::TelemetrySpanEnterGuard + '_> {
                 Box::new(())
             }

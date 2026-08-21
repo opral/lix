@@ -4,6 +4,7 @@ import type {
 	LixBinding,
 	LixStorageConfig,
 	TelemetryDispatch,
+	TelemetryParentContext,
 	SyncServerBindingOptions,
 } from "../binding-types.js";
 import type {
@@ -16,6 +17,7 @@ import type {
 export const openDirectLixBinding: undefined | ((
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
 ) => Promise<LixBinding>) = undefined;
 

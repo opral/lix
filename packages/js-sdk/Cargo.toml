@@ -28,6 +28,7 @@ storage-bridge-bench = []
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 lix = { workspace = true, default-features = false, features = ["default_wasm_runtime"] }
