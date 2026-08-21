@@ -7001,6 +7001,12 @@ enum DirectChangeRecordRoute {
     NotOwned(DirectNotOwnedReason),
 }
 
+#[derive(Clone, Copy)]
+enum AuthoredCoordinatePolicy {
+    Reject,
+    MatchExplicitLocator,
+}
+
 impl From<super::mutation_directory::MutationDirectoryNotOwnedReason> for DirectNotOwnedReason {
     fn from(reason: super::mutation_directory::MutationDirectoryNotOwnedReason) -> Self {
         match reason {
@@ -7228,6 +7234,7 @@ async fn route_direct_change_records_for_state(
                     .map(|&index| locators[index])
                     .collect::<Vec<_>>(),
                 runs,
+                AuthoredCoordinatePolicy::Reject,
             )
             .await?
             {
@@ -7302,13 +7309,18 @@ async fn route_direct_change_records_for_state(
                 let locator_index = unique_locator_indices[selector_index];
                 let locator = locators[locator_index];
                 let route = match state.mutations.direct_coordinate_owned(0, locator.ordinal) {
-                    Some(direct) => route_change_at_locator_from_decoded(
-                        &leaf,
-                        &payloads,
-                        locator,
-                        &state.change_account_id,
-                        direct,
-                    )?,
+                    Some(false) => {
+                        DirectChangeRecordRoute::NotOwned(DirectNotOwnedReason::AuthoredCoordinate)
+                    }
+                    Some(true) => DirectChangeRecordRoute::Owned(
+                        decode_change_at_locator_from_decoded(
+                            &leaf,
+                            &payloads,
+                            locator,
+                            &state.change_account_id,
+                        )?
+                        .change_record,
+                    ),
                     None => {
                         return Err(replacement_payload_error(
                             "inline direct coordinate omitted authenticated ownership",
@@ -7421,6 +7433,7 @@ async fn load_physical_direct_change_records(
     coordinates: &[super::mutation_directory::MutationDirectoryDirectCoordinate],
     locators: &[CommitDeltaChangeLocator],
     runs: Vec<super::mutation_directory::MutationDirectoryPartRun>,
+    authored_coordinate_policy: AuthoredCoordinatePolicy,
 ) -> Result<Vec<(usize, DirectChangeRecordRoute)>, LixError> {
     #[cfg(any(test, feature = "storage-benches"))]
     super::mutation_directory::record_direct_external_parts_loaded(runs.len());
@@ -7539,6 +7552,7 @@ async fn load_physical_direct_change_records(
                     locator,
                     &state.change_account_id,
                     direct,
+                    authored_coordinate_policy,
                 )?,
                 None => {
                     return Err(replacement_payload_error(
@@ -7935,6 +7949,7 @@ async fn load_selected_change_records_from_state(
                 &coordinates,
                 &unique_locators,
                 runs,
+                AuthoredCoordinatePolicy::MatchExplicitLocator,
             )
             .await?;
             let mut records = (0..unique_locators.len()).map(|_| None).collect::<Vec<_>>();
@@ -8148,11 +8163,17 @@ fn route_change_at_locator_from_decoded<S>(
     locator: CommitDeltaChangeLocator,
     account_id: &str,
     direct: bool,
+    authored_coordinate_policy: AuthoredCoordinatePolicy,
 ) -> Result<DirectChangeRecordRoute, LixError>
 where
     S: AsRef<[u8]>,
 {
     if !direct {
+        if matches!(authored_coordinate_policy, AuthoredCoordinatePolicy::Reject) {
+            return Ok(DirectChangeRecordRoute::NotOwned(
+                DirectNotOwnedReason::AuthoredCoordinate,
+            ));
+        }
         let ordinal = usize::from(locator.ordinal);
         let Some(entry) = leaf.entry(ordinal) else {
             return Err(replacement_payload_error(
@@ -18049,6 +18070,104 @@ mod tests {
                 .commit_id,
             explicit_commit,
         );
+    }
+
+    async fn assert_equal_id_authored_locator_requires_explicit_authority(
+        label: &str,
+        schemas: [&str; 2],
+        authored_segment_index: usize,
+        authored_ordinal: usize,
+        expected_direct_rows: &[u16],
+    ) {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_6789_0000_0000,
+        ));
+        let mut fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        for (index, fixture) in fixtures.iter_mut().enumerate() {
+            fixture.schema_key = schemas[index].to_string();
+            fixture.row_pk = RowPk::single(format!("{label}-row-{index}"));
+            fixture.deleted = false;
+        }
+        fixtures[1].change_id = super::addressable_change_id(
+            commit_id,
+            authored_segment_index,
+            authored_ordinal,
+        )
+        .expect("authored test id should have direct-address geometry");
+
+        let deltas = commit_delta_refs(commit_id, &fixtures);
+        let mut writes = storage.new_write_set();
+        let staged = stage_addressable_commit_deltas(&mut writes, &deltas, &[true, false])
+            .expect("mixed direct and authored deltas should stage");
+        assert_eq!(
+            staged.mutation_inventory().direct_part_row_counts,
+            expected_direct_rows
+        );
+        assert_eq!(staged.locators.len(), 1);
+        assert_eq!(staged.locators[0].change_id, fixtures[1].change_id);
+        stage_change_locators(&mut writes, &staged.locators);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("mixed direct and authored deltas should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("mixed direct and authored read should open");
+        let direct_locator = super::direct_change_locator(fixtures[1].change_id)
+            .expect("authored id should decode as a speculative direct locator");
+        let authority = super::load_direct_change_authority(&read, direct_locator.commit_id)
+            .await
+            .expect("direct authority should load");
+        let super::DirectChangeAuthority::Candidate(authority) = authority else {
+            panic!("mixed commit should publish direct authority");
+        };
+        let routes =
+            super::route_direct_change_records_for_state(&read, &authority, &[direct_locator])
+                .await
+                .expect("speculative direct route should resolve");
+        assert!(matches!(
+            routes.as_slice(),
+            [super::DirectChangeRecordRoute::NotOwned(
+                super::DirectNotOwnedReason::AuthoredCoordinate
+            )]
+        ));
+
+        let loaded = load_change_record_by_id(&read, fixtures[1].change_id)
+            .await
+            .expect("explicit authored locator should read")
+            .expect("explicit authored locator should resolve");
+        assert_eq!(loaded.row_pk, fixtures[1].row_pk);
+        assert_eq!(loaded.change_id, fixtures[1].change_id);
+    }
+
+    #[tokio::test]
+    async fn inline_authored_equal_direct_id_requires_explicit_locator() {
+        assert_equal_id_authored_locator_requires_explicit_authority(
+            "inline-equal-id",
+            ["same", "same"],
+            0,
+            1,
+            &[2],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn segmented_authored_equal_direct_id_requires_explicit_locator() {
+        assert_equal_id_authored_locator_requires_explicit_authority(
+            "segmented-equal-id",
+            ["alpha", "beta"],
+            1,
+            0,
+            &[1, 1],
+        )
+        .await;
     }
 
     #[test]
