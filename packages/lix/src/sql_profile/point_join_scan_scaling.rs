@@ -132,6 +132,41 @@ async fn nested_bundle_point_lookup_preserves_left_join_null_extension() {
         );
 }
 
+#[tokio::test]
+async fn nested_bundle_point_lookup_reads_untracked_only_rows() {
+    let session = seeded_untracked_session().await;
+    let unfiltered = session
+        .execute(
+            r#"SELECT bundle.id AS bundle_id, message.id AS message_id, variant.id AS variant_id FROM bundle LEFT JOIN message ON message."bundle_id" = bundle.id LEFT JOIN variant ON variant."message_id" = message.id"#,
+            &[],
+        )
+        .await
+        .expect("unfiltered nested bundle query");
+    assert_eq!(unfiltered.rows().len(), 1);
+
+    let filtered = session
+        .execute(
+            r#"SELECT bundle.id AS bundle_id, message.id AS message_id, variant.id AS variant_id FROM bundle LEFT JOIN message ON message."bundle_id" = bundle.id LEFT JOIN variant ON variant."message_id" = message.id WHERE bundle.id = $1"#,
+            &[Value::Text("bundle-untracked".to_string())],
+        )
+        .await
+        .expect("point-filtered nested bundle query");
+    assert_eq!(
+        filtered.rows().len(),
+        1,
+        "an exact parent identity must preserve its untracked child join rows"
+    );
+    let row = &filtered.rows()[0];
+    assert_eq!(
+        text(row.value("message_id").expect("message_id column")),
+        Some("message-untracked".to_string())
+    );
+    assert_eq!(
+        text(row.value("variant_id").expect("variant_id column")),
+        Some("variant-untracked".to_string())
+    );
+}
+
 type NestedRow = (String, Option<String>, Option<String>);
 
 async fn select_ids(session: &SessionContext<Memory>, bundle_id: &str) -> Vec<NestedRow> {
@@ -213,6 +248,46 @@ async fn seeded_session(bundles: usize) -> SessionContext<Memory> {
                 .expect("insert variant");
         }
     }
+    session
+}
+
+async fn seeded_untracked_session() -> SessionContext<Memory> {
+    let storage = Memory::default();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("initialize fixture");
+    let engine = Engine::new(storage).await.expect("open engine");
+    let session = engine.open_session().await.expect("open session");
+    for schema in schemas() {
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("register schema");
+    }
+    session
+        .execute(
+            "INSERT INTO bundle (id, declarations, lixcol_untracked) VALUES ('bundle-untracked', CAST('[]' AS JSONB), true)",
+            &[],
+        )
+        .await
+        .expect("insert untracked bundle");
+    session
+        .execute(
+            r#"INSERT INTO message (id, "bundle_id", locale, selectors, lixcol_untracked) VALUES ('message-untracked', 'bundle-untracked', 'en', CAST('[]' AS JSONB), true)"#,
+            &[],
+        )
+        .await
+        .expect("insert untracked message");
+    session
+        .execute(
+            r#"INSERT INTO variant (id, "message_id", matches, pattern, lixcol_untracked) VALUES ('variant-untracked', 'message-untracked', CAST('[]' AS JSONB), CAST('[]' AS JSONB), true)"#,
+            &[],
+        )
+        .await
+        .expect("insert untracked variant");
     session
 }
 

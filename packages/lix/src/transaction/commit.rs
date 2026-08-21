@@ -1663,6 +1663,36 @@ fn hot_index_writes_for_commit(
     (entries, witnesses)
 }
 
+/// Publishes the indexed view of one branch's current-state mutations into
+/// the same generation and write set as the rows themselves.
+///
+/// Retention is deliberately absent from this boundary: tracked and untracked
+/// rows share one serving generation, so a completeness witness is sound only
+/// when both publication paths pass through this funnel.
+async fn stage_hot_index_writes_for_commit(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state_rows: &PreparedStateBatch,
+    branch_id: &str,
+    generation: CommitId,
+    parent_control: Option<&BranchHeadControl>,
+) -> Result<(), LixError> {
+    let (entries, witnesses) =
+        hot_index_writes_for_commit(state_rows, branch_id, parent_control);
+    if entries.is_empty() && witnesses.is_empty() {
+        return Ok(());
+    }
+    crate::hot_state::stage_hot_index_entries(
+        read,
+        writes,
+        branch_id,
+        generation,
+        &entries,
+        &witnesses,
+    )
+    .await
+}
+
 fn current_state_delta_from_state_row(
     row: PreparedStateRowRef<'_>,
 ) -> Result<crate::hot_state::CurrentStateDeltaRef<'_>, LixError> {
@@ -4521,19 +4551,15 @@ async fn stage_tracked_head(
         // The index plane is staged from this commit's own rows, so it is
         // correct whichever physical route above published them, and it lands
         // in the same write set as the rows themselves.
-        let (index_entries, index_witnesses) =
-            hot_index_writes_for_commit(state_rows, &root.branch_id, parent_control.as_ref());
-        if !index_entries.is_empty() || !index_witnesses.is_empty() {
-            crate::hot_state::stage_hot_index_entries(
-                read,
-                writes,
-                &root.branch_id,
-                generation,
-                &index_entries,
-                &index_witnesses,
-            )
-            .await?;
-        }
+        stage_hot_index_writes_for_commit(
+            read,
+            writes,
+            state_rows,
+            &root.branch_id,
+            generation,
+            parent_control.as_ref(),
+        )
+        .await?;
         if let Some(epoch) = working_diff_epoch {
             let next_epoch = TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: epoch.checkpoint_commit_id,
@@ -4661,6 +4687,22 @@ async fn stage_tracked_head(
                 )
                 .await?;
         }
+        // The hot index describes the unified current-state generation, not
+        // just its tracked members. Schema registration may already have
+        // published a completeness witness for an empty indexed collection;
+        // every later untracked mutation must therefore append its index
+        // entries before the same control revision becomes visible. Skipping
+        // this on the history-free path leaves a valid-looking witness over a
+        // stale index and turns indexed equality probes into false negatives.
+        stage_hot_index_writes_for_commit(
+            read,
+            writes,
+            state_rows,
+            branch_id,
+            control.tracked_generation,
+            Some(&control),
+        )
+        .await?;
         control.current_state_revision = next_revision;
         control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
         insert_direct_branch_control(&mut controls, branch_id, control)?;
