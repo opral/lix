@@ -10912,7 +10912,7 @@ mod tests {
     }
 
     fn assert_info_plane(spans: &[CapturedSpan]) {
-        use lix::telemetry::spans::{FORBIDDEN_PRODUCTION_NAMES, PRODUCTION_NAMES};
+        use crate::telemetry::{FORBIDDEN_PRODUCTION_NAMES, PRODUCTION_NAMES};
         assert_eq!(PRODUCTION_NAMES.len(), 11);
         for span in spans.iter().filter(|span| span.level == tracing::Level::INFO) {
             assert!(

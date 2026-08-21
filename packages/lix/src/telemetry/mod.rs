@@ -16,6 +16,8 @@ pub(crate) use spans::{
     SQL_COHERENT_READ_BATCH, SQL_QUERY, TRANSACTION_MATERIALIZE, TRANSACTION_NOTIFY,
     TRANSACTION_STORAGE, TRANSACTION_WAIT,
 };
+#[cfg(test)]
+pub(crate) use spans::{FORBIDDEN_PRODUCTION_NAMES, PRODUCTION_NAMES};
 
 /// A stable, coarse category that lets sinks filter telemetry without making
 /// every Lix operation a public Rust enum variant.
@@ -916,14 +918,14 @@ mod tests {
 
     #[test]
     fn production_contract_has_eleven_names_and_no_legacy_aliases() {
-        assert_eq!(spans::PRODUCTION_NAMES.len(), 11);
+        assert_eq!(PRODUCTION_NAMES.len(), 11);
         assert_eq!(spans::ALL.len(), 11);
-        let mut names = spans::PRODUCTION_NAMES.to_vec();
+        let mut names = PRODUCTION_NAMES.to_vec();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), 11);
-        for forbidden in spans::FORBIDDEN_PRODUCTION_NAMES {
-            assert!(!spans::PRODUCTION_NAMES.contains(forbidden));
+        for forbidden in FORBIDDEN_PRODUCTION_NAMES {
+            assert!(!PRODUCTION_NAMES.contains(forbidden));
         }
     }
 
