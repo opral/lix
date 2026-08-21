@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type {
 	LixStorageConfig,
 	LixBinding,
+	ObserveEventsBinding,
 	SyncServerBindingOptions,
 	TelemetryDispatch,
 	TelemetryParentContext,
@@ -28,9 +29,37 @@ type NativeAddon = {
 	};
 };
 
-type NativeLixBinding = Omit<LixBinding, "setTelemetryParent"> & {
+type NativeObserveEventsBinding = Omit<
+	ObserveEventsBinding,
+	"setTelemetryParent"
+> & {
 	setTelemetryParent(parentJson?: string): void;
 };
+
+type NativeLixBinding = Omit<LixBinding, "observe" | "setTelemetryParent"> & {
+	setTelemetryParent(parentJson?: string): void;
+	observe(
+		sql: Parameters<LixBinding["observe"]>[0],
+		params: Parameters<LixBinding["observe"]>[1],
+	): Promise<NativeObserveEventsBinding>;
+};
+
+function normalizeNativeObserveEvents(
+	events: NativeObserveEventsBinding,
+): ObserveEventsBinding {
+	return new Proxy(events, {
+		get(target, property, receiver) {
+			if (property === "setTelemetryParent") {
+				return (parent?: TelemetryParentContext) =>
+					target.setTelemetryParent(
+						parent === undefined ? undefined : JSON.stringify(parent),
+					);
+			}
+			const value = Reflect.get(target, property, receiver) as unknown;
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as ObserveEventsBinding;
+}
 
 function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
 	return new Proxy(binding, {
@@ -40,6 +69,12 @@ function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
 					target.setTelemetryParent(
 						parent === undefined ? undefined : JSON.stringify(parent),
 					);
+			}
+			if (property === "observe") {
+				return async (
+					sql: Parameters<LixBinding["observe"]>[0],
+					params: Parameters<LixBinding["observe"]>[1],
+				) => normalizeNativeObserveEvents(await target.observe(sql, params));
 			}
 			const value = Reflect.get(target, property, receiver) as unknown;
 			return typeof value === "function" ? value.bind(target) : value;

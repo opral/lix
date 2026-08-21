@@ -175,6 +175,7 @@ enum LixCommand {
     Observe {
         sql: String,
         params: Vec<Value>,
+        telemetry_parent: Option<PendingTelemetryParent>,
         deferred: NativeDeferred<NativeObserveEvents>,
     },
     TransactionExecute {
@@ -510,11 +511,12 @@ fn handle_lix_command(
         LixCommand::Observe {
             sql,
             params,
+            telemetry_parent,
             deferred,
         } => {
             let result = block_on!(async {
                 state.lix.observe(&sql, &params).and_then(|events| {
-                    NativeObserveEvents::new(events).map_err(|error| {
+                    NativeObserveEvents::new(events, telemetry_parent).map_err(|error| {
                         LixError::unknown(format!("failed to start observe actor: {error}"))
                     })
                 })
@@ -1231,6 +1233,7 @@ impl NativeLix {
             .send_with_deferred(deferred, |deferred| LixCommand::Observe {
                 sql,
                 params,
+                telemetry_parent: self.telemetry_parent.clone(),
                 deferred,
             });
         Ok(promise)
@@ -1396,15 +1399,20 @@ pub struct NativeObserveEvents {
     closed: Arc<AtomicBool>,
     close_signal: watch::Sender<bool>,
     next_in_flight: Arc<AtomicBool>,
+    telemetry_parent: Option<PendingTelemetryParent>,
 }
 
 #[napi]
 impl NativeObserveEvents {
-    fn new(events: NativeObserveEventsInner) -> Result<Self> {
+    fn new(
+        events: NativeObserveEventsInner,
+        telemetry_parent: Option<PendingTelemetryParent>,
+    ) -> Result<Self> {
         let (commands, receiver) = mpsc::channel();
         let closed = Arc::new(AtomicBool::new(false));
         let (close_signal, actor_close_signal) = watch::channel(false);
         let next_in_flight = Arc::new(AtomicBool::new(false));
+        let telemetry_parent = telemetry_parent.map(|_| Arc::new(Mutex::new(None)));
 
         let actor_closed = Arc::clone(&closed);
         let actor_next_in_flight = Arc::clone(&next_in_flight);
@@ -1427,6 +1435,7 @@ impl NativeObserveEvents {
             closed,
             close_signal,
             next_in_flight,
+            telemetry_parent,
         })
     }
 
@@ -1460,17 +1469,36 @@ impl NativeObserveEvents {
                 return Err(error);
             }
         };
-        match self.commands.send(ObserveCommand::Next(deferred)) {
+        let telemetry_parent = self
+            .telemetry_parent
+            .as_ref()
+            .and_then(take_pending_telemetry_parent);
+        match self.commands.send(ObserveCommand::Next {
+            deferred,
+            telemetry_parent,
+        }) {
             Ok(()) => Ok(promise),
             Err(error) => {
                 self.closed.store(true, Ordering::SeqCst);
-                let ObserveCommand::Next(deferred) = error.0 else {
+                let ObserveCommand::Next { deferred, .. } = error.0 else {
                     unreachable!("next() only sends ObserveCommand::Next");
                 };
                 resolve_observe_deferred(deferred, Ok(None), Arc::clone(&self.next_in_flight));
                 Ok(promise)
             }
         }
+    }
+
+    #[napi(js_name = "setTelemetryParent")]
+    pub fn set_telemetry_parent(&self, parent_json: Option<String>) -> Result<()> {
+        if let Some(parent_source) = &self.telemetry_parent {
+            *parent_source
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                crate::telemetry::parse_parent_context_json(parent_json)
+                    .map_err(Error::from_reason)?;
+        }
+        Ok(())
     }
 
     #[napi]
@@ -1490,7 +1518,10 @@ type ObserveNextResolver = Box<dyn FnOnce(Env) -> Result<Option<ObserveEventDto>
 type ObserveNextDeferred = JsDeferred<Option<ObserveEventDto>, ObserveNextResolver>;
 
 enum ObserveCommand {
-    Next(ObserveNextDeferred),
+    Next {
+        deferred: ObserveNextDeferred,
+        telemetry_parent: Option<SpanContext>,
+    },
     Close,
 }
 
@@ -1507,7 +1538,7 @@ fn run_observe_actor(
             closed.store(true, Ordering::SeqCst);
             while let Ok(command) = receiver.recv() {
                 match command {
-                    ObserveCommand::Next(deferred) => {
+                    ObserveCommand::Next { deferred, .. } => {
                         next_in_flight.store(false, Ordering::SeqCst);
                         deferred.reject(to_napi_error(&error));
                     }
@@ -1520,8 +1551,14 @@ fn run_observe_actor(
 
     while let Ok(command) = receiver.recv() {
         match command {
-            ObserveCommand::Next(deferred) => {
-                let result = rt.block_on(observe_next(&mut events, &closed, &mut close_signal));
+            ObserveCommand::Next {
+                deferred,
+                telemetry_parent,
+            } => {
+                let result = rt.block_on(instrument_remote_parent(
+                    telemetry_parent,
+                    observe_next(&mut events, &closed, &mut close_signal),
+                ));
                 let result = match result {
                     Ok(Some(_)) | Err(_) if closed.load(Ordering::SeqCst) => Ok(None),
                     Err(error) if error.code == LixError::CODE_CLOSED => Ok(None),

@@ -165,6 +165,39 @@ test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 	await lix.close();
 });
 
+test("observe.next samples its own telemetry parent", async () => {
+	let activeParent = {
+		traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		spanId: "aaaaaaaaaaaaaaaa",
+		traceFlags: 1,
+	};
+	const spans: LixTelemetrySpan[] = [];
+	const lix = await openLix({
+		telemetry: {
+			parentContext: () => activeParent,
+			onSpan: (span) => spans.push(span),
+		},
+	});
+	const observation = lix.observe("SELECT 'observe-private' AS value");
+	activeParent = {
+		traceId: "fedcba9876543210fedcba9876543210",
+		spanId: "fedcba9876543210",
+		traceFlags: 1,
+	};
+	await observation.next();
+
+	expect(
+		spans.some(
+			(span) =>
+				span.name === "lix.sql.query" &&
+				span.traceId === activeParent.traceId &&
+				span.parentSpanId === activeParent.spanId,
+		),
+	).toBe(true);
+	observation.close();
+	await lix.close();
+});
+
 test("openLix forwards production commit phases through onSpan", async () => {
 	const names = new Set<string>();
 	const lix = await openLix({

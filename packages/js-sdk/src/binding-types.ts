@@ -91,6 +91,7 @@ export type LixTransactionBinding = {
 };
 
 export type ObserveEventsBinding = {
+	setTelemetryParent(parent?: TelemetryParentContext): void;
 	next(): Promise<BindingObserveEvent | null | undefined>;
 	close(): void;
 };

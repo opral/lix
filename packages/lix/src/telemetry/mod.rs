@@ -566,8 +566,6 @@ impl ActiveTelemetrySpan {
                 if let Some(parent) = parent.as_ref() {
                     if !parent.links.is_empty() {
                         start.links = parent.links.clone();
-                    } else if let Some(link) = parent.as_link() {
-                        start.links.push(link);
                     }
                 }
             }
@@ -1165,6 +1163,32 @@ mod tests {
             attribute_string(&completed[0].start, "lix.commit_cohort_id"),
             Some("cohort-1")
         );
+    }
+
+    #[test]
+    fn single_transaction_performance_span_has_parent_without_duplicate_link() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("completed").push(span);
+        }));
+        let expected_parent = new_span_context(None);
+        let context = TelemetryContext::for_test(Arc::clone(&sink), expected_parent.clone());
+        futures_lite::future::block_on(context.instrument(async {
+            let span = ActiveTelemetrySpan::start_current(
+                &TRANSACTION_MATERIALIZE,
+                vec![TelemetryAttribute::i64("lix.transaction.count", 1)],
+            )
+            .expect("materialize enabled");
+            span.finish(Status::Unset, Vec::new());
+        }));
+        let completed = completed.lock().expect("completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].start.parent_span_context.as_ref(),
+            Some(&expected_parent)
+        );
+        assert!(completed[0].start.links.is_empty());
     }
 
     #[test]

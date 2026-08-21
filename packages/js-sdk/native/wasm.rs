@@ -113,6 +113,7 @@ pub struct WasmObserveEvents {
     inner: RefCell<Option<BrowserObserveEvents>>,
     closed: Cell<bool>,
     next_abort: RefCell<Option<AbortHandle>>,
+    telemetry_parent: Option<PendingTelemetryParent>,
 }
 
 #[wasm_bindgen(js_name = openMemory)]
@@ -397,6 +398,10 @@ impl WasmLix {
             inner: RefCell::new(Some(inner)),
             closed: Cell::new(false),
             next_abort: RefCell::new(None),
+            telemetry_parent: self
+                .telemetry_parent
+                .as_ref()
+                .map(|_| Rc::new(RefCell::new(None))),
         })
     }
 
@@ -615,6 +620,29 @@ impl WasmLixTransaction {
 
 #[wasm_bindgen]
 impl WasmObserveEvents {
+    #[wasm_bindgen(js_name = setTelemetryParent)]
+    pub fn set_telemetry_parent(&self, parent: Option<JsValue>) -> Result<(), JsValue> {
+        let Some(parent_source) = &self.telemetry_parent else {
+            return Ok(());
+        };
+        let parent = parent
+            .map(|value| {
+                js_sys::JSON::stringify(&value)
+                    .map_err(|_| {
+                        JsValue::from_str("telemetry parent context must be serializable")
+                    })?
+                    .as_string()
+                    .ok_or_else(|| JsValue::from_str("telemetry parent context must be an object"))
+            })
+            .transpose()?
+            .map(|json| crate::telemetry::parse_parent_context_json(Some(json)))
+            .transpose()
+            .map_err(|error| JsValue::from_str(&error))?
+            .flatten();
+        *parent_source.borrow_mut() = parent;
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = next)]
     pub async fn next(&self) -> Result<JsValue, JsValue> {
         if self.closed.get() {
@@ -627,7 +655,13 @@ impl WasmObserveEvents {
             .ok_or_else(observe_next_in_flight_error)?;
         let (abort, registration) = AbortHandle::new_pair();
         self.next_abort.borrow_mut().replace(abort);
-        let result = Abortable::new(inner.next(), registration).await;
+        let telemetry_parent = self
+            .telemetry_parent
+            .as_ref()
+            .and_then(|parent| parent.borrow_mut().take());
+        let result =
+            instrument_remote_parent(telemetry_parent, Abortable::new(inner.next(), registration))
+                .await;
         self.next_abort.borrow_mut().take();
         let result = match result {
             Ok(result) if !self.closed.get() => result,

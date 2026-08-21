@@ -125,6 +125,18 @@ function wrapTelemetryParentBinding(
 					);
 				};
 			}
+			if (property === "observe") {
+				return async (
+					sql: Parameters<LixBinding["observe"]>[0],
+					params: Parameters<LixBinding["observe"]>[1],
+				) => {
+					prepareOperation();
+					return wrapTelemetryParentObserve(
+						await target.observe(sql, params),
+						parentContext,
+					);
+				};
+			}
 			if (property === "beginTransaction") {
 				return async () => {
 					prepareOperation();
@@ -143,6 +155,20 @@ function wrapTelemetryParentBinding(
 			};
 		},
 	}) as LixBinding;
+}
+
+function wrapTelemetryParentObserve(
+	events: ObserveEventsBinding,
+	parentContext: NonNullable<LixTelemetryOptions["parentContext"]>,
+): ObserveEventsBinding {
+	return {
+		setTelemetryParent: (parent) => events.setTelemetryParent(parent),
+		next: () => {
+			events.setTelemetryParent(parentContext());
+			return events.next();
+		},
+		close: () => events.close(),
+	};
 }
 
 function wrapTelemetryParentTransaction(
@@ -300,6 +326,7 @@ function workerObserveBinding(
 	observeId: number,
 ): ObserveEventsBinding {
 	return {
+		setTelemetryParent: () => {},
 		next: () => request({ kind: "observe.next", observeId }),
 		close: () => notify({ kind: "observe.close", observeId }),
 	};

@@ -379,6 +379,9 @@ impl WasmRemoteLixTransaction {
 
 #[wasm_bindgen]
 impl WasmRemoteObserveEvents {
+    #[wasm_bindgen(js_name = setTelemetryParent)]
+    pub fn set_telemetry_parent(&self, _parent: Option<JsValue>) {}
+
     #[wasm_bindgen(js_name = next)]
     pub async fn next(&self) -> Result<JsValue, JsValue> {
         if *self.next_in_flight.borrow() {

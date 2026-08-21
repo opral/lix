@@ -42,7 +42,9 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		}
 		if (message.operation.kind === "observe.next") {
 			const observeId = message.operation.observeId;
-			void respond(message, () => handleObserveNext(observeId));
+			void respond(message, () =>
+				handleObserveNext(observeId, message.telemetryParent),
+			);
 			return;
 		}
 		finiteQueue = finiteQueue.then(async () => {
@@ -305,9 +307,13 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		}
 	}
 
-	async function handleObserveNext(observeId: number): Promise<unknown> {
+	async function handleObserveNext(
+		observeId: number,
+		telemetryParent: WorkerRequest["telemetryParent"],
+	): Promise<unknown> {
 		const events = observations.get(observeId);
 		if (!events) return undefined;
+		events.setTelemetryParent(telemetryParent);
 		return events.next();
 	}
 
