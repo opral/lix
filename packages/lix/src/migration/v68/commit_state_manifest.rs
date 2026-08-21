@@ -21,7 +21,8 @@ use crate::{LixError, storage_codec};
 
 use super::mutation_directory::{DirectoryEntry, load_all, validate_root_for_header};
 
-const HEADER_MAGIC: &[u8] = b"LXCS10";
+const HEADER_V10_MAGIC: &[u8] = b"LXCS10";
+const HEADER_V11_MAGIC: &[u8] = b"LXCS11";
 const INVENTORY_MAGIC: &[u8] = b"LXMI1";
 const TOUCHED_SCOPE_FILTER_BYTES: usize = 128;
 const DIRECT_PART_MAX_ROWS: usize = 512;
@@ -29,6 +30,27 @@ const DIRECT_PART_MAX_ROWS: usize = 512;
 #[derive(Clone, musli::Encode, musli::Decode)]
 #[musli(packed)]
 struct HeaderV68 {
+    commit_id: CommitId,
+    change_account_id: String,
+    replay_debt: CommitStateReplayDebt,
+    #[musli(with = storage_codec::option)]
+    selected_source_commit_id: Option<[u8; 16]>,
+    mutation_inventory_digest: [u8; 32],
+    mutation_transition_digest: [u8; 32],
+    mutation_member_count: u32,
+    mutation_part_count: u32,
+    #[musli(with = storage_codec::option)]
+    mutation_directory_root: Option<MutationDirectoryRoot>,
+    touched_scope_filter: TouchedScopeFilterWire,
+    #[musli(with = storage_codec::option)]
+    current_state_scoped_ranges: Option<Box<ScopedRangeAuthorityWire>>,
+    #[musli(with = storage_codec::option)]
+    snapshot_root: Option<Box<TrackedStateCommitRoot>>,
+}
+
+#[derive(Clone, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct HeaderV68V10 {
     commit_id: CommitId,
     change_account_id: String,
     replay_debt: CommitStateReplayDebt,
@@ -68,6 +90,27 @@ impl From<TrackedStateCommitRootV10> for TrackedStateCommitRoot {
             row_count_estimate: root.row_count_estimate,
             tree_height: root.tree_height,
             complete_state_fence: false,
+        }
+    }
+}
+
+impl From<HeaderV68V10> for HeaderV68 {
+    fn from(header: HeaderV68V10) -> Self {
+        Self {
+            commit_id: header.commit_id,
+            change_account_id: header.change_account_id,
+            replay_debt: header.replay_debt,
+            selected_source_commit_id: header.selected_source_commit_id,
+            mutation_inventory_digest: header.mutation_inventory_digest,
+            mutation_transition_digest: header.mutation_transition_digest,
+            mutation_member_count: header.mutation_member_count,
+            mutation_part_count: header.mutation_part_count,
+            mutation_directory_root: header.mutation_directory_root,
+            touched_scope_filter: header.touched_scope_filter,
+            current_state_scoped_ranges: header.current_state_scoped_ranges,
+            snapshot_root: header
+                .snapshot_root
+                .map(|root| Box::new((*root).into())),
         }
     }
 }
@@ -236,11 +279,7 @@ async fn decode_manifest(
     header: &[u8],
     inventory: &[u8],
 ) -> Result<CommitStateManifest, LixError> {
-    let header_payload = header
-        .strip_prefix(HEADER_MAGIC)
-        .ok_or_else(|| authority_error("header has an unsupported format"))?;
-    let stored: HeaderV68 =
-        storage_codec::decode("v68 tracked_state commit_state_manifest", header_payload)?;
+    let stored = decode_header(header)?;
     validate_header(&stored)?;
     if stored.mutation_inventory_digest != *blake3::hash(inventory).as_bytes() {
         return Err(authority_error(
@@ -267,6 +306,18 @@ async fn decode_manifest(
     };
     let entries = authenticate_bounded_segments(store, stored.commit_id, entries).await?;
     assemble_manifest(stored, catalog, entries)
+}
+
+fn decode_header(header: &[u8]) -> Result<HeaderV68, LixError> {
+    if let Some(payload) = header.strip_prefix(HEADER_V11_MAGIC) {
+        return storage_codec::decode("v68 tracked_state commit_state_manifest v11", payload);
+    }
+    if let Some(payload) = header.strip_prefix(HEADER_V10_MAGIC) {
+        let header: HeaderV68V10 =
+            storage_codec::decode("v68 tracked_state commit_state_manifest v10", payload)?;
+        return Ok(header.into());
+    }
+    Err(authority_error("header has an unsupported format"))
 }
 
 enum UpgradedDirectoryEntry {
@@ -519,7 +570,7 @@ fn assemble_manifest(
         },
         touched_scope_filter: stored.touched_scope_filter,
         current_state_scoped_ranges,
-        snapshot_root: stored.snapshot_root.map(|root| Box::new((*root).into())),
+        snapshot_root: stored.snapshot_root,
     };
     let encoded = storage_codec::encode("upgraded v68 commit-state manifest", &wire)?;
     storage_codec::decode("upgraded v68 commit-state manifest", &encoded)
@@ -803,11 +854,13 @@ fn authority_error(message: &str) -> LixError {
 #[cfg(test)]
 mod tests {
     use crate::changelog::CommitId;
-    use crate::tracked_state::CommitStateReplayDebt;
+    use crate::tracked_state::{
+        CommitStateReplayDebt, TrackedStateCommitRoot, TrackedStateRootId,
+    };
 
     use super::{
-        HeaderV68, InventoryV68, TouchedScopeFilterWire, assemble_manifest, full_ownership,
-        old_transition_digest,
+        HEADER_V11_MAGIC, HeaderV68, InventoryV68, TouchedScopeFilterWire, assemble_manifest,
+        decode_header, full_ownership, old_transition_digest,
     };
 
     #[test]
@@ -862,5 +915,48 @@ mod tests {
         let mut tampered = header;
         tampered.mutation_transition_digest[0] ^= 1;
         assert!(assemble_manifest(tampered, catalog, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn lxcs11_header_preserves_complete_state_fence() {
+        let commit_id = CommitId::for_test_label("v68-lxcs11-header");
+        let header = HeaderV68 {
+            commit_id,
+            change_account_id: "account".to_string(),
+            replay_debt: CommitStateReplayDebt::default(),
+            selected_source_commit_id: None,
+            mutation_inventory_digest: [1; 32],
+            mutation_transition_digest: [2; 32],
+            mutation_member_count: 0,
+            mutation_part_count: 0,
+            mutation_directory_root: None,
+            touched_scope_filter: TouchedScopeFilterWire {
+                complete: false,
+                bits: Vec::new(),
+            },
+            current_state_scoped_ranges: None,
+            snapshot_root: Some(Box::new(TrackedStateCommitRoot {
+                commit_id,
+                root_id: TrackedStateRootId::new([3; 32]),
+                parent_roots: Vec::new(),
+                changed_key_count: 0,
+                row_count_estimate: 0,
+                tree_height: 1,
+                complete_state_fence: true,
+            })),
+        };
+        let mut encoded = HEADER_V11_MAGIC.to_vec();
+        encoded.extend_from_slice(
+            &crate::storage_codec::encode("v68 LXCS11 header fixture", &header).unwrap(),
+        );
+
+        let decoded = decode_header(&encoded).unwrap();
+
+        assert!(
+            decoded
+                .snapshot_root
+                .as_ref()
+                .is_some_and(|root| root.complete_state_fence)
+        );
     }
 }
