@@ -19792,8 +19792,8 @@ mod tests {
         stage_commit_deltas(&mut writes, &deltas).expect("packed deltas should stage");
         assert_eq!(
             writes.stats().staged_puts,
-            7,
-            "generic history keeps three read-friendly segments plus an atomic header, catalog, directory root, and semantic owner"
+            8,
+            "generic history keeps four schema-bounded read-friendly segments plus an atomic header, catalog, directory root, and semantic owner"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
