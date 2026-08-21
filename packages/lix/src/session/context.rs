@@ -35,8 +35,8 @@ use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteSetStats};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::sync::SyncModeState;
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanClass,
-    TelemetrySpanStatus, instrument_value,
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, Status, instrument_value,
+    TRANSACTION_NOTIFY, TRANSACTION_WAIT,
 };
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{Transaction, open_transaction};
@@ -411,8 +411,7 @@ where
             let span = self.telemetry.as_ref().and_then(|sink| {
                 ActiveTelemetrySpan::start_if_enabled(
                     sink,
-                    TelemetrySpanClass::Performance,
-                    "lix.transaction.wait",
+                    &TRANSACTION_WAIT,
                     vec![TelemetryAttribute::string(
                         "lix.wait.reason",
                         "collaboration_write_gate",
@@ -598,7 +597,7 @@ where
         storage_stats: &StorageWriteSetStats,
         commit_cohort_id: Option<&str>,
     ) {
-        let mut attributes = vec![TelemetryAttribute::u64("lix.transaction.count", 1)];
+        let mut attributes = vec![TelemetryAttribute::i64("lix.transaction.count", 1)];
         if let Some(commit_cohort_id) = commit_cohort_id {
             attributes.push(TelemetryAttribute::string(
                 "lix.commit_cohort_id",
@@ -606,12 +605,7 @@ where
             ));
         }
         let span = self.telemetry.as_ref().and_then(|sink| {
-            ActiveTelemetrySpan::start_if_enabled(
-                sink,
-                TelemetrySpanClass::Performance,
-                "lix.transaction.notify",
-                attributes,
-            )
+            ActiveTelemetrySpan::start_if_enabled(sink, &TRANSACTION_NOTIFY, attributes)
         });
         let _entered = span.as_ref().map(ActiveTelemetrySpan::enter);
         self.observe_invalidation
@@ -626,7 +620,7 @@ where
         }
         drop(_entered);
         if let Some(span) = span {
-            span.finish(TelemetrySpanStatus::Ok, Vec::new());
+            span.finish(Status::Unset, Vec::new());
         }
     }
 }
@@ -647,8 +641,7 @@ impl SessionWriteAccess {
     ) {
         if self.collaboration_write_guard.is_none() {
             let span = ActiveTelemetrySpan::start_current(
-                TelemetrySpanClass::Performance,
-                "lix.transaction.wait",
+                &TRANSACTION_WAIT,
                 vec![TelemetryAttribute::string(
                     "lix.wait.reason",
                     "collaboration_write_gate",

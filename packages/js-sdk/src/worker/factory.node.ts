@@ -5,6 +5,7 @@ import type {
 	LixStorageConfig,
 	SyncServerBindingOptions,
 	TelemetryDispatch,
+	TelemetryParentContext,
 } from "../binding-types.js";
 import type {
 	WorkerConnection,
@@ -66,10 +67,11 @@ export function workerExecArgv(execArgv: readonly string[]): string[] {
 export const openDirectLixBinding = async (
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
+	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
 ): Promise<LixBinding | undefined> => {
 	try {
-		return await openNativeLixBinding(storage, telemetry, server);
+		return await openNativeLixBinding(storage, telemetry, telemetryParent, server);
 	} catch (error) {
 		if (server !== undefined) throw error;
 		if (storage.kind === "memory") return undefined;

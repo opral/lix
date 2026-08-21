@@ -117,6 +117,13 @@ pub async fn open_remote(
 
 #[wasm_bindgen]
 impl WasmRemoteLix {
+    #[wasm_bindgen(js_name = setTelemetryParent)]
+    pub fn set_telemetry_parent(&self, _parent: Option<JsValue>) {
+        // Remote repositories execute in the server process and do not own a
+        // local telemetry sink. Keep the binding shape uniform; distributed
+        // context propagation belongs to the server protocol transport.
+    }
+
     #[wasm_bindgen(js_name = openAnotherSession)]
     pub async fn open_another_session(&self, options: JsValue) -> Result<WasmRemoteLix, JsValue> {
         let options: OpenAnotherSessionOptionsDto = from_js(options)?;
@@ -372,6 +379,9 @@ impl WasmRemoteLixTransaction {
 
 #[wasm_bindgen]
 impl WasmRemoteObserveEvents {
+    #[wasm_bindgen(js_name = setTelemetryParent)]
+    pub fn set_telemetry_parent(&self, _parent: Option<JsValue>) {}
+
     #[wasm_bindgen(js_name = next)]
     pub async fn next(&self) -> Result<JsValue, JsValue> {
         if *self.next_in_flight.borrow() {

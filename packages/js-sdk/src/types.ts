@@ -24,20 +24,44 @@ export type SyncLixServerOptions = {
 	fetch?: RemoteLixFetch;
 };
 
-export type LixTelemetrySpan = {
-	schemaVersion: 2;
-	name: string;
+export type LixTelemetrySpanLink = {
 	traceId: string;
 	spanId: string;
+	traceFlags: number;
+	traceState?: string;
+};
+
+/** W3C/OpenTelemetry context used as the remote parent of engine root spans. */
+export type LixTelemetryParentContext = {
+	traceId: string;
+	spanId: string;
+	traceFlags: number;
+	traceState?: string;
+};
+
+export type LixTelemetrySpan = {
+	schemaVersion: 3;
+	name: string;
+	kind: "internal" | "server" | "client" | "producer" | "consumer";
+	traceId: string;
+	spanId: string;
+	traceFlags: number;
+	traceState?: string;
 	parentSpanId?: string;
+	links?: LixTelemetrySpanLink[];
 	startedAtUnixMs: number;
 	durationMs: number;
-	status: "ok" | "error" | "cancelled";
+	status: {
+		code: "unset" | "error" | "ok";
+		description?: string;
+	};
 	attributes: Record<string, string | number | boolean>;
 };
 
 export type LixTelemetryOptions = {
 	onSpan(span: LixTelemetrySpan): void;
+	/** Read immediately before each serialized engine operation. */
+	parentContext?(): LixTelemetryParentContext | undefined;
 };
 
 export type OpenLixOptions =

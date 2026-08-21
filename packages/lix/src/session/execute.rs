@@ -1888,7 +1888,11 @@ where
         idempotency: Option<ExecuteIdempotency>,
         require_idempotency_for_writes: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let telemetry = start_batch(self.telemetry.as_ref(), "lix.sql.batch", statements.len());
+        let telemetry = start_batch(
+            self.telemetry.as_ref(),
+            &crate::telemetry::SQL_BATCH,
+            statements.len(),
+        );
         let operation = self.execute_batch_with_options_inner(
             statements,
             options,
@@ -2343,7 +2347,7 @@ where
     ) -> Result<CoherentReadBatch, LixError> {
         let telemetry = start_batch(
             self.telemetry.as_ref(),
-            "lix.sql.coherent_read_batch",
+            &crate::telemetry::SQL_COHERENT_READ_BATCH,
             statements.len(),
         );
         let operation = self.execute_coherent_read_batch_inner(statements);
@@ -10361,10 +10365,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(query_spans.len(), 2);
         for (index, span) in query_spans.into_iter().enumerate() {
-            assert_eq!(span.start.trace_id, batch_span.start.trace_id);
             assert_eq!(
-                span.start.parent_span_id.as_deref(),
-                Some(batch_span.start.span_id.as_str())
+                span.span_context.trace_id(),
+                batch_span.span_context.trace_id()
+            );
+            assert_eq!(
+                span.start
+                    .parent_span_context
+                    .as_ref()
+                    .map(crate::telemetry::SpanContext::span_id),
+                Some(batch_span.span_context.span_id())
             );
             assert!(span.start.attributes.iter().any(|attribute| {
                 attribute.key == "lix.sql.fingerprint"
@@ -10372,10 +10382,10 @@ mod tests {
             }));
             assert!(span.start.attributes.iter().any(|attribute| {
                 attribute.key == "lix.batch.index"
-                    && attribute.value == TelemetryValue::U64(index as u64)
+                    && attribute.value == TelemetryValue::I64(index as i64)
             }));
             assert!(span.end.attributes.iter().any(|attribute| {
-                attribute.key == "lix.rows_affected" && attribute.value == TelemetryValue::U64(1)
+                attribute.key == "lix.rows_affected" && attribute.value == TelemetryValue::I64(1)
             }));
         }
     }

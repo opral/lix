@@ -1,4 +1,4 @@
-use lix::telemetry::{CallbackTelemetrySink, TelemetrySink};
+use lix::telemetry::{CallbackTelemetrySink, SpanContext, TelemetrySink, instrument_remote_parent};
 use lix::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt,
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
@@ -45,6 +45,7 @@ fn optional_telemetry_dispatch(
 #[napi(js_name = "Lix")]
 pub struct NativeLix {
     actor: NativeLixActor,
+    telemetry_parent: Option<PendingTelemetryParent>,
 }
 
 enum NativeLixInner {
@@ -92,10 +93,11 @@ pub struct NativeExecuteBatchStatement {
 
 #[derive(Clone)]
 struct NativeLixActor {
-    commands: Sender<LixCommand>,
+    commands: Sender<QueuedLixCommand>,
     closed: Arc<AtomicBool>,
     send_lock: Arc<Mutex<()>>,
     next_transaction_id: Arc<AtomicU64>,
+    telemetry_parent: Option<PendingTelemetryParent>,
 }
 
 struct NativeLixActorState {
@@ -119,10 +121,12 @@ type NativeSwitchBranchDeferred = NativeDeferred<SwitchBranchReceiptDto>;
 type NativeMergePreviewDeferred = NativeDeferred<MergeBranchPreviewDto>;
 type NativeMergeReceiptDeferred = NativeDeferred<MergeBranchReceiptDto>;
 type NativeUnitDeferred = NativeDeferred<()>;
+type PendingTelemetryParent = Arc<Mutex<Option<SpanContext>>>;
 
 enum LixCommand {
     OpenAnotherSession {
         options: NativeOpenAnotherSessionOptions,
+        telemetry_parent: Option<PendingTelemetryParent>,
         deferred: NativeLixDeferred,
     },
     Execute {
@@ -171,6 +175,7 @@ enum LixCommand {
     Observe {
         sql: String,
         params: Vec<Value>,
+        telemetry_parent: Option<PendingTelemetryParent>,
         deferred: NativeDeferred<NativeObserveEvents>,
     },
     TransactionExecute {
@@ -193,14 +198,30 @@ enum LixCommand {
     },
 }
 
+struct QueuedLixCommand {
+    command: LixCommand,
+    telemetry_parent: Option<SpanContext>,
+}
+
+fn take_pending_telemetry_parent(parent: &PendingTelemetryParent) -> Option<SpanContext> {
+    parent
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+}
+
 impl NativeLixActor {
-    fn start(lix: NativeLixInner) -> Result<Self> {
+    fn start(
+        lix: NativeLixInner,
+        telemetry_parent: Option<PendingTelemetryParent>,
+    ) -> Result<Self> {
         let (commands, receiver) = mpsc::channel();
         let actor = Self {
             commands,
             closed: Arc::new(AtomicBool::new(false)),
             send_lock: Arc::new(Mutex::new(())),
             next_transaction_id: Arc::new(AtomicU64::new(1)),
+            telemetry_parent,
         };
         let actor_closed = Arc::clone(&actor.closed);
         let actor_send_lock = Arc::clone(&actor.send_lock);
@@ -231,11 +252,17 @@ impl NativeLixActor {
             settle_deferred(deferred, Err(lix_closed_error()));
             return;
         }
-        let command = command(deferred);
-        match self.commands.send(command) {
+        let queued = QueuedLixCommand {
+            command: command(deferred),
+            telemetry_parent: self
+                .telemetry_parent
+                .as_ref()
+                .and_then(take_pending_telemetry_parent),
+        };
+        match self.commands.send(queued) {
             Ok(()) => {}
             Err(error) => {
-                settle_command_after_close(error.0);
+                settle_command_after_close(error.0.command);
             }
         }
     }
@@ -243,9 +270,13 @@ impl NativeLixActor {
 
 impl NativeLixActor {
     fn abandon_transaction(&self, transaction_id: u64) {
-        let _ = self
-            .commands
-            .send(LixCommand::TransactionAbandon { transaction_id });
+        let _ = self.commands.send(QueuedLixCommand {
+            command: LixCommand::TransactionAbandon { transaction_id },
+            telemetry_parent: self
+                .telemetry_parent
+                .as_ref()
+                .and_then(take_pending_telemetry_parent),
+        });
     }
 }
 
@@ -260,7 +291,7 @@ where
 
 fn run_lix_actor(
     lix: NativeLixInner,
-    receiver: mpsc::Receiver<LixCommand>,
+    receiver: mpsc::Receiver<QueuedLixCommand>,
     closed: Arc<AtomicBool>,
     send_lock: Arc<Mutex<()>>,
 ) {
@@ -277,18 +308,24 @@ fn run_lix_actor(
         transactions: HashMap::new(),
     });
 
-    while let Ok(command) = receiver.recv() {
+    while let Ok(queued) = receiver.recv() {
         let Some(open_state) = state.as_mut() else {
-            settle_command_after_close(command);
+            settle_command_after_close(queued.command);
             continue;
         };
         if closed.load(Ordering::SeqCst) {
             drop(state.take());
-            settle_command_after_close(command);
+            settle_command_after_close(queued.command);
             drain_commands_after_close(&receiver, &send_lock);
             break;
         }
-        if handle_lix_command(&rt, open_state, &closed, command) {
+        if handle_lix_command(
+            &rt,
+            open_state,
+            &closed,
+            queued.command,
+            queued.telemetry_parent,
+        ) {
             drop(state.take());
             drain_commands_after_close(&receiver, &send_lock);
             break;
@@ -297,18 +334,18 @@ fn run_lix_actor(
     closed.store(true, Ordering::SeqCst);
 }
 
-fn drain_commands_after_close(receiver: &mpsc::Receiver<LixCommand>, send_lock: &Mutex<()>) {
+fn drain_commands_after_close(receiver: &mpsc::Receiver<QueuedLixCommand>, send_lock: &Mutex<()>) {
     let Ok(_send_guard) = send_lock.lock() else {
         return;
     };
-    for command in receiver.try_iter() {
-        settle_command_after_close(command);
+    for queued in receiver.try_iter() {
+        settle_command_after_close(queued.command);
     }
 }
 
-fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std::io::Error) {
-    while let Ok(command) = receiver.recv() {
-        match command {
+fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error: std::io::Error) {
+    while let Ok(queued) = receiver.recv() {
+        match queued.command {
             LixCommand::Execute { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::OpenAnotherSession { deferred, .. } => {
                 deferred.reject(to_napi_error(&error))
@@ -347,12 +384,21 @@ fn handle_lix_command(
     state: &mut NativeLixActorState,
     closed: &AtomicBool,
     command: LixCommand,
+    telemetry_parent: Option<SpanContext>,
 ) -> bool {
+    macro_rules! block_on {
+        ($future:expr) => {
+            rt.block_on(instrument_remote_parent(telemetry_parent.clone(), $future))
+        };
+    }
     match command {
-        LixCommand::OpenAnotherSession { options, deferred } => {
-            let result = rt
-                .block_on(state.lix.open_another_session(options))
-                .and_then(NativeLix::new);
+        LixCommand::OpenAnotherSession {
+            options,
+            telemetry_parent,
+            deferred,
+        } => {
+            let result = block_on!(state.lix.open_another_session(options))
+                .and_then(|lix| NativeLix::new(lix, telemetry_parent));
             settle_deferred(deferred, result);
             false
         }
@@ -362,8 +408,7 @@ fn handle_lix_command(
             options,
             deferred,
         } => {
-            let result = rt
-                .block_on(state.lix.execute(&sql, &params, options))
+            let result = block_on!(state.lix.execute(&sql, &params, options))
                 .and_then(ExecuteResult::try_from);
             settle_deferred(deferred, result);
             false
@@ -373,9 +418,8 @@ fn handle_lix_command(
             options,
             deferred,
         } => {
-            let result = rt
-                .block_on(state.lix.execute_batch(&statements, options))
-                .and_then(|results| {
+            let result =
+                block_on!(state.lix.execute_batch(&statements, options)).and_then(|results| {
                     results
                         .into_iter()
                         .map(ExecuteResult::try_from)
@@ -389,17 +433,15 @@ fn handle_lix_command(
             actor,
             deferred,
         } => {
-            let result = rt
-                .block_on(state.lix.begin_transaction())
-                .map(|transaction| {
-                    state.transactions.insert(transaction_id, transaction);
-                    NativeLixTransaction::new(actor, transaction_id)
-                });
+            let result = block_on!(state.lix.begin_transaction()).map(|transaction| {
+                state.transactions.insert(transaction_id, transaction);
+                NativeLixTransaction::new(actor, transaction_id)
+            });
             settle_deferred(deferred, result);
             false
         }
         LixCommand::ActiveBranchId(deferred) => {
-            let result = rt.block_on(state.lix.active_branch_id());
+            let result = block_on!(state.lix.active_branch_id());
             settle_deferred(deferred, result);
             false
         }
@@ -408,62 +450,57 @@ fn handle_lix_command(
             false
         }
         LixCommand::CreateBranch { options, deferred } => {
-            let result = rt
-                .block_on(state.lix.create_branch(options))
-                .map(CreateBranchReceiptDto::from);
+            let result =
+                block_on!(state.lix.create_branch(options)).map(CreateBranchReceiptDto::from);
             settle_deferred(deferred, result);
             false
         }
         LixCommand::CreateCheckpoint(deferred) => {
-            let result = rt
-                .block_on(state.lix.create_checkpoint())
-                .map(CreateCheckpointReceiptDto::from);
+            let result =
+                block_on!(state.lix.create_checkpoint()).map(CreateCheckpointReceiptDto::from);
             settle_deferred(deferred, result);
             false
         }
         LixCommand::Undo(deferred) => {
-            let result = rt.block_on(state.lix.undo()).map(UndoReceiptDto::from);
+            let result = block_on!(state.lix.undo()).map(UndoReceiptDto::from);
             settle_deferred(deferred, result);
             false
         }
         LixCommand::Redo(deferred) => {
-            let result = rt.block_on(state.lix.redo()).map(RedoReceiptDto::from);
+            let result = block_on!(state.lix.redo()).map(RedoReceiptDto::from);
             settle_deferred(deferred, result);
             false
         }
         LixCommand::SwitchBranch { options, deferred } => {
-            let result = rt
-                .block_on(state.lix.switch_branch(options))
-                .map(SwitchBranchReceiptDto::from);
+            let result =
+                block_on!(state.lix.switch_branch(options)).map(SwitchBranchReceiptDto::from);
             settle_deferred(deferred, result);
             false
         }
         LixCommand::ImportFilesystemPaths { paths, deferred } => {
-            let result = rt.block_on(state.lix.import_filesystem_paths(paths));
+            let result = block_on!(state.lix.import_filesystem_paths(paths));
             settle_deferred(deferred, result);
             false
         }
         LixCommand::MergeBranchPreview { options, deferred } => {
-            let result = rt
-                .block_on(state.lix.merge_branch_preview(options))
-                .map(MergeBranchPreviewDto::from);
+            let result =
+                block_on!(state.lix.merge_branch_preview(options)).map(MergeBranchPreviewDto::from);
             settle_deferred(deferred, result);
             false
         }
         LixCommand::MergeBranch { options, deferred } => {
-            let result = rt
-                .block_on(state.lix.merge_branch(options))
-                .map(MergeBranchReceiptDto::from);
+            let result =
+                block_on!(state.lix.merge_branch(options)).map(MergeBranchReceiptDto::from);
             settle_deferred(deferred, result);
             false
         }
         LixCommand::SyncDiskToLix(deferred) => {
-            let result = rt.block_on(state.lix.sync_disk_to_lix());
+            let result = block_on!(state.lix.sync_disk_to_lix());
             settle_deferred(deferred, result);
             false
         }
         LixCommand::Close(deferred) => {
-            let result = rt.block_on(state.lix.close());
+            let result = block_on!(state.lix.close());
             let should_drop_state = result.is_ok();
             if result.is_ok() {
                 closed.store(true, Ordering::SeqCst);
@@ -474,11 +511,14 @@ fn handle_lix_command(
         LixCommand::Observe {
             sql,
             params,
+            telemetry_parent,
             deferred,
         } => {
-            let result = state.lix.observe(&sql, &params).and_then(|events| {
-                NativeObserveEvents::new(events).map_err(|error| {
-                    LixError::unknown(format!("failed to start observe actor: {error}"))
+            let result = block_on!(async {
+                state.lix.observe(&sql, &params).and_then(|events| {
+                    NativeObserveEvents::new(events, telemetry_parent).map_err(|error| {
+                        LixError::unknown(format!("failed to start observe actor: {error}"))
+                    })
                 })
             });
             settle_deferred(deferred, result);
@@ -494,7 +534,7 @@ fn handle_lix_command(
             let result = state.transactions.get_mut(&transaction_id).map_or_else(
                 || Err(transaction_closed_error()),
                 |transaction| {
-                    rt.block_on(transaction.execute(&sql, &params, options))
+                    block_on!(transaction.execute(&sql, &params, options))
                         .and_then(ExecuteResult::try_from)
                 },
             );
@@ -507,7 +547,7 @@ fn handle_lix_command(
         } => {
             let result = state.transactions.remove(&transaction_id).map_or_else(
                 || Err(transaction_closed_error()),
-                |transaction| rt.block_on(transaction.commit()),
+                |transaction| block_on!(transaction.commit()),
             );
             settle_deferred(deferred, result);
             false
@@ -518,14 +558,14 @@ fn handle_lix_command(
         } => {
             let result = state.transactions.remove(&transaction_id).map_or_else(
                 || Err(transaction_closed_error()),
-                |transaction| rt.block_on(transaction.rollback()),
+                |transaction| block_on!(transaction.rollback()),
             );
             settle_deferred(deferred, result);
             false
         }
         LixCommand::TransactionAbandon { transaction_id } => {
             if let Some(transaction) = state.transactions.remove(&transaction_id) {
-                let _ = rt.block_on(transaction.rollback());
+                let _ = block_on!(transaction.rollback());
             }
             false
         }
@@ -870,6 +910,7 @@ pub struct OpenFilesystemStorageTask {
     path: String,
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
+    telemetry_parent: Option<SpanContext>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
 }
@@ -877,6 +918,7 @@ pub struct OpenFilesystemStorageTask {
 #[expect(missing_debug_implementations)]
 pub struct OpenMemoryTask {
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
+    telemetry_parent: Option<SpanContext>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
 }
@@ -890,6 +932,7 @@ impl Task for OpenFilesystemStorageTask {
             std::mem::take(&mut self.path),
             self.sync_all_files,
             self.telemetry_dispatch.take(),
+            self.telemetry_parent.take(),
             self.server_url.take(),
             std::mem::take(&mut self.server_headers),
         ))
@@ -907,6 +950,7 @@ impl Task for OpenMemoryTask {
     fn compute(&mut self) -> Result<Self::Output> {
         Ok(open_memory_native(
             self.telemetry_dispatch.take(),
+            self.telemetry_parent.take(),
             self.server_url.take(),
             std::mem::take(&mut self.server_headers),
         ))
@@ -917,14 +961,18 @@ impl Task for OpenMemoryTask {
     }
 }
 
-fn telemetry_sink(dispatch: SharedJsTelemetryDispatch) -> Arc<dyn TelemetrySink> {
-    Arc::new(CallbackTelemetrySink::new(move |span| {
+fn telemetry_sink(
+    dispatch: SharedJsTelemetryDispatch,
+) -> (Arc<dyn TelemetrySink>, PendingTelemetryParent) {
+    let parent_source = Arc::new(Mutex::new(None));
+    let sink = CallbackTelemetrySink::new(move |span| {
         let Ok(json) = serde_json::to_string(&crate::telemetry::TelemetrySpanDto::from(span))
         else {
             return;
         };
         let _ = dispatch.call(json, ThreadsafeFunctionCallMode::NonBlocking);
-    }))
+    });
+    (Arc::new(sink), parent_source)
 }
 
 fn parse_server_headers(headers: Option<Vec<Vec<String>>>) -> Result<Vec<(String, String)>> {
@@ -942,6 +990,7 @@ fn parse_server_headers(headers: Option<Vec<Vec<String>>>) -> Result<Vec<(String
 
 fn open_memory_native(
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
+    telemetry_parent: Option<SpanContext>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
 ) -> std::result::Result<NativeLix, LixError> {
@@ -949,15 +998,20 @@ fn open_memory_native(
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let lix = match telemetry_dispatch.map(telemetry_sink) {
-        Some(telemetry) => {
+    let (lix, telemetry_parent_source) = match telemetry_dispatch.map(telemetry_sink) {
+        Some((telemetry, parent_source)) => {
             let builder = open_lix().with_telemetry(telemetry);
             let builder = match server_url {
                 Some(url) => builder
                     .with_server(ServerOptions::sync(url).with_headers(server_headers.clone())),
                 None => builder,
             };
-            rt.block_on(async { builder.await })
+            (
+                rt.block_on(instrument_remote_parent(telemetry_parent, async {
+                    builder.await
+                })),
+                Some(parent_source),
+            )
         }
         None => {
             let builder = open_lix();
@@ -967,17 +1021,18 @@ fn open_memory_native(
                 }
                 None => builder,
             };
-            rt.block_on(async { builder.await })
+            (rt.block_on(async { builder.await }), None)
         }
     };
     let lix = lix?;
-    NativeLix::new(NativeLixInner::Memory(lix))
+    NativeLix::new(NativeLixInner::Memory(lix), telemetry_parent_source)
 }
 
 fn open_filesystem_storage_native(
     path: String,
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
+    telemetry_parent: Option<SpanContext>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
 ) -> std::result::Result<NativeLix, LixError> {
@@ -988,8 +1043,8 @@ fn open_filesystem_storage_native(
     let storage = FilesystemStorage::new(path)
         .sync_all_files(sync_all_files)
         .open()?;
-    let lix = match telemetry_dispatch.map(telemetry_sink) {
-        Some(telemetry) => {
+    let (lix, telemetry_parent_source) = match telemetry_dispatch.map(telemetry_sink) {
+        Some((telemetry, parent_source)) => {
             let builder = open_lix()
                 .with_storage(storage.clone())
                 .with_telemetry(telemetry);
@@ -998,7 +1053,12 @@ fn open_filesystem_storage_native(
                     .with_server(ServerOptions::sync(url).with_headers(server_headers.clone())),
                 None => builder,
             };
-            rt.block_on(async { builder.await })
+            (
+                rt.block_on(instrument_remote_parent(telemetry_parent, async {
+                    builder.await
+                })),
+                Some(parent_source),
+            )
         }
         None => {
             let builder = open_lix().with_storage(storage.clone());
@@ -1008,28 +1068,42 @@ fn open_filesystem_storage_native(
                 }
                 None => builder,
             };
-            rt.block_on(async { builder.await })
+            (rt.block_on(async { builder.await }), None)
         }
     };
     let lix = lix?;
     rt.block_on(storage.start_sync(&lix))?;
-    NativeLix::new(NativeLixInner::FilesystemStorage(
-        lix,
-        storage,
-        Arc::new(AtomicUsize::new(1)),
-    ))
+    NativeLix::new(
+        NativeLixInner::FilesystemStorage(lix, storage, Arc::new(AtomicUsize::new(1))),
+        telemetry_parent_source,
+    )
 }
 
 #[napi]
 impl NativeLix {
+    #[napi(js_name = "setTelemetryParent")]
+    pub fn set_telemetry_parent(&self, parent_json: Option<String>) -> Result<()> {
+        if let Some(parent_source) = &self.telemetry_parent {
+            *parent_source
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                crate::telemetry::parse_parent_context_json(parent_json)
+                    .map_err(Error::from_reason)?;
+        }
+        Ok(())
+    }
+
     #[napi(js_name = "openMemory")]
     pub fn open_memory(
         telemetry_dispatch: Option<Function<'_, String, ()>>,
+        telemetry_parent_json: Option<String>,
         server_url: Option<String>,
         server_headers: Option<Vec<Vec<String>>>,
     ) -> Result<AsyncTask<OpenMemoryTask>> {
         Ok(AsyncTask::new(OpenMemoryTask {
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
+            telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json)
+                .map_err(Error::from_reason)?,
             server_url,
             server_headers: parse_server_headers(server_headers)?,
         }))
@@ -1040,6 +1114,7 @@ impl NativeLix {
         path: String,
         sync_all_files: bool,
         telemetry_dispatch: Option<Function<'_, String, ()>>,
+        telemetry_parent_json: Option<String>,
         server_url: Option<String>,
         server_headers: Option<Vec<Vec<String>>>,
     ) -> Result<AsyncTask<OpenFilesystemStorageTask>> {
@@ -1047,6 +1122,8 @@ impl NativeLix {
             path,
             sync_all_files,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
+            telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json)
+                .map_err(Error::from_reason)?,
             server_url,
             server_headers: parse_server_headers(server_headers)?,
         }))
@@ -1065,6 +1142,7 @@ impl NativeLix {
                     branch_id: None,
                     account_id: None,
                 }),
+                telemetry_parent: self.telemetry_parent.clone(),
                 deferred,
             });
         Ok(promise)
@@ -1155,6 +1233,7 @@ impl NativeLix {
             .send_with_deferred(deferred, |deferred| LixCommand::Observe {
                 sql,
                 params,
+                telemetry_parent: self.telemetry_parent.clone(),
                 deferred,
             });
         Ok(promise)
@@ -1320,15 +1399,20 @@ pub struct NativeObserveEvents {
     closed: Arc<AtomicBool>,
     close_signal: watch::Sender<bool>,
     next_in_flight: Arc<AtomicBool>,
+    telemetry_parent: Option<PendingTelemetryParent>,
 }
 
 #[napi]
 impl NativeObserveEvents {
-    fn new(events: NativeObserveEventsInner) -> Result<Self> {
+    fn new(
+        events: NativeObserveEventsInner,
+        telemetry_parent: Option<PendingTelemetryParent>,
+    ) -> Result<Self> {
         let (commands, receiver) = mpsc::channel();
         let closed = Arc::new(AtomicBool::new(false));
         let (close_signal, actor_close_signal) = watch::channel(false);
         let next_in_flight = Arc::new(AtomicBool::new(false));
+        let telemetry_parent = telemetry_parent.map(|_| Arc::new(Mutex::new(None)));
 
         let actor_closed = Arc::clone(&closed);
         let actor_next_in_flight = Arc::clone(&next_in_flight);
@@ -1351,6 +1435,7 @@ impl NativeObserveEvents {
             closed,
             close_signal,
             next_in_flight,
+            telemetry_parent,
         })
     }
 
@@ -1384,17 +1469,36 @@ impl NativeObserveEvents {
                 return Err(error);
             }
         };
-        match self.commands.send(ObserveCommand::Next(deferred)) {
+        let telemetry_parent = self
+            .telemetry_parent
+            .as_ref()
+            .and_then(take_pending_telemetry_parent);
+        match self.commands.send(ObserveCommand::Next {
+            deferred,
+            telemetry_parent,
+        }) {
             Ok(()) => Ok(promise),
             Err(error) => {
                 self.closed.store(true, Ordering::SeqCst);
-                let ObserveCommand::Next(deferred) = error.0 else {
+                let ObserveCommand::Next { deferred, .. } = error.0 else {
                     unreachable!("next() only sends ObserveCommand::Next");
                 };
                 resolve_observe_deferred(deferred, Ok(None), Arc::clone(&self.next_in_flight));
                 Ok(promise)
             }
         }
+    }
+
+    #[napi(js_name = "setTelemetryParent")]
+    pub fn set_telemetry_parent(&self, parent_json: Option<String>) -> Result<()> {
+        if let Some(parent_source) = &self.telemetry_parent {
+            *parent_source
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                crate::telemetry::parse_parent_context_json(parent_json)
+                    .map_err(Error::from_reason)?;
+        }
+        Ok(())
     }
 
     #[napi]
@@ -1414,7 +1518,10 @@ type ObserveNextResolver = Box<dyn FnOnce(Env) -> Result<Option<ObserveEventDto>
 type ObserveNextDeferred = JsDeferred<Option<ObserveEventDto>, ObserveNextResolver>;
 
 enum ObserveCommand {
-    Next(ObserveNextDeferred),
+    Next {
+        deferred: ObserveNextDeferred,
+        telemetry_parent: Option<SpanContext>,
+    },
     Close,
 }
 
@@ -1431,7 +1538,7 @@ fn run_observe_actor(
             closed.store(true, Ordering::SeqCst);
             while let Ok(command) = receiver.recv() {
                 match command {
-                    ObserveCommand::Next(deferred) => {
+                    ObserveCommand::Next { deferred, .. } => {
                         next_in_flight.store(false, Ordering::SeqCst);
                         deferred.reject(to_napi_error(&error));
                     }
@@ -1444,8 +1551,14 @@ fn run_observe_actor(
 
     while let Ok(command) = receiver.recv() {
         match command {
-            ObserveCommand::Next(deferred) => {
-                let result = rt.block_on(observe_next(&mut events, &closed, &mut close_signal));
+            ObserveCommand::Next {
+                deferred,
+                telemetry_parent,
+            } => {
+                let result = rt.block_on(instrument_remote_parent(
+                    telemetry_parent,
+                    observe_next(&mut events, &closed, &mut close_signal),
+                ));
                 let result = match result {
                     Ok(Some(_)) | Err(_) if closed.load(Ordering::SeqCst) => Ok(None),
                     Err(error) if error.code == LixError::CODE_CLOSED => Ok(None),
@@ -1556,10 +1669,16 @@ fn close_observe_events(
 }
 
 impl NativeLix {
-    fn new(lix: NativeLixInner) -> std::result::Result<Self, LixError> {
-        let actor = NativeLixActor::start(lix)
+    fn new(
+        lix: NativeLixInner,
+        telemetry_parent: Option<PendingTelemetryParent>,
+    ) -> std::result::Result<Self, LixError> {
+        let actor = NativeLixActor::start(lix, telemetry_parent.clone())
             .map_err(|error| LixError::unknown(format!("failed to start native actor: {error}")))?;
-        Ok(Self { actor })
+        Ok(Self {
+            actor,
+            telemetry_parent,
+        })
     }
 }
 

@@ -1311,7 +1311,7 @@ where
 mod tests {
     use super::*;
     use lix::telemetry::{
-        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySink, TelemetrySpanClass,
+        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySink, TelemetrySpanDescriptor,
         TelemetrySpanEnd, TelemetrySpanHandle, TelemetrySpanStart,
     };
     use std::sync::{
@@ -1400,8 +1400,8 @@ mod tests {
         }
 
         impl TelemetrySink for SqlOnlySink {
-            fn enabled(&self, _class: TelemetrySpanClass, name: &'static str) -> bool {
-                name != "lix.repository.opened"
+            fn enabled(&self, descriptor: &TelemetrySpanDescriptor) -> bool {
+                descriptor.name() != "lix.repository.opened"
             }
 
             fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
@@ -1410,13 +1410,19 @@ mod tests {
                     "disabled opened spans must not be started"
                 );
                 self.started.lock().expect("started").push(start.name);
-                Box::new(NoopHandle)
+                Box::new(NoopHandle(crate::telemetry::new_span_context(
+                    start.parent_span_context.as_ref(),
+                )))
             }
         }
 
-        struct NoopHandle;
+        struct NoopHandle(opentelemetry::trace::SpanContext);
 
         impl TelemetrySpanHandle for NoopHandle {
+            fn span_context(&self) -> &opentelemetry::trace::SpanContext {
+                &self.0
+            }
+
             fn enter(&self) -> Box<dyn crate::telemetry::TelemetrySpanEnterGuard + '_> {
                 Box::new(())
             }

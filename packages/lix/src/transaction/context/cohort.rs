@@ -39,10 +39,20 @@ where
     }
 
     let member_count = cohort.len();
+    let commit_cohort_id = crate::telemetry::current_commit_cohort_id()
+        .unwrap_or_else(crate::telemetry::next_commit_cohort_id);
+    let materialize_span = start_materialize_span(member_count, &commit_cohort_id);
     let mut prepared: Vec<PreparedCohortMember<StorageImpl>> = Vec::with_capacity(member_count);
     let mut cohort = cohort.into_iter();
     while let Some((mut transaction, runtime_functions)) = cohort.next() {
-        let prepared_writes = match transaction.staged_writes.drain() {
+        let prepared_writes = match materialize_span.as_ref() {
+            Some(span) => {
+                let _entered = span.enter();
+                transaction.staged_writes.drain()
+            }
+            None => transaction.staged_writes.drain(),
+        };
+        let prepared_writes = match prepared_writes {
             Ok(writes) => writes,
             Err(error) => {
                 transaction
@@ -57,6 +67,12 @@ where
                         .discard_pending_plugin_actor_publications()
                         .await;
                 }
+                if let Some(span) = materialize_span {
+                    span.finish(
+                        Status::error(error.code.clone()),
+                        vec![TelemetryAttribute::string("error.type", error.code.clone())],
+                    );
+                }
                 return vec![Err(error); member_count];
             }
         };
@@ -68,9 +84,17 @@ where
     }
 
     if !can_merge_cohort(&prepared) {
+        if let Some(span) = materialize_span {
+            span.finish(Status::Unset, Vec::new());
+        }
         return commit_prepared_individually(prepared).await;
     }
-    let outcomes = Box::pin(commit_merged_cohort(prepared)).await;
+    let outcomes = Box::pin(commit_merged_cohort(
+        prepared,
+        commit_cohort_id,
+        materialize_span,
+    ))
+    .await;
     drop(commit_guards);
     outcomes
 }
@@ -124,8 +148,80 @@ where
 }
 
 async fn commit_merged_cohort<StorageImpl>(
-    mut members: Vec<PreparedCohortMember<StorageImpl>>,
+    members: Vec<PreparedCohortMember<StorageImpl>>,
+    commit_cohort_id: String,
+    materialize_span: Option<ActiveTelemetrySpan>,
 ) -> Vec<Result<TransactionCommitOutcome, LixError>>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let member_count = members.len();
+    let preparation = prepare_merged_cohort(members);
+    let preparation = match materialize_span.as_ref() {
+        Some(span) => span.instrument(preparation).await,
+        None => preparation.await,
+    };
+    let (leader, merged_writes) = match preparation {
+        MergedCohortPreparation::Ready {
+            leader,
+            merged_writes,
+        } => (leader, merged_writes),
+        MergedCohortPreparation::Fallback(individual) => {
+            if let Some(span) = materialize_span {
+                span.finish(Status::Unset, Vec::new());
+            }
+            return commit_prepared_individually(individual).await;
+        }
+        MergedCohortPreparation::Error(error) => {
+            if let Some(span) = materialize_span {
+                span.finish(
+                    Status::error(error.code.clone()),
+                    vec![TelemetryAttribute::string("error.type", error.code.clone())],
+                );
+            }
+            return vec![Err(error); member_count];
+        }
+    };
+    let result = leader
+        .transaction
+        .commit_prepared(
+            &leader.runtime_functions,
+            merged_writes,
+            member_count,
+            commit_cohort_id,
+            materialize_span,
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_transaction",
+            "lix.transaction.commit_cohort.execute",
+            cohort_size = member_count,
+        ))
+        .await;
+    match result {
+        Ok(outcome) => {
+            let mut outcomes = vec![Ok(TransactionCommitOutcome::default()); member_count];
+            outcomes[0] = Ok(outcome);
+            outcomes
+        }
+        Err(error) => vec![Err(error); member_count],
+    }
+}
+
+enum MergedCohortPreparation<StorageImpl>
+where
+    StorageImpl: Storage + 'static,
+{
+    Ready {
+        leader: PreparedCohortMember<StorageImpl>,
+        merged_writes: PreparedWriteSet,
+    },
+    Fallback(Vec<PreparedCohortMember<StorageImpl>>),
+    Error(LixError),
+}
+
+async fn prepare_merged_cohort<StorageImpl>(
+    mut members: Vec<PreparedCohortMember<StorageImpl>>,
+) -> MergedCohortPreparation<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -166,7 +262,7 @@ where
                 let mut individual = Vec::with_capacity(member_count);
                 individual.push(leader);
                 individual.extend(members);
-                return commit_prepared_individually(individual).await;
+                return MergedCohortPreparation::Fallback(individual);
             }
         }
     };
@@ -181,7 +277,7 @@ where
                 .transaction
                 .discard_pending_plugin_actor_publications()
                 .await;
-            return vec![Err(error); member_count];
+            return MergedCohortPreparation::Error(error);
         }
     }
     if let Some(replacement) = replacement {
@@ -202,7 +298,7 @@ where
                 .await;
             let mut individual = vec![leader];
             individual.extend(members);
-            return commit_prepared_individually(individual).await;
+            return MergedCohortPreparation::Fallback(individual);
         }
     };
     let validation_read = SharedStorageAdapterRead::new(validation_read);
@@ -219,7 +315,7 @@ where
             .await;
         let mut individual = vec![leader];
         individual.extend(members);
-        return commit_prepared_individually(individual).await;
+        return MergedCohortPreparation::Fallback(individual);
     }
     let session_views = std::iter::once(&leader)
         .chain(members.iter())
@@ -242,22 +338,9 @@ where
             .discard_pending_plugin_actor_publications()
             .await;
     }
-    let result = leader
-        .transaction
-        .commit_prepared(&leader.runtime_functions, merged_writes, member_count)
-        .instrument(tracing::debug_span!(
-            target: "lix_transaction",
-            "lix.transaction.commit_cohort.execute",
-            cohort_size = member_count,
-        ))
-        .await;
-    match result {
-        Ok(outcome) => {
-            let mut outcomes = vec![Ok(TransactionCommitOutcome::default()); member_count];
-            outcomes[0] = Ok(outcome);
-            outcomes
-        }
-        Err(error) => vec![Err(error); member_count],
+    MergedCohortPreparation::Ready {
+        leader,
+        merged_writes,
     }
 }
 
@@ -689,10 +772,19 @@ where
 {
     let mut outcomes = Vec::with_capacity(members.len());
     for member in members {
+        let commit_cohort_id = crate::telemetry::current_commit_cohort_id()
+            .unwrap_or_else(crate::telemetry::next_commit_cohort_id);
+        let materialize_span = start_materialize_span(1, &commit_cohort_id);
         outcomes.push(
             member
                 .transaction
-                .commit_prepared(&member.runtime_functions, member.prepared_writes, 1)
+                .commit_prepared(
+                    &member.runtime_functions,
+                    member.prepared_writes,
+                    1,
+                    commit_cohort_id,
+                    materialize_span,
+                )
                 .await,
         );
     }

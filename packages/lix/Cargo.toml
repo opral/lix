@@ -160,6 +160,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 futures-lite = "2"
 tokio = { version = "1", features = ["rt", "sync"] }
 tracing = "0.1"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+tracing-opentelemetry = "0.33"
+paste = "1"
 blake3 = "1"
 fastcdc = "3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -185,6 +189,7 @@ criterion = { package = "codspeed-criterion-compat", version = "4" }
 flate2 = "1"
 http-body-util = "0.1"
 lix_collaboration_test_support = { path = "../collaboration-test-support" }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["testing", "trace"] }
 paste = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }

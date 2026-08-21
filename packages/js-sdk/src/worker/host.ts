@@ -42,13 +42,31 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		}
 		if (message.operation.kind === "observe.next") {
 			const observeId = message.operation.observeId;
-			void respond(message, () => handleObserveNext(observeId));
+			void respond(message, () =>
+				handleObserveNext(observeId, message.telemetryParent),
+			);
 			return;
 		}
 		finiteQueue = finiteQueue.then(async () => {
-			await respond(message, () =>
-				handleFiniteOperation(message.sessionId, message.operation),
-			);
+			try {
+				await respond(message, async () => {
+					if (message.operation.kind !== "open") {
+						requiredLix(message.sessionId).setTelemetryParent(
+							message.telemetryParent,
+						);
+					}
+					return handleFiniteOperation(
+						message.sessionId,
+						message.operation,
+						message.telemetryParent,
+					);
+				});
+			} finally {
+				// The mutable FFI carrier is safe only within this serialized
+				// operation. Clear it before another request or background task
+				// can accidentally inherit a stale remote parent.
+				(sessions.get(message.sessionId) ?? sessions.get(0))?.setTelemetryParent();
+			}
 		});
 	});
 
@@ -107,6 +125,7 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 	async function handleFiniteOperation(
 		sessionId: number,
 		operation: WorkerOperation,
+		telemetryParent: WorkerRequest["telemetryParent"],
 	): Promise<unknown> {
 		switch (operation.kind) {
 			case "open":
@@ -120,6 +139,7 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 							? (span: LixTelemetrySpan) =>
 									endpoint.postMessage({ kind: "telemetry", span })
 							: undefined,
+						telemetryParent,
 						createSyncServerBridge(operation.server),
 					),
 				);
@@ -287,9 +307,13 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		}
 	}
 
-	async function handleObserveNext(observeId: number): Promise<unknown> {
+	async function handleObserveNext(
+		observeId: number,
+		telemetryParent: WorkerRequest["telemetryParent"],
+	): Promise<unknown> {
 		const events = observations.get(observeId);
 		if (!events) return undefined;
+		events.setTelemetryParent(telemetryParent);
 		return events.next();
 	}
 

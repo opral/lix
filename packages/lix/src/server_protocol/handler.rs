@@ -4790,8 +4790,12 @@ mod tests {
         MemoryWrite, PutBatch, ReadDurability, ReadOptions, ScanCursor, SpaceId, Storage,
         StorageError, StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
-    use lix::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, TracingTelemetrySink};
+    use lix::telemetry::{
+        CallbackTelemetrySink, CompletedTelemetrySpan, OpenTelemetryTracingSink,
+    };
     use lix::{Blob, Memory, open_lix};
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
     use serde_json::{Value as JsonValue, json};
     use std::io::Write as _;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
@@ -5088,12 +5092,26 @@ mod tests {
         id: tracing::span::Id,
         parent: Option<tracing::span::Id>,
         name: &'static str,
+        level: tracing::Level,
         fields: std::collections::BTreeMap<String, String>,
     }
 
     #[derive(Clone, Default)]
     struct CaptureLayer {
         spans: Arc<Mutex<Vec<CapturedSpan>>>,
+    }
+
+    fn set_otel_capture_default(
+        capture: CaptureLayer,
+    ) -> (SdkTracerProvider, tracing::subscriber::DefaultGuard) {
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("lix-test");
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(capture)
+                .with(tracing_opentelemetry::layer().with_tracer(tracer)),
+        );
+        (provider, guard)
     }
 
     struct FieldVisitor<'a> {
@@ -5139,6 +5157,7 @@ mod tests {
                     id: id.clone(),
                     parent,
                     name: attributes.metadata().name(),
+                    level: *attributes.metadata().level(),
                     fields,
                 });
         }
@@ -6819,7 +6838,7 @@ mod tests {
     async fn app_with_tracing_telemetry() -> TestApp {
         let lix = Arc::new(
             open_lix()
-                .with_telemetry(Arc::new(TracingTelemetrySink::new()))
+                .with_telemetry(Arc::new(OpenTelemetryTracingSink::new()))
                 .as_protocol_root()
                 .await
                 .expect("open lix"),
@@ -10855,8 +10874,7 @@ mod tests {
     async fn execute_keeps_sql_span_under_protocol_request_on_native_runtime() {
         let capture = CaptureLayer::default();
         let spans = Arc::clone(&capture.spans);
-        let _subscriber =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let (_provider, _subscriber) = set_otel_capture_default(capture);
         let protocol_span = tracing::info_span!("lix.protocol.request");
         let protocol_span_id = protocol_span.id().expect("protocol span id");
 
@@ -10893,6 +10911,29 @@ mod tests {
             })
     }
 
+    fn assert_info_plane(spans: &[CapturedSpan]) {
+        use crate::telemetry::{FORBIDDEN_PRODUCTION_NAMES, PRODUCTION_NAMES};
+        assert_eq!(PRODUCTION_NAMES.len(), 11);
+        for span in spans.iter().filter(|span| span.level == tracing::Level::INFO) {
+            assert!(
+                PRODUCTION_NAMES.contains(&span.name) || span.name == "lix.protocol.request",
+                "unexpected INFO production span {}",
+                span.name
+            );
+            assert!(
+                !FORBIDDEN_PRODUCTION_NAMES.contains(&span.name),
+                "legacy INFO name still exported: {}",
+                span.name
+            );
+        }
+        for forbidden in FORBIDDEN_PRODUCTION_NAMES {
+            assert!(
+                spans.iter().all(|span| span.name != *forbidden),
+                "legacy name {forbidden} still present"
+            );
+        }
+    }
+
     fn assert_no_bound_parameter_or_bytea_fields(spans: &[CapturedSpan]) {
         for span in spans {
             for (key, value) in &span.fields {
@@ -10914,8 +10955,7 @@ mod tests {
     async fn execute_batch_write_exports_materialize_storage_and_notify() {
         let capture = CaptureLayer::default();
         let spans = Arc::clone(&capture.spans);
-        let _subscriber =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let (_provider, _subscriber) = set_otel_capture_default(capture);
         let app = app_with_tracing_telemetry().await;
         let (session_id, _) = new_session(&app.router).await;
         spans.lock().expect("capture spans").clear();
@@ -10938,8 +10978,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
         let batch = require_span(&spans, "lix.sql.batch");
-        require_span(&spans, "lix.sql.query");
+        let query = require_span(&spans, "lix.sql.query");
+        assert_eq!(
+            query.fields.get("db.operation.name").map(String::as_str),
+            Some("INSERT")
+        );
         let materialize = require_span(&spans, "lix.transaction.materialize");
         let storage_commit = require_span(&spans, "lix.transaction.storage");
         let notify = require_span(&spans, "lix.transaction.notify");
@@ -10955,6 +11000,8 @@ mod tests {
             Some(cohort_id)
         );
         assert_eq!(notify.fields.get("lix.commit_cohort_id"), Some(cohort_id));
+        assert!(!materialize.fields.contains_key("lix.trace_id"));
+        assert!(!materialize.fields.contains_key("lix.span.links"));
         assert_no_bound_parameter_or_bytea_fields(&spans);
     }
 
@@ -10962,8 +11009,7 @@ mod tests {
     async fn checkpoint_create_exports_engine_parent_commit_children_and_commit_id() {
         let capture = CaptureLayer::default();
         let spans = Arc::clone(&capture.spans);
-        let _subscriber =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let (_provider, _subscriber) = set_otel_capture_default(capture);
         let app = app_with_tracing_telemetry().await;
         let (session_id, _) = new_session(&app.router).await;
         let write = request(
@@ -10995,6 +11041,7 @@ mod tests {
             .to_string();
 
         let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
         let checkpoint = require_span(&spans, "lix.checkpoint.create");
         assert_eq!(
             checkpoint.fields.get("lix.commit_id").map(String::as_str),
@@ -11019,8 +11066,7 @@ mod tests {
     async fn handshake_exports_session_open_separate_from_opened_bind() {
         let capture = CaptureLayer::default();
         let spans = Arc::clone(&capture.spans);
-        let _subscriber =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let (_provider, _subscriber) = set_otel_capture_default(capture);
         let app = app_with_tracing_telemetry().await;
         spans.lock().expect("capture spans").clear();
 
@@ -11028,6 +11074,7 @@ mod tests {
         assert!(!session_id.is_empty());
 
         let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
         assert_eq!(
             spans
                 .iter()
@@ -11047,8 +11094,7 @@ mod tests {
     async fn explicit_transaction_exports_one_transaction_notify_span() {
         let capture = CaptureLayer::default();
         let spans = Arc::clone(&capture.spans);
-        let _subscriber =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let (_provider, _subscriber) = set_otel_capture_default(capture);
         let app = app_with_tracing_telemetry().await;
         let (session_id, _) = new_session(&app.router).await;
         let transaction_id = begin_remote_transaction(&app.router, &session_id).await;
@@ -11078,6 +11124,7 @@ mod tests {
         assert_eq!(committed.status(), StatusCode::NO_CONTENT);
 
         let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
         assert_eq!(
             spans
                 .iter()
@@ -11093,14 +11140,14 @@ mod tests {
     async fn cold_open_lix_exports_engine_and_session_open() {
         let capture = CaptureLayer::default();
         let spans = Arc::clone(&capture.spans);
-        let _subscriber =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let (_provider, _subscriber) = set_otel_capture_default(capture);
         let _lix = open_lix()
-            .with_telemetry(Arc::new(TracingTelemetrySink::new()))
+            .with_telemetry(Arc::new(OpenTelemetryTracingSink::new()))
             .await
             .expect("open lix");
 
         let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
         require_span(&spans, "lix.engine.open");
         require_span(&spans, "lix.session.open");
         assert_eq!(

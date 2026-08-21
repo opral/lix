@@ -116,12 +116,18 @@ test("sync mode forwards static headers through the native transport", async () 
 }, 30_000);
 
 test("openLix forwards opt-in SQL telemetry from the engine", async () => {
+	let activeParent = {
+		traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		spanId: "aaaaaaaaaaaaaaaa",
+		traceFlags: 1,
+	};
 	let resolveSpan!: (span: LixTelemetrySpan) => void;
 	const received = new Promise<LixTelemetrySpan>((resolve) => {
 		resolveSpan = resolve;
 	});
 	const lix = await openLix({
 		telemetry: {
+			parentContext: () => activeParent,
 			onSpan(span) {
 				if (
 					span.name === "lix.sql.query" &&
@@ -134,19 +140,84 @@ test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 		},
 	});
 
+	activeParent = {
+		traceId: "0123456789abcdef0123456789abcdef",
+		spanId: "0123456789abcdef",
+		traceFlags: 1,
+	};
 	await lix.execute("SELECT 'private-value' AS value, 42 AS number");
 	const span = await received;
 	expect(span).toMatchObject({
-		schemaVersion: 2,
+		schemaVersion: 3,
 		name: "lix.sql.query",
-		status: "ok",
+		kind: "internal",
+		traceFlags: 1,
+		status: { code: "unset" },
 	});
 	expect(span.durationMs).toBeGreaterThanOrEqual(0);
 	expect(span.traceId).toMatch(/^[0-9a-f]{32}$/u);
+	expect(span.traceId).toBe("0123456789abcdef0123456789abcdef");
+	expect(span.parentSpanId).toBe("0123456789abcdef");
 	expect(span.spanId).toMatch(/^[0-9a-f]{16}$/u);
 	expect(span.attributes["db.query.text"]).toBe(
 		"SELECT ? AS value, ? AS number",
 	);
+	await lix.close();
+});
+
+test("observe.next samples its own telemetry parent", async () => {
+	const nextParent = {
+		traceId: "fedcba9876543210fedcba9876543210",
+		spanId: "fedcba9876543210",
+		traceFlags: 1,
+	};
+	let activeParent = {
+		traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		spanId: "aaaaaaaaaaaaaaaa",
+		traceFlags: 1,
+	};
+	let resolveSpan!: (span: LixTelemetrySpan) => void;
+	const received = new Promise<LixTelemetrySpan>((resolve) => {
+		resolveSpan = resolve;
+	});
+	const lix = await openLix({
+		telemetry: {
+			parentContext: () => activeParent,
+			onSpan(span) {
+				if (span.name === "lix.sql.query" && span.traceId === nextParent.traceId) {
+					resolveSpan(span);
+				}
+			},
+		},
+	});
+	const observation = lix.observe("SELECT 'observe-private' AS value");
+	activeParent = nextParent;
+	await observation.next();
+	const span = await received;
+	expect(span.parentSpanId).toBe(nextParent.spanId);
+	observation.close();
+	await lix.close();
+});
+
+test("openLix forwards production commit phases through onSpan", async () => {
+	const names = new Set<string>();
+	const lix = await openLix({
+		telemetry: {
+			onSpan(span) {
+				names.add(span.name);
+			},
+		},
+	});
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('telemetry-cut', '1')",
+	);
+	expect(names.has("lix.sql.query")).toBe(true);
+	expect(names.has("lix.transaction.materialize")).toBe(true);
+	expect(names.has("lix.transaction.storage")).toBe(true);
+	expect(names.has("lix.transaction.notify")).toBe(true);
+	expect(names.has("SELECT")).toBe(false);
+	expect(names.has("SQL batch")).toBe(false);
+	expect(names.has("lix.opened")).toBe(false);
 	await lix.close();
 });
 

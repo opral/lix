@@ -12,6 +12,7 @@ import type {
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 	LixTelemetrySpan,
+	LixTelemetryParentContext,
 	OpenAnotherSessionOptions,
 } from "./types.js";
 import type { NativeLixValue } from "./value.js";
@@ -52,6 +53,7 @@ export type BindingBatchStatement = {
 };
 
 export type LixBinding = {
+	setTelemetryParent(parent?: TelemetryParentContext): void;
 	openAnotherSession(options: OpenAnotherSessionOptions): Promise<LixBinding>;
 	execute(
 		sql: string,
@@ -89,11 +91,13 @@ export type LixTransactionBinding = {
 };
 
 export type ObserveEventsBinding = {
+	setTelemetryParent(parent?: TelemetryParentContext): void;
 	next(): Promise<BindingObserveEvent | null | undefined>;
 	close(): void;
 };
 
 export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
+export type TelemetryParentContext = LixTelemetryParentContext;
 
 export type LixStorageProviderModule = {
 	createLixStorageProvider(options: unknown): Promise<LixStorageProvider>;
