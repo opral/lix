@@ -56,6 +56,16 @@ WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```
 
+`lix_commit_ancestry()` returns the active head at depth `0` and every
+reachable ancestor once at its shortest depth. Pass one commit ID to use an
+explicit graph anchor:
+
+```sql
+SELECT commit_id, depth
+FROM lix_commit_ancestry($1)
+ORDER BY depth, commit_id;
+```
+
 `lix_restore` is a command-shaped mutation and must be the statement's only
 projection:
 

@@ -118,7 +118,9 @@ impl PublicCatalog {
                 Field::new("commit_id", DataType::Utf8, false),
             ])),
             PublicSurfaceKind::WorkingDiff => working_diff_schema(),
-            PublicSurfaceKind::HistoryFunction => return None,
+            PublicSurfaceKind::HistoryFunction | PublicSurfaceKind::CommitAncestryFunction => {
+                return None;
+            }
             PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![Field::new(
@@ -245,6 +247,12 @@ impl PublicCatalog {
         self.insert(surface(
             "lix_history",
             PublicSurfaceKind::HistoryFunction,
+            Vec::new(),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_commit_ancestry",
+            PublicSurfaceKind::CommitAncestryFunction,
             Vec::new(),
             SurfaceCapabilities::read_only(),
         ))?;

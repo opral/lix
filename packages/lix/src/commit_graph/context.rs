@@ -199,6 +199,36 @@ where
             .await
     }
 
+    /// Walks only the complete nearest-depth layers needed to satisfy `limit`.
+    pub(crate) async fn reachable_nodes_limited(
+        &mut self,
+        head_commit_id: &CommitId,
+        limit: usize,
+    ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
+        if limit == 0 {
+            return Ok(Arc::from([]));
+        }
+        if let Some(nodes) = self.reachable_nodes_cache.get(&(*head_commit_id, None)) {
+            return Ok(nodes.iter().take(limit).cloned().collect());
+        }
+        let mut walk = ReachableWalk::new(*head_commit_id);
+        let mut nodes = Vec::new();
+        while let Some(layer) = walk.next_layer(self).await? {
+            let depth = layer.depth;
+            nodes.extend(
+                layer
+                    .commits
+                    .into_iter()
+                    .map(|commit| ReachableCommitGraphNode { commit, depth }),
+            );
+            if nodes.len() >= limit {
+                break;
+            }
+        }
+        nodes.truncate(limit);
+        Ok(Arc::from(nodes))
+    }
+
     /// Walks from `head_commit_id` and stops once `max_depth` is complete.
     async fn reachable_nodes_within_depth(
         &mut self,
@@ -820,6 +850,14 @@ where
         head_commit_id: &CommitId,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
         Self::reachable_nodes(self, head_commit_id).await
+    }
+
+    async fn reachable_nodes_limited(
+        &mut self,
+        head_commit_id: &CommitId,
+        limit: usize,
+    ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
+        Self::reachable_nodes_limited(self, head_commit_id, limit).await
     }
 
     async fn change_history_from_commit(

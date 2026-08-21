@@ -2877,11 +2877,14 @@ fn bind_table_function_parameters(
             else {
                 return ControlFlow::Continue(());
             };
-            let public_function_name = ["lix_history", "lix_working_diff", "lix_diff"]
-                .into_iter()
-                .find(|candidate| {
-                    crate::sql2::parse::object_name_is_public_function(name, candidate)
-                });
+            let public_function_name = [
+                "lix_history",
+                "lix_working_diff",
+                "lix_diff",
+                "lix_commit_ancestry",
+            ]
+            .into_iter()
+            .find(|candidate| crate::sql2::parse::object_name_is_public_function(name, candidate));
             let is_history = public_function_name == Some("lix_history");
             if let Some(function_name) = public_function_name {
                 // DataFusion's table-function registry is case-sensitive and
@@ -3029,7 +3032,7 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
                 "recursive CTEs are not supported by Lix SQL",
             )
             .with_hint(
-                "Use explicit commit graph surfaces such as lix_commit and lix_commit_edge, or a typed <schema>_history surface, instead of WITH RECURSIVE.",
+                "Use lix_commit_ancestry() for transitive commit traversal, explicit graph surfaces such as lix_commit and lix_commit_edge for topology, or a typed history surface instead of WITH RECURSIVE.",
             ));
         }
         _ => {}

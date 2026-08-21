@@ -5322,6 +5322,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lix_restore_repairs_a_legacy_missing_checkpoint_cursor() {
+        let session = open_session().await;
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should load");
+        let restore_target = session
+            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+            .await
+            .expect("initial head should read")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("initial head should be text");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('legacy-cursor', 'later')",
+                &[],
+            )
+            .await
+            .expect("later state should commit");
+
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch control read should open");
+        let mut control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("branch control should read")
+            .expect("active branch control should exist");
+        control.working_diff_checkpoint_commit_id = None;
+        drop(read);
+        let mut corrupt = session.storage.new_write_set();
+        crate::branch::stage_branch_head_control(&mut corrupt, &branch_id, control)
+            .expect("legacy cursor corruption should stage");
+        session
+            .storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("legacy cursor corruption should commit");
+
+        let broken = session
+            .execute("SELECT * FROM lix_working_diff()", &[])
+            .await
+            .expect_err("legacy branch should reproduce the missing-cursor failure");
+        assert!(broken.message.contains("has no checkpoint cursor"));
+
+        let restored = session
+            .execute(
+                "SELECT lix_restore($1)",
+                &[Value::Text(restore_target.clone())],
+            )
+            .await
+            .expect("restore should repair the legacy branch atomically");
+        assert_eq!(
+            restored.rows()[0].get::<String>("lix_restore").unwrap(),
+            restore_target
+        );
+        let working_diff = session
+            .execute("SELECT * FROM lix_working_diff()", &[])
+            .await
+            .expect("working diff should read after repair");
+        assert!(working_diff.rows().is_empty());
+
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("repaired branch control read should open");
+        let repaired = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("repaired branch control should read")
+            .expect("repaired branch control should exist");
+        assert_eq!(
+            repaired
+                .working_diff_checkpoint_commit_id
+                .map(|commit_id| commit_id.to_string()),
+            Some(restore_target)
+        );
+    }
+
+    #[tokio::test]
     async fn exact_registered_schema_point_preserves_typed_public_projection() {
         let session = open_session().await;
         let schema = serde_json::json!({

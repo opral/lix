@@ -43,6 +43,7 @@ pub(crate) enum PublicSurfaceKind {
     Directory,
     Branch,
     HistoryFunction,
+    CommitAncestryFunction,
     WorkingDiff,
     Revert,
     Apply,

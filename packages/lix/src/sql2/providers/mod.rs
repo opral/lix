@@ -12,6 +12,8 @@ mod branch;
 mod branch_selection;
 mod change;
 mod columns;
+mod commit_ancestry;
+pub(crate) use commit_ancestry::commit_ancestry_schema;
 mod diff;
 mod directory;
 mod directory_history;
@@ -385,7 +387,7 @@ where
         }
     });
     let history_query_source = if needs_history_query_source {
-        let active_branch_commit_id = active_branch_commit_id.ok_or_else(|| {
+        let active_branch_commit_id = active_branch_commit_id.clone().ok_or_else(|| {
             LixError::branch_not_found(
                 ctx.active_branch_id(),
                 "register SQL history providers",
@@ -458,6 +460,21 @@ where
                     ctx.changelog_query_source(),
                 )
                 .await?;
+            }
+            PublicSurfaceKind::CommitAncestryFunction => {
+                let active_branch_commit_id = active_branch_commit_id.clone().ok_or_else(|| {
+                    LixError::branch_not_found(
+                        ctx.active_branch_id(),
+                        "register lix_commit_ancestry",
+                        "active branch",
+                    )
+                })?;
+                commit_ancestry::register_commit_ancestry_function(
+                    session,
+                    &surface.name,
+                    active_branch_commit_id,
+                    ctx.commit_graph(),
+                );
             }
             PublicSurfaceKind::File => {
                 file::register_lix_file_active_provider(
@@ -683,7 +700,8 @@ async fn register_write_from_catalog(
             }
             PublicSurfaceKind::Change
             | PublicSurfaceKind::WorkingDiff
-            | PublicSurfaceKind::HistoryFunction => {}
+            | PublicSurfaceKind::HistoryFunction
+            | PublicSurfaceKind::CommitAncestryFunction => {}
             PublicSurfaceKind::SchemaBase { .. } => {}
         }
     }
@@ -924,7 +942,12 @@ mod tests {
 
         assert_eq!(
             read_only,
-            vec!["lix_change", "lix_history", "lix_working_diff"]
+            vec![
+                "lix_change",
+                "lix_commit_ancestry",
+                "lix_history",
+                "lix_working_diff",
+            ]
         );
         assert_eq!(
             writable,
@@ -939,8 +962,8 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 17, "construction count");
-        assert_eq!(read_only.len() + writable.len(), 10, "surface count");
+        assert_eq!(all_read + writable.len(), 18, "construction count");
+        assert_eq!(read_only.len() + writable.len(), 11, "surface count");
     }
 
     #[test]
