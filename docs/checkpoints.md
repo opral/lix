@@ -65,13 +65,15 @@ A runnable Rust version lives at
 
 ## SQL surfaces
 
-Checkpointing has three read-only SQL surfaces:
+Checkpointing and commit reachability use these read-only SQL surfaces:
 
 | Surface | Scope | Columns |
 | :-- | :-- | :-- |
 | `lix_working_diff()` | Active branch | `diff_id`, `row_pk`, `schema_key`, `file_id`, `diff_type`, `before_change_id`, `after_change_id` |
 | `lix_checkpoint` | Repository-global | `id`, `commit_id`, plus the standard `lixcol_*` row columns |
-| `lix_history('lix_checkpoint')` | Revisions reachable from a commit | `id`, `commit_id`, plus the standard history `lixcol_*` columns including `lixcol_depth` |
+| `lix_history('lix_checkpoint'[, commit_id])` | Global row-authorship history | `id`, `commit_id`, plus the standard history `lixcol_*` columns |
+| `lix_commit_ancestry()` | Active branch head | `commit_id`, `depth` |
+| `lix_commit_ancestry(commit_id)` | Explicit commit | `commit_id`, `depth` |
 
 Working-diff relations are scoped to the current session. Open another session
 on another branch to inspect that branch without switching the primary session.
@@ -86,22 +88,27 @@ granularity as `lix_change`. Its heterogeneous envelope exposes source-schema
 identity and change IDs; applications can join the affected `file_id` or row
 identity to typed current-state relations when presenting a composed review.
 
-`lix_checkpoint` holds the checkpoint rows themselves. It carries no ordering
-column. Use `lix_history('lix_checkpoint')` when you need order, because it exposes
-`lixcol_depth`.
+`lix_checkpoint` is a normal immutable global schema. Its current table retains
+checkpoint markers even when a branch restore abandons their commits. Join the
+table with `lix_commit_ancestry()` when you need checkpoints reachable from the
+active branch head:
 
-Depth is commit distance from the anchor commit. A checkpoint has
-`lixcol_depth = 0` only while it is the head; three later auto-commits put that
-checkpoint at depth `3`. Ascending depth is therefore newest-first, but depths
-are not checkpoint ordinals and may have gaps. SQL row order is not implicit, so
-request it explicitly:
+`lix_history('lix_checkpoint'[, commit_id])` remains the normal history of
+those global rows. It follows where checkpoint-row changes were authored; it
+does not interpret a row's `commit_id` as membership in another commit graph.
 
 ```sql
-SELECT id, commit_id, lixcol_depth
-FROM lix_history('lix_checkpoint')
-ORDER BY lixcol_depth;
+SELECT checkpoint.id, checkpoint.commit_id, ancestry.depth
+FROM lix_checkpoint AS checkpoint
+JOIN lix_commit_ancestry() AS ancestry
+  ON ancestry.commit_id = checkpoint.commit_id
+ORDER BY ancestry.depth, checkpoint.commit_id;
 ```
 
-All three surfaces are read-only. Create a checkpoint for every working diff
+The anchor itself has `depth = 0`; parents have depth `1`. A commit reachable
+through multiple merge paths appears once at its shortest depth. SQL row order
+is not implicit, so request it explicitly.
+
+These surfaces are read-only. Create a checkpoint for every working diff
 through `lix.createCheckpoint()`, or checkpoint a SQL-selected subset
 through `lix_create_checkpoint`. See [Diff commands](./diff-commands.md).

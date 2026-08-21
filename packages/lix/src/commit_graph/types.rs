@@ -137,6 +137,17 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         head_commit_id: &CommitId,
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError>;
 
+    /// Returns the nearest reachable nodes while avoiding traversal below the
+    /// complete breadth layer that satisfies `limit` when supported.
+    async fn reachable_nodes_limited(
+        &mut self,
+        head_commit_id: &CommitId,
+        limit: usize,
+    ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
+        let nodes = self.reachable_nodes(head_commit_id).await?;
+        Ok(nodes.iter().take(limit).cloned().collect())
+    }
+
     async fn change_history_from_commit(
         &mut self,
         start_commit_id: &CommitId,

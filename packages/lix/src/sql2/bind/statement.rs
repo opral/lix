@@ -1452,7 +1452,8 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         }
         PublicSurfaceKind::Change
         | PublicSurfaceKind::WorkingDiff
-        | PublicSurfaceKind::HistoryFunction => {
+        | PublicSurfaceKind::HistoryFunction
+        | PublicSurfaceKind::CommitAncestryFunction => {
             unreachable!("write capability checked before target binding")
         }
     }

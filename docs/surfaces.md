@@ -12,9 +12,11 @@ Lix exposes logical application data through typed SQL relations:
 | Files                           | `lix_file`                   | `lix_history('lix_file')`                   |
 | Directories                     | `lix_directory`              | `lix_history('lix_directory')`              |
 | Working diffs                   | `lix_working_diff()`         | `lix_diff(from_commit, to_commit)`     |
-| Checkpoints                     | `lix_checkpoint`             | `lix_history('lix_checkpoint')`             |
+| Checkpoints                     | `lix_checkpoint`             | `lix_history('lix_checkpoint')` for row-authorship history |
+| Commit graph                    | `lix_commit`, `lix_commit_edge` | `lix_commit_ancestry()` for active-head reachability |
 
-The history functions read revisions reachable from a commit; `lix_diff`
+The history functions read row revisions reachable from a commit;
+`lix_commit_ancestry()` reads the reachable commit set, and `lix_diff`
 compares two arbitrary commits. `lix_registered_schema` and its history
 function provide schema discovery; `lix_key_value` and its history function
 provide shared repository metadata.

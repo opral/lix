@@ -205,6 +205,11 @@ impl LixInformationSchemaProvider {
 
         for (name, signature, provider_schema) in [
             (
+                "lix_commit_ancestry",
+                "() | (commit_id TEXT)",
+                super::providers::commit_ancestry_schema(),
+            ),
+            (
                 "lix_working_diff",
                 "()",
                 super::providers::working_diff_schema(),

@@ -279,6 +279,96 @@ simulation_test!(
 );
 
 simulation_test!(
+    checkpoint_history_as_of_branch_head_follows_global_row_authorship,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        let initial_commit_id = sim.initial_commit_id().to_string();
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-history', 'one')",
+                &[],
+            )
+            .await
+            .expect("first value should commit");
+        let first_checkpoint = session
+            .create_checkpoint()
+            .await
+            .expect("first checkpoint should commit");
+
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'two' WHERE key = 'checkpoint-history'",
+                &[],
+            )
+            .await
+            .expect("second value should commit");
+        let abandoned_checkpoint = session
+            .create_checkpoint()
+            .await
+            .expect("second checkpoint should commit");
+
+        session
+            .execute(
+                "SELECT lix_restore($1)",
+                &[Value::Text(first_checkpoint.commit_id.clone())],
+            )
+            .await
+            .expect("restore to first checkpoint should succeed");
+
+        let global_rows = select_rows(
+            &session,
+            "SELECT commit_id FROM lix_checkpoint ORDER BY commit_id",
+        )
+        .await;
+        assert!(
+            global_rows.contains(&vec![Value::Text(abandoned_checkpoint.commit_id.clone())]),
+            "the normal global table must retain the abandoned checkpoint marker"
+        );
+
+        let reachable_history = select_rows(
+            &session,
+            &format!(
+                "SELECT commit_id FROM lix_history('lix_checkpoint', '{}') \
+                 ORDER BY lixcol_depth",
+                first_checkpoint.commit_id
+            ),
+        )
+        .await;
+        assert_eq!(
+            reachable_history,
+            vec![vec![Value::Text(initial_commit_id)]],
+            "history follows global checkpoint-row authorship; it does not treat a row's commit_id as active-branch graph membership"
+        );
+
+        let reachable_checkpoints = select_rows(
+            &session,
+            "SELECT checkpoint.commit_id, ancestry.depth \
+             FROM lix_checkpoint AS checkpoint \
+             JOIN lix_commit_ancestry() AS ancestry \
+               ON ancestry.commit_id = checkpoint.commit_id \
+             ORDER BY ancestry.depth, checkpoint.commit_id",
+        )
+        .await;
+        assert_eq!(
+            reachable_checkpoints,
+            vec![
+                vec![Value::Text(first_checkpoint.commit_id), Value::Integer(0)],
+                vec![
+                    Value::Text(sim.initial_commit_id().to_string()),
+                    Value::Integer(1)
+                ],
+            ],
+            "joining normal checkpoint rows with active-head ancestry must expose exactly the restorable checkpoint timeline"
+        );
+    }
+);
+
+simulation_test!(
     working_diff_reports_net_tracked_adds_and_removals_after_a_revert,
     |sim| async move {
         let engine = sim.boot_engine().await;

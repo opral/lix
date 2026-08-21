@@ -226,6 +226,7 @@ mod tests {
             "lix_change",
             "lix_checkpoint",
             "lix_commit",
+            "lix_commit_ancestry",
             "lix_commit_edge",
             "lix_create_checkpoint",
             "lix_directory",
