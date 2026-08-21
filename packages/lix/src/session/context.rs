@@ -32,10 +32,13 @@ use crate::sql2::{
     SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
 };
 use crate::storage_adapter::Storage;
-use crate::storage_adapter::{Memory, StorageReadOptions};
+use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteSetStats};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::sync::SyncModeState;
-use crate::telemetry::TelemetrySink;
+use crate::telemetry::{
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanClass,
+    TelemetrySpanStatus, instrument_value,
+};
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{CertifiedHistoryStoreReader, Transaction, open_transaction};
 
@@ -411,14 +414,23 @@ where
         serialize_collaboration_write: bool,
     ) -> Result<SessionWriteAccess, LixError> {
         let collaboration_write_guard = if serialize_collaboration_write {
+            let span = self.telemetry.as_ref().and_then(|sink| {
+                ActiveTelemetrySpan::start_if_enabled(
+                    sink,
+                    TelemetrySpanClass::Performance,
+                    "lix.transaction.wait",
+                    vec![TelemetryAttribute::string(
+                        "lix.wait.reason",
+                        "collaboration_write_gate",
+                    )],
+                )
+            });
             Some(
-                Arc::clone(&self.collaboration_write_gate)
-                    .lock_owned()
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.collaboration_gate_wait"
-                    ))
-                    .await,
+                instrument_value(
+                    span,
+                    Arc::clone(&self.collaboration_write_gate).lock_owned(),
+                )
+                .await,
             )
         } else {
             None
@@ -561,16 +573,10 @@ where
                 crate::storage_bench::record_crud_physical_writes(outcome.storage_stats);
                 let after_commit_result = after_commit(&value);
                 drop(write_access);
-                self.observe_invalidation
-                    .bump_if_storage_changed(&outcome.storage_stats);
-                // The server sync endpoint long-polls on canonical-head
-                // movement. Notify only after the storage commit has crossed
-                // its boundary so a woken pull can always observe the event
-                // it was waiting for. Suppressed internal replica sessions
-                // must not wake their own worker while applying a pull.
-                if !self.sync_outbox_suppressed {
-                    self.sync_mode.notify_sync_change();
-                }
+                self.notify_after_storage_commit(
+                    &outcome.storage_stats,
+                    outcome.commit_cohort_id.as_deref(),
+                );
                 after_commit_result?;
                 Ok(value)
             }
@@ -587,6 +593,47 @@ where
         &self,
     ) -> crate::transaction::TransactionCommitBoundary {
         self.transaction_manager.transaction_commit_boundary()
+    }
+
+    /// Wakes observers and sync long-polls after a durable storage commit.
+    ///
+    /// Named so this work cannot hide inside `transaction.commit()` self-time
+    /// on the production-exported `lix_sql` plane.
+    pub(super) fn notify_after_storage_commit(
+        &self,
+        storage_stats: &StorageWriteSetStats,
+        commit_cohort_id: Option<&str>,
+    ) {
+        let mut attributes = vec![TelemetryAttribute::u64("lix.transaction.count", 1)];
+        if let Some(commit_cohort_id) = commit_cohort_id {
+            attributes.push(TelemetryAttribute::string(
+                "lix.commit_cohort_id",
+                commit_cohort_id,
+            ));
+        }
+        let span = self.telemetry.as_ref().and_then(|sink| {
+            ActiveTelemetrySpan::start_if_enabled(
+                sink,
+                TelemetrySpanClass::Performance,
+                "lix.transaction.notify",
+                attributes,
+            )
+        });
+        let _entered = span.as_ref().map(ActiveTelemetrySpan::enter);
+        self.observe_invalidation
+            .bump_if_storage_changed(storage_stats);
+        // The server sync endpoint long-polls on canonical-head movement.
+        // Notify only after the storage commit has crossed its boundary so a
+        // woken pull can always observe the event it was waiting for.
+        // Suppressed internal replica sessions must not wake their own worker
+        // while applying a pull.
+        if !self.sync_outbox_suppressed {
+            self.sync_mode.notify_sync_change();
+        }
+        drop(_entered);
+        if let Some(span) = span {
+            span.finish(TelemetrySpanStatus::Ok, Vec::new());
+        }
     }
 }
 
@@ -605,14 +652,16 @@ impl SessionWriteAccess {
         collaboration_write_gate: &Arc<tokio::sync::Mutex<()>>,
     ) {
         if self.collaboration_write_guard.is_none() {
+            let span = ActiveTelemetrySpan::start_current(
+                TelemetrySpanClass::Performance,
+                "lix.transaction.wait",
+                vec![TelemetryAttribute::string(
+                    "lix.wait.reason",
+                    "collaboration_write_gate",
+                )],
+            );
             self.collaboration_write_guard = Some(
-                Arc::clone(collaboration_write_gate)
-                    .lock_owned()
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.collaboration_gate_wait"
-                    ))
-                    .await,
+                instrument_value(span, Arc::clone(collaboration_write_gate).lock_owned()).await,
             );
         }
     }

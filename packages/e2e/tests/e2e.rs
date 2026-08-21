@@ -68,6 +68,10 @@ struct StartedPerfSpan {
     started: Instant,
 }
 
+fn is_exported_or_debug_perf_target(target: &str) -> bool {
+    matches!(target, "lix_perf" | "lix_sql")
+}
+
 fn is_import_perf_span(name: &str) -> bool {
     matches!(
         name,
@@ -169,7 +173,8 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
-        if metadata.target() == "lix_perf" && is_import_perf_span(metadata.name()) {
+        if is_exported_or_debug_perf_target(metadata.target()) && is_import_perf_span(metadata.name())
+        {
             Interest::always()
         } else {
             Interest::never()

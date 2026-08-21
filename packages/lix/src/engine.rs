@@ -25,7 +25,9 @@ use crate::storage_adapter::{
 };
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::sync::SyncModeState;
-use crate::telemetry::TelemetrySink;
+use crate::telemetry::{
+    ActiveTelemetrySpan, TelemetrySink, TelemetrySpanClass, instrument_lix_result,
+};
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
 use crate::{LixError, NullableKeyFilter};
@@ -149,53 +151,65 @@ where
         storage: StorageImpl,
         options: EngineOptions,
     ) -> Result<Self, LixError> {
-        let storage = StorageAdapter::new(storage);
-        let wasm_runtime = options
-            .wasm_runtime
-            .unwrap_or_else(|| Arc::new(UnsupportedWasmRuntime));
-        let plugin_host = PluginRuntimeHost::new_with_limits(
-            wasm_runtime,
-            options.plugin_max_memory_bytes,
-            options.plugin_max_live_stores,
-        )?;
+        let span = options.telemetry.as_ref().and_then(|sink| {
+            ActiveTelemetrySpan::start_if_enabled(
+                sink,
+                TelemetrySpanClass::Lifecycle,
+                "lix.engine.open",
+                Vec::new(),
+            )
+        });
+        instrument_lix_result(span, async move {
+            let storage = StorageAdapter::new(storage);
+            let wasm_runtime = options
+                .wasm_runtime
+                .unwrap_or_else(|| Arc::new(UnsupportedWasmRuntime));
+            let plugin_host = PluginRuntimeHost::new_with_limits(
+                wasm_runtime,
+                options.plugin_max_memory_bytes,
+                options.plugin_max_live_stores,
+            )?;
 
-        let tracked_state = Arc::new(TrackedStateContext::new());
-        let commit_graph = CommitGraphContext::new();
-        let hot_state = Arc::new(HotStateContext::new(
-            tracked_state.as_ref().clone(),
-            commit_graph,
-        ));
-        let branch_ctx = Arc::new(BranchContext::new());
-        let lix_id = assert_initialized(storage.clone(), hot_state.as_ref()).await?;
+            let tracked_state = Arc::new(TrackedStateContext::new());
+            let commit_graph = CommitGraphContext::new();
+            let hot_state = Arc::new(HotStateContext::new(
+                tracked_state.as_ref().clone(),
+                commit_graph,
+            ));
+            let branch_ctx = Arc::new(BranchContext::new());
+            let lix_id = assert_initialized(storage.clone(), hot_state.as_ref()).await?;
 
-        // SessionContext::execute later projects these stable state contexts into one
-        // execution-scoped SQL context, optionally wrapped by a transaction
-        // overlay for writes.
+            // SessionContext::execute later projects these stable state contexts into one
+            // execution-scoped SQL context, optionally wrapped by a transaction
+            // overlay for writes.
 
-        let collaboration_write_gate = Arc::new(tokio::sync::Mutex::new(()));
-        let observe_invalidation = Arc::new(ObserveInvalidation::new());
-        let commit_coordinator = Arc::new(CommitCoordinator::new(
-            Arc::clone(&collaboration_write_gate),
-            Arc::clone(&observe_invalidation),
-        ));
-        Ok(Self {
-            binary_cas: Arc::new(BinaryCasContext::new()),
-            storage,
-            tracked_state,
-            hot_state,
-            branch_ctx,
-            catalog_context: Arc::new(CatalogContext::new()),
-            sql_planning_cache: Arc::new(SqlPlanningCache::default()),
-            deterministic_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
-            collaboration_write_gate,
-            commit_coordinator,
-            observe_coordinator: Arc::new(ObserveCoordinator::new()),
-            observe_invalidation,
-            sync_mode: SyncModeState::default(),
-            plugin_host,
-            telemetry: options.telemetry,
-            lix_id,
+            let collaboration_write_gate = Arc::new(tokio::sync::Mutex::new(()));
+            let observe_invalidation = Arc::new(ObserveInvalidation::new());
+            let commit_coordinator = Arc::new(CommitCoordinator::new(
+                Arc::clone(&collaboration_write_gate),
+                Arc::clone(&observe_invalidation),
+                options.telemetry.clone(),
+            ));
+            Ok(Self {
+                binary_cas: Arc::new(BinaryCasContext::new()),
+                storage,
+                tracked_state,
+                hot_state,
+                branch_ctx,
+                catalog_context: Arc::new(CatalogContext::new()),
+                sql_planning_cache: Arc::new(SqlPlanningCache::default()),
+                deterministic_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
+                collaboration_write_gate,
+                commit_coordinator,
+                observe_coordinator: Arc::new(ObserveCoordinator::new()),
+                observe_invalidation,
+                sync_mode: SyncModeState::default(),
+                plugin_host,
+                telemetry: options.telemetry,
+                lix_id,
+            })
         })
+        .await
     }
 
     pub(crate) fn storage(&self) -> StorageAdapter<StorageImpl> {
@@ -278,27 +292,38 @@ where
         active_branch_id: impl Into<String>,
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
-        let active_account_id = active_account_id.into();
-        self.validate_active_account(&active_account_id).await?;
-        Ok(SessionContext::new(
-            SessionBranch::new(active_branch_id.into()),
-            active_account_id,
-            self.storage(),
-            Arc::clone(&self.hot_state),
-            Arc::clone(&self.tracked_state),
-            Arc::clone(&self.binary_cas),
-            Arc::clone(&self.branch_ctx),
-            Arc::clone(&self.catalog_context),
-            Arc::clone(&self.sql_planning_cache),
-            Arc::clone(&self.deterministic_runtime_gate),
-            Arc::clone(&self.collaboration_write_gate),
-            Arc::clone(&self.commit_coordinator),
-            Arc::clone(&self.observe_coordinator),
-            Arc::clone(&self.observe_invalidation),
-            self.sync_mode.clone(),
-            self.plugin_host.clone(),
-            self.telemetry.clone(),
-        ))
+        let span = self.telemetry.as_ref().and_then(|sink| {
+            ActiveTelemetrySpan::start_if_enabled(
+                sink,
+                TelemetrySpanClass::Lifecycle,
+                "lix.session.open",
+                Vec::new(),
+            )
+        });
+        instrument_lix_result(span, async move {
+            let active_account_id = active_account_id.into();
+            self.validate_active_account(&active_account_id).await?;
+            Ok(SessionContext::new(
+                SessionBranch::new(active_branch_id.into()),
+                active_account_id,
+                self.storage(),
+                Arc::clone(&self.hot_state),
+                Arc::clone(&self.tracked_state),
+                Arc::clone(&self.binary_cas),
+                Arc::clone(&self.branch_ctx),
+                Arc::clone(&self.catalog_context),
+                Arc::clone(&self.sql_planning_cache),
+                Arc::clone(&self.deterministic_runtime_gate),
+                Arc::clone(&self.collaboration_write_gate),
+                Arc::clone(&self.commit_coordinator),
+                Arc::clone(&self.observe_coordinator),
+                Arc::clone(&self.observe_invalidation),
+                self.sync_mode.clone(),
+                self.plugin_host.clone(),
+                self.telemetry.clone(),
+            ))
+        })
+        .await
     }
 
     pub(crate) async fn open_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
@@ -310,26 +335,37 @@ where
         &self,
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
-        let active_account_id = active_account_id.into();
-        self.validate_active_account(&active_account_id).await?;
-        SessionContext::open_default(
-            active_account_id,
-            self.storage(),
-            Arc::clone(&self.hot_state),
-            Arc::clone(&self.tracked_state),
-            Arc::clone(&self.binary_cas),
-            Arc::clone(&self.branch_ctx),
-            Arc::clone(&self.catalog_context),
-            Arc::clone(&self.sql_planning_cache),
-            Arc::clone(&self.deterministic_runtime_gate),
-            Arc::clone(&self.collaboration_write_gate),
-            Arc::clone(&self.commit_coordinator),
-            Arc::clone(&self.observe_coordinator),
-            Arc::clone(&self.observe_invalidation),
-            self.sync_mode.clone(),
-            self.plugin_host.clone(),
-            self.telemetry.clone(),
-        )
+        let span = self.telemetry.as_ref().and_then(|sink| {
+            ActiveTelemetrySpan::start_if_enabled(
+                sink,
+                TelemetrySpanClass::Lifecycle,
+                "lix.session.open",
+                Vec::new(),
+            )
+        });
+        instrument_lix_result(span, async move {
+            let active_account_id = active_account_id.into();
+            self.validate_active_account(&active_account_id).await?;
+            SessionContext::open_default(
+                active_account_id,
+                self.storage(),
+                Arc::clone(&self.hot_state),
+                Arc::clone(&self.tracked_state),
+                Arc::clone(&self.binary_cas),
+                Arc::clone(&self.branch_ctx),
+                Arc::clone(&self.catalog_context),
+                Arc::clone(&self.sql_planning_cache),
+                Arc::clone(&self.deterministic_runtime_gate),
+                Arc::clone(&self.collaboration_write_gate),
+                Arc::clone(&self.commit_coordinator),
+                Arc::clone(&self.observe_coordinator),
+                Arc::clone(&self.observe_invalidation),
+                self.sync_mode.clone(),
+                self.plugin_host.clone(),
+                self.telemetry.clone(),
+            )
+            .await
+        })
         .await
     }
 

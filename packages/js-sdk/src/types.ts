@@ -25,11 +25,14 @@ export type SyncLixServerOptions = {
 };
 
 export type LixTelemetrySpan = {
-	schemaVersion: 1;
+	schemaVersion: 2;
 	name: string;
+	traceId: string;
+	spanId: string;
+	parentSpanId?: string;
 	startedAtUnixMs: number;
 	durationMs: number;
-	status: "ok" | "error";
+	status: "ok" | "error" | "cancelled";
 	attributes: Record<string, string | number | boolean>;
 };
 

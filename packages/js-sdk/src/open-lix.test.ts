@@ -137,11 +137,13 @@ test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 	await lix.execute("SELECT 'private-value' AS value, 42 AS number");
 	const span = await received;
 	expect(span).toMatchObject({
-		schemaVersion: 1,
+		schemaVersion: 2,
 		name: "lix.sql.query",
 		status: "ok",
 	});
 	expect(span.durationMs).toBeGreaterThanOrEqual(0);
+	expect(span.traceId).toMatch(/^[0-9a-f]{32}$/u);
+	expect(span.spanId).toMatch(/^[0-9a-f]{16}$/u);
 	expect(span.attributes["db.query.text"]).toBe(
 		"SELECT ? AS value, ? AS number",
 	);

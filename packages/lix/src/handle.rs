@@ -119,7 +119,7 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
         self
     }
 
-    /// Attaches a sink (if any) without emitting `lix.opened`.
+    /// Attaches a sink (if any) without emitting `lix.repository.opened`.
     ///
     /// Use this when the handle is only a protocol root or cached runtime
     /// that later protocol sessions inherit. Handshake session creation and
@@ -1310,8 +1310,8 @@ where
 mod tests {
     use super::*;
     use lix::telemetry::{
-        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySink, TelemetrySpanEnd,
-        TelemetrySpanHandle, TelemetrySpanKind, TelemetrySpanStart,
+        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySink, TelemetrySpanClass,
+        TelemetrySpanEnd, TelemetrySpanHandle, TelemetrySpanStart,
     };
     use std::sync::{
         Mutex,
@@ -1321,7 +1321,7 @@ mod tests {
     fn opened_spans(spans: &[CompletedTelemetrySpan]) -> Vec<&CompletedTelemetrySpan> {
         spans
             .iter()
-            .filter(|span| span.start.kind == TelemetrySpanKind::LixOpened)
+            .filter(|span| span.start.name == "lix.repository.opened")
             .collect()
     }
 
@@ -1363,7 +1363,7 @@ mod tests {
         let spans = spans.lock().expect("spans");
         let opened = opened_spans(&spans);
         assert_eq!(opened.len(), 1);
-        assert_eq!(opened[0].start.name, "lix.opened");
+        assert_eq!(opened[0].start.name, "lix.repository.opened");
         assert_eq!(attribute_string(opened[0], "lix.id"), Some(lix.lix_id()));
         assert_eq!(
             attribute_string(opened[0], "lix.branch_id"),
@@ -1374,9 +1374,7 @@ mod tests {
             Some(lix.active_account_id())
         );
         assert!(
-            spans
-                .iter()
-                .any(|span| span.start.kind == TelemetrySpanKind::SqlQuery),
+            spans.iter().any(|span| span.start.name == "lix.sql.query"),
             "SQL spans still work after an opened span"
         );
     }
@@ -1391,7 +1389,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_opened_kind_does_no_opened_span_work() {
         struct SqlOnlySink {
-            started: Mutex<Vec<TelemetrySpanKind>>,
+            started: Mutex<Vec<&'static str>>,
         }
 
         impl SqlOnlySink {
@@ -1401,17 +1399,16 @@ mod tests {
         }
 
         impl TelemetrySink for SqlOnlySink {
-            fn enabled(&self, kind: TelemetrySpanKind) -> bool {
-                !matches!(kind, TelemetrySpanKind::LixOpened)
+            fn enabled(&self, _class: TelemetrySpanClass, name: &'static str) -> bool {
+                name != "lix.repository.opened"
             }
 
             fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
                 assert_ne!(
-                    start.kind,
-                    TelemetrySpanKind::LixOpened,
+                    start.name, "lix.repository.opened",
                     "disabled opened spans must not be started"
                 );
-                self.started.lock().expect("started").push(start.kind);
+                self.started.lock().expect("started").push(start.name);
                 Box::new(NoopHandle)
             }
         }
@@ -1435,12 +1432,8 @@ mod tests {
             .expect("open Lix");
         lix.execute("SELECT 1", &[]).await.expect("execute");
         let started = sink.started.lock().expect("started");
-        assert!(
-            started
-                .iter()
-                .all(|kind| *kind != TelemetrySpanKind::LixOpened)
-        );
-        assert!(started.contains(&TelemetrySpanKind::SqlQuery));
+        assert!(started.iter().all(|name| *name != "lix.repository.opened"));
+        assert!(started.contains(&"lix.sql.query"));
     }
 
     #[tokio::test]
@@ -1461,9 +1454,7 @@ mod tests {
         let spans = spans.lock().expect("spans");
         assert!(opened_spans(&spans).is_empty());
         assert!(
-            spans
-                .iter()
-                .any(|span| span.start.kind == TelemetrySpanKind::SqlQuery),
+            spans.iter().any(|span| span.start.name == "lix.sql.query"),
             "SQL spans still work on a protocol root"
         );
     }
@@ -1486,7 +1477,7 @@ mod tests {
         let spans = spans.lock().expect("spans");
         let opened = opened_spans(&spans);
         assert_eq!(opened.len(), 1);
-        assert_eq!(opened[0].start.name, "lix.opened");
+        assert_eq!(opened[0].start.name, "lix.repository.opened");
         assert_eq!(attribute_string(opened[0], "lix.id"), Some(lix.lix_id()));
     }
 
@@ -1513,7 +1504,11 @@ mod tests {
         let spans = spans.lock().expect("spans");
         let opened = opened_spans(&spans);
         assert_eq!(opened.len(), 3);
-        assert!(opened.iter().all(|span| span.start.name == "lix.opened"));
+        assert!(
+            opened
+                .iter()
+                .all(|span| span.start.name == "lix.repository.opened")
+        );
         assert!(
             opened
                 .iter()

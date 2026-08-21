@@ -2,8 +2,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanKind, TelemetrySpanStart,
-    TelemetrySpanStatus, unix_time_ms,
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanClass, TelemetrySpanStart,
+    TelemetrySpanStatus,
 };
 use crate::{ExecuteResult, LixError};
 
@@ -21,7 +21,7 @@ impl SqlStatementTelemetry {
         batch_index: Option<usize>,
     ) -> Option<Self> {
         let sink = sink?;
-        if !sink.enabled(TelemetrySpanKind::SqlQuery) {
+        if !sink.enabled(TelemetrySpanClass::Sql, "lix.sql.query") {
             return None;
         }
         Some(Self {
@@ -54,7 +54,7 @@ fn statement_start(
     let operation = query_operation(&query_text);
     let fingerprint = blake3::hash(query_text.as_bytes()).to_hex().to_string();
     let mut attributes = vec![
-        TelemetryAttribute::string("otel.name", operation.clone()),
+        TelemetryAttribute::string("otel.name", "lix.sql.query"),
         TelemetryAttribute::string("otel.kind", "internal"),
         TelemetryAttribute::string("db.system.name", "lix"),
         TelemetryAttribute::string("db.operation.name", operation.clone()),
@@ -69,12 +69,7 @@ fn statement_start(
             u64::try_from(batch_index).unwrap_or(u64::MAX),
         ));
     }
-    TelemetrySpanStart {
-        kind: TelemetrySpanKind::SqlQuery,
-        name: "lix.sql.query",
-        started_at_unix_ms: unix_time_ms(),
-        attributes,
-    }
+    TelemetrySpanStart::new(TelemetrySpanClass::Sql, "lix.sql.query", attributes)
 }
 
 fn statement_end(
@@ -104,30 +99,25 @@ fn statement_end(
 
 pub(crate) fn start_batch(
     sink: Option<&Arc<dyn TelemetrySink>>,
-    kind: TelemetrySpanKind,
+    name: &'static str,
     size: usize,
 ) -> Option<ActiveTelemetrySpan> {
     let sink = sink?;
-    if !sink.enabled(kind) {
+    if !sink.enabled(TelemetrySpanClass::Sql, name) {
         return None;
     }
-    let (name, display_name, execution_kind) = match kind {
-        TelemetrySpanKind::SqlBatch => ("lix.sql.batch", "SQL batch", "batch"),
-        TelemetrySpanKind::SqlCoherentReadBatch => (
-            "lix.sql.coherent_read_batch",
-            "SQL coherent read batch",
-            "coherent_read_batch",
-        ),
-        TelemetrySpanKind::SqlQuery | TelemetrySpanKind::LixOpened => return None,
+    let execution_kind = match name {
+        "lix.sql.batch" => "batch",
+        "lix.sql.coherent_read_batch" => "coherent_read_batch",
+        _ => return None,
     };
     Some(ActiveTelemetrySpan::start(
         sink,
-        TelemetrySpanStart {
-            kind,
+        TelemetrySpanStart::new(
+            TelemetrySpanClass::Sql,
             name,
-            started_at_unix_ms: unix_time_ms(),
-            attributes: vec![
-                TelemetryAttribute::string("otel.name", display_name),
+            vec![
+                TelemetryAttribute::string("otel.name", name),
                 TelemetryAttribute::string("otel.kind", "internal"),
                 TelemetryAttribute::string("db.system.name", "lix"),
                 TelemetryAttribute::u64(
@@ -136,7 +126,7 @@ pub(crate) fn start_batch(
                 ),
                 TelemetryAttribute::string("lix.execution.kind", execution_kind),
             ],
-        },
+        ),
     ))
 }
 

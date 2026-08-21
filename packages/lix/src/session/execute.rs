@@ -17,7 +17,6 @@ use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
     StorageReadDurability, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
-use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{Blob, LixError, LixNotice, SqlQueryResult, Value};
 use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
@@ -1816,11 +1815,7 @@ where
         idempotency: Option<ExecuteIdempotency>,
         require_idempotency_for_writes: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let telemetry = start_batch(
-            self.telemetry.as_ref(),
-            TelemetrySpanKind::SqlBatch,
-            statements.len(),
-        );
+        let telemetry = start_batch(self.telemetry.as_ref(), "lix.sql.batch", statements.len());
         let operation = self.execute_batch_with_options_inner(
             statements,
             options,
@@ -2275,7 +2270,7 @@ where
     ) -> Result<CoherentReadBatch, LixError> {
         let telemetry = start_batch(
             self.telemetry.as_ref(),
-            TelemetrySpanKind::SqlCoherentReadBatch,
+            "lix.sql.coherent_read_batch",
             statements.len(),
         );
         let operation = self.execute_coherent_read_batch_inner(statements);
@@ -5308,9 +5303,7 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
     use crate::row_pk::RowPk;
-    use crate::telemetry::{
-        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TelemetryValue,
-    };
+    use crate::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, TelemetryValue};
     use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
     use crate::{
         Memory,
@@ -10178,12 +10171,21 @@ mod tests {
             .unwrap();
 
         let spans = spans.lock().expect("telemetry span lock");
+        let batch_span = spans
+            .iter()
+            .find(|span| span.start.name == "lix.sql.batch")
+            .expect("batch span");
         let query_spans = spans
             .iter()
-            .filter(|span| span.start.kind == TelemetrySpanKind::SqlQuery)
+            .filter(|span| span.start.name == "lix.sql.query")
             .collect::<Vec<_>>();
         assert_eq!(query_spans.len(), 2);
         for (index, span) in query_spans.into_iter().enumerate() {
+            assert_eq!(span.start.trace_id, batch_span.start.trace_id);
+            assert_eq!(
+                span.start.parent_span_id.as_deref(),
+                Some(batch_span.start.span_id.as_str())
+            );
             assert!(span.start.attributes.iter().any(|attribute| {
                 attribute.key == "lix.sql.fingerprint"
                     && matches!(&attribute.value, TelemetryValue::String(value) if !value.is_empty())
