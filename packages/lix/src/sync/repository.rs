@@ -10015,6 +10015,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sparse_snapshot_can_diff_from_checkpoint_without_authored_bodies() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/history.md".to_owned()),
+                    Value::Text("before".to_owned()),
+                ],
+            )
+            .await
+            .expect("baseline file should commit");
+        let checkpoint = authority
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should commit")
+            .commit_id;
+        authority
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2",
+                &[
+                    Value::Text("after".to_owned()),
+                    Value::Text("/history.md".to_owned()),
+                ],
+            )
+            .await
+            .expect("post-checkpoint file update should commit");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (_, head) = default_head(&snapshot);
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+
+        let diff = replica
+            .execute(
+                "SELECT schema_key, diff_type FROM lix_diff($1, $2)",
+                &[Value::Text(checkpoint), Value::Text(head)],
+            )
+            .await
+            .expect("checkpoint diff should use its authenticated sparse snapshot");
+        assert_eq!(diff.rows().len(), 1);
+        assert_eq!(
+            diff.rows()[0]
+                .get::<String>("diff_type")
+                .expect("diff type should decode"),
+            "modified",
+        );
+    }
+
+    #[tokio::test]
     async fn authority_rejects_a_stale_expected_checkpoint_coordinate() {
         let authority = open_lix().await.expect("authority should open");
         write_key_value(&authority, "checkpoint-cas", "baseline").await;

@@ -1658,7 +1658,18 @@ where
             by_commit.entry(row.commit_id()).or_default().push(row);
         }
         for (commit_id, commit_rows) in by_commit {
+            // A sparse sync snapshot authenticates every selected row through
+            // a complete-state root while intentionally retaining only a
+            // snapshot row for the commit that originally authored it. The
+            // immutable payload remains routable through the snapshot's
+            // selected fallback locator, but the authored delta index may be
+            // outside even the bounded header frontier. In that case the
+            // authenticated root plus immutable payload is the complete local
+            // authority. If a commit delta is present, it must still match.
             let state = storage::load_point_replay_commit_state(&self.store, commit_id).await?;
+            if state.is_none() {
+                continue;
+            }
             let mut encoded_keys =
                 TrackedStateKeyBatchBuilder::with_row_capacity(commit_rows.len());
             for row in &commit_rows {
@@ -2578,6 +2589,36 @@ where
     /// Packed tracked changes intentionally do not have one global storage key
     /// per change id. Routing through their owning commit avoids scanning every
     /// changelog and commit-delta segment for a sparse diff.
+    async fn fill_sparse_snapshot_change_fallbacks(
+        &self,
+        commit_id: CommitId,
+        change_ids: &[ChangeId],
+        loaded: &mut [Option<ChangeRecord>],
+    ) -> Result<(), LixError> {
+        debug_assert_eq!(change_ids.len(), loaded.len());
+        if !loaded.iter().any(Option::is_none)
+            || storage::load_point_replay_commit_state(&self.store, commit_id)
+                .await?
+                .is_some()
+        {
+            return Ok(());
+        }
+        let missing = change_ids
+            .iter()
+            .zip(loaded.iter())
+            .filter_map(|(change_id, record)| record.is_none().then_some(*change_id))
+            .collect::<Vec<_>>();
+        let mut fallback = storage::load_change_records_by_ids(&self.store, &missing)
+            .await?
+            .into_iter();
+        for record in loaded {
+            if record.is_none() {
+                *record = fallback.next();
+            }
+        }
+        Ok(())
+    }
+
     async fn load_routed_diff_changes(
         &mut self,
         rows: &[&TrackedStateDiffRow],
@@ -2678,6 +2719,15 @@ where
                     }
                 }
             }
+            self.fill_sparse_snapshot_change_fallbacks(
+                commit_id,
+                &commit_rows
+                    .iter()
+                    .map(|row| row.change_id)
+                    .collect::<Vec<_>>(),
+                &mut loaded,
+            )
+            .await?;
             for (row, record) in commit_rows.into_iter().zip(loaded) {
                 let record = record.ok_or_else(|| {
                     LixError::new(
@@ -2784,6 +2834,15 @@ where
                     }
                 }
             }
+            self.fill_sparse_snapshot_change_fallbacks(
+                commit_id,
+                &commit_rows
+                    .iter()
+                    .map(|row| row.change_id())
+                    .collect::<Vec<_>>(),
+                &mut loaded,
+            )
+            .await?;
             for (row, record) in commit_rows.into_iter().zip(loaded) {
                 let record = record.ok_or_else(|| {
                     LixError::new(
