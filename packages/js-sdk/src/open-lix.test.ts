@@ -166,34 +166,35 @@ test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 });
 
 test("observe.next samples its own telemetry parent", async () => {
+	const nextParent = {
+		traceId: "fedcba9876543210fedcba9876543210",
+		spanId: "fedcba9876543210",
+		traceFlags: 1,
+	};
 	let activeParent = {
 		traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		spanId: "aaaaaaaaaaaaaaaa",
 		traceFlags: 1,
 	};
-	const spans: LixTelemetrySpan[] = [];
+	let resolveSpan!: (span: LixTelemetrySpan) => void;
+	const received = new Promise<LixTelemetrySpan>((resolve) => {
+		resolveSpan = resolve;
+	});
 	const lix = await openLix({
 		telemetry: {
 			parentContext: () => activeParent,
-			onSpan: (span) => spans.push(span),
+			onSpan(span) {
+				if (span.name === "lix.sql.query" && span.traceId === nextParent.traceId) {
+					resolveSpan(span);
+				}
+			},
 		},
 	});
 	const observation = lix.observe("SELECT 'observe-private' AS value");
-	activeParent = {
-		traceId: "fedcba9876543210fedcba9876543210",
-		spanId: "fedcba9876543210",
-		traceFlags: 1,
-	};
+	activeParent = nextParent;
 	await observation.next();
-
-	expect(
-		spans.some(
-			(span) =>
-				span.name === "lix.sql.query" &&
-				span.traceId === activeParent.traceId &&
-				span.parentSpanId === activeParent.spanId,
-		),
-	).toBe(true);
+	const span = await received;
+	expect(span.parentSpanId).toBe(nextParent.spanId);
 	observation.close();
 	await lix.close();
 });
