@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
@@ -18,8 +18,8 @@ use crate::storage_adapter::{
     StorageWriteSet,
 };
 use crate::tracked_state::{
-    CommitDeltaReplacementGeneration, CommitStateManifest, CommitStateTouchedScopeFilter,
-    ReplacementPartRowRef, TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+    CommitDeltaChangeLocator, CommitDeltaReplacementGeneration, CommitStateManifest,
+    CommitStateTouchedScopeFilter, ReplacementPartRowRef, TRACKED_STATE_CHANGE_LOCATOR_SPACE,
     TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
     TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE, TrackedStateBaseCoordinate,
     TrackedStateCommitDeltaRef, TrackedStateDeltaRef, TrackedStateIndexValue, TrackedStateKey,
@@ -49,6 +49,30 @@ struct OwnedMember {
 pub(super) struct CommitAuthorityPlan {
     pub(super) member_count: u64,
     pub(super) recovered_changes: Vec<RewrittenChange>,
+}
+
+#[derive(Clone, Copy)]
+struct PlannedChangeLocator {
+    locator: CommitDeltaChangeLocator,
+    authored: bool,
+}
+
+fn retain_canonical_change_locator(
+    locators: &mut BTreeMap<ChangeId, PlannedChangeLocator>,
+    locator: CommitDeltaChangeLocator,
+    authored: bool,
+) {
+    match locators.entry(locator.change_id) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(PlannedChangeLocator { locator, authored });
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry)
+            if authored && !entry.get().authored =>
+        {
+            entry.insert(PlannedChangeLocator { locator, authored });
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {}
+    }
 }
 
 impl OwnedMember {
@@ -466,6 +490,7 @@ pub(super) async fn plan_commit_authorities(
         .collect::<BTreeMap<_, _>>();
     let commit_ids = scan_commit_state_manifest_commit_ids(read).await?;
     let mut writes = StorageWriteSet::new();
+    let mut change_locators = BTreeMap::<ChangeId, PlannedChangeLocator>::new();
     let mut member_count = 0u64;
     let mut recovered_changes = BTreeMap::new();
     for commit_id in commit_ids.iter().copied() {
@@ -537,6 +562,11 @@ pub(super) async fn plan_commit_authorities(
             }
             staged.mutation_inventory().clone()
         } else {
+            let authored_change_ids = members
+                .iter()
+                .filter(|member| member.authored)
+                .map(|member| member.value.change_id)
+                .collect::<BTreeSet<_>>();
             let staged = if let Some(selected_source) = old.mutations.selected_source_commit_id() {
                 stage_addressable_commit_deltas_with_selected_source(
                     &mut writes,
@@ -547,7 +577,17 @@ pub(super) async fn plan_commit_authorities(
             } else {
                 stage_addressable_commit_deltas(&mut writes, &refs, &addressable)?
             };
-            stage_change_locators(&mut writes, &staged.locators);
+            for &locator in &staged.locators {
+                // A selected change can be present in several commit
+                // authorities, but the mutable locator namespace has one key
+                // per change. Prefer its authored authority when available
+                // and publish the canonical locator exactly once.
+                retain_canonical_change_locator(
+                    &mut change_locators,
+                    locator,
+                    authored_change_ids.contains(&locator.change_id),
+                );
+            }
             staged.mutation_inventory().clone()
         };
         let manifest = CommitStateManifest {
@@ -561,6 +601,13 @@ pub(super) async fn plan_commit_authorities(
         };
         stage_commit_state_manifest(&mut writes, &manifest)?;
     }
+    stage_change_locators(
+        &mut writes,
+        &change_locators
+            .into_values()
+            .map(|planned| planned.locator)
+            .collect::<Vec<_>>(),
+    );
     publication.clear_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE);
     publication.clear_space(TRACKED_STATE_CHANGE_LOCATOR_SPACE);
     publication.clear_space(TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE);
@@ -1025,7 +1072,12 @@ fn migration_error(message: impl Into<String>) -> LixError {
 
 #[cfg(test)]
 mod tests {
-    use super::charge_discovery_bytes;
+    use std::collections::BTreeMap;
+
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::tracked_state::CommitDeltaChangeLocator;
+
+    use super::{charge_discovery_bytes, retain_canonical_change_locator};
 
     #[test]
     fn authority_discovery_enforces_its_shared_byte_budget() {
@@ -1038,5 +1090,31 @@ mod tests {
             .expect_err("one byte beyond the shared bound must fail");
         assert_eq!(error.code, "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED");
         assert_eq!(retained, 5, "failed accounting must not mutate the total");
+    }
+
+    #[test]
+    fn duplicate_selected_locators_collapse_to_the_authored_authority() {
+        let change_id = ChangeId::new(uuid::Uuid::from_u128(
+            0xa01d742e_1e7e_d293_a48a_670000000001,
+        ));
+        let locator = |commit: u128| CommitDeltaChangeLocator {
+            change_id,
+            commit_id: CommitId::new(uuid::Uuid::from_u128(commit)),
+            segment_index: 0,
+            ordinal: 0,
+        };
+        let selected_first = locator(1);
+        let authored = locator(2);
+        let selected_later = locator(3);
+        let mut locators = BTreeMap::new();
+
+        retain_canonical_change_locator(&mut locators, selected_first, false);
+        retain_canonical_change_locator(&mut locators, authored, true);
+        retain_canonical_change_locator(&mut locators, selected_later, false);
+
+        assert_eq!(locators.len(), 1);
+        let planned = locators.get(&change_id).unwrap();
+        assert!(planned.authored);
+        assert_eq!(planned.locator, authored);
     }
 }
