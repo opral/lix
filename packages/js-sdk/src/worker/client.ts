@@ -69,7 +69,7 @@ export async function openLixWorkerBinding(
 	telemetry?: LixTelemetryOptions,
 	server?: SyncServerRuntimeOptions,
 ): Promise<LixBinding> {
-	if (openDirectLixBinding && telemetry?.parentContext === undefined) {
+	if (openDirectLixBinding) {
 		const telemetryDispatch = telemetry
 			? (span: Parameters<LixTelemetryOptions["onSpan"]>[0]) => {
 					try {
@@ -82,12 +82,18 @@ export async function openLixWorkerBinding(
 		const binding = await openDirectLixBinding(
 			storage,
 			telemetryDispatch,
-			undefined,
+			telemetry?.parentContext?.(),
 			await resolveDirectSyncServer(server),
 		);
 		if (binding) {
-			if (!onDisposed) return binding;
-			return wrapDirectBinding(binding, new BindingLease(onDisposed));
+			const operationAwareBinding = telemetry?.parentContext
+				? wrapTelemetryParentBinding(binding, telemetry.parentContext)
+				: binding;
+			if (!onDisposed) return operationAwareBinding;
+			return wrapDirectBinding(
+				operationAwareBinding,
+				new BindingLease(onDisposed),
+			);
 		}
 	}
 	const client = await openLixWorker(storage, onDisposed, telemetry, server);
@@ -96,6 +102,69 @@ export async function openLixWorkerBinding(
 		new BindingLease(() => releaseWorker(client)),
 		0,
 	);
+}
+
+function wrapTelemetryParentBinding(
+	binding: LixBinding,
+	parentContext: NonNullable<LixTelemetryOptions["parentContext"]>,
+): LixBinding {
+	const prepareOperation = () => binding.setTelemetryParent(parentContext());
+	return new Proxy(binding, {
+		get(target, property, receiver) {
+			if (property === "setTelemetryParent") {
+				return target.setTelemetryParent.bind(target);
+			}
+			if (property === "openAnotherSession") {
+				return async (
+					options: Parameters<LixBinding["openAnotherSession"]>[0],
+				) => {
+					prepareOperation();
+					return wrapTelemetryParentBinding(
+						await target.openAnotherSession(options),
+						parentContext,
+					);
+				};
+			}
+			if (property === "beginTransaction") {
+				return async () => {
+					prepareOperation();
+					return wrapTelemetryParentTransaction(
+						await target.beginTransaction(),
+						target,
+						parentContext,
+					);
+				};
+			}
+			const value = Reflect.get(target, property, receiver) as unknown;
+			if (typeof value !== "function") return value;
+			return (...args: unknown[]) => {
+				prepareOperation();
+				return Reflect.apply(value, target, args) as unknown;
+			};
+		},
+	}) as LixBinding;
+}
+
+function wrapTelemetryParentTransaction(
+	transaction: LixTransactionBinding,
+	binding: LixBinding,
+	parentContext: NonNullable<LixTelemetryOptions["parentContext"]>,
+): LixTransactionBinding {
+	const prepareOperation = () => binding.setTelemetryParent(parentContext());
+	return {
+		execute: (sql, params, options) => {
+			prepareOperation();
+			return transaction.execute(sql, params, options);
+		},
+		commit: () => {
+			prepareOperation();
+			return transaction.commit();
+		},
+		rollback: () => {
+			prepareOperation();
+			return transaction.rollback();
+		},
+	};
 }
 
 class BindingLease {
