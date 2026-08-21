@@ -6487,8 +6487,19 @@ fn stage_commit_deltas_inner(
     let mut segment_start = 0usize;
     let mut sidecar_compressor = None;
     while segment_start < entries.len() {
-        let mut segment_end =
+        let segment_limit =
             (segment_start + GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS).min(entries.len());
+        let first = crate::tracked_state::codec::decode_key_borrowed(
+            &entries[segment_start].key,
+        )?;
+        let schema_prefix = encode_schema_key_prefix(first.schema_key.as_ref());
+        // Native projection certificates have one schema fingerprint and one
+        // field layout. Preserve that physical invariant at construction time:
+        // a logical commit may span schemas, but an immutable segment may not.
+        let mut segment_end = entries[segment_start + 1..segment_limit]
+            .iter()
+            .position(|entry| !entry.key.starts_with(&schema_prefix))
+            .map_or(segment_limit, |offset| segment_start + 1 + offset);
         let segment_index = encoded_segments.len();
         let (encoded, assigned_entries, segment_assignments) = loop {
             let mut candidate = entries[segment_start..segment_end].to_vec();

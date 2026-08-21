@@ -7861,6 +7861,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_commits_rows_from_multiple_typed_schemas() {
+        let session = open_session().await;
+        let first_schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "mixed_batch_first",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        });
+        let second_schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "mixed_batch_second",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+                { "name": "enabled", "type": "boolean", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        });
+        for schema in [first_schema, second_schema] {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                    &[Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("register typed schema");
+        }
+
+        session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    label: None,
+                    sql: "INSERT INTO mixed_batch_first (id, value) VALUES ($1, $2)".to_owned(),
+                    params: vec![
+                        Value::Text("first".to_owned()),
+                        Value::Text("one".to_owned()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    label: None,
+                    sql: "INSERT INTO mixed_batch_second (id, value, enabled) VALUES ($1, $2, $3)".to_owned(),
+                    params: vec![
+                        Value::Text("second".to_owned()),
+                        Value::Text("two".to_owned()),
+                        Value::Boolean(true),
+                    ],
+                },
+            ])
+            .await
+            .expect("one logical batch may atomically commit several typed schemas");
+
+        for table in ["mixed_batch_first", "mixed_batch_second"] {
+            let result = session
+                .execute(&format!("SELECT COUNT(*) AS count FROM {table}"), &[])
+                .await
+                .expect("read committed mixed-schema row");
+            assert_eq!(result.rows()[0].get::<i64>("count").unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn certified_replacement_batch_revalidates_after_staged_schema_amendment() {
         let session = open_session().await;
         let schema = serde_json::json!({
