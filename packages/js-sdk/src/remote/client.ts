@@ -14,8 +14,9 @@ let wasmInitialized: Promise<unknown> | undefined;
 
 function initializeWasm(): Promise<unknown> {
 	if (wasmInitialized !== undefined) return wasmInitialized;
+	let initialization: Promise<unknown>;
 	if (typeof process !== "undefined" && process.versions?.node) {
-		wasmInitialized = import("node:fs/promises").then(
+		initialization = import("node:fs/promises").then(
 			({ readFile }) =>
 				initWasm({
 					module_or_path: readFile(
@@ -28,9 +29,10 @@ function initializeWasm(): Promise<unknown> {
 			},
 		);
 	} else {
-		wasmInitialized = initWasm();
+		initialization = initWasm();
 	}
-	return wasmInitialized;
+	wasmInitialized = initialization;
+	return initialization;
 }
 
 export async function openRemoteLixBinding(
