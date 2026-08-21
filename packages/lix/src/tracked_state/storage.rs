@@ -5382,6 +5382,32 @@ pub(crate) fn stage_imported_addressable_commit_deltas(
     stage_commit_deltas_inner(writes, deltas, Some(addressable), None, true)
 }
 
+/// Stages commit deltas imported from an authority that selected another
+/// commit as its complete-state source.
+///
+/// Like every imported commit, these rows retain their wire change ids when
+/// the current physical packing gives them different direct coordinates.
+pub(crate) fn stage_imported_addressable_commit_deltas_with_selected_source(
+    writes: &mut StorageWriteSet,
+    deltas: &[TrackedStateCommitDeltaRef<'_>],
+    addressable: &[bool],
+    selected_source_commit_id: CommitId,
+) -> Result<AddressableCommitDeltaStage, LixError> {
+    if addressable.len() != deltas.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state addressability column does not match commit deltas",
+        ));
+    }
+    stage_commit_deltas_inner(
+        writes,
+        deltas,
+        Some(addressable),
+        Some(selected_source_commit_id),
+        true,
+    )
+}
+
 pub(crate) fn stage_addressable_commit_deltas_with_selected_source(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],
@@ -17983,6 +18009,88 @@ mod tests {
             .expect("direct address batch should read");
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0], loaded);
+    }
+
+    #[tokio::test]
+    async fn imported_direct_ids_survive_schema_bounded_repacking() {
+        for selected_source in [None, Some(CommitId::for_test_label("imported-selected-source"))] {
+            let storage = StorageAdapter::new(Memory::new());
+            let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+                0x0192_0000_0000_7000_8000_9876_0000_0000,
+            ));
+            let mut fixtures = packed_commit_delta_fixtures()
+                .into_iter()
+                .take(2)
+                .collect::<Vec<_>>();
+            fixtures[0].change_id = super::addressable_change_id(commit_id, 0, 0)
+                .expect("first v68 direct id should encode");
+            fixtures[1].change_id = super::addressable_change_id(commit_id, 0, 1)
+                .expect("second v68 direct id should encode");
+            let deltas = commit_delta_refs(commit_id, &fixtures);
+            let mut writes = storage.new_write_set();
+            let staged = match selected_source {
+                Some(source) => {
+                    super::stage_imported_addressable_commit_deltas_with_selected_source(
+                        &mut writes,
+                        &deltas,
+                        &[true, true],
+                        source,
+                    )
+                }
+                None => super::stage_imported_addressable_commit_deltas(
+                    &mut writes,
+                    &deltas,
+                    &[true, true],
+                ),
+            }
+            .expect("imported direct rows should stage");
+
+            assert_eq!(
+                staged.assigned_change_ids,
+                fixtures
+                    .iter()
+                    .map(|fixture| fixture.change_id)
+                    .collect::<Vec<_>>(),
+                "migration must preserve v68 identities after schema-bounded repacking"
+            );
+            if selected_source.is_none() {
+                assert_eq!(staged.mutation_inventory().direct_part_row_counts, vec![1, 1]);
+                assert_eq!(staged.locators.len(), 1);
+                assert_eq!(staged.locators[0].change_id, fixtures[1].change_id);
+            } else {
+                assert!(staged.mutation_inventory().direct_part_row_counts.is_empty());
+                assert_eq!(staged.locators.len(), 2);
+            }
+            stage_change_locators(&mut writes, &staged.locators);
+            if let Some(source) = selected_source {
+                stage_fixture_manifest(
+                    &mut writes,
+                    source,
+                    &CommitStateMutationInventory::default(),
+                )
+                .expect("selected source manifest should stage");
+            }
+            stage_fixture_manifest(&mut writes, commit_id, staged.mutation_inventory())
+                .expect("imported commit manifest should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("imported direct rows should commit");
+
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("imported direct row read should open");
+            for fixture in &fixtures {
+                let loaded = load_change_record_by_id(&read, fixture.change_id)
+                    .await
+                    .expect("imported change should load")
+                    .expect("imported change should resolve by its v68 identity");
+                assert_eq!(loaded.change_id, fixture.change_id);
+                assert_eq!(loaded.schema_key, fixture.schema_key);
+                assert_eq!(loaded.row_pk, fixture.row_pk);
+            }
+        }
     }
 
     #[tokio::test]

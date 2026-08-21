@@ -25,8 +25,8 @@ use crate::tracked_state::{
     TrackedStateCommitDeltaRef, TrackedStateDeltaRef, TrackedStateIndexValue, TrackedStateKey,
     TrackedStateKeyRef, direct_change_locator, encode_key_ref,
     encode_replacement_part_with_compressor, scan_commit_state_manifest_commit_ids,
-    stage_addressable_commit_deltas, stage_addressable_commit_deltas_with_selected_source,
-    stage_change_locators, stage_commit_state_manifest,
+    stage_change_locators, stage_commit_state_manifest, stage_imported_addressable_commit_deltas,
+    stage_imported_addressable_commit_deltas_with_selected_source,
     stage_preencoded_ordered_addressable_replacement_parts,
 };
 
@@ -568,14 +568,14 @@ pub(super) async fn plan_commit_authorities(
                 .map(|member| member.value.change_id)
                 .collect::<BTreeSet<_>>();
             let staged = if let Some(selected_source) = old.mutations.selected_source_commit_id() {
-                stage_addressable_commit_deltas_with_selected_source(
+                stage_imported_addressable_commit_deltas_with_selected_source(
                     &mut writes,
                     &refs,
                     &addressable,
                     selected_source,
                 )?
             } else {
-                stage_addressable_commit_deltas(&mut writes, &refs, &addressable)?
+                stage_imported_addressable_commit_deltas(&mut writes, &refs, &addressable)?
             };
             for &locator in &staged.locators {
                 // A selected change can be present in several commit
