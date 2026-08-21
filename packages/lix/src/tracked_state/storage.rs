@@ -7693,7 +7693,7 @@ fn hydrate_compact_replacement_direct_run(
     Ok(())
 }
 
-async fn load_change_records_by_ids(
+pub(crate) async fn load_change_records_by_ids(
     store: &(impl StorageAdapterRead + ?Sized),
     change_ids: &[crate::changelog::ChangeId],
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
