@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! How much of the settled repository is byte-identical duplicate content?
 //!
 //! The commit-delta segment plane is keyed `commit_id ++ segment_index`, not by

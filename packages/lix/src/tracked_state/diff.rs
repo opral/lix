@@ -356,8 +356,11 @@ where
     S: crate::storage_adapter::StorageAdapterRead,
 {
     let scan_request = scan_request_for_diff(request);
-    let tree_diff = reader
+    let mut tree_diff = reader
         .diff_semantic_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
+        .await?;
+    reader
+        .suppress_collection_generation_cascade_tombstones(&mut tree_diff)
         .await?;
 
     // Validate only rows exposed by the hash-guided tree diff. Whole-root
@@ -584,6 +587,100 @@ impl TrackedStateTreeDiffBatch {
         )
     }
 
+    pub(crate) fn rows(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            usize,
+            TrackedStateKeyRef<'_>,
+            Option<&TrackedStateIndexValue>,
+            Option<&TrackedStateIndexValue>,
+        ),
+    > {
+        let identities = self.identities.as_deref();
+        self.before
+            .iter()
+            .zip(&self.after)
+            .enumerate()
+            .map(move |(ordinal, (before, after))| {
+                let identities = identities.expect("non-empty tree diff columns retain identities");
+                let ordinal_u32 =
+                    u32::try_from(ordinal).expect("tree diff batch row count is bounded to u32");
+                (
+                    ordinal,
+                    TrackedStateKeyRef {
+                        schema_key: identities.schema_key(ordinal_u32),
+                        file_id: identities.file_id(ordinal_u32),
+                        row_pk: identities.row_pk(ordinal_u32),
+                    },
+                    before.as_ref(),
+                    after.as_ref(),
+                )
+            })
+    }
+
+    pub(crate) fn remove_rows(&mut self, remove: &[bool]) {
+        debug_assert_eq!(remove.len(), self.len());
+        if !remove.iter().any(|remove| *remove) {
+            return;
+        }
+        let Some(identities) = self.identities.as_deref() else {
+            return;
+        };
+        let mut keys = Vec::with_capacity(self.len());
+        let mut before = Vec::with_capacity(self.len());
+        let mut after = Vec::with_capacity(self.len());
+        for (ordinal, ((before_value, after_value), remove)) in
+            self.before.iter().zip(&self.after).zip(remove).enumerate()
+        {
+            if *remove {
+                continue;
+            }
+            let ordinal =
+                u32::try_from(ordinal).expect("tree diff batch row count is bounded to u32");
+            keys.push(TrackedStateKey {
+                schema_key: identities.schema_key(ordinal).to_owned(),
+                file_id: identities.file_id(ordinal).map(str::to_owned),
+                row_pk: identities.row_pk(ordinal).clone(),
+            });
+            before.push(before_value.clone());
+            after.push(after_value.clone());
+        }
+        if keys.is_empty() {
+            *self = Self::default();
+        } else {
+            self.identities = Some(TrackedStateDiffIdentityBatch::from_keys(keys));
+            self.before = before;
+            self.after = after;
+        }
+    }
+
+    /// Rows that represent a logical state transition at a complete-state
+    /// checkpoint fence.
+    ///
+    /// The immutable tree retains physical tombstones. An absent row and a
+    /// tombstone are both logically deleted, so a newly written tombstone for
+    /// an identity that was already absent must not become checkpoint history.
+    pub(crate) fn checkpoint_delta_rows(
+        &self,
+    ) -> impl Iterator<Item = TrackedStateTreeDiffRowRef<'_>> {
+        let identities = self.identities.as_deref();
+        self.before.iter().zip(&self.after).enumerate().filter_map(
+            move |(ordinal, (before, after))| {
+                let after = after.as_ref()?;
+                if after.deleted && before.as_ref().is_none_or(|before| before.deleted) {
+                    return None;
+                }
+                Some(TrackedStateTreeDiffRowRef {
+                    identities: identities.expect("non-empty tree diff columns retain identities"),
+                    ordinal: u32::try_from(ordinal)
+                        .expect("tree diff batch row count is bounded to u32"),
+                    value: after,
+                })
+            },
+        )
+    }
+
     pub(crate) fn comparison_rows(&self) -> Vec<TrackedStateTreeDiffRowRef<'_>> {
         let Some(identities) = self.identities.as_deref() else {
             return Vec::new();
@@ -677,6 +774,10 @@ impl TrackedStateTreeDiffBatch {
 }
 
 impl<'a> TrackedStateTreeDiffRowRef<'a> {
+    pub(crate) fn value(self) -> &'a TrackedStateIndexValue {
+        self.value
+    }
+
     pub(crate) fn schema_key(self) -> &'a str {
         self.identities.schema_key(self.ordinal)
     }

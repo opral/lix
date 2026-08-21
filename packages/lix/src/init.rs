@@ -71,9 +71,15 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// JSON representation to schema-fingerprinted native typed-row payloads for
 /// both plugin-owned and engine-owned Schema v1 rows. Repositories using v68
 /// are upgraded by the explicit offline migration before the engine opens.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 69;
+///
+/// `v70` admits complete-state checkpoint fences whose single parent-root
+/// edge is a physical state source rather than a semantic commit parent, and
+/// persists canonical materialized sync aliases independently from rebuilt
+/// snapshot roots. Older readers reject those manifest/sidecar shapes, so the
+/// repository gate must fail before they reach either storage plane.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 70;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v69";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v70";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -1202,16 +1208,16 @@ mod tests {
     #[test]
     fn repository_protocol_parser_distinguishes_versions() {
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v69"),
+            parse_repository_protocol(b"tracked-default-branch.v70"),
             RepositoryProtocolStatus::Current
         );
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v68"),
-            RepositoryProtocolStatus::MigrationRequired { found_version: 68 }
+            parse_repository_protocol(b"tracked-default-branch.v69"),
+            RepositoryProtocolStatus::MigrationRequired { found_version: 69 }
         );
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v70"),
-            RepositoryProtocolStatus::TooNew { found_version: 70 }
+            parse_repository_protocol(b"tracked-default-branch.v71"),
+            RepositoryProtocolStatus::TooNew { found_version: 71 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),
@@ -1335,8 +1341,7 @@ mod tests {
         );
         for row in &account_rows {
             assert_eq!(
-                row.commit_id,
-                receipt.initial_commit_id,
+                row.commit_id, receipt.initial_commit_id,
                 "account {:?} should be in the initial commit",
                 row.row_pk
             );

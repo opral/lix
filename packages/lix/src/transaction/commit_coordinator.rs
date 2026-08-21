@@ -1,4 +1,7 @@
 use std::collections::VecDeque;
+#[cfg(not(test))]
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -50,6 +53,8 @@ where
     observe_invalidation: Arc<ObserveInvalidation>,
     capacity: Arc<Semaphore>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    checkpoint_gc_running: AtomicBool,
+    checkpoint_gc_not_before_sequence: AtomicU64,
     state: Mutex<CommitCoordinatorState<StorageImpl>>,
     #[cfg(test)]
     stats: CommitCoordinatorStats,
@@ -98,11 +103,46 @@ where
                 observe_invalidation,
                 capacity: Arc::new(Semaphore::new(COMMIT_QUEUE_CAPACITY)),
                 telemetry,
+                checkpoint_gc_running: AtomicBool::new(false),
+                checkpoint_gc_not_before_sequence: AtomicU64::new(0),
                 state: Mutex::new(CommitCoordinatorState::default()),
                 #[cfg(test)]
                 stats: CommitCoordinatorStats::default(),
             }),
         }
+    }
+
+    /// Coalesces repository-wide checkpoint maintenance across every session
+    /// sharing this coordinator. Foreground checkpoints only attempt this
+    /// atomic transition; they never wait for maintenance ownership.
+    pub(crate) fn try_begin_checkpoint_gc(&self, checkpoint_sequence: u64) -> bool {
+        if checkpoint_sequence
+            < self
+                .inner
+                .checkpoint_gc_not_before_sequence
+                .load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.inner
+            .checkpoint_gc_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Process-local fallback when even the durable failure counter loses its
+    /// CAS race. This keeps sustained contention from immediately launching a
+    /// fresh full repository plan at the next checkpoint.
+    pub(crate) fn defer_checkpoint_gc_until(&self, checkpoint_sequence: u64) {
+        self.inner
+            .checkpoint_gc_not_before_sequence
+            .fetch_max(checkpoint_sequence, Ordering::AcqRel);
+    }
+
+    pub(crate) fn finish_checkpoint_gc(&self) {
+        self.inner
+            .checkpoint_gc_running
+            .store(false, Ordering::Release);
     }
 
     pub(crate) async fn commit(

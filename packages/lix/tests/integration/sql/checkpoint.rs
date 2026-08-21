@@ -4,7 +4,7 @@ use serde_json::json;
 use super::select_rows;
 
 simulation_test!(
-    checkpoint_compacts_working_interval_and_projects_sql_surfaces,
+    checkpoint_marks_working_interval_and_projects_sql_surfaces,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -182,7 +182,8 @@ simulation_test!(
                 ),
             )
             .await,
-            vec![vec![Value::Text(initial_commit_id)]]
+            vec![vec![Value::Text(initial_commit_id.clone())]],
+            "checkpoint severs the working interval at the prior checkpoint"
         );
         assert_eq!(
             select_rows(

@@ -198,6 +198,27 @@ where
     .await
 }
 
+pub(crate) async fn load_rebuild_plans_to_nearest_available_root_bounded<S>(
+    store: &S,
+    commit_id: &str,
+    force_head: bool,
+    max_members: usize,
+    known_commit_ids: &BTreeSet<CommitId>,
+) -> Result<Vec<CommitRootRebuildPlan>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    load_rebuild_plans_to_nearest_available_root_inner(
+        store,
+        commit_id,
+        force_head,
+        RootAvailabilityProof::Addressable,
+        Some(max_members),
+        known_commit_ids,
+    )
+    .await
+}
+
 pub(crate) async fn load_rebuild_plans_to_nearest_available_root_with_proof<S>(
     store: &S,
     commit_id: &str,
@@ -207,11 +228,40 @@ pub(crate) async fn load_rebuild_plans_to_nearest_available_root_with_proof<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    load_rebuild_plans_to_nearest_available_root_inner(
+        store,
+        commit_id,
+        force_head,
+        proof,
+        None,
+        &BTreeSet::new(),
+    )
+    .await
+}
+
+async fn load_rebuild_plans_to_nearest_available_root_inner<S>(
+    store: &S,
+    commit_id: &str,
+    force_head: bool,
+    proof: RootAvailabilityProof,
+    max_members: Option<usize>,
+    known_commit_ids: &BTreeSet<CommitId>,
+) -> Result<Vec<CommitRootRebuildPlan>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
     let mut plans = Vec::new();
+    let mut loaded_members = 0usize;
     let mut current_commit_id = commit_id.to_string();
     let mut force_current = force_head;
+    let mut physical_alias_source = false;
     let mut seen_commit_ids = HashSet::new();
     loop {
+        let typed_current_commit_id =
+            CommitId::parse_lix(&current_commit_id, "tracked-state rebuild commit id")?;
+        if known_commit_ids.contains(&typed_current_commit_id) {
+            break;
+        }
         if !seen_commit_ids.insert(current_commit_id.clone()) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -225,15 +275,27 @@ where
             let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
                 crate::storage_bench::PlanLoadPhase::AvailProbe,
             );
-            let available = load_available_root(store, &current_commit_id, proof).await?;
+            let available =
+                load_available_root(store, &current_commit_id, proof, physical_alias_source)
+                    .await?;
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_root_replay_available_root_probe(available.is_some());
             if available.is_some() {
                 break;
             }
         }
-        let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
-        let parent_commit_id = plan.parent_commit_id;
+        let plan = load_commit_root_rebuild_plan(
+            store,
+            &current_commit_id,
+            physical_alias_source,
+            max_members.map(|limit| limit.saturating_sub(loaded_members)),
+        )
+        .await?;
+        loaded_members = loaded_members.saturating_add(plan.deltas.len());
+        let parent_commit_id = plan
+            .complete_state_source_commit_id
+            .or(plan.parent_commit_id);
+        physical_alias_source = plan.complete_state_source_commit_id.is_some();
         plans.push(plan);
         let Some(parent_commit_id) = parent_commit_id else {
             break;
@@ -253,9 +315,10 @@ where
 /// repair, so the manifest — not a replay of the changelog — is what makes a
 /// root canonical. Availability therefore has exactly two obligations:
 ///
-/// 1. the root pointer is live (`load_snapshot_commit_root` also proves the
-///    commit itself exists in the changelog, so an orphaned manifest cannot
-///    authorize a resume), and
+/// 1. the root pointer is live (`load_snapshot_commit_root` also proves an
+///    ordinary commit still exists in the changelog; a complete-state alias
+///    may instead authorize its physically retained source manifest after the
+///    source's semantic projection has been collected), and
 /// 2. the content-addressed chunk closure it names is physically addressable,
 ///    so a damaged root is never resumed from and explicit repair stays total.
 ///
@@ -274,11 +337,20 @@ async fn load_available_root<S>(
     store: &S,
     commit_id: &str,
     proof: RootAvailabilityProof,
+    physical_alias_source: bool,
 ) -> Result<Option<TrackedStateRootId>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let Some(metadata) = storage::load_snapshot_commit_root(store, commit_id).await? else {
+    let metadata = if physical_alias_source {
+        let commit_id = CommitId::parse_lix(commit_id, "physical checkpoint source commit id")?;
+        storage::load_commit_state_manifest(store, commit_id)
+            .await?
+            .and_then(|manifest| manifest.snapshot_root.map(|root| *root))
+    } else {
+        storage::load_snapshot_commit_root(store, commit_id).await?
+    };
+    let Some(metadata) = metadata else {
         return Ok(None);
     };
     let readable = {
@@ -325,48 +397,76 @@ where
 pub(crate) struct CommitRootRebuildPlan {
     pub(crate) commit_id: CommitId,
     pub(crate) parent_commit_id: Option<CommitId>,
+    pub(crate) complete_state_source_commit_id: Option<CommitId>,
     pub(crate) deltas: Vec<CommitRootRebuildDelta>,
 }
 
 async fn load_commit_root_rebuild_plan<S>(
     store: &S,
     commit_id: &str,
+    allow_missing_commit: bool,
+    max_members: Option<usize>,
 ) -> Result<CommitRootRebuildPlan, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    let typed_commit_id = CommitId::parse_lix(commit_id, "commit-root rebuild commit_id")?;
     let commit = {
         #[cfg(feature = "storage-benches")]
         let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
             crate::storage_bench::PlanLoadPhase::CommitRecord,
         );
         let mut reader = ChangelogContext::new().reader(store);
-        let commit_ids = [CommitId::parse_lix(
-            commit_id,
-            "commit-root rebuild commit_id",
-        )?];
+        let commit_ids = [typed_commit_id];
         let batch = reader
             .load_commits(CommitLoadRequest {
                 commit_ids: &commit_ids,
             })
             .await?;
-        batch
-            .into_iter()
-            .next()
-            .and_then(|(_, value)| value)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"
-                    ),
-                )
-            })?
+        batch.into_iter().next().and_then(|(_, value)| value)
     };
-    // Commit roots contain only identity/index facts. Avoid hydrating JSON
-    // sidecars while rebuilding them; the packed delta index already carries
-    // deletion, owner ids, and original timestamps.
-    let members = storage::scan_commit_delta_members(store, commit.commit_id).await?;
+    if commit.is_none() && !allow_missing_commit {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"),
+        ));
+    }
+    let manifest = storage::load_commit_state_manifest(store, typed_commit_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot rebuild tracked_state root for commit '{}' without its commit-state manifest",
+                    typed_commit_id
+                ),
+            )
+        })?;
+    let complete_state_source_commit_id = manifest
+        .snapshot_root
+        .as_ref()
+        .filter(|root| root.complete_state_fence)
+        .and_then(|root| root.parent_roots.first())
+        .map(|source| source.commit_id);
+    if complete_state_source_commit_id.is_none()
+        && max_members.is_some_and(|limit| manifest.mutations.member_count as usize > limit)
+    {
+        return Err(LixError::new(
+            "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+            format!(
+                "commit-root migration replay exceeds configured change bound before hydration: commit '{}' has {} members",
+                typed_commit_id, manifest.mutations.member_count
+            ),
+        ));
+    }
+    // Complete-state aliases rebuild by sharing their source root. Ordinary
+    // roots contain only identity/index facts, so avoid hydrating JSON
+    // sidecars while rebuilding them.
+    let members = if complete_state_source_commit_id.is_some() {
+        Vec::new()
+    } else {
+        storage::scan_commit_delta_members(store, typed_commit_id).await?
+    };
     #[cfg(feature = "root-replay-trace")]
     let member_bytes = members
         .iter()
@@ -397,8 +497,19 @@ where
         .collect();
 
     Ok(CommitRootRebuildPlan {
-        commit_id: commit.commit_id,
-        parent_commit_id: first_parent_commit_id(&commit),
+        commit_id: typed_commit_id,
+        parent_commit_id: commit
+            .as_ref()
+            .and_then(first_parent_commit_id)
+            .or_else(|| {
+                manifest
+                    .snapshot_root
+                    .as_ref()
+                    .filter(|root| !root.complete_state_fence)
+                    .and_then(|root| root.parent_roots.first())
+                    .map(|parent| parent.commit_id)
+            }),
+        complete_state_source_commit_id,
         deltas,
     })
 }
@@ -410,6 +521,11 @@ pub(crate) async fn stage_rebuild_plan_with_writer<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    if let Some(source_commit_id) = plan.complete_state_source_commit_id {
+        return writer
+            .stage_complete_state_alias(plan.commit_id, source_commit_id)
+            .await;
+    }
     let deltas = plan
         .deltas
         .iter()
@@ -665,6 +781,7 @@ mod tests {
         CommitRootRebuildPlan {
             commit_id: CommitId::for_test_label(commit),
             parent_commit_id: parent.map(CommitId::for_test_label),
+            complete_state_source_commit_id: None,
             deltas,
         }
     }

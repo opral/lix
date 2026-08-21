@@ -1065,6 +1065,32 @@ impl DiffCommitRootValidationCache {
     }
 }
 
+fn collection_generation_cascade_winners(
+    winners: &HashMap<TrackedStateIdentity, ChangeId>,
+    row_map: &HashMap<TrackedStateIdentity, &TrackedStateIndexValue>,
+) -> Result<BTreeMap<(String, Option<String>), ChangeId>, LixError> {
+    let mut cascades = BTreeMap::new();
+    for (identity, change_id) in winners {
+        if identity.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
+            continue;
+        }
+        let Some(value) = row_map.get(identity) else {
+            continue;
+        };
+        if value.deleted || value.change_id != *change_id {
+            continue;
+        }
+        let scope = crate::collection_generation::collection_scope_from_row_pk(&identity.row_pk)?;
+        if cascades.insert(scope.clone(), *change_id).is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("commit contains duplicate collection-generation scope {scope:?}"),
+            ));
+        }
+    }
+    Ok(cascades)
+}
+
 impl<S> TrackedStateStoreReader<S>
 where
     S: StorageAdapterRead,
@@ -1504,6 +1530,76 @@ where
         )
     }
 
+    /// Removes physical tombstones synthesized into persistent roots for a
+    /// collection-generation delete. The authenticated marker is the logical
+    /// commit member; exposing every retired predecessor would both expand the
+    /// commit and require payloads that intentionally do not exist.
+    pub(crate) async fn suppress_collection_generation_cascade_tombstones(
+        &mut self,
+        batch: &mut TrackedStateTreeDiffBatch,
+    ) -> Result<(), LixError> {
+        use crate::collection_generation::{
+            COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_key,
+        };
+
+        let mut scopes = BTreeMap::<
+            (CommitId, String, Option<String>),
+            (TrackedStateKey, Vec<(usize, ChangeId)>),
+        >::new();
+        for (ordinal, key, _, after) in batch.rows() {
+            let Some(after) = after.filter(|after| after.deleted) else {
+                continue;
+            };
+            if key.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
+                continue;
+            }
+            let scope = (key.schema_key.to_owned(), key.file_id.map(str::to_owned));
+            let marker_key = TrackedStateKey {
+                schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+                file_id: None,
+                row_pk: RowPk::single(collection_scope_key(CollectionScopeRef {
+                    schema_key: &scope.0,
+                    file_id: scope.1.as_deref(),
+                })),
+            };
+            scopes
+                .entry((after.commit_id, scope.0, scope.1))
+                .or_insert_with(|| (marker_key, Vec::new()))
+                .1
+                .push((ordinal, after.change_id));
+        }
+        if scopes.is_empty() {
+            return Ok(());
+        }
+
+        let mut by_commit =
+            BTreeMap::<CommitId, Vec<(TrackedStateKey, Vec<(usize, ChangeId)>)>>::new();
+        for ((commit_id, _, _), request) in scopes {
+            by_commit.entry(commit_id).or_default().push(request);
+        }
+        let mut remove = vec![false; batch.len()];
+        for (commit_id, requests) in by_commit {
+            let keys = requests
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            let records =
+                storage::load_commit_delta_change_records(&self.store, commit_id, &keys).await?;
+            for ((_, candidates), record) in requests.into_iter().zip(records) {
+                let Some(record) = record else {
+                    continue;
+                };
+                for (ordinal, change_id) in candidates {
+                    if record.change_id == change_id && record.snapshot.is_some() {
+                        remove[ordinal] = true;
+                    }
+                }
+            }
+        }
+        batch.remove_rows(&remove);
+        Ok(())
+    }
+
     pub(crate) async fn load_tree_diff_comparison_payloads(
         &mut self,
         batch: &TrackedStateTreeDiffBatch,
@@ -1748,6 +1844,16 @@ where
                     cache,
                 )
                 .await?;
+                if metadata.complete_state_fence {
+                    self.validate_diff_row_created_at(
+                        row,
+                        &key,
+                        &current_commit_id,
+                        change_created_at,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 let Some(parent) = metadata.parent_roots.first() else {
                     if !metadata.complete_state_fence {
                         return Err(LixError::unknown(format!(
@@ -1836,6 +1942,17 @@ where
         metadata: &TrackedStateCommitRoot,
         cache: &mut DiffCommitRootValidationCache,
     ) -> Result<(), LixError> {
+        if metadata.complete_state_fence {
+            return match metadata.parent_roots.as_slice() {
+                [] => Ok(()),
+                [source] if source.commit_id != commit_id && source.root_id == metadata.root_id => {
+                    Ok(())
+                }
+                _ => Err(LixError::unknown(format!(
+                    "tracked-state complete-state fence for commit '{commit_id}' has invalid physical source ancestry"
+                ))),
+            };
+        }
         if metadata.parent_roots.len() > 1 {
             return Err(LixError::unknown(format!(
                 "tracked-state commit-root metadata for commit '{commit_id}' has more than one first-parent root"
@@ -2303,24 +2420,8 @@ where
         let file_delete_cascades = self
             .load_file_delete_cascade_winners(&winners, &row_map)
             .await?;
-        let mut collection_generation_cascades = HashMap::new();
-        for (identity, change_id) in &winners {
-            if identity.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-            {
-                continue;
-            }
-            let scope =
-                crate::collection_generation::collection_scope_from_row_pk(&identity.row_pk)?;
-            if collection_generation_cascades
-                .insert(scope, *change_id)
-                .is_some()
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "commit contains duplicate collection-generation cascade scopes",
-                ));
-            }
-        }
+        let collection_generation_cascades =
+            collection_generation_cascade_winners(&winners, &row_map)?;
         for (identity, change_id) in &winners {
             if !tracked_state_identity_matches_tree_request(identity, request) {
                 continue;
@@ -2370,10 +2471,13 @@ where
             if !parent_value.deleted
                 && let Some(cascade_change_id) = collection_generation_cascades
                     .get(&(parent_key.schema_key.clone(), parent_key.file_id.clone()))
-                && value.deleted
-                && &value.change_id == cascade_change_id
             {
-                continue;
+                if value.deleted && &value.change_id == cascade_change_id {
+                    continue;
+                }
+                return Err(LixError::unknown(format!(
+                    "tracked-state commit-root for commit '{commit_id}' does not apply collection-generation cascade change '{cascade_change_id}' to inherited identity {identity:?}"
+                )));
             }
             if *value != &parent_value {
                 return Err(LixError::unknown(format!(
@@ -2547,6 +2651,30 @@ where
                         *record = fallbacks
                             .next()
                             .expect("one fallback was loaded per missing file-scoped tombstone");
+                    }
+                }
+            }
+            let collection_fallback_rows = commit_rows
+                .iter()
+                .zip(&loaded)
+                .filter_map(|(row, record)| {
+                    (record.is_none() && row.deleted)
+                        .then(|| collection_cascade_payload_key(row.schema_key(), row.file_id()))
+                })
+                .collect::<Vec<_>>();
+            if !collection_fallback_rows.is_empty() {
+                let fallbacks = storage::load_commit_delta_change_records(
+                    &self.store,
+                    commit_id,
+                    &collection_fallback_rows,
+                )
+                .await?;
+                let mut fallbacks = fallbacks.into_iter();
+                for (row, record) in commit_rows.iter().zip(&mut loaded) {
+                    if record.is_none() && row.deleted {
+                        *record = fallbacks
+                            .next()
+                            .expect("one fallback was loaded per missing collection tombstone");
                     }
                 }
             }
@@ -4197,6 +4325,52 @@ where
         .await
     }
 
+    /// Publishes a complete-state fence by sharing an already materialized
+    /// persistent tree root. Only the small root descriptor is new; no state
+    /// rows or tree chunks are visited or copied.
+    pub(crate) async fn stage_complete_state_alias(
+        &mut self,
+        commit_id: CommitId,
+        source_commit_id: CommitId,
+    ) -> Result<TrackedStateWriteReport, LixError> {
+        let source_key = source_commit_id.to_string();
+        let source = match self.staged_roots.get(&source_key) {
+            Some(root) => root.clone(),
+            None => storage::load_snapshot_commit_root(self.store, &source_key)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "checkpoint source '{source_commit_id}' has no materialized tracked-state root"
+                        ),
+                    )
+                })?,
+        };
+        let root_id = source.root_id;
+        self.staged_roots.insert(
+            commit_id.to_string(),
+            TrackedStateCommitRoot {
+                commit_id,
+                root_id: root_id.clone(),
+                parent_roots: vec![TrackedStateCommitRootParent {
+                    commit_id: source_commit_id,
+                    root_id: root_id.clone(),
+                }],
+                changed_key_count: source.row_count_estimate,
+                row_count_estimate: source.row_count_estimate,
+                tree_height: source.tree_height,
+                complete_state_fence: true,
+            },
+        );
+        Ok(TrackedStateWriteReport {
+            commit_id,
+            root_id,
+            changed_rows: 0,
+            primary_chunk_puts: 0,
+        })
+    }
+
     pub(crate) async fn stage_commit_root_with_absence_guards<'a, I>(
         &mut self,
         commit_id: &str,
@@ -4960,9 +5134,19 @@ fn validate_diff_row_against_changelog(
             row.change_id
         )));
     };
-    tracked_state_winner_identity_for_diff_row(row, change)?;
-    let change_deleted = change.snapshot.is_none();
-    if row.deleted != change_deleted {
+    let winner = tracked_state_winner_kind_for_diff_parts(
+        row.schema_key(),
+        row.file_id(),
+        row.row_pk(),
+        row.deleted,
+        row.change_id,
+        change,
+    )?;
+    if !matches!(
+        winner,
+        TrackedStateRowWinnerKind::CollectionGenerationCascade
+    ) && row.deleted != change.snapshot.is_none()
+    {
         return Err(LixError::unknown(format!(
             "tracked-state diff row for change '{}' deleted flag does not match changelog snapshot",
             row.change_id
@@ -5037,7 +5221,6 @@ fn collection_cascade_payload_key(schema_key: &str, file_id: Option<&str>) -> Tr
     use crate::collection_generation::{
         COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_key,
     };
-
     TrackedStateKey {
         schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
         file_id: None,

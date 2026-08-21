@@ -25,6 +25,7 @@ mod write_set;
 #[cfg(test)]
 mod conformance;
 
+pub(crate) use crate::storage::StorageWrite;
 pub use crate::storage::{
     BeginScanOptions as StorageBeginScanOptions, BufferRange,
     CoreProjection as StorageCoreProjection, EncodedMutationBatch, EncodedPut,
@@ -39,10 +40,12 @@ pub use crate::storage::{
     ValueSemantics, WriteOptions as StorageWriteOptions,
 };
 pub(crate) use crate::storage::{Capability as StorageCapability, PutBatch, PutEntry};
-pub(crate) use crate::storage::StorageWrite;
 
 pub use context::StorageAdapter;
-pub(crate) use context::stage_mutation_revision;
+pub(crate) use context::{
+    load_repository_mutation_revision, repository_mutation_revision_precondition,
+    stage_mutation_revision,
+};
 pub(crate) use point::exact_get_many;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
 pub(crate) use read_scope::SharedStorageAdapterRead;

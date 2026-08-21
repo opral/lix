@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Does delta encoding pay for the content-addressed JSON store?
 //!
 //! `duplicate_audit` established that `json_store.json` is full of *near*

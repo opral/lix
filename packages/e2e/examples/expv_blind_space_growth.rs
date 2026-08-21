@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Growth curves for the storage spaces layout accounting could not see.
 //!
 //! Before PR #1308 `native_storage_spaces()` enumerated 32 of 46 physical

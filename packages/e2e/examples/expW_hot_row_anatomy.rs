@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Anatomy of a `hot_state.row.v21` row, and what two branches share.
 //!
 //! Experiment T attributed 95.4% of the two-branch storage delta to

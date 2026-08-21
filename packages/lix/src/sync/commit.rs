@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::changelog::{
@@ -15,9 +16,22 @@ use crate::changelog::{
 };
 use crate::common::LixTimestamp;
 use crate::row_pk::RowPk;
-use crate::storage_adapter::{Storage, StorageAdapterRead, StorageReadOptions};
-use crate::tracked_state::load_commit_delta_members_with_payloads;
+use crate::storage_adapter::{
+    Storage, StorageAdapterRead, StorageGetManyRequest, StorageGetOptions, StorageKey,
+    StorageProjectedValue, StorageReadOptions, StorageSpace, StorageSpaceId, StorageValue,
+    StorageWriteSet, ValueSemantics, exact_get_many,
+};
+use crate::tracked_state::{
+    load_commit_delta_members_with_payloads, load_commit_state_manifest,
+    load_local_commit_delta_members_with_payloads,
+};
 use crate::{Lix, LixError};
+
+pub(crate) const SYNC_MATERIALIZED_STATE_ALIAS_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0007_0015),
+    "sync.materialized_state_alias.v1",
+    ValueSemantics::Immutable,
+);
 
 /// A complete immutable commit, independent of the local storage layout.
 ///
@@ -32,7 +46,114 @@ pub struct SyncCommit {
     pub account_id: String,
     pub created_at: String,
     pub selected_source_commit_id: Option<String>,
+    /// Authenticated O(1) representation of a complete-state checkpoint.
+    /// The source is a dependency and `state_root_id` binds the alias to the
+    /// exact persistent tree the authority captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_alias: Option<SyncCommitStateAlias>,
     pub members: Vec<SyncCommitMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncCommitStateAlias {
+    pub source_commit_id: String,
+    pub state_root_id: String,
+}
+
+fn materialized_state_alias_key(commit_id: CommitId) -> StorageKey {
+    StorageKey(Bytes::copy_from_slice(commit_id.as_uuid().as_bytes()))
+}
+
+pub(crate) fn stage_materialized_sync_state_alias(
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    alias: &SyncCommitStateAlias,
+) -> Result<(), LixError> {
+    let bytes = serde_json::to_vec(alias).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("encode materialized sync state alias: {error}"),
+        )
+    })?;
+    writes.put(
+        SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
+        materialized_state_alias_key(commit_id),
+        StorageValue {
+            bytes: Bytes::from(bytes),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn stage_delete_materialized_sync_state_alias(
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+) {
+    writes.delete(
+        SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
+        materialized_state_alias_key(commit_id),
+    );
+}
+
+async fn load_materialized_sync_state_alias(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<SyncCommitStateAlias>, LixError> {
+    let key = materialized_state_alias_key(commit_id);
+    let values = exact_get_many(
+        store,
+        &[StorageGetManyRequest {
+            space: SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
+            keys: std::slice::from_ref(&key),
+            opts: StorageGetOptions::default(),
+        }],
+    )
+    .await?;
+    let Some(value) = values.values.into_iter().next().flatten() else {
+        return Ok(None);
+    };
+    let StorageProjectedValue::FullValue(value) = value else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "materialized sync state alias read omitted its value",
+        ));
+    };
+    serde_json::from_slice(&value).map(Some).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("decode materialized sync state alias: {error}"),
+        )
+    })
+}
+
+pub(crate) async fn load_sync_commit_state_alias(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<SyncCommitStateAlias>, LixError> {
+    if let Some(alias) = load_materialized_sync_state_alias(store, commit_id).await? {
+        return Ok(Some(alias));
+    }
+    load_manifest_sync_state_alias(store, commit_id).await
+}
+
+async fn load_manifest_sync_state_alias(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<SyncCommitStateAlias>, LixError> {
+    Ok(load_commit_state_manifest(store, commit_id)
+        .await?
+        .and_then(|manifest| manifest.snapshot_root)
+        .filter(|root| root.complete_state_fence)
+        .and_then(|root| {
+            let source = root.parent_roots.into_iter().next()?;
+            Some(SyncCommitStateAlias {
+                source_commit_id: source.commit_id.to_string(),
+                state_root_id: blake3::Hash::from_bytes(*root.root_id.as_bytes())
+                    .to_hex()
+                    .to_string(),
+            })
+        }))
 }
 
 /// One identity-ordered member of a commit delta.
@@ -124,6 +245,30 @@ impl SyncCommit {
             .transpose()?;
         if selected_source_commit_id == Some(commit_id) {
             return invalid("sync commit cannot select itself as its source");
+        }
+        if let Some(alias) = &self.state_alias {
+            let source = CommitId::parse_lix(
+                &alias.source_commit_id,
+                "sync complete-state source commit id",
+            )?;
+            if source == commit_id {
+                return invalid("sync commit cannot alias its own state");
+            }
+            super::validate_blake3_id(
+                &alias.state_root_id,
+                "sync complete-state alias stateRootId",
+            )?;
+            if self.selected_source_commit_id.is_some() {
+                return invalid(
+                    "sync commit cannot carry both selected and complete-state sources",
+                );
+            }
+            if self.parent_commit_ids.len() != 1 {
+                return invalid("sync complete-state alias must have exactly one semantic parent");
+            }
+            if !self.members.is_empty() {
+                return invalid("sync complete-state alias must not carry commit members");
+            }
         }
 
         let mut previous: Option<(String, Option<String>, RowPk)> = None;
@@ -241,7 +386,18 @@ where
         return Ok(None);
     };
 
-    let delta = load_commit_delta_members_with_payloads(store, commit_id).await?;
+    let materialized_state_alias = load_materialized_sync_state_alias(store, commit_id).await?;
+    let state_alias = match materialized_state_alias.clone() {
+        Some(alias) => Some(alias),
+        None => load_manifest_sync_state_alias(store, commit_id).await?,
+    };
+    let delta = if materialized_state_alias.is_some() {
+        Vec::new()
+    } else if state_alias.is_some() {
+        load_local_commit_delta_members_with_payloads(store, commit_id).await?
+    } else {
+        load_commit_delta_members_with_payloads(store, commit_id).await?
+    };
     let payloads = materialize_known_change_payloads_in_order(
         delta.iter().map(|member| member.change.clone()),
         ChangeRecordProjection::full(),
@@ -300,6 +456,7 @@ where
         account_id: record.account_id,
         created_at: record.created_at.to_string(),
         selected_source_commit_id: selected_source_commit_id.map(|source| source.to_string()),
+        state_alias,
         members,
     };
     exported.validate()?;
@@ -551,7 +708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_exports_complete_selected_members_without_a_source_pointer() {
+    async fn checkpoint_exports_bounded_authenticated_state_alias() {
         let lix = crate::open_lix().await.expect("open checkpoint fixture");
         lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-source', 'selected')",
@@ -574,9 +731,69 @@ mod tests {
         exported
             .validate()
             .expect("checkpoint alias must remain a valid sync commit");
-        assert!(exported.members.iter().any(|member| !member.authored));
+        assert!(exported.members.iter().all(|member| member.authored));
+        assert!(
+            exported.members.is_empty(),
+            "the branch checkpoint boundary has no local row mutations"
+        );
         assert_eq!(exported.selected_source_commit_id, None);
+        let alias = exported
+            .state_alias
+            .as_ref()
+            .expect("checkpoint export must carry its physical state source");
+        super::super::validate_blake3_id(&alias.state_root_id, "checkpoint state root")
+            .expect("checkpoint root id must be canonical");
         lix.close().await.expect("close checkpoint fixture");
+    }
+
+    #[tokio::test]
+    async fn materialized_state_alias_sidecar_retires_by_commit_identity() {
+        let lix = crate::open_lix().await.expect("open sidecar fixture");
+        let commit_id = CommitId::for_test_label("materialized-alias-owner");
+        let alias = SyncCommitStateAlias {
+            source_commit_id: CommitId::for_test_label("materialized-alias-source").to_string(),
+            state_root_id: blake3::hash(b"materialized-alias-root")
+                .to_hex()
+                .to_string(),
+        };
+        let adapter = lix.storage_adapter();
+        let mut writes = adapter.new_write_set();
+        stage_materialized_sync_state_alias(&mut writes, commit_id, &alias)
+            .expect("stage sidecar");
+        adapter
+            .commit_write_set(writes, crate::storage_adapter::StorageWriteOptions::default())
+            .await
+            .expect("publish sidecar");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open sidecar read");
+        assert_eq!(
+            load_materialized_sync_state_alias(&read, commit_id)
+                .await
+                .expect("load sidecar"),
+            Some(alias),
+        );
+        drop(read);
+
+        let mut writes = adapter.new_write_set();
+        stage_delete_materialized_sync_state_alias(&mut writes, commit_id);
+        adapter
+            .commit_write_set(writes, crate::storage_adapter::StorageWriteOptions::default())
+            .await
+            .expect("retire sidecar");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open retired sidecar read");
+        assert_eq!(
+            load_materialized_sync_state_alias(&read, commit_id)
+                .await
+                .expect("load retired sidecar"),
+            None,
+        );
+        drop(read);
+        lix.close().await.expect("close sidecar fixture");
     }
 
     #[test]
@@ -608,6 +825,7 @@ mod tests {
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             created_at: "2026-08-19T00:00:00Z".to_owned(),
             selected_source_commit_id: None,
+            state_alias: None,
             members: vec![member("b", 1), member("a", 2)],
         };
         assert!(
@@ -655,6 +873,58 @@ mod tests {
                 .expect_err("merge selected members require the second parent source")
                 .message
                 .contains("second parent")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_non_metadata_only_state_aliases() {
+        let commit_id = CommitId::for_test_label("alias-validation");
+        let parent = CommitId::for_test_label("alias-parent");
+        let source = CommitId::for_test_label("alias-source");
+        let mut commit = SyncCommit {
+            commit_id: commit_id.to_string(),
+            parent_commit_ids: vec![parent.to_string()],
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            created_at: "2026-08-19T00:00:00Z".to_owned(),
+            selected_source_commit_id: None,
+            state_alias: Some(SyncCommitStateAlias {
+                source_commit_id: source.to_string(),
+                state_root_id: blake3::hash(b"alias-root").to_hex().to_string(),
+            }),
+            members: Vec::new(),
+        };
+        commit.validate().expect("canonical state alias validates");
+
+        commit.parent_commit_ids.clear();
+        assert!(
+            commit
+                .validate()
+                .expect_err("alias without one semantic parent must fail")
+                .message
+                .contains("exactly one")
+        );
+        commit.parent_commit_ids = vec![parent.to_string()];
+        commit.members.push(SyncCommitMember {
+            change_id: crate::changelog::ChangeId::for_test_label("alias-member").to_string(),
+            authored: true,
+            schema_key: "schema".to_owned(),
+            file_id: None,
+            row_pk: serde_json::json!([{ "type": "string", "value": "row" }]),
+            deleted: false,
+            snapshot: Some(serde_json::json!({ "id": "row" })),
+            metadata: None,
+            row_created_at: "2026-08-19T00:00:00Z".to_owned(),
+            row_updated_at: "2026-08-19T00:00:00Z".to_owned(),
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            change_created_at: "2026-08-19T00:00:00Z".to_owned(),
+            origin_key: None,
+        });
+        assert!(
+            commit
+                .validate()
+                .expect_err("alias with members must fail")
+                .message
+                .contains("must not carry")
         );
     }
 }

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Does retiring a *fixed* amount of hot-generation garbage cost more as the
 //! repository grows?
 //!

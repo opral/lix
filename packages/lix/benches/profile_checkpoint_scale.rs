@@ -9,18 +9,24 @@
 //! GC is identified from the engine's post-collection tracing event, without
 //! assuming a maintenance cadence or classifying by latency.
 //!
-//! cargo bench -p lix --bench profile_checkpoint_scale \
-//!   --features checkpoint_backends -- \
+//! cargo bench --manifest-path packages/e2e/Cargo.toml \
+//!   --bench profile_checkpoint_scale --features storage-benches,slatedb -- \
 //!   setup rocksdb /tmp/checkpoint-rocks-seed 10000
 //! cp -a /tmp/checkpoint-rocks-seed /tmp/checkpoint-rocks-run
-//! cargo bench -p lix --bench profile_checkpoint_scale \
-//!   --features checkpoint_backends -- \
+//! cargo bench --manifest-path packages/e2e/Cargo.toml \
+//!   --bench profile_checkpoint_scale --features storage-benches,slatedb -- \
 //!   run rocksdb /tmp/checkpoint-rocks-run 1000 10 5
 
 use async_trait::async_trait;
-use lix::{ExecuteBatchStatement, Lix, Storage, Value, open_lix};
+use lix::storage::Storage;
+use lix::storage_bench::{
+    CheckpointForegroundAccounting, checkpoint_foreground_is_active, measure_checkpoint_foreground,
+};
+use lix::{ExecuteBatchStatement, Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -43,6 +49,75 @@ const FILE_BYTES: usize = 256;
 // bounded opportunity to run before validating/reopening the fixture. This is
 // outside the measured checkpoint latency window.
 const BACKGROUND_GC_SETTLE_MILLIS: u64 = 5_000;
+
+// These are architectural ceilings, not values derived from a particular
+// fixture. Any scale dimension that leaks into publication should break an
+// operation, payload, or allocation gate before timing noise can hide it.
+const MAX_FOREGROUND_READ_VIEWS: u64 = 8;
+const MAX_FOREGROUND_POINT_BATCHES: u64 = 80;
+const MAX_FOREGROUND_POINT_KEYS: u64 = 80;
+const MAX_FOREGROUND_SCAN_STARTS: u64 = 4;
+const MAX_FOREGROUND_SCAN_PAGES: u64 = 4;
+const MAX_FOREGROUND_SCAN_ROWS: u64 = 48;
+const MAX_FOREGROUND_WRITE_TRANSACTIONS: u64 = 1;
+const MAX_FOREGROUND_WRITE_CALLS: u64 = 20;
+const MAX_FOREGROUND_WRITTEN_RECORDS: u64 = 32;
+const MAX_FOREGROUND_WRITTEN_BYTES: u64 = 64 * 1024;
+const MAX_FOREGROUND_ALLOCATIONS: u64 = 24_576;
+const MAX_FOREGROUND_ALLOCATED_BYTES: u64 = 3 * 1024 * 1024;
+const MAX_CHECKPOINT_P99_MILLIS: f64 = 25.0;
+const MAX_CHECKPOINT_MILLIS: f64 = 100.0;
+const MAX_INTERVAL_WRITE_P99_MILLIS: f64 = 100.0;
+const MAX_INTERVAL_WRITE_MILLIS: f64 = 500.0;
+const MAX_DEPTH_P95_RATIO: f64 = 2.0;
+const MAX_DEPTH_P95_ADDITIVE_MILLIS: f64 = 2.0;
+
+struct CountingAllocator;
+
+thread_local! {
+    static ALLOCATION_CALLS: Cell<u64> = const { Cell::new(0) };
+    static ALLOCATED_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if checkpoint_foreground_is_active() {
+            ALLOCATION_CALLS.with(|calls| calls.set(calls.get() + 1));
+            ALLOCATED_BYTES.with(|bytes| bytes.set(bytes.get() + layout.size() as u64));
+        }
+        // SAFETY: this allocator delegates the unchanged layout to `System`.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from the delegated `System` allocation above.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if checkpoint_foreground_is_active() {
+            ALLOCATION_CALLS.with(|calls| calls.set(calls.get() + 1));
+            ALLOCATED_BYTES.with(|bytes| bytes.set(bytes.get() + new_size as u64));
+        }
+        // SAFETY: arguments are forwarded unchanged to `System`.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AllocationAccounting {
+    calls: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ForegroundAccounting {
+    storage: CheckpointForegroundAccounting,
+    allocations: AllocationAccounting,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -90,7 +165,8 @@ fn main() {
     match mode {
         "setup" => {
             let file_count = parse_usize(args.get(4), DEFAULT_FILE_COUNT, "file count");
-            runtime.block_on(setup_backend(backend, &path, file_count));
+            let branch_count = parse_usize(args.get(5), 0, "branch count");
+            runtime.block_on(setup_backend(backend, &path, file_count, branch_count));
         }
         "run" => {
             let checkpoint_count =
@@ -122,7 +198,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  profile_checkpoint_scale setup <rocksdb|slatedb> <storage-dir> [files]\n  \
+        "usage:\n  profile_checkpoint_scale setup <rocksdb|slatedb> <storage-dir> [files] [branches]\n  \
          profile_checkpoint_scale run <rocksdb|slatedb> <storage-dir> \
          [checkpoints] [files-per-checkpoint] \
          [auto-commits-per-checkpoint]\n  \
@@ -277,19 +353,19 @@ impl Visit for GcObservationVisitor {
     }
 }
 
-async fn setup_backend(backend: Backend, path: &Path, file_count: usize) {
+async fn setup_backend(backend: Backend, path: &Path, file_count: usize, branch_count: usize) {
     assert!(
         !path.exists(),
         "refusing to overwrite existing fixture {}",
         path.display()
     );
     match backend {
-        Backend::RocksDb => setup_fixture::<RocksDB>(path, file_count).await,
-        Backend::SlateDb => setup_fixture::<SlateDB>(path, file_count).await,
+        Backend::RocksDb => setup_fixture::<RocksDB>(path, file_count, branch_count).await,
+        Backend::SlateDb => setup_fixture::<SlateDB>(path, file_count, branch_count).await,
     }
 }
 
-async fn setup_fixture<S>(path: &Path, file_count: usize)
+async fn setup_fixture<S>(path: &Path, file_count: usize, branch_count: usize)
 where
     S: BenchmarkStorage,
 {
@@ -305,11 +381,19 @@ where
         let batch_end = (batch_start + SEED_BATCH_SIZE).min(file_count);
         insert_file_batch(&lix, batch_start, batch_end).await;
     }
+    let starting_branch_count =
+        scalar_count(&lix, "SELECT count(*) AS count FROM lix_branch").await;
+    for batch_start in (0..branch_count).step_by(SEED_BATCH_SIZE) {
+        let batch_end = (batch_start + SEED_BATCH_SIZE).min(branch_count);
+        insert_branch_batch(&lix, batch_start, batch_end).await;
+    }
+    assert_eq!(
+        scalar_count(&lix, "SELECT count(*) AS count FROM lix_branch").await,
+        starting_branch_count + branch_count,
+    );
     let seed_elapsed = setup_start.elapsed();
     let checkpoint_start = Instant::now();
-    lix.create_checkpoint()
-        .await
-        .expect("compact initial checkpoint");
+    let initial_foreground = profile_checkpoint_phase(&lix).await;
     let initial_checkpoint_elapsed = checkpoint_start.elapsed();
     assert_eq!(
         scalar_count(&lix, "SELECT count(*) AS count FROM lix_file").await,
@@ -328,19 +412,44 @@ where
     drop(storage);
     let after_close = physical_stats(path);
     println!(
-        "setup backend={} files={file_count} seed_ms={:.3} \
+        "setup backend={} files={file_count} branches={branch_count} seed_ms={:.3} \
          initial_checkpoint_ms={:.3} backend_flush_ms={:.3} \
-         storage_bytes_after_flush={} storage_files_after_flush={} \
+         foreground={} storage_bytes_after_flush={} storage_files_after_flush={} \
          storage_bytes_after_close={} storage_files_after_close={}",
         S::NAME,
         millis(seed_elapsed),
         millis(initial_checkpoint_elapsed),
         millis(flush_elapsed),
+        format_foreground(initial_foreground),
         after_flush.storage_bytes,
         after_flush.storage_files,
         after_close.storage_bytes,
         after_close.storage_files,
     );
+}
+
+async fn insert_branch_batch<S>(lix: &Lix<S>, start: usize, end: usize)
+where
+    S: BenchmarkStorage,
+{
+    let row_count = end - start;
+    let mut sql = String::from("INSERT INTO lix_branch (id, name) VALUES ");
+    let mut params = Vec::with_capacity(row_count * 2);
+    for (offset, branch_index) in (start..end).enumerate() {
+        if offset > 0 {
+            sql.push(',');
+        }
+        let parameter = offset * 2;
+        write!(sql, "(${}, ${})", parameter + 1, parameter + 2)
+            .expect("write branch parameter placeholders");
+        params.push(Value::Text(format!(
+            "10000000-0000-7000-8000-{branch_index:012x}"
+        )));
+        params.push(Value::Text(format!("benchmark-branch-{branch_index:05}")));
+    }
+    lix.execute(&sql, &params)
+        .await
+        .expect("insert checkpoint benchmark branches");
 }
 
 async fn insert_file_batch<S>(lix: &Lix<S>, start: usize, end: usize)
@@ -443,6 +552,8 @@ async fn run_workload<S>(
     let files_per_auto_commit = files_per_checkpoint / auto_commits_per_checkpoint;
     let mut write_latencies = Vec::with_capacity(checkpoint_count);
     let mut checkpoint_latencies = Vec::with_capacity(checkpoint_count);
+    let mut contention_probe_latencies = Vec::with_capacity(checkpoint_count);
+    let mut foreground_accounting = Vec::with_capacity(checkpoint_count * 2);
     let mut observed_background_gc_latencies = Vec::new();
     let mut backend_flush_latencies = Vec::new();
     gc_observer.clear();
@@ -467,20 +578,33 @@ async fn run_workload<S>(
         }
         let write_elapsed = write_start.elapsed();
         let checkpoint_start = Instant::now();
-        profile_checkpoint_phase(&lix).await;
+        let foreground = profile_checkpoint_phase(&lix).await;
         let checkpoint_elapsed = checkpoint_start.elapsed();
         write_latencies.push(write_elapsed);
         checkpoint_latencies.push(checkpoint_elapsed);
+        foreground_accounting.push(foreground);
+        // Let maintenance scheduled by the just-published checkpoint start
+        // outside its timer. The direct probe below measures real adapter and
+        // commit-coordinator contention before any ordinary write can absorb
+        // the wait.
+        tokio::task::yield_now().await;
+        // Start a checkpoint directly after maintenance receives a scheduling
+        // opportunity. Ordinary interval writes must not absorb an exclusive
+        // adapter-writer wait before the checkpoint timer starts.
+        let contention_probe_start = Instant::now();
+        let contention_foreground = profile_checkpoint_phase(&lix).await;
+        contention_probe_latencies.push(contention_probe_start.elapsed());
+        foreground_accounting.push(contention_foreground);
         for gc in gc_observer.drain() {
             observed_background_gc_latencies.push(Duration::from_micros(gc.gc_total_us));
             println!(
                 "observed_background_gc backend={} observed_after_checkpoint_index={checkpoint_index} \
-                 visible_checkpoint_count={} gc_total_ms={:.3} \
+                visible_checkpoint_count={} gc_total_ms={:.3} \
                  swept_commits={} swept_changes={} swept_tracked_roots={} \
                  root_discovery_ms={:.3} changelog_ms={:.3} \
                  tracked_root_stage_ms={:.3} gc_total_ms={:.3}",
                 S::NAME,
-                starting_checkpoint_count + checkpoint_index,
+                starting_checkpoint_count + checkpoint_index * 2,
                 micros_to_millis(gc.gc_total_us),
                 gc.swept_commits,
                 gc.swept_changes,
@@ -489,6 +613,10 @@ async fn run_workload<S>(
                 micros_to_millis(gc.changelog_us),
                 micros_to_millis(gc.tracked_root_stage_us),
                 micros_to_millis(gc.gc_total_us),
+            );
+            println!(
+                "foreground checkpoint_index={checkpoint_index} {}",
+                format_foreground(foreground)
             );
         }
         if is_milestone(checkpoint_index, checkpoint_count) {
@@ -501,7 +629,7 @@ async fn run_workload<S>(
             println!(
                 "{checkpoint_index},{},{file_count},{},{:.3},{:.3},{:.3},{},{}",
                 S::NAME,
-                starting_checkpoint_count + checkpoint_index,
+                starting_checkpoint_count + checkpoint_index * 2,
                 millis(write_elapsed),
                 millis(checkpoint_elapsed),
                 millis(flush_elapsed),
@@ -567,7 +695,7 @@ async fn run_workload<S>(
     let checkpoint_history_query_elapsed = checkpoint_history_query_start.elapsed();
     assert_eq!(
         visible_checkpoint_count,
-        starting_checkpoint_count + checkpoint_count,
+        starting_checkpoint_count + checkpoint_count * 2,
         "every requested checkpoint must remain visible"
     );
     let live_commits = scalar_count(&lix, "SELECT count(*) AS count FROM lix_commit").await;
@@ -601,23 +729,38 @@ async fn run_workload<S>(
 
     print_latency_summary("interval_write", &write_latencies);
     print_latency_summary("create_checkpoint", &checkpoint_latencies);
+    print_latency_summary(
+        "create_checkpoint_after_gc_yield",
+        &contention_probe_latencies,
+    );
     if !observed_background_gc_latencies.is_empty() {
         print_latency_summary("background_gc", &observed_background_gc_latencies);
     }
     print_latency_summary("backend_flush_sample", &backend_flush_latencies);
     print_depth_bands(&checkpoint_latencies);
+    print_foreground_summary(&foreground_accounting);
+    assert_latency_bounds(&checkpoint_latencies);
+    assert_latency_bounds(&contention_probe_latencies);
+    assert_operation_latency_bounds(
+        &write_latencies,
+        MAX_INTERVAL_WRITE_P99_MILLIS,
+        MAX_INTERVAL_WRITE_MILLIS,
+        "interval write",
+    );
     let first_window = checkpoint_latencies.len().min(100);
     let last_window_start = checkpoint_latencies.len().saturating_sub(100);
     println!(
         "summary backend={} files={file_count} checkpoints={checkpoint_count} \
          files_per_checkpoint={files_per_checkpoint} \
-         auto_commits_per_checkpoint={auto_commits_per_checkpoint} \
-         total_s={:.3} checkpoints_per_s={:.3} live_commits={live_commits} \
+        auto_commits_per_checkpoint={auto_commits_per_checkpoint} \
+         checkpoint_publications={} total_s={:.3} intervals_per_s={:.3} \
+         live_commits={live_commits} \
          first_100_checkpoint_mean_ms={:.3} last_100_checkpoint_mean_ms={:.3} \
          storage_bytes_after_flush={} storage_files_after_flush={} \
          storage_bytes_after_close={} storage_files_after_close={} \
          peak_sampled_storage_bytes={}",
         S::NAME,
+        checkpoint_count * 2,
         total_elapsed.as_secs_f64(),
         f64::from(u32::try_from(checkpoint_count).expect("checkpoint count should fit u32"))
             / total_elapsed.as_secs_f64(),
@@ -680,13 +823,119 @@ fn benchmark_file_id(file_index: usize) -> String {
 }
 
 #[inline(never)]
-async fn profile_checkpoint_phase<S>(lix: &Lix<S>)
+async fn profile_checkpoint_phase<S>(lix: &Lix<S>) -> ForegroundAccounting
 where
     S: BenchmarkStorage,
 {
-    lix.create_checkpoint()
-        .await
-        .expect("create benchmark checkpoint");
+    ALLOCATION_CALLS.with(|calls| calls.set(0));
+    ALLOCATED_BYTES.with(|bytes| bytes.set(0));
+    let (result, storage) = measure_checkpoint_foreground(lix.create_checkpoint()).await;
+    result.expect("create benchmark checkpoint");
+    let accounting = ForegroundAccounting {
+        storage,
+        allocations: AllocationAccounting {
+            calls: ALLOCATION_CALLS.with(Cell::get),
+            bytes: ALLOCATED_BYTES.with(Cell::get),
+        },
+    };
+    assert_foreground_bounds(accounting);
+    accounting
+}
+
+fn assert_foreground_bounds(accounting: ForegroundAccounting) {
+    let storage = accounting.storage;
+    assert!(
+        storage.read_views <= MAX_FOREGROUND_READ_VIEWS,
+        "{accounting:?}"
+    );
+    assert!(
+        storage.point_batches <= MAX_FOREGROUND_POINT_BATCHES,
+        "{accounting:?}"
+    );
+    assert!(
+        storage.point_keys <= MAX_FOREGROUND_POINT_KEYS,
+        "{accounting:?}"
+    );
+    assert!(
+        storage.scan_starts <= MAX_FOREGROUND_SCAN_STARTS,
+        "{accounting:?}"
+    );
+    assert!(
+        storage.scan_pages <= MAX_FOREGROUND_SCAN_PAGES,
+        "{accounting:?}"
+    );
+    assert!(
+        storage.scan_rows <= MAX_FOREGROUND_SCAN_ROWS,
+        "{accounting:?}"
+    );
+    assert!(
+        storage.write_transactions <= MAX_FOREGROUND_WRITE_TRANSACTIONS,
+        "{accounting:?}"
+    );
+    assert!(
+        storage.write_calls <= MAX_FOREGROUND_WRITE_CALLS,
+        "{accounting:?}"
+    );
+    assert!(
+        storage.written_records <= MAX_FOREGROUND_WRITTEN_RECORDS,
+        "{accounting:?}"
+    );
+    assert!(
+        storage.written_bytes <= MAX_FOREGROUND_WRITTEN_BYTES,
+        "{accounting:?}"
+    );
+    assert!(
+        accounting.allocations.calls <= MAX_FOREGROUND_ALLOCATIONS,
+        "{accounting:?}"
+    );
+    assert!(
+        accounting.allocations.bytes <= MAX_FOREGROUND_ALLOCATED_BYTES,
+        "{accounting:?}"
+    );
+}
+
+fn format_foreground(accounting: ForegroundAccounting) -> String {
+    let storage = accounting.storage;
+    format!(
+        "read_views={} point_batches={} point_keys={} scan_starts={} scan_pages={} \
+         scan_rows={} write_transactions={} write_calls={} written_records={} \
+         written_bytes={} allocations={} allocated_bytes={}",
+        storage.read_views,
+        storage.point_batches,
+        storage.point_keys,
+        storage.scan_starts,
+        storage.scan_pages,
+        storage.scan_rows,
+        storage.write_transactions,
+        storage.write_calls,
+        storage.written_records,
+        storage.written_bytes,
+        accounting.allocations.calls,
+        accounting.allocations.bytes,
+    )
+}
+
+fn print_foreground_summary(samples: &[ForegroundAccounting]) {
+    let max = |select: fn(&ForegroundAccounting) -> u64| {
+        samples.iter().map(select).max().unwrap_or_default()
+    };
+    println!(
+        "foreground_max read_views={} point_batches={} point_keys={} scan_starts={} \
+         scan_pages={} scan_rows={} write_transactions={} write_calls={} \
+         written_records={} written_bytes={} allocations={} allocated_bytes={}",
+        max(|sample| sample.storage.read_views),
+        max(|sample| sample.storage.point_batches),
+        max(|sample| sample.storage.point_keys),
+        max(|sample| sample.storage.scan_starts),
+        max(|sample| sample.storage.scan_pages),
+        max(|sample| sample.storage.scan_rows),
+        max(|sample| sample.storage.write_transactions),
+        max(|sample| sample.storage.write_calls),
+        max(|sample| sample.storage.written_records),
+        max(|sample| sample.storage.written_bytes),
+        max(|sample| sample.allocations.calls),
+        max(|sample| sample.allocations.bytes),
+    );
 }
 
 async fn scalar_count<S>(lix: &Lix<S>, sql: &str) -> usize
@@ -783,6 +1032,55 @@ fn print_depth_bands(latencies: &[Duration]) {
             millis(*sorted.last().expect("depth band must not be empty")),
         );
     }
+}
+
+fn assert_latency_bounds(latencies: &[Duration]) {
+    let mut sorted = latencies.to_vec();
+    sorted.sort_unstable();
+    let p99 = millis(percentile(&sorted, 99, 100));
+    let max = millis(*sorted.last().expect("latencies must not be empty"));
+    assert!(
+        p99 <= MAX_CHECKPOINT_P99_MILLIS,
+        "checkpoint p99 {p99:.3}ms exceeded {MAX_CHECKPOINT_P99_MILLIS:.3}ms"
+    );
+    assert!(
+        max <= MAX_CHECKPOINT_MILLIS,
+        "checkpoint max {max:.3}ms exceeded {MAX_CHECKPOINT_MILLIS:.3}ms"
+    );
+    if latencies.len() >= 200 {
+        let mut first = latencies[..100].to_vec();
+        let mut last = latencies[latencies.len() - 100..].to_vec();
+        first.sort_unstable();
+        last.sort_unstable();
+        let first_p95 = millis(percentile(&first, 95, 100));
+        let last_p95 = millis(percentile(&last, 95, 100));
+        let allowed = first_p95 * MAX_DEPTH_P95_RATIO + MAX_DEPTH_P95_ADDITIVE_MILLIS;
+        assert!(
+            last_p95 <= allowed,
+            "checkpoint depth p95 drifted from {first_p95:.3}ms to {last_p95:.3}ms; \
+             allowed {allowed:.3}ms"
+        );
+    }
+}
+
+fn assert_operation_latency_bounds(
+    latencies: &[Duration],
+    max_p99_millis: f64,
+    max_millis: f64,
+    label: &str,
+) {
+    let mut sorted = latencies.to_vec();
+    sorted.sort_unstable();
+    let p99 = millis(percentile(&sorted, 99, 100));
+    let max = millis(*sorted.last().expect("latencies must not be empty"));
+    assert!(
+        p99 <= max_p99_millis,
+        "{label} p99 {p99:.3}ms exceeded {max_p99_millis:.3}ms"
+    );
+    assert!(
+        max <= max_millis,
+        "{label} max {max:.3}ms exceeded {max_millis:.3}ms"
+    );
 }
 
 fn mean_millis(durations: &[Duration]) -> f64 {

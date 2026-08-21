@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Content-addressed storage audit: does lix store the same bytes twice?
 //!
 //! `storage_layout` answers "how many rows and bytes does each space hold".

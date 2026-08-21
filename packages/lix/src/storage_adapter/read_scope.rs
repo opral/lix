@@ -135,6 +135,11 @@ where
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_checkpoint_point_read(
+            requests.len(),
+            requests.iter().map(|request| request.keys.len()).sum(),
+        );
         #[cfg(feature = "root-replay-trace")]
         {
             traced_get_many(requests, self.read.get_many(requests))
@@ -151,6 +156,8 @@ where
         range: KeyRange,
         opts: BeginScanOptions,
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_checkpoint_scan_start();
         self.read.begin_scan(space, range, opts)
     }
 }
@@ -167,6 +174,11 @@ where
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_checkpoint_point_read(
+            requests.len(),
+            requests.iter().map(|request| request.keys.len()).sum(),
+        );
         #[cfg(feature = "root-replay-trace")]
         {
             traced_get_many(requests, self.read.get_many(requests))
@@ -183,6 +195,8 @@ where
         range: KeyRange,
         opts: BeginScanOptions,
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_checkpoint_scan_start();
         self.read.begin_scan(space, range, opts)
     }
 }

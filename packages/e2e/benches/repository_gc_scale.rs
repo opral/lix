@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 use std::time::{Duration, Instant};

@@ -23,7 +23,8 @@ mod types;
 
 pub(crate) use codec::{encode_key_ref, encode_single_string_key_ref_into};
 pub(crate) use commit_root_rebuild::{
-    load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
+    load_rebuild_plans_to_nearest_available_root,
+    load_rebuild_plans_to_nearest_available_root_bounded, stage_rebuild_plan_with_writer,
     try_stage_collapsed_rebuild_plans_with_writer,
 };
 #[cfg(test)]
@@ -79,13 +80,14 @@ pub(crate) use storage::{
     CommitDeltaReplacementScope, EnvelopeCertifiedNativeProjectionBatch,
     EnvelopeCertifiedNativeProjectionSegment, ExclusiveRowSnapshotBatch,
     OrderedAddressableCommitDeltaStage, PublishedCommitStateTopology, StagedCommitStateManifest,
-    commit_delta_contains_schema, commit_delta_member_scopes,
-    commit_history_is_deferred, direct_change_locator, load_change_record_by_id,
-    load_commit_delta_change_records,
-    load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
-    load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
-    load_commit_mutation_directory_roots, load_commit_state_manifest, load_commit_state_manifests,
-    load_exclusive_row_snapshots, load_local_selected_change_owner_commit_ids,
+    commit_delta_contains_schema, commit_delta_member_scopes, commit_history_is_deferred,
+    complete_state_fence_change_owner_commit_ids, direct_change_locator,
+    encode_commit_state_manifest_replacement_for_migration, load_change_record_by_id,
+    load_commit_delta_change_records, load_commit_delta_members_with_payloads,
+    load_commit_delta_members_with_payloads_for_schemas, load_commit_delta_replay_metadata,
+    load_commit_delta_selection_certificate, load_commit_mutation_directory_roots,
+    load_commit_state_manifest, load_commit_state_manifests, load_exclusive_row_snapshots,
+    load_local_commit_delta_members_with_payloads, load_local_selected_change_owner_commit_ids,
     load_owned_commit_delta_entries, load_owned_commit_delta_entries_one_ordered_ref,
     load_published_commit_state_topology, load_retained_commit_snapshots_for_schemas,
     scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
@@ -94,6 +96,7 @@ pub(crate) use storage::{
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_history_available,
     stage_commit_history_deferred, stage_commit_state_manifest_with_handle,
+    stage_current_state_scoped_ranges_from_complete_state_source,
     stage_current_state_scoped_ranges_from_published_parent,
     stage_current_state_scoped_ranges_from_published_topology_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
@@ -104,7 +107,7 @@ pub(crate) use storage::{
 };
 pub(crate) use storage::{
     RetainedPhysicalState, load_native_current_state_part_owners,
-    stage_retire_commit_physical_state,
+    stage_retire_commit_physical_state, stage_retire_commit_physical_state_bounded,
 };
 // Manufacturing a repository swept by the code that shipped before the
 // history-retention fix is the only caller: `session::gc` needs to delete one
@@ -142,10 +145,9 @@ pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DE
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,
     CommitStateMutationInventory, CommitStateReplayDebt, CommitStateTouchedScopeFilter,
-    MaterializedTrackedStateRow,
-    RowPkRangeBound, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
-    TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateDeltaRef,
-    TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
+    MaterializedTrackedStateRow, RowPkRangeBound, TrackedStateBaseCoordinate,
+    TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateCommitRootParent,
+    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
     row_pk_satisfies_bounds,
 };

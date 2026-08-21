@@ -261,7 +261,7 @@ impl Event {
 /// Stable URL prefix owned by the Lix Server Protocol.
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Canonical method and path registry for protocol hosts and conformance tools.
 pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
     ("GET", "/lix/v1"),
@@ -4864,6 +4864,8 @@ mod tests {
         assert!(openapi.contains(
             "required: [commitId, parentCommitIds, accountId, createdAt, selectedSourceCommitId, members]"
         ));
+        assert!(openapi.contains("required: [sourceCommitId, stateRootId]"));
+        assert!(openapi.contains("stateAlias:"));
         assert!(openapi.contains("changeAccountId: { type: string, minLength: 1 }"));
         assert!(openapi.contains("changeCreatedAt: { type: string, minLength: 1 }"));
         assert_eq!(
@@ -4877,7 +4879,7 @@ mod tests {
             assert!(openapi.contains(&format!("type: {{ const: {row_pk_type} }}")));
         }
         assert!(!openapi.contains("rowPk: {}"));
-        assert!(!openapi.contains("sourceCommitId:"));
+        assert!(openapi.contains("sourceCommitId:"));
     }
 
     #[test]
@@ -6720,7 +6722,10 @@ mod tests {
         .await;
         assert_eq!(first.status(), StatusCode::OK);
         let first = response_json(first).await;
-        assert!(first[0]["rows"][0][0]["value"].as_i64().unwrap_or(0) >= 2);
+        assert!(
+            first[0]["rows"][0][0]["value"].as_i64().unwrap_or(0) >= 2,
+            "sparse history response: {first}"
+        );
         hydration.await.expect("history hydration task");
 
         let replay = request_with_headers(

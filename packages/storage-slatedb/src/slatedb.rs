@@ -8,7 +8,7 @@ use std::fmt;
 use std::future::Future;
 use std::ops::{Bound, Range};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -1728,12 +1728,17 @@ pub struct SlateDBWrite {
     write_gate: WriteGate,
     writer_permit: Option<OwnedMutexGuard<()>>,
     preconditions: Vec<Precondition>,
+    background_maintenance: bool,
     await_durable: bool,
     base: Option<Arc<DbSnapshot>>,
     overlay: BTreeMap<Key, Option<Bytes>>,
     immutable_values: HashMap<Key, Bytes>,
     stats: WriteStats,
 }
+
+const BACKGROUND_MAINTENANCE_MAX_MUTATIONS: usize = 4_096;
+const BACKGROUND_MAINTENANCE_MAX_WRITTEN_BYTES: u64 = 4 * 1024 * 1024;
+const BACKGROUND_MAINTENANCE_MAX_PRECONDITIONS: usize = 16;
 
 /// Bounded values from immutable visible snapshots.
 ///
@@ -2599,6 +2604,7 @@ impl Storage for SlateDB {
                 write_gate: self.write_gate.clone(),
                 writer_permit: None,
                 preconditions: opts.preconditions,
+                background_maintenance: opts.background_maintenance,
                 // The engine sets this only for the atomic mutation plus
                 // idempotency-receipt commit. Its replay contract requires a
                 // durable receipt before the request can be acknowledged.
@@ -3456,7 +3462,7 @@ impl SlateDBWrite {
             return Ok(());
         }
         let wait_started = Instant::now();
-        let permit = self.write_gate.acquire().await;
+        let permit = self.write_gate.acquire(self.background_maintenance).await;
         if let Some(counters) = &self.immutable_value_store.counters {
             counters
                 .inner
@@ -3727,7 +3733,14 @@ impl StorageWrite for SlateDBWrite {
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            self.serialize_publication().await?;
+            // Foreground range deletion retains strict latest-at-publication
+            // semantics. Opportunistic repository maintenance is guarded by
+            // its own root/revision preconditions, so it may expand the range
+            // from a visible snapshot before taking the writer gate; a raced
+            // domain mutation rejects the final publication and is replanned.
+            if !self.background_maintenance {
+                self.serialize_publication().await?;
+            }
             let range = physical_range(space.id, range)?;
             let bounds = EncodedBounds::new(range.clone());
             if bounds.is_empty() {
@@ -3782,12 +3795,37 @@ impl StorageWrite for SlateDBWrite {
     fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
         async move {
             let mut this = self;
+            // Account the scale-dependent overlay before entering the
+            // serialized publication lane. Maintenance then holds the gate
+            // only for validation and atomic pipeline publication.
+            let overlay_entries = this.overlay.len();
+            let overlay_bytes = this
+                .overlay
+                .iter()
+                .map(|(key, value)| {
+                    key.0
+                        .len()
+                        .saturating_add(value.as_ref().map_or(0, Bytes::len))
+                })
+                .sum::<usize>();
+            if this.background_maintenance
+                && (overlay_entries > BACKGROUND_MAINTENANCE_MAX_MUTATIONS
+                    || this.stats.written_bytes > BACKGROUND_MAINTENANCE_MAX_WRITTEN_BYTES
+                    || this.preconditions.len() > BACKGROUND_MAINTENANCE_MAX_PRECONDITIONS)
+            {
+                return Err(StorageError::Io(format!(
+                    "background maintenance publication exceeds hard cut: {overlay_entries} mutations, {} bytes, {} preconditions",
+                    this.stats.written_bytes,
+                    this.preconditions.len(),
+                )));
+            }
             this.serialize_publication().await?;
             let Self {
                 worker,
                 write_pipeline,
                 point_cache,
                 writer_permit,
+                background_maintenance,
                 await_durable,
                 overlay,
                 stats,
@@ -3803,15 +3841,6 @@ impl StorageWrite for SlateDBWrite {
 
             worker.check_open()?;
             write_pipeline.terminal_error()?;
-            let overlay_entries = overlay.len();
-            let overlay_bytes = overlay
-                .iter()
-                .map(|(key, value)| {
-                    key.0
-                        .len()
-                        .saturating_add(value.as_ref().map_or(0, Bytes::len))
-                })
-                .sum::<usize>();
             let overlay = Arc::new(overlay);
             let completion = Arc::new(WriteCompletion::new());
             let (start_drainer, apply_backpressure) = {
@@ -3819,6 +3848,14 @@ impl StorageWrite for SlateDBWrite {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if background_maintenance
+                    && write_pipeline_should_backpressure(
+                        state.pending_entries.saturating_add(overlay_entries),
+                        state.pending_bytes.saturating_add(overlay_bytes),
+                    )
+                {
+                    return Err(StorageError::WriteConflict);
+                }
                 // A cached snapshot remains logically correct through the
                 // publication overlay, but it must not outlive that overlay
                 // after persistence. Force the next reader to fetch a current
@@ -3850,8 +3887,8 @@ impl StorageWrite for SlateDBWrite {
                 state.draining = true;
                 let apply_backpressure =
                     write_pipeline_should_backpressure(state.pending_entries, state.pending_bytes);
-                (start_drainer, apply_backpressure)
-            };
+                Ok((start_drainer, apply_backpressure))
+            }?;
 
             if start_drainer {
                 let task_pipeline = write_pipeline.clone();
@@ -4772,6 +4809,27 @@ fn object_store_error(error: object_store::Error) -> StorageError {
 #[allow(missing_debug_implementations)]
 struct WriteGate {
     state: Arc<AsyncMutex<()>>,
+    foreground_waiters: Arc<AtomicUsize>,
+    foreground_changed: Arc<Notify>,
+}
+
+struct ForegroundWaiterRegistration<'a> {
+    waiters: &'a AtomicUsize,
+    changed: &'a Notify,
+}
+
+impl<'a> ForegroundWaiterRegistration<'a> {
+    fn new(waiters: &'a AtomicUsize, changed: &'a Notify) -> Self {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        Self { waiters, changed }
+    }
+}
+
+impl Drop for ForegroundWaiterRegistration<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+        self.changed.notify_waiters();
+    }
 }
 
 impl WriteGate {
@@ -4779,8 +4837,33 @@ impl WriteGate {
         Self::default()
     }
 
-    async fn acquire(&self) -> OwnedMutexGuard<()> {
-        Arc::clone(&self.state).lock_owned().await
+    async fn acquire(&self, background_maintenance: bool) -> OwnedMutexGuard<()> {
+        if !background_maintenance {
+            let registration = ForegroundWaiterRegistration::new(
+                &self.foreground_waiters,
+                &self.foreground_changed,
+            );
+            let permit = Arc::clone(&self.state).lock_owned().await;
+            drop(registration);
+            return permit;
+        }
+        loop {
+            while self.foreground_waiters.load(Ordering::Acquire) != 0 {
+                let changed = self.foreground_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.foreground_waiters.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                changed.await;
+            }
+            let permit = Arc::clone(&self.state).lock_owned().await;
+            if self.foreground_waiters.load(Ordering::Acquire) == 0 {
+                return permit;
+            }
+            drop(permit);
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -4790,6 +4873,92 @@ mod tests {
 
     const TEST_IMMUTABLE_SPACE: StorageSpace =
         StorageSpace::immutable(SpaceId(0x00ff_0001), "test.immutable");
+
+    #[tokio::test]
+    async fn foreground_writer_overtakes_queued_background_maintenance() {
+        let gate = Arc::new(WriteGate::new());
+        let initial = gate.acquire(false).await;
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let background_gate = Arc::clone(&gate);
+        let background_tx = order_tx.clone();
+        let background = tokio::spawn(async move {
+            let _permit = background_gate.acquire(true).await;
+            background_tx.send("background").expect("receiver is open");
+        });
+        tokio::task::yield_now().await;
+
+        let foreground_gate = Arc::clone(&gate);
+        let foreground = tokio::spawn(async move {
+            let _permit = foreground_gate.acquire(false).await;
+            order_tx.send("foreground").expect("receiver is open");
+        });
+        tokio::task::yield_now().await;
+        drop(initial);
+
+        assert_eq!(order_rx.recv().await, Some("foreground"));
+        foreground.await.expect("foreground task succeeds");
+        assert_eq!(order_rx.recv().await, Some("background"));
+        background.await.expect("background task succeeds");
+    }
+
+    #[tokio::test]
+    async fn cancelled_foreground_waiter_does_not_starve_background_maintenance() {
+        let gate = Arc::new(WriteGate::new());
+        let initial = gate.acquire(false).await;
+        let foreground_gate = Arc::clone(&gate);
+        let foreground = tokio::spawn(async move {
+            let _permit = foreground_gate.acquire(false).await;
+        });
+        while gate.foreground_waiters.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        foreground.abort();
+        let _ = foreground.await;
+        assert_eq!(gate.foreground_waiters.load(Ordering::Acquire), 0);
+        drop(initial);
+
+        tokio::time::timeout(Duration::from_secs(1), gate.acquire(true))
+            .await
+            .expect("cancelled foreground waiter must wake background maintenance");
+    }
+
+    #[tokio::test]
+    async fn oversized_background_maintenance_is_rejected_before_the_writer_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = SlateDB::open(directory.path()).unwrap();
+        let gate = storage.write_gate.acquire(false).await;
+        let mut write = storage
+            .begin_write(WriteOptions {
+                background_maintenance: true,
+                ..WriteOptions::default()
+            })
+            .await
+            .unwrap();
+        let entries = (0..=BACKGROUND_MAINTENANCE_MAX_MUTATIONS)
+            .map(|index| PutEntry {
+                key: Key(Bytes::copy_from_slice(&index.to_be_bytes())),
+                value: StoredValue {
+                    bytes: Bytes::from_static(b"value"),
+                },
+            })
+            .collect();
+        write
+            .put_many(
+                StorageSpace::mutable(SpaceId(0x00ff_0002), "test.maintenance-cap"),
+                PutBatch { entries },
+            )
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), write.commit())
+            .await
+            .expect("hard-cut rejection must not wait for the occupied writer gate")
+            .expect_err("oversized maintenance must be rejected");
+        assert!(matches!(error, StorageError::Io(message) if message.contains("hard cut")));
+        drop(gate);
+    }
+
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
     use lix::storage::{

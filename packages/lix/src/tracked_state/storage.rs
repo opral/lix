@@ -31,10 +31,9 @@ use crate::storage_adapter::{
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
     TrackedStateKeyBatchBuilder, TrackedStateMutationBatchBuilder, decode_key, decode_key_shared,
-    decode_node_ref, decode_row_pk_shared_with_trusted_prefix,
-    decode_value, encode_key_ref, encode_key_ref_into, encode_leaf_node_refs,
-    encode_schema_file_prefix, encode_schema_key_prefix, encode_single_string_key_ref_into,
-    encode_value_ref,
+    decode_node_ref, decode_row_pk_shared_with_trusted_prefix, decode_value, encode_key_ref,
+    encode_key_ref_into, encode_leaf_node_refs, encode_schema_file_prefix,
+    encode_schema_key_prefix, encode_single_string_key_ref_into, encode_value_ref,
 };
 use crate::tracked_state::types::{
     ColumnarPageSource, CommitStateManifest, CommitStateMutationInventory, CommitStateMutationPart,
@@ -3397,6 +3396,38 @@ impl DecodedCommitDeltaBatchBuilder {
         Ok(())
     }
 
+    fn push_owned_row(
+        &mut self,
+        key: TrackedStateKey,
+        value: TrackedStateIndexValue,
+    ) -> Result<(), LixError> {
+        let schema_key_ordinal = self.schema_keys.intern(SharedStr::from(key.schema_key))?;
+        let file_id_ordinal = key.file_id.map_or(Ok(u32::MAX), |file_id| {
+            self.file_ids.intern(SharedStr::from(file_id))
+        })?;
+        let start = self.columnar_keys.len();
+        encode_key_ref_into(
+            &mut self.columnar_keys,
+            TrackedStateKeyRef {
+                schema_key: self.schema_keys.values[schema_key_ordinal as usize].as_str(),
+                file_id: (file_id_ordinal != u32::MAX)
+                    .then(|| self.file_ids.values[file_id_ordinal as usize].as_str()),
+                row_pk: &key.row_pk,
+            },
+        );
+        let columnar_key = BufferRange::new(start, self.columnar_keys.len() - start);
+        self.rows.push(DecodedCommitDeltaRow {
+            arena_ordinal: u32::MAX,
+            entry_ordinal: 0,
+            columnar_key: Some(columnar_key),
+            schema_key_ordinal,
+            file_id_ordinal,
+            row_pk: key.row_pk,
+        });
+        self.values.push(value);
+        Ok(())
+    }
+
     fn finish(self) -> DecodedCommitDeltaBatch {
         DecodedCommitDeltaBatch {
             arenas: self.arenas,
@@ -3542,6 +3573,15 @@ impl PublishedCommitStateTopology {
         self.header.current_state_scoped_ranges.as_deref()
     }
 
+    pub(crate) fn complete_state_source_commit_id(&self) -> Option<CommitId> {
+        self.header
+            .snapshot_root
+            .as_ref()
+            .filter(|root| root.complete_state_fence)
+            .and_then(|root| root.parent_roots.first())
+            .map(|source| source.commit_id)
+    }
+
     fn topology_ref(&self) -> super::scoped_current_state::CommitStateTopologyRef<'_> {
         super::scoped_current_state::CommitStateTopologyRef {
             commit_id: self.header.commit_id,
@@ -3647,6 +3687,42 @@ pub(crate) async fn stage_current_state_scoped_ranges_from_topology(
         &parents,
         selected_source,
         serving_base,
+        commit_id,
+        account_id,
+        inventory,
+    )
+    .await
+}
+
+/// Attests an unchanged current-state directory against a complete-state
+/// checkpoint's physical source while keeping semantic graph parents separate.
+pub(crate) async fn stage_current_state_scoped_ranges_from_complete_state_source(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    graph_parents: &[CertifiedCommitStateTopologyParent<'_>],
+    source: CertifiedCommitStateTopologyParent<'_>,
+    commit_id: CommitId,
+    account_id: &str,
+    inventory: &CommitStateMutationInventory,
+) -> Result<super::scoped_current_state::CertifiedCommitStatePhysicalPublication, LixError> {
+    let mut parents = graph_parents
+        .iter()
+        .copied()
+        .map(|parent| parent.topology(writes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let source = source.topology(writes)?;
+    if parents
+        .iter()
+        .all(|parent| parent.commit_id != source.commit_id)
+    {
+        parents.push(source);
+    }
+    super::scoped_current_state::stage_current_state_scoped_ranges_from_topology_refs(
+        store,
+        writes,
+        &parents,
+        None,
+        Some(source),
         commit_id,
         account_id,
         inventory,
@@ -9078,6 +9154,33 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
     )
 }
 
+/// Loads only the mutations physically authored by one commit, without
+/// expanding a complete-state checkpoint fence into its logical net diff.
+/// Sync uses this together with an authenticated state alias so a checkpoint
+/// remains a bounded wire item.
+pub(crate) async fn load_local_commit_delta_members_with_payloads(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Vec<CommitDeltaMember>, LixError> {
+    let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
+        if commit_history_is_deferred(store, commit_id).await? {
+            return Err(sync_history_required(commit_id));
+        }
+        return Ok(Vec::new());
+    };
+    let (local, _) = load_authenticated_local_commit_delta_members_for_schemas(
+        store,
+        &state,
+        &[],
+        &[],
+        usize::MAX,
+        true,
+    )
+    .await?
+    .expect("unbounded local commit-delta scan cannot exceed its segment limit");
+    Ok(local)
+}
+
 /// Loads tracked members and payloads for only the requested schemas.
 ///
 /// Segment bounds route around unrelated schema ranges before payload-sidecar
@@ -9090,6 +9193,109 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
     file_ids: &[String],
     max_segment_count: usize,
 ) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
+    if let Some(mut diff) =
+        complete_state_fence_tree_diff(store, commit_id, schema_keys, false).await?
+    {
+        // Collection-generation deletes synthesize physical tombstones for
+        // every retired row, but only the generation marker is a logical
+        // commit member with a payload. Keep checkpoint wire/history deltas
+        // aligned with the ordinary tree-diff path by suppressing those
+        // derived tombstones before owner hydration.
+        let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+        reader
+            .suppress_collection_generation_cascade_tombstones(&mut diff)
+            .await?;
+        if max_segment_count == 0 && diff.len() != 0 {
+            return Ok(None);
+        }
+        let rows = diff
+            .checkpoint_delta_rows()
+            .filter(|row| {
+                file_ids.is_empty()
+                    || row
+                        .file_id()
+                        .is_some_and(|file_id| file_ids.iter().any(|filter| filter == file_id))
+            })
+            .map(|row| {
+                (
+                    TrackedStateKey {
+                        schema_key: row.schema_key().to_owned(),
+                        file_id: row.file_id().map(str::to_owned),
+                        row_pk: row.row_pk().clone(),
+                    },
+                    row.value().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let owner_requests = rows
+            .iter()
+            .map(|(key, value)| (value.commit_id, key.clone()))
+            .collect::<Vec<_>>();
+        let mut owners = load_owned_commit_delta_entries(store, &owner_requests).await?;
+        // File deletion also synthesizes one tombstone per file-scoped row.
+        // Those rows are physically owned by the descriptor deletion rather
+        // than by an exact commit-delta identity, so route missing deleted
+        // members through the same descriptor authority as ordinary history.
+        let fallback_requests = rows
+            .iter()
+            .zip(&owners)
+            .filter_map(|((key, value), owner)| {
+                (owner.is_none() && value.deleted)
+                    .then(|| key.file_id.as_deref())
+                    .flatten()
+                    .map(|file_id| (value.commit_id, cascade_payload_key(file_id)))
+            })
+            .collect::<Vec<_>>();
+        if !fallback_requests.is_empty() {
+            let mut fallbacks = load_owned_commit_delta_entries(store, &fallback_requests)
+                .await?
+                .into_iter();
+            for ((key, value), owner) in rows.iter().zip(&mut owners) {
+                if owner.is_none() && value.deleted && key.file_id.is_some() {
+                    *owner = fallbacks.next().unwrap_or(None);
+                }
+            }
+        }
+        return rows
+            .into_iter()
+            .zip(owners)
+            .enumerate()
+            .map(|(ordinal, ((key, mut value), owner))| {
+                let owner = owner.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "complete-state checkpoint member '{}' lost physical owner '{}'",
+                            value.change_id, value.commit_id
+                        ),
+                    )
+                })?;
+                if owner.value.change_id != value.change_id {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "complete-state checkpoint member disagrees with physical owner",
+                    ));
+                }
+                value.commit_id = commit_id;
+                Ok(CommitDeltaMember {
+                    key,
+                    selected_tombstone: value.deleted,
+                    value,
+                    change: owner.change_record,
+                    segment_index: 0,
+                    ordinal: u32::try_from(ordinal).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "complete-state checkpoint delta exceeds u32 rows",
+                        )
+                    })?,
+                    authored: false,
+                    base_coordinate: None,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some);
+    }
     let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
         if commit_history_is_deferred(store, commit_id).await? {
             return Err(sync_history_required(commit_id));
@@ -9716,6 +9922,119 @@ fn validate_exclusive_direct_change_id(
         ));
     }
     Ok(())
+}
+
+fn cascade_payload_key(file_id: &str) -> TrackedStateKey {
+    TrackedStateKey {
+        schema_key: "lix_file_descriptor".to_owned(),
+        file_id: Some(file_id.to_owned()),
+        row_pk: RowPk::uuid_from_canonical(file_id).unwrap_or_else(|_| RowPk::single(file_id)),
+    }
+}
+
+async fn complete_state_fence_delta_batch(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+) -> Result<Option<DecodedCommitDeltaBatch>, LixError> {
+    let Some(diff) = complete_state_fence_tree_diff(store, commit_id, schema_keys, false).await?
+    else {
+        return Ok(None);
+    };
+    let mut output = DecodedCommitDeltaBatchBuilder::with_capacity(diff.len(), 0);
+    for row in diff.checkpoint_delta_rows() {
+        let mut value = row.value().clone();
+        value.commit_id = commit_id;
+        output.push_owned_row(
+            TrackedStateKey {
+                schema_key: row.schema_key().to_owned(),
+                file_id: row.file_id().map(str::to_owned),
+                row_pk: row.row_pk().clone(),
+            },
+            value,
+        )?;
+    }
+    Ok(Some(output.finish()))
+}
+
+pub(crate) async fn complete_state_fence_change_owner_commit_ids(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<BTreeSet<CommitId>>, LixError> {
+    Ok(complete_state_fence_tree_diff(store, commit_id, &[], true)
+        .await?
+        .map(|diff| {
+            diff.checkpoint_delta_rows()
+                .map(|row| row.commit_id())
+                .collect()
+        }))
+}
+
+async fn complete_state_fence_tree_diff(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+    missing_parent_is_absent: bool,
+) -> Result<Option<super::diff::TrackedStateTreeDiffBatch>, LixError> {
+    let Some(manifest) = load_commit_state_manifest(store, commit_id).await? else {
+        return Ok(None);
+    };
+    let Some(root) = manifest
+        .snapshot_root
+        .as_ref()
+        .filter(|root| root.complete_state_fence)
+    else {
+        return Ok(None);
+    };
+    if root.parent_roots.is_empty() {
+        return Ok(None);
+    }
+    let record = ChangelogContext::new()
+        .reader(store)
+        .load_commits(CommitLoadRequest {
+            commit_ids: &[commit_id],
+        })
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|(_, record)| record)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("complete-state checkpoint '{commit_id}' has no commit record"),
+            )
+        })?;
+    let parent_commit_id = record.parent_commit_ids.first().copied().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("complete-state checkpoint '{commit_id}' has no prior checkpoint parent"),
+        )
+    })?;
+    let parent = load_snapshot_commit_root(store, &parent_commit_id.to_string()).await?;
+    let Some(parent) = parent else {
+        if missing_parent_is_absent {
+            return Ok(None);
+        }
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "complete-state checkpoint '{commit_id}' has no materialized parent root '{parent_commit_id}'"
+            ),
+        ));
+    };
+    let diff = super::tree::TrackedStateTree::new()
+        .diff(
+            &store,
+            Some(&parent.root_id),
+            Some(&root.root_id),
+            &TrackedStateTreeScanRequest {
+                schema_keys: schema_keys.to_vec(),
+                include_tombstones: true,
+                ..TrackedStateTreeScanRequest::default()
+            },
+        )
+        .await?;
+    Ok(Some(diff))
 }
 
 /// Resolves the immutable owners of finite selected members in one commit.
@@ -11286,6 +11605,9 @@ pub(crate) async fn scan_commit_delta_values(
     commit_id: CommitId,
     schema_keys: &[String],
 ) -> Result<DecodedCommitDeltaBatch, LixError> {
+    if let Some(batch) = complete_state_fence_delta_batch(store, commit_id, schema_keys).await? {
+        return Ok(batch);
+    }
     let state = {
         #[cfg(feature = "storage-benches")]
         let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(
@@ -12637,7 +12959,8 @@ async fn stage_reclaim_retired_change_locators(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     commit_id: CommitId,
-) -> Result<(), LixError> {
+    max_deletes: Option<usize>,
+) -> Result<bool, LixError> {
     let change_ids = scan_commit_delta_members(store, commit_id)
         .await?
         .into_iter()
@@ -12646,7 +12969,7 @@ async fn stage_reclaim_retired_change_locators(
         .into_iter()
         .collect::<Vec<_>>();
     if change_ids.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     let locator_keys = change_ids
         .iter()
@@ -12664,10 +12987,14 @@ async fn stage_reclaim_retired_change_locators(
             reclaimed.push(change_id.as_uuid().as_bytes().to_vec());
         }
     }
+    let complete = max_deletes.is_none_or(|limit| reclaimed.len() <= limit);
+    if let Some(limit) = max_deletes {
+        reclaimed.truncate(limit);
+    }
     if !reclaimed.is_empty() {
         writes.delete_batch(TRACKED_STATE_CHANGE_LOCATOR_SPACE, reclaimed);
     }
-    Ok(())
+    Ok(complete)
 }
 
 /// Collects the out-of-band JSON payload refs one commit's own packed delta
@@ -12697,6 +13024,159 @@ pub(crate) async fn stage_retire_commit_physical_state(
     commit_id: CommitId,
     retained: RetainedPhysicalState<'_>,
 ) -> Result<(), LixError> {
+    if !stage_retire_commit_physical_state_bounded(store, writes, commit_id, retained, None).await?
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "unbounded commit retirement was unexpectedly incomplete",
+        ));
+    }
+    Ok(())
+}
+
+fn retirement_marker_key(commit_id: CommitId) -> StorageKey {
+    let mut bytes = commit_id.as_uuid().as_bytes().to_vec();
+    bytes.push(0xff);
+    StorageKey(Bytes::from(bytes))
+}
+
+fn retirement_intent_key(
+    commit_id: CommitId,
+    space: StorageSpace,
+    target: &StorageKey,
+) -> StorageKey {
+    let mut bytes = Vec::with_capacity(21 + target.0.len());
+    bytes.extend_from_slice(commit_id.as_uuid().as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&space.id.0.to_be_bytes());
+    bytes.extend_from_slice(&target.0);
+    StorageKey(Bytes::from(bytes))
+}
+
+fn decode_retirement_intent(key: &StorageKey) -> Result<(StorageSpace, StorageKey), LixError> {
+    if key.0.len() < 21 || key.0[16] != 0 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "commit-retirement intent key is malformed",
+        ));
+    }
+    let id = StorageSpaceId(u32::from_be_bytes(
+        key.0[17..21]
+            .try_into()
+            .expect("retirement intent space-id width checked"),
+    ));
+    let space = crate::storage_spaces::ALL_STORAGE_SPACES
+        .iter()
+        .copied()
+        .find(|space| space.id == id)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "commit-retirement intent names an unknown storage space",
+            )
+        })?;
+    Ok((space, StorageKey(key.0.slice(21..))))
+}
+
+async fn load_retirement_cursor_rows(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Vec<StorageKey>, LixError> {
+    let prefix = commit_id.as_uuid().as_bytes();
+    Ok(
+        scan_full_space(store, crate::gc::COMMIT_RETIREMENT_INTENT_SPACE)
+            .await?
+            .into_iter()
+            .filter_map(|(key, _)| key.0.starts_with(prefix).then_some(key))
+            .collect(),
+    )
+}
+
+fn stage_final_retirement_authority(writes: &mut StorageWriteSet, commit_id: CommitId) {
+    writes.delete(
+        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        key(commit_state_manifest_key(commit_id)),
+    );
+    writes.delete(
+        TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+        key(commit_mutation_inventory_key(commit_id)),
+    );
+}
+
+fn retirement_target_is_retained(
+    space: StorageSpace,
+    target: &StorageKey,
+    retained: RetainedPhysicalState<'_>,
+) -> Result<bool, LixError> {
+    let retained_set = if space.id == crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE.id {
+        Some(retained.mutation_nodes)
+    } else if space.id == crate::tracked_state::SCOPED_RANGE_NODE_SPACE.id {
+        Some(retained.scoped_nodes)
+    } else if space.id == crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE.id {
+        Some(retained.native_parts)
+    } else {
+        None
+    };
+    let Some(retained_set) = retained_set else {
+        return Ok(false);
+    };
+    let digest: [u8; 32] = target.0.as_ref().try_into().map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "commit-retirement intent has a malformed content-addressed target",
+        )
+    })?;
+    Ok(retained_set.contains(&digest))
+}
+
+/// Stages a resumable retirement slice. Locator rows are the only
+/// per-authored-row physical plane; drain them first while all immutable delta
+/// segments remain readable. Once they fit, the compact manifest/tree
+/// authority retirement is staged atomically as before.
+pub(crate) async fn stage_retire_commit_physical_state_bounded(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    retained: RetainedPhysicalState<'_>,
+    max_mutations: Option<usize>,
+) -> Result<bool, LixError> {
+    let cursor_rows = load_retirement_cursor_rows(store, commit_id).await?;
+    let marker_key = retirement_marker_key(commit_id);
+    if cursor_rows.iter().any(|key| key == &marker_key) {
+        let intents = cursor_rows
+            .into_iter()
+            .filter(|key| key != &marker_key)
+            .collect::<Vec<_>>();
+        let limit = max_mutations.unwrap_or(usize::MAX);
+        let final_mutations = 3usize;
+        let can_finish = intents
+            .len()
+            .saturating_mul(2)
+            .saturating_add(final_mutations)
+            <= limit;
+        let take = if can_finish {
+            intents.len()
+        } else {
+            (limit / 2).min(intents.len())
+        };
+        for intent_key in intents.iter().take(take) {
+            let (space, target) = decode_retirement_intent(intent_key)?;
+            if !retirement_target_is_retained(space, &target, retained)? {
+                writes.delete(space, target);
+            }
+            writes.delete(
+                crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
+                intent_key.clone(),
+            );
+        }
+        if !can_finish {
+            return Ok(false);
+        }
+        stage_final_retirement_authority(writes, commit_id);
+        writes.delete(crate::gc::COMMIT_RETIREMENT_INTENT_SPACE, marker_key);
+        return Ok(true);
+    }
+
     let manifest = load_commit_state_manifest(store, commit_id)
         .await?
         .ok_or_else(|| {
@@ -12705,7 +13185,7 @@ pub(crate) async fn stage_retire_commit_physical_state(
                 format!("retired GC root '{commit_id}' has no authenticated manifest"),
             )
         })?;
-    stage_reclaim_retired_change_locators(store, writes, commit_id).await?;
+    let mut compact_retirement = StorageWriteSet::new();
     let retired_root = load_commit_mutation_directory_roots(store, &[commit_id])
         .await?
         .into_iter()
@@ -12714,7 +13194,7 @@ pub(crate) async fn stage_retire_commit_physical_state(
     if let Some(root) = retired_root {
         let nodes = crate::tracked_state::collect_mutation_directory_node_ids(store, &root).await?;
         for node_id in nodes.difference(retained.mutation_nodes) {
-            writes.delete(
+            compact_retirement.delete(
                 crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
                 key(node_id.to_vec()),
             );
@@ -12727,7 +13207,7 @@ pub(crate) async fn stage_retire_commit_physical_state(
         )
         .await?;
         for node_id in reachable.node_ids.difference(retained.scoped_nodes) {
-            writes.delete(
+            compact_retirement.delete(
                 crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
                 key(node_id.to_vec()),
             );
@@ -12738,14 +13218,101 @@ pub(crate) async fn stage_retire_commit_physical_state(
             if let CurrentStatePartSource::NativeDataPart = descriptor.source
                 && !retained.native_parts.contains(&descriptor.content_digest)
             {
-                writes.delete(
+                compact_retirement.delete(
                     crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
                     key(descriptor.content_digest.to_vec()),
                 );
             }
         }
     }
-    stage_delete_commit_state_manifest_for_gc(store, writes, commit_id, &manifest).await
+    stage_delete_commit_state_manifest_for_gc(store, &mut compact_retirement, commit_id, &manifest)
+        .await?;
+    let compact_deletes = compact_retirement.into_point_deletes();
+    let compact_mutations = compact_deletes.len();
+    let locator_budget = max_mutations.map(|limit| {
+        if compact_mutations <= limit {
+            limit - compact_mutations
+        } else {
+            // Drain the scalable plane first. A compact remainder larger than
+            // adapter admission is a layout-invariant violation, but existing
+            // locator rows can still make bounded progress before it is
+            // reported on the following pass.
+            limit
+        }
+    });
+    let mut locator_writes = StorageWriteSet::new();
+    let locators_complete = stage_reclaim_retired_change_locators(
+        store,
+        &mut locator_writes,
+        commit_id,
+        locator_budget,
+    )
+    .await?;
+    let locator_mutations =
+        usize::try_from(locator_writes.stats().staged_deletes).unwrap_or(usize::MAX);
+    writes.extend(locator_writes);
+    if !locators_complete {
+        return Ok(false);
+    }
+    let remaining = max_mutations
+        .unwrap_or(usize::MAX)
+        .saturating_sub(locator_mutations);
+    if cursor_rows.is_empty() && compact_mutations <= remaining {
+        for (space, target) in compact_deletes {
+            writes.delete(space, target);
+        }
+        return Ok(true);
+    }
+
+    let desired = compact_deletes
+        .into_iter()
+        .filter(|(space, _)| {
+            space.id != TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id
+                && space.id != TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id
+        })
+        .map(|(space, target)| retirement_intent_key(commit_id, space, &target))
+        .collect::<BTreeSet<_>>();
+    let mut remaining = remaining;
+    let mut existing = cursor_rows.into_iter().collect::<BTreeSet<_>>();
+    let stale = existing.difference(&desired).cloned().collect::<Vec<_>>();
+    let stale_take = remaining.min(stale.len());
+    for intent_key in stale.iter().take(stale_take) {
+        writes.delete(
+            crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
+            intent_key.clone(),
+        );
+        existing.remove(intent_key);
+    }
+    remaining -= stale_take;
+    if stale_take < stale.len() {
+        return Ok(false);
+    }
+    let missing = desired.difference(&existing).cloned().collect::<Vec<_>>();
+    let can_seal = missing.len().saturating_add(1) <= remaining;
+    let take = if can_seal {
+        missing.len()
+    } else {
+        remaining.min(missing.len())
+    };
+    for intent_key in missing.into_iter().take(take) {
+        writes.put(
+            crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
+            intent_key,
+            StorageValue {
+                bytes: Bytes::new(),
+            },
+        );
+    }
+    if can_seal {
+        writes.put(
+            crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
+            marker_key,
+            StorageValue {
+                bytes: Bytes::new(),
+            },
+        );
+    }
+    Ok(false)
 }
 
 /// Loads the owning commit ids of every native current-state data part named by
@@ -13187,7 +13754,6 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
     // whose only contribution is topology. Its canonical empty mutation
     // inventory is a valid delta with no physical segment to read.
     if manifest.member_count == 0
-        && manifest.selected_source_commit_id.is_none()
         && manifest.direct_segment_row_counts.is_empty()
         && manifest.single_partition.is_none()
         && manifest.lifecycle_summary.is_none()
@@ -15000,6 +15566,27 @@ fn encode_commit_state_manifest(
     })
 }
 
+/// Encodes the two immutable authority rows replaced only by an offline
+/// repository-format migration. Normal publications must use the certified
+/// staging APIs and never rewrite an existing commit authority.
+pub(crate) fn encode_commit_state_manifest_replacement_for_migration(
+    manifest: &CommitStateManifest,
+) -> Result<[(StorageSpace, Vec<u8>, Vec<u8>); 2], LixError> {
+    let encoded = encode_commit_state_manifest(manifest)?;
+    Ok([
+        (
+            TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            commit_state_manifest_key(manifest.commit_id),
+            encoded.header,
+        ),
+        (
+            TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+            commit_mutation_inventory_key(manifest.commit_id),
+            encoded.mutation_inventory,
+        ),
+    ])
+}
+
 fn stored_commit_mutation_inventory(
     inventory: &CommitStateMutationInventory,
 ) -> Result<
@@ -15456,11 +16043,11 @@ fn validate_commit_state_manifest_header(
     if stored
         .snapshot_root
         .as_ref()
-        .is_some_and(|root| root.complete_state_fence && !root.parent_roots.is_empty())
+        .is_some_and(|root| !complete_state_fence_source_is_valid(root))
     {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "tracked_state complete-state fence retains physical parent roots",
+            "tracked_state complete-state fence has invalid physical source ancestry",
         ));
     }
     super::scoped_current_state::validate_touched_scope_filter(&stored.touched_scope_filter)?;
@@ -15547,10 +16134,10 @@ fn validate_commit_state_manifest_inner(
                 "tracked_state rootless commit_state_manifest cannot publish a snapshot root",
             ));
         }
-        if root.complete_state_fence && !root.parent_roots.is_empty() {
+        if !complete_state_fence_source_is_valid(root) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "tracked_state complete-state fence retains physical parent roots",
+                "tracked_state complete-state fence has invalid physical source ancestry",
             ));
         }
     }
@@ -15558,6 +16145,17 @@ fn validate_commit_state_manifest_inner(
     validate_commit_state_mutation_inventory(manifest.commit_id, &manifest.mutations)?;
     super::scoped_current_state::validate_touched_scope_filter(&manifest.touched_scope_filter)?;
     validate_current_state_scoped_ranges(manifest, validate_scoped_range_attestation)
+}
+
+fn complete_state_fence_source_is_valid(root: &TrackedStateCommitRoot) -> bool {
+    if !root.complete_state_fence {
+        return true;
+    }
+    match root.parent_roots.as_slice() {
+        [] => true,
+        [source] => source.commit_id != root.commit_id && source.root_id == root.root_id,
+        _ => false,
+    }
 }
 
 fn validate_current_state_scoped_ranges(
@@ -15808,7 +16406,7 @@ fn validate_compact_replacement_inventory(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};
@@ -15821,8 +16419,8 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::row_pk::RowPk;
     use crate::storage_adapter::{
-        Memory, StorageAdapter, StorageReadOptions, StorageSpace, StorageWriteOptions,
-        StorageWriteSet,
+        Memory, PointReadPlan, StorageAdapter, StorageGetOptions, StorageKey, StorageReadOptions,
+        StorageSpace, StorageWriteOptions, StorageWriteSet,
     };
     use crate::storage_codec;
     use crate::tracked_state::codec::{
@@ -15859,6 +16457,125 @@ mod tests {
         stage_fragmented_scoped_current_state_descriptor,
         try_encode_commit_delta_segment_with_payloads, validate_unique_exclusive_change_id, value,
     };
+
+    #[tokio::test]
+    async fn wide_commit_retirement_cursor_drains_non_locator_children_in_bounded_slices() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("wide-retirement-cursor");
+        let mut seed = storage.new_write_set();
+        let mut retained_digest = [0_u8; 32];
+        for index in 0..2_500_u32 {
+            let mut digest = [0_u8; 32];
+            digest[28..].copy_from_slice(&index.to_be_bytes());
+            if index == 0 {
+                retained_digest = digest;
+                seed.put(
+                    crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+                    StorageKey(Bytes::copy_from_slice(&digest)),
+                    &b"live-shared-node"[..],
+                );
+            }
+            let target = StorageKey(Bytes::copy_from_slice(&digest));
+            seed.put(
+                crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
+                super::retirement_intent_key(
+                    commit_id,
+                    crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+                    &target,
+                ),
+                &b""[..],
+            );
+        }
+        seed.put(
+            crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
+            super::retirement_marker_key(commit_id),
+            &b""[..],
+        );
+        storage
+            .commit_write_set(seed, StorageWriteOptions::default())
+            .await
+            .expect("wide retirement cursor should seed");
+
+        let empty = BTreeSet::new();
+        let retained_mutation_nodes = BTreeSet::from([retained_digest]);
+        let retained = super::RetainedPhysicalState {
+            mutation_nodes: &retained_mutation_nodes,
+            scoped_nodes: &empty,
+            native_parts: &empty,
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("first cursor read should open");
+        let mut first = storage.new_write_set();
+        assert!(
+            !super::stage_retire_commit_physical_state_bounded(
+                &read,
+                &mut first,
+                commit_id,
+                retained,
+                Some(4_000),
+            )
+            .await
+            .expect("first cursor slice should stage")
+        );
+        assert!(first.stats().staged_puts + first.stats().staged_deletes <= 4_000);
+        drop(read);
+        storage
+            .commit_write_set(
+                first,
+                StorageWriteOptions {
+                    background_maintenance: true,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("first cursor slice should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("final cursor read should open");
+        let mut final_slice = storage.new_write_set();
+        assert!(
+            super::stage_retire_commit_physical_state_bounded(
+                &read,
+                &mut final_slice,
+                commit_id,
+                retained,
+                Some(4_000),
+            )
+            .await
+            .expect("final cursor slice should stage")
+        );
+        assert_eq!(
+            final_slice.stats().staged_puts + final_slice.stats().staged_deletes,
+            1_003
+        );
+        drop(read);
+        storage
+            .commit_write_set(
+                final_slice,
+                StorageWriteOptions {
+                    background_maintenance: true,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("final cursor slice should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("retained-node read should open");
+        let loaded = PointReadPlan::new(
+            crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+            &[StorageKey(Bytes::copy_from_slice(&retained_digest))],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("retained node should load");
+        assert!(loaded.value[0].is_some(), "newly live shared node survives");
+    }
 
     #[tokio::test]
     async fn deferred_commit_history_is_not_reported_as_an_empty_commit() {
@@ -15990,11 +16707,11 @@ mod tests {
                 snapshot: typed.durable_payload_ref().expect("typed snapshot encodes"),
             },
         ];
-        let encoded = crate::tracked_state::replacement_part::encode_replacement_part_with_compressor(
-            &rows,
-            &mut None,
-        )
-        .expect("native replacement part should encode");
+        let encoded =
+            crate::tracked_state::replacement_part::encode_replacement_part_with_compressor(
+                &rows, &mut None,
+            )
+            .expect("native replacement part should encode");
         let prepared = crate::tracked_state::replacement_part::decode_native_replacement_part(
             encoded.digest(),
             encoded.bytes().clone(),

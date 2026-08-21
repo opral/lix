@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Commit-root replay scope and cost attribution (experiment AA).
 //!
 //! Tracked-state root materialization is bursty: ordinary commits are

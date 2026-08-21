@@ -108,8 +108,11 @@ pub const UPLOAD_MANIFEST_LEAF_SPACE: StorageSpace = crate::session::UPLOAD_MANI
 pub const SYNC_SEQUENCE_SPACE: StorageSpace = crate::sync::SYNC_SEQUENCE_SPACE;
 pub const SYNC_REPOSITORY_EVENT_SPACE: StorageSpace = crate::sync::SYNC_REPOSITORY_EVENT_SPACE;
 pub const SYNC_REPLICA_STATE_SPACE: StorageSpace = crate::sync::SYNC_REPLICA_STATE_SPACE;
+pub const SYNC_MATERIALIZED_STATE_ALIAS_SPACE: StorageSpace =
+    crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE;
 pub const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = crate::gc::CHECKPOINT_RECOVERY_REF_SPACE;
 pub const CHECKPOINT_GC_STATE_SPACE: StorageSpace = crate::gc::CHECKPOINT_GC_STATE_SPACE;
+pub const COMMIT_RETIREMENT_INTENT_SPACE: StorageSpace = crate::gc::COMMIT_RETIREMENT_INTENT_SPACE;
 
 #[cfg(test)]
 mod tests {
@@ -159,8 +162,10 @@ mod tests {
         SYNC_SEQUENCE_SPACE,
         SYNC_REPOSITORY_EVENT_SPACE,
         SYNC_REPLICA_STATE_SPACE,
+        SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
         CHECKPOINT_RECOVERY_REF_SPACE,
         CHECKPOINT_GC_STATE_SPACE,
+        COMMIT_RETIREMENT_INTENT_SPACE,
     ];
 
     /// The published handles must be the registry, exactly and in order.

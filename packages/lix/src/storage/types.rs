@@ -648,6 +648,10 @@ pub struct WriteOptions {
     /// from the complete canonical write set so backends with contiguous batch
     /// encodings can allocate their large buffer once.
     pub batch_capacity_hint_bytes: usize,
+    /// Marks opportunistic repository maintenance so single-writer adapters
+    /// can yield admission to foreground publications. Correctness must not
+    /// depend on this hint; both lanes remain atomically serialized.
+    pub background_maintenance: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

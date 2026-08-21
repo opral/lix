@@ -1,7 +1,7 @@
 use crate::LixError;
 use crate::gc::{
-    RepositoryGcPlan, load_checkpoint_gc_state, stage_checkpoint_gc_state,
-    stage_repository_gc_with_preconditions,
+    RepositoryGcPlan, load_checkpoint_gc_state, load_checkpoint_gc_state_with_precondition,
+    stage_checkpoint_gc_state, stage_repository_gc_with_preconditions,
 };
 use crate::storage_adapter::{
     SharedStorageAdapterRead, Storage, StorageReadOptions, StorageWriteOptions,
@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::SessionContext;
 use super::checkpoint::checkpoint_gc_due;
 
+const CHECKPOINT_GC_MAX_CONFLICT_ATTEMPTS: u32 = 3;
+const CHECKPOINT_GC_FAILURE_RECORD_ATTEMPTS: u32 = 3;
+
 impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -19,11 +22,11 @@ where
     /// Runs one repository-wide sweep after a checkpoint has committed.
     ///
     /// The checkpoint transaction has already atomically published both the
-    /// new branch head and its rotated recovery root. This follow-up pass takes
-    /// the same repository write gate as ordinary implicit writes, plans from
-    /// one pinned read, and commits the entire sweep as one write set.
+    /// new branch head and its rotated recovery root. Planning runs without
+    /// the foreground write gate and binds every destructive decision to
+    /// storage preconditions. The prepared maintenance commit does not enter
+    /// the foreground session gate; conflicts retry from a fresh snapshot.
     async fn collect_checkpoint_garbage(&self) -> Result<Option<RepositoryGcPlan>, LixError> {
-        let write_access = self.begin_session_write_access().await?;
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
@@ -37,11 +40,13 @@ where
         let mut preconditions = Vec::new();
         let plan =
             stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions).await?;
-        gc_state.mark_collected(
-            plan.sweep.tracked_commit_roots.len() as u64,
-            plan.sweep.live_manifest_count,
-        );
-        stage_checkpoint_gc_state(&mut writes, &gc_state)?;
+        if !plan.sweep.has_more {
+            gc_state.mark_collected(
+                plan.sweep.tracked_commit_roots.len() as u64,
+                plan.sweep.live_manifest_count,
+            );
+            stage_checkpoint_gc_state(&mut writes, &gc_state)?;
+        }
         let commit_boundary = self.transaction_commit_boundary();
         let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
         let prepared_commit = self
@@ -50,6 +55,7 @@ where
                 writes,
                 StorageWriteOptions {
                     preconditions,
+                    background_maintenance: true,
                     ..StorageWriteOptions::default()
                 },
             )
@@ -59,7 +65,6 @@ where
             Ok(stats)
         })
         .await?;
-        drop(write_access);
         self.observe_invalidation.bump_if_storage_changed(&stats);
         Ok(Some(plan))
     }
@@ -69,30 +74,65 @@ where
     /// Deliberately a tiny single-key write rather than part of the sweep's
     /// write set: the sweep's write set is exactly what did not commit.
     async fn record_reclaim_failure(&self) -> Result<(), LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let mut gc_state = load_checkpoint_gc_state(&read).await?;
-        drop(read);
-        gc_state.note_reclaim_failure();
-        let mut writes = self.storage.new_write_set();
-        stage_checkpoint_gc_state(&mut writes, &gc_state)?;
-        // Through the commit boundary like every other session write, so a
-        // concurrent close cannot race the final pre-commit check.
-        let commit_boundary = self.transaction_commit_boundary();
-        let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
-        let prepared_commit = self
-            .storage
-            .prepare_write_set(writes, StorageWriteOptions::default())
-            .await?;
-        commit_at_boundary(Some(&commit_boundary), || async move {
-            let (_, stats) = prepared_commit.commit().await?;
-            Ok(stats)
-        })
-        .await?;
-        Ok(())
+        for attempt in 0..CHECKPOINT_GC_FAILURE_RECORD_ATTEMPTS {
+            let read = SharedStorageAdapterRead::new(
+                self.storage
+                    .begin_read(StorageReadOptions::default())
+                    .await?,
+            );
+            let (mut gc_state, observed) =
+                load_checkpoint_gc_state_with_precondition(&read).await?;
+            drop(read);
+            gc_state.note_reclaim_failure();
+            let local_cooldown_until = gc_state.checkpoint_sequence.saturating_add(8);
+            let mut writes = self.storage.new_write_set();
+            stage_checkpoint_gc_state(&mut writes, &gc_state)?;
+            // Through the commit boundary like every other session write, so
+            // a concurrent close cannot race the final pre-commit check. The
+            // exact-value guard prevents this maintenance counter from
+            // restoring stale checkpoint sequence/debt fields.
+            let commit_boundary = self.transaction_commit_boundary();
+            let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
+            let prepared_commit = match self
+                .storage
+                .prepare_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions: vec![observed],
+                        background_maintenance: true,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.commit_coordinator
+                        .defer_checkpoint_gc_until(local_cooldown_until);
+                    return Err(error.into());
+                }
+            };
+            match commit_at_boundary(Some(&commit_boundary), || async move {
+                let (_, stats) = prepared_commit.commit().await?;
+                Ok(stats)
+            })
+            .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error)
+                    if error.code == LixError::CODE_TRANSACTION_CONFLICT
+                        && attempt + 1 < CHECKPOINT_GC_FAILURE_RECORD_ATTEMPTS =>
+                {
+                    checkpoint_gc_retry_delay(attempt).await;
+                }
+                Err(error) => {
+                    self.commit_coordinator
+                        .defer_checkpoint_gc_until(local_cooldown_until);
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("failure-record attempt loop always returns")
     }
 
     /// Checkpoint creation must not fail merely because opportunistic cleanup
@@ -100,42 +140,79 @@ where
     /// atomic write as a successful sweep, so every later checkpoint retries
     /// while collection remains due.
     pub(super) async fn collect_checkpoint_garbage_best_effort(&self) {
-        match self.collect_checkpoint_garbage().await {
-            Ok(Some(plan)) => {
-                tracing::debug!(
-                    swept_commits = plan.changelog.sweep.commits.len(),
-                    swept_changes = plan.changelog.sweep.changes.len(),
-                    swept_tracked_roots = plan.sweep.tracked_commit_roots.len(),
-                    history_manifests_missing = plan.profile.history_manifests_missing,
-                    root_discovery_us = plan.profile.root_discovery_us,
-                    changelog_us = plan.profile.changelog_us,
-                    tracked_root_stage_us = plan.profile.tracked_root_stage_us,
-                    gc_total_us = plan.profile.total_us,
-                    "completed post-checkpoint garbage collection"
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                // Persistent failure here used to be undetectable: one
-                // `tracing::warn!` and no counter, invisible in production
-                // without a subscriber and invisible in tests entirely. Record
-                // it so the next occurrence is findable, and damp the retry so
-                // a failing sweep cannot re-arm a full repository pass on every
-                // checkpoint.
-                reclaim_failures_total().fetch_add(1, Ordering::Relaxed);
-                if let Err(record_error) = self.record_reclaim_failure().await {
-                    tracing::warn!(
-                        error = %record_error,
-                        "could not record reclaim failure; retry damping is skipped"
+        for attempt in 0..CHECKPOINT_GC_MAX_CONFLICT_ATTEMPTS {
+            match self.collect_checkpoint_garbage().await {
+                Ok(Some(plan)) => {
+                    tracing::debug!(
+                        swept_commits = plan.changelog.sweep.commits.len(),
+                        swept_changes = plan.changelog.sweep.changes.len(),
+                        swept_tracked_roots = plan.sweep.tracked_commit_roots.len(),
+                        history_manifests_missing = plan.profile.history_manifests_missing,
+                        root_discovery_us = plan.profile.root_discovery_us,
+                        changelog_us = plan.profile.changelog_us,
+                        tracked_root_stage_us = plan.profile.tracked_root_stage_us,
+                        gc_total_us = plan.profile.total_us,
+                        "completed post-checkpoint garbage collection"
                     );
+                    return;
                 }
-                tracing::warn!(
-                    error = %error,
-                    "post-checkpoint garbage collection failed; checkpoint remains committed"
-                );
+                Ok(None) => return,
+                Err(error)
+                    if error.code == LixError::CODE_TRANSACTION_CONFLICT
+                        && attempt + 1 < CHECKPOINT_GC_MAX_CONFLICT_ATTEMPTS =>
+                {
+                    // A foreground commit moved one of the roots observed by
+                    // optimistic planning. This is expected under sustained
+                    // checkpointing: retry outside the write gate instead of
+                    // damping maintenance as though it were broken.
+                    checkpoint_gc_retry_delay(attempt).await;
+                }
+                Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => {
+                    reclaim_failures_total().fetch_add(1, Ordering::Relaxed);
+                    if let Err(record_error) = self.record_reclaim_failure().await {
+                        tracing::warn!(
+                            error = %record_error,
+                            "could not record checkpoint GC conflict backoff"
+                        );
+                    }
+                    tracing::debug!(
+                        attempts = CHECKPOINT_GC_MAX_CONFLICT_ATTEMPTS,
+                        error = %error,
+                        "post-checkpoint garbage collection yielded and damped retries after sustained conflicts"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    // Persistent failure here used to be undetectable: one
+                    // `tracing::warn!` and no counter, invisible in production
+                    // without a subscriber and invisible in tests entirely. Record
+                    // it so the next occurrence is findable, and damp the retry so
+                    // a failing sweep cannot re-arm a full repository pass on every
+                    // checkpoint.
+                    reclaim_failures_total().fetch_add(1, Ordering::Relaxed);
+                    if let Err(record_error) = self.record_reclaim_failure().await {
+                        tracing::warn!(
+                            error = %record_error,
+                            "could not record reclaim failure; retry damping is skipped"
+                        );
+                    }
+                    tracing::warn!(
+                        error = %error,
+                        "post-checkpoint garbage collection failed; checkpoint remains committed"
+                    );
+                    return;
+                }
             }
         }
+        unreachable!("checkpoint GC attempt loop always returns")
     }
+}
+
+async fn checkpoint_gc_retry_delay(_attempt: u32) {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    std::thread::sleep(std::time::Duration::from_millis(10_u64 << _attempt.min(5)));
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    futures_lite::future::yield_now().await;
 }
 
 #[cfg(test)]
@@ -146,7 +223,10 @@ mod tests {
     use super::checkpoint_gc_due;
     use crate::changelog::CommitId;
     use crate::engine::Engine;
-    use crate::gc::{load_checkpoint_gc_state, stage_repository_gc_with_preconditions};
+    use crate::gc::{
+        CheckpointGcState, load_checkpoint_gc_state, load_checkpoint_gc_state_with_precondition,
+        stage_checkpoint_gc_state, stage_repository_gc_with_preconditions,
+    };
     use crate::session::SessionContext;
     use crate::storage::Memory;
     use crate::storage_adapter::{
@@ -177,6 +257,78 @@ mod tests {
         let engine = Engine::new(storage).await.expect("engine opens");
         let session = engine.open_session().await.expect("session opens");
         (engine, session)
+    }
+
+    #[tokio::test]
+    async fn stale_failure_accounting_cannot_overwrite_newer_checkpoint_debt() {
+        let (_engine, session) = open().await;
+        let initial = CheckpointGcState {
+            checkpoint_sequence: 10,
+            last_gc_sequence: 5,
+            collectible_interval_count: 1,
+            ..CheckpointGcState::default()
+        };
+        let mut initial_writes = session.storage.new_write_set();
+        stage_checkpoint_gc_state(&mut initial_writes, &initial).expect("initial state stages");
+        session
+            .storage
+            .commit_write_set(initial_writes, StorageWriteOptions::default())
+            .await
+            .expect("initial state commits");
+
+        let read = SharedStorageAdapterRead::new(
+            session
+                .storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("stale failure read opens"),
+        );
+        let (mut stale, observed) = load_checkpoint_gc_state_with_precondition(&read)
+            .await
+            .expect("stale failure state loads");
+        drop(read);
+        stale.note_reclaim_failure();
+
+        let newer = CheckpointGcState {
+            checkpoint_sequence: 11,
+            collectible_interval_count: 2,
+            ..initial
+        };
+        let mut newer_writes = session.storage.new_write_set();
+        stage_checkpoint_gc_state(&mut newer_writes, &newer).expect("newer state stages");
+        session
+            .storage
+            .commit_write_set(newer_writes, StorageWriteOptions::default())
+            .await
+            .expect("newer checkpoint debt commits");
+
+        let mut stale_writes = session.storage.new_write_set();
+        stage_checkpoint_gc_state(&mut stale_writes, &stale).expect("stale state stages");
+        session
+            .storage
+            .commit_write_set(
+                stale_writes,
+                StorageWriteOptions {
+                    preconditions: vec![observed],
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale failure accounting must conflict");
+
+        let read = SharedStorageAdapterRead::new(
+            session
+                .storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("final state read opens"),
+        );
+        assert_eq!(
+            load_checkpoint_gc_state(&read)
+                .await
+                .expect("final state loads"),
+            newer,
+        );
     }
 
     async fn head(engine: &Engine<Memory>, branch_id: &str) -> String {
@@ -236,7 +388,7 @@ mod tests {
                 .expect("round checkpoint succeeds");
         }
 
-        async fn committed_state(session: &SessionContext<Memory>) -> crate::gc::CheckpointGcState {
+        async fn committed_state(session: &SessionContext<Memory>) -> CheckpointGcState {
             let read = SharedStorageAdapterRead::new(
                 session
                     .storage
@@ -334,8 +486,8 @@ mod tests {
             .await
             .expect("D commits");
         let commit_d = head(&engine, &branch_id).await;
-        let commit_d_id = CommitId::parse_lix(&commit_d, "restore GC commit D")
-            .expect("D commit id parses");
+        let commit_d_id =
+            CommitId::parse_lix(&commit_d, "restore GC commit D").expect("D commit id parses");
 
         session
             .execute("SELECT lix_restore($1)", &[Value::Text(commit_c.clone())])

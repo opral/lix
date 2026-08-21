@@ -370,6 +370,14 @@ path = "benches/checkpoint_history_scale.rs"
 harness = false
 required-features = ["storage-benches", "slatedb"]
 
+# Kept beside the checkpoint implementation while the profile report and
+# harness evolve together; this e2e target supplies the real storage adapters.
+[[bench]]
+name = "profile_checkpoint_scale"
+path = "../lix/benches/profile_checkpoint_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
 
 [[bench]]
 name = "merge_base_scale"

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! How much storage do two branches actually share?
 //!
 //! Seeds a realistic workspace through the real `SessionContext` SQL commit

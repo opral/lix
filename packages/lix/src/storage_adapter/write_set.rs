@@ -709,6 +709,84 @@ impl StorageWriteSet {
         self.stats
     }
 
+    /// Extracts a backend-admissible, restartable maintenance slice.
+    ///
+    /// Maintenance planners derive this set again from durable state on every
+    /// pass. All puts and range deletions stay together (they include fences
+    /// and any replacement authority); point deletes are the idempotent work
+    /// that may be truncated. Rows left behind are rediscovered by the next
+    /// pass, so no separate cursor can become stale or corrupt.
+    pub(crate) fn into_bounded_maintenance_slice(
+        self,
+        max_mutations: u64,
+        max_written_bytes: u64,
+    ) -> (Self, bool) {
+        let base_mutations = self
+            .stats
+            .staged_puts
+            .saturating_add(self.exclusive_range_deletes.len() as u64);
+        if !self.deferred_final_puts.is_empty()
+            || base_mutations > max_mutations
+            || self.stats.written_bytes > max_written_bytes
+        {
+            return (Self::new(), true);
+        }
+
+        let delete_budget =
+            usize::try_from(max_mutations.saturating_sub(base_mutations)).unwrap_or(usize::MAX);
+        let total_deletes = usize::try_from(self.stats.staged_deletes).unwrap_or(usize::MAX);
+        let has_more = total_deletes > delete_budget;
+        let Self {
+            groups,
+            exclusive_range_deletes,
+            changelog_gc_sealed,
+            ..
+        } = self;
+        let mut slice = Self::new();
+        slice.changelog_gc_sealed = changelog_gc_sealed;
+        let mut remaining_deletes = delete_budget;
+        for group in groups {
+            let (space, puts, deletes) = group.lower();
+            for put in puts {
+                slice.put(space, put.key, put.value);
+            }
+            let take = remaining_deletes.min(deletes.len());
+            slice.delete_batch(space, deletes.into_iter().take(take));
+            remaining_deletes -= take;
+        }
+        for (space, range) in exclusive_range_deletes {
+            slice
+                .delete_range_exclusive(space, range)
+                .expect("maintenance range-delete spaces remain exclusive");
+        }
+        (slice, has_more)
+    }
+
+    /// Consumes a delete-only domain plan into owned point mutations.
+    ///
+    /// Repository GC uses this to persist a durable intent inventory before it
+    /// starts removing child nodes whose disappearance would make the source
+    /// tree impossible to traverse on a later maintenance pass.
+    pub(crate) fn into_point_deletes(self) -> Vec<(StorageSpace, Key)> {
+        assert_eq!(self.stats.staged_puts, 0, "delete inventory contains puts");
+        assert!(
+            self.exclusive_range_deletes.is_empty(),
+            "delete inventory contains range deletes"
+        );
+        assert!(
+            self.deferred_final_puts.is_empty(),
+            "delete inventory contains deferred puts"
+        );
+        self.groups
+            .into_iter()
+            .flat_map(|group| {
+                let (space, puts, deletes) = group.lower();
+                assert!(puts.is_empty(), "delete inventory group contains puts");
+                deletes.into_iter().map(move |key| (space, key))
+            })
+            .collect()
+    }
+
     #[cfg(any(test, feature = "storage-benches"))]
     pub fn arena_stats(&self) -> StorageWriteSetArenaStats {
         let mut stats = StorageWriteSetArenaStats {
@@ -753,9 +831,7 @@ impl StorageWriteSet {
     pub fn put_counts_by_space(&self) -> Vec<(StorageSpace, usize)> {
         self.groups
             .iter()
-            .filter_map(|group| {
-                (!group.puts.is_empty()).then_some((group.space, group.puts.len()))
-            })
+            .filter_map(|group| (!group.puts.is_empty()).then_some((group.space, group.puts.len())))
             .collect()
     }
 
@@ -1482,6 +1558,22 @@ mod tests {
         assert_eq!(stats.delete_batches, 1);
         assert_eq!(commit.stats.put_entries, 2);
         assert_eq!(commit.stats.deleted_entries, 1);
+    }
+
+    #[test]
+    fn maintenance_slice_keeps_fence_puts_and_bounds_restartable_deletes() {
+        let mut writes = StorageWriteSet::new();
+        writes.put(space(), key("fence"), value("next-token"));
+        writes.delete_batch(
+            space(),
+            [key("dead-a"), key("dead-b"), key("dead-c"), key("dead-d")],
+        );
+
+        let (slice, has_more) = writes.into_bounded_maintenance_slice(3, 1_024);
+        assert!(has_more);
+        assert_eq!(slice.stats().staged_puts, 1);
+        assert_eq!(slice.stats().staged_deletes, 2);
+        assert!(slice.stats().staged_puts + slice.stats().staged_deletes <= 3);
     }
 
     #[tokio::test]

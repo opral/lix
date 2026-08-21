@@ -66,6 +66,7 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::sync::SYNC_SEQUENCE_SPACE,
     crate::sync::SYNC_REPOSITORY_EVENT_SPACE,
     crate::sync::SYNC_REPLICA_STATE_SPACE,
+    crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
     // `gc.rs` declares these through the checked constructors rather than
     // `StorageSpace::declare`, so referencing its constants here would make
     // `may_declare` read a registry it is in the middle of evaluating. The
@@ -79,6 +80,11 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     StorageSpace::declare(
         StorageSpaceId(0x0008_0002),
         "checkpoint.gc_state.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_0008),
+        "gc.commit_retirement_intent.v1",
         ValueSemantics::Mutable,
     ),
 ];
@@ -523,6 +529,7 @@ mod tests {
         for space in [
             crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
             crate::gc::CHECKPOINT_GC_STATE_SPACE,
+            crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
         ] {
             let row = ALL_STORAGE_SPACES
                 .iter()

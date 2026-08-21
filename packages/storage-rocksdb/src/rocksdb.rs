@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[cfg(test)]
@@ -29,7 +29,7 @@ use rocksdb::{
 };
 use rocksdb::{DBRawIteratorWithThreadMode, Snapshot};
 use tempfile::TempDir;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 
 const WRITE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 /// Spare memtables per column family. Four buffers cap resident memtable memory
@@ -66,6 +66,10 @@ struct RocksDBInner {
     write_gate: WriteGate,
 }
 
+const BACKGROUND_MAINTENANCE_MAX_MUTATIONS: u64 = 4_096;
+const BACKGROUND_MAINTENANCE_MAX_WRITTEN_BYTES: u64 = 4 * 1024 * 1024;
+const BACKGROUND_MAINTENANCE_MAX_PRECONDITIONS: usize = 16;
+
 #[allow(missing_debug_implementations)]
 pub struct RocksDBRead<'a> {
     db: &'a DB,
@@ -75,7 +79,8 @@ pub struct RocksDBRead<'a> {
 #[allow(missing_debug_implementations)]
 pub struct RocksDBWrite {
     inner: Arc<RocksDBInner>,
-    _writer_permit: OwnedMutexGuard<()>,
+    preconditions: Vec<Precondition>,
+    background_maintenance: bool,
     batch: WriteBatch,
     immutable_values: HashMap<Vec<u8>, Bytes>,
     stats: WriteStats,
@@ -211,11 +216,10 @@ impl Storage for RocksDB {
         opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
-            let writer_permit = self.inner.write_gate.acquire().await;
-            check_preconditions(&self.inner.db, &opts.preconditions)?;
             Ok(RocksDBWrite {
                 inner: Arc::clone(&self.inner),
-                _writer_permit: writer_permit,
+                preconditions: opts.preconditions,
+                background_maintenance: opts.background_maintenance,
                 batch: if opts.batch_capacity_hint_bytes == 0 {
                     WriteBatch::default()
                 } else {
@@ -628,19 +632,6 @@ impl StorageWrite for RocksDBWrite {
                         }
                         continue;
                     }
-                    if let Some(existing) = self
-                        .inner
-                        .db
-                        .get_cf(cf, physical_key.as_slice())
-                        .map_err(rocksdb_error)?
-                    {
-                        if existing.as_slice() != value.as_ref() {
-                            return Err(StorageError::Corruption(
-                                "immutable identity was assigned different bytes".to_string(),
-                            ));
-                        }
-                        continue;
-                    }
                     self.immutable_values
                         .insert(physical_key.clone(), value.clone());
                 }
@@ -724,6 +715,7 @@ impl StorageWrite for RocksDBWrite {
                     .delete_range_cf(cf, lower.as_slice(), upper.as_slice());
             } else {
                 let bounds = EncodedBounds::new(range);
+                let mut expanded_deletes = 0_u64;
                 for item in self.inner.db.iterator_cf(
                     cf,
                     IteratorMode::From(&bounds.lower_seek, Direction::Forward),
@@ -737,7 +729,10 @@ impl StorageWrite for RocksDBWrite {
                         break;
                     }
                     self.batch.delete_cf(cf, encoded_key);
+                    expanded_deletes = expanded_deletes.saturating_add(1);
                 }
+                self.stats.deleted_entries =
+                    self.stats.deleted_entries.saturating_add(expanded_deletes);
             }
             self.stats.deleted_ranges += 1;
             self.stats.storage_calls += 1;
@@ -747,6 +742,47 @@ impl StorageWrite for RocksDBWrite {
 
     fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
         async move {
+            // Build and sort the RocksDB batch before entering the serialized
+            // publication lane. Repository maintenance can contain an
+            // unbounded number of logical deletions; only its final atomic
+            // precondition check and backend write may contend with a
+            // foreground checkpoint.
+            let mutation_count = self
+                .stats
+                .put_entries
+                .saturating_add(self.stats.deleted_entries)
+                .saturating_add(self.stats.deleted_ranges);
+            if self.background_maintenance
+                && (mutation_count > BACKGROUND_MAINTENANCE_MAX_MUTATIONS
+                    || self.stats.written_bytes > BACKGROUND_MAINTENANCE_MAX_WRITTEN_BYTES
+                    || self.preconditions.len() > BACKGROUND_MAINTENANCE_MAX_PRECONDITIONS)
+            {
+                return Err(StorageError::Io(format!(
+                    "background maintenance publication exceeds hard cut: {mutation_count} mutations, {} bytes, {} preconditions",
+                    self.stats.written_bytes,
+                    self.preconditions.len(),
+                )));
+            }
+            let _writer_permit = self
+                .inner
+                .write_gate
+                .acquire(self.background_maintenance)
+                .await;
+            check_preconditions(&self.inner.db, &self.preconditions)?;
+            for (key, expected) in &self.immutable_values {
+                let cf = self
+                    .inner
+                    .db
+                    .cf_handle(IMMUTABLE_COLUMN_FAMILY)
+                    .expect("immutable column family is open");
+                if let Some(existing) = self.inner.db.get_cf(cf, key).map_err(rocksdb_error)?
+                    && existing.as_slice() != expected.as_ref()
+                {
+                    return Err(StorageError::Corruption(
+                        "immutable identity was assigned different bytes".to_string(),
+                    ));
+                }
+            }
             // `await_durable` means "do not acknowledge until the backend has
             // crossed its durable persistence boundary". For RocksDB that is
             // `sync = true`: the WAL append is fsynced before `write` returns,
@@ -990,7 +1026,102 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{CoreProjection, ProjectedValue, logical_key_from_physical, project_owned_value};
+    use std::sync::{Arc, atomic::Ordering};
+
+    use super::{
+        BACKGROUND_MAINTENANCE_MAX_MUTATIONS, CoreProjection, ProjectedValue, RocksDB, WriteGate,
+        logical_key_from_physical, project_owned_value,
+    };
+    use bytes::Bytes;
+    use lix::storage::{
+        Key, PutBatch, PutEntry, SpaceId, Storage, StorageError, StorageSpace, StorageWrite,
+        StoredValue, WriteOptions,
+    };
+
+    #[tokio::test]
+    async fn foreground_writer_overtakes_queued_background_maintenance() {
+        let gate = Arc::new(WriteGate::new());
+        let initial = gate.acquire(false).await;
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let background_gate = Arc::clone(&gate);
+        let background_tx = order_tx.clone();
+        let background = tokio::spawn(async move {
+            let _permit = background_gate.acquire(true).await;
+            background_tx.send("background").expect("receiver is open");
+        });
+        tokio::task::yield_now().await;
+
+        let foreground_gate = Arc::clone(&gate);
+        let foreground = tokio::spawn(async move {
+            let _permit = foreground_gate.acquire(false).await;
+            order_tx.send("foreground").expect("receiver is open");
+        });
+        tokio::task::yield_now().await;
+        drop(initial);
+
+        assert_eq!(order_rx.recv().await, Some("foreground"));
+        foreground.await.expect("foreground task succeeds");
+        assert_eq!(order_rx.recv().await, Some("background"));
+        background.await.expect("background task succeeds");
+    }
+
+    #[tokio::test]
+    async fn cancelled_foreground_waiter_does_not_starve_background_maintenance() {
+        let gate = Arc::new(WriteGate::new());
+        let initial = gate.acquire(false).await;
+        let foreground_gate = Arc::clone(&gate);
+        let foreground = tokio::spawn(async move {
+            let _permit = foreground_gate.acquire(false).await;
+        });
+        while gate.foreground_waiters.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        foreground.abort();
+        let _ = foreground.await;
+        assert_eq!(gate.foreground_waiters.load(Ordering::Acquire), 0);
+        drop(initial);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire(true))
+            .await
+            .expect("cancelled foreground waiter must wake background maintenance");
+    }
+
+    #[tokio::test]
+    async fn oversized_background_maintenance_is_rejected_before_the_writer_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RocksDB::open(directory.path()).unwrap();
+        let gate = storage.inner.write_gate.acquire(false).await;
+        let mut write = storage
+            .begin_write(WriteOptions {
+                background_maintenance: true,
+                ..WriteOptions::default()
+            })
+            .await
+            .unwrap();
+        let entries = (0..=BACKGROUND_MAINTENANCE_MAX_MUTATIONS)
+            .map(|index| PutEntry {
+                key: Key(Bytes::copy_from_slice(&index.to_be_bytes())),
+                value: StoredValue {
+                    bytes: Bytes::from_static(b"value"),
+                },
+            })
+            .collect();
+        write
+            .put_many(
+                StorageSpace::mutable(SpaceId(0x00ff_0002), "test.maintenance-cap"),
+                PutBatch { entries },
+            )
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), write.commit())
+            .await
+            .expect("hard-cut rejection must not wait for the occupied writer gate")
+            .expect_err("oversized maintenance must be rejected");
+        assert!(matches!(error, StorageError::Io(message) if message.contains("hard cut")));
+        drop(gate);
+    }
 
     #[test]
     fn logical_key_reuses_the_physical_key_allocation() {
@@ -1053,10 +1184,31 @@ fn rocksdb_open_error(error: rocksdb::Error, path: &Path) -> StorageError {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 #[allow(missing_debug_implementations)]
 struct WriteGate {
     state: Arc<AsyncMutex<()>>,
+    foreground_waiters: Arc<AtomicUsize>,
+    foreground_changed: Arc<Notify>,
+}
+
+struct ForegroundWaiterRegistration<'a> {
+    waiters: &'a AtomicUsize,
+    changed: &'a Notify,
+}
+
+impl<'a> ForegroundWaiterRegistration<'a> {
+    fn new(waiters: &'a AtomicUsize, changed: &'a Notify) -> Self {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        Self { waiters, changed }
+    }
+}
+
+impl Drop for ForegroundWaiterRegistration<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+        self.changed.notify_waiters();
+    }
 }
 
 impl WriteGate {
@@ -1064,7 +1216,32 @@ impl WriteGate {
         Self::default()
     }
 
-    async fn acquire(&self) -> OwnedMutexGuard<()> {
-        Arc::clone(&self.state).lock_owned().await
+    async fn acquire(&self, background_maintenance: bool) -> OwnedMutexGuard<()> {
+        if !background_maintenance {
+            let registration = ForegroundWaiterRegistration::new(
+                &self.foreground_waiters,
+                &self.foreground_changed,
+            );
+            let permit = Arc::clone(&self.state).lock_owned().await;
+            drop(registration);
+            return permit;
+        }
+        loop {
+            while self.foreground_waiters.load(Ordering::Acquire) != 0 {
+                let changed = self.foreground_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.foreground_waiters.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                changed.await;
+            }
+            let permit = Arc::clone(&self.state).lock_owned().await;
+            if self.foreground_waiters.load(Ordering::Acquire) == 0 {
+                return permit;
+            }
+            drop(permit);
+            tokio::task::yield_now().await;
+        }
     }
 }
