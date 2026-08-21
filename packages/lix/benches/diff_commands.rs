@@ -98,6 +98,28 @@ async fn profile_sample(rows: usize, sample: usize) {
     .await;
     emit("working_diff", rows, rows, sample, scan);
 
+    let atelier_count = elapsed(async {
+        execute(
+            &session,
+            "SELECT COUNT(*) AS change_count, \
+             COUNT(DISTINCT CASE \
+               WHEN file_id IS NOT NULL THEN file_id \
+               WHEN schema_key = 'lix_file_descriptor' THEN row_pk ->> 0 \
+               ELSE NULL \
+             END) AS file_count \
+             FROM lix_working_diff()",
+        )
+        .await;
+    })
+    .await;
+    emit(
+        "working_diff_projected_aggregate",
+        rows,
+        rows,
+        sample,
+        atelier_count,
+    );
+
     let revert = elapsed(async {
         execute(
             &session,

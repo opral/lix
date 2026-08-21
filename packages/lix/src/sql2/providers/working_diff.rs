@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableType;
@@ -126,6 +127,7 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema(), projection);
+        let read = WorkingDiffReadColumns::from_schema(&schema);
         let route = WorkingDiffRoute::from_filters(filters)?;
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
@@ -139,8 +141,9 @@ where
                     self.store.clone(),
                     schema,
                     route,
+                    read,
                 ),
-                move |(active_branch_id, branch_ref, _commit_graph, store, schema, route)| async move {
+                move |(active_branch_id, branch_ref, _commit_graph, store, schema, route, read)| async move {
                     if limit == Some(0) || route.contradictory {
                         return WORKING_DIFF_COLS
                             .build(schema, &[])
@@ -160,8 +163,9 @@ where
                     // not serialize behind an unrelated historical diff.
                     let mut tracked = None;
                     let mut rows = Vec::new();
+                    let mut row_count = 0;
                     for head in heads {
-                        if limit.is_some_and(|limit| rows.len() >= limit) {
+                        if limit.is_some_and(|limit| row_count >= limit) {
                             break;
                         }
                         let direct_diff = match BranchHeadControlContext::new()
@@ -212,23 +216,65 @@ where
                             {
                                 continue;
                             }
+                            row_count += 1;
+                            if schema.fields().is_empty() {
+                                if limit.is_some_and(|limit| row_count >= limit) {
+                                    break;
+                                }
+                                continue;
+                            }
                             rows.push(WorkingDiffSqlRow {
-                                diff_id: entry.diff_id(),
-                                row_pk: entry.identity.row_pk().as_json_array_text(),
-                                schema_key: entry.identity.schema_key().to_owned(),
-                                file_id: entry.identity.file_id().map(str::to_owned),
-                                diff_type: match entry.kind {
-                                    TrackedStateDiffKind::Added => "added",
-                                    TrackedStateDiffKind::Modified => "modified",
-                                    TrackedStateDiffKind::Removed => "removed",
+                                diff_id: if read.diff_id {
+                                    entry.diff_id()
+                                } else {
+                                    Ok(String::new())
                                 },
-                                before_change_id: entry.before.map(|row| row.change_id.to_string()),
-                                after_change_id: entry.after.map(|row| row.change_id.to_string()),
+                                row_pk: if read.row_pk {
+                                    entry.identity.row_pk().as_json_array_text()
+                                } else {
+                                    Ok(String::new())
+                                },
+                                schema_key: read
+                                    .schema_key
+                                    .then(|| entry.identity.schema_key().to_owned())
+                                    .unwrap_or_default(),
+                                file_id: if read.file_id {
+                                    entry.identity.file_id().map(str::to_owned)
+                                } else {
+                                    None
+                                },
+                                diff_type: if read.diff_type {
+                                    match entry.kind {
+                                        TrackedStateDiffKind::Added => "added",
+                                        TrackedStateDiffKind::Modified => "modified",
+                                        TrackedStateDiffKind::Removed => "removed",
+                                    }
+                                } else {
+                                    ""
+                                },
+                                before_change_id: if read.before_change_id {
+                                    entry.before.map(|row| row.change_id.to_string())
+                                } else {
+                                    None
+                                },
+                                after_change_id: if read.after_change_id {
+                                    entry.after.map(|row| row.change_id.to_string())
+                                } else {
+                                    None
+                                },
                             });
-                            if limit.is_some_and(|limit| rows.len() >= limit) {
+                            if limit.is_some_and(|limit| row_count >= limit) {
                                 break;
                             }
                         }
+                    }
+                    if schema.fields().is_empty() {
+                        return RecordBatch::try_new_with_options(
+                            schema,
+                            Vec::new(),
+                            &RecordBatchOptions::new().with_row_count(Some(row_count)),
+                        )
+                        .map_err(DataFusionError::from);
                     }
                     WORKING_DIFF_COLS
                         .build(schema, &rows)
@@ -236,6 +282,31 @@ where
                 },
             ),
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkingDiffReadColumns {
+    diff_id: bool,
+    row_pk: bool,
+    schema_key: bool,
+    file_id: bool,
+    diff_type: bool,
+    before_change_id: bool,
+    after_change_id: bool,
+}
+
+impl WorkingDiffReadColumns {
+    fn from_schema(schema: &Schema) -> Self {
+        Self {
+            diff_id: schema.index_of("diff_id").is_ok(),
+            row_pk: schema.index_of("row_pk").is_ok(),
+            schema_key: schema.index_of("schema_key").is_ok(),
+            file_id: schema.index_of("file_id").is_ok(),
+            diff_type: schema.index_of("diff_type").is_ok(),
+            before_change_id: schema.index_of("before_change_id").is_ok(),
+            after_change_id: schema.index_of("after_change_id").is_ok(),
+        }
     }
 }
 
@@ -364,7 +435,23 @@ mod tests {
 
     use crate::NullableKeyFilter;
 
-    use super::WorkingDiffRoute;
+    use super::{WorkingDiffReadColumns, WorkingDiffRoute, working_diff_schema};
+
+    #[test]
+    fn projected_working_diff_columns_skip_unrequested_values() {
+        let schema = working_diff_schema()
+            .project(&[1, 2, 3])
+            .expect("project working-diff aggregate inputs");
+        let read = WorkingDiffReadColumns::from_schema(&schema);
+
+        assert!(read.row_pk);
+        assert!(read.schema_key);
+        assert!(read.file_id);
+        assert!(!read.diff_id);
+        assert!(!read.diff_type);
+        assert!(!read.before_change_id);
+        assert!(!read.after_change_id);
+    }
 
     #[test]
     fn routes_exact_tracked_identity_filters() {
