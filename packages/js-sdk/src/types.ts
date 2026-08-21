@@ -24,12 +24,18 @@ export type SyncLixServerOptions = {
 	fetch?: RemoteLixFetch;
 };
 
+export type LixTelemetrySpanLink = {
+	traceId: string;
+	spanId: string;
+};
+
 export type LixTelemetrySpan = {
 	schemaVersion: 2;
 	name: string;
 	traceId: string;
 	spanId: string;
 	parentSpanId?: string;
+	links?: LixTelemetrySpanLink[];
 	startedAtUnixMs: number;
 	durationMs: number;
 	status: "ok" | "error" | "cancelled";

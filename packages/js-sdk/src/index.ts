@@ -52,6 +52,7 @@ export type {
 	OpenAnotherSessionOptions,
 	LixTelemetryOptions,
 	LixTelemetrySpan,
+	LixTelemetrySpanLink,
 	RemoteLixFetch,
 	RemoteLixServerOptions,
 	SyncLixServerOptions,

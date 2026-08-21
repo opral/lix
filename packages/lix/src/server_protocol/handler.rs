@@ -5088,6 +5088,7 @@ mod tests {
         id: tracing::span::Id,
         parent: Option<tracing::span::Id>,
         name: &'static str,
+        level: tracing::Level,
         fields: std::collections::BTreeMap<String, String>,
     }
 
@@ -5139,6 +5140,7 @@ mod tests {
                     id: id.clone(),
                     parent,
                     name: attributes.metadata().name(),
+                    level: *attributes.metadata().level(),
                     fields,
                 });
         }
@@ -10893,6 +10895,29 @@ mod tests {
             })
     }
 
+    fn assert_info_plane(spans: &[CapturedSpan]) {
+        use lix::telemetry::spans::{FORBIDDEN_PRODUCTION_NAMES, PRODUCTION_NAMES};
+        assert_eq!(PRODUCTION_NAMES.len(), 11);
+        for span in spans.iter().filter(|span| span.level == tracing::Level::INFO) {
+            assert!(
+                PRODUCTION_NAMES.contains(&span.name) || span.name == "lix.protocol.request",
+                "unexpected INFO production span {}",
+                span.name
+            );
+            assert!(
+                !FORBIDDEN_PRODUCTION_NAMES.contains(&span.name),
+                "legacy INFO name still exported: {}",
+                span.name
+            );
+        }
+        for forbidden in FORBIDDEN_PRODUCTION_NAMES {
+            assert!(
+                spans.iter().all(|span| span.name != *forbidden),
+                "legacy name {forbidden} still present"
+            );
+        }
+    }
+
     fn assert_no_bound_parameter_or_bytea_fields(spans: &[CapturedSpan]) {
         for span in spans {
             for (key, value) in &span.fields {
@@ -10938,8 +10963,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
         let batch = require_span(&spans, "lix.sql.batch");
-        require_span(&spans, "lix.sql.query");
+        let query = require_span(&spans, "lix.sql.query");
+        assert_eq!(
+            query.fields.get("db.operation.name").map(String::as_str),
+            Some("INSERT")
+        );
         let materialize = require_span(&spans, "lix.transaction.materialize");
         let storage_commit = require_span(&spans, "lix.transaction.storage");
         let notify = require_span(&spans, "lix.transaction.notify");
@@ -10955,6 +10985,18 @@ mod tests {
             Some(cohort_id)
         );
         assert_eq!(notify.fields.get("lix.commit_cohort_id"), Some(cohort_id));
+        let batch_span_id = batch
+            .fields
+            .get("lix.span_id")
+            .expect("batch lix.span_id");
+        assert!(
+            materialize
+                .fields
+                .get("lix.span.links")
+                .is_some_and(|links| links.contains(batch_span_id)),
+            "materialize should link the logical batch, got {:?}",
+            materialize.fields.get("lix.span.links")
+        );
         assert_no_bound_parameter_or_bytea_fields(&spans);
     }
 
@@ -10995,6 +11037,7 @@ mod tests {
             .to_string();
 
         let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
         let checkpoint = require_span(&spans, "lix.checkpoint.create");
         assert_eq!(
             checkpoint.fields.get("lix.commit_id").map(String::as_str),
@@ -11028,6 +11071,7 @@ mod tests {
         assert!(!session_id.is_empty());
 
         let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
         assert_eq!(
             spans
                 .iter()
@@ -11078,6 +11122,7 @@ mod tests {
         assert_eq!(committed.status(), StatusCode::NO_CONTENT);
 
         let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
         assert_eq!(
             spans
                 .iter()
@@ -11101,6 +11146,7 @@ mod tests {
             .expect("open lix");
 
         let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
         require_span(&spans, "lix.engine.open");
         require_span(&spans, "lix.session.open");
         assert_eq!(

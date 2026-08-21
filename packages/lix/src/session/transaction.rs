@@ -9,7 +9,7 @@ use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Memory;
 use crate::storage_adapter::Storage;
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanClass, TelemetrySpanStatus,
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanStatus, spans,
 };
 use tokio::sync::Notify;
 
@@ -183,8 +183,7 @@ where
             let notify = already_serialized
                 .then(|| {
                     ActiveTelemetrySpan::start_current(
-                        TelemetrySpanClass::Performance,
-                        "lix.transaction.notify",
+                        &spans::TRANSACTION_NOTIFY,
                         vec![
                             TelemetryAttribute::u64("lix.transaction.count", 1),
                             TelemetryAttribute::string(

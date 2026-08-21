@@ -97,7 +97,7 @@ use crate::storage_adapter::{
     REVISION_KEY_CATALOG, REVISION_KEY_TRACKED_MUTATION, SharedStorageAdapterRead, StorageAdapter,
     StorageAdapterRead, StorageAdapterReadScope, load_revisions,
 };
-use crate::telemetry::{ActiveTelemetrySpan, TelemetrySpanClass, instrument_lix_result};
+use crate::telemetry::{ActiveTelemetrySpan, instrument_lix_result, spans};
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateKey,
     TrackedStateStoreReader,
@@ -1692,8 +1692,7 @@ where
         let commit_boundary = transaction.commit_boundary.clone();
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         let materialize_span = ActiveTelemetrySpan::start_current(
-            TelemetrySpanClass::Performance,
-            "lix.transaction.materialize",
+            &spans::TRANSACTION_MATERIALIZE,
             vec![
                 TelemetryAttribute::u64(
                     "lix.transaction.count",
@@ -1975,8 +1974,7 @@ where
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_crud_write_set_arena(&writes);
         let storage_span = ActiveTelemetrySpan::start_current(
-            TelemetrySpanClass::Performance,
-            "lix.transaction.storage",
+            &spans::TRANSACTION_STORAGE,
             vec![
                 TelemetryAttribute::u64(
                     "lix.transaction.count",

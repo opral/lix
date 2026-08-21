@@ -7,6 +7,8 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 
+pub(crate) mod spans;
+
 /// A stable, coarse category that lets sinks filter telemetry without making
 /// every Lix operation a public Rust enum variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +16,49 @@ pub enum TelemetrySpanClass {
     Sql,
     Lifecycle,
     Performance,
+}
+
+/// Opaque production-span identity. Declared once by the internal descriptor
+/// macro: stable name, coarse class, allowed attributes, and the tracing
+/// callsite used by [`TracingTelemetrySink`].
+#[derive(Clone, Copy)]
+pub struct TelemetrySpanDescriptor {
+    pub(crate) name: &'static str,
+    pub(crate) class: TelemetrySpanClass,
+    pub(crate) allowed_attributes: &'static [&'static str],
+    pub(crate) create_tracing_span: fn() -> tracing::Span,
+}
+
+impl std::fmt::Debug for TelemetrySpanDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TelemetrySpanDescriptor")
+            .field("name", &self.name)
+            .field("class", &self.class)
+            .finish()
+    }
+}
+
+impl PartialEq for TelemetrySpanDescriptor {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for TelemetrySpanDescriptor {}
+
+impl TelemetrySpanDescriptor {
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn class(&self) -> TelemetrySpanClass {
+        self.class
+    }
+
+    fn allows(&self, key: &str) -> bool {
+        self.allowed_attributes.contains(&key)
+    }
 }
 
 /// One vendor-neutral telemetry attribute.
@@ -46,6 +91,13 @@ pub enum TelemetryValue {
     Boolean(bool),
 }
 
+/// A causal link from one physical operation to a logical transaction span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetrySpanLink {
+    pub trace_id: String,
+    pub span_id: String,
+}
+
 /// Information available when an engine operation begins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetrySpanStart {
@@ -54,25 +106,33 @@ pub struct TelemetrySpanStart {
     pub trace_id: String,
     pub span_id: String,
     pub parent_span_id: Option<String>,
+    pub links: Vec<TelemetrySpanLink>,
     pub started_at_unix_ms: u64,
     pub attributes: Vec<TelemetryAttribute>,
+    descriptor: &'static TelemetrySpanDescriptor,
 }
 
 impl TelemetrySpanStart {
     pub fn new(
-        class: TelemetrySpanClass,
-        name: &'static str,
+        descriptor: &'static TelemetrySpanDescriptor,
         attributes: Vec<TelemetryAttribute>,
     ) -> Self {
+        debug_assert_attributes(descriptor, &attributes);
         Self {
-            class,
-            name,
+            class: descriptor.class,
+            name: descriptor.name,
             trace_id: String::new(),
             span_id: String::new(),
             parent_span_id: None,
+            links: Vec::new(),
             started_at_unix_ms: unix_time_ms(),
             attributes,
+            descriptor,
         }
+    }
+
+    pub fn descriptor(&self) -> &'static TelemetrySpanDescriptor {
+        self.descriptor
     }
 }
 
@@ -100,9 +160,9 @@ pub struct CompletedTelemetrySpan {
 
 /// Per-engine telemetry destination. Lix never installs a global exporter.
 pub trait TelemetrySink: Send + Sync {
-    /// Called before Lix builds attributes. The class is deliberately coarse;
-    /// `name` is the stable telemetry contract.
-    fn enabled(&self, _class: TelemetrySpanClass, _name: &'static str) -> bool {
+    /// Called before Lix builds attributes. The descriptor is the only source
+    /// of the stable production name.
+    fn enabled(&self, _descriptor: &TelemetrySpanDescriptor) -> bool {
         true
     }
 
@@ -165,11 +225,8 @@ impl TelemetrySpanHandle for CallbackTelemetrySpan {
 
 /// Explicit adapter from engine telemetry into the Rust `tracing` ecosystem.
 ///
-/// Production subscribers export INFO `lix_sql` (SQL batch / query) and INFO
-/// `lix` (`lix.repository.opened`). Commit, storage, notify, checkpoint, and session /
-/// engine-open phases that can take tens of milliseconds use those same
-/// targets at INFO so they appear in the same tree. Debug-only `lix_perf`
-/// micro-phases stay off the production plane.
+/// This sink is not a second source of names. It opens the callsite owned by
+/// the descriptor and records the same ids the callback plane receives.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TracingTelemetrySink;
 
@@ -180,8 +237,8 @@ impl TracingTelemetrySink {
 }
 
 impl TelemetrySink for TracingTelemetrySink {
-    fn enabled(&self, class: TelemetrySpanClass, _name: &'static str) -> bool {
-        match class {
+    fn enabled(&self, descriptor: &TelemetrySpanDescriptor) -> bool {
+        match descriptor.class {
             TelemetrySpanClass::Sql | TelemetrySpanClass::Performance => {
                 tracing::enabled!(target: "lix_sql", tracing::Level::INFO)
             }
@@ -192,7 +249,19 @@ impl TelemetrySink for TracingTelemetrySink {
     }
 
     fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
-        let span = tracing_span(&start);
+        let span = (start.descriptor.create_tracing_span)();
+        span.record("lix.trace_id", start.trace_id.as_str());
+        span.record("lix.span_id", start.span_id.as_str());
+        if let Some(parent_span_id) = start.parent_span_id.as_deref() {
+            span.record("lix.parent_span_id", parent_span_id);
+        }
+        if !start.links.is_empty() {
+            let links = encode_links(&start.links);
+            span.record("lix.span.links", links.as_str());
+        }
+        for attribute in &start.attributes {
+            record_attribute(&span, attribute);
+        }
         Box::new(TracingTelemetrySpan { span })
     }
 }
@@ -228,134 +297,12 @@ impl TelemetrySpanHandle for TracingTelemetrySpan {
     }
 }
 
-fn tracing_span(start: &TelemetrySpanStart) -> tracing::Span {
-    let span = match start.name {
-        "lix.sql.query" => tracing::info_span!(
-            target: "lix_sql",
-            "lix.sql.query",
-            "otel.name" = tracing::field::Empty,
-            "otel.kind" = tracing::field::Empty,
-            "db.system.name" = tracing::field::Empty,
-            "db.operation.name" = tracing::field::Empty,
-            "db.query.summary" = tracing::field::Empty,
-            "db.query.text" = tracing::field::Empty,
-            "lix.sql.fingerprint" = tracing::field::Empty,
-            "lix.execution.kind" = tracing::field::Empty,
-            "lix.batch.index" = tracing::field::Empty,
-            "db.response.returned_rows" = tracing::field::Empty,
-            "lix.rows_affected" = tracing::field::Empty,
-            "error.type" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        "lix.sql.batch" => tracing::info_span!(
-            target: "lix_sql",
-            "lix.sql.batch",
-            "otel.name" = tracing::field::Empty,
-            "otel.kind" = tracing::field::Empty,
-            "db.system.name" = tracing::field::Empty,
-            "db.operation.batch.size" = tracing::field::Empty,
-            "lix.execution.kind" = tracing::field::Empty,
-            "error.type" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        "lix.sql.coherent_read_batch" => tracing::info_span!(
-            target: "lix_sql",
-            "lix.sql.coherent_read_batch",
-            "otel.name" = tracing::field::Empty,
-            "otel.kind" = tracing::field::Empty,
-            "db.system.name" = tracing::field::Empty,
-            "db.operation.batch.size" = tracing::field::Empty,
-            "lix.execution.kind" = tracing::field::Empty,
-            "error.type" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        "lix.repository.opened" => tracing::info_span!(
-            target: "lix",
-            "lix.repository.opened",
-            "lix.id" = tracing::field::Empty,
-            "lix.branch_id" = tracing::field::Empty,
-            "lix.account_id" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        "lix.engine.open" => lifecycle_tracing_span("lix.engine.open"),
-        "lix.session.open" => lifecycle_tracing_span("lix.session.open"),
-        "lix.checkpoint.create" => tracing::info_span!(
-            target: "lix",
-            "lix.checkpoint.create",
-            "lix.commit_id" = tracing::field::Empty,
-            "lix.parent_commit_id" = tracing::field::Empty,
-            "error.type" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        "lix.transaction.wait" => performance_tracing_span("lix.transaction.wait"),
-        "lix.transaction.materialize" => performance_tracing_span("lix.transaction.materialize"),
-        "lix.transaction.storage" => performance_tracing_span("lix.transaction.storage"),
-        "lix.transaction.notify" => performance_tracing_span("lix.transaction.notify"),
-        _ => {
-            debug_assert!(false, "unknown production telemetry span: {}", start.name);
-            tracing::Span::none()
-        }
-    };
-    for attribute in &start.attributes {
-        record_attribute(&span, attribute);
-    }
-    span
-}
-
-fn lifecycle_tracing_span(name: &'static str) -> tracing::Span {
-    match name {
-        "lix.engine.open" => tracing::info_span!(
-            target: "lix",
-            "lix.engine.open",
-            "error.type" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        "lix.session.open" => tracing::info_span!(
-            target: "lix",
-            "lix.session.open",
-            "error.type" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        _ => tracing::Span::none(),
-    }
-}
-
-fn performance_tracing_span(name: &'static str) -> tracing::Span {
-    match name {
-        "lix.transaction.wait" => tracing::info_span!(
-            target: "lix_sql",
-            "lix.transaction.wait",
-            "lix.commit_cohort_id" = tracing::field::Empty,
-            "lix.wait.reason" = tracing::field::Empty,
-            "error.type" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        "lix.transaction.materialize" => tracing::info_span!(
-            target: "lix_sql",
-            "lix.transaction.materialize",
-            "lix.commit_cohort_id" = tracing::field::Empty,
-            "lix.transaction.count" = tracing::field::Empty,
-            "error.type" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        "lix.transaction.storage" => tracing::info_span!(
-            target: "lix_sql",
-            "lix.transaction.storage",
-            "lix.commit_cohort_id" = tracing::field::Empty,
-            "lix.transaction.count" = tracing::field::Empty,
-            "error.type" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        "lix.transaction.notify" => tracing::info_span!(
-            target: "lix_sql",
-            "lix.transaction.notify",
-            "lix.commit_cohort_id" = tracing::field::Empty,
-            "lix.transaction.count" = tracing::field::Empty,
-            "error.type" = tracing::field::Empty,
-            "otel.status_code" = tracing::field::Empty,
-        ),
-        _ => tracing::Span::none(),
-    }
+fn encode_links(links: &[TelemetrySpanLink]) -> String {
+    links
+        .iter()
+        .map(|link| format!("{}:{}", link.trace_id, link.span_id))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn record_attribute(span: &tracing::Span, attribute: &TelemetryAttribute) {
@@ -366,12 +313,28 @@ fn record_attribute(span: &tracing::Span, attribute: &TelemetryAttribute) {
     };
 }
 
+fn debug_assert_attributes(descriptor: &TelemetrySpanDescriptor, attributes: &[TelemetryAttribute]) {
+    debug_assert!(
+        attributes
+            .iter()
+            .all(|attribute| descriptor.allows(attribute.key)),
+        "attribute not allowed on {}: {:?}",
+        descriptor.name,
+        attributes
+            .iter()
+            .filter(|attribute| !descriptor.allows(attribute.key))
+            .map(|attribute| attribute.key)
+            .collect::<Vec<_>>()
+    );
+}
+
 #[derive(Clone)]
 pub(crate) struct TelemetryContext {
     sink: Arc<dyn TelemetrySink>,
     trace_id: String,
     span_id: String,
     commit_cohort_id: Option<String>,
+    links: Vec<TelemetrySpanLink>,
 }
 
 thread_local! {
@@ -427,12 +390,36 @@ impl TelemetryContext {
             trace_id: next_trace_id(),
             span_id: String::new(),
             commit_cohort_id: None,
+            links: Vec::new(),
         }
     }
 
     pub(crate) fn with_commit_cohort_id(mut self, commit_cohort_id: String) -> Self {
         self.commit_cohort_id = Some(commit_cohort_id);
         self
+    }
+
+    pub(crate) fn with_links(mut self, links: Vec<TelemetrySpanLink>) -> Self {
+        self.links = links;
+        self
+    }
+
+    pub(crate) fn as_link(&self) -> Option<TelemetrySpanLink> {
+        (!self.span_id.is_empty()).then(|| TelemetrySpanLink {
+            trace_id: self.trace_id.clone(),
+            span_id: self.span_id.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(sink: Arc<dyn TelemetrySink>, trace_id: &str, span_id: &str) -> Self {
+        Self {
+            sink,
+            trace_id: trace_id.to_string(),
+            span_id: span_id.to_string(),
+            commit_cohort_id: None,
+            links: Vec::new(),
+        }
     }
 
     fn enter(&self) -> CurrentTelemetryGuard {
@@ -469,24 +456,35 @@ pub(crate) struct ActiveTelemetrySpan {
     handle: Option<Box<dyn TelemetrySpanHandle>>,
     started: web_time::Instant,
     context: TelemetryContext,
+    descriptor: &'static TelemetrySpanDescriptor,
 }
 
 impl ActiveTelemetrySpan {
     pub(crate) fn start(sink: &Arc<dyn TelemetrySink>, mut start: TelemetrySpanStart) -> Self {
         let parent = current_context_for(sink);
-        if start.class == TelemetrySpanClass::Performance
-            && !start
+        if start.class == TelemetrySpanClass::Performance {
+            if !start
                 .attributes
                 .iter()
                 .any(|attribute| attribute.key == "lix.commit_cohort_id")
-            && let Some(commit_cohort_id) = parent
-                .as_ref()
-                .and_then(|parent| parent.commit_cohort_id.as_deref())
-        {
-            start.attributes.push(TelemetryAttribute::string(
-                "lix.commit_cohort_id",
-                commit_cohort_id,
-            ));
+                && let Some(commit_cohort_id) = parent
+                    .as_ref()
+                    .and_then(|parent| parent.commit_cohort_id.as_deref())
+            {
+                start.attributes.push(TelemetryAttribute::string(
+                    "lix.commit_cohort_id",
+                    commit_cohort_id,
+                ));
+            }
+            if start.links.is_empty() {
+                if let Some(parent) = parent.as_ref() {
+                    if !parent.links.is_empty() {
+                        start.links = parent.links.clone();
+                    } else if let Some(link) = parent.as_link() {
+                        start.links.push(link);
+                    }
+                }
+            }
         }
         start.trace_id = parent
             .as_ref()
@@ -500,32 +498,36 @@ impl ActiveTelemetrySpan {
             sink: Arc::clone(sink),
             trace_id: start.trace_id.clone(),
             span_id: start.span_id.clone(),
-            commit_cohort_id: parent.and_then(|parent| parent.commit_cohort_id),
+            commit_cohort_id: parent
+                .as_ref()
+                .and_then(|parent| parent.commit_cohort_id.clone()),
+            links: start.links.clone(),
         };
+        debug_assert_attributes(start.descriptor, &start.attributes);
+        let descriptor = start.descriptor;
         Self {
             handle: Some(sink.start_span(start)),
             started: web_time::Instant::now(),
             context,
+            descriptor,
         }
     }
 
     pub(crate) fn start_if_enabled(
         sink: &Arc<dyn TelemetrySink>,
-        class: TelemetrySpanClass,
-        name: &'static str,
+        descriptor: &'static TelemetrySpanDescriptor,
         attributes: Vec<TelemetryAttribute>,
     ) -> Option<Self> {
-        sink.enabled(class, name)
-            .then(|| Self::start(sink, TelemetrySpanStart::new(class, name, attributes)))
+        sink.enabled(descriptor)
+            .then(|| Self::start(sink, TelemetrySpanStart::new(descriptor, attributes)))
     }
 
     pub(crate) fn start_current(
-        class: TelemetrySpanClass,
-        name: &'static str,
+        descriptor: &'static TelemetrySpanDescriptor,
         attributes: Vec<TelemetryAttribute>,
     ) -> Option<Self> {
         let context = current_telemetry_context()?;
-        Self::start_if_enabled(&context.sink, class, name, attributes)
+        Self::start_if_enabled(&context.sink, descriptor, attributes)
     }
 
     pub(crate) fn instrument<F>(&self, future: F) -> TelemetryInstrumentedFuture<'_, F>
@@ -543,6 +545,7 @@ impl ActiveTelemetrySpan {
         status: TelemetrySpanStatus,
         attributes: Vec<TelemetryAttribute>,
     ) {
+        debug_assert_attributes(self.descriptor, &attributes);
         let duration_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if let Some(handle) = self.handle.take() {
             handle.finish(TelemetrySpanEnd {
@@ -727,7 +730,7 @@ pub fn bind_session(
     let Some(sink) = sink else {
         return;
     };
-    if !sink.enabled(TelemetrySpanClass::Lifecycle, "lix.repository.opened") {
+    if !sink.enabled(&spans::REPOSITORY_OPENED) {
         return;
     }
     let mut attributes = vec![
@@ -739,11 +742,7 @@ pub fn bind_session(
     }
     let span = ActiveTelemetrySpan::start(
         sink,
-        TelemetrySpanStart::new(
-            TelemetrySpanClass::Lifecycle,
-            "lix.repository.opened",
-            attributes,
-        ),
+        TelemetrySpanStart::new(&spans::REPOSITORY_OPENED, attributes),
     );
     span.finish(TelemetrySpanStatus::Ok, Vec::new());
 }
@@ -776,9 +775,12 @@ mod tests {
     }
 
     impl TelemetrySink for RecordingSink {
-        fn enabled(&self, class: TelemetrySpanClass, name: &'static str) -> bool {
-            self.enabled_names.lock().expect("enabled names").push(name);
-            match class {
+        fn enabled(&self, descriptor: &TelemetrySpanDescriptor) -> bool {
+            self.enabled_names
+                .lock()
+                .expect("enabled names")
+                .push(descriptor.name());
+            match descriptor.class() {
                 TelemetrySpanClass::Lifecycle => self.opened_enabled,
                 TelemetrySpanClass::Sql | TelemetrySpanClass::Performance => self.sql_enabled,
             }
@@ -814,6 +816,19 @@ mod tests {
     }
 
     #[test]
+    fn production_contract_has_eleven_names_and_no_legacy_aliases() {
+        assert_eq!(spans::PRODUCTION_NAMES.len(), 11);
+        assert_eq!(spans::ALL.len(), 11);
+        let mut names = spans::PRODUCTION_NAMES.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 11);
+        for forbidden in spans::FORBIDDEN_PRODUCTION_NAMES {
+            assert!(!spans::PRODUCTION_NAMES.contains(forbidden));
+        }
+    }
+
+    #[test]
     fn absent_sink_does_no_opened_span_work() {
         bind_session(None, "lix-id", "branch-id", Some("account-id"));
     }
@@ -839,6 +854,7 @@ mod tests {
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].class, TelemetrySpanClass::Lifecycle);
         assert_eq!(started[0].name, "lix.repository.opened");
+        assert_eq!(started[0].descriptor(), &spans::REPOSITORY_OPENED);
         assert_eq!(attribute_string(&started[0], "lix.id"), Some("lix-id"));
         assert_eq!(
             attribute_string(&started[0], "lix.branch_id"),
@@ -864,5 +880,80 @@ mod tests {
         let started = sink.started.lock().expect("started spans").clone();
         assert_eq!(started.len(), 1);
         assert!(attribute_string(&started[0], "lix.account_id").is_none());
+    }
+
+    #[test]
+    fn dropped_span_finishes_as_cancelled() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("completed").push(span);
+        }));
+        drop(ActiveTelemetrySpan::start(
+            &sink,
+            TelemetrySpanStart::new(&spans::ENGINE_OPEN, Vec::new()),
+        ));
+        let completed = completed.lock().expect("completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].start.name, "lix.engine.open");
+        assert_eq!(completed[0].end.status, TelemetrySpanStatus::Cancelled);
+    }
+
+    #[test]
+    fn dropped_instrumented_future_finishes_as_cancelled() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("completed").push(span);
+        }));
+        let span = ActiveTelemetrySpan::start(
+            &sink,
+            TelemetrySpanStart::new(&spans::SESSION_OPEN, Vec::new()),
+        );
+        drop(instrument_lix_result(
+            Some(span),
+            std::future::pending::<Result<(), crate::LixError>>(),
+        ));
+        let completed = completed.lock().expect("completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].end.status, TelemetrySpanStatus::Cancelled);
+    }
+
+    #[test]
+    fn performance_spans_inherit_cohort_id_and_links() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().expect("completed").push(span);
+        }));
+        let links = vec![
+            TelemetrySpanLink {
+                trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                span_id: "1111111111111111".to_string(),
+            },
+            TelemetrySpanLink {
+                trace_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                span_id: "2222222222222222".to_string(),
+            },
+        ];
+        let context = TelemetryContext::root(Arc::clone(&sink))
+            .with_commit_cohort_id("cohort-1".to_string())
+            .with_links(links.clone());
+        futures_lite::future::block_on(context.instrument(async {
+            let span = ActiveTelemetrySpan::start_current(
+                &spans::TRANSACTION_MATERIALIZE,
+                vec![TelemetryAttribute::u64("lix.transaction.count", 2)],
+            )
+            .expect("materialize enabled");
+            span.finish(TelemetrySpanStatus::Ok, Vec::new());
+        }));
+        let completed = completed.lock().expect("completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].start.name, "lix.transaction.materialize");
+        assert_eq!(completed[0].start.links, links);
+        assert_eq!(
+            attribute_string(&completed[0].start, "lix.commit_cohort_id"),
+            Some("cohort-1")
+        );
     }
 }

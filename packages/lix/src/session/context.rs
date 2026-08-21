@@ -35,8 +35,8 @@ use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteSetStats};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::sync::SyncModeState;
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanClass,
-    TelemetrySpanStatus, instrument_value,
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanStatus, instrument_value,
+    spans,
 };
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{Transaction, open_transaction};
@@ -411,8 +411,7 @@ where
             let span = self.telemetry.as_ref().and_then(|sink| {
                 ActiveTelemetrySpan::start_if_enabled(
                     sink,
-                    TelemetrySpanClass::Performance,
-                    "lix.transaction.wait",
+                    &spans::TRANSACTION_WAIT,
                     vec![TelemetryAttribute::string(
                         "lix.wait.reason",
                         "collaboration_write_gate",
@@ -606,12 +605,7 @@ where
             ));
         }
         let span = self.telemetry.as_ref().and_then(|sink| {
-            ActiveTelemetrySpan::start_if_enabled(
-                sink,
-                TelemetrySpanClass::Performance,
-                "lix.transaction.notify",
-                attributes,
-            )
+            ActiveTelemetrySpan::start_if_enabled(sink, &spans::TRANSACTION_NOTIFY, attributes)
         });
         let _entered = span.as_ref().map(ActiveTelemetrySpan::enter);
         self.observe_invalidation
@@ -647,8 +641,7 @@ impl SessionWriteAccess {
     ) {
         if self.collaboration_write_guard.is_none() {
             let span = ActiveTelemetrySpan::start_current(
-                TelemetrySpanClass::Performance,
-                "lix.transaction.wait",
+                &spans::TRANSACTION_WAIT,
                 vec![TelemetryAttribute::string(
                     "lix.wait.reason",
                     "collaboration_write_gate",

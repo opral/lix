@@ -17,8 +17,8 @@ use crate::functions::FunctionContext;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::storage_adapter::Storage;
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetryAttribute, TelemetryContext, TelemetrySink, TelemetrySpanClass,
-    TelemetrySpanStatus, current_telemetry_context, next_commit_cohort_id,
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetryContext, TelemetrySink, TelemetrySpanLink,
+    TelemetrySpanStatus, current_telemetry_context, next_commit_cohort_id, spans,
 };
 
 const COMMIT_QUEUE_CAPACITY: usize = 256;
@@ -276,10 +276,7 @@ where
                 ))
                 .await;
             let transaction_count = cohort.len();
-            let telemetry_context = cohort
-                .first()
-                .and_then(|request| request.telemetry_context.clone())
-                .map(|context| context.with_commit_cohort_id(next_commit_cohort_id()));
+            let telemetry_context = cohort_telemetry_context(&cohort);
             let tracing_parent = cohort.first().map_or_else(tracing::Span::none, |request| {
                 request.tracing_parent.clone()
             });
@@ -296,8 +293,7 @@ where
                 let outcomes = Box::pin(commit_transaction_cohort(inputs)).await;
                 if let Some(outcome) = outcomes.iter().find_map(|result| result.as_ref().ok()) {
                     let notify = ActiveTelemetrySpan::start_current(
-                        TelemetrySpanClass::Performance,
-                        "lix.transaction.notify",
+                        &spans::TRANSACTION_NOTIFY,
                         vec![TelemetryAttribute::u64(
                             "lix.transaction.count",
                             u64::try_from(transaction_count).unwrap_or(u64::MAX),
@@ -382,6 +378,30 @@ where
     }
 }
 
+fn cohort_telemetry_context<StorageImpl>(
+    cohort: &[CommitRequest<StorageImpl>],
+) -> Option<TelemetryContext>
+where
+    StorageImpl: Storage + 'static,
+{
+    attach_cohort_parent_contexts(cohort.iter().filter_map(|request| request.telemetry_context.clone()))
+}
+
+fn attach_cohort_parent_contexts(
+    contexts: impl IntoIterator<Item = TelemetryContext>,
+) -> Option<TelemetryContext> {
+    let contexts = contexts.into_iter().collect::<Vec<_>>();
+    let links = contexts
+        .iter()
+        .filter_map(TelemetryContext::as_link)
+        .collect::<Vec<TelemetrySpanLink>>();
+    contexts.into_iter().next().map(|context| {
+        context
+            .with_commit_cohort_id(next_commit_cohort_id())
+            .with_links(links)
+    })
+}
+
 fn coordinator_closed() -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
@@ -393,6 +413,47 @@ fn coordinator_closed() -> LixError {
 mod tests {
     use super::*;
     use crate::storage_adapter::Memory;
+    use crate::telemetry::{CallbackTelemetrySink, TelemetryContext};
+
+    #[test]
+    fn cohort_context_links_every_logical_transaction() {
+        let completed = Mutex::new(Vec::new());
+        let captured = Arc::new(completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new({
+            let captured = Arc::clone(&captured);
+            move |span| captured.lock().expect("spans").push(span)
+        }));
+        let context = attach_cohort_parent_contexts([
+            TelemetryContext::for_test(Arc::clone(&sink), "trace-a", "span-a"),
+            TelemetryContext::for_test(Arc::clone(&sink), "trace-b", "span-b"),
+        ])
+        .expect("cohort context");
+        futures_lite::future::block_on(TelemetryContext::instrument(
+            &context,
+            async {
+                let span = ActiveTelemetrySpan::start_current(
+                    &spans::TRANSACTION_STORAGE,
+                    vec![TelemetryAttribute::u64("lix.transaction.count", 2)],
+                )
+                .expect("storage enabled");
+                span.finish(TelemetrySpanStatus::Ok, Vec::new());
+            },
+        ));
+        let spans = captured.lock().expect("spans");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start.name, "lix.transaction.storage");
+        assert_eq!(spans[0].start.parent_span_id.as_deref(), Some("span-a"));
+        assert_eq!(spans[0].start.links.len(), 2);
+        assert_eq!(spans[0].start.links[0].span_id, "span-a");
+        assert_eq!(spans[0].start.links[1].span_id, "span-b");
+        assert!(
+            spans[0]
+                .start
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "lix.commit_cohort_id")
+        );
+    }
 
     #[test]
     fn coordinator_capacity_accepts_realtime_collaboration_wave() {

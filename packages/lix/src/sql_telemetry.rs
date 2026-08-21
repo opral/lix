@@ -2,8 +2,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanClass, TelemetrySpanStart,
-    TelemetrySpanStatus,
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanStart, TelemetrySpanStatus,
+    spans,
 };
 use crate::{ExecuteResult, LixError};
 
@@ -21,7 +21,7 @@ impl SqlStatementTelemetry {
         batch_index: Option<usize>,
     ) -> Option<Self> {
         let sink = sink?;
-        if !sink.enabled(TelemetrySpanClass::Sql, "lix.sql.query") {
+        if !sink.enabled(&spans::SQL_QUERY) {
             return None;
         }
         Some(Self {
@@ -69,7 +69,7 @@ fn statement_start(
             u64::try_from(batch_index).unwrap_or(u64::MAX),
         ));
     }
-    TelemetrySpanStart::new(TelemetrySpanClass::Sql, "lix.sql.query", attributes)
+    TelemetrySpanStart::new(&spans::SQL_QUERY, attributes)
 }
 
 fn statement_end(
@@ -99,25 +99,26 @@ fn statement_end(
 
 pub(crate) fn start_batch(
     sink: Option<&Arc<dyn TelemetrySink>>,
-    name: &'static str,
+    descriptor: &'static crate::telemetry::TelemetrySpanDescriptor,
     size: usize,
 ) -> Option<ActiveTelemetrySpan> {
     let sink = sink?;
-    if !sink.enabled(TelemetrySpanClass::Sql, name) {
+    if !sink.enabled(descriptor) {
         return None;
     }
-    let execution_kind = match name {
-        "lix.sql.batch" => "batch",
-        "lix.sql.coherent_read_batch" => "coherent_read_batch",
-        _ => return None,
+    let execution_kind = if descriptor == &spans::SQL_BATCH {
+        "batch"
+    } else if descriptor == &spans::SQL_COHERENT_READ_BATCH {
+        "coherent_read_batch"
+    } else {
+        return None;
     };
     Some(ActiveTelemetrySpan::start(
         sink,
         TelemetrySpanStart::new(
-            TelemetrySpanClass::Sql,
-            name,
+            descriptor,
             vec![
-                TelemetryAttribute::string("otel.name", name),
+                TelemetryAttribute::string("otel.name", descriptor.name()),
                 TelemetryAttribute::string("otel.kind", "internal"),
                 TelemetryAttribute::string("db.system.name", "lix"),
                 TelemetryAttribute::u64(

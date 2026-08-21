@@ -150,6 +150,28 @@ test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 	await lix.close();
 });
 
+test("openLix forwards production commit phases through onSpan", async () => {
+	const names = new Set<string>();
+	const lix = await openLix({
+		telemetry: {
+			onSpan(span) {
+				names.add(span.name);
+			},
+		},
+	});
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('telemetry-cut', '1')",
+	);
+	expect(names.has("lix.sql.query")).toBe(true);
+	expect(names.has("lix.transaction.materialize")).toBe(true);
+	expect(names.has("lix.transaction.storage")).toBe(true);
+	expect(names.has("lix.transaction.notify")).toBe(true);
+	expect(names.has("SELECT")).toBe(false);
+	expect(names.has("SQL batch")).toBe(false);
+	expect(names.has("lix.opened")).toBe(false);
+	await lix.close();
+});
+
 test("native telemetry preserves its receiver and cannot fail commands", async () => {
 	const telemetry = {
 		calls: 0,

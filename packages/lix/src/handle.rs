@@ -1311,7 +1311,7 @@ where
 mod tests {
     use super::*;
     use lix::telemetry::{
-        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySink, TelemetrySpanClass,
+        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySink, TelemetrySpanDescriptor,
         TelemetrySpanEnd, TelemetrySpanHandle, TelemetrySpanStart,
     };
     use std::sync::{
@@ -1400,8 +1400,8 @@ mod tests {
         }
 
         impl TelemetrySink for SqlOnlySink {
-            fn enabled(&self, _class: TelemetrySpanClass, name: &'static str) -> bool {
-                name != "lix.repository.opened"
+            fn enabled(&self, descriptor: &TelemetrySpanDescriptor) -> bool {
+                descriptor.name() != "lix.repository.opened"
             }
 
             fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {

@@ -1888,7 +1888,11 @@ where
         idempotency: Option<ExecuteIdempotency>,
         require_idempotency_for_writes: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let telemetry = start_batch(self.telemetry.as_ref(), "lix.sql.batch", statements.len());
+        let telemetry = start_batch(
+            self.telemetry.as_ref(),
+            &crate::telemetry::spans::SQL_BATCH,
+            statements.len(),
+        );
         let operation = self.execute_batch_with_options_inner(
             statements,
             options,
@@ -2343,7 +2347,7 @@ where
     ) -> Result<CoherentReadBatch, LixError> {
         let telemetry = start_batch(
             self.telemetry.as_ref(),
-            "lix.sql.coherent_read_batch",
+            &crate::telemetry::spans::SQL_COHERENT_READ_BATCH,
             statements.len(),
         );
         let operation = self.execute_coherent_read_batch_inner(statements);

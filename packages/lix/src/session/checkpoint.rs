@@ -4,7 +4,7 @@ use crate::checkpoint::checkpoint_stage_row;
 use crate::gc::CheckpointGcState;
 use crate::storage_adapter::Storage;
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySpanClass, TelemetrySpanStatus,
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySpanStatus, spans,
 };
 #[cfg(test)]
 use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRow};
@@ -56,12 +56,7 @@ where
     /// maintenance work and cannot extend foreground checkpoint latency.
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
         let span = self.telemetry.as_ref().and_then(|sink| {
-            ActiveTelemetrySpan::start_if_enabled(
-                sink,
-                TelemetrySpanClass::Lifecycle,
-                "lix.checkpoint.create",
-                Vec::new(),
-            )
+            ActiveTelemetrySpan::start_if_enabled(sink, &spans::CHECKPOINT_CREATE, Vec::new())
         });
         let operation = self.with_write_transaction_lending(async move |transaction| {
             let branch_id = transaction.active_branch_id().to_string();

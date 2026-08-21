@@ -12,10 +12,19 @@ pub(crate) struct TelemetrySpanDto {
     span_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_span_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    links: Vec<TelemetrySpanLinkDto>,
     started_at_unix_ms: f64,
     duration_ms: f64,
     status: &'static str,
     attributes: BTreeMap<&'static str, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TelemetrySpanLinkDto {
+    trace_id: String,
+    span_id: String,
 }
 
 #[expect(
@@ -39,6 +48,15 @@ impl From<CompletedTelemetrySpan> for TelemetrySpanDto {
             trace_id: span.start.trace_id,
             span_id: span.start.span_id,
             parent_span_id: span.start.parent_span_id,
+            links: span
+                .start
+                .links
+                .into_iter()
+                .map(|link| TelemetrySpanLinkDto {
+                    trace_id: link.trace_id,
+                    span_id: link.span_id,
+                })
+                .collect(),
             started_at_unix_ms: span.start.started_at_unix_ms as f64,
             duration_ms: span.end.duration_ns as f64 / 1_000_000.0,
             status: match span.end.status {
