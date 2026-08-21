@@ -101,6 +101,7 @@ pub(crate) use storage::{
     stage_current_state_scoped_ranges_from_published_topology_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
     stage_current_state_scoped_ranges_from_topology, stage_imported_addressable_commit_deltas,
+    stage_imported_addressable_commit_deltas_with_selected_source,
     stage_ordered_addressable_commit_deltas, stage_ordered_addressable_replacement_parts,
     stage_ordered_columnar_mutations, stage_preencoded_ordered_addressable_replacement_parts,
     stage_prefixed_ordered_addressable_replacement_parts,
