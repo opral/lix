@@ -37,7 +37,9 @@ use crate::row_pk::{RowPk, RowPkError, canonical_json_text};
 #[cfg(test)]
 use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definition};
 use crate::schema::{schema_from_registered_snapshot, validate_schema_amendment};
-use crate::transaction::normalization::reject_reserved_schema_namespace;
+use crate::transaction::normalization::{
+    reject_reserved_schema_namespace, reject_reserved_schema_namespace_unless_exact_builtin,
+};
 use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::{
     PreparedInsertRef, PreparedValidationRow, PreparedWriteSet, PreparedWriteValidationSet,
@@ -1101,8 +1103,8 @@ async fn validate_registered_schema_identity_is_canonical(
     for pending_row in pending_schema_rows {
         let pending_snapshot = staged_registered_schema_snapshot(*pending_row)?
             .expect("pending registered schema row has a live payload");
-        let (key, _) = schema_from_registered_snapshot(&pending_snapshot)?;
-        reject_reserved_schema_namespace(&key)?;
+        let (key, pending_schema) = schema_from_registered_snapshot(&pending_snapshot)?;
+        reject_reserved_schema_namespace_unless_exact_builtin(&key, &pending_schema)?;
 
         let committed_rows = load_committed_constraint_rows(
             input.hot_state,

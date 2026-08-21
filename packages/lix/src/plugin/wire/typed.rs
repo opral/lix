@@ -980,16 +980,18 @@ pub(crate) fn decode_engine_row_payload(
         )));
     }
     let column_count = reader.u32()? as usize;
-    if column_count != schema.canonical_columns().len() {
+    let schema_column_count = schema.canonical_columns().len();
+    if column_count > schema_column_count {
         return Err(Error::Invalid(
             "engine typed row column count does not match its schema",
         ));
     }
-    let mut row = Row::with_capacity(column_count);
-    for column in schema.canonical_columns() {
+    let mut row = Row::with_capacity(schema_column_count);
+    for column in schema.canonical_columns().take(column_count) {
         row.insert(column, reader.value(&mut [])?);
     }
     reader.finish()?;
+    schema.materialize_missing_nullable_columns(&mut row);
     schema.validate_complete_row(&row).map_err(|error| {
         Error::Message(format!(
             "decoded engine typed row does not satisfy its schema: {error}"
@@ -1017,15 +1019,25 @@ pub(crate) fn visit_engine_row_payload<'a>(
         )));
     }
     let column_count = reader.u32()? as usize;
-    if column_count != schema.canonical_columns().len() {
+    let schema_column_count = schema.canonical_columns().len();
+    if column_count > schema_column_count {
         return Err(Error::Invalid(
             "engine typed row column count does not match its schema",
         ));
     }
-    for column in schema.canonical_columns() {
+    for column in schema.canonical_columns().take(column_count) {
         visit_field(column, reader.borrowed_value()?);
     }
-    reader.finish()
+    reader.finish()?;
+    for column in schema.canonical_columns().skip(column_count) {
+        if schema.column_nullable(column) != Some(true) {
+            return Err(Error::Invalid(
+                "engine typed row column count does not match its schema",
+            ));
+        }
+        visit_field(column, BorrowedNativeValue::Null);
+    }
+    Ok(())
 }
 
 fn encoded_inline_row_size(row: &Row) -> Result<usize, Error> {
@@ -2125,6 +2137,58 @@ mod tests {
         super::encode_value_inline(&mut corrupt, &Value::Null).expect("NULL should encode");
 
         assert!(super::decode_engine_row_payload(&corrupt, &compiled).is_err());
+    }
+
+    #[test]
+    fn compact_engine_payload_materializes_appended_nullable_columns() {
+        let historical: Schema = serde_json::from_value(serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "compact_probe",
+            "columns": [
+                {"name": "id", "type": "uuid", "nullable": false},
+                {"name": "value", "type": "text", "nullable": false}
+            ],
+            "primary_key": ["id"]
+        }))
+        .expect("historical compact schema should decode");
+        let amended: Schema = serde_json::from_value(serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "compact_probe",
+            "columns": [
+                {"name": "id", "type": "uuid", "nullable": false},
+                {"name": "value", "type": "text", "nullable": false},
+                {"name": "profile_uri", "type": "text", "nullable": true}
+            ],
+            "primary_key": ["id"]
+        }))
+        .expect("amended compact schema should decode");
+        let historical =
+            CompiledSchema::compile(&historical).expect("historical schema should compile");
+        let amended = CompiledSchema::compile(&amended).expect("amended schema should compile");
+        let id = uuid::Uuid::from_u128(1);
+        let row = Row::from([
+            ("id", Value::Uuid(id)),
+            ("value", Value::Text("payload".to_owned())),
+        ]);
+        let compact = super::encode_engine_row_payload(&historical, &row)
+            .expect("historical compact payload should encode");
+
+        let mut expected = row;
+        expected.insert("profile_uri", Value::Null);
+        assert_eq!(
+            super::decode_engine_row_payload(&compact, &amended)
+                .expect("nullable amendment should decode historical payload"),
+            expected
+        );
+        let mut visited = Vec::new();
+        super::visit_engine_row_payload(&compact, &amended, |name, value| {
+            visited.push((name.to_owned(), value));
+        })
+        .expect("projection visitor should materialize the nullable amendment");
+        assert_eq!(
+            visited.last(),
+            Some(&("profile_uri".to_owned(), super::BorrowedNativeValue::Null))
+        );
     }
 
     #[test]

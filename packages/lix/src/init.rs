@@ -88,9 +88,14 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// its branch control. The explicit offline migration rebuilds stale derived
 /// projections once; application and protocol session opening contains no
 /// legacy repair path.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 72;
+///
+/// `v73` durably amends every live branch's persisted `lix_account` schema
+/// with the nullable `profile_uri` column. The schema catalog is repository
+/// data, so changing only the bundled initialization document would leave v72
+/// repositories on the historical SQL surface.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 73;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v72";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v73";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -1219,20 +1224,20 @@ mod tests {
     #[test]
     fn repository_protocol_parser_distinguishes_versions() {
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v72"),
+            parse_repository_protocol(b"tracked-default-branch.v73"),
             RepositoryProtocolStatus::Current
         );
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v71"),
-            RepositoryProtocolStatus::MigrationRequired { found_version: 71 }
+            parse_repository_protocol(b"tracked-default-branch.v72"),
+            RepositoryProtocolStatus::MigrationRequired { found_version: 72 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v69"),
             RepositoryProtocolStatus::MigrationRequired { found_version: 69 }
         );
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v73"),
-            RepositoryProtocolStatus::TooNew { found_version: 73 }
+            parse_repository_protocol(b"tracked-default-branch.v74"),
+            RepositoryProtocolStatus::TooNew { found_version: 74 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),
