@@ -124,7 +124,9 @@ pub(crate) struct DeferredFinalPutPage {
 /// is accepted only when its target spaces have no ordinary mutations.
 pub(crate) trait DeferredFinalPutSource: Send + Sync {
     fn target_spaces(&self) -> &[StorageSpace];
+    #[allow(dead_code)]
     fn put_count(&self) -> u64;
+    #[allow(dead_code)]
     fn written_bytes(&self) -> u64;
     fn backend_capacity_hint_bytes(&self) -> usize;
     fn next_page(&mut self) -> Option<DeferredFinalPutPage>;
@@ -434,6 +436,7 @@ impl StorageWriteSet {
     /// makes their no-duplicate certificate compositional with the ordinary
     /// write-set validator instead of silently bypassing mutations staged by
     /// another domain writer.
+    #[allow(dead_code)]
     pub(crate) fn stage_deferred_final_put_source(
         &mut self,
         source: Box<dyn DeferredFinalPutSource>,
@@ -746,6 +749,16 @@ impl StorageWriteSet {
             .collect()
     }
 
+    #[cfg(feature = "storage-benches")]
+    pub fn put_counts_by_space(&self) -> Vec<(StorageSpace, usize)> {
+        self.groups
+            .iter()
+            .filter_map(|group| {
+                (!group.puts.is_empty()).then_some((group.space, group.puts.len()))
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn has_mutations_in_space(&self, space: StorageSpace) -> bool {
         self.group_index
@@ -827,6 +840,35 @@ impl StorageWriteSet {
     {
         self.validate_and_sort()?;
         self.lower_sorted_into(write).await
+    }
+
+    /// Extracts builder-produced point puts for an offline format migration.
+    ///
+    /// Migration publication needs to route immutable puts through
+    /// `StorageWrite::replace_many`; ordinary write-set lowering
+    /// intentionally cannot do that. Only delete-free, non-deferred plans are
+    /// accepted here.
+    pub(crate) fn into_migration_put_batches(
+        mut self,
+    ) -> Result<Vec<(StorageSpace, PutBatch)>, StorageWriteSetError> {
+        self.validate_and_sort()?;
+        if !self.exclusive_range_deletes.is_empty()
+            || !self.deferred_final_puts.is_empty()
+            || self.groups.iter().any(|group| !group.deletes.is_empty())
+        {
+            return Err(StorageWriteSetError::Storage(StorageError::Corruption(
+                "migration builder plan contains deletes or deferred writes".to_string(),
+            )));
+        }
+        Ok(self
+            .groups
+            .into_iter()
+            .filter_map(|group| {
+                let (space, puts, deletes) = group.lower();
+                debug_assert!(deletes.is_empty());
+                (!puts.is_empty()).then_some((space, PutBatch { entries: puts }))
+            })
+            .collect())
     }
 
     /// Validates the owned write set while putting each storage batch in its
@@ -1357,6 +1399,15 @@ mod tests {
 
     impl StorageWrite for CapturingStorageWrite {
         fn put_many(
+            &mut self,
+            space: StorageSpace,
+            entries: PutBatch,
+        ) -> impl Future<Output = Result<(), StorageError>> + Send {
+            self.puts.push((space, entries));
+            async { Ok(()) }
+        }
+
+        fn replace_many(
             &mut self,
             space: StorageSpace,
             entries: PutBatch,

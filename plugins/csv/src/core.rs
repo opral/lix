@@ -1,9 +1,10 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde_json::Value;
+use lix_schema::{Row as TypedRow, Value as TypedValue};
+use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub const TABLE_SCHEMA_KEY: &str = "csv_table";
 pub const ROW_SCHEMA_KEY: &str = "csv_row";
@@ -31,20 +32,20 @@ impl IdNamespace {
         Self(bytes)
     }
 
-    pub fn encode(self, ordinal: u64) -> String {
+    pub fn encode(self, ordinal: u64) -> uuid::Uuid {
         let ordinal = u32::try_from(ordinal)
             .expect("one CSV mutation cannot allocate more than u32::MAX rows");
         let mut bytes = [0; 16];
         bytes[..12].copy_from_slice(&self.0[..12]);
         bytes[12..].copy_from_slice(&ordinal.to_be_bytes());
-        uuid::Uuid::from_bytes(bytes).to_string()
+        uuid::Uuid::from_bytes(bytes)
     }
 
     /// Converts one API-generated ID back into the compact namespace retained
     /// by the CSV identity index. Author code never receives raw namespace
     /// halves; this is only the reference core's storage optimization.
-    pub fn from_generated_id(id: &str) -> Result<Self, String> {
-        decode_generated_id(id.as_bytes())
+    pub fn from_generated_id(id: uuid::Uuid) -> Result<Self, String> {
+        decode_generated_id(id)
             .map(|(namespace, _)| Self(namespace))
             .ok_or_else(|| "plugin API generated an invalid CSV identity".to_owned())
     }
@@ -66,7 +67,7 @@ impl Terminator {
         }
     }
 
-    fn snapshot(self) -> &'static str {
+    fn text(self) -> &'static str {
         match self {
             Self::Lf => "\n",
             Self::CrLf => "\r\n",
@@ -154,19 +155,25 @@ pub enum ChangeEffect {
     FormatOnly,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowChange {
-    pub schema_key: String,
-    pub row_pk: Vec<String>,
-    pub snapshot: Option<Vec<u8>>,
+    pub schema_key: Arc<str>,
+    pub row_pk: Vec<TypedValue>,
+    pub row: Option<TypedRow>,
     pub effect: ChangeEffect,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowRecord {
-    pub schema_key: String,
-    pub row_pk: Vec<String>,
-    pub snapshot: Vec<u8>,
+    pub schema_key: Arc<str>,
+    pub row_pk: Vec<TypedValue>,
+    pub row: TypedRow,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowIdentity {
+    pub id: uuid::Uuid,
+    pub order_key: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -407,31 +414,54 @@ fn push_blob_piece(output: &mut Vec<BlobPiece>, piece: BlobPiece) {
 }
 
 impl RowChange {
-    fn upsert(schema_key: &str, row_pk: String, snapshot: Vec<u8>) -> Self {
-        Self::upsert_with_effect(schema_key, row_pk, snapshot, ChangeEffect::Content)
+    fn upsert_row(row_pk: uuid::Uuid, row: TypedRow) -> Self {
+        Self::upsert_row_with_effect(row_pk, row, ChangeEffect::Content)
     }
 
-    fn upsert_with_effect(
-        schema_key: &str,
-        row_pk: String,
-        snapshot: Vec<u8>,
-        effect: ChangeEffect,
-    ) -> Self {
+    fn upsert_row_with_effect(row_pk: uuid::Uuid, row: TypedRow, effect: ChangeEffect) -> Self {
         Self {
-            schema_key: schema_key.to_owned(),
-            row_pk: vec![row_pk],
-            snapshot: Some(snapshot),
+            schema_key: ROW_SCHEMA_KEY.into(),
+            row_pk: vec![TypedValue::Uuid(row_pk)],
+            row: Some(row),
             effect,
         }
     }
 
-    fn delete(schema_key: &str, row_pk: String) -> Self {
+    fn delete_row(row_pk: uuid::Uuid) -> Self {
         Self {
-            schema_key: schema_key.to_owned(),
-            row_pk: vec![row_pk],
-            snapshot: None,
+            schema_key: ROW_SCHEMA_KEY.into(),
+            row_pk: vec![TypedValue::Uuid(row_pk)],
+            row: None,
             effect: ChangeEffect::Content,
         }
+    }
+
+    fn upsert_table(row: TypedRow) -> Self {
+        Self {
+            schema_key: TABLE_SCHEMA_KEY.into(),
+            row_pk: vec![TypedValue::Text(ROOT_ROW_PK.to_owned())],
+            row: Some(row),
+            effect: ChangeEffect::Content,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum PrimaryKey {
+    Table(String),
+    Row(uuid::Uuid),
+}
+
+fn primary_key(schema_key: &str, row_pk: &[TypedValue]) -> Result<PrimaryKey, String> {
+    if row_pk.len() != 1 {
+        return Err("CSV rows require one primary-key component".to_owned());
+    }
+    match (schema_key, &row_pk[0]) {
+        (TABLE_SCHEMA_KEY, TypedValue::Text(value)) => Ok(PrimaryKey::Table(value.clone())),
+        (ROW_SCHEMA_KEY, TypedValue::Uuid(value)) => Ok(PrimaryKey::Row(*value)),
+        (TABLE_SCHEMA_KEY, _) => Err("CSV table primary key must be text".to_owned()),
+        (ROW_SCHEMA_KEY, _) => Err("CSV row primary key must be UUID".to_owned()),
+        _ => Err(format!("unsupported CSV schema '{schema_key}'")),
     }
 }
 
@@ -464,7 +494,7 @@ struct IdentityChunk {
 #[derive(Clone, Debug)]
 enum StoredIdentity {
     Generated { namespace_index: u16, ordinal: u64 },
-    NonCompact(Arc<str>),
+    NonCompact(uuid::Uuid),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -516,7 +546,8 @@ impl IdentityStore {
         for (slot, range) in ranges.into_iter().enumerate() {
             let start = usize::try_from(range.start).expect("u32 fits usize");
             let end = start + usize::try_from(range.len).expect("u32 fits usize");
-            let id = &bytes[start..end];
+            let id = uuid::Uuid::from_slice(&bytes[start..end])
+                .map_err(|_| "CSV import contains an invalid UUID identity".to_owned())?;
             if let Some((namespace, ordinal)) = decode_generated_id(id) {
                 let namespace_index = if let Some(index) = namespace_lookup.get(&namespace) {
                     usize::from(*index)
@@ -550,12 +581,12 @@ impl IdentityStore {
             } else {
                 let noncompact_start = u32::try_from(noncompact_bytes.len())
                     .expect("validated noncompact identity bytes fit u32");
-                noncompact_bytes.extend_from_slice(id);
+                noncompact_bytes.extend_from_slice(id.as_bytes());
                 namespace_indices.push(u16::MAX);
                 ordinals.push(0);
                 noncompact_ranges.push(IdentityRange {
                     start: noncompact_start,
-                    len: u32::try_from(id.len()).expect("validated identity length fits u32"),
+                    len: 16,
                 });
             }
         }
@@ -574,18 +605,17 @@ impl IdentityStore {
         Ok(store)
     }
 
-    fn id(&self, slot: u32) -> String {
+    fn id(&self, slot: u32) -> uuid::Uuid {
         let index = usize::try_from(slot).expect("u32 fits usize");
         if index >= self.base_len() {
-            return self.appended_identity(slot).to_string(self);
+            return self.appended_identity(slot).to_uuid(self);
         }
         let noncompact = self.base_noncompact_ranges[index];
         if noncompact.len != 0 {
             let start = usize::try_from(noncompact.start).expect("u32 fits usize");
             let end = start + usize::try_from(noncompact.len).expect("u32 fits usize");
-            return std::str::from_utf8(&self.base_noncompact_bytes[start..end])
-                .expect("noncompact row IDs were validated as UTF-8")
-                .to_owned();
+            return uuid::Uuid::from_slice(&self.base_noncompact_bytes[start..end])
+                .expect("noncompact row IDs were validated as UUIDs");
         }
         let namespace_index = usize::from(self.base_namespace_indices[index]);
         IdNamespace(self.namespaces[namespace_index]).encode(self.base_ordinals[index])
@@ -620,8 +650,8 @@ impl IdentityStore {
         ))
     }
 
-    fn slot_for_id(&self, id: &str) -> Option<u32> {
-        if let Some((namespace, ordinal)) = decode_generated_id(id.as_bytes())
+    fn slot_for_id(&self, id: uuid::Uuid) -> Option<u32> {
+        if let Some((namespace, ordinal)) = decode_generated_id(id)
             && let Some(namespace_index) = self
                 .namespaces
                 .iter()
@@ -647,13 +677,13 @@ impl IdentityStore {
                     .iter()
                     .rev()
                     .copied()
-                    .find(|slot| self.id_eq(*slot, id.as_bytes()))
+                    .find(|slot| self.id_eq(*slot, id))
             })
-            .or_else(|| self.base_lookup.find(self, hash, id.as_bytes()))
+            .or_else(|| self.base_lookup.find(self, hash, id))
     }
 
     fn append_generated(&mut self, namespace: IdNamespace, ordinal: u64) -> Result<u32, String> {
-        if self.slot_for_id(&namespace.encode(ordinal)).is_some() {
+        if self.slot_for_id(namespace.encode(ordinal)).is_some() {
             return Err("generated CSV row identity already exists".to_owned());
         }
         let namespace_index = if let Some(index) = self
@@ -680,12 +710,12 @@ impl IdentityStore {
         Ok(slot)
     }
 
-    fn append_id(&mut self, id: &str) -> Result<u32, String> {
+    fn append_id(&mut self, id: uuid::Uuid) -> Result<u32, String> {
         if self.slot_for_id(id).is_some() {
             return Err("CSV row identity already exists".to_owned());
         }
         let slot = self.len_u32()?;
-        let identity = if let Some((namespace, ordinal)) = decode_generated_id(id.as_bytes()) {
+        let identity = if let Some((namespace, ordinal)) = decode_generated_id(id) {
             let namespace_index = if let Some(index) = self
                 .namespaces
                 .iter()
@@ -704,7 +734,7 @@ impl IdentityStore {
                 ordinal,
             }
         } else {
-            StoredIdentity::NonCompact(Arc::from(id))
+            StoredIdentity::NonCompact(id)
         };
         self.append_identity(identity)?;
         Ok(slot)
@@ -758,16 +788,16 @@ impl IdentityStore {
         &self.appended[offset / IDENTITIES_PER_CHUNK].entries[offset % IDENTITIES_PER_CHUNK]
     }
 
-    fn id_eq(&self, slot: u32, id: &[u8]) -> bool {
+    fn id_eq(&self, slot: u32, id: uuid::Uuid) -> bool {
         let index = usize::try_from(slot).expect("u32 fits usize");
         if index >= self.base_len() {
-            return self.appended_identity(slot).eq_bytes(self, id);
+            return self.appended_identity(slot).eq_uuid(self, id);
         }
         let range = self.base_noncompact_ranges[index];
         if range.len != 0 {
             let start = usize::try_from(range.start).expect("u32 fits usize");
             let end = start + usize::try_from(range.len).expect("u32 fits usize");
-            return &self.base_noncompact_bytes[start..end] == id;
+            return &self.base_noncompact_bytes[start..end] == id.as_bytes();
         }
         decode_generated_id(id).is_some_and(|(namespace, ordinal)| {
             self.namespaces[usize::from(self.base_namespace_indices[index])] == namespace
@@ -792,7 +822,7 @@ impl IdentityStore {
                             .entries
                             .iter()
                             .map(|identity| match identity {
-                                StoredIdentity::NonCompact(value) => value.len(),
+                                StoredIdentity::NonCompact(_) => 16,
                                 StoredIdentity::Generated { .. } => 0,
                             })
                             .sum::<usize>()
@@ -802,17 +832,17 @@ impl IdentityStore {
 }
 
 impl StoredIdentity {
-    fn to_string(&self, store: &IdentityStore) -> String {
+    fn to_uuid(&self, store: &IdentityStore) -> uuid::Uuid {
         match self {
             Self::Generated {
                 namespace_index,
                 ordinal,
             } => IdNamespace(store.namespaces[usize::from(*namespace_index)]).encode(*ordinal),
-            Self::NonCompact(value) => value.to_string(),
+            Self::NonCompact(value) => *value,
         }
     }
 
-    fn eq_bytes(&self, store: &IdentityStore, id: &[u8]) -> bool {
+    fn eq_uuid(&self, store: &IdentityStore, id: uuid::Uuid) -> bool {
         match self {
             Self::Generated {
                 namespace_index,
@@ -821,7 +851,7 @@ impl StoredIdentity {
                 store.namespaces[usize::from(*namespace_index)] == namespace
                     && *ordinal == candidate
             }),
-            Self::NonCompact(value) => value.as_bytes() == id,
+            Self::NonCompact(value) => *value == id,
         }
     }
 }
@@ -862,7 +892,7 @@ impl IdentityLookup {
         Ok(Self { slots })
     }
 
-    fn find(&self, store: &IdentityStore, hash: u64, id: &[u8]) -> Option<u32> {
+    fn find(&self, store: &IdentityStore, hash: u64, id: uuid::Uuid) -> Option<u32> {
         if self.slots.is_empty() {
             return None;
         }
@@ -928,10 +958,7 @@ fn identity_hash(bytes: &[u8]) -> u64 {
 }
 
 fn generated_identity_hash(namespace: [u8; 16], ordinal: u64) -> u64 {
-    let mut bytes = [0u8; 24];
-    bytes[..16].copy_from_slice(&namespace);
-    bytes[16..].copy_from_slice(&ordinal.to_be_bytes());
-    identity_hash(&URL_SAFE_NO_PAD.encode(bytes).into_bytes())
+    identity_hash(IdNamespace(namespace).encode(ordinal).as_bytes())
 }
 
 fn identity_hash_for_stored(store: &IdentityStore, identity: &StoredIdentity) -> u64 {
@@ -983,9 +1010,7 @@ fn identity_lookup_insert(
     Arc::new(output)
 }
 
-fn decode_generated_id(id: &[u8]) -> Option<([u8; 16], u64)> {
-    let id = std::str::from_utf8(id).ok()?;
-    let decoded = uuid::Uuid::parse_str(id).ok()?;
+fn decode_generated_id(decoded: uuid::Uuid) -> Option<([u8; 16], u64)> {
     let mut namespace = [0_u8; 16];
     namespace[..12].copy_from_slice(&decoded.as_bytes()[..12]);
     let ordinal = u64::from(u32::from_be_bytes(
@@ -1500,7 +1525,7 @@ struct ImportedLayout {
 }
 
 /// Incremental cold-start importer. Packet pages are decoded and compacted as
-/// they arrive, so the guest never retains all row snapshots or a
+/// they arrive, so the guest never retains all typed rows or a
 /// `Vec<String>` per row. The compact arenas are consumed directly when the
 /// accepted renderer document is constructed.
 #[derive(Debug)]
@@ -1530,24 +1555,22 @@ impl RowImportBuilder {
     }
 
     pub(crate) fn push(&mut self, record: RowRecord) -> Result<(), String> {
-        if record.row_pk.len() != 1 {
-            return Err("CSV rows require one primary-key component".to_owned());
-        }
-        match record.schema_key.as_str() {
+        let row_pk = primary_key(&record.schema_key, &record.row_pk)?;
+        match record.schema_key.as_ref() {
             TABLE_SCHEMA_KEY => {
-                if record.row_pk[0] != ROOT_ROW_PK {
+                if row_pk != PrimaryKey::Table(ROOT_ROW_PK.to_owned()) {
                     return Err("CSV table primary key must be root".to_owned());
                 }
                 if self.table_root_seen {
                     return Err("CSV cold state contains duplicate table root".to_owned());
                 }
-                self.dialect = parse_table_snapshot(&record.snapshot)?;
+                self.dialect = parse_table_row(&record.row)?;
                 self.table_root_seen = true;
             }
             ROW_SCHEMA_KEY => {
-                let row = parse_row_snapshot(&record.snapshot)?;
-                if row.id != record.row_pk[0] {
-                    return Err("CSV row snapshot id does not match row key".to_owned());
+                let row = parse_csv_row(&record.row)?;
+                if row_pk != PrimaryKey::Row(row.id) {
+                    return Err("CSV row id does not match row key".to_owned());
                 }
                 let id = append_import_bytes(&mut self.id_bytes, row.id.as_bytes())?;
                 if !row.layout.is_default() {
@@ -1888,11 +1911,19 @@ impl Document {
         path: Option<&str>,
         namespace: IdNamespace,
     ) -> Result<(Self, InitialChanges), String> {
+        Self::open_file_with_dialect(bytes, Dialect::for_path(path), namespace)
+    }
+
+    pub fn open_file_with_dialect(
+        bytes: Vec<u8>,
+        mut dialect: Dialect,
+        namespace: IdNamespace,
+    ) -> Result<(Self, InitialChanges), String> {
         if bytes.len() > u32::MAX as usize {
             return Err("CSV supports files smaller than 4GiB".to_owned());
         }
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
-        let mut dialect = Dialect::for_path(path);
+        dialect = dialect.validate_row()?;
         let mut drafts = scan_rows(&bytes, 0, bytes.len(), dialect)?;
         dialect.terminator =
             preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
@@ -1912,6 +1943,30 @@ impl Document {
             table_pending: true,
         };
         Ok((document, changes))
+    }
+
+    pub fn open_file_with_identities(
+        bytes: Vec<u8>,
+        dialect: Dialect,
+        namespace: IdNamespace,
+        identities: &[RowIdentity],
+    ) -> Result<Self, String> {
+        let document = Self::open_file_with_dialect(bytes, dialect, namespace)?.0;
+        let mut records = document.row_records()?;
+        if records.len() != identities.len() + 1 {
+            return Err("CSV identity checkpoint row count does not match the file".to_owned());
+        }
+        for (record, identity) in records.iter_mut().skip(1).zip(identities) {
+            record.row_pk = vec![TypedValue::Uuid(identity.id)];
+            record
+                .row
+                .insert("id".to_owned(), TypedValue::Uuid(identity.id));
+            record.row.insert(
+                "order_key".to_owned(),
+                TypedValue::Text(identity.order_key.clone()),
+            );
+        }
+        Self::open_rows(records).map(|(document, _)| document)
     }
 
     pub fn fork(&self) -> Self {
@@ -1941,7 +1996,7 @@ impl Document {
     /// Returns the compact row-offset arena when every durable identity and
     /// order key still has the initial dense form. Structural edits fall back
     /// to the paged identity checkpoint; ordinary large-file successors avoid
-    /// materializing and serializing every row snapshot a second time.
+    /// materializing and serializing every typed row a second time.
     pub fn canonical_arena_state(&self) -> Option<([u8; 12], Vec<u8>)> {
         let row_count = self.0.index.row_count;
         if row_count == 0 {
@@ -2087,6 +2142,25 @@ impl Document {
         )?;
         assign_missing_order_ranks(self, &old_locations, &mut new_drafts)?;
 
+        let old_ranks = old_locations
+            .iter()
+            .map(|location| {
+                let (_, row) = self.0.index.row(*location);
+                (row.id_slot, row.order_rank)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut order_overrides = self.0.order_overrides.clone();
+        for draft in &new_drafts {
+            let slot = draft.id_slot.expect("assigned row identity");
+            let rank = draft.order_rank.expect("assigned rank");
+            let Some(old_rank) = old_ranks.get(&slot) else {
+                continue;
+            };
+            if *old_rank != rank {
+                order_overrides = order_overrides.with_key(slot, &format!("{rank:016x}"), rank);
+            }
+        }
+
         let delta = i64::try_from(after.len()).expect("u32-sized file fits i64")
             - i64::try_from(self.0.blob.len()).expect("u32-sized file fits i64");
         let mut next_chunk_key = self.0.index.next_chunk_key;
@@ -2097,7 +2171,7 @@ impl Document {
             blob: after,
             index: new_index,
             identities,
-            order_overrides: self.0.order_overrides.clone(),
+            order_overrides,
             // A local edit does not re-sniff global dialect metadata. Mixed
             // line endings stay attached to their indexed rows.
             dialect: self.0.dialect,
@@ -2159,34 +2233,33 @@ impl Document {
         }
         if changes
             .iter()
-            .any(|change| change.schema_key == TABLE_SCHEMA_KEY && change.snapshot.is_none())
+            .any(|change| change.schema_key.as_ref() == TABLE_SCHEMA_KEY && change.row.is_none())
         {
             return Err("CSV table root cannot be deleted".to_owned());
         }
-        if changes.len() == 1 && changes[0].schema_key == ROW_SCHEMA_KEY {
+        if changes.len() == 1 && changes[0].schema_key.as_ref() == ROW_SCHEMA_KEY {
             let change = &changes[0];
-            if change.row_pk.len() != 1 {
-                return Err("CSV row changes require one primary-key component".to_owned());
-            }
-            let id = &change.row_pk[0];
+            let PrimaryKey::Row(id) = primary_key(&change.schema_key, &change.row_pk)? else {
+                unreachable!("CSV row schema has a UUID primary key")
+            };
             let slot = self.0.identities.slot_for_id(id);
             let existing = slot.and_then(|slot| self.0.index.location_for_identity_slot(slot));
-            match (&change.snapshot, existing) {
+            match (&change.row, existing) {
                 (None, Some(location)) => return self.delete_sparse_row(location),
                 (None, None) => return Ok((self.clone(), Vec::new())),
-                (Some(snapshot), Some(location)) => {
-                    let semantic = parse_row_snapshot(snapshot)?;
-                    if semantic.id != *id {
-                        return Err("CSV row snapshot id does not match row key".to_owned());
+                (Some(row), Some(location)) => {
+                    let semantic = parse_csv_row(row)?;
+                    if semantic.id != id {
+                        return Err("CSV row id does not match row key".to_owned());
                     }
                     if let Some(result) = self.update_or_reorder_sparse_row(location, &semantic)? {
                         return Ok(result);
                     }
                 }
-                (Some(snapshot), None) => {
-                    let semantic = parse_row_snapshot(snapshot)?;
-                    if semantic.id != *id {
-                        return Err("CSV row snapshot id does not match row key".to_owned());
+                (Some(row), None) => {
+                    let semantic = parse_csv_row(row)?;
+                    if semantic.id != id {
+                        return Err("CSV row id does not match row key".to_owned());
                     }
                     return self.insert_sparse_row(slot, &semantic);
                 }
@@ -2196,7 +2269,7 @@ impl Document {
         // Multi-row sparse sets and dialect mutation use the exact cold
         // renderer. Every single-row content/delete/insert/reorder case above
         // stays local except an unterminated-EOF reorder.
-        let records = apply_row_changes(self.row_records()?, changes);
+        let records = apply_row_changes(self.row_records()?, changes)?;
         let (document, mut edit) = Self::open_rows(records)?;
         edit.delete_len = u64::try_from(self.0.blob.len()).expect("file length fits u64");
         Ok((document, vec![edit]))
@@ -2205,25 +2278,44 @@ impl Document {
     pub fn row_records(&self) -> Result<Vec<RowRecord>, String> {
         let mut records = Vec::with_capacity(self.row_count() + 1);
         records.push(RowRecord {
-            schema_key: TABLE_SCHEMA_KEY.to_owned(),
-            row_pk: vec![ROOT_ROW_PK.to_owned()],
-            snapshot: table_snapshot(self.0.dialect),
+            schema_key: TABLE_SCHEMA_KEY.into(),
+            row_pk: vec![TypedValue::Text(ROOT_ROW_PK.to_owned())],
+            row: table_row(self.0.dialect),
         });
         for location in self.0.index.locations() {
             records.push(RowRecord {
-                schema_key: ROW_SCHEMA_KEY.to_owned(),
-                row_pk: vec![self.row_id(location)],
-                snapshot: self.row_snapshot(location)?,
+                schema_key: ROW_SCHEMA_KEY.into(),
+                row_pk: vec![TypedValue::Uuid(self.row_id(location))],
+                row: self.typed_row(location)?,
             });
         }
         Ok(records)
     }
 
-    fn row_snapshot(&self, location: RowLocation) -> Result<Vec<u8>, String> {
+    pub fn identity_checkpoint(&self) -> (Dialect, Vec<RowIdentity>) {
+        let mut locations = self.0.index.locations().collect::<Vec<_>>();
+        locations.sort_unstable_by_key(|&location| {
+            let (chunk, row) = self.0.index.row(location);
+            chunk.byte_start + row.relative_start
+        });
+        let identities = locations
+            .into_iter()
+            .map(|location| {
+                let (_, row) = self.0.index.row(location);
+                RowIdentity {
+                    id: self.row_id(location),
+                    order_key: self.order_key(row),
+                }
+            })
+            .collect();
+        (self.0.dialect, identities)
+    }
+
+    fn typed_row(&self, location: RowLocation) -> Result<TypedRow, String> {
         let (chunk, row) = self.0.index.row(location);
         let id = self.0.identities.id(row.id_slot);
         let order = self.order_key(row);
-        row_snapshot_bytes(&self.0.blob, chunk, row, &id, &order, self.0.dialect)
+        typed_row_from_index(&self.0.blob, chunk, row, &id, &order, self.0.dialect)
     }
 
     fn order_key(&self, row: &CompactRow) -> String {
@@ -2233,7 +2325,7 @@ impl Document {
             .map_or_else(|| format!("{:016x}", row.order_rank), ToOwned::to_owned)
     }
 
-    fn row_id(&self, location: RowLocation) -> String {
+    fn row_id(&self, location: RowLocation) -> uuid::Uuid {
         let (_, row) = self.0.index.row(location);
         self.0.identities.id(row.id_slot)
     }
@@ -2276,7 +2368,7 @@ impl Document {
     fn update_or_reorder_sparse_row(
         &self,
         location: RowLocation,
-        semantic: &RowSnapshot,
+        semantic: &CsvRow,
     ) -> Result<Option<(Self, Vec<ByteEdit>)>, String> {
         let source_ordinal = self.0.index.ordinal_of(location);
         let (source_chunk, source_row) = self.0.index.row(location);
@@ -2419,7 +2511,7 @@ impl Document {
     fn replace_sparse_row(
         &self,
         location: RowLocation,
-        semantic: &RowSnapshot,
+        semantic: &CsvRow,
         order_rank: u64,
         lookup_rows_touched: usize,
     ) -> Result<(Self, Vec<ByteEdit>), String> {
@@ -2475,7 +2567,7 @@ impl Document {
     fn insert_sparse_row(
         &self,
         existing_slot: Option<u32>,
-        semantic: &RowSnapshot,
+        semantic: &CsvRow,
     ) -> Result<(Self, Vec<ByteEdit>), String> {
         let (target_ordinal, lookup_rows_touched) =
             self.insertion_ordinal(&semantic.order_key, &semantic.id, None);
@@ -2484,7 +2576,7 @@ impl Document {
         let slot = if let Some(slot) = existing_slot {
             slot
         } else {
-            identities.append_id(&semantic.id)?
+            identities.append_id(semantic.id)?
         };
         let ending = semantic.layout.ending(self.0.dialect);
         if ending.is_none() && target_ordinal != self.row_count() {
@@ -2595,7 +2687,7 @@ impl Document {
     fn insertion_ordinal(
         &self,
         order_key: &str,
-        id: &str,
+        id: &uuid::Uuid,
         excluding: Option<usize>,
     ) -> (usize, usize) {
         let len = self.row_count() - usize::from(excluding.is_some());
@@ -2614,7 +2706,7 @@ impl Document {
             let (_, row) = self.0.index.row(location);
             let candidate_order = self.order_key(row);
             let candidate_id = self.row_id(location);
-            if (candidate_order.as_str(), candidate_id.as_str()) < (order_key, id) {
+            if (candidate_order.as_str(), candidate_id) < (order_key, *id) {
                 low = middle + 1;
             } else {
                 high = middle;
@@ -2648,30 +2740,42 @@ impl Document {
 /// Applies a transition batch with the same last-write-wins ordering as the
 /// sequential remove-and-append implementation, without rescanning the full
 /// document for every changed row.
-fn apply_row_changes(mut records: Vec<RowRecord>, changes: &[RowChange]) -> Vec<RowRecord> {
-    let mut last_change_by_key = HashMap::<(&str, &[String]), usize>::with_capacity(changes.len());
+fn apply_row_changes(
+    mut records: Vec<RowRecord>,
+    changes: &[RowChange],
+) -> Result<Vec<RowRecord>, String> {
+    let mut last_change_by_key =
+        HashMap::<(Arc<str>, PrimaryKey), usize>::with_capacity(changes.len());
     for (index, change) in changes.iter().enumerate() {
         last_change_by_key.insert(
-            (change.schema_key.as_str(), change.row_pk.as_slice()),
+            (
+                change.schema_key.clone(),
+                primary_key(&change.schema_key, &change.row_pk)?,
+            ),
             index,
         );
     }
     records.retain(|record| {
-        !last_change_by_key.contains_key(&(record.schema_key.as_str(), record.row_pk.as_slice()))
+        primary_key(&record.schema_key, &record.row_pk).map_or(true, |row_pk| {
+            !last_change_by_key.contains_key(&(record.schema_key.clone(), row_pk))
+        })
     });
-    records.extend(changes.iter().enumerate().filter_map(|(index, change)| {
-        (last_change_by_key.get(&(change.schema_key.as_str(), change.row_pk.as_slice()))
-            == Some(&index))
-        .then(|| {
-            change.snapshot.as_ref().map(|snapshot| RowRecord {
+    for (index, change) in changes.iter().enumerate() {
+        let key = (
+            change.schema_key.clone(),
+            primary_key(&change.schema_key, &change.row_pk)?,
+        );
+        if last_change_by_key.get(&key) == Some(&index)
+            && let Some(row) = &change.row
+        {
+            records.push(RowRecord {
                 schema_key: change.schema_key.clone(),
                 row_pk: change.row_pk.clone(),
-                snapshot: snapshot.clone(),
-            })
-        })
-        .flatten()
-    }));
-    records
+                row: row.clone(),
+            });
+        }
+    }
+    Ok(records)
 }
 
 /// One-shot initial-import view for actors that will not be cached.
@@ -2731,11 +2835,7 @@ impl ColdInitialImport {
     }
 
     pub fn table_change(&self) -> RowChange {
-        RowChange::upsert(
-            TABLE_SCHEMA_KEY,
-            ROOT_ROW_PK.to_owned(),
-            table_snapshot(self.dialect),
-        )
+        RowChange::upsert_table(table_row(self.dialect))
     }
 
     /// Compact host-owned state for a document-free successor.
@@ -2772,7 +2872,7 @@ impl ColdInitialImport {
         output
     }
 
-    pub fn next_row_snapshot(&mut self, id: &str) -> Result<Option<(u32, Vec<u8>)>, String> {
+    pub fn next_row(&mut self, id: uuid::Uuid) -> Result<Option<(u32, TypedRow)>, String> {
         let Some(row) = self.rows.get(self.next_row).copied() else {
             return Ok(None);
         };
@@ -2787,18 +2887,18 @@ impl ColdInitialImport {
             order_remainder -= self.order_denominator;
         }
         let order_rank = next_order_rank | 1;
-        let snapshot = cold_row_snapshot_bytes(
+        let row = typed_row_from_cold(
             &self.bytes,
             &self.fields,
             row,
-            id,
+            &id,
             &format!("{order_rank:016x}"),
             self.dialect,
         )?;
         self.next_order_rank = next_order_rank;
         self.order_remainder = order_remainder;
         self.next_row += 1;
-        Ok(Some((local_ref, snapshot)))
+        Ok(Some((local_ref, row)))
     }
 }
 
@@ -3014,12 +3114,11 @@ impl ArenaRowIndex {
         let mut id_bytes = [0_u8; 16];
         id_bytes[..12].copy_from_slice(&self.namespace);
         id_bytes[12..].copy_from_slice(&ordinal.to_be_bytes());
-        let id = uuid::Uuid::from_bytes(id_bytes).to_string();
+        let id = uuid::Uuid::from_bytes(id_bytes);
         let order_key = format!("{:016x}", row.order_rank);
-        Ok(RowChange::upsert(
-            ROW_SCHEMA_KEY,
-            id.clone(),
-            row_snapshot_bytes(&blob, chunk, row, &id, &order_key, self.dialect)?,
+        Ok(RowChange::upsert_row(
+            id,
+            typed_row_from_index(&blob, chunk, row, &id, &order_key, self.dialect)?,
         ))
     }
 
@@ -3374,35 +3473,87 @@ fn scan_rows(
 #[cfg(test)]
 mod cold_scan_tests {
     use super::{
-        ChangeEffect, ColdInitialImport, Dialect, Document, IdNamespace, ROOT_ROW_PK,
-        ROW_SCHEMA_KEY, RowChange, RowLayout, RowRecord, RowSnapshot, TABLE_SCHEMA_KEY,
-        apply_row_changes, canonical_row_snapshot, scan_cold_rows, scan_rows, table_snapshot,
+        ChangeEffect, ColdInitialImport, CsvRow, Dialect, Document, FileEdit, IdNamespace,
+        ROOT_ROW_PK, ROW_SCHEMA_KEY, RowChange, RowLayout, RowRecord, TABLE_SCHEMA_KEY, TypedValue,
+        apply_row_changes, csv_typed_row, primary_key, scan_cold_rows, scan_rows, table_row,
     };
 
-    fn row_id(ordinal: usize) -> String {
+    fn replace_difference<'a>(before: &[u8], after: &'a [u8]) -> FileEdit<'a> {
+        let prefix = before
+            .iter()
+            .zip(after)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let max_suffix = (before.len() - prefix).min(after.len() - prefix);
+        let suffix = before[before.len() - max_suffix..]
+            .iter()
+            .rev()
+            .zip(after[after.len() - max_suffix..].iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count();
+        FileEdit {
+            offset: prefix as u64,
+            delete_len: (before.len() - prefix - suffix) as u64,
+            insert: &after[prefix..after.len() - suffix],
+        }
+    }
+
+    #[test]
+    fn successive_structural_splices_preserve_reordered_rows() {
+        let namespace = IdNamespace::from_namespace_bytes([0x5a; 12]);
+        let initial = b"alpha,one\ndup,same\ndup,same\nomega,last\n".to_vec();
+        let (mut document, _) = Document::open_file(initial.clone(), None, namespace).unwrap();
+        for (revision, after) in [
+            b"alpha,one\ninserted,new\ndup,same\ndup,same\nomega,last\n".as_slice(),
+            b"alpha,ONE\ninserted,new\ndup,same\ndup,same\nomega,last\n".as_slice(),
+            b"omega,last\ndup,same\nalpha,ONE\ninserted,new\ndup,same\n".as_slice(),
+            b"omega,last\ndup,same\ninserted,new\n".as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let before = document.bytes();
+            let edit = replace_difference(&before, after);
+            let create_namespace = IdNamespace::from_namespace_bytes([0x60 + revision as u8; 12]);
+            let (successor, changes) = document.file_changed(&[edit], create_namespace).unwrap();
+            assert!(!changes.is_empty(), "structural successor must change rows");
+            document = successor;
+            assert_eq!(document.bytes(), after);
+            let (dialect, identities) = document.identity_checkpoint();
+            document = Document::open_file_with_identities(
+                document.bytes(),
+                dialect,
+                namespace,
+                &identities,
+            )
+            .unwrap();
+        }
+    }
+
+    fn row_id(ordinal: usize) -> uuid::Uuid {
         IdNamespace::from_namespace_bytes([0x5a; 12]).encode(ordinal as u64)
     }
 
     fn row_record(ordinal: usize, value: &str) -> RowRecord {
         let id = row_id(ordinal);
         RowRecord {
-            schema_key: ROW_SCHEMA_KEY.to_owned(),
-            row_pk: vec![id.clone()],
-            snapshot: canonical_row_snapshot(&RowSnapshot {
+            schema_key: ROW_SCHEMA_KEY.into(),
+            row_pk: vec![TypedValue::Uuid(id)],
+            row: csv_typed_row(CsvRow {
                 id,
                 order_key: format!("{:016x}", ordinal * 2 + 1),
                 cells: vec![value.to_owned()],
                 layout: RowLayout::default(),
             })
-            .expect("canonical row snapshot"),
+            .expect("typed CSV row"),
         }
     }
 
     fn table_record() -> RowRecord {
         RowRecord {
-            schema_key: TABLE_SCHEMA_KEY.to_owned(),
-            row_pk: vec![ROOT_ROW_PK.to_owned()],
-            snapshot: table_snapshot(Dialect::for_path(Some("/fixture.csv"))),
+            schema_key: TABLE_SCHEMA_KEY.into(),
+            row_pk: vec![TypedValue::Text(ROOT_ROW_PK.to_owned())],
+            row: table_row(Dialect::for_path(Some("/fixture.csv"))),
         }
     }
 
@@ -3410,7 +3561,7 @@ mod cold_scan_tests {
         RowChange {
             schema_key: record.schema_key.clone(),
             row_pk: record.row_pk.clone(),
-            snapshot: Some(record.snapshot.clone()),
+            row: Some(record.row.clone()),
             effect: ChangeEffect::Content,
         }
     }
@@ -3419,7 +3570,7 @@ mod cold_scan_tests {
         RowChange {
             schema_key: record.schema_key.clone(),
             row_pk: record.row_pk.clone(),
-            snapshot: None,
+            row: None,
             effect: ChangeEffect::Content,
         }
     }
@@ -3431,11 +3582,11 @@ mod cold_scan_tests {
         for change in changes {
             let key = (&change.schema_key, &change.row_pk);
             records.retain(|record| (&record.schema_key, &record.row_pk) != key);
-            if let Some(snapshot) = &change.snapshot {
+            if let Some(row) = &change.row {
                 records.push(RowRecord {
                     schema_key: change.schema_key.clone(),
                     row_pk: change.row_pk.clone(),
-                    snapshot: snapshot.clone(),
+                    row: row.clone(),
                 });
             }
         }
@@ -3461,7 +3612,7 @@ mod cold_scan_tests {
 
         for changes in cases {
             assert_eq!(
-                apply_row_changes(initial.clone(), &changes),
+                apply_row_changes(initial.clone(), &changes).expect("indexed changes"),
                 apply_row_changes_reference(initial.clone(), &changes)
             );
         }
@@ -3485,15 +3636,19 @@ mod cold_scan_tests {
             upsert(&last_b),
         ];
 
-        let result = apply_row_changes(initial.clone(), &changes);
+        let result = apply_row_changes(initial.clone(), &changes).expect("indexed changes");
         assert_eq!(result, apply_row_changes_reference(initial, &changes));
         assert_eq!(
             result
                 .iter()
                 .skip(1)
-                .map(|record| record.row_pk[0].clone())
+                .map(|record| primary_key(&record.schema_key, &record.row_pk).unwrap())
                 .collect::<Vec<_>>(),
-            vec![row_id(2), row_id(3), row_id(1)]
+            vec![
+                super::PrimaryKey::Row(row_id(2)),
+                super::PrimaryKey::Row(row_id(3)),
+                super::PrimaryKey::Row(row_id(1)),
+            ]
         );
     }
 
@@ -3507,7 +3662,7 @@ mod cold_scan_tests {
             .map(|ordinal| upsert(&row_record(ordinal, "after")))
             .collect::<Vec<_>>();
 
-        let indexed = apply_row_changes(initial.clone(), &changes);
+        let indexed = apply_row_changes(initial.clone(), &changes).expect("indexed changes");
         let reference = apply_row_changes_reference(initial, &changes);
         assert_eq!(indexed, reference);
         assert_eq!(indexed.len(), CONFLICTS + 1);
@@ -3515,7 +3670,7 @@ mod cold_scan_tests {
             indexed
                 .iter()
                 .skip(1)
-                .map(|record| record.row_pk[0].as_str())
+                .map(|record| primary_key(&record.schema_key, &record.row_pk).unwrap())
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
             CONFLICTS
@@ -3528,6 +3683,48 @@ mod cold_scan_tests {
         assert_eq!(indexed_document.bytes(), reference_document.bytes());
         assert_eq!(indexed_edit, reference_edit);
         assert_eq!(indexed_document.row_count(), CONFLICTS);
+    }
+
+    #[test]
+    fn identity_checkpoint_preserves_reordered_row_for_a_followup_delete() {
+        let namespace = IdNamespace::from_namespace_bytes([0x33; 12]);
+        let (document, _) = Document::open_file(
+            b"name,score\nalice,1\nbob,2\n".to_vec(),
+            Some("/fixture.csv"),
+            namespace,
+        )
+        .expect("initial CSV document");
+        let mut header = document.row_records().expect("typed rows")[1].clone();
+        let header_id = header.row_pk.clone();
+        header.row.insert(
+            "order_key".to_owned(),
+            TypedValue::Text("ffff000000000001".to_owned()),
+        );
+
+        let (reordered, _) = document
+            .rows_changed(&[upsert(&header)])
+            .expect("reorder the header row");
+        assert_eq!(
+            reordered.bytes(),
+            b"alice,1\nbob,2\nname,score\n",
+            "the direct typed update must move the selected row"
+        );
+
+        let (dialect, identities) = reordered.identity_checkpoint();
+        let reopened =
+            Document::open_file_with_identities(reordered.bytes(), dialect, namespace, &identities)
+                .expect("reopen the typed successor identity checkpoint");
+        let (deleted, edits) = reopened
+            .rows_changed(&[RowChange {
+                schema_key: ROW_SCHEMA_KEY.into(),
+                row_pk: header_id,
+                row: None,
+                effect: ChangeEffect::Content,
+            }])
+            .expect("delete the same row after reopen");
+
+        assert_eq!(deleted.bytes(), b"alice,1\nbob,2\n");
+        assert_eq!(edits.len(), 1, "the followup delete must emit a file edit");
     }
 
     #[test]
@@ -3561,8 +3758,8 @@ mod cold_scan_tests {
         let mut import = ColdInitialImport::open(bytes, Some("/fixture.csv")).expect("cold import");
         let mut rows = 0u32;
         while let Some((local_ref, _)) = import
-            .next_row_snapshot("019a0000-0000-7000-8000-000000000001")
-            .expect("row snapshot")
+            .next_row(uuid::uuid!("019a0000-0000-7000-8000-000000000001"))
+            .expect("typed row")
         {
             assert_eq!(local_ref, rows);
             rows += 1;
@@ -4258,7 +4455,7 @@ fn changed_rows(
     let mut changes = Vec::new();
     for (&slot, &location) in &old_by_slot {
         if !new_slots.contains_key(&slot) {
-            changes.push(RowChange::delete(ROW_SCHEMA_KEY, before.row_id(location)));
+            changes.push(RowChange::delete_row(before.row_id(location)));
         }
     }
     for (&slot, draft) in &new_slots {
@@ -4267,14 +4464,14 @@ fn changed_rows(
             .index
             .location_for_identity_slot(slot)
             .ok_or_else(|| "new CSV row was not indexed".to_owned())?;
-        let new_snapshot = after.row_snapshot(location)?;
+        let new_row = after.typed_row(location)?;
         let effect = if let Some(&old_location) = old_by_slot.get(&slot) {
             let old_cells = indexed_cells(before, old_location)?;
             let new_cells = draft_cells(&after.0.blob, draft, after.0.dialect)?;
             let (_, old_row) = before.0.index.row(old_location);
             let semantic_changed = old_cells != new_cells
                 || old_row.order_rank != draft.order_rank.expect("assigned rank");
-            let lexical_changed = before.row_snapshot(old_location)? != new_snapshot;
+            let lexical_changed = before.typed_row(old_location)? != new_row;
             if semantic_changed {
                 Some(ChangeEffect::Content)
             } else if lexical_changed {
@@ -4286,39 +4483,34 @@ fn changed_rows(
             Some(ChangeEffect::Content)
         };
         if let Some(effect) = effect {
-            changes.push(RowChange::upsert_with_effect(
-                ROW_SCHEMA_KEY,
+            changes.push(RowChange::upsert_row_with_effect(
                 after.row_id(location),
-                new_snapshot,
+                new_row,
                 effect,
             ));
         }
     }
     if before.0.dialect != after.0.dialect {
-        changes.push(RowChange::upsert(
-            TABLE_SCHEMA_KEY,
-            ROOT_ROW_PK.to_owned(),
-            table_snapshot(after.0.dialect),
-        ));
+        changes.push(RowChange::upsert_table(table_row(after.0.dialect)));
     }
     changes.sort_by(|left, right| {
-        left.schema_key
-            .cmp(&right.schema_key)
-            .then_with(|| left.row_pk.cmp(&right.row_pk))
+        left.schema_key.cmp(&right.schema_key).then_with(|| {
+            primary_key(&left.schema_key, &left.row_pk)
+                .ok()
+                .cmp(&primary_key(&right.schema_key, &right.row_pk).ok())
+        })
     });
     Ok(changes)
 }
 
-fn row_snapshot_bytes(
+fn typed_row_from_index(
     blob: &PersistentBlob,
     chunk: &ChunkRef,
     row: &CompactRow,
-    id: &str,
+    id: &uuid::Uuid,
     order_key: &str,
     dialect: Dialect,
-) -> Result<Vec<u8>, String> {
-    let mut output = Vec::with_capacity(128);
-    output.extend_from_slice(b"{\"cells\":[");
+) -> Result<TypedRow, String> {
     let row_start = usize::try_from(chunk.byte_start + row.relative_start).expect("u32 fits usize");
     let row_bytes = blob.range(
         row_start,
@@ -4326,191 +4518,107 @@ fn row_snapshot_bytes(
     )?;
     let first = usize::try_from(row.first_field).expect("u32 fits usize");
     let end = first + usize::from(row.field_count);
+    let mut cells = Vec::with_capacity(usize::from(row.field_count));
     let mut force_quote = Vec::new();
     for (index, field) in chunk.data.fields[first..end].iter().copied().enumerate() {
-        if index > 0 {
-            output.push(b',');
-        }
         if field_has_unnecessary_quotes(&row_bytes, 0, field, dialect)? {
             if force_quote.len() <= index / 8 {
                 force_quote.resize(index / 8 + 1, 0);
             }
             force_quote[index / 8] |= 1 << (index % 8);
         }
-        let value = decoded_field(&row_bytes, 0, field, dialect.quote)?;
-        write_canonical_json_string(&mut output, &value);
+        cells.push(decoded_field(&row_bytes, 0, field, dialect.quote)?);
     }
-    output.push(b']');
-    output.extend_from_slice(b",\"id\":");
-    write_canonical_json_string(&mut output, id);
-    let has_force_quote = !force_quote.is_empty();
     let exceptional_ending = (row.ending() != Some(dialect.terminator)).then_some(row.ending());
-    if has_force_quote || exceptional_ending.is_some() {
-        output.extend_from_slice(b",\"layout\":{");
-        let needs_comma = if has_force_quote {
-            output.extend_from_slice(b"\"force_quote\":");
-            write_canonical_json_string(&mut output, &URL_SAFE_NO_PAD.encode(force_quote));
-            true
-        } else {
-            false
-        };
-        if let Some(ending) = exceptional_ending {
-            if needs_comma {
-                output.push(b',');
-            }
-            output.extend_from_slice(b"\"terminator\":");
-            write_canonical_json_string(
-                &mut output,
-                ending.map_or("", |terminator| terminator.snapshot()),
-            );
-        }
-        output.push(b'}');
-    }
-    output.extend_from_slice(b",\"order_key\":");
-    write_canonical_json_string(&mut output, order_key);
-    output.push(b'}');
-    Ok(output)
+    csv_typed_row(CsvRow {
+        id: *id,
+        order_key: order_key.to_owned(),
+        cells,
+        layout: RowLayout {
+            force_quote,
+            terminator: exceptional_ending,
+        },
+    })
 }
 
-fn cold_row_snapshot_bytes(
+fn typed_row_from_cold(
     bytes: &[u8],
     fields: &[FieldRange],
     row: ColdRowDraft,
-    id: &str,
+    id: &uuid::Uuid,
     order_key: &str,
     dialect: Dialect,
-) -> Result<Vec<u8>, String> {
-    let mut output = Vec::with_capacity(128);
-    output.extend_from_slice(b"{\"cells\":[");
+) -> Result<TypedRow, String> {
     let row_start = row.start as usize;
     let row_bytes = &bytes[row_start..row_start + row.byte_len as usize];
     let first = usize::try_from(row.first_field).expect("u32 fits usize");
     let end = first + usize::from(row.field_count);
+    let mut cells = Vec::with_capacity(usize::from(row.field_count));
     let mut force_quote = Vec::new();
     for (index, field) in fields[first..end].iter().copied().enumerate() {
-        if index > 0 {
-            output.push(b',');
-        }
         if row.has_quoted_fields && field_has_unnecessary_quotes(row_bytes, 0, field, dialect)? {
             if force_quote.len() <= index / 8 {
                 force_quote.resize(index / 8 + 1, 0);
             }
             force_quote[index / 8] |= 1 << (index % 8);
         }
-        let value = decoded_field(row_bytes, 0, field, dialect.quote)?;
-        write_canonical_json_string(&mut output, &value);
+        cells.push(decoded_field(row_bytes, 0, field, dialect.quote)?);
     }
-    output.push(b']');
-    output.extend_from_slice(b",\"id\":");
-    write_canonical_json_string(&mut output, id);
     let exceptional_ending = (row.ending != Some(dialect.terminator)).then_some(row.ending);
-    if !force_quote.is_empty() || exceptional_ending.is_some() {
-        output.extend_from_slice(b",\"layout\":{");
-        let needs_comma = if !force_quote.is_empty() {
-            output.extend_from_slice(b"\"force_quote\":");
-            write_canonical_json_string(&mut output, &URL_SAFE_NO_PAD.encode(force_quote));
-            true
-        } else {
-            false
-        };
-        if let Some(ending) = exceptional_ending {
-            if needs_comma {
-                output.push(b',');
-            }
-            output.extend_from_slice(b"\"terminator\":");
-            write_canonical_json_string(
-                &mut output,
-                ending.map_or("", |terminator| terminator.snapshot()),
-            );
-        }
-        output.push(b'}');
-    }
-    output.extend_from_slice(b",\"order_key\":");
-    write_canonical_json_string(&mut output, order_key);
-    output.push(b'}');
-    Ok(output)
+    csv_typed_row(CsvRow {
+        id: *id,
+        order_key: order_key.to_owned(),
+        cells,
+        layout: RowLayout {
+            force_quote,
+            terminator: exceptional_ending,
+        },
+    })
 }
 
-fn table_snapshot(dialect: Dialect) -> Vec<u8> {
-    let mut output = Vec::with_capacity(96);
-    output.extend_from_slice(b"{\"dialect\":{\"delimiter\":");
-    let delimiter = char::from(dialect.delimiter).to_string();
-    write_canonical_json_string(&mut output, &delimiter);
-    output.extend_from_slice(b",\"quote\":");
-    match dialect.quote {
-        Some(quote) => {
-            write_canonical_json_string(&mut output, &char::from(quote).to_string());
-        }
-        None => output.extend_from_slice(b"null"),
-    }
-    output.extend_from_slice(b",\"terminator\":");
-    write_canonical_json_string(&mut output, dialect.terminator.snapshot());
-    output.extend_from_slice(b"},\"id\":\"root\"}");
-    output
+fn table_row(dialect: Dialect) -> TypedRow {
+    let mut dialect_value = serde_json::Map::new();
+    dialect_value.insert(
+        "delimiter".to_owned(),
+        JsonValue::String(char::from(dialect.delimiter).to_string()),
+    );
+    dialect_value.insert(
+        "quote".to_owned(),
+        dialect.quote.map_or(JsonValue::Null, |quote| {
+            JsonValue::String(char::from(quote).to_string())
+        }),
+    );
+    dialect_value.insert(
+        "terminator".to_owned(),
+        JsonValue::String(dialect.terminator.text().to_owned()),
+    );
+    TypedRow::from([
+        (
+            "dialect".to_owned(),
+            TypedValue::Jsonb(JsonValue::Object(dialect_value).into()),
+        ),
+        ("id".to_owned(), TypedValue::Text(ROOT_ROW_PK.to_owned())),
+    ])
 }
 
-pub(crate) fn write_canonical_json_string(output: &mut Vec<u8>, value: &str) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bytes = value.as_bytes();
-    output.push(b'"');
-
-    // CSV snapshots are overwhelmingly ASCII and escape-free. Copy that
-    // complete UTF-8 run in one operation instead of decoding and appending
-    // every scalar separately.
-    let Some(mut cursor) = bytes
-        .iter()
-        .position(|&byte| byte <= 0x1f || matches!(byte, b'"' | b'\\'))
-    else {
-        output.extend_from_slice(bytes);
-        output.push(b'"');
-        return;
-    };
-
-    let mut run_start = 0;
-    while cursor < bytes.len() {
-        let byte = bytes[cursor];
-        if byte > 0x1f && !matches!(byte, b'"' | b'\\') {
-            cursor += 1;
-            continue;
-        }
-        output.extend_from_slice(&bytes[run_start..cursor]);
-        match byte {
-            b'"' => output.extend_from_slice(br#"\""#),
-            b'\\' => output.extend_from_slice(br#"\\"#),
-            b'\x08' => output.extend_from_slice(br#"\b"#),
-            b'\t' => output.extend_from_slice(br#"\t"#),
-            b'\n' => output.extend_from_slice(br#"\n"#),
-            b'\x0c' => output.extend_from_slice(br#"\f"#),
-            b'\r' => output.extend_from_slice(br#"\r"#),
-            byte => {
-                output.extend_from_slice(b"\\u00");
-                output.push(HEX[usize::from(byte >> 4)]);
-                output.push(HEX[usize::from(byte & 0x0f)]);
-            }
-        }
-        cursor += 1;
-        run_start = cursor;
+fn parse_table_row(row: &TypedRow) -> Result<Dialect, String> {
+    if row.len() != 2 {
+        return Err("CSV table row must contain only id and dialect".to_owned());
     }
-    output.extend_from_slice(&bytes[run_start..]);
-    output.push(b'"');
-}
-
-fn parse_table_snapshot(bytes: &[u8]) -> Result<Dialect, String> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|error| format!("invalid CSV table snapshot: {error}"))?;
-    reject_numbers(&value)?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| "CSV table snapshot must be an object".to_owned())?;
-    if object.get("id").and_then(Value::as_str) != Some(ROOT_ROW_PK) {
+    if row.get("id") != Some(&TypedValue::Text(ROOT_ROW_PK.to_owned())) {
         return Err("CSV table id must be root".to_owned());
     }
-    if object.len() != 2 || !object.contains_key("dialect") {
-        return Err("CSV table snapshot must contain only id and dialect".to_owned());
-    }
-    let dialect = object
-        .get("dialect")
-        .and_then(Value::as_object)
+    let dialect = match row.get("dialect") {
+        Some(TypedValue::Jsonb(value)) => match value.as_value() {
+            JsonValue::Object(value) => value,
+            _ => return Err("CSV table dialect must be JSONB".to_owned()),
+        },
+        _ => return Err("CSV table dialect must be JSONB".to_owned()),
+    };
+    reject_numbers(&JsonValue::Object(dialect.clone()))?;
+    let dialect = JsonValue::Object(dialect.clone());
+    let dialect = dialect
+        .as_object()
         .ok_or_else(|| "CSV table dialect must be an object".to_owned())?;
     if dialect.len() != 3
         || !dialect.contains_key("delimiter")
@@ -4521,13 +4629,13 @@ fn parse_table_snapshot(bytes: &[u8]) -> Result<Dialect, String> {
     }
     let delimiter = dialect
         .get("delimiter")
-        .and_then(Value::as_str)
+        .and_then(JsonValue::as_str)
         .and_then(|value| value.chars().next().filter(|_| value.chars().count() == 1))
         .and_then(|value| u8::try_from(u32::from(value)).ok())
         .ok_or_else(|| "CSV delimiter must be one Latin-1 character".to_owned())?;
     let quote = match dialect.get("quote") {
-        Some(Value::Null) => None,
-        Some(Value::String(value)) => value
+        Some(JsonValue::Null) => None,
+        Some(JsonValue::String(value)) => value
             .chars()
             .next()
             .filter(|_| value.chars().count() == 1)
@@ -4536,7 +4644,7 @@ fn parse_table_snapshot(bytes: &[u8]) -> Result<Dialect, String> {
             .ok_or_else(|| "CSV quote must be one Latin-1 character".to_owned())?,
         _ => return Err("CSV quote must be a string or null".to_owned()),
     };
-    let terminator = match dialect.get("terminator").and_then(Value::as_str) {
+    let terminator = match dialect.get("terminator").and_then(JsonValue::as_str) {
         Some("\n") => Terminator::Lf,
         Some("\r\n") => Terminator::CrLf,
         Some("\r") => Terminator::Cr,
@@ -4563,212 +4671,110 @@ impl Iterator for InitialChanges {
     fn next(&mut self) -> Option<Self::Item> {
         if self.table_pending {
             self.table_pending = false;
-            return Some(Ok(RowChange::upsert(
-                TABLE_SCHEMA_KEY,
-                ROOT_ROW_PK.to_owned(),
-                table_snapshot(self.document.0.dialect),
-            )));
+            return Some(Ok(RowChange::upsert_table(table_row(
+                self.document.0.dialect,
+            ))));
         }
         let location = self.document.0.index.ordinal_location(self.row)?;
         self.row += 1;
-        Some(self.document.row_snapshot(location).map(|snapshot| {
-            RowChange::upsert(ROW_SCHEMA_KEY, self.document.row_id(location), snapshot)
-        }))
+        Some(
+            self.document
+                .typed_row(location)
+                .map(|row| RowChange::upsert_row(self.document.row_id(location), row)),
+        )
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RowSnapshot {
-    pub id: String,
+pub struct CsvRow {
+    pub id: uuid::Uuid,
     pub order_key: String,
     pub cells: Vec<String>,
     pub layout: RowLayout,
 }
-
-/// Deterministic result of merging one three-way CSV row conflict.
-///
-/// `a` and `b` are supplied by the engine's stable order rather than
-/// the direction of a branch merge.  That makes the fallback independent of
-/// which branch happened to initiate the merge.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RowConflictResolution {
-    TakeA,
-    TakeB,
-    Replace(Vec<u8>),
-    Delete,
-}
-
-/// Resolves a concurrent edit of one CSV row without a hydrated document.
-///
-/// The fast path composes edits to different same-index cells.  Row identity,
-/// order, field count, quoting, and terminator layout are structural: when any
-/// of those differs, or both sides replace the same cell differently, the
-/// deterministic `b` side wins.  This keeps the common spreadsheet case
-/// intuitive while deliberately avoiding a speculative row-structure CRDT.
-pub fn resolve_row_conflict(
-    base: Option<&[u8]>,
-    a: Option<&[u8]>,
-    b: Option<&[u8]>,
-) -> RowConflictResolution {
-    // These cases avoid JSON parsing and, for a lazy host packet, let the
-    // bindings retain the selected source without copying it into Wasm.
-    if a == b || base == a {
-        return match b {
-            Some(_) => RowConflictResolution::TakeB,
-            None => RowConflictResolution::Delete,
-        };
-    }
-    if base == b {
-        return match a {
-            Some(_) => RowConflictResolution::TakeA,
-            None => RowConflictResolution::Delete,
-        };
-    }
-
-    let (Some(base), Some(a), Some(b)) = (base, a, b) else {
-        return match b {
-            Some(_) => RowConflictResolution::TakeB,
-            None => RowConflictResolution::Delete,
-        };
-    };
-    let (Ok(base), Ok(a), Ok(b)) = (
-        parse_row_snapshot(base),
-        parse_row_snapshot(a),
-        parse_row_snapshot(b),
-    ) else {
-        return RowConflictResolution::TakeB;
-    };
-
-    if base.id != a.id
-        || base.id != b.id
-        || base.order_key != a.order_key
-        || base.order_key != b.order_key
-        || base.layout != a.layout
-        || base.layout != b.layout
-        || base.cells.len() != a.cells.len()
-        || base.cells.len() != b.cells.len()
-    {
-        return RowConflictResolution::TakeB;
-    }
-
-    let mut merged = b.cells.clone();
-    let mut differs_from_b = false;
-    for (index, merged_cell) in merged.iter_mut().enumerate() {
-        let a_changed = base.cells[index] != a.cells[index];
-        let b_changed = base.cells[index] != b.cells[index];
-        match (a_changed, b_changed) {
-            (false, _) => {}
-            (true, false) => {
-                merged_cell.clone_from(&a.cells[index]);
-                differs_from_b = true;
-            }
-            (true, true) if a.cells[index] == b.cells[index] => {}
-            (true, true) => return RowConflictResolution::TakeB,
-        }
-    }
-    if !differs_from_b {
-        return RowConflictResolution::TakeB;
-    }
-    let merged = RowSnapshot {
-        id: b.id,
-        order_key: b.order_key,
-        cells: merged,
-        layout: b.layout,
-    };
-    canonical_row_snapshot(&merged)
-        .map(RowConflictResolution::Replace)
-        .unwrap_or(RowConflictResolution::TakeB)
-}
-
-fn canonical_row_snapshot(snapshot: &RowSnapshot) -> Result<Vec<u8>, String> {
-    let mut output = Vec::with_capacity(128);
-    output.extend_from_slice(b"{\"cells\":[");
-    for (index, cell) in snapshot.cells.iter().enumerate() {
-        if index > 0 {
-            output.push(b',');
-        }
-        write_canonical_json_string(&mut output, cell);
-    }
-    output.push(b']');
-    output.extend_from_slice(b",\"id\":");
-    write_canonical_json_string(&mut output, &snapshot.id);
-    if !snapshot.layout.is_default() {
-        output.extend_from_slice(b",\"layout\":{");
-        let has_force_quote = !snapshot.layout.force_quote.is_empty();
-        if has_force_quote {
-            output.extend_from_slice(b"\"force_quote\":");
-            write_canonical_json_string(
-                &mut output,
-                &URL_SAFE_NO_PAD.encode(&snapshot.layout.force_quote),
+fn csv_typed_row(row: CsvRow) -> Result<TypedRow, String> {
+    static COLUMNS: OnceLock<[Arc<str>; 4]> = OnceLock::new();
+    let columns = COLUMNS.get_or_init(|| {
+        [
+            Arc::from("cells"),
+            Arc::from("id"),
+            Arc::from("layout"),
+            Arc::from("order_key"),
+        ]
+    });
+    let layout = if row.layout.is_default() {
+        TypedValue::Null
+    } else {
+        let mut layout = serde_json::Map::new();
+        if !row.layout.force_quote.is_empty() {
+            layout.insert(
+                "force_quote".to_owned(),
+                JsonValue::String(URL_SAFE_NO_PAD.encode(row.layout.force_quote)),
             );
         }
-        if let Some(ending) = snapshot.layout.terminator {
-            if has_force_quote {
-                output.push(b',');
-            }
-            output.extend_from_slice(b"\"terminator\":");
-            write_canonical_json_string(&mut output, ending.map_or("", Terminator::snapshot));
+        if let Some(ending) = row.layout.terminator {
+            layout.insert(
+                "terminator".to_owned(),
+                JsonValue::String(ending.map_or("", Terminator::text).to_owned()),
+            );
         }
-        output.push(b'}');
-    }
-    output.extend_from_slice(b",\"order_key\":");
-    write_canonical_json_string(&mut output, &snapshot.order_key);
-    output.push(b'}');
-    Ok(output)
+        TypedValue::Jsonb(JsonValue::Object(layout).into())
+    };
+    TypedRow::from_sorted_entries(vec![
+        (
+            Arc::clone(&columns[0]),
+            TypedValue::Jsonb(
+                lix_schema::Jsonb::from_text_array(row.cells)
+                    .map_err(|error| format!("cannot encode CSV cells as JSONB: {error}"))?,
+            ),
+        ),
+        (Arc::clone(&columns[1]), TypedValue::Uuid(row.id)),
+        (Arc::clone(&columns[2]), layout),
+        (Arc::clone(&columns[3]), TypedValue::Text(row.order_key)),
+    ])
+    .map_err(str::to_owned)
 }
 
-pub fn parse_row_snapshot(bytes: &[u8]) -> Result<RowSnapshot, String> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|error| format!("invalid CSV row snapshot: {error}"))?;
-    reject_numbers(&value)?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| "CSV row snapshot must be an object".to_owned())?;
-    if !(object.len() == 3 || object.len() == 4)
-        || !object.contains_key("id")
-        || !object.contains_key("order_key")
-        || !object.contains_key("cells")
-        || object
+pub fn parse_csv_row(row: &TypedRow) -> Result<CsvRow, String> {
+    if row.len() != 4
+        || row
             .keys()
-            .any(|key| !matches!(key.as_str(), "id" | "order_key" | "cells" | "layout"))
+            .any(|key| !matches!(key, "id" | "order_key" | "cells" | "layout"))
     {
-        return Err(
-            "CSV row snapshot must contain id, order_key, cells, and optional layout".to_owned(),
-        );
+        return Err("CSV row must contain id, order_key, cells, and layout".to_owned());
     }
-    let id = object
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| "CSV row id must be a non-empty string".to_owned())?
-        .to_owned();
-    let order_key = object
-        .get("order_key")
-        .and_then(Value::as_str)
-        .filter(|key| valid_order_key(key))
-        .ok_or_else(|| "CSV row order_key is invalid".to_owned())?
-        .to_owned();
-    let cells = object
-        .get("cells")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "CSV row cells must be an array".to_owned())?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| "CSV cells must be strings".to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let id = match row.get("id") {
+        Some(TypedValue::Uuid(id)) => *id,
+        _ => return Err("CSV row id must be a UUID".to_owned()),
+    };
+    let order_key = match row.get("order_key") {
+        Some(TypedValue::Text(key)) if valid_order_key(key) => key.clone(),
+        _ => return Err("CSV row order_key is invalid".to_owned()),
+    };
+    let cells = match row.get("cells") {
+        Some(TypedValue::Jsonb(value)) => match value.as_value() {
+            JsonValue::Array(cells) => cells,
+            _ => return Err("CSV row cells must be a JSONB array".to_owned()),
+        },
+        _ => return Err("CSV row cells must be a JSONB array".to_owned()),
+    }
+    .iter()
+    .map(|value| {
+        value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "CSV cells must be strings".to_owned())
+    })
+    .collect::<Result<Vec<_>, _>>()?;
     if cells.is_empty() {
         return Err("CSV rows require at least one cell".to_owned());
     }
-    let layout = object
-        .get("layout")
-        .map(|value| parse_row_layout(value, cells.len()))
-        .transpose()?
-        .unwrap_or_default();
-    Ok(RowSnapshot {
+    let layout = match row.get("layout") {
+        Some(TypedValue::Null) => RowLayout::default(),
+        Some(TypedValue::Jsonb(value)) => parse_row_layout(value, cells.len())?,
+        _ => return Err("CSV row layout must be JSONB or null".to_owned()),
+    };
+    Ok(CsvRow {
         id,
         order_key,
         cells,
@@ -4776,7 +4782,7 @@ pub fn parse_row_snapshot(bytes: &[u8]) -> Result<RowSnapshot, String> {
     })
 }
 
-fn parse_row_layout(value: &Value, field_count: usize) -> Result<RowLayout, String> {
+fn parse_row_layout(value: &JsonValue, field_count: usize) -> Result<RowLayout, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "CSV row layout must be an object".to_owned())?;
@@ -4789,7 +4795,7 @@ fn parse_row_layout(value: &Value, field_count: usize) -> Result<RowLayout, Stri
     }
     let force_quote = match object.get("force_quote") {
         None => Vec::new(),
-        Some(Value::String(value)) => {
+        Some(JsonValue::String(value)) => {
             let decoded = URL_SAFE_NO_PAD
                 .decode(value)
                 .map_err(|_| "CSV force_quote must be unpadded base64url".to_owned())?;
@@ -4821,7 +4827,7 @@ fn parse_row_layout(value: &Value, field_count: usize) -> Result<RowLayout, Stri
     };
     let terminator = match object.get("terminator") {
         None => None,
-        Some(Value::String(value)) => Some(match value.as_str() {
+        Some(JsonValue::String(value)) => Some(match value.as_str() {
             "" => None,
             "\n" => Some(Terminator::Lf),
             "\r\n" => Some(Terminator::CrLf),
@@ -4836,13 +4842,13 @@ fn parse_row_layout(value: &Value, field_count: usize) -> Result<RowLayout, Stri
     })
 }
 
-fn reject_numbers(value: &Value) -> Result<(), String> {
+fn reject_numbers(value: &JsonValue) -> Result<(), String> {
     match value {
-        Value::Number(_) => {
-            Err("number-bearing snapshots are not eligible for this layout".to_owned())
+        JsonValue::Number(_) => {
+            Err("number-bearing JSONB values are not eligible for this layout".to_owned())
         }
-        Value::Array(values) => values.iter().try_for_each(reject_numbers),
-        Value::Object(values) => values.values().try_for_each(reject_numbers),
+        JsonValue::Array(values) => values.iter().try_for_each(reject_numbers),
+        JsonValue::Object(values) => values.values().try_for_each(reject_numbers),
         _ => Ok(()),
     }
 }

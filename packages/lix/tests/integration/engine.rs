@@ -93,10 +93,7 @@ simulation_test!(
         let Value::Text(uuid) = &uuid_rows.rows()[0].values()[0] else {
             panic!("uuidv7 should return text");
         };
-        assert!(
-            !uuid.is_empty(),
-            "uuidv7 should return a non-empty UUID"
-        );
+        assert!(!uuid.is_empty(), "uuidv7 should return a non-empty UUID");
 
         let insert_result = session
             .execute(
@@ -337,12 +334,10 @@ simulation_test!(
                 .execute("SELECT uuidv7()", &[])
                 .await
                 .expect("uuid after deterministic write should continue"),
-            // The tracked write consumes deterministic values for row and
-            // commit metadata, including the branch-ref ChangeRecord ID. The
-            // commit's own change id is no longer among them — it is derived
-            // from the commit id — so the write draws one fewer value than it
-            // used to.
-            "01920000-0000-7000-8000-000000000008",
+            // Native v69 row encoding no longer allocates a compatibility
+            // snapshot identity. The tracked write consumes four deterministic
+            // values after the explicit query sequence above.
+            "01920000-0000-7000-8000-000000000007",
         );
     }
 );
@@ -389,10 +384,7 @@ simulation_test!(
         );
 
         let failed_write = session
-            .execute(
-                "INSERT INTO missing_engine_table VALUES (uuidv7())",
-                &[],
-            )
+            .execute("INSERT INTO missing_engine_table VALUES (uuidv7())", &[])
             .await;
         assert!(
             failed_write.is_err(),

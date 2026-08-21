@@ -10,17 +10,16 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use datafusion::arrow::array::{Array, BooleanArray, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::Statistics;
 
 use crate::LixError;
-use crate::row_pk::RowPk;
 use crate::hot_state::{
-    RowColumnarShadowMaskCache, RowColumnarShadowMaskKey, HotStateContext, HotStateRowFilter,
-    HotStateScanRequest,
+    HotStateContext, HotStateRowFilter, HotStateScanRequest, RowColumnarShadowMaskCache,
+    RowColumnarShadowMaskKey,
 };
+use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
 
 #[derive(Clone, Debug)]
@@ -47,11 +46,6 @@ pub(crate) struct RowColumnarScanLayout {
 /// stronger tie order must retain the general SQL path.
 #[async_trait]
 pub(crate) trait RowSnapshotReader: Send + Sync {
-    async fn scan_row_snapshots(
-        &self,
-        request: HotStateScanRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError>;
-
     /// Returns primary keys from the same committed direct-scan proof as raw
     /// snapshots. Providers use this only when every projected SQL field is
     /// an exact primary-key component, avoiding a redundant JSON decode while
@@ -60,6 +54,17 @@ pub(crate) trait RowSnapshotReader: Send + Sync {
         &self,
         _request: HotStateScanRequest,
     ) -> Result<Option<Vec<RowPk>>, LixError> {
+        Ok(None)
+    }
+
+    /// Returns raw durable typed payloads and their authenticated storage
+    /// identities for one exclusive packed collection. Protocol v69 providers
+    /// can project these directly without constructing compatibility JSON or
+    /// a generic materialized current-state batch.
+    async fn scan_row_snapshots(
+        &self,
+        _request: HotStateScanRequest,
+    ) -> Result<Option<crate::tracked_state::ExclusiveRowSnapshotBatch>, LixError> {
         Ok(None)
     }
 
@@ -175,19 +180,6 @@ impl<S> RowSnapshotReader for CurrentRowSnapshotReader<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    async fn scan_row_snapshots(
-        &self,
-        request: HotStateScanRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        if !direct_row_snapshot_request(&request) {
-            return Ok(None);
-        }
-        self.hot_state
-            .reader(self.store.clone())
-            .scan_direct_row_snapshots(&request)
-            .await
-    }
-
     async fn scan_row_primary_keys(
         &self,
         request: HotStateScanRequest,
@@ -198,6 +190,19 @@ where
         self.hot_state
             .reader(self.store.clone())
             .scan_direct_row_primary_keys(&request)
+            .await
+    }
+
+    async fn scan_row_snapshots(
+        &self,
+        request: HotStateScanRequest,
+    ) -> Result<Option<crate::tracked_state::ExclusiveRowSnapshotBatch>, LixError> {
+        if !direct_row_snapshot_request(&request) {
+            return Ok(None);
+        }
+        self.hot_state
+            .reader(self.store.clone())
+            .scan_direct_row_snapshots(&request)
             .await
     }
 
@@ -487,10 +492,7 @@ mod tests {
         let mut request = HotStateScanRequest::default();
         assert!(direct_row_columnar_request(&request));
 
-        request
-            .filter
-            .row_pks
-            .push(RowPk::single("point-read"));
+        request.filter.row_pks.push(RowPk::single("point-read"));
         assert!(!direct_row_columnar_request(&request));
 
         request.filter.row_pks.clear();

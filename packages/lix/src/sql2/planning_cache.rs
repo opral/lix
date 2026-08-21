@@ -295,13 +295,7 @@ where
     CatalogKey: Clone + Eq + Hash,
 {
     pub(crate) fn datafusion_session(&self) -> SessionContext {
-        let catalogs = Arc::new(MemoryCatalogProviderList::new());
-        let catalog = Arc::new(MemoryCatalogProvider::new());
-        catalog
-            .register_schema("public", Arc::new(StatementSchemaProvider::default()))
-            .expect("fresh DataFusion catalog accepts the public schema");
-        catalogs.register_catalog("datafusion".to_string(), catalog);
-        super::session::sql_session_from_template(self.datafusion_state.clone(), Some(catalogs))
+        datafusion_session_from_state(self.datafusion_state.clone())
     }
 
     pub(crate) fn datafusion_read_session(&self) -> PooledReadSession {
@@ -610,9 +604,14 @@ where
         write_plan_capacity: usize,
         read_plan_capacity: usize,
     ) -> Self {
+        // Construct the first pooled session alongside the planning cache.
+        // Repository/session setup owns this one-time DataFusion builder cost;
+        // the first recurring read can immediately check out a ready session.
+        let first_read_session =
+            PooledReadSession::new(datafusion_session_from_state(datafusion_state.clone()));
         Self {
             datafusion_state,
-            read_sessions: Mutex::new(Vec::new()),
+            read_sessions: Mutex::new(vec![first_read_session]),
             parsed_statements: Mutex::new(LruCache::new(non_zero(parsed_statement_capacity))),
             public_catalogs: Mutex::new(LruCache::new(non_zero(public_catalog_capacity))),
             write_plans: Mutex::new(LruCache::new(non_zero(write_plan_capacity))),
@@ -620,6 +619,16 @@ where
             physical_read_plans: Mutex::new(LruCache::new(non_zero(read_plan_capacity))),
         }
     }
+}
+
+fn datafusion_session_from_state(datafusion_state: SessionState) -> SessionContext {
+    let catalogs = Arc::new(MemoryCatalogProviderList::new());
+    let catalog = Arc::new(MemoryCatalogProvider::new());
+    catalog
+        .register_schema("public", Arc::new(StatementSchemaProvider::default()))
+        .expect("fresh DataFusion catalog accepts the public schema");
+    catalogs.register_catalog("datafusion".to_string(), catalog);
+    super::session::sql_session_from_template(datafusion_state, Some(catalogs))
 }
 
 impl<CatalogKey> ReadPlanCacheKey<CatalogKey> {
@@ -1245,6 +1254,23 @@ mod tests {
             cache
                 .read_plan("SELECT $1", &[Value::Integer(1)], &"a".into())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn first_read_session_checkout_uses_eagerly_seeded_pool() {
+        let cache = test_cache(2);
+        let prebuilt_session_id = {
+            let sessions = lock_or_recover(&cache.read_sessions);
+            assert_eq!(sessions.len(), 1, "cache construction seeds one session");
+            sessions[0].context().session_id()
+        };
+
+        let checked_out = cache.datafusion_read_session();
+        assert_eq!(checked_out.context().session_id(), prebuilt_session_id);
+        assert!(
+            lock_or_recover(&cache.read_sessions).is_empty(),
+            "first checkout consumes the prebuilt session"
         );
     }
 

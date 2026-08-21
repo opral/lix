@@ -1,8 +1,8 @@
 //! Point- and range-addressable immutable identity parts for complete replacements.
 //!
-//! A replacement part contains the ordered tracked key and canonical
-//! snapshot/metadata authority. Small JSON remains inline; large JSON keeps
-//! its content-addressed reference to avoid duplicate storage.
+//! A replacement part contains the ordered tracked key and canonical row
+//! authority. Its native typed-payload slot is the sole durable live-row
+//! representation.
 //! Commit-wide timestamps, change identifiers, lifecycle metadata, and the
 //! row-group set identity belong to the publishing manifest.
 
@@ -11,18 +11,24 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
+use std::mem::size_of;
 use std::ops::Range;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
 use crate::LixError;
 
 pub(crate) const REPLACEMENT_PART_MAX_ROWS: usize = 512;
-pub(crate) const REPLACEMENT_PART_TARGET_BYTES: usize = 64 * 1024;
+// Native typed rows are already compact and bounded. Keep the physical part
+// aligned with the 512-row direct-address limit so the writer encodes each
+// part once instead of repeatedly halving and recompressing a JSON-era 64 KiB
+// candidate.
+pub(crate) const REPLACEMENT_PART_TARGET_BYTES: usize = 512 * 1024;
 pub(crate) const REPLACEMENT_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-const REPLACEMENT_PART_MAGIC: &[u8; 8] = b"LXRPI003";
-const REPLACEMENT_PART_COMPRESSED_MAGIC: &[u8; 8] = b"LXRPZ003";
+const REPLACEMENT_PART_MAGIC: &[u8; 8] = b"LXRPI005";
+const REPLACEMENT_PART_COMPRESSED_MAGIC: &[u8; 8] = b"LXRPZ005";
 const REPLACEMENT_PART_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const REPLACEMENT_DIRECTORY_MAGIC: &[u8; 8] = b"LXRPD001";
 const REPLACEMENT_PART_DIGEST_CONTEXT: &str = "lix tracked-state replacement identity part v1";
@@ -35,8 +41,8 @@ const DIRECTORY_FIXED_ENTRY_BYTES: usize = DIGEST_BYTES + 4 + 2 + 4 + 4;
 pub(crate) struct ReplacementPartRowRef<'a> {
     /// Canonical bytes produced by the tracked-state key codec.
     pub(crate) encoded_key: &'a [u8],
-    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
-    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) metadata: Option<&'a lix_schema::Jsonb>,
+    pub(crate) snapshot: &'a [u8],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,8 +90,70 @@ impl EncodedReplacementPart {
 pub(crate) struct DecodedReplacementPart {
     key_arena: Bytes,
     key_ranges: Vec<Range<usize>>,
-    snapshots: Vec<crate::json_store::JsonSlot>,
-    metadata: Vec<crate::json_store::JsonSlot>,
+    metadata: Vec<Option<lix_schema::Jsonb>>,
+    snapshots: Vec<Vec<u8>>,
+}
+
+/// Strict replacement-part projection which retains one logical byte arena and
+/// exposes typed payloads as slices of it. Collection scans use this to avoid
+/// manufacturing metadata and one `Vec<u8>` per live row.
+#[derive(Clone, Debug)]
+pub(crate) struct DecodedRawReplacementPart {
+    key_arena: Bytes,
+    key_ranges: Vec<Range<usize>>,
+    payload_arena: Bytes,
+    payload_ranges: Vec<Range<usize>>,
+}
+
+/// A compact replacement projection whose identity and native payload bytes
+/// have already passed the physical decoder and native-wire validator.
+///
+/// The payload certificates share one logical part arena, so a cache hit can
+/// stream rows without loading or decompressing the immutable physical value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedReplacementNativePart {
+    key_arena: Bytes,
+    key_ranges: Vec<Range<usize>>,
+    payloads: Arc<[crate::plugin::wire::typed::ValidatedNativePayload]>,
+}
+
+impl PreparedReplacementNativePart {
+    pub(crate) fn len(&self) -> usize {
+        self.key_ranges.len()
+    }
+
+    pub(crate) fn key(&self, ordinal: usize) -> Option<&[u8]> {
+        self.key_ranges
+            .get(ordinal)
+            .map(|range| &self.key_arena[range.clone()])
+    }
+
+    pub(crate) fn key_owned(&self, ordinal: usize) -> Option<Bytes> {
+        self.key_ranges
+            .get(ordinal)
+            .map(|range| self.key_arena.slice(range.clone()))
+    }
+
+    pub(crate) fn payload(
+        &self,
+        ordinal: usize,
+    ) -> Option<&crate::plugin::wire::typed::ValidatedNativePayload> {
+        self.payloads.get(ordinal)
+    }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.key_arena
+            .len()
+            .saturating_add(self.key_ranges.capacity() * size_of::<Range<usize>>())
+            .saturating_add(
+                self.payloads.len()
+                    * size_of::<crate::plugin::wire::typed::ValidatedNativePayload>(),
+            )
+            .saturating_add(self.payloads.first().map_or(
+                0,
+                crate::plugin::wire::typed::ValidatedNativePayload::owner_len,
+            ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,18 +185,12 @@ impl DecodedReplacementPart {
             .map(|range| &self.key_arena[range.clone()]))
     }
 
-    pub(crate) fn snapshot(
-        &self,
-        ordinal: usize,
-    ) -> Result<Option<crate::json_store::JsonSlotRef<'_>>, LixError> {
-        Ok(self.snapshots.get(ordinal).map(|slot| slot.as_ref_slot()))
+    pub(crate) fn metadata(&self, ordinal: usize) -> Result<Option<&lix_schema::Jsonb>, LixError> {
+        Ok(self.metadata.get(ordinal).and_then(Option::as_ref))
     }
 
-    pub(crate) fn metadata(
-        &self,
-        ordinal: usize,
-    ) -> Result<Option<crate::json_store::JsonSlotRef<'_>>, LixError> {
-        Ok(self.metadata.get(ordinal).map(|slot| slot.as_ref_slot()))
+    pub(crate) fn snapshot(&self, ordinal: usize) -> Result<Option<&[u8]>, LixError> {
+        Ok(self.snapshots.get(ordinal).map(Vec::as_slice))
     }
 
     pub(crate) fn find(
@@ -158,6 +220,24 @@ impl DecodedReplacementPart {
             ordinal: u16::try_from(lower)
                 .expect("replacement part row count is bounded below u16::MAX"),
         }))
+    }
+}
+
+impl DecodedRawReplacementPart {
+    pub(crate) fn len(&self) -> usize {
+        self.key_ranges.len()
+    }
+
+    pub(crate) fn key(&self, ordinal: usize) -> Option<&[u8]> {
+        self.key_ranges
+            .get(ordinal)
+            .map(|range| &self.key_arena[range.clone()])
+    }
+
+    pub(crate) fn snapshot(&self, ordinal: usize) -> Option<Bytes> {
+        self.payload_ranges
+            .get(ordinal)
+            .map(|range| self.payload_arena.slice(range.clone()))
     }
 }
 
@@ -435,8 +515,13 @@ pub(crate) fn encode_replacement_part_with_compressor(
                 .to_be_bytes(),
         );
         encoded.extend_from_slice(suffix);
-        encode_json_slot(&mut encoded, row.snapshot, true)?;
-        encode_json_slot(&mut encoded, row.metadata, false)?;
+        if row.snapshot.is_empty() {
+            return Err(replacement_part_error(
+                "replacement row is missing its typed payload",
+            ));
+        }
+        encode_jsonb(&mut encoded, row.metadata)?;
+        encode_snapshot_slot(&mut encoded, Some(row.snapshot))?;
         previous_key = row.encoded_key;
     }
     if encoded.len() > REPLACEMENT_PART_MAX_DECODED_BYTES {
@@ -543,8 +628,8 @@ pub(crate) fn decode_replacement_part(
     }
     let mut key_arena = Vec::new();
     let mut key_ranges = Vec::with_capacity(row_count);
-    let mut snapshots = Vec::with_capacity(row_count);
     let mut metadata = Vec::with_capacity(row_count);
+    let mut snapshots = Vec::with_capacity(row_count);
     let mut previous_key = Vec::new();
     for _ in 0..row_count {
         let shared = usize::from(decode_u16(body, &mut cursor)?);
@@ -566,8 +651,11 @@ pub(crate) fn decode_replacement_part(
         let start = key_arena.len();
         key_arena.extend_from_slice(&key);
         key_ranges.push(start..key_arena.len());
-        snapshots.push(decode_json_slot(body, &mut cursor, true)?);
-        metadata.push(decode_json_slot(body, &mut cursor, false)?);
+        metadata.push(decode_jsonb(body, &mut cursor)?);
+        let snapshot = decode_snapshot_slot(body, &mut cursor)?.ok_or_else(|| {
+            replacement_part_error("replacement row is missing its typed payload")
+        })?;
+        snapshots.push(snapshot);
         previous_key = key;
     }
     if cursor != body.len() {
@@ -578,9 +666,166 @@ pub(crate) fn decode_replacement_part(
     Ok(DecodedReplacementPart {
         key_arena: Bytes::from(key_arena),
         key_ranges,
-        snapshots,
         metadata,
+        snapshots,
     })
+}
+
+/// Decodes the identity and typed-payload columns while validating (but not
+/// allocating) the metadata column. The physical digest and every structural
+/// bound are checked exactly as in the general decoder.
+pub(crate) fn decode_raw_replacement_part(
+    expected_digest: &[u8; DIGEST_BYTES],
+    encoded: Bytes,
+) -> Result<DecodedRawReplacementPart, LixError> {
+    if encoded.len() > REPLACEMENT_PART_MAX_BYTES {
+        return Err(replacement_part_error(
+            "replacement part exceeds its physical byte bound",
+        ));
+    }
+    if &domain_digest(REPLACEMENT_PART_DIGEST_CONTEXT, &encoded) != expected_digest {
+        return Err(replacement_part_error(
+            "replacement part content digest mismatch",
+        ));
+    }
+    let logical = if encoded.starts_with(REPLACEMENT_PART_COMPRESSED_MAGIC) {
+        let compressed = &encoded[REPLACEMENT_PART_COMPRESSED_MAGIC.len()..];
+        let (uncompressed_len, compressed) = compressed
+            .split_at_checked(4)
+            .ok_or_else(|| replacement_part_error("compressed replacement part is truncated"))?;
+        let uncompressed_len = usize::try_from(u32::from_be_bytes(
+            uncompressed_len
+                .try_into()
+                .expect("four decoded-length bytes"),
+        ))
+        .expect("u32 fits usize");
+        if uncompressed_len > REPLACEMENT_PART_MAX_DECODED_BYTES {
+            return Err(replacement_part_error(
+                "compressed replacement part exceeds its decoded byte bound",
+            ));
+        }
+        let decoded =
+            crate::compression::decompress_zstd(compressed, uncompressed_len).map_err(|error| {
+                replacement_part_error(format!("replacement part decompression failed: {error}"))
+            })?;
+        if decoded.len() != uncompressed_len {
+            return Err(replacement_part_error(
+                "compressed replacement part decoded length mismatch",
+            ));
+        }
+        Bytes::from(decoded)
+    } else {
+        encoded
+    };
+    let Some(body) = logical.strip_prefix(REPLACEMENT_PART_MAGIC) else {
+        return Err(replacement_part_error("replacement part has invalid magic"));
+    };
+    let body_start = logical.len() - body.len();
+    let mut cursor = 0usize;
+    let row_count = usize::from(decode_u16(body, &mut cursor)?);
+    if row_count == 0 || row_count > REPLACEMENT_PART_MAX_ROWS {
+        return Err(replacement_part_error(
+            "replacement part has an invalid row count",
+        ));
+    }
+    let mut key_arena = Vec::new();
+    let mut key_ranges = Vec::with_capacity(row_count);
+    let mut payload_ranges = Vec::with_capacity(row_count);
+    let mut previous_key = Vec::new();
+    for _ in 0..row_count {
+        let shared = usize::from(decode_u16(body, &mut cursor)?);
+        let suffix_len = usize::from(decode_u16(body, &mut cursor)?);
+        if shared > previous_key.len() {
+            return Err(replacement_part_error(
+                "replacement part key prefix exceeds the previous key",
+            ));
+        }
+        let suffix = take_exact(body, &mut cursor, suffix_len)?;
+        let mut key = Vec::with_capacity(shared + suffix_len);
+        key.extend_from_slice(&previous_key[..shared]);
+        key.extend_from_slice(suffix);
+        if key.is_empty() || (!previous_key.is_empty() && previous_key >= key) {
+            return Err(replacement_part_error(
+                "replacement part keys are not strictly ordered",
+            ));
+        }
+        let key_start = key_arena.len();
+        key_arena.extend_from_slice(&key);
+        key_ranges.push(key_start..key_arena.len());
+        skip_jsonb(body, &mut cursor)?;
+        match *take_exact(body, &mut cursor, 1)?
+            .first()
+            .expect("one typed-payload tag byte")
+        {
+            1 => {
+                let payload = decode_u32_bytes(body, &mut cursor)?;
+                if payload.is_empty() {
+                    return Err(replacement_part_error("typed payload is empty"));
+                }
+                let start = body_start + (payload.as_ptr() as usize - body.as_ptr() as usize);
+                payload_ranges.push(start..start + payload.len());
+            }
+            0 => {
+                return Err(replacement_part_error(
+                    "replacement row is missing its typed payload",
+                ));
+            }
+            _ => {
+                return Err(replacement_part_error(
+                    "replacement typed payload has an invalid tag",
+                ));
+            }
+        }
+        previous_key = key;
+    }
+    if cursor != body.len() {
+        return Err(replacement_part_error(
+            "replacement part has trailing bytes",
+        ));
+    }
+    Ok(DecodedRawReplacementPart {
+        key_arena: Bytes::from(key_arena),
+        key_ranges,
+        payload_arena: logical,
+        payload_ranges,
+    })
+}
+
+pub(crate) fn decode_native_replacement_part(
+    expected_digest: &[u8; DIGEST_BYTES],
+    encoded: Bytes,
+) -> Result<Option<Arc<PreparedReplacementNativePart>>, LixError> {
+    let decoded = decode_raw_replacement_part(expected_digest, encoded)?;
+    if decoded.payload_ranges.iter().any(|range| {
+        !matches!(
+            decoded.payload_arena.get(range.start).copied(),
+            Some(crate::plugin::wire::typed::NATIVE_ROW_PAYLOAD_VERSION)
+                | Some(crate::plugin::wire::typed::STORAGE_ROW_PAYLOAD_VERSION)
+        )
+    }) {
+        return Ok(None);
+    }
+    let owner = decoded.payload_arena.clone();
+    let Ok(payloads) = decoded
+        .payload_ranges
+        .iter()
+        .cloned()
+        .map(|range| {
+            crate::plugin::wire::typed::ValidatedNativePayload::try_new_range(
+                owner.clone(),
+                range,
+            )
+            .map_err(|_| ())
+        })
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(PreparedReplacementNativePart {
+        key_arena: decoded.key_arena,
+        key_ranges: decoded.key_ranges,
+        payloads: Arc::from(payloads),
+    })))
 }
 
 pub(crate) fn decode_replacement_part_for_entry(
@@ -621,59 +866,91 @@ fn encode_u32_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), LixError> {
     Ok(())
 }
 
-fn encode_json_slot(
-    out: &mut Vec<u8>,
-    slot: crate::json_store::JsonSlotRef<'_>,
-    required: bool,
-) -> Result<(), LixError> {
-    match slot {
-        crate::json_store::JsonSlotRef::None if required => Err(replacement_part_error(
-            "replacement snapshot payload is missing",
-        )),
-        crate::json_store::JsonSlotRef::None => {
+fn encode_jsonb(out: &mut Vec<u8>, value: Option<&lix_schema::Jsonb>) -> Result<(), LixError> {
+    match value {
+        None => {
             out.push(0);
             Ok(())
         }
-        crate::json_store::JsonSlotRef::Ref(json_ref) => {
+        Some(value) => {
             out.push(1);
-            out.extend_from_slice(json_ref.as_hash_bytes());
-            Ok(())
-        }
-        crate::json_store::JsonSlotRef::Inline(json) => {
-            out.push(2);
-            encode_u32_bytes(out, json.as_bytes())
+            let binary = value.binary().map_err(|error| {
+                replacement_part_error(format!("replacement metadata JSONB cannot encode: {error}"))
+            })?;
+            encode_u32_bytes(out, &binary)
         }
     }
 }
 
-fn decode_json_slot(
-    encoded: &[u8],
-    cursor: &mut usize,
-    required: bool,
-) -> Result<crate::json_store::JsonSlot, LixError> {
+fn decode_jsonb(encoded: &[u8], cursor: &mut usize) -> Result<Option<lix_schema::Jsonb>, LixError> {
     let tag = *take_exact(encoded, cursor, 1)?
         .first()
         .expect("one tag byte");
     match tag {
-        0 if required => Err(replacement_part_error(
-            "replacement snapshot payload is missing",
-        )),
-        0 => Ok(crate::json_store::JsonSlot::None),
-        1 => Ok(crate::json_store::JsonSlot::Ref(
-            crate::json_store::JsonRef::from_hash_bytes(
-                take_exact(encoded, cursor, 32)?
-                    .try_into()
-                    .expect("JSON reference width checked"),
-            ),
-        )),
-        2 => {
+        0 => Ok(None),
+        1 => {
             let bytes = decode_u32_bytes(encoded, cursor)?;
-            let json = std::str::from_utf8(bytes)
-                .map_err(|_| replacement_part_error("replacement inline JSON is not UTF-8"))?;
-            Ok(crate::json_store::JsonSlot::Inline(json.to_owned().into()))
+            lix_schema::Jsonb::from_binary_vec(bytes.to_vec())
+                .map(Some)
+                .map_err(|error| {
+                    replacement_part_error(format!(
+                        "replacement metadata JSONB is invalid: {error}"
+                    ))
+                })
         }
         _ => Err(replacement_part_error(
-            "replacement JSON slot has an invalid tag",
+            "replacement metadata JSONB has an invalid tag",
+        )),
+    }
+}
+
+fn skip_jsonb(encoded: &[u8], cursor: &mut usize) -> Result<(), LixError> {
+    let tag = *take_exact(encoded, cursor, 1)?
+        .first()
+        .expect("one tag byte");
+    match tag {
+        0 => Ok(()),
+        1 => {
+            let bytes = decode_u32_bytes(encoded, cursor)?;
+            lix_schema::validate_binary(bytes).map_err(|error| {
+                replacement_part_error(format!("replacement metadata JSONB is invalid: {error}"))
+            })
+        }
+        _ => Err(replacement_part_error(
+            "replacement metadata JSONB has an invalid tag",
+        )),
+    }
+}
+
+fn encode_snapshot_slot(out: &mut Vec<u8>, payload: Option<&[u8]>) -> Result<(), LixError> {
+    match payload {
+        None => out.push(0),
+        Some(payload) => {
+            if payload.is_empty() {
+                return Err(replacement_part_error("typed payload is empty"));
+            }
+            out.push(1);
+            encode_u32_bytes(out, payload)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_snapshot_slot(encoded: &[u8], cursor: &mut usize) -> Result<Option<Vec<u8>>, LixError> {
+    match *take_exact(encoded, cursor, 1)?
+        .first()
+        .expect("one tag byte")
+    {
+        0 => Ok(None),
+        1 => {
+            let payload = decode_u32_bytes(encoded, cursor)?;
+            if payload.is_empty() {
+                return Err(replacement_part_error("typed payload is empty"));
+            }
+            Ok(Some(payload.to_vec()))
+        }
+        _ => Err(replacement_part_error(
+            "replacement typed payload has an invalid tag",
         )),
     }
 }
@@ -744,8 +1021,8 @@ mod tests {
         keys.iter()
             .map(|key| ReplacementPartRowRef {
                 encoded_key: key,
-                snapshot: crate::json_store::JsonSlotRef::Inline("{}"),
-                metadata: crate::json_store::JsonSlotRef::None,
+                metadata: None,
+                snapshot: b"typed",
             })
             .collect()
     }
@@ -782,26 +1059,55 @@ mod tests {
     }
 
     #[test]
-    fn part_preserves_content_references_without_inlining_payloads() {
-        let snapshot_ref = crate::json_store::JsonRef::for_content(&vec![b'x'; 8 * 1024 * 1024]);
-        let metadata_ref = crate::json_store::JsonRef::for_content(&vec![b'y'; 2 * 1024 * 1024]);
+    fn part_round_trips_native_jsonb_metadata() {
+        let metadata = lix_schema::Jsonb::from_value(serde_json::json!({"source": "test"}));
         let rows = [ReplacementPartRowRef {
             encoded_key: b"alpha",
-            snapshot: crate::json_store::JsonSlotRef::Ref(&snapshot_ref),
-            metadata: crate::json_store::JsonSlotRef::Ref(&metadata_ref),
+            metadata: Some(&metadata),
+            snapshot: b"typed",
         }];
-        let encoded = encode_replacement_part(&rows).expect("encode referenced replacement part");
-        assert!(encoded.bytes().len() < 256);
+        let encoded = encode_replacement_part(&rows).expect("encode replacement part metadata");
         let decoded = decode_replacement_part(encoded.digest(), encoded.bytes())
-            .expect("decode referenced replacement part");
+            .expect("decode replacement part metadata");
+        assert_eq!(decoded.metadata(0).expect("metadata slot"), Some(&metadata));
+    }
+
+    #[test]
+    fn part_round_trips_native_snapshot_without_json() {
+        let typed = crate::plugin::runtime::WasmTypedRow {
+            schema_fingerprint: [7; 32],
+            row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+            row: lix_schema::Row::from([("value".to_owned(), lix_schema::Value::Int8(42))]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        };
+        let rows = [ReplacementPartRowRef {
+            encoded_key: b"typed-row",
+            metadata: None,
+            snapshot: typed.durable_payload_ref().expect("typed snapshot encodes"),
+        }];
+        let encoded = encode_replacement_part(&rows).expect("typed part should encode");
+        let decoded = decode_replacement_part(encoded.digest(), encoded.bytes())
+            .expect("typed part should decode");
+        let payload = decoded
+            .snapshot(0)
+            .expect("typed payload accessor should succeed")
+            .expect("typed payload should be present");
         assert_eq!(
-            decoded.snapshot(0).expect("snapshot slot"),
-            Some(crate::json_store::JsonSlotRef::Ref(&snapshot_ref))
+            crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+                std::sync::Arc::from(payload),
+                "test",
+                &crate::row_pk::RowPk::single("row-1"),
+            )
+            .expect("typed payload decodes against its outer identity"),
+            typed
         );
-        assert_eq!(
-            decoded.metadata(0).expect("metadata slot"),
-            Some(crate::json_store::JsonSlotRef::Ref(&metadata_ref))
-        );
+        let decoded_native =
+            super::decode_native_replacement_part(encoded.digest(), encoded.bytes().clone())
+                .expect("native descriptor decode should succeed")
+                .expect("native descriptor should be recognized");
+        assert_eq!(decoded_native.key(0), Some(b"typed-row".as_slice()));
+        assert_eq!(decoded_native.payload(0).unwrap().as_bytes(), payload);
     }
 
     #[test]

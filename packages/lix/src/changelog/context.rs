@@ -28,7 +28,6 @@ use crate::changelog::{
     CommitLoadRequest, CommitRecord, CommitScanBatch, CommitScanRequest,
     TransactionChangelogAppend,
 };
-use crate::json_store::JsonSlotRef;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, StorageAdapter,
@@ -142,21 +141,18 @@ fn transaction_change_value_capacity(
         .saturating_add(change.row_pk.estimated_heap_bytes())
         .saturating_add(change.file_id.map_or(0, str::len))
         .saturating_add(change.origin_key.map_or(0, str::len))
-        .saturating_add(json_slot_ref_value_capacity(change.snapshot))
-        .saturating_add(json_slot_ref_value_capacity(change.metadata))
+        .saturating_add(change.snapshot.map_or(0, <[u8]>::len))
+        .saturating_add(
+            change
+                .metadata
+                .and_then(|metadata| metadata.binary_len().ok())
+                .unwrap_or(0),
+        )
 }
 
 fn change_value_capacity(change: &ChangeRecord) -> usize {
     let change = crate::changelog::TransactionChangeRecordRef::from(change);
     transaction_change_value_capacity(&change)
-}
-
-fn json_slot_ref_value_capacity(slot: JsonSlotRef<'_>) -> usize {
-    match slot {
-        JsonSlotRef::None => 1,
-        JsonSlotRef::Ref(_) => 33,
-        JsonSlotRef::Inline(json) => json.len().saturating_add(9),
-    }
 }
 
 fn commit_value_capacity(commit: &CommitRecord) -> usize {
@@ -1056,7 +1052,6 @@ where
 mod sparse_append_tests {
     use super::*;
     use crate::changelog::{COMMIT_RECORD_FORMAT_VERSION, CommitTouchedScopeDigest};
-    use crate::json_store::JsonSlot;
     use crate::row_pk::RowPk;
     use crate::storage_adapter::StorageReadOptions;
 
@@ -1090,8 +1085,8 @@ mod sparse_append_tests {
             schema_key: "lix_key_value".to_owned(),
             row_pk: RowPk::single("collision"),
             file_id: None,
-            snapshot: JsonSlot::from_json(r#"{"key":"collision","value":"x"}"#),
-            metadata: JsonSlot::None,
+            snapshot: None,
+            metadata: None,
             created_at: timestamp,
             origin_key: None,
         };

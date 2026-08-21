@@ -5,9 +5,8 @@ use lix::storage_adapter::{
     StorageAdapter, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
 };
 use lix::storage_bench::{
-    MergeBaseBenchScenario, layout_space_catalog, load_seeded_branch_plugin_checkpoint_for_bench,
-    merge_base_for_bench, prepare_merge_for_bench, read_binary_cas_for_bench,
-    seed_branch_plugin_checkpoints_for_bench, seed_merge_base_fixture_for_bench, space_inventory,
+    MergeBaseBenchScenario, layout_space_catalog, merge_base_for_bench, prepare_merge_for_bench,
+    read_binary_cas_for_bench, seed_merge_base_fixture_for_bench, space_inventory,
     write_binary_cas_for_bench,
 };
 use lix::{Lix, Value, open_lix};
@@ -15,15 +14,12 @@ use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use std::path::Path;
 
-const BRANCH_ID: &str = "01920000-0000-7000-8000-000000000001";
-const CHECKPOINT_FILE_ID: &str = "01920000-0000-7000-8000-000010000000";
 // Must track `BRANCH_HEAD_CONTROL_NAMESPACE` in `lix::branch::control`, which
 // is bumped whenever the branch-control record layout changes. Unlike the
 // predicate in the server-protocol gate this cannot match on a prefix: it names
 // the space it reconstructs. A stale value here does not fail loudly at the
 // mismatch, it makes the inventory come back empty.
 const BRANCH_CONTROL_SPACE: &str = "branch.head_control.v11";
-const PLUGIN_CHECKPOINT_SPACE: &str = "plugin.current_checkpoint.v2";
 const COMMIT_MANIFEST_SPACE: &str = "tracked_state.commit_state_manifest.v7";
 const TREE_CHUNK_SPACE: &str = "tracked_state.tree_chunk";
 const BINARY_CHUNK_SPACE: &str = "binary_cas.chunk";
@@ -98,9 +94,58 @@ async fn slatedb_cold_reopen_corruption_qualification() {
 
 async fn qualify_backend<B: DurableBackend>() {
     qualify_healthy_reopen_undo_diff_and_branch_control::<B>().await;
-    qualify_10k_history_manifest_and_checkpoint::<B>().await;
+    qualify_10k_history_manifest::<B>().await;
     qualify_tracked_tree_chunk::<B>().await;
     qualify_binary_payload_chunk::<B>().await;
+}
+
+async fn qualify_10k_history_manifest<B: DurableBackend>() {
+    let directory = tempfile::tempdir().expect("create 10K-history corruption fixture");
+    let path = directory.path();
+    let database = B::open(path);
+    let storage = StorageAdapter::new(database.clone());
+    let fixture = seed_merge_base_fixture_for_bench(
+        &storage,
+        10_000,
+        MergeBaseBenchScenario::AncestorDescendant,
+    )
+    .await
+    .expect("seed 10K production commit graph");
+    database.flush_all().await;
+    drop(storage);
+    drop(database);
+
+    let database = B::open(path);
+    let storage = StorageAdapter::new(database.clone());
+    assert_eq!(
+        merge_base_for_bench(&storage, &fixture.left_head, &fixture.right_head)
+            .await
+            .expect("10K merge base should survive cold reopen"),
+        fixture.left_head
+    );
+    let prepared = prepare_merge_for_bench(&storage, &fixture.left_head, &fixture.right_head)
+        .await
+        .expect("10K empty-root diff should survive cold reopen");
+    assert_eq!((prepared.target_entries, prepared.source_entries), (0, 0));
+
+    let target_key = uuid::Uuid::parse_str(&fixture.right_head)
+        .expect("benchmark head is a UUID")
+        .as_bytes()
+        .to_vec();
+    replace_immutable_value_with_corruption(&database, COMMIT_MANIFEST_SPACE, &target_key, 0).await;
+    database.flush_all().await;
+    drop(storage);
+    drop(database);
+
+    let database = B::open(path);
+    let storage = StorageAdapter::new(database.clone());
+    let error = prepare_merge_for_bench(&storage, &fixture.left_head, &fixture.right_head)
+        .await
+        .expect_err("corrupt commit manifest must fail closed");
+    assert!(
+        error.to_string().contains("commit_state_manifest"),
+        "unexpected manifest corruption error: {error}"
+    );
 }
 
 async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>() {
@@ -174,84 +219,6 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
         error.to_string().contains("authentication digest mismatch"),
         "unexpected branch-control corruption error: {error}"
     );
-    drop(database);
-}
-
-async fn qualify_10k_history_manifest_and_checkpoint<B: DurableBackend>() {
-    let directory = tempfile::tempdir().expect("create 10K-history corruption fixture");
-    let path = directory.path();
-    let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
-    let fixture = seed_merge_base_fixture_for_bench(
-        &storage,
-        10_000,
-        MergeBaseBenchScenario::AncestorDescendant,
-    )
-    .await
-    .expect("seed 10K production commit graph");
-    seed_branch_plugin_checkpoints_for_bench(&storage, BRANCH_ID, 1, 1)
-        .await
-        .expect("seed authenticated checkpoint");
-    database.flush_all().await;
-    drop(storage);
-    drop(database);
-
-    let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
-    assert_eq!(
-        merge_base_for_bench(&storage, &fixture.left_head, &fixture.right_head)
-            .await
-            .expect("10K merge base should survive cold reopen"),
-        fixture.left_head
-    );
-    let prepared = prepare_merge_for_bench(&storage, &fixture.left_head, &fixture.right_head)
-        .await
-        .expect("10K empty-root diff should survive cold reopen");
-    assert_eq!((prepared.target_entries, prepared.source_entries), (0, 0));
-    assert_eq!(
-        load_seeded_branch_plugin_checkpoint_for_bench(&storage, BRANCH_ID, CHECKPOINT_FILE_ID)
-            .await
-            .expect("healthy checkpoint should load"),
-        Some((
-            b"checkpoint-runtime".to_vec(),
-            b"checkpoint-authority".to_vec()
-        ))
-    );
-    corrupt_every_mutable_value(&database, PLUGIN_CHECKPOINT_SPACE, 92).await;
-    database.flush_all().await;
-    drop(storage);
-    drop(database);
-
-    let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
-    let error =
-        load_seeded_branch_plugin_checkpoint_for_bench(&storage, BRANCH_ID, CHECKPOINT_FILE_ID)
-            .await
-            .expect_err("corrupt checkpoint must not become a cache miss");
-    assert!(
-        error.to_string().contains("authentication digest mismatch"),
-        "unexpected checkpoint corruption error: {error}"
-    );
-
-    let target_key = uuid::Uuid::parse_str(&fixture.right_head)
-        .expect("benchmark head is a UUID")
-        .as_bytes()
-        .to_vec();
-    replace_immutable_value_with_corruption(&database, COMMIT_MANIFEST_SPACE, &target_key, 0).await;
-    database.flush_all().await;
-    drop(storage);
-    drop(database);
-
-    let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
-    let error = prepare_merge_for_bench(&storage, &fixture.left_head, &fixture.right_head)
-        .await
-        .expect_err("corrupt commit manifest must fail closed");
-    assert!(
-        error.to_string().contains("commit_state_manifest"),
-        "unexpected manifest corruption error: {error}"
-    );
-    drop(storage);
     drop(database);
 }
 

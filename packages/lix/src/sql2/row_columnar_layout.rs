@@ -43,8 +43,29 @@ enum ClusterField<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct RowColumnarRowRef<'a> {
     pub(crate) row_pk: &'a RowPk,
-    pub(crate) snapshot_bytes: &'a [u8],
-    pub(crate) snapshot_value: &'a JsonValue,
+    pub(crate) snapshot_bytes: Option<&'a [u8]>,
+    pub(crate) snapshot_value: Option<&'a JsonValue>,
+    pub(crate) typed_row: Option<&'a lix_schema::Row>,
+}
+
+impl RowColumnarRowRef<'_> {
+    fn boolean(&self, name: &str) -> Option<bool> {
+        self.typed_row
+            .and_then(|row| match row.get(name) {
+                Some(lix_schema::Value::Boolean(value)) => Some(*value),
+                _ => None,
+            })
+            .or_else(|| self.snapshot_value?.get(name)?.as_bool())
+    }
+
+    fn string(&self, name: &str) -> Option<&str> {
+        self.typed_row
+            .and_then(|row| match row.get(name) {
+                Some(lix_schema::Value::Text(value)) => Some(value.as_str()),
+                _ => None,
+            })
+            .or_else(|| self.snapshot_value?.get(name)?.as_str())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -253,11 +274,7 @@ where
         }
         let mut values = std::collections::BTreeSet::new();
         for (_, row) in &rows {
-            if let Some(value) = row
-                .snapshot_value
-                .get(&column.name)
-                .and_then(JsonValue::as_str)
-            {
+            if let Some(value) = row.string(&column.name) {
                 values.insert(value.to_owned());
                 if values.len() > LOW_CARDINALITY_CLUSTER_MAX_VALUES {
                     break;
@@ -299,16 +316,14 @@ where
                 .iter()
                 .map(|field| match field {
                     ClusterField::Boolean(name) => {
-                        match row.snapshot_value.get(*name).and_then(JsonValue::as_bool) {
+                        match row.boolean(name) {
                             Some(false) => 0,
                             Some(true) => 1,
                             None => 2,
                         }
                     }
                     ClusterField::String(name, dictionary) => row
-                        .snapshot_value
-                        .get(*name)
-                        .and_then(JsonValue::as_str)
+                        .string(name)
                         .and_then(|value| dictionary.get(value).copied())
                         .unwrap_or(u8::MAX),
                 })
@@ -332,8 +347,10 @@ where
                         .map_err(|_| row_columnar_error("row index exceeds u32"))?,
                 });
             }
-            let mut columns = decoder
-                .decode_arrow_columns(rows.iter().map(|(_, row)| Some(row.snapshot_bytes)))?;
+            let mut columns = decoder.decode_mixed_arrow_columns(
+                rows.iter()
+                    .map(|(_, row)| (row.snapshot_bytes, row.typed_row)),
+            )?;
             let row_pks = rows
                 .iter()
                 .map(|(_, row)| row.row_pk.as_json_array_text())
@@ -368,6 +385,12 @@ fn optional_derived_row_group_set(
 
 fn row_columnar_metadata(spec: &SchemaSurfaceSpec) -> HashMap<String, String> {
     let mut metadata = HashMap::from([
+        (
+            "lix.schema_v1.fingerprint".to_owned(),
+            blake3::Hash::from_bytes(spec.schema_fingerprint)
+                .to_hex()
+                .to_string(),
+        ),
         (
             ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
             spec.columnar_layout_fingerprint(),
@@ -434,8 +457,9 @@ mod tests {
             identities.iter().zip(&snapshots).zip(&canonical).map(
                 |((row_pk, snapshot), canonical)| RowColumnarRowRef {
                     row_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
+                    snapshot_value: Some(snapshot),
+                    typed_row: None,
                 },
             ),
         )
@@ -519,8 +543,9 @@ mod tests {
             identities.iter().zip(&snapshots).zip(&canonical).map(
                 |((row_pk, snapshot), canonical)| RowColumnarRowRef {
                     row_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
+                    snapshot_value: Some(snapshot),
+                    typed_row: None,
                 },
             ),
         )
@@ -590,8 +615,9 @@ mod tests {
             identities.iter().zip(&snapshots).zip(&canonical).map(
                 |((row_pk, snapshot), canonical)| RowColumnarRowRef {
                     row_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
+                    snapshot_value: Some(snapshot),
+                    typed_row: None,
                 },
             ),
         )
@@ -657,8 +683,9 @@ mod tests {
             identities.iter().zip(&snapshots).zip(&canonical).map(
                 |((row_pk, snapshot), canonical)| RowColumnarRowRef {
                     row_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
+                    snapshot_value: Some(snapshot),
+                    typed_row: None,
                 },
             ),
         )
@@ -727,8 +754,9 @@ mod tests {
                 &spec,
                 std::iter::once(RowColumnarRowRef {
                     row_pk: &identity,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: &snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
+                    snapshot_value: Some(&snapshot),
+                    typed_row: None,
                 }),
             )
             .expect("encode")
@@ -791,8 +819,9 @@ mod tests {
             identities.iter().zip(&snapshots).zip(&canonical).map(
                 |((row_pk, snapshot), canonical)| RowColumnarRowRef {
                     row_pk,
-                    snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_bytes: Some(canonical.as_bytes()),
+                    snapshot_value: Some(snapshot),
+                    typed_row: None,
                 },
             ),
         )

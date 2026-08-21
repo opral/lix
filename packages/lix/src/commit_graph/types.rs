@@ -5,15 +5,15 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{ExactValue, LixTimestamp};
 use crate::row_pk::RowPk;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CommitGraphChange {
     pub(crate) id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) row_pk: RowPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) snapshot: crate::json_store::JsonSlot,
-    pub(crate) metadata: crate::json_store::JsonSlot,
+    pub(crate) metadata: Option<lix_schema::Jsonb>,
+    pub(crate) snapshot: Option<Vec<u8>>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<String>,
 }
@@ -107,7 +107,7 @@ pub(crate) struct CommitGraphChangeHistoryRequest {
 ///
 /// `start_commit_id` is the traversal anchor requested by the caller. It is not
 /// necessarily a graph root or a branch head.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CommitGraphChangeHistoryEntry {
     pub(crate) change: CommitGraphChange,
     pub(crate) observed_commit_id: CommitId,
@@ -115,7 +115,7 @@ pub(crate) struct CommitGraphChangeHistoryEntry {
     pub(crate) depth: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CommitGraphHistory {
     pub(crate) entries: Vec<CommitGraphChangeHistoryEntry>,
     pub(crate) reachable_nodes: Arc<[ReachableCommitGraphNode]>,

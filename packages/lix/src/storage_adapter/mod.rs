@@ -39,8 +39,10 @@ pub use crate::storage::{
     ValueSemantics, WriteOptions as StorageWriteOptions,
 };
 pub(crate) use crate::storage::{Capability as StorageCapability, PutBatch, PutEntry};
+pub(crate) use crate::storage::StorageWrite;
 
 pub use context::StorageAdapter;
+pub(crate) use context::stage_mutation_revision;
 pub(crate) use point::exact_get_many;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
 pub(crate) use read_scope::SharedStorageAdapterRead;
@@ -56,5 +58,4 @@ pub use stats::{
 };
 #[cfg(any(test, feature = "storage-benches"))]
 pub use write_set::StorageWriteSetArenaStats;
-pub(crate) use write_set::{DeferredFinalPutPage, DeferredFinalPutSource};
 pub use write_set::{StorageWriteSet, StorageWriteSetError};

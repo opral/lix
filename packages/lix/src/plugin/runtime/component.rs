@@ -54,6 +54,7 @@ struct CachedPluginFactory {
 struct PluginRegistryReadCache {
     snapshot: Option<u128>,
     registries: BTreeMap<String, PluginRegistry>,
+    durable_registries: BTreeMap<String, (String, PluginRegistry)>,
 }
 
 #[derive(Clone)]
@@ -132,6 +133,43 @@ impl PluginRuntimeHost {
             .get_or_compile(registry)
     }
 
+    pub(crate) fn cached_plugin_registry(
+        &self,
+        branch_id: &str,
+        change_id: &str,
+    ) -> Result<Option<PluginRegistry>, LixError> {
+        let cache = self.plugin_registry_read_cache.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "plugin registry read cache lock poisoned",
+            )
+        })?;
+        Ok(cache
+            .durable_registries
+            .get(branch_id)
+            .filter(|(cached_change_id, _)| cached_change_id == change_id)
+            .map(|(_, registry)| registry.clone()))
+    }
+
+    pub(crate) fn cache_plugin_registry(
+        &self,
+        branch_id: &str,
+        change_id: &str,
+        registry: &PluginRegistry,
+    ) -> Result<(), LixError> {
+        let mut cache = self.plugin_registry_read_cache.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "plugin registry read cache lock poisoned",
+            )
+        })?;
+        cache.durable_registries.insert(
+            branch_id.to_owned(),
+            (change_id.to_owned(), registry.clone()),
+        );
+        Ok(())
+    }
+
     pub(crate) fn cached_plugin_registries(
         &self,
         snapshot: u128,
@@ -146,7 +184,7 @@ impl PluginRuntimeHost {
         if cache.snapshot != Some(snapshot) {
             return Ok(None);
         }
-        let registries = branch_ids
+        Ok(branch_ids
             .iter()
             .map(|branch_id| {
                 cache
@@ -155,8 +193,7 @@ impl PluginRuntimeHost {
                     .cloned()
                     .map(|registry| (branch_id.clone(), registry))
             })
-            .collect::<Option<BTreeMap<_, _>>>();
-        Ok(registries)
+            .collect())
     }
 
     pub(crate) fn cache_plugin_registries(
@@ -386,29 +423,26 @@ mod tests {
     }
 
     #[test]
-    fn plugin_registry_read_cache_isolated_by_snapshot() {
+    fn plugin_registry_read_cache_isolated_by_durable_change() {
         let host = PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime));
-        let branches = BTreeSet::from(["01920000-0000-7000-8000-0000000000a1".to_string()]);
-        let registries = BTreeMap::from([(
-            "01920000-0000-7000-8000-0000000000a1".to_string(),
-            PluginRegistry::empty(),
-        )]);
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let registry = PluginRegistry::empty();
 
         assert!(
-            host.cached_plugin_registries(7, &branches)
+            host.cached_plugin_registry(branch_id, "change-7")
                 .expect("inspect empty cache")
                 .is_none()
         );
-        host.cache_plugin_registries(7, &registries)
+        host.cache_plugin_registry(branch_id, "change-7", &registry)
             .expect("cache registry");
         assert_eq!(
-            host.cached_plugin_registries(7, &branches)
-                .expect("read matching snapshot"),
-            Some(registries)
+            host.cached_plugin_registry(branch_id, "change-7")
+                .expect("read matching durable change"),
+            Some(registry)
         );
         assert!(
-            host.cached_plugin_registries(8, &branches)
-                .expect("read different snapshot")
+            host.cached_plugin_registry(branch_id, "change-8")
+                .expect("read different durable change")
                 .is_none()
         );
     }

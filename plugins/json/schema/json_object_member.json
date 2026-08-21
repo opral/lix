@@ -47,9 +47,9 @@
     },
     {
       "name": "scalar_json",
-      "type": "text",
+      "type": "jsonb",
       "nullable": true,
-      "description": "The complete raw JSON scalar encoded as text. Omitted when kind is object or array."
+      "description": "The JSON scalar value. Omitted when kind is object or array."
     },
     {
       "name": "suffix_json",

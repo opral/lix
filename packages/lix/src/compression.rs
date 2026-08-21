@@ -3,7 +3,7 @@ pub(crate) fn compress_zstd_level_1(data: &[u8]) -> Result<Vec<u8>, String> {
     zstd::bulk::compress(data, 1).map_err(|error| error.to_string())
 }
 
-/// Reusable level-1 compressor for page/segment loops.
+/// Reusable level-1 compressor for durable page/segment loops.
 ///
 /// `zstd::bulk::compress` constructs a fresh context for every call. History
 /// staging emits thousands of bounded segments at scale, so retaining one
@@ -24,6 +24,24 @@ impl ZstdLevel1Compressor {
 
     pub(crate) fn compress(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
         self.inner.compress(data).map_err(|error| error.to_string())
+    }
+
+    /// Reuses a very-fast zstd context for latency-sensitive, highly
+    /// repetitive typed row segments. The frame remains ordinary zstd and is
+    /// decoded by the same bounded reader.
+    pub(crate) fn new_fast() -> Result<Self, String> {
+        let mut inner = zstd::bulk::Compressor::new(-5).map_err(|error| error.to_string())?;
+        // Commit-delta parts are independently bounded and dominated by
+        // adjacent row-layout repetition. A full-size zstd history/hash table
+        // allocates tens of MiB per transaction without improving this input's
+        // useful ratio. Keep a 128-KiB window and compact fast-strategy table;
+        // each emitted frame remains standard zstd with its own declared
+        // window and therefore preserves the existing decoder contract.
+        inner
+            .set_parameter(zstd::zstd_safe::CParameter::WindowLog(17))
+            .and_then(|()| inner.set_parameter(zstd::zstd_safe::CParameter::HashLog(15)))
+            .map_err(|error| error.to_string())?;
+        Ok(Self { inner })
     }
 }
 
@@ -50,6 +68,10 @@ impl ZstdLevel1Compressor {
 
     pub(crate) fn compress(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
         compress_zstd_level_1(data)
+    }
+
+    pub(crate) fn new_fast() -> Result<Self, String> {
+        Self::new()
     }
 }
 

@@ -32,8 +32,7 @@ pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
 };
 pub(crate) use current_state_data_part::{
-    CURRENT_STATE_DATA_PART_REFS_SPACE, CURRENT_STATE_DATA_PART_SPACE,
-    decode_current_state_data_part_commit_ids, decode_current_state_data_part_refs,
+    CURRENT_STATE_DATA_PART_SPACE, decode_current_state_data_part_commit_ids,
 };
 #[cfg(test)]
 pub(crate) use current_state_data_part::{CurrentStateDataRow, encode_current_state_data_part};
@@ -48,7 +47,9 @@ pub(crate) use merge::{
     merge_payload_fallback_ids, plan_merge,
 };
 pub(crate) use mutation_directory::{
-    MUTATION_DIRECTORY_NODE_SPACE, collect_mutation_directory_node_ids,
+    LAYOUT_BOUNDED_DIRECT, LAYOUT_BOUNDED_INDIRECT, LAYOUT_COMPACT_REPLACEMENT,
+    LAYOUT_DIRECT_ROWS_ONLY, MUTATION_DIRECTORY_NODE_SPACE, MutationDirectoryRoot,
+    collect_mutation_directory_node_ids,
 };
 pub(crate) use replacement_part::{
     EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS, REPLACEMENT_PART_TARGET_BYTES,
@@ -62,31 +63,34 @@ pub(crate) use row_materialization::{
 #[cfg(test)]
 pub(crate) use scoped_current_state::attest_scoped_range_root;
 pub(crate) use scoped_current_state::incomplete_touched_scope_filter;
-pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
+pub(crate) use scoped_range::{
+    SCOPED_RANGE_NODE_SPACE, ScopedRangeRoot, validate_scoped_range_trees,
+};
 pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::decode_change_locator;
 pub(crate) use storage::load_commit_state_authority_ids;
-#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::stage_commit_state_manifest;
 #[cfg(test)]
 pub(crate) use storage::stage_sweep_unreachable_content_nodes;
 pub(crate) use storage::{
     CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
     CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
-    CommitDeltaReplacementScope, OrderedAddressableCommitDeltaStage, PublishedCommitStateTopology,
-    StagedCommitStateManifest, commit_delta_contains_schema, commit_delta_member_scopes,
+    CommitDeltaReplacementScope, EnvelopeCertifiedNativeProjectionBatch,
+    EnvelopeCertifiedNativeProjectionSegment, ExclusiveRowSnapshotBatch,
+    OrderedAddressableCommitDeltaStage, PublishedCommitStateTopology, StagedCommitStateManifest,
+    commit_delta_contains_schema, commit_delta_member_scopes,
     commit_history_is_deferred, direct_change_locator, load_change_record_by_id,
     load_commit_delta_change_records,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
     load_commit_mutation_directory_roots, load_commit_state_manifest, load_commit_state_manifests,
-    load_local_selected_change_owner_commit_ids, load_owned_commit_delta_entries,
-    load_owned_commit_delta_entries_one_ordered_ref, load_published_commit_state_topology,
-    load_retained_commit_snapshots_for_schemas, scan_change_records_from_commit_deltas,
-    scan_commit_delta_inventory, scan_commit_delta_values, scan_commit_state_manifest_commit_ids,
-    selected_change_selection_fingerprint, stage_addressable_commit_deltas,
-    stage_addressable_commit_deltas_with_selected_source,
+    load_exclusive_row_snapshots, load_local_selected_change_owner_commit_ids,
+    load_owned_commit_delta_entries, load_owned_commit_delta_entries_one_ordered_ref,
+    load_published_commit_state_topology, load_retained_commit_snapshots_for_schemas,
+    scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
+    scan_commit_state_manifest_commit_ids, selected_change_selection_fingerprint,
+    stage_addressable_commit_deltas, stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_history_available,
     stage_commit_history_deferred, stage_commit_state_manifest_with_handle,
@@ -99,8 +103,7 @@ pub(crate) use storage::{
     stage_prefixed_ordered_addressable_replacement_parts,
 };
 pub(crate) use storage::{
-    RetainedPhysicalState, collect_current_state_part_json_refs,
-    collect_local_commit_delta_json_refs, load_native_current_state_part_owners,
+    RetainedPhysicalState, load_native_current_state_part_owners,
     stage_retire_commit_physical_state,
 };
 // Manufacturing a repository swept by the code that shipped before the
@@ -123,9 +126,8 @@ pub(crate) use storage::{
 };
 #[cfg(test)]
 pub(crate) use storage::{
-    change_id_from_packed_address, commit_state_authority_key, load_commit_delta_change_ids,
-    load_complete_current_state_values_from_scoped_root, load_snapshot_commit_root,
-    scan_commit_delta_members, stage_resealed_commit_state_manifest_for_test,
+    commit_state_authority_key, load_commit_delta_change_ids, load_snapshot_commit_root,
+    stage_resealed_commit_state_manifest_for_test,
 };
 #[cfg(test)]
 pub(crate) use storage::{
@@ -139,7 +141,8 @@ pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,
-    CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
+    CommitStateMutationInventory, CommitStateReplayDebt, CommitStateTouchedScopeFilter,
+    MaterializedTrackedStateRow,
     RowPkRangeBound, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
     TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateDeltaRef,
     TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,

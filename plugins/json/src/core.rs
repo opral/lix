@@ -1,9 +1,10 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde_json::{Map, Value};
+use lix::plugin as sdk;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub const ROOT_SCHEMA_KEY: &str = "json_root";
 pub const OBJECT_MEMBER_SCHEMA_KEY: &str = "json_object_member";
@@ -65,19 +66,19 @@ pub enum ChangeEffect {
     FormatOnly,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowChange {
-    pub schema_key: String,
-    pub row_pk: Vec<String>,
-    pub snapshot: Option<Vec<u8>>,
+    pub schema_key: Arc<str>,
+    pub row_pk: Vec<sdk::TypedValue>,
+    pub row: Option<sdk::TypedRow>,
     pub effect: ChangeEffect,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowRecord {
-    pub schema_key: String,
-    pub row_pk: Vec<String>,
-    pub snapshot: Vec<u8>,
+    pub schema_key: Arc<str>,
+    pub row_pk: Vec<sdk::TypedValue>,
+    pub row: sdk::TypedRow,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,24 +89,28 @@ pub struct ByteEdit {
 }
 
 impl RowChange {
-    fn upsert(identity: &RowIdentity, snapshot: Vec<u8>) -> Self {
-        Self::upsert_with_effect(identity, snapshot, ChangeEffect::Content)
+    fn upsert(identity: &RowIdentity, row: sdk::TypedRow) -> Self {
+        Self::upsert_with_effect(identity, row, ChangeEffect::Content)
     }
 
-    fn upsert_with_effect(identity: &RowIdentity, snapshot: Vec<u8>, effect: ChangeEffect) -> Self {
+    fn upsert_with_effect(
+        identity: &RowIdentity,
+        row: sdk::TypedRow,
+        effect: ChangeEffect,
+    ) -> Self {
         Self {
-            schema_key: identity.schema_key().to_owned(),
+            schema_key: identity.schema_key().into(),
             row_pk: identity.row_pk(),
-            snapshot: Some(snapshot),
+            row: Some(row),
             effect,
         }
     }
 
     fn delete(identity: &RowIdentity) -> Self {
         Self {
-            schema_key: identity.schema_key().to_owned(),
+            schema_key: identity.schema_key().into(),
             row_pk: identity.row_pk(),
-            snapshot: None,
+            row: None,
             effect: ChangeEffect::Content,
         }
     }
@@ -180,6 +185,25 @@ impl PersistentBlob {
         let mut output = Vec::with_capacity(usize::try_from(end - start).expect("u32 fits usize"));
         self.append_range(start, end, &mut output)?;
         Ok(output)
+    }
+
+    fn contiguous_range(&self, start: u32, end: u32) -> Option<&[u8]> {
+        if start > end || end > self.len {
+            return None;
+        }
+        let mut logical_start = 0u32;
+        for piece in self.pieces.iter() {
+            let logical_end = logical_start.checked_add(piece.len)?;
+            if start >= logical_start && end <= logical_end {
+                let piece_start = piece.start.checked_add(start - logical_start)?;
+                let piece_end = piece.start.checked_add(end - logical_start)?;
+                return piece
+                    .bytes
+                    .get(usize::try_from(piece_start).ok()?..usize::try_from(piece_end).ok()?);
+            }
+            logical_start = logical_end;
+        }
+        None
     }
 
     fn append_range(&self, start: u32, end: u32, output: &mut Vec<u8>) -> Result<(), String> {
@@ -575,28 +599,38 @@ impl RowIdentity {
         }
     }
 
-    fn row_pk(&self) -> Vec<String> {
+    fn row_pk(&self) -> Vec<sdk::TypedValue> {
         match self {
-            Self::Snapshot => vec![ROOT_ID.to_owned()],
+            Self::Snapshot => vec![sdk::TypedValue::Text(ROOT_ID.to_owned())],
             Self::Object { parent_id, key } => {
-                vec![parent_id.to_string(), key.to_string()]
+                vec![
+                    sdk::TypedValue::Text(parent_id.to_string()),
+                    sdk::TypedValue::Text(key.to_string()),
+                ]
             }
-            Self::Array(id) => vec![id.to_string()],
+            Self::Array(id) => vec![sdk::TypedValue::Uuid(
+                uuid::Uuid::parse_str(id).expect("JSON array identities are valid UUIDs"),
+            )],
         }
     }
 
-    fn from_parts(schema_key: &str, row_pk: &[String]) -> Result<Self, String> {
+    fn from_parts(schema_key: &str, row_pk: &[sdk::TypedValue]) -> Result<Self, String> {
         match (schema_key, row_pk) {
-            (ROOT_SCHEMA_KEY, [id]) if id == ROOT_ID => Ok(Self::Snapshot),
+            (ROOT_SCHEMA_KEY, [sdk::TypedValue::Text(id)]) if id == ROOT_ID => Ok(Self::Snapshot),
             (ROOT_SCHEMA_KEY, _) => Err("json_root requires the single key \"root\"".to_owned()),
-            (OBJECT_MEMBER_SCHEMA_KEY, [parent_id, key]) => Ok(Self::Object {
+            (
+                OBJECT_MEMBER_SCHEMA_KEY,
+                [sdk::TypedValue::Text(parent_id), sdk::TypedValue::Text(key)],
+            ) => Ok(Self::Object {
                 parent_id: Arc::from(parent_id.as_str()),
                 key: Arc::from(key.as_str()),
             }),
             (OBJECT_MEMBER_SCHEMA_KEY, _) => {
                 Err("json_object_member requires parent_id and key components".to_owned())
             }
-            (ARRAY_ITEM_SCHEMA_KEY, [id]) => Ok(Self::Array(Arc::from(id.as_str()))),
+            (ARRAY_ITEM_SCHEMA_KEY, [sdk::TypedValue::Uuid(id)]) => {
+                Ok(Self::Array(Arc::from(id.to_string())))
+            }
             (ARRAY_ITEM_SCHEMA_KEY, _) => {
                 Err("json_array_item requires one ID component".to_owned())
             }
@@ -1077,12 +1111,12 @@ fn node_layout_mut(nodes: &mut [Node], node: u32) -> &mut NodeLayout {
 #[derive(Clone, Debug)]
 pub struct Document(Arc<DocumentInner>);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ArenaJsonScalar {
     pub start: u32,
     pub length: u32,
     pub relation: ArenaJsonRelation,
-    pub row_pk: Vec<String>,
+    pub row_pk: Vec<sdk::TypedValue>,
     pub parent_id: Option<String>,
     pub order_key: Option<String>,
     pub prefix_json: Option<String>,
@@ -1253,7 +1287,7 @@ impl Document {
                 let (relation, row_pk, parent_id, order_key) = match &node.relation {
                     NodeRelation::Snapshot => (
                         ArenaJsonRelation::Snapshot,
-                        vec![ROOT_ID.to_owned()],
+                        vec![sdk::TypedValue::Text(ROOT_ID.to_owned())],
                         None,
                         None,
                     ),
@@ -1264,7 +1298,10 @@ impl Document {
                         ..
                     } => (
                         ArenaJsonRelation::Object,
-                        vec![parent_id.to_string(), key.to_string()],
+                        vec![
+                            sdk::TypedValue::Text(parent_id.to_string()),
+                            sdk::TypedValue::Text(key.to_string()),
+                        ],
                         None,
                         Some(order_key.to_string()),
                     ),
@@ -1274,7 +1311,7 @@ impl Document {
                         order_key,
                     } => (
                         ArenaJsonRelation::Array,
-                        vec![id.to_string()],
+                        vec![sdk::TypedValue::Uuid(parse_uuid(id, "id")?)],
                         Some(parent_id.to_string()),
                         Some(order_key.to_string()),
                     ),
@@ -1316,7 +1353,7 @@ impl Document {
             Ok(kind) => kind,
             // The indexed scalar span may now contain adjacent structural
             // syntax (for example `1,"b":2`). That is a valid optimization
-            // miss: the complete-document fallback owns validation.
+            // The complete-document path owns validation for an optimization miss.
             Err(_) => return Ok(None),
         };
         let scalar = std::str::from_utf8(scalar)
@@ -1331,35 +1368,41 @@ impl Document {
             empty_json,
             ..
         } = metadata;
-        let mut object = Map::new();
+        let mut row = sdk::TypedRow::new();
         let schema_key = match (relation, row_pk.as_slice()) {
-            (ArenaJsonRelation::Snapshot, [id]) if id == ROOT_ID => {
-                object.insert("id".to_owned(), Value::String(id.clone()));
+            (ArenaJsonRelation::Snapshot, [sdk::TypedValue::Text(id)]) if id == ROOT_ID => {
+                row.insert("id".to_owned(), sdk::TypedValue::Text(id.clone()));
                 ROOT_SCHEMA_KEY
             }
-            (ArenaJsonRelation::Object, [parent_id, key]) => {
-                object.insert("parent_id".to_owned(), Value::String(parent_id.to_owned()));
-                object.insert("key".to_owned(), Value::String(key.to_owned()));
-                object.insert(
+            (
+                ArenaJsonRelation::Object,
+                [sdk::TypedValue::Text(parent_id), sdk::TypedValue::Text(key)],
+            ) => {
+                row.insert(
+                    "parent_id".to_owned(),
+                    sdk::TypedValue::Text(parent_id.to_owned()),
+                );
+                row.insert("key".to_owned(), sdk::TypedValue::Text(key.to_owned()));
+                row.insert(
                     "order_key".to_owned(),
-                    Value::String(
+                    sdk::TypedValue::Text(
                         order_key
                             .ok_or_else(|| "JSON object scalar has no order key".to_owned())?,
                     ),
                 );
                 OBJECT_MEMBER_SCHEMA_KEY
             }
-            (ArenaJsonRelation::Array, [id]) => {
-                object.insert("id".to_owned(), Value::String(id.to_owned()));
-                object.insert(
+            (ArenaJsonRelation::Array, [sdk::TypedValue::Uuid(id)]) => {
+                row.insert("id".to_owned(), sdk::TypedValue::Uuid(*id));
+                row.insert(
                     "parent_id".to_owned(),
-                    Value::String(
+                    sdk::TypedValue::Text(
                         parent_id.ok_or_else(|| "JSON array scalar has no parent ID".to_owned())?,
                     ),
                 );
-                object.insert(
+                row.insert(
                     "order_key".to_owned(),
-                    Value::String(
+                    sdk::TypedValue::Text(
                         order_key.ok_or_else(|| "JSON array scalar has no order key".to_owned())?,
                     ),
                 );
@@ -1367,25 +1410,93 @@ impl Document {
             }
             _ => return Err("invalid JSON arena scalar identity".to_owned()),
         };
-        object.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
-        object.insert("scalar_json".to_owned(), Value::String(scalar.to_owned()));
+        row.insert(
+            "kind".to_owned(),
+            sdk::TypedValue::Text(kind.as_str().to_owned()),
+        );
+        row.insert(
+            "scalar_json".to_owned(),
+            sdk::TypedValue::Jsonb(
+                serde_json::from_str(scalar)
+                    .map_err(|error| format!("invalid JSON arena scalar: {error}"))?,
+            ),
+        );
         if let Some(value) = prefix_json {
-            object.insert("prefix_json".to_owned(), Value::String(value));
+            row.insert("prefix_json".to_owned(), sdk::TypedValue::Text(value));
         }
         if let Some(value) = suffix_json {
-            object.insert("suffix_json".to_owned(), Value::String(value));
+            row.insert("suffix_json".to_owned(), sdk::TypedValue::Text(value));
         }
         if let Some(value) = empty_json {
-            object.insert("empty_json".to_owned(), Value::String(value));
+            row.insert("empty_json".to_owned(), sdk::TypedValue::Text(value));
         }
+        complete_nullable_fields(&mut row, schema_key);
         Ok(Some(RowChange {
-            schema_key: schema_key.to_owned(),
+            schema_key: schema_key.into(),
             row_pk,
-            snapshot: Some(
-                serde_json::to_vec(&Value::Object(object))
-                    .map_err(|error| format!("serialize JSON arena scalar: {error}"))?,
-            ),
+            row: Some(row),
             effect: ChangeEffect::Content,
+        }))
+    }
+
+    pub fn scalar_edit_from_arena(
+        metadata: ArenaJsonScalar,
+        current_scalar: &[u8],
+        change: &RowChange,
+    ) -> Result<Option<ByteEdit>, String> {
+        let current = Self::scalar_change_from_arena(metadata.clone(), current_scalar)?
+            .ok_or_else(|| SCALAR_ONLY_SEMANTIC_WRITE.to_owned())?;
+        if current.schema_key != change.schema_key || current.row_pk != change.row_pk {
+            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
+        }
+        let Some(changed_row) = &change.row else {
+            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
+        };
+        let current_row = current
+            .row
+            .ok_or_else(|| SCALAR_ONLY_SEMANTIC_WRITE.to_owned())?;
+        let mut strings = HashSet::new();
+        let changed = SemanticRow::parse(
+            RowRecord {
+                schema_key: change.schema_key.clone(),
+                row_pk: change.row_pk.clone(),
+                row: changed_row.clone(),
+            },
+            &mut strings,
+        )?;
+        let current = SemanticRow::parse(
+            RowRecord {
+                schema_key: change.schema_key.clone(),
+                row_pk: change.row_pk.clone(),
+                row: current_row,
+            },
+            &mut strings,
+        )?;
+        if changed.kind().is_container() {
+            return Err("indexed semantic row became a container".to_owned());
+        }
+        if changed.identity() != current.identity() {
+            return Err("indexed semantic row identity changed".to_owned());
+        }
+        if !changed.same_location(&current) {
+            return Err("indexed semantic row location changed".to_owned());
+        }
+        let scalar = serde_json::to_vec(
+            changed
+                .scalar_json()
+                .ok_or_else(|| "scalar JSON row is missing scalar_json".to_owned())?,
+        )
+        .map_err(|error| format!("failed to serialize scalar_json: {error}"))?;
+        if parse_complete_scalar(&scalar)? != changed.kind() {
+            return Err("scalar_json does not match the row kind".to_owned());
+        }
+        if current_scalar == scalar {
+            return Ok(None);
+        }
+        Ok(Some(ByteEdit {
+            offset: u64::from(metadata.start),
+            delete_len: u64::from(metadata.length),
+            insert: Arc::new(scalar),
         }))
     }
 
@@ -1492,13 +1603,13 @@ impl Document {
             Arc::new(nodes)
         };
         let identity = node.identity();
-        let before_snapshot = self.node_snapshot(node_index)?;
+        let before_row = self.node_row(node_index)?;
         let after = Self::from_sparse_parts(after_blob, nodes, spans, Arc::clone(&self.0.lookup));
-        let after_snapshot = after.node_snapshot(node_index)?;
-        let changes = if before_snapshot == after_snapshot {
+        let after_row = after.node_row(node_index)?;
+        let changes = if before_row == after_row {
             Vec::new()
         } else {
-            vec![RowChange::upsert(&identity, after_snapshot)]
+            vec![RowChange::upsert(&identity, after_row)]
         };
         Ok(Some((after, changes)))
     }
@@ -1508,27 +1619,27 @@ impl Document {
         after: Self,
         _before_bytes: &[u8],
     ) -> Result<(Self, Vec<RowChange>), String> {
-        let before = self.row_snapshots()?;
-        let after_snapshots = after.row_snapshots()?;
+        let before = self.rows_by_identity()?;
+        let after_rows = after.rows_by_identity()?;
         let mut changes = Vec::new();
         for identity in before.keys() {
-            if !after_snapshots.contains_key(identity) {
+            if !after_rows.contains_key(identity) {
                 changes.push(RowChange::delete(identity));
             }
         }
-        for (identity, snapshot) in after_snapshots {
-            if let Some(before_snapshot) = before.get(&identity) {
-                if before_snapshot == &snapshot {
+        for (identity, row) in after_rows {
+            if let Some(before_row) = before.get(&identity) {
+                if before_row == &row {
                     continue;
                 }
-                let effect = if snapshots_equal_without_layout(before_snapshot, &snapshot)? {
+                let effect = if rows_equal_without_layout(before_row, &row) {
                     ChangeEffect::FormatOnly
                 } else {
                     ChangeEffect::Content
                 };
-                changes.push(RowChange::upsert_with_effect(&identity, snapshot, effect));
+                changes.push(RowChange::upsert_with_effect(&identity, row, effect));
             } else {
-                changes.push(RowChange::upsert(&identity, snapshot));
+                changes.push(RowChange::upsert(&identity, row));
             }
         }
         Ok((after, changes))
@@ -1615,7 +1726,7 @@ impl Document {
         if node.kind.is_container() {
             return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         }
-        let Some(snapshot) = &change.snapshot else {
+        let Some(changed_row) = &change.row else {
             return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         };
         let mut strings = HashSet::new();
@@ -1623,7 +1734,7 @@ impl Document {
             RowRecord {
                 schema_key: change.schema_key.clone(),
                 row_pk: change.row_pk.clone(),
-                snapshot: snapshot.clone(),
+                row: changed_row.clone(),
             },
             &mut strings,
         )?;
@@ -1634,17 +1745,19 @@ impl Document {
             RowRecord {
                 schema_key: change.schema_key.clone(),
                 row_pk: change.row_pk.clone(),
-                snapshot: self.node_snapshot(node_index)?,
+                row: self.node_row(node_index)?,
             },
             &mut strings,
         )?;
         if !row.same_location(&current) {
             return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         }
-        let scalar = row
-            .scalar_json()
-            .ok_or_else(|| "scalar JSON row is missing scalar_json".to_owned())?;
-        let scalar_kind = parse_complete_scalar(scalar.as_bytes())?;
+        let scalar = serde_json::to_vec(
+            row.scalar_json()
+                .ok_or_else(|| "scalar JSON row is missing scalar_json".to_owned())?,
+        )
+        .map_err(|error| format!("failed to serialize scalar_json: {error}"))?;
+        let scalar_kind = parse_complete_scalar(&scalar)?;
         if scalar_kind != row.kind() {
             return Err("scalar_json does not match the row kind".to_owned());
         }
@@ -1659,13 +1772,13 @@ impl Document {
                 .checked_add(value_len)
                 .ok_or_else(|| "JSON scalar range overflow".to_owned())?,
         )?;
-        if before == scalar.as_bytes() {
+        if before == scalar {
             return Ok(None);
         }
         Ok(Some(ByteEdit {
             offset: u64::from(value_start),
             delete_len: u64::from(value_len),
-            insert: Arc::new(scalar.as_bytes().to_vec()),
+            insert: Arc::new(scalar),
         }))
     }
 
@@ -1684,29 +1797,29 @@ impl Document {
                 Ok(RowRecord {
                     schema_key: change.schema_key,
                     row_pk: change.row_pk,
-                    snapshot: change
-                        .snapshot
-                        .ok_or_else(|| "initial JSON row has no snapshot".to_owned())?,
+                    row: change
+                        .row
+                        .ok_or_else(|| "initial JSON row has no typed value".to_owned())?,
                 })
             })
             .collect()
     }
 
-    fn node_snapshot(&self, index: usize) -> Result<Vec<u8>, String> {
+    fn node_row(&self, index: usize) -> Result<sdk::TypedRow, String> {
         let (value_start, value_len) = self
             .0
             .spans
             .span(index)
             .ok_or_else(|| "JSON node span is missing".to_owned())?;
-        snapshot_node(&self.0.blob, &self.0.nodes[index], value_start, value_len)
+        typed_node_row(&self.0.blob, &self.0.nodes[index], value_start, value_len)
     }
 
-    fn row_snapshots(&self) -> Result<HashMap<RowIdentity, Vec<u8>>, String> {
+    fn rows_by_identity(&self) -> Result<HashMap<RowIdentity, sdk::TypedRow>, String> {
         self.0
             .nodes
             .iter()
             .enumerate()
-            .map(|(index, node)| Ok((node.identity(), self.node_snapshot(index)?)))
+            .map(|(index, node)| Ok((node.identity(), self.node_row(index)?)))
             .collect()
     }
 }
@@ -1723,9 +1836,9 @@ impl Iterator for InitialChanges {
     fn next(&mut self) -> Option<Self::Item> {
         let node = self.document.0.nodes.get(self.node)?;
         let identity = node.identity();
-        let snapshot = self.document.node_snapshot(self.node);
+        let row = self.document.node_row(self.node);
         self.node += 1;
-        Some(snapshot.map(|snapshot| RowChange::upsert(&identity, snapshot)))
+        Some(row.map(|row| RowChange::upsert(&identity, row)))
     }
 }
 
@@ -1771,7 +1884,7 @@ impl RowImportBuilder {
 enum SemanticRow {
     Snapshot {
         kind: NodeKind,
-        scalar_json: Option<String>,
+        scalar_json: Option<Value>,
         layout: Option<Arc<NodeLayout>>,
     },
     Object {
@@ -1779,7 +1892,7 @@ enum SemanticRow {
         key: Arc<str>,
         order_key: Arc<str>,
         kind: NodeKind,
-        scalar_json: Option<String>,
+        scalar_json: Option<Value>,
         container_id: Option<Arc<str>>,
         layout: Option<Arc<NodeLayout>>,
     },
@@ -1788,7 +1901,7 @@ enum SemanticRow {
         parent_id: Arc<str>,
         order_key: Arc<str>,
         kind: NodeKind,
-        scalar_json: Option<String>,
+        scalar_json: Option<Value>,
         layout: Option<Arc<NodeLayout>>,
     },
 }
@@ -1799,25 +1912,20 @@ impl SemanticRow {
             RowIdentity::from_parts(&record.schema_key, &record.row_pk)?,
             strings,
         );
-        let value: Value = serde_json::from_slice(&record.snapshot)
-            .map_err(|error| format!("invalid JSON row snapshot: {error}"))?;
-        reject_numbers(&value)?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| "JSON row snapshot must be an object".to_owned())?;
-        let kind = required_string(object, "kind").and_then(NodeKind::parse)?;
-        let scalar_json = optional_string(object, "scalar_json")?;
-        validate_scalar_fields(kind, scalar_json.as_deref())?;
-        let layout = parse_row_layout(object, &identity, kind, strings)?;
+        let row = &record.row;
+        let kind = required_text(row, "kind").and_then(NodeKind::parse)?;
+        let scalar_json = optional_jsonb(row, "scalar_json")?;
+        validate_scalar_fields(kind, scalar_json.as_ref())?;
+        let layout = parse_row_layout(row, &identity, kind, strings)?;
         match identity {
             RowIdentity::Snapshot => {
                 require_fields(
-                    object,
+                    row,
                     &["id", "kind"],
                     &["scalar_json", "prefix_json", "suffix_json", "empty_json"],
                 )?;
-                if required_string(object, "id")? != ROOT_ID {
-                    return Err("json_root snapshot id must be \"root\"".to_owned());
+                if required_text(row, "id")? != ROOT_ID {
+                    return Err("json_root row id must be \"root\"".to_owned());
                 }
                 Ok(Self::Snapshot {
                     kind,
@@ -1827,7 +1935,7 @@ impl SemanticRow {
             }
             RowIdentity::Object { parent_id, key } => {
                 require_fields(
-                    object,
+                    row,
                     &["parent_id", "key", "order_key", "kind"],
                     &[
                         "scalar_json",
@@ -1837,15 +1945,13 @@ impl SemanticRow {
                         "empty_json",
                     ],
                 )?;
-                if required_string(object, "parent_id")? != parent_id.as_ref()
-                    || required_string(object, "key")? != key.as_ref()
+                if required_text(row, "parent_id")? != parent_id.as_ref()
+                    || required_text(row, "key")? != key.as_ref()
                 {
-                    return Err(
-                        "json_object_member snapshot does not match its primary key".to_owned()
-                    );
+                    return Err("json_object_member row does not match its primary key".to_owned());
                 }
-                let order_key = parse_order_key(required_string(object, "order_key")?)?;
-                let container_id = optional_string(object, "container_id")?;
+                let order_key = parse_order_key(required_text(row, "order_key")?)?;
+                let container_id = optional_text(row, "container_id")?;
                 if kind.is_container() {
                     let expected = derive_object_container_id(&parent_id, &key);
                     if container_id.as_deref() != Some(expected.as_str()) {
@@ -1871,15 +1977,15 @@ impl SemanticRow {
             }
             RowIdentity::Array(id) => {
                 require_fields(
-                    object,
+                    row,
                     &["id", "parent_id", "order_key", "kind"],
                     &["scalar_json", "prefix_json", "suffix_json", "empty_json"],
                 )?;
-                if required_string(object, "id")? != id.as_ref() {
-                    return Err("json_array_item snapshot ID does not match its key".to_owned());
+                if required_uuid(row, "id")?.to_string() != id.as_ref() {
+                    return Err("json_array_item row ID does not match its key".to_owned());
                 }
-                let parent_id = required_string(object, "parent_id")?.to_owned();
-                let order_key = parse_order_key(required_string(object, "order_key")?)?;
+                let parent_id = required_text(row, "parent_id")?.to_owned();
+                let order_key = parse_order_key(required_text(row, "order_key")?)?;
                 Ok(Self::Array {
                     id,
                     parent_id: intern_string(strings, &parent_id),
@@ -1956,11 +2062,11 @@ impl SemanticRow {
         }
     }
 
-    fn scalar_json(&self) -> Option<&str> {
+    fn scalar_json(&self) -> Option<&Value> {
         match self {
             Self::Snapshot { scalar_json, .. }
             | Self::Object { scalar_json, .. }
-            | Self::Array { scalar_json, .. } => scalar_json.as_deref(),
+            | Self::Array { scalar_json, .. } => scalar_json.as_ref(),
         }
     }
 
@@ -2215,11 +2321,12 @@ impl SemanticModel {
                 }
                 output.push(b']');
             }
-            _ => output.extend_from_slice(
+            _ => serde_json::to_writer(
+                &mut *output,
                 row.scalar_json()
-                    .ok_or_else(|| "JSON scalar has no scalar_json".to_owned())?
-                    .as_bytes(),
-            ),
+                    .ok_or_else(|| "JSON scalar has no scalar_json".to_owned())?,
+            )
+            .map_err(|error| format!("failed to serialize scalar_json: {error}"))?,
         }
         if let Some(first) = rendered_children.first().copied() {
             nodes[usize::try_from(node_index).expect("u32 fits usize")].first_child = Some(first);
@@ -2241,43 +2348,88 @@ impl SemanticModel {
     }
 }
 
-fn snapshot_node(
+fn typed_node_row(
     blob: &PersistentBlob,
     node: &Node,
     value_start: u32,
     value_len: u32,
-) -> Result<Vec<u8>, String> {
+) -> Result<sdk::TypedRow, String> {
     let scalar = if node.kind.is_container() {
         None
     } else {
-        let bytes = blob.range(
-            value_start,
-            value_start
-                .checked_add(value_len)
-                .ok_or_else(|| "JSON scalar range overflow".to_owned())?,
-        )?;
-        Some(
-            String::from_utf8(bytes)
-                .map_err(|error| format!("retained JSON scalar is not UTF-8: {error}"))?,
-        )
+        let value_end = value_start
+            .checked_add(value_len)
+            .ok_or_else(|| "JSON scalar range overflow".to_owned())?;
+        if let Some(bytes) = blob.contiguous_range(value_start, value_end) {
+            Some(
+                serde_json::from_slice(bytes)
+                    .map_err(|error| format!("retained JSON scalar is not valid JSON: {error}"))?,
+            )
+        } else {
+            let bytes = blob.range(value_start, value_end)?;
+            Some(
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("retained JSON scalar is not valid JSON: {error}"))?,
+            )
+        }
     };
-    serialize_node_snapshot(node, scalar)
+    typed_row_for_node(node, scalar)
 }
+fn typed_row_for_node(node: &Node, scalar: Option<Value>) -> Result<sdk::TypedRow, String> {
+    static ROOT_COLUMNS: OnceLock<Vec<Arc<str>>> = OnceLock::new();
+    static OBJECT_COLUMNS: OnceLock<Vec<Arc<str>>> = OnceLock::new();
+    static ARRAY_COLUMNS: OnceLock<Vec<Arc<str>>> = OnceLock::new();
 
-fn serialize_node_snapshot(node: &Node, scalar: Option<String>) -> Result<Vec<u8>, String> {
-    let mut output = Vec::with_capacity(192 + scalar.as_ref().map_or(0, String::len));
-    output.push(b'{');
-    let mut first = true;
-    match &node.relation {
+    let nullable_text = |value: Option<&str>| {
+        value.map_or(sdk::TypedValue::Null, |value| {
+            sdk::TypedValue::Text(value.to_owned())
+        })
+    };
+    let scalar = scalar.map_or(sdk::TypedValue::Null, |value| {
+        sdk::TypedValue::Jsonb(value.into())
+    });
+    let empty_json = nullable_text(
+        node.layout
+            .as_deref()
+            .and_then(|layout| layout.empty_json.as_deref()),
+    );
+    let prefix_json = nullable_text(
+        node.layout
+            .as_deref()
+            .and_then(|layout| layout.prefix_json.as_deref()),
+    );
+    let suffix_json = nullable_text(
+        node.layout
+            .as_deref()
+            .and_then(|layout| layout.suffix_json.as_deref()),
+    );
+    let kind = sdk::TypedValue::Text(node.kind.as_str().to_owned());
+
+    let entries = match &node.relation {
         NodeRelation::Snapshot => {
-            push_layout_empty_field(&mut output, &mut first, node.layout.as_deref())?;
-            push_snapshot_string_field(&mut output, &mut first, b"\"id\":", ROOT_ID)?;
-            push_snapshot_string_field(&mut output, &mut first, b"\"kind\":", node.kind.as_str())?;
-            push_layout_prefix_field(&mut output, &mut first, node.layout.as_deref())?;
-            if let Some(scalar) = scalar.as_deref() {
-                push_snapshot_string_field(&mut output, &mut first, b"\"scalar_json\":", scalar)?;
-            }
-            push_layout_suffix_field(&mut output, &mut first, node.layout.as_deref())?;
+            let columns = ROOT_COLUMNS.get_or_init(|| {
+                [
+                    "empty_json",
+                    "id",
+                    "kind",
+                    "prefix_json",
+                    "scalar_json",
+                    "suffix_json",
+                ]
+                .map(Arc::<str>::from)
+                .into()
+            });
+            vec![
+                (Arc::clone(&columns[0]), empty_json),
+                (
+                    Arc::clone(&columns[1]),
+                    sdk::TypedValue::Text(ROOT_ID.to_owned()),
+                ),
+                (Arc::clone(&columns[2]), kind),
+                (Arc::clone(&columns[3]), prefix_json),
+                (Arc::clone(&columns[4]), scalar),
+                (Arc::clone(&columns[5]), suffix_json),
+            ]
         }
         NodeRelation::Object {
             parent_id,
@@ -2285,109 +2437,111 @@ fn serialize_node_snapshot(node: &Node, scalar: Option<String>) -> Result<Vec<u8
             order_key,
             container_id,
         } => {
-            if let Some(container_id) = container_id {
-                push_snapshot_string_field(
-                    &mut output,
-                    &mut first,
-                    b"\"container_id\":",
-                    container_id,
-                )?;
-            }
-            push_layout_empty_field(&mut output, &mut first, node.layout.as_deref())?;
-            push_snapshot_string_field(&mut output, &mut first, b"\"key\":", key)?;
-            push_snapshot_string_field(&mut output, &mut first, b"\"kind\":", node.kind.as_str())?;
-            push_snapshot_string_field(&mut output, &mut first, b"\"order_key\":", order_key)?;
-            push_snapshot_string_field(&mut output, &mut first, b"\"parent_id\":", parent_id)?;
-            push_layout_prefix_field(&mut output, &mut first, node.layout.as_deref())?;
-            if let Some(scalar) = scalar.as_deref() {
-                push_snapshot_string_field(&mut output, &mut first, b"\"scalar_json\":", scalar)?;
-            }
-            push_layout_suffix_field(&mut output, &mut first, node.layout.as_deref())?;
+            let columns = OBJECT_COLUMNS.get_or_init(|| {
+                [
+                    "container_id",
+                    "empty_json",
+                    "key",
+                    "kind",
+                    "order_key",
+                    "parent_id",
+                    "prefix_json",
+                    "scalar_json",
+                    "suffix_json",
+                ]
+                .map(Arc::<str>::from)
+                .into()
+            });
+            vec![
+                (
+                    Arc::clone(&columns[0]),
+                    nullable_text(container_id.as_deref()),
+                ),
+                (Arc::clone(&columns[1]), empty_json),
+                (
+                    Arc::clone(&columns[2]),
+                    sdk::TypedValue::Text(key.to_string()),
+                ),
+                (Arc::clone(&columns[3]), kind),
+                (
+                    Arc::clone(&columns[4]),
+                    sdk::TypedValue::Text(order_key.to_string()),
+                ),
+                (
+                    Arc::clone(&columns[5]),
+                    sdk::TypedValue::Text(parent_id.to_string()),
+                ),
+                (Arc::clone(&columns[6]), prefix_json),
+                (Arc::clone(&columns[7]), scalar),
+                (Arc::clone(&columns[8]), suffix_json),
+            ]
         }
         NodeRelation::Array {
             id,
             parent_id,
             order_key,
         } => {
-            push_layout_empty_field(&mut output, &mut first, node.layout.as_deref())?;
-            push_snapshot_string_field(&mut output, &mut first, b"\"id\":", id)?;
-            push_snapshot_string_field(&mut output, &mut first, b"\"kind\":", node.kind.as_str())?;
-            push_snapshot_string_field(&mut output, &mut first, b"\"order_key\":", order_key)?;
-            push_snapshot_string_field(&mut output, &mut first, b"\"parent_id\":", parent_id)?;
-            push_layout_prefix_field(&mut output, &mut first, node.layout.as_deref())?;
-            if let Some(scalar) = scalar.as_deref() {
-                push_snapshot_string_field(&mut output, &mut first, b"\"scalar_json\":", scalar)?;
-            }
-            push_layout_suffix_field(&mut output, &mut first, node.layout.as_deref())?;
+            let columns = ARRAY_COLUMNS.get_or_init(|| {
+                [
+                    "empty_json",
+                    "id",
+                    "kind",
+                    "order_key",
+                    "parent_id",
+                    "prefix_json",
+                    "scalar_json",
+                    "suffix_json",
+                ]
+                .map(Arc::<str>::from)
+                .into()
+            });
+            vec![
+                (Arc::clone(&columns[0]), empty_json),
+                (
+                    Arc::clone(&columns[1]),
+                    sdk::TypedValue::Uuid(parse_uuid(id, "id")?),
+                ),
+                (Arc::clone(&columns[2]), kind),
+                (
+                    Arc::clone(&columns[3]),
+                    sdk::TypedValue::Text(order_key.to_string()),
+                ),
+                (
+                    Arc::clone(&columns[4]),
+                    sdk::TypedValue::Text(parent_id.to_string()),
+                ),
+                (Arc::clone(&columns[5]), prefix_json),
+                (Arc::clone(&columns[6]), scalar),
+                (Arc::clone(&columns[7]), suffix_json),
+            ]
+        }
+    };
+    sdk::TypedRow::from_sorted_entries(entries).map_err(str::to_owned)
+}
+
+fn complete_nullable_fields(row: &mut sdk::TypedRow, schema_key: &str) {
+    for name in ["empty_json", "prefix_json", "scalar_json", "suffix_json"] {
+        if !row.contains_key(name) {
+            row.insert(name, sdk::TypedValue::Null);
         }
     }
-    output.push(b'}');
-    Ok(output)
+    if schema_key == OBJECT_MEMBER_SCHEMA_KEY && !row.contains_key("container_id") {
+        row.insert("container_id", sdk::TypedValue::Null);
+    }
 }
 
-fn push_snapshot_string_field(
-    output: &mut Vec<u8>,
-    first: &mut bool,
-    encoded_key: &[u8],
-    value: &str,
-) -> Result<(), String> {
-    if *first {
-        *first = false;
-    } else {
-        output.push(b',');
-    }
-    output.extend_from_slice(encoded_key);
-    serde_json::to_writer(output, value)
-        .map_err(|error| format!("failed to serialize JSON row snapshot: {error}"))
+fn insert_text(row: &mut sdk::TypedRow, name: &str, value: &str) {
+    row.insert(name.to_owned(), sdk::TypedValue::Text(value.to_owned()));
 }
 
-fn push_layout_empty_field(
-    output: &mut Vec<u8>,
-    first: &mut bool,
-    layout: Option<&NodeLayout>,
-) -> Result<(), String> {
-    if let Some(value) = layout.and_then(|layout| layout.empty_json.as_deref()) {
-        push_snapshot_string_field(output, first, b"\"empty_json\":", value)?;
+fn rows_equal_without_layout(before: &sdk::TypedRow, after: &sdk::TypedRow) -> bool {
+    let mut before = before.clone();
+    let mut after = after.clone();
+    for name in ["prefix_json", "suffix_json", "empty_json"] {
+        before.remove(name);
+        after.remove(name);
     }
-    Ok(())
-}
-
-fn push_layout_prefix_field(
-    output: &mut Vec<u8>,
-    first: &mut bool,
-    layout: Option<&NodeLayout>,
-) -> Result<(), String> {
-    if let Some(value) = layout.and_then(|layout| layout.prefix_json.as_deref()) {
-        push_snapshot_string_field(output, first, b"\"prefix_json\":", value)?;
-    }
-    Ok(())
-}
-
-fn push_layout_suffix_field(
-    output: &mut Vec<u8>,
-    first: &mut bool,
-    layout: Option<&NodeLayout>,
-) -> Result<(), String> {
-    if let Some(value) = layout.and_then(|layout| layout.suffix_json.as_deref()) {
-        push_snapshot_string_field(output, first, b"\"suffix_json\":", value)?;
-    }
-    Ok(())
-}
-
-fn snapshots_equal_without_layout(before: &[u8], after: &[u8]) -> Result<bool, String> {
-    fn semantic_snapshot(bytes: &[u8]) -> Result<Value, String> {
-        let mut value: Value = serde_json::from_slice(bytes)
-            .map_err(|error| format!("invalid generated JSON row snapshot: {error}"))?;
-        let object = value
-            .as_object_mut()
-            .ok_or_else(|| "generated JSON row snapshot is not an object".to_owned())?;
-        object.remove("prefix_json");
-        object.remove("suffix_json");
-        object.remove("empty_json");
-        Ok(value)
-    }
-
-    Ok(semantic_snapshot(before)? == semantic_snapshot(after)?)
+    before == after
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3071,7 +3225,7 @@ fn parse_complete_scalar(bytes: &[u8]) -> Result<NodeKind, String> {
     Ok(root.kind)
 }
 
-fn validate_scalar_fields(kind: NodeKind, scalar_json: Option<&str>) -> Result<(), String> {
+fn validate_scalar_fields(kind: NodeKind, scalar_json: Option<&Value>) -> Result<(), String> {
     if kind.is_container() {
         if scalar_json.is_some() {
             return Err("JSON container row cannot carry scalar_json".to_owned());
@@ -3080,61 +3234,84 @@ fn validate_scalar_fields(kind: NodeKind, scalar_json: Option<&str>) -> Result<(
     }
     let scalar_json =
         scalar_json.ok_or_else(|| "JSON scalar row requires scalar_json".to_owned())?;
-    if parse_complete_scalar(scalar_json.as_bytes())? != kind {
+    if json_value_kind(scalar_json)? != kind {
         return Err("scalar_json kind does not match row kind".to_owned());
     }
     Ok(())
 }
 
-fn require_fields(
-    object: &Map<String, Value>,
-    required: &[&str],
-    optional: &[&str],
-) -> Result<(), String> {
+fn require_fields(row: &sdk::TypedRow, required: &[&str], optional: &[&str]) -> Result<(), String> {
     for field in required {
-        if !object.contains_key(*field) {
-            return Err(format!("JSON row snapshot is missing {field:?}"));
+        if !row.contains_key(*field) {
+            return Err(format!("JSON typed row is missing {field:?}"));
         }
     }
-    if let Some(field) = object
+    if let Some(field) = row
         .keys()
-        .find(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+        .find(|field| !required.contains(field) && !optional.contains(field))
     {
         return Err(format!(
-            "JSON row snapshot contains unsupported field {field:?}"
+            "JSON typed row contains unsupported field {field:?}"
         ));
     }
     Ok(())
 }
 
-fn required_string<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
-    object
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("JSON row field {field:?} must be a string"))
+fn required_text<'a>(row: &'a sdk::TypedRow, field: &str) -> Result<&'a str, String> {
+    match row.get(field) {
+        Some(sdk::TypedValue::Text(value)) => Ok(value),
+        _ => Err(format!("JSON row field {field:?} must be text")),
+    }
 }
 
-fn optional_string(object: &Map<String, Value>, field: &str) -> Result<Option<String>, String> {
-    object
-        .get(field)
-        .map(|value| {
-            value
-                .as_str()
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| format!("JSON row field {field:?} must be a string"))
-        })
-        .transpose()
+fn required_uuid(row: &sdk::TypedRow, field: &str) -> Result<uuid::Uuid, String> {
+    match row.get(field) {
+        Some(sdk::TypedValue::Uuid(value)) => Ok(*value),
+        _ => Err(format!("JSON row field {field:?} must be UUID")),
+    }
+}
+
+fn optional_text(row: &sdk::TypedRow, field: &str) -> Result<Option<String>, String> {
+    match row.get(field) {
+        None | Some(sdk::TypedValue::Null) => Ok(None),
+        Some(sdk::TypedValue::Text(value)) => Ok(Some(value.clone())),
+        _ => Err(format!("JSON row field {field:?} must be text or null")),
+    }
+}
+
+fn optional_jsonb(row: &sdk::TypedRow, field: &str) -> Result<Option<Value>, String> {
+    match row.get(field) {
+        None | Some(sdk::TypedValue::Null) => Ok(None),
+        Some(sdk::TypedValue::Jsonb(value)) => Ok(Some(value.as_value().clone())),
+        _ => Err(format!("JSON row field {field:?} must be JSONB or null")),
+    }
+}
+
+fn parse_uuid(value: &str, field: &str) -> Result<uuid::Uuid, String> {
+    uuid::Uuid::parse_str(value).map_err(|_| format!("JSON row field {field:?} is not a UUID"))
+}
+
+fn json_value_kind(value: &Value) -> Result<NodeKind, String> {
+    match value {
+        Value::Null => Ok(NodeKind::Null),
+        Value::Bool(_) => Ok(NodeKind::Boolean),
+        Value::Number(_) => Ok(NodeKind::Number),
+        Value::String(_) => Ok(NodeKind::String),
+        Value::Array(_) | Value::Object(_) => {
+            Err("scalar_json must contain a JSON scalar".to_owned())
+        }
+    }
 }
 
 fn parse_row_layout(
-    object: &Map<String, Value>,
+    row: &sdk::TypedRow,
     identity: &RowIdentity,
     kind: NodeKind,
     strings: &mut HashSet<Arc<str>>,
 ) -> Result<Option<Arc<NodeLayout>>, String> {
-    let prefix_json = optional_string(object, "prefix_json")?;
-    let suffix_json = optional_string(object, "suffix_json")?;
-    let empty_json = optional_string(object, "empty_json")?;
+    let prefix_json = optional_text(row, "prefix_json")?;
+    let suffix_json = optional_text(row, "suffix_json")?;
+    let empty_json = optional_text(row, "empty_json")?;
 
     if let Some(prefix) = prefix_json.as_deref() {
         match identity {
@@ -3235,28 +3412,6 @@ fn identity_tiebreak(row: &SemanticRow) -> &str {
         SemanticRow::Snapshot { .. } => "",
         SemanticRow::Object { key, .. } => key,
         SemanticRow::Array { id, .. } => id,
-    }
-}
-
-fn reject_numbers(value: &Value) -> Result<(), String> {
-    match value {
-        Value::Number(_) => Err(
-            "durable JSON row snapshots must encode JSON numbers inside scalar_json strings"
-                .to_owned(),
-        ),
-        Value::Array(values) => {
-            for value in values {
-                reject_numbers(value)?;
-            }
-            Ok(())
-        }
-        Value::Object(object) => {
-            for value in object.values() {
-                reject_numbers(value)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
     }
 }
 

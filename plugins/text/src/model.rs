@@ -1,46 +1,51 @@
+use std::sync::Arc;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChangeEffect {
     Content,
     FormatOnly,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RowChange {
-    pub(crate) schema_key: String,
-    pub(crate) row_pk: Vec<String>,
-    pub(crate) snapshot: Option<Vec<u8>>,
+    pub(crate) schema_key: Arc<str>,
+    pub(crate) row_pk: Vec<lix::plugin::TypedValue>,
+    pub(crate) row: Option<lix::plugin::TypedRow>,
     pub(crate) effect: ChangeEffect,
 }
 
 impl RowChange {
     pub(crate) fn upsert(
-        schema_key: impl Into<String>,
-        row_pk: Vec<String>,
-        snapshot: Vec<u8>,
+        schema_key: impl Into<Arc<str>>,
+        row_pk: Vec<lix::plugin::TypedValue>,
+        row: lix::plugin::TypedRow,
     ) -> Self {
         Self {
             schema_key: schema_key.into(),
             row_pk,
-            snapshot: Some(snapshot),
+            row: Some(row),
             effect: ChangeEffect::Content,
         }
     }
 
-    pub(crate) fn delete(schema_key: impl Into<String>, row_pk: Vec<String>) -> Self {
+    pub(crate) fn delete(
+        schema_key: impl Into<Arc<str>>,
+        row_pk: Vec<lix::plugin::TypedValue>,
+    ) -> Self {
         Self {
             schema_key: schema_key.into(),
             row_pk,
-            snapshot: None,
+            row: None,
             effect: ChangeEffect::Content,
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RowRecord {
-    pub(crate) schema_key: String,
-    pub(crate) row_pk: Vec<String>,
-    pub(crate) snapshot: Vec<u8>,
+    pub(crate) schema_key: Arc<str>,
+    pub(crate) row_pk: Vec<lix::plugin::TypedValue>,
+    pub(crate) row: lix::plugin::TypedRow,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

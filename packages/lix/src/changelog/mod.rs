@@ -14,7 +14,7 @@ mod store;
 mod test_support;
 mod types;
 
-pub(crate) use codec::decode_change_record;
+pub(crate) use codec::{decode_change_record, encode_change_record};
 #[cfg(test)]
 pub(crate) use codec::encode_commit_record;
 pub(crate) use context::ChangelogContext;
@@ -31,9 +31,10 @@ pub(crate) use materialization::{
     materialize_known_change_payloads, materialize_known_change_payloads_in_order,
 };
 pub(crate) use scope_digest::{CommitScopeKey, CommitTouchedScopeDigest};
-pub(crate) use store::{CHANGE_SPACE, COMMIT_SPACE, commit_key};
+pub(crate) use store::{CHANGE_SPACE, COMMIT_SPACE, change_key, commit_key};
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use types::COMMIT_RECORD_FORMAT_VERSION;
+pub(crate) use types::{jsonb_option_ref_storage, jsonb_option_storage};
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitRecord, CommitScanBatch,

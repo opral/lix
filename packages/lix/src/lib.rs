@@ -83,6 +83,7 @@ mod json_predicate_pushdown_probe;
 pub(crate) mod hot_state;
 pub(crate) mod init;
 pub(crate) mod json_store;
+pub mod migration;
 /// The declared module layer order and the test that enforces it. Test-only:
 /// it contains no engine code, just the layering artifact and its guard.
 #[cfg(test)]
@@ -164,7 +165,7 @@ pub use common::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryRe
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
 pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};
-pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
+pub(crate) use common::{parse_row_metadata_value, serialize_row_metadata};
 pub(crate) use prepared_dml::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, MergeBranchOptions,

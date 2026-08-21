@@ -459,6 +459,14 @@ impl StorageWrite for BrokenWrite {
         }
     }
 
+    fn replace_many(
+        &mut self,
+        space: crate::storage::StorageSpace,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.put_many(space, entries)
+    }
+
     fn delete_many(
         &mut self,
         space: crate::storage::StorageSpace,

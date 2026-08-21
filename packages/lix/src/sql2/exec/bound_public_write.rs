@@ -16,17 +16,16 @@ use crate::changelog::CommitId;
 use crate::common::{
     ExecuteStatementMetadata, RequestBlobSpliceProvenance, SharedStr, validate_row_metadata,
 };
-use crate::row_pk::RowPk;
 use crate::hot_state::{
     HotStateFilter, HotStateProjection, HotStateRowFilter, HotStateScanRequest,
     MaterializedHotStateBatch, MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
-use crate::plugin::runtime::WasmRowKey;
+use crate::row_pk::RowPk;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundWriteInput,
-    BoundWriteOp, BoundWriteTarget, RowWriteSurface, FileWriteSurface,
+    BoundWriteOp, BoundWriteTarget, FileWriteSurface, RowWriteSurface,
 };
 use crate::sql2::catalog::schema_surface::SchemaSurfaceColumn;
 use crate::sql2::catalog::{SchemaColumnType, SchemaSurfaceSpec};
@@ -127,6 +126,10 @@ const TYPED_CERTIFIED_INSERT_MIN_ROWS: usize = 32 * 1024;
 
 fn use_typed_certified_insert(row_count: usize) -> bool {
     row_count >= TYPED_CERTIFIED_INSERT_MIN_ROWS
+}
+
+fn schema_requires_plugin_write_path(ctx: &dyn SqlWriteExecutionContext, schema_key: &str) -> bool {
+    ctx.plugin_owns_schema(schema_key)
 }
 
 impl CertifiedRowInsertParameterBatch {
@@ -356,8 +359,7 @@ async fn try_execute_row_insert_batch(
     parameter_batch: RowInsertParameterBatch<'_>,
     allow_generic_fallback: bool,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) = &plan.bound.target
-    else {
+    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) = &plan.bound.target else {
         return Ok(None);
     };
     let BoundWriteInput::Values(values) = &plan.bound.input else {
@@ -569,12 +571,7 @@ pub(crate) async fn try_execute_row_update_parameter_batch(
     plan: &LogicalWritePlan,
     parameter_batch: &RecordBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    try_execute_row_update_batch(
-        ctx,
-        plan,
-        RowInsertParameterBatch::Arrow(parameter_batch),
-    )
-    .await
+    try_execute_row_update_batch(ctx, plan, RowInsertParameterBatch::Arrow(parameter_batch)).await
 }
 
 async fn try_execute_row_update_batch(
@@ -588,8 +585,7 @@ async fn try_execute_row_update_batch(
         return Ok(Some(results));
     }
 
-    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) = &plan.bound.target
-    else {
+    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) = &plan.bound.target else {
         return Ok(None);
     };
     if plan.bound.op != BoundWriteOp::Update {
@@ -650,11 +646,9 @@ async fn try_execute_row_update_batch(
                 };
                 RowPk::single(value.clone())
             } else {
-                let Some(mut row_pks) = bound_row_pks_from_primary_key_predicate(
-                    &spec,
-                    &plan.bound.predicate,
-                    &params,
-                ) else {
+                let Some(mut row_pks) =
+                    bound_row_pks_from_primary_key_predicate(&spec, &plan.bound.predicate, &params)
+                else {
                     return Ok(None);
                 };
                 if row_pks.len() != 1 {
@@ -680,10 +674,7 @@ async fn try_execute_row_update_batch(
     }
     if !row_pks_strictly_ordered {
         let mut unique_row_pks = std::collections::BTreeSet::new();
-        if row_pks
-            .iter()
-            .any(|row_pk| !unique_row_pks.insert(row_pk))
-        {
+        if row_pks.iter().any(|row_pk| !unique_row_pks.insert(row_pk)) {
             return Ok(None);
         }
     }
@@ -702,14 +693,9 @@ async fn try_execute_row_update_batch(
     } else {
         row_pks.clone()
     };
-    let candidates = scan_row_candidates_for_pks(
-        ctx,
-        plan,
-        &spec,
-        scan_row_pks,
-        direct_replacement.is_some(),
-    )
-    .await?;
+    let candidates =
+        scan_row_candidates_for_pks(ctx, plan, &spec, scan_row_pks, direct_replacement.is_some())
+            .await?;
     if direct_replacement.is_some()
         && candidates
             .iter()
@@ -808,9 +794,7 @@ async fn try_execute_row_update_batch(
                 .or_default()
                 .push(candidate);
         }
-        for (row_index, (row_pk, params)) in
-            row_pks.into_iter().zip(&parameter_rows).enumerate()
-        {
+        for (row_index, (row_pk, params)) in row_pks.into_iter().zip(&parameter_rows).enumerate() {
             let mut affected = 0;
             for candidate in candidates_by_pk.remove(&row_pk).unwrap_or_default() {
                 let appended = match direct_replacement.as_ref() {
@@ -838,6 +822,12 @@ async fn try_execute_row_update_batch(
                 }
             }
             affected_by_statement.push(affected);
+        }
+    }
+    if let Some(catalog) = ctx.schema_catalog_snapshot() {
+        if let Some((_, schema_plan)) = catalog.plan_for_key(&spec.schema_key) {
+            write_rows.convert_json_snapshots_to_typed(schema_plan)?;
+            certify_fileless_typed_sql_rows(ctx, &spec, &mut write_rows)?;
         }
     }
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
@@ -903,10 +893,12 @@ async fn try_execute_direct_path_value_replacement_batch(
     plan: &LogicalWritePlan,
     parameter_batch: RowInsertParameterBatch<'_>,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) = &plan.bound.target
-    else {
+    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) = &plan.bound.target else {
         return Ok(None);
     };
+    if schema_requires_plugin_write_path(ctx, schema_key) {
+        return Ok(None);
+    }
     if plan.bound.op != BoundWriteOp::Update {
         return Ok(None);
     }
@@ -1032,7 +1024,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         let mut snapshots = Vec::with_capacity(
             primary_key_arena
                 .len()
-                .saturating_add(row_count.saturating_mul(32)),
+                .saturating_add(row_count.saturating_mul(64)),
         );
         let mut snapshot_offsets = Vec::with_capacity(row_count);
         for (statement_index, &(identity_start, identity_end)) in
@@ -1040,24 +1032,15 @@ async fn try_execute_direct_path_value_replacement_batch(
         {
             let primary_key = std::str::from_utf8(&primary_key_arena[identity_start..identity_end])
                 .expect("borrowed SQL text remains UTF-8 in its mutation arena");
-            let snapshot_start = snapshots.len();
-            snapshots.extend_from_slice(b"{\"path\":");
-            append_canonical_json_string(&mut snapshots, primary_key)
-                .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
-            snapshots.extend_from_slice(b",\"value\":");
-            match parameter_batch.value(replacement.value_param_index, statement_index) {
-                DirectParameterValue::Null => snapshots.extend_from_slice(b"null"),
-                DirectParameterValue::String(raw) => {
-                    append_canonical_json_parameter(&mut snapshots, raw).map_err(|error| {
-                        with_parameter_batch_statement_index(error, statement_index)
-                    })?;
-                }
-                DirectParameterValue::Boolean(_) => {
-                    unreachable!("the certified replacement value parameter is text")
-                }
-            }
-            snapshots.push(b'}');
-            snapshot_offsets.push((snapshot_start, snapshots.len()));
+            let payload_start = snapshots.len();
+            append_certified_path_value_parameter_payload(
+                &mut snapshots,
+                schema_plan,
+                primary_key,
+                parameter_batch.value(replacement.value_param_index, statement_index),
+            )
+            .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
+            snapshot_offsets.push((payload_start, snapshots.len()));
         }
         let journal = TypedMutationJournalBatch::new(
             schema_plan_id,
@@ -1142,9 +1125,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         .unwrap_or(row_pks.as_slice());
     let unique_row_count = unique_row_pks.len();
     let ordered_identity_digest =
-        crate::collection_generation::ordered_single_string_identity_digest(
-            unique_row_pks.iter(),
-        );
+        crate::collection_generation::ordered_single_string_identity_digest(unique_row_pks.iter());
     let certified_generation_identity = !has_staged_collection_rows
         && collection_generation.is_some_and(|generation| {
             generation.live_count == unique_row_count as u64
@@ -1249,7 +1230,8 @@ async fn try_execute_direct_path_value_replacement_batch(
             ))
         })
         .ok_or_else(|| LixError::unknown("certified replacement byte accounting overflowed"))?;
-    let mut normalized = Vec::with_capacity(estimated_row_bytes);
+    let mut snapshots =
+        Vec::with_capacity(estimated_row_bytes.saturating_add(unique_row_count.saturating_mul(64)));
     let replacement_capacity = if certified_generation_identity {
         unique_row_count
     } else {
@@ -1263,18 +1245,17 @@ async fn try_execute_direct_path_value_replacement_batch(
     let mut candidate_index = 0;
     let mut ordinal_index = 0;
     for (identity_index, row_pk) in unique_row_pks.iter().enumerate() {
-        let (first_statement_index, last_statement_index) =
-            if let Some(ordinals) = &sorted_statement_ordinals {
-                let first = ordinal_index;
-                while ordinal_index < ordinals.len()
-                    && row_pks[ordinals[ordinal_index]] == *row_pk
-                {
-                    ordinal_index += 1;
-                }
-                (first, ordinal_index - 1)
-            } else {
-                (identity_index, identity_index)
-            };
+        let (first_statement_index, last_statement_index) = if let Some(ordinals) =
+            &sorted_statement_ordinals
+        {
+            let first = ordinal_index;
+            while ordinal_index < ordinals.len() && row_pks[ordinals[ordinal_index]] == *row_pk {
+                ordinal_index += 1;
+            }
+            (first, ordinal_index - 1)
+        } else {
+            (identity_index, identity_index)
+        };
         if !certified_generation_identity {
             while candidate_index < candidates.len()
                 && candidates.row(candidate_index).row_pk() < row_pk
@@ -1294,24 +1275,15 @@ async fn try_execute_direct_path_value_replacement_batch(
                 ordinals[last_statement_index]
             });
 
-        let start = normalized.len();
-        normalized.extend_from_slice(b"{\"path\":");
-        append_canonical_json_string(&mut normalized, row_pk.as_single_string()?)
-            .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
-        normalized.extend_from_slice(b",\"value\":");
-        match parameter_batch.value(replacement.value_param_index, statement_index) {
-            DirectParameterValue::Null => normalized.extend_from_slice(b"null"),
-            DirectParameterValue::String(raw) => {
-                append_canonical_json_parameter(&mut normalized, raw).map_err(|error| {
-                    with_parameter_batch_statement_index(error, statement_index)
-                })?;
-            }
-            DirectParameterValue::Boolean(_) => {
-                unreachable!("the certified replacement value parameter is text")
-            }
-        }
-        normalized.push(b'}');
-        snapshot_offsets.push((start, normalized.len()));
+        let start = snapshots.len();
+        append_certified_path_value_parameter_payload(
+            &mut snapshots,
+            schema_plan,
+            row_pk.as_single_string()?,
+            parameter_batch.value(replacement.value_param_index, statement_index),
+        )
+        .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
+        snapshot_offsets.push((start, snapshots.len()));
         replacement_row_pks.push(row_pk.clone());
         replacement_predecessors.push(
             (!certified_generation_identity)
@@ -1337,18 +1309,11 @@ async fn try_execute_direct_path_value_replacement_batch(
         }
     }
     if !replacement_row_pks.is_empty() {
-        let normalized_len = normalized.len();
-        // SAFETY: the arena contains only JSON syntax literals and text
-        // emitted by the canonical JSON append helpers above.
-        let snapshots = unsafe {
-            TransactionJson::from_validated_certified_row_content_arena(
-                normalized,
-                snapshot_offsets,
-            )?
-        };
-        let mut rows = CertifiedParameterReplacementBatch::new(
+        let snapshot_len = snapshots.len();
+        let mut rows = CertifiedParameterReplacementBatch::new_typed(
             replacement_row_pks,
             snapshots,
+            snapshot_offsets,
             spec.schema_key.as_str().into(),
             active_branch_id.into(),
             CertifiedRawWriteBatchPreparation {
@@ -1363,12 +1328,13 @@ async fn try_execute_direct_path_value_replacement_batch(
                         Some(CompleteCollectionReplacementProof {
                             ordered_identity_digest: ordered_identity_digest?,
                             replay_bytes: u64::try_from(
-                                replacement_identity_replay_bytes.checked_add(normalized_len)?,
+                                replacement_identity_replay_bytes.checked_add(snapshot_len)?,
                             )
                             .ok()?,
                         })
                     })
                     .flatten(),
+                fileless_typed_sql_rows: false,
             },
         )?;
         for (index, predecessor) in replacement_predecessors.into_iter().enumerate() {
@@ -1407,6 +1373,44 @@ async fn try_execute_direct_path_value_replacement_batch(
             .map(SqlWriteResult::affected)
             .collect()
     }))
+}
+
+fn append_certified_path_value_parameter_payload(
+    output: &mut Vec<u8>,
+    schema_plan: &crate::catalog::SchemaPlan,
+    primary_key: &str,
+    parameter: DirectParameterValue<'_>,
+) -> Result<(), LixError> {
+    let canonical = match parameter {
+        DirectParameterValue::Null => b"null".as_slice(),
+        DirectParameterValue::String(raw) => raw.as_bytes(),
+        DirectParameterValue::Boolean(_) => {
+            unreachable!("the certified replacement value parameter is text")
+        }
+    };
+    if crate::plugin::runtime::WasmTypedRow::try_append_certified_path_value_payload_from_canonical_json(
+        output,
+        schema_plan,
+        primary_key,
+        canonical,
+    )? {
+        return Ok(());
+    }
+    let DirectParameterValue::String(raw) = parameter else {
+        unreachable!("null is canonical JSON")
+    };
+    let value = crate::sql2::udfs::common::parse_jsonb(raw).map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("invalid JSONB value: {error}"),
+        )
+    })?;
+    crate::plugin::runtime::WasmTypedRow::append_certified_path_value_payload(
+        output,
+        schema_plan,
+        primary_key,
+        value,
+    )
 }
 
 struct DirectPathValueReplacement {
@@ -1494,10 +1498,28 @@ impl<'a> RowLiveRowRef<'a> {
         }
     }
 
-    fn snapshot_content(self) -> Option<&'a str> {
+    fn decoded_snapshot(self) -> Option<&'a crate::plugin::runtime::WasmTypedRow> {
         match self {
-            Self::Owned(row) => row.snapshot_content.as_deref(),
-            Self::Batch(row) => row.snapshot_content().map(SharedStr::as_str),
+            Self::Owned(_) => None,
+            Self::Batch(row) => row.decoded_snapshot().map(Arc::as_ref),
+        }
+    }
+
+    fn snapshot_json_value(self) -> Result<Option<JsonValue>, LixError> {
+        match self {
+            Self::Owned(row) => row
+                .snapshot_content
+                .as_deref()
+                .map(|snapshot| {
+                    serde_json::from_str(snapshot).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("row snapshot_content is not valid JSON: {error}"),
+                        )
+                    })
+                })
+                .transpose(),
+            Self::Batch(row) => row.snapshot_json_value(),
         }
     }
 
@@ -2191,8 +2213,7 @@ mod active_branch_commit_id_reference_tests {
     use super::*;
     use crate::sql2::bind::expr::BoundColumnRef;
     use crate::sql2::bind::write::{
-        BoundParamMap, BoundWrite, BoundWriteInput, BoundWriteOp, BoundWriteTarget,
-        RowWriteSurface,
+        BoundParamMap, BoundWrite, BoundWriteInput, BoundWriteOp, BoundWriteTarget, RowWriteSurface,
     };
     use crate::sql2::plan::branch_scope::BranchScope;
     use crate::sql2::plan::write::PlannedWriteFilters;
@@ -2630,8 +2651,7 @@ async fn row_upsert(
     for index in 0..insert_rows.len() {
         let insert_row = insert_rows.row(index);
         let inserted_row_pk = insert_row_pk(insert_row, spec)?;
-        let matching_candidate =
-            find_conflict_candidate(insert_row, &inserted_row_pk, &candidates);
+        let matching_candidate = find_conflict_candidate(insert_row, &inserted_row_pk, &candidates);
         match (matching_candidate, &conflict.action) {
             // DO NOTHING on a conflicting row: leave the existing row untouched.
             (Some(_), BoundConflictAction::DoNothing) => {}
@@ -2701,6 +2721,8 @@ fn row_insert_batch(
             active_branch_commit_id,
         )?;
     }
+    convert_sql_row_snapshots_to_typed(ctx, spec, &mut write_rows)?;
+    certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows)?;
     Ok(write_rows)
 }
 
@@ -2732,6 +2754,8 @@ async fn row_update(
             write_rows.mark_last_constraints_unchanged();
         }
     }
+    convert_sql_row_snapshots_to_typed(ctx, spec, &mut write_rows)?;
+    certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows)?;
     stage_rows_with_postimage_returning(
         ctx,
         plan,
@@ -2902,7 +2926,7 @@ pub(crate) async fn execute_prepared_path_value_replacement(
     let Some(row) = prepare_path_value_replacement_row(ctx, program, params).await? else {
         return Ok(SqlWriteResult::affected(0));
     };
-    let rows = CertifiedParameterReplacementBatch::new(
+    let mut rows = CertifiedParameterReplacementBatch::new(
         vec![row.row_pk],
         vec![row.snapshot],
         program.schema_key.as_str().into(),
@@ -2915,8 +2939,22 @@ pub(crate) async fn execute_prepared_path_value_replacement(
             },
             tracked_keys_strictly_ordered: true,
             complete_collection_replacement: None,
+            fileless_typed_sql_rows: false,
         },
     )?;
+    let schema_catalog = ctx.schema_catalog_snapshot().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "prepared path replacement lost its schema catalog",
+        )
+    })?;
+    let schema_plan = schema_catalog.plan(program.schema_plan_id).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "prepared path replacement lost its schema plan",
+        )
+    })?;
+    rows.convert_to_typed(schema_plan)?;
     ctx.stage_certified_parameter_batch_replace(rows).await?;
     Ok(SqlWriteResult::affected(1))
 }
@@ -2981,10 +3019,7 @@ pub(crate) fn prepare_path_value_replacement_row_known_live(
     }
     .pop()
     .expect("one certified replacement snapshot");
-    Ok(PreparedPathValueReplacementRow {
-        row_pk,
-        snapshot,
-    })
+    Ok(PreparedPathValueReplacementRow { row_pk, snapshot })
 }
 
 pub(crate) fn append_path_value_replacement_snapshot(
@@ -3112,12 +3147,14 @@ fn row_postimage_returning_rows(
         // Certified parameter batches intentionally retain only canonical
         // bytes. Decoding through `TransactionJson::value()` would panic for
         // those rows, so materialize the normalized representation here.
-        let snapshot = row
-            .snapshot
-            .map(|snapshot| transaction_json_returning_value(snapshot, "row post-image"))
-            .transpose()?
-            .unwrap_or(JsonValue::Null);
-        let context = RowEvalContext::staged(&snapshot, row, spec);
+        let image = staged_row_image(row, "row post-image")?;
+        let context = RowEvalContext::staged(
+            image
+                .as_ref()
+                .map_or(RowImageRef::Empty, CandidateRowImage::as_ref),
+            row,
+            spec,
+        );
         rows.push(row_returning_row(
             returning,
             &context,
@@ -3187,7 +3224,7 @@ async fn row_staged_postimage_returning_rows(
                 ),
             )
         })?;
-        let snapshot = candidate_snapshot(candidate)?.ok_or_else(|| {
+        let image = candidate_row_image(candidate)?.ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -3196,7 +3233,7 @@ async fn row_staged_postimage_returning_rows(
                 ),
             )
         })?;
-        let context = RowEvalContext::live(&snapshot, candidate, spec);
+        let context = RowEvalContext::live(image.as_ref(), candidate, spec);
         rows.push(row_returning_row(
             returning,
             &context,
@@ -3309,10 +3346,10 @@ fn append_row_update_row<'a>(
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<bool, LixError> {
     let candidate = candidate.into();
-    let Some(snapshot) = candidate_snapshot(candidate)? else {
+    let Some(image) = candidate_row_image(candidate)? else {
         return Ok(false);
     };
-    let original_context = RowEvalContext::live(&snapshot, candidate, spec);
+    let original_context = RowEvalContext::live(image.as_ref(), candidate, spec);
     if !predicate_matches(
         &plan.bound.predicate,
         &original_context,
@@ -3323,8 +3360,7 @@ fn append_row_update_row<'a>(
     )? {
         return Ok(false);
     }
-    let mut updated = snapshot.clone();
-    let mut visible_assignments = Vec::new();
+    let mut updated = image.to_owned();
     for assignment in &plan.bound.assignments {
         if let Some(column) = spec.visible_column(&assignment.column.name) {
             reject_direct_blob_json_value(&assignment.value, column.column_type, params)?;
@@ -3335,16 +3371,16 @@ fn append_row_update_row<'a>(
                 params,
                 active_branch_commit_id,
             )?;
-            visible_assignments.push((
-                column.name.clone(),
-                row_json_value(
-                    &assignment.value,
-                    value,
-                    column.column_type,
-                    &spec.schema_key,
-                    &column.name,
-                )?,
-            ));
+            set_owned_row_image_eval_value(
+                ctx,
+                &mut updated,
+                &column.name,
+                &assignment.value,
+                value,
+                column.column_type,
+                column.read_nullable,
+                &spec.schema_key,
+            )?;
         } else if assignment.column.name == "lixcol_metadata" {
             // handled below from the assignment list
         } else {
@@ -3356,9 +3392,6 @@ fn append_row_update_row<'a>(
                 ),
             ));
         }
-    }
-    for (column_name, value) in visible_assignments {
-        updated[&column_name] = value;
     }
     append_row_replace_row_from_live(
         rows,
@@ -3384,10 +3417,10 @@ async fn row_delete(
     let mut write_rows = RawWriteBatch::with_capacity(candidates.len());
     let mut returning_rows = plan.bound.returning.as_ref().map(|_| Vec::new());
     for candidate in candidates.iter() {
-        let Some(snapshot) = candidate_snapshot(candidate)? else {
+        let Some(image) = candidate_row_image(candidate)? else {
             continue;
         };
-        let context = RowEvalContext::live(&snapshot, candidate, spec);
+        let context = RowEvalContext::live(image.as_ref(), candidate, spec);
         if predicate_matches(
             &plan.bound.predicate,
             &context,
@@ -3420,6 +3453,8 @@ async fn row_delete(
             )?;
         }
     }
+    convert_sql_row_snapshots_to_typed(ctx, spec, &mut write_rows)?;
+    certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows)?;
     let rows_affected = stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
     match (plan.bound.returning.as_ref(), returning_rows) {
         (Some(returning), Some(rows)) => Ok(SqlWriteResult::returning(
@@ -3555,20 +3590,23 @@ fn append_row_conflict_update_row<'a>(
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<(), LixError> {
     let candidate = candidate.into();
-    let snapshot = candidate_snapshot(candidate)?.ok_or_else(|| {
+    let image = candidate_row_image(candidate)?.ok_or_else(|| {
         LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "INSERT ON CONFLICT cannot update a tombstone row",
         )
     })?;
-    let insert_snapshot = insert_row
-        .snapshot
-        .map(TransactionJson::value)
-        .unwrap_or(&JsonValue::Null);
-    let context =
-        RowEvalContext::conflict(&snapshot, candidate, insert_snapshot, insert_row, spec);
-    let mut updated = snapshot.clone();
-    let mut visible_assignments = Vec::new();
+    let excluded_image = staged_row_image(insert_row, "INSERT ON CONFLICT excluded row")?;
+    let context = RowEvalContext::conflict(
+        image.as_ref(),
+        candidate,
+        excluded_image
+            .as_ref()
+            .map_or(RowImageRef::Empty, CandidateRowImage::as_ref),
+        insert_row,
+        spec,
+    );
+    let mut updated = image.to_owned();
     for assignment in assignments {
         if let Some(column) = spec.visible_column(&assignment.column.name) {
             reject_direct_blob_json_value(&assignment.value, column.column_type, params)?;
@@ -3579,16 +3617,16 @@ fn append_row_conflict_update_row<'a>(
                 params,
                 active_branch_commit_id,
             )?;
-            visible_assignments.push((
-                column.name.clone(),
-                row_json_value(
-                    &assignment.value,
-                    value,
-                    column.column_type,
-                    &spec.schema_key,
-                    &column.name,
-                )?,
-            ));
+            set_owned_row_image_eval_value(
+                ctx,
+                &mut updated,
+                &column.name,
+                &assignment.value,
+                value,
+                column.column_type,
+                column.read_nullable,
+                &spec.schema_key,
+            )?;
         } else if assignment.column.name == "lixcol_metadata" {
             // handled by append_row_replace_row_from_live from the assignment list
         } else {
@@ -3600,9 +3638,6 @@ fn append_row_conflict_update_row<'a>(
                 ),
             ));
         }
-    }
-    for (column_name, value) in visible_assignments {
-        updated[&column_name] = value;
     }
 
     append_row_replace_row_from_live(
@@ -3629,6 +3664,66 @@ async fn stage_rows(
         .stage_write(TransactionWrite::Rows { mode, rows })
         .await?;
     Ok(outcome.count)
+}
+
+fn certify_fileless_typed_sql_rows(
+    ctx: &dyn SqlWriteExecutionContext,
+    spec: &SchemaSurfaceSpec,
+    rows: &mut RawWriteBatch,
+) -> Result<(), LixError> {
+    if rows.is_empty() || spec.schema_key == "lix_registered_schema" {
+        return Ok(());
+    }
+    let Some(first) = rows.iter().next() else {
+        return Ok(());
+    };
+    if rows.iter().any(|row| {
+        row.untracked != first.untracked || row.schema_scope_branch_id() != ctx.active_branch_id()
+    }) {
+        return Ok(());
+    }
+    let catalog = if first.untracked {
+        ctx.schema_catalog_snapshot()
+    } else {
+        ctx.tracked_schema_catalog_snapshot()
+    };
+    let Some(catalog) = catalog else {
+        return Ok(());
+    };
+    let Some((schema_plan_id, _)) = catalog.plan_for_key(&spec.schema_key) else {
+        return Ok(());
+    };
+    if rows.iter().any(|row| {
+        row.schema_key.as_str() != spec.schema_key
+            || row.file_id.is_some()
+            || row.global
+            || row.snapshot_json().is_some()
+            || row.metadata.is_some()
+            || (row.decoded_snapshot().is_none() && row.row_pk.is_none())
+    }) {
+        return Ok(());
+    }
+    rows.certify_fileless_typed_sql_rows(
+        schema_plan_id,
+        PreparedRowFacts {
+            row_content_validated: true,
+            requires_transaction_validation: spec.has_inter_row_constraints,
+        },
+    )
+}
+
+fn convert_sql_row_snapshots_to_typed(
+    ctx: &dyn SqlWriteExecutionContext,
+    spec: &SchemaSurfaceSpec,
+    rows: &mut RawWriteBatch,
+) -> Result<(), LixError> {
+    let Some(catalog) = ctx.schema_catalog_snapshot() else {
+        return Ok(());
+    };
+    let Some((_, schema_plan)) = catalog.plan_for_key(&spec.schema_key) else {
+        return Ok(());
+    };
+    rows.convert_json_snapshots_to_typed(schema_plan)
 }
 
 fn validate_insert_conflict_target(
@@ -3673,14 +3768,11 @@ fn validate_insert_conflict_target(
     Ok(())
 }
 
-fn insert_row_pk(
-    row: RawWriteRowRef<'_>,
-    spec: &SchemaSurfaceSpec,
-) -> Result<RowPk, LixError> {
+fn insert_row_pk(row: RawWriteRowRef<'_>, spec: &SchemaSurfaceSpec) -> Result<RowPk, LixError> {
     if let Some(row_pk) = row.row_pk {
         return Ok(row_pk.clone());
     }
-    let snapshot = row.snapshot.ok_or_else(|| {
+    let snapshot = row.snapshot_json().ok_or_else(|| {
         LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
@@ -4053,16 +4145,16 @@ fn bound_primary_key_external(
             },
             _ => None,
         },
-        RowPkComponentType::String
-        | RowPkComponentType::Uuid
-        | RowPkComponentType::Bytes => match expr {
-            BoundExpr::Literal(BoundLiteral::Text(value)) => Some(value.clone()),
-            BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
-                Some(Value::Text(value)) => Some(value.clone()),
+        RowPkComponentType::String | RowPkComponentType::Uuid | RowPkComponentType::Bytes => {
+            match expr {
+                BoundExpr::Literal(BoundLiteral::Text(value)) => Some(value.clone()),
+                BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+                    Some(Value::Text(value)) => Some(value.clone()),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        },
+            }
+        }
     }
 }
 
@@ -4119,10 +4211,7 @@ impl InsertRowLayout {
                     _ => {
                         return Err(LixError::new(
                             LixError::CODE_UNSUPPORTED_SQL,
-                            format!(
-                                "bound row INSERT does not support column '{}'",
-                                column.name
-                            ),
+                            format!("bound row INSERT does not support column '{}'", column.name),
                         ));
                     }
                 })
@@ -4175,7 +4264,18 @@ fn certified_row_insert_batch(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<Option<RawWriteBatch>, LixError> {
-    certified_row_insert_rows(
+    if spec.schema_key != "lix_registered_schema"
+        && ctx
+            .schema_catalog_snapshot()
+            .is_some_and(|catalog| catalog.plan_for_key(&spec.schema_key).is_some())
+    {
+        // Ordinary native rows must pass the canonical transaction path so
+        // target-branch schema visibility and durability-domain checks remain
+        // authoritative. The dedicated active-branch parameter lanes below
+        // perform those proofs in bulk before taking their fast path.
+        return Ok(None);
+    }
+    let Some(mut rows) = certified_row_insert_rows(
         ctx,
         plan,
         spec,
@@ -4189,7 +4289,17 @@ fn certified_row_insert_batch(
             })
         }),
         active_branch_commit_id,
-    )
+    )?
+    else {
+        return Ok(None);
+    };
+    if let Some(catalog) = ctx.schema_catalog_snapshot()
+        && let Some((_, schema_plan)) = catalog.plan_for_key(&spec.schema_key)
+    {
+        rows.convert_json_snapshots_to_typed(schema_plan)?;
+        certify_fileless_typed_sql_rows(ctx, spec, &mut rows)?;
+    }
+    Ok(Some(rows))
 }
 
 fn certified_row_insert_parameter_batch(
@@ -4222,13 +4332,11 @@ fn certified_row_insert_parameter_batch(
         // 32,768 rows move, and they move to raw rather than to the generic
         // path they would otherwise fall to.
         let dense_lane_supports_batch = !rows.untracked();
-        return Ok(Some(
-            if dense_lane_supports_batch && use_typed_certified_insert(rows.len()) {
-                CertifiedRowInsertParameterBatch::Typed(rows)
-            } else {
-                CertifiedRowInsertParameterBatch::Raw(rows.into_raw()?)
-            },
-        ));
+        return Ok(Some(if dense_lane_supports_batch {
+            CertifiedRowInsertParameterBatch::Typed(rows)
+        } else {
+            CertifiedRowInsertParameterBatch::Raw(rows.into_raw()?)
+        }));
     }
     if !allow_generic_fallback {
         return Ok(None);
@@ -4249,7 +4357,7 @@ fn certified_row_insert_parameter_batch(
     }) {
         return Ok(None);
     }
-    certified_row_insert_rows(
+    let rows = certified_row_insert_rows(
         ctx,
         plan,
         spec,
@@ -4280,8 +4388,17 @@ fn certified_row_insert_parameter_batch(
                 .map_err(|error| with_parameter_batch_statement_index(error, statement_index))
         }),
         active_branch_commit_id,
-    )
-    .map(|rows| rows.map(CertifiedRowInsertParameterBatch::Raw))
+    )?;
+    let Some(mut rows) = rows else {
+        return Ok(None);
+    };
+    if let Some(catalog) = ctx.schema_catalog_snapshot()
+        && let Some((_, schema_plan)) = catalog.plan_for_key(&spec.schema_key)
+    {
+        rows.convert_json_snapshots_to_typed(schema_plan)?;
+        certify_fileless_typed_sql_rows(ctx, spec, &mut rows)?;
+    }
+    Ok(Some(CertifiedRowInsertParameterBatch::Raw(rows)))
 }
 
 struct DirectParameterInsertColumn {
@@ -4386,6 +4503,7 @@ fn certified_direct_parameter_insert_batch(
         row,
         parameter_batch,
         schema_plan_id,
+        schema_plan,
     )? {
         return Ok(Some(rows));
     }
@@ -4482,15 +4600,10 @@ fn certified_direct_parameter_insert_batch(
         })?);
     let mut offsets = Vec::with_capacity(row_count);
     let mut row_pks = Vec::with_capacity(row_count);
-    let shared_string_primary_keys =
-        spec.primary_key_component_types
-            .iter()
-            .all(|component_type| {
-                matches!(
-                    component_type,
-                    crate::row_pk::RowPkComponentType::String
-                )
-            });
+    let shared_string_primary_keys = spec
+        .primary_key_component_types
+        .iter()
+        .all(|component_type| matches!(component_type, crate::row_pk::RowPkComponentType::String));
     let mut primary_key_arena = Vec::with_capacity(
         row_count
             .saturating_mul(primary_key_columns.len())
@@ -4634,8 +4747,7 @@ fn certified_direct_parameter_insert_batch(
                     primary_key_ranges.push((start, end));
                 }
             } else {
-                let row_pk =
-                    derived_row_pk.expect("non-string primary key was materialized above");
+                let row_pk = derived_row_pk.expect("non-string primary key was materialized above");
                 if let Some(unique) = &mut unordered_row_pks {
                     if !unique.insert(row_pk.clone()) {
                         return Ok(false);
@@ -4688,8 +4800,7 @@ fn certified_direct_parameter_insert_batch(
             }
         }
     }
-    let tracked_keys_strictly_ordered =
-        shared_string_primary_keys || unordered_row_pks.is_none();
+    let tracked_keys_strictly_ordered = shared_string_primary_keys || unordered_row_pks.is_none();
     // SAFETY: each row is assembled from UTF-8 literals, validated text
     // parameters, and canonical JSON serializer output.
     let snapshots = unsafe {
@@ -4705,6 +4816,7 @@ fn certified_direct_parameter_insert_batch(
         },
         tracked_keys_strictly_ordered,
         complete_collection_replacement: None,
+        fileless_typed_sql_rows: false,
     };
     let row_columnar = if use_typed_certified_insert(row_count)
         && !direct_parameter_batch_needs_clustering(spec, &columns, parameter_batch)
@@ -4788,13 +4900,9 @@ fn certified_direct_parameter_insert_batch(
     } else {
         None
     };
-    let mut rows = CertifiedParameterInsertBatch::new(
-        row_pks,
-        snapshots,
-        schema_key,
-        branch_id,
-        certificate,
-    )?;
+    let mut rows =
+        CertifiedParameterInsertBatch::new(row_pks, snapshots, schema_key, branch_id, certificate)?;
+    rows.convert_to_typed(schema_plan)?;
     if let Some(row_columnar) = row_columnar {
         rows = rows.with_row_columnar(row_columnar);
     }
@@ -4808,6 +4916,7 @@ fn certified_direct_path_value_insert_batch(
     row: &[BoundExpr],
     parameter_batch: RowInsertParameterBatch<'_>,
     schema_plan_id: SchemaPlanId,
+    schema_plan: &crate::catalog::SchemaPlan,
 ) -> Result<Option<CertifiedParameterInsertBatch>, LixError> {
     if !spec.certifies_path_value_replacement
         || !(row.len() == 2 || row.len() == 3)
@@ -4980,11 +5089,17 @@ fn certified_direct_path_value_insert_batch(
             },
             tracked_keys_strictly_ordered: true,
             complete_collection_replacement: None,
+            fileless_typed_sql_rows: false,
         },
     )?;
     if let Some(row_columnar) = row_columnar {
         rows = rows.with_row_columnar(row_columnar);
     }
+    // The direct path/value producer has already validated the exact schema
+    // plan and canonical row shape. Lower it before transaction staging so a
+    // plugin-owned insert retains its certified INSERT/absence lane while v69
+    // persists only the native typed payload.
+    rows.convert_to_typed(schema_plan)?;
     Ok(Some(rows))
 }
 
@@ -5078,7 +5193,7 @@ fn certified_row_insert_rows<'a>(
     let mut row_values = (0..layout.columns.len())
         .map(|_| None)
         .collect::<Vec<Option<JsonValue>>>();
-    let context = RowEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
+    let context = RowEvalContext::insert(&layout.visible_columns);
 
     for input in inputs {
         let input = input?;
@@ -5136,7 +5251,7 @@ fn certified_row_insert_rows<'a>(
                     read_nullable,
                 } = target
                 {
-                    if !read_nullable && row_eval_value_is_null(&eval_value) {
+                    if !read_nullable && row_eval_value_is_sql_null(&eval_value, *column_type) {
                         return Err(LixError::new(
                             LixError::CODE_SCHEMA_VALIDATION,
                             format!(
@@ -5160,8 +5275,7 @@ fn certified_row_insert_rows<'a>(
                         unreachable!("visible columns handled above")
                     }
                     InsertColumnTarget::RowPk => {
-                        explicit_row_pk =
-                            Some(row_pk_from_value(&value, "lixcol_row_pk")?);
+                        explicit_row_pk = Some(row_pk_from_value(&value, "lixcol_row_pk")?);
                     }
                     InsertColumnTarget::FileId => {
                         file_id = text_value(value, "lixcol_file_id")?;
@@ -5208,9 +5322,14 @@ fn certified_row_insert_rows<'a>(
                     ),
                 )
             })?;
-            if explicit_row_pk.as_ref().is_some_and(|explicit| {
-                explicit.clone().into_parts() != derived_row_pk.clone().into_parts()
-            }) {
+            let explicit_row_pk_parts = explicit_row_pk
+                .as_ref()
+                .map(|explicit| explicit.clone().into_parts());
+            let derived_row_pk_parts = derived_row_pk.clone().into_parts();
+            if explicit_row_pk_parts
+                .as_ref()
+                .is_some_and(|explicit| explicit != &derived_row_pk_parts)
+            {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
@@ -5245,18 +5364,22 @@ fn certified_row_insert_rows<'a>(
                 })?;
             }
             normalized.push(b'}');
-            let key = WasmRowKey::from_owned_parts(
-                layout.schema_key.clone(),
-                derived_row_pk.clone().into_parts(),
-            );
-            let certified = schema_plan
-                .certify_or_normalize_plugin_row(&normalized[start..], &key)?
+            let derived_row_pk_refs = derived_row_pk_parts
+                .iter()
+                .map(|component| component.as_str())
+                .collect::<Vec<_>>();
+            let canonical = schema_plan
+                .certify_or_normalize_json_row_parts(
+                    &normalized[start..],
+                    &layout.schema_key,
+                    &derived_row_pk_refs,
+                )?
                 .ok_or_else(|| {
                     LixError::unknown(
                         "eligible certified INSERT row declined its schema certificate",
                     )
                 })?;
-            if let Some(canonical) = certified.normalized {
+            if let Some(canonical) = canonical {
                 normalized.truncate(start);
                 normalized.extend_from_slice(&canonical);
             }
@@ -5270,7 +5393,7 @@ fn certified_row_insert_rows<'a>(
                 branch_id: row_branch_id(plan, global)?.into(),
             };
             if !unique_identities.insert((
-                certified.row_pk.clone(),
+                derived_row_pk.clone(),
                 row_parts_entry.file_id.clone(),
                 row_parts_entry.branch_id.clone(),
                 global,
@@ -5278,7 +5401,7 @@ fn certified_row_insert_rows<'a>(
                 return Ok(false);
             }
             offsets.push((start, end));
-            row_pks.push(certified.row_pk);
+            row_pks.push(derived_row_pk);
             row_parts.push(row_parts_entry);
             for value in &mut row_values {
                 *value = None;
@@ -5342,13 +5465,25 @@ fn append_row_insert_row(
         ));
     }
 
+    let native_catalog = ctx.schema_catalog_snapshot();
+    let native_plan = matches!(plan.bound.branch_scope, BranchScope::Active { .. })
+        .then(|| {
+            native_catalog.as_ref().and_then(|catalog| {
+                catalog
+                    .plan_for_key(&layout.schema_key)
+                    .map(|(_, plan)| plan)
+            })
+        })
+        .flatten()
+        .filter(|_| layout.schema_key != "lix_registered_schema");
     let mut snapshot = serde_json::Map::with_capacity(layout.snapshot_capacity);
+    let mut typed_row = native_plan.map(|_| lix_schema::Row::with_capacity(spec.columns.len()));
     let mut row_pk = None;
     let mut file_id = None;
     let mut metadata = None;
     let mut global = None;
     let mut untracked = None;
-    let context = RowEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
+    let context = RowEvalContext::insert(&layout.visible_columns);
 
     for (expr, target) in row.iter().zip(layout.columns.iter()) {
         if let InsertColumnTarget::Visible { column_type, .. } = target {
@@ -5387,7 +5522,7 @@ fn append_row_insert_row(
             read_nullable,
         } = target
         {
-            if !read_nullable && row_eval_value_is_null(&eval_value) {
+            if !read_nullable && row_eval_value_is_sql_null(&eval_value, *column_type) {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
@@ -5396,10 +5531,30 @@ fn append_row_insert_row(
                     ),
                 ));
             }
-            snapshot.insert(
-                name.clone(),
-                row_json_value(expr, eval_value, *column_type, &layout.schema_key, name)?,
-            );
+            if let (Some(plan), Some(typed_row)) = (native_plan, typed_row.as_mut()) {
+                let data_type = plan.compiled_schema.column_type(name).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!("schema '{}' has no column '{name}'", layout.schema_key),
+                    )
+                })?;
+                typed_row.insert(
+                    name.clone(),
+                    typed_value_from_eval(
+                        expr,
+                        eval_value,
+                        data_type,
+                        *read_nullable,
+                        &layout.schema_key,
+                        name,
+                    )?,
+                );
+            } else {
+                snapshot.insert(
+                    name.clone(),
+                    row_json_value(expr, eval_value, *column_type, &layout.schema_key, name)?,
+                );
+            }
             continue;
         }
         let value = eval_value.into_json();
@@ -5423,14 +5578,76 @@ fn append_row_insert_row(
         }
     }
 
+    if let (Some(native_schema_plan), Some(mut typed_row)) = (native_plan, typed_row) {
+        let functions = ctx.functions();
+        native_schema_plan
+            .compiled_schema
+            .apply_defaults(
+                &mut typed_row,
+                || functions.call_uuid_v7(),
+                || {
+                    (ctx.current_timestamp().milliseconds_since_unix_epoch() as i64)
+                        .saturating_mul(1_000)
+                },
+            )
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!(
+                        "INSERT defaults for schema '{}' failed: {error}",
+                        layout.schema_key
+                    ),
+                )
+            })?;
+        native_schema_plan
+            .compiled_schema
+            .materialize_missing_nullable_columns(&mut typed_row);
+        let typed = crate::plugin::runtime::WasmTypedRow {
+            schema_fingerprint: native_schema_plan.fingerprint().bytes(),
+            row_pk: Arc::from([]),
+            row: typed_row,
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        };
+        let (derived_row_pk, typed) =
+            finalize_typed_row_with_plan(&layout.schema_key, native_schema_plan, typed)?;
+        if row_pk.as_ref().is_some_and(|explicit_row_pk| {
+            explicit_row_pk.clone().into_parts() != derived_row_pk.clone().into_parts()
+        }) {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "INSERT into {} has lixcol_row_pk that does not match its public primary-key columns",
+                    layout.schema_key
+                ),
+            ));
+        }
+        let global = global.unwrap_or(false);
+        let branch_id = row_branch_id(plan, global)?;
+        rows.push_typed_parts(
+            Some(derived_row_pk),
+            layout.schema_key.as_str().into(),
+            file_id.map(Into::into),
+            Some(Arc::new(typed)),
+            metadata,
+            None,
+            None,
+            None,
+            global,
+            None,
+            None,
+            untracked.unwrap_or(false),
+            branch_id.into(),
+        );
+        return Ok(());
+    }
+
     populate_registered_schema_key(&layout.schema_key, &mut snapshot)?;
     let functions = ctx.functions();
-    spec.defaults.apply(
-        &mut snapshot,
-        functions,
-        &layout.schema_key,
-        || Ok(ctx.current_timestamp()),
-    )?;
+    spec.defaults
+        .apply(&mut snapshot, functions, &layout.schema_key, || {
+            Ok(ctx.current_timestamp())
+        })?;
     let snapshot = JsonValue::Object(snapshot);
     if !spec.primary_key_paths.is_empty() {
         let derived_row_pk = RowPk::from_primary_key_plan(
@@ -5447,10 +5664,9 @@ fn append_row_insert_row(
                 ),
             )
         })?;
-        if row_pk
-            .as_ref()
-            .is_some_and(|explicit_row_pk| explicit_row_pk != &derived_row_pk)
-        {
+        if row_pk.as_ref().is_some_and(|explicit_row_pk| {
+            explicit_row_pk.clone().into_parts() != derived_row_pk.clone().into_parts()
+        }) {
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
@@ -5513,48 +5729,109 @@ fn append_row_replace_row_from_live<'a>(
     ctx: &mut dyn SqlWriteExecutionContext,
     spec: &SchemaSurfaceSpec,
     row: impl Into<RowLiveRowRef<'a>>,
-    snapshot: Option<JsonValue>,
+    image: Option<OwnedRowImage>,
     assignments: &[BoundAssignment],
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<(), LixError> {
     let row = row.into();
     let metadata = if let Some(expr) = assignment_value(assignments, "lixcol_metadata") {
-        let snapshot_for_eval = candidate_snapshot(row)?.unwrap_or(JsonValue::Null);
-        let context = RowEvalContext::live(&snapshot_for_eval, row, spec);
+        let current_image = candidate_row_image(row)?;
+        let context = RowEvalContext::live(
+            current_image
+                .as_ref()
+                .map_or(RowImageRef::Empty, CandidateRowImage::as_ref),
+            row,
+            spec,
+        );
         let value = eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
         optional_metadata_from_eval_value(value, "lixcol_metadata", &spec.schema_key)?
     } else {
         inherited_metadata(row, spec)?
     };
 
-    let snapshot = snapshot
-        .map(|snapshot| {
-            TransactionJson::from_value(
+    let branch_id = if row.global() {
+        crate::GLOBAL_BRANCH_ID.into()
+    } else {
+        row.branch_id().into()
+    };
+    match image {
+        Some(OwnedRowImage::Typed(typed)) => {
+            let (row_pk, typed) = finalize_typed_row(ctx, &spec.schema_key, typed)?;
+            if &row_pk != row.row_pk() {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!(
+                        "UPDATE of schema '{}' changed its primary key; delete and insert the row instead",
+                        spec.schema_key
+                    ),
+                ));
+            }
+            rows.push_typed_parts(
+                Some(row_pk),
+                spec.schema_key.as_str().into(),
+                row.file_id().map(Into::into),
+                Some(Arc::new(typed)),
+                metadata,
+                None,
+                None,
+                None,
+                row.global(),
+                None,
+                None,
+                row.untracked(),
+                branch_id,
+            );
+        }
+        Some(OwnedRowImage::Json(snapshot)) => rows.push_parts(
+            Some(row.row_pk().clone()),
+            spec.schema_key.as_str().into(),
+            row.file_id().map(Into::into),
+            Some(TransactionJson::from_value(
                 snapshot,
                 &format!("{} update snapshot_content", spec.schema_key),
-            )
-        })
-        .transpose()?;
-    rows.push_parts(
-        Some(row.row_pk().clone()),
-        spec.schema_key.as_str().into(),
-        row.file_id().map(Into::into),
-        snapshot,
-        metadata,
-        None,
-        None,
-        None,
-        row.global(),
-        None,
-        None,
-        row.untracked(),
-        if row.global() {
-            crate::GLOBAL_BRANCH_ID.into()
-        } else {
-            row.branch_id().into()
-        },
-    );
+            )?),
+            metadata,
+            None,
+            None,
+            None,
+            row.global(),
+            None,
+            None,
+            row.untracked(),
+            branch_id,
+        ),
+        None if row.decoded_snapshot().is_some() => rows.push_typed_parts(
+            Some(row.row_pk().clone()),
+            spec.schema_key.as_str().into(),
+            row.file_id().map(Into::into),
+            None,
+            metadata,
+            None,
+            None,
+            None,
+            row.global(),
+            None,
+            None,
+            row.untracked(),
+            branch_id,
+        ),
+        None => rows.push_parts(
+            Some(row.row_pk().clone()),
+            spec.schema_key.as_str().into(),
+            row.file_id().map(Into::into),
+            None,
+            metadata,
+            None,
+            None,
+            None,
+            row.global(),
+            None,
+            None,
+            row.untracked(),
+            branch_id,
+        ),
+    }
     Ok(())
 }
 
@@ -5572,9 +5849,9 @@ fn inherited_metadata<'a>(
 }
 
 struct RowEvalContext<'a> {
-    snapshot: &'a JsonValue,
+    image: RowImageRef<'a>,
     row: Option<RowEvalRowRef<'a>>,
-    excluded_snapshot: Option<&'a JsonValue>,
+    excluded_image: Option<RowImageRef<'a>>,
     excluded_row: Option<RawWriteRowRef<'a>>,
     visible_columns: &'a [SchemaSurfaceColumn],
 }
@@ -5665,55 +5942,55 @@ impl<'a> RowEvalRowRef<'a> {
 }
 
 impl<'a> RowEvalContext<'a> {
-    fn insert(snapshot: &'a JsonValue, visible_columns: &'a [SchemaSurfaceColumn]) -> Self {
+    fn insert(visible_columns: &'a [SchemaSurfaceColumn]) -> Self {
         Self {
-            snapshot,
+            image: RowImageRef::Empty,
             row: None,
-            excluded_snapshot: None,
+            excluded_image: None,
             excluded_row: None,
             visible_columns,
         }
     }
 
     fn live(
-        snapshot: &'a JsonValue,
+        image: RowImageRef<'a>,
         row: impl Into<RowLiveRowRef<'a>>,
         spec: &'a SchemaSurfaceSpec,
     ) -> Self {
         Self {
-            snapshot,
+            image,
             row: Some(RowEvalRowRef::Live(row.into())),
-            excluded_snapshot: None,
+            excluded_image: None,
             excluded_row: None,
             visible_columns: &spec.columns,
         }
     }
 
     fn staged(
-        snapshot: &'a JsonValue,
+        image: RowImageRef<'a>,
         row: RawWriteRowRef<'a>,
         spec: &'a SchemaSurfaceSpec,
     ) -> Self {
         Self {
-            snapshot,
+            image,
             row: Some(RowEvalRowRef::Staged(row)),
-            excluded_snapshot: None,
+            excluded_image: None,
             excluded_row: None,
             visible_columns: &spec.columns,
         }
     }
 
     fn conflict(
-        snapshot: &'a JsonValue,
+        image: RowImageRef<'a>,
         row: impl Into<RowLiveRowRef<'a>>,
-        excluded_snapshot: &'a JsonValue,
+        excluded_image: RowImageRef<'a>,
         excluded_row: RawWriteRowRef<'a>,
         spec: &'a SchemaSurfaceSpec,
     ) -> Self {
         Self {
-            snapshot,
+            image,
             row: Some(RowEvalRowRef::Live(row.into())),
-            excluded_snapshot: Some(excluded_snapshot),
+            excluded_image: Some(excluded_image),
             excluded_row: Some(excluded_row),
             visible_columns: &spec.columns,
         }
@@ -5757,6 +6034,12 @@ fn row_eval_value_is_null(value: &RowEvalValue) -> bool {
         value,
         RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null)
     )
+}
+
+fn row_eval_value_is_sql_null(value: &RowEvalValue, column_type: SchemaColumnType) -> bool {
+    matches!(value, RowEvalValue::SqlNull)
+        || (column_type != SchemaColumnType::Jsonb
+            && matches!(value, RowEvalValue::Json(JsonValue::Null)))
 }
 
 fn cast_row_eval_value(
@@ -5838,9 +6121,7 @@ fn row_eval_value_from_cast_scalar(
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
         | ScalarValue::LargeUtf8(Some(value)) => Ok(RowEvalValue::SqlText(value)),
-        ScalarValue::Int64(Some(value)) => {
-            Ok(RowEvalValue::Json(JsonValue::Number(value.into())))
-        }
+        ScalarValue::Int64(Some(value)) => Ok(RowEvalValue::Json(JsonValue::Number(value.into()))),
         ScalarValue::Float64(Some(value)) => serde_json::Number::from_f64(value)
             .map(JsonValue::Number)
             .map(RowEvalValue::Json)
@@ -5881,9 +6162,7 @@ fn eval_expr_value(
 ) -> Result<RowEvalValue, LixError> {
     match expr {
         BoundExpr::Literal(BoundLiteral::Null) => Ok(RowEvalValue::SqlNull),
-        BoundExpr::Literal(BoundLiteral::Text(value)) => {
-            Ok(RowEvalValue::SqlText(value.clone()))
-        }
+        BoundExpr::Literal(BoundLiteral::Text(value)) => Ok(RowEvalValue::SqlText(value.clone())),
         BoundExpr::Literal(literal) => Ok(RowEvalValue::Json(literal_json(literal))),
         BoundExpr::Param(param) => params
             .get(param.index.saturating_sub(1))
@@ -6542,20 +6821,270 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
     }
 }
 
-fn candidate_snapshot<'a>(
+enum CandidateRowImage<'a> {
+    Json(JsonValue),
+    Typed(&'a crate::plugin::runtime::WasmTypedRow),
+}
+
+#[derive(Clone, Copy)]
+enum RowImageRef<'a> {
+    Empty,
+    Json(&'a JsonValue),
+    Typed(&'a lix_schema::Row),
+}
+
+impl<'a> CandidateRowImage<'a> {
+    fn as_ref(&'a self) -> RowImageRef<'a> {
+        match self {
+            Self::Json(value) => RowImageRef::Json(value),
+            Self::Typed(value) => RowImageRef::Typed(&value.row),
+        }
+    }
+}
+
+enum OwnedRowImage {
+    Json(JsonValue),
+    Typed(crate::plugin::runtime::WasmTypedRow),
+}
+
+impl CandidateRowImage<'_> {
+    fn to_owned(&self) -> OwnedRowImage {
+        match self {
+            Self::Json(value) => OwnedRowImage::Json(value.clone()),
+            Self::Typed(value) => OwnedRowImage::Typed((*value).clone()),
+        }
+    }
+}
+
+fn candidate_row_image<'a>(
     row: impl Into<RowLiveRowRef<'a>>,
-) -> Result<Option<JsonValue>, LixError> {
-    row.into()
-        .snapshot_content()
-        .map(|snapshot| {
-            serde_json::from_str(snapshot).map_err(|error| {
+) -> Result<Option<CandidateRowImage<'a>>, LixError> {
+    let row = row.into();
+    if let Some(typed) = row.decoded_snapshot() {
+        return Ok(Some(CandidateRowImage::Typed(typed)));
+    }
+    row.snapshot_json_value()
+        .map(|value| value.map(CandidateRowImage::Json))
+}
+
+fn staged_row_image<'a>(
+    row: RawWriteRowRef<'a>,
+    context: &str,
+) -> Result<Option<CandidateRowImage<'a>>, LixError> {
+    if let Some(typed) = row.decoded_snapshot() {
+        return Ok(Some(CandidateRowImage::Typed(typed.as_ref())));
+    }
+    row.snapshot_json()
+        .map(|snapshot| transaction_json_returning_value(snapshot, context))
+        .transpose()
+        .map(|value| value.map(CandidateRowImage::Json))
+}
+
+#[expect(clippy::too_many_arguments)]
+fn set_owned_row_image_eval_value(
+    ctx: &dyn SqlWriteExecutionContext,
+    image: &mut OwnedRowImage,
+    column_name: &str,
+    expr: &BoundExpr,
+    value: RowEvalValue,
+    column_type: SchemaColumnType,
+    read_nullable: bool,
+    schema_key: &str,
+) -> Result<(), LixError> {
+    match image {
+        OwnedRowImage::Json(snapshot) => {
+            let object = snapshot.as_object_mut().ok_or_else(|| {
                 LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    format!("row snapshot_content is not valid JSON: {error}"),
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("row for schema '{schema_key}' is not an object"),
+                )
+            })?;
+            object.insert(
+                column_name.to_owned(),
+                row_json_value(expr, value, column_type, schema_key, column_name)?,
+            );
+        }
+        OwnedRowImage::Typed(typed) => {
+            typed.invalidate_durable_payload();
+            let catalog = ctx.schema_catalog_snapshot().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!("typed row schema '{schema_key}' is not available"),
+                )
+            })?;
+            let (_, plan) = catalog.plan_for_key(schema_key).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!("typed row schema '{schema_key}' is not available"),
+                )
+            })?;
+            let data_type = plan
+                .compiled_schema
+                .column_type(column_name)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!("typed row schema '{schema_key}' has no column '{column_name}'"),
+                    )
+                })?;
+            typed.row.insert(
+                column_name.to_owned(),
+                typed_value_from_eval(
+                    expr,
+                    value,
+                    data_type,
+                    read_nullable,
+                    schema_key,
+                    column_name,
+                )?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn typed_value_from_eval(
+    expr: &BoundExpr,
+    value: RowEvalValue,
+    data_type: lix_schema::DataType,
+    nullable: bool,
+    schema_key: &str,
+    column_name: &str,
+) -> Result<lix_schema::Value, LixError> {
+    use lix_schema::{DataType, Value};
+
+    if matches!(value, RowEvalValue::SqlNull)
+        || ((data_type != DataType::Jsonb || nullable)
+            && matches!(value, RowEvalValue::Json(JsonValue::Null)))
+    {
+        return Ok(Value::Null);
+    }
+    let mismatch = || {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!(
+                "schema '{schema_key}' column '{column_name}' expected {}",
+                data_type.postgres_name()
+            ),
+        )
+    };
+
+    // Keep SQL values native on the typed-row path. The JSON snapshot path
+    // needs `row_json_value` for canonical object construction; turning a
+    // scalar into a JSON DOM node and immediately decoding it back into its
+    // Schema v1 type is pure transport overhead here.
+    match (data_type, value) {
+        (DataType::Text, RowEvalValue::SqlText(value))
+        | (DataType::Text, RowEvalValue::Json(JsonValue::String(value))) => Ok(Value::Text(value)),
+        (DataType::Uuid, RowEvalValue::SqlText(value))
+        | (DataType::Uuid, RowEvalValue::Json(JsonValue::String(value))) => {
+            uuid::Uuid::parse_str(&value)
+                .map(Value::Uuid)
+                .map_err(|_| mismatch())
+        }
+        (DataType::Int8, value) => {
+            if let Some(value) = bigint_number_literal(expr, schema_key, column_name)? {
+                return Ok(Value::Int8(value));
+            }
+            match value {
+                RowEvalValue::Json(JsonValue::Number(value)) => {
+                    value.as_i64().map(Value::Int8).ok_or_else(mismatch)
+                }
+                _ => Err(mismatch()),
+            }
+        }
+        (DataType::Float8, RowEvalValue::Json(JsonValue::Number(value))) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(Value::Float8)
+            .ok_or_else(mismatch),
+        (DataType::Boolean, RowEvalValue::Json(JsonValue::Bool(value))) => {
+            Ok(Value::Boolean(value))
+        }
+        (DataType::Jsonb, RowEvalValue::SqlText(value)) => Ok(Value::Jsonb(
+            serde_json::from_str(&value)
+                .unwrap_or(JsonValue::String(value))
+                .into(),
+        )),
+        (DataType::Jsonb, RowEvalValue::Json(value)) => Ok(Value::Jsonb(value.into())),
+        (DataType::Timestamptz, RowEvalValue::SqlText(value))
+        | (DataType::Timestamptz, RowEvalValue::Json(JsonValue::String(value))) => {
+            chrono::DateTime::parse_from_rfc3339(&value)
+                .map(|value| Value::Timestamptz(value.timestamp_micros()))
+                .map_err(|_| mismatch())
+        }
+        _ => Err(mismatch()),
+    }
+}
+
+fn finalize_typed_row(
+    ctx: &dyn SqlWriteExecutionContext,
+    schema_key: &str,
+    typed: crate::plugin::runtime::WasmTypedRow,
+) -> Result<(RowPk, crate::plugin::runtime::WasmTypedRow), LixError> {
+    let catalog = ctx.schema_catalog_snapshot().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!("typed row schema '{schema_key}' is not available"),
+        )
+    })?;
+    let (_, plan) = catalog.plan_for_key(schema_key).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!("typed row schema '{schema_key}' is not available"),
+        )
+    })?;
+    finalize_typed_row_with_plan(schema_key, plan, typed)
+}
+
+fn finalize_typed_row_with_plan(
+    schema_key: &str,
+    plan: &crate::catalog::SchemaPlan,
+    mut typed: crate::plugin::runtime::WasmTypedRow,
+) -> Result<(RowPk, crate::plugin::runtime::WasmTypedRow), LixError> {
+    plan.compiled_schema
+        .validate_complete_row(&typed.row)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("typed row for schema '{schema_key}' is invalid: {error}"),
+            )
+        })?;
+    let typed_row_pk = plan
+        .compiled_schema
+        .primary_key()
+        .iter()
+        .map(|name| {
+            typed.row.get(name).cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("typed row for schema '{schema_key}' is missing key column '{name}'"),
                 )
             })
         })
-        .transpose()
+        .collect::<Result<Vec<_>, _>>()?;
+    if plan.primary_key_component_types.is_none() {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("typed row schema '{schema_key}' has no typed primary key"),
+        ));
+    }
+    let row_pk = RowPk::from_schema_values(&typed_row_pk).map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("typed row for schema '{schema_key}' has an invalid key: {error}"),
+        )
+    })?;
+    typed.invalidate_durable_payload();
+    typed.schema_fingerprint = plan.fingerprint().bytes();
+    typed.row_pk = typed_row_pk.into();
+    typed.certify_boundary_validation().map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("typed row for schema '{schema_key}' is not durably encodable: {error:?}"),
+        )
+    })?;
+    Ok((row_pk, typed))
 }
 
 fn row_json_value(
@@ -6880,14 +7409,31 @@ fn column_eval_value(
     context: &RowEvalContext<'_>,
     column_name: &str,
 ) -> Result<RowEvalValue, LixError> {
-    if let Some(value) = context.snapshot.get(column_name) {
-        return Ok(visible_column_eval_value(
-            context
-                .visible_columns
-                .iter()
-                .find(|column| column.name == column_name),
-            value,
-        ));
+    match context.image {
+        RowImageRef::Json(snapshot) => {
+            if let Some(value) = snapshot.get(column_name) {
+                return Ok(visible_column_eval_value(
+                    context
+                        .visible_columns
+                        .iter()
+                        .find(|column| column.name == column_name),
+                    value,
+                ));
+            }
+        }
+        RowImageRef::Typed(row) => {
+            if let Some(value) = row.get(column_name) {
+                return typed_column_eval_value(
+                    value,
+                    context
+                        .visible_columns
+                        .iter()
+                        .find(|column| column.name == column_name)
+                        .map(|column| column.column_type),
+                );
+            }
+        }
+        RowImageRef::Empty => {}
     }
     let Some(row) = context.row else {
         return Ok(RowEvalValue::SqlNull);
@@ -6940,20 +7486,37 @@ fn excluded_column_eval_value(
     context: &RowEvalContext<'_>,
     column_name: &str,
 ) -> Result<RowEvalValue, LixError> {
-    let Some(excluded_snapshot) = context.excluded_snapshot else {
+    let Some(excluded_image) = context.excluded_image else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "excluded columns are only available in INSERT ON CONFLICT assignments",
         ));
     };
-    if let Some(value) = excluded_snapshot.get(column_name) {
-        return Ok(visible_column_eval_value(
-            context
-                .visible_columns
-                .iter()
-                .find(|column| column.name == column_name),
-            value,
-        ));
+    match excluded_image {
+        RowImageRef::Json(snapshot) => {
+            if let Some(value) = snapshot.get(column_name) {
+                return Ok(visible_column_eval_value(
+                    context
+                        .visible_columns
+                        .iter()
+                        .find(|column| column.name == column_name),
+                    value,
+                ));
+            }
+        }
+        RowImageRef::Typed(row) => {
+            if let Some(value) = row.get(column_name) {
+                return typed_column_eval_value(
+                    value,
+                    context
+                        .visible_columns
+                        .iter()
+                        .find(|column| column.name == column_name)
+                        .map(|column| column.column_type),
+                );
+            }
+        }
+        RowImageRef::Empty => {}
     }
     let Some(row) = context.excluded_row else {
         return Ok(RowEvalValue::SqlNull);
@@ -6992,6 +7555,44 @@ fn visible_column_eval_value(
         }
         _ => RowEvalValue::Json(value.clone()),
     }
+}
+
+fn typed_column_eval_value(
+    value: &lix_schema::Value,
+    column_type: Option<SchemaColumnType>,
+) -> Result<RowEvalValue, LixError> {
+    Ok(match value {
+        // The historical row-expression contract exposes a null JSONB data
+        // value as JSON null, while a null system column remains SQL NULL.
+        // Native typed rows must preserve that distinction even though both
+        // are represented by Schema v1 `Value::Null` at rest.
+        lix_schema::Value::Null if column_type == Some(SchemaColumnType::Jsonb) => {
+            RowEvalValue::Json(JsonValue::Null)
+        }
+        lix_schema::Value::Null => RowEvalValue::SqlNull,
+        lix_schema::Value::Text(value) => RowEvalValue::SqlText(value.clone()),
+        lix_schema::Value::Uuid(value) => RowEvalValue::SqlText(value.to_string()),
+        lix_schema::Value::Int8(value) => RowEvalValue::Json(JsonValue::Number((*value).into())),
+        lix_schema::Value::Float8(value) => RowEvalValue::Json(JsonValue::Number(
+            serde_json::Number::from_f64(*value).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    "typed row contains a non-finite float",
+                )
+            })?,
+        )),
+        lix_schema::Value::Boolean(value) => RowEvalValue::Json(JsonValue::Bool(*value)),
+        lix_schema::Value::Jsonb(value) => RowEvalValue::Json(value.as_value().clone()),
+        lix_schema::Value::Timestamptz(value) => {
+            let timestamp = chrono::DateTime::from_timestamp_micros(*value).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    "typed row contains an invalid timestamptz",
+                )
+            })?;
+            RowEvalValue::SqlText(timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        }
+    })
 }
 
 fn scan_branch_ids(scope: &BranchScope) -> Result<Vec<String>, LixError> {
@@ -7130,8 +7731,8 @@ mod primary_key_route_tests {
 
     #[test]
     fn compiles_single_text_primary_key_parameter_once() {
-        let spec = crate::sql2::catalog::derive_schema_surface_spec_from_schema(
-            &serde_json::json!({
+        let spec =
+            crate::sql2::catalog::derive_schema_surface_spec_from_schema(&serde_json::json!({
                 "$schema": "https://lix.dev/schema-v1.json",
                 "key": "row",
                 "columns": [
@@ -7139,9 +7740,8 @@ mod primary_key_route_tests {
                     { "name": "value", "type": "jsonb", "nullable": false },
                 ],
                 "primary_key": ["id"],
-            }),
-        )
-        .expect("schema surface schema should compile");
+            }))
+            .expect("schema surface schema should compile");
         assert_eq!(
             bound_single_text_primary_key_param(
                 &spec,

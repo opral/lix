@@ -243,11 +243,9 @@ where
 
     let delta = load_commit_delta_members_with_payloads(store, commit_id).await?;
     let payloads = materialize_known_change_payloads_in_order(
-        store,
         delta.iter().map(|member| member.change.clone()),
         ChangeRecordProjection::full(),
-    )
-    .await?;
+    )?;
     if payloads.len() != delta.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,

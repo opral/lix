@@ -1,0 +1,7 @@
+{
+  "key": "test_plugin_column_merger",
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/merge_test_row.json"
+  ]
+}

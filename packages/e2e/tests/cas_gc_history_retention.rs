@@ -73,10 +73,8 @@ async fn slatedb_current_untracked_blob_survives_sweep_and_cold_reopen() {
 #[tokio::test]
 async fn rocksdb_shared_blob_survives_replace_rollback_delete_gc_and_reopen() {
     let temp = tempfile::tempdir().expect("create RocksDB shared-blob fixture");
-    shared_blob_replacement_lifecycle(&temp.path().join("database"), |path| {
-        RocksDB::open(path)
-    })
-    .await;
+    shared_blob_replacement_lifecycle(&temp.path().join("database"), |path| RocksDB::open(path))
+        .await;
 }
 
 #[tokio::test]
@@ -122,7 +120,10 @@ where
         session
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[Value::Text(path.to_owned()), Value::Blob(OLD.to_vec().into())],
+                &[
+                    Value::Text(path.to_owned()),
+                    Value::Blob(OLD.to_vec().into()),
+                ],
             )
             .await
             .expect("insert shared blob owner");
@@ -139,21 +140,27 @@ where
         )
         .await
         .expect("stage shared replacement rollback");
-    rollback.rollback().await.expect("rollback shared replacement");
-    assert_eq!(read_file_at(&session, "/shared-a.bin").await, Some(OLD.to_vec()));
-    assert_eq!(read_file_at(&session, "/shared-b.bin").await, Some(OLD.to_vec()));
+    rollback
+        .rollback()
+        .await
+        .expect("rollback shared replacement");
+    assert_eq!(
+        read_file_at(&session, "/shared-a.bin").await,
+        Some(OLD.to_vec())
+    );
+    assert_eq!(
+        read_file_at(&session, "/shared-b.bin").await,
+        Some(OLD.to_vec())
+    );
     let rolled_back_hash = blake3::hash(ROLLED_BACK).to_hex().to_string();
     collect_repository_gc_for_bench(&StorageAdapter::new(storage.clone()))
         .await
         .expect("collect rolled-back replacement");
     assert!(
-        read_binary_cas_for_bench(
-            &StorageAdapter::new(storage.clone()),
-            &rolled_back_hash,
-        )
-        .await
-        .expect("rolled-back CAS lookup should succeed")
-        .is_none(),
+        read_binary_cas_for_bench(&StorageAdapter::new(storage.clone()), &rolled_back_hash,)
+            .await
+            .expect("rolled-back CAS lookup should succeed")
+            .is_none(),
         "rolled-back replacement must not become a current or historical owner",
     );
 
@@ -164,7 +171,10 @@ where
         )
         .await
         .expect("commit one shared owner replacement");
-    assert_eq!(read_file_at(&session, "/shared-a.bin").await, Some(NEW.to_vec()));
+    assert_eq!(
+        read_file_at(&session, "/shared-a.bin").await,
+        Some(NEW.to_vec())
+    );
     session
         .execute("DELETE FROM lix_file WHERE path = '/shared-a.bin'", &[])
         .await
@@ -172,7 +182,10 @@ where
     collect_repository_gc_for_bench(&StorageAdapter::new(storage.clone()))
         .await
         .expect("collect while second shared owner remains");
-    assert_eq!(read_file_at(&session, "/shared-b.bin").await, Some(OLD.to_vec()));
+    assert_eq!(
+        read_file_at(&session, "/shared-b.bin").await,
+        Some(OLD.to_vec())
+    );
     let old_hash = blake3::hash(OLD).to_hex().to_string();
     let new_hash = blake3::hash(NEW).to_hex().to_string();
     assert_eq!(
@@ -252,7 +265,10 @@ where
     let sweep = collect_repository_gc_for_bench(&adapter)
         .await
         .expect("collect after final owner and history release");
-    assert_ne!(sweep.swept_commits, 0, "shared history release must sweep commits");
+    assert_ne!(
+        sweep.swept_commits, 0,
+        "shared history release must sweep commits"
+    );
     assert!(
         read_binary_cas_for_bench(&adapter, &old_hash)
             .await

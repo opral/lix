@@ -1,17 +1,12 @@
 [package]
-name = "plugin_conversation"
+name = "test_plugin_column_merger"
+workspace = "../../../../tooling"
 version.workspace = true
+publish = false
 authors.workspace = true
 edition.workspace = true
-description = "Row-only conversation text merger for Lix"
 license.workspace = true
-homepage.workspace = true
-repository.workspace = true
-documentation.workspace = true
-keywords.workspace = true
-categories.workspace = true
 rust-version.workspace = true
-publish = false
 
 [lints]
 workspace = true

@@ -12,11 +12,11 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
 };
 use crate::common::LixTimestamp;
-use crate::row_pk::RowPk;
 use crate::hot_state::{
     CurrentStateDeltaRef, HotStateContext, HotStateFilter, HotStateProjection, HotStateRowRequest,
     HotStateScanRequest, TrackedHeadContext, WorkingDiffIndexCoverage,
 };
+use crate::row_pk::RowPk;
 use crate::session::SessionBranch;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
@@ -303,7 +303,9 @@ where
             Arc::clone(&self.hot_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            crate::plugin::runtime::PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
+            crate::plugin::runtime::PluginRuntimeHost::new(Arc::new(
+                crate::plugin::runtime::UnsupportedWasmRuntime,
+            )),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::new(crate::sql2::SqlPlanningCache::default()),
@@ -378,7 +380,17 @@ where
         .await
         .expect("global branch control should load")
         .expect("global branch control should exist");
-    let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
+    let snapshot_value: serde_json::Value =
+        serde_json::from_str(&snapshot_content).expect("deterministic mode snapshot should parse");
+    let decoded_snapshot = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+        "lix_key_value",
+        &row_pk,
+        &snapshot_value,
+    )
+    .expect("deterministic mode snapshot should type");
+    let snapshot = decoded_snapshot
+        .durable_payload_ref()
+        .expect("deterministic mode snapshot should encode");
     let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
     TrackedHeadContext::new()
         .writer(&read, &mut writes)
@@ -390,18 +402,17 @@ where
                 schema_key: "lix_key_value",
                 file_id: None,
                 row_pk: &row_pk,
-                change_id: None,
+                change_id: Some(ChangeId::for_test_label("bench-deterministic-mode")),
                 commit_id: None,
                 untracked: true,
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
-                snapshot: snapshot.as_ref_slot(),
-                metadata: crate::json_store::JsonSlotRef::None,
+                snapshot: Some(snapshot),
+                metadata: None,
                 columnar_base_coordinate: None,
             }],
             &BTreeSet::new(),
-            None,
             None,
             None,
             &mut working_diff_coverage,
@@ -469,17 +480,24 @@ async fn seed_visible_schema_rows<StorageImpl>(
         .map(|schema| {
             let key = crate::schema::schema_key_from_definition(schema)
                 .expect("seed schema key should derive");
-            let snapshot_content = json!({
+            let snapshot = json!({
                 "schema_key": key.schema_key.clone(),
                 "value": schema,
-            })
-            .to_string();
+            });
+            let row_pk = crate::schema::registered_schema_row_pk(&key.schema_key)
+                .expect("registered schema identity should derive");
+            let typed = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+                "lix_registered_schema",
+                &row_pk,
+                &snapshot,
+            )
+            .expect("registered schema fixture should type");
             crate::tracked_state::MaterializedTrackedStateRow {
-                row_pk: crate::schema::registered_schema_row_pk(&key.schema_key)
-                    .expect("registered schema identity should derive"),
+                row_pk,
                 schema_key: "lix_registered_schema".to_string(),
                 file_id: None,
-                snapshot_content: Some(snapshot_content.into()),
+                snapshot_content: None,
+                decoded_snapshot: Some(Arc::new(typed)),
                 metadata: None,
                 deleted: false,
                 created_at: TIMESTAMP.to_string(),
@@ -542,8 +560,18 @@ async fn seed_visible_schema_rows<StorageImpl>(
                     row_pk: row_pk.clone(),
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    snapshot: crate::json_store::JsonSlot::from_json(snapshot),
-                    metadata: crate::json_store::JsonSlot::None,
+                    snapshot: Some(
+                        crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+                            row_pk,
+                            &serde_json::from_str(snapshot)
+                                .expect("branch-ref benchmark row is JSON"),
+                        )
+                        .expect("branch-ref benchmark row should type")
+                        .durable_payload()
+                        .expect("branch-ref benchmark row should encode")
+                        .to_vec(),
+                    ),
+                    metadata: None,
                     created_at: timestamp,
                     origin_key: None,
                 })
@@ -572,7 +600,6 @@ async fn seed_visible_schema_rows<StorageImpl>(
                     &[],
                     &absence_guards,
                     Some(rows.clone()),
-                    None,
                     None,
                     &mut coverage,
                 )

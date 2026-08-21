@@ -52,15 +52,10 @@ pub const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace =
     crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE;
 pub const CERTIFIED_ROW_BATCH_SPACE: StorageSpace = crate::hot_state::CERTIFIED_ROW_BATCH_SPACE;
 pub const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = crate::branch::BRANCH_HEAD_CONTROL_SPACE;
-pub const CERTIFIED_ROW_BATCH_MANIFEST_SPACE: StorageSpace =
-    crate::hot_state::CERTIFIED_ROW_BATCH_MANIFEST_SPACE;
-pub const CERTIFIED_ROW_BATCH_PAGE_SPACE: StorageSpace =
-    crate::hot_state::CERTIFIED_ROW_BATCH_PAGE_SPACE;
 pub const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = crate::hot_state::COLLECTION_CONTROL_SPACE;
 pub const PACKED_CURRENT_BASE_SPACE: StorageSpace = crate::hot_state::PACKED_CURRENT_BASE_SPACE;
 pub const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace =
     crate::hot_state::PACKED_CURRENT_BASE_CONTROL_SPACE;
-pub const PLUGIN_CHECKPOINT_SPACE: StorageSpace = crate::transaction::PLUGIN_CHECKPOINT_SPACE;
 pub const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace =
     crate::hot_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE;
 pub const ROOT_CURRENT_BASE_SPACE: StorageSpace = crate::hot_state::ROOT_CURRENT_BASE_SPACE;
@@ -77,8 +72,6 @@ pub const TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE: StorageSpace =
     crate::tracked_state::TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE;
 pub const CURRENT_STATE_DATA_PART_SPACE: StorageSpace =
     crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE;
-pub const CURRENT_STATE_DATA_PART_REFS_SPACE: StorageSpace =
-    crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE;
 pub const SCOPED_RANGE_NODE_SPACE: StorageSpace = crate::tracked_state::SCOPED_RANGE_NODE_SPACE;
 /// Declared-column access path over the hot rows. Disposable, and genuinely
 /// reclaimed with its generation: `INDEX_SPACE` is the first entry in
@@ -137,14 +130,10 @@ mod tests {
         HOT_FILE_SPACE,
         HOT_DIFF_SPACE,
         TRACKED_WORKING_DIFF_MARKER_SPACE,
-        CERTIFIED_ROW_BATCH_SPACE,
         BRANCH_HEAD_CONTROL_SPACE,
-        CERTIFIED_ROW_BATCH_MANIFEST_SPACE,
-        CERTIFIED_ROW_BATCH_PAGE_SPACE,
         HOT_COLLECTION_CONTROL_SPACE,
         PACKED_CURRENT_BASE_SPACE,
         PACKED_CURRENT_BASE_CONTROL_SPACE,
-        PLUGIN_CHECKPOINT_SPACE,
         PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
         ROOT_CURRENT_BASE_SPACE,
         ROW_GROUP_MANIFEST_SPACE,
@@ -154,7 +143,6 @@ mod tests {
         MUTATION_DIRECTORY_NODE_SPACE,
         TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
         CURRENT_STATE_DATA_PART_SPACE,
-        CURRENT_STATE_DATA_PART_REFS_SPACE,
         SCOPED_RANGE_NODE_SPACE,
         HOT_INDEX_SPACE,
         BINARY_CAS_MANIFEST_SPACE,

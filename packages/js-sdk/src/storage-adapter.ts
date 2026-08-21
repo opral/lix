@@ -208,6 +208,10 @@ export interface LixStorageWrite {
 		space: LixStorageSpace,
 		entries: LixStoragePutEntry[],
 	): Promise<void>;
+	replaceMany(
+		space: LixStorageSpace,
+		entries: LixStoragePutEntry[],
+	): Promise<void>;
 	deleteMany(space: LixStorageSpace, keys: Uint8Array[]): Promise<void>;
 	deleteRange(
 		space: LixStorageSpace,

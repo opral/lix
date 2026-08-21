@@ -114,6 +114,10 @@ path = "tests/plugin_arena_scorecard.rs"
 name = "hot_index_range_probe"
 path = "tests/hot_index_range_probe.rs"
 
+[[test]]
+name = "migration_v68"
+path = "tests/migration_v68.rs"
+
 [dependencies]
 lix_schema.workspace = true
 serde = { version = "1", features = ["derive"] }
@@ -161,6 +165,7 @@ fastcdc = "3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }
+lz4_flex = "0.11"
 async-stream = { version = "0.3", optional = true }
 flate2 = { version = "1", optional = true }
 futures-core = { version = "0.3", optional = true }

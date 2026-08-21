@@ -30,13 +30,11 @@ pub(crate) use hot::{
 pub(crate) use hot::{
     CERTIFIED_ROW_BATCH_MANIFEST_SPACE, CERTIFIED_ROW_BATCH_PAGE_SPACE, CERTIFIED_ROW_BATCH_SPACE,
     COLLECTION_CONTROL_SPACE, CertifiedRowBatchFileRef, CompleteWorkingDiffMode, DIFF_SPACE,
-    DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows, FILE_SPACE, HotIndexEntry,
-    HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot, INDEX_SPACE,
-    PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
+    FILE_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot,
+    INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
-    ROW_SPACE, RootBaseBatchCache, RowColumnarOverlayRow, load_certified_rows_at_commit,
-    materialize_certified_root_rows, scan_certified_history_rows, stage_certified_row_batches,
-    stage_hot_index_entries, stage_retire_hot_generation,
+    ROW_SPACE, RootBaseBatchCache, RowColumnarOverlayRow, decode_hot_row_key_for_migration,
+    stage_certified_row_batches, stage_hot_index_entries, stage_retire_hot_generation,
 };
 
 /// Stable physical address of a row in an immutable columnar base.
@@ -67,9 +65,10 @@ use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch,
     MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
-use crate::json_store::{
-    JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
-};
+use crate::json_store::JsonRef;
+use crate::plugin::runtime::WasmTypedRow;
+#[cfg(any(test, feature = "storage-benches"))]
+use crate::plugin::wire::typed as typed_wire;
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
@@ -250,7 +249,7 @@ impl HeadIdentity {
 /// [`HeadValueView`], which parses the fixed header directly from RocksDB's
 /// returned bytes and never builds this allocation-heavy representation.
 #[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct HeadValue {
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
@@ -258,8 +257,8 @@ struct HeadValue {
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    snapshot: JsonSlot,
-    metadata: JsonSlot,
+    snapshot: Option<Vec<u8>>,
+    metadata: Option<lix_schema::Jsonb>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
 
@@ -273,8 +272,8 @@ impl HeadValue {
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            snapshot: self.snapshot.as_ref_slot(),
-            metadata: self.metadata.as_ref_slot(),
+            snapshot: self.snapshot.as_deref(),
+            metadata: self.metadata.as_ref(),
             columnar_base_coordinate: self.columnar_base_coordinate,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         }
@@ -289,8 +288,8 @@ struct HeadValueRef<'a> {
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    snapshot: JsonSlotRef<'a>,
-    metadata: JsonSlotRef<'a>,
+    snapshot: Option<&'a [u8]>,
+    metadata: Option<&'a lix_schema::Jsonb>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
 }
@@ -313,7 +312,7 @@ struct BranchRefKey {
 /// serving publication converts it to [`CurrentStateDeltaRef`], which is also
 /// able to carry history-free untracked mutations.
 #[cfg(any(test, feature = "storage-benches"))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct TrackedHeadDeltaRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
@@ -323,13 +322,13 @@ pub(crate) struct TrackedHeadDeltaRef<'a> {
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
-    pub(crate) snapshot: JsonSlotRef<'a>,
-    pub(crate) metadata: JsonSlotRef<'a>,
+    pub(crate) snapshot: Option<&'a str>,
+    pub(crate) metadata: Option<lix_schema::Jsonb>,
 }
 
 #[cfg(any(test, feature = "storage-benches"))]
 impl<'a> TrackedHeadDeltaRef<'a> {
-    fn as_current(&self) -> CurrentStateDeltaRef<'a> {
+    fn as_current(&'a self) -> CurrentStateDeltaRef<'a> {
         CurrentStateDeltaRef {
             schema_key: self.schema_key,
             file_id: self.file_id,
@@ -340,8 +339,22 @@ impl<'a> TrackedHeadDeltaRef<'a> {
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            snapshot: self.snapshot,
-            metadata: self.metadata,
+            snapshot: match self.snapshot {
+                None => None,
+                Some(json) => {
+                    let value: serde_json::Value = serde_json::from_str(json)
+                        .expect("test tracked-head snapshot must be valid JSON");
+                    let row = WasmTypedRow::from_test_json_unchecked(self.row_pk, &value)
+                        .expect("test tracked-head snapshot must be typable");
+                    Some(Box::leak(
+                        row.durable_payload()
+                            .expect("test payload")
+                            .to_vec()
+                            .into_boxed_slice(),
+                    ))
+                }
+            },
+            metadata: self.metadata.as_ref(),
             columnar_base_coordinate: None,
         }
     }
@@ -364,8 +377,8 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
-    pub(crate) snapshot: JsonSlotRef<'a>,
-    pub(crate) metadata: JsonSlotRef<'a>,
+    pub(crate) snapshot: Option<&'a [u8]>,
+    pub(crate) metadata: Option<&'a lix_schema::Jsonb>,
     pub(crate) columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
 
@@ -433,16 +446,8 @@ impl<'a> CurrentStateDeltaRef<'a> {
             deleted: self.deleted,
             created_at,
             updated_at: self.updated_at,
-            snapshot: if self.deleted {
-                JsonSlotRef::None
-            } else {
-                self.snapshot
-            },
-            metadata: if self.deleted {
-                JsonSlotRef::None
-            } else {
-                self.metadata
-            },
+            snapshot: if self.deleted { None } else { self.snapshot },
+            metadata: if self.deleted { None } else { self.metadata },
             columnar_base_coordinate: self.columnar_base_coordinate,
             working_diff_baseline,
         }
@@ -586,7 +591,6 @@ where
             generation,
             deltas,
             absence_guards,
-            None,
             None,
             None,
             &mut coverage,
@@ -1281,56 +1285,41 @@ fn working_diff_error(message: &str) -> LixError {
 
 /// Current-state values are intentionally a small, fixed-header wire record rather
 /// than a general Musli struct. The normal read path needs only these fields,
-/// and decoding a Musli `JsonSlot` first allocated an intermediate value for
-/// every row before it was copied into a live-state row.
+/// and the only variable payloads are the typed snapshot and canonical binary
+/// JSONB metadata.
 ///
 /// ```text
-///  0      format version (9)
-///  1      deleted + untracked + snapshot/metadata kinds + diff baseline kind
+///  0      format version (11; older versions are rejected)
+///  1      deleted + untracked + diff baseline kind
 ///  2..18  change UUID
 /// 18..34  commit UUID
 /// 34..42  created_at packed timestamp (big endian)
 /// 42..50  updated_at packed timestamp (big endian)
-/// 50..54  snapshot payload byte length (big endian u32)
-/// 54..58  metadata payload byte length (big endian u32)
-/// 58      columnar base-coordinate presence (0 or 1)
-/// 59..    snapshot payload, metadata payload, then an optional fixed
+/// 50..54  metadata payload byte length (big endian u32)
+/// 54      columnar base-coordinate presence (0 or 1)
+/// 55..59  typed payload byte length (big endian u32)
+/// 59..    metadata payload, then an optional fixed
 ///          checkpoint before-image, then an optional 24-byte base coordinate
+///          and the typed row payload
 /// ```
 ///
-/// Slot payloads are either inline UTF-8 JSON, a fixed 32-byte `JsonRef`, or
-/// that same fingerprint followed by inline JSON for dirty working-diff rows.
-/// Persisting fingerprints only while a row is dirty keeps repeated diff
-/// classification independent of payload size without taxing checkpointed
-/// current state.
-const HEAD_VALUE_VERSION: u8 = 9;
+/// Metadata is canonical binary JSONB stored inline. Every live row uses the
+/// native snapshot slot; deletes carry no row payload.
+/// There is no current-format outer-row JSON reader.
+const HEAD_VALUE_VERSION: u8 = 11;
 const HEAD_VALUE_HEADER_BYTES: usize = 59;
+const HEAD_VALUE_TYPED_HEADER_BYTES: usize = HEAD_VALUE_HEADER_BYTES;
 const COLUMNAR_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
-const HEAD_VALUE_SNAPSHOT_SHIFT: u8 = 1;
-const HEAD_VALUE_METADATA_SHIFT: u8 = 3;
 const HEAD_VALUE_UNTRACKED: u8 = 0b0010_0000;
 const HEAD_VALUE_WORKING_DIFF_SHIFT: u8 = 6;
-const HEAD_VALUE_SLOT_MASK: u8 = 0b11;
 const HEAD_VALUE_WORKING_DIFF_MASK: u8 = 0b11;
-const HEAD_SLOT_NONE: u8 = 0;
-const HEAD_SLOT_REF: u8 = 1;
-const HEAD_SLOT_INLINE: u8 = 2;
-const HEAD_SLOT_INLINE_FINGERPRINTED: u8 = 3;
 const HEAD_WORKING_DIFF_DISABLED: u8 = 0;
 const HEAD_WORKING_DIFF_CLEAN: u8 = 1;
 const HEAD_WORKING_DIFF_BEFORE_ABSENT: u8 = 2;
 const HEAD_WORKING_DIFF_BEFORE_PRESENT: u8 = 3;
 const UUID_BYTES: usize = 16;
 const JSON_REF_BYTES: usize = 32;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeadSlotView<'a> {
-    None,
-    Ref(JsonRef),
-    Inline(&'a str),
-    InlineFingerprinted { json_ref: JsonRef, json: &'a str },
-}
 
 #[derive(Debug, Clone, Copy)]
 struct HeadValueView<'a> {
@@ -1340,8 +1329,8 @@ struct HeadValueView<'a> {
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    snapshot: HeadSlotView<'a>,
-    metadata: HeadSlotView<'a>,
+    snapshot: Option<&'a [u8]>,
+    metadata: Option<&'a [u8]>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
     /// False when the JSON slots above are placeholders because this view was
@@ -1369,8 +1358,8 @@ impl CertifiedCurrentStatePredecessor {
                 // Current-state bases are read without payload projection, so
                 // these slots are placeholders. The change id above is the
                 // reference the reader hydrates from when it needs the payload.
-                snapshot: HeadSlotView::None,
-                metadata: HeadSlotView::None,
+                snapshot: None,
+                metadata: None,
                 payload_slots_materialized: false,
                 columnar_base_coordinate: value.columnar_base_coordinate,
                 working_diff_baseline: match value.working_diff_baseline {
@@ -1395,17 +1384,13 @@ impl HeadValueView<'_> {
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            snapshot: self.working_diff_slot(self.snapshot),
-            metadata: self.working_diff_slot(self.metadata),
+            snapshot: if self.payload_slots_materialized {
+                working_diff_snapshot_fingerprint(self.snapshot)
+            } else {
+                WorkingDiffSlotFingerprint::unresolved()
+            },
+            metadata: working_diff_snapshot_fingerprint(self.metadata),
         })
-    }
-
-    fn working_diff_slot(self, slot: HeadSlotView<'_>) -> WorkingDiffSlotFingerprint {
-        if self.payload_slots_materialized {
-            working_diff_slot_fingerprint(slot)
-        } else {
-            WorkingDiffSlotFingerprint::unresolved()
-        }
     }
 }
 
@@ -1534,65 +1519,13 @@ impl WorkingDiffVersion {
     }
 }
 
-fn working_diff_slot_fingerprint(slot: HeadSlotView<'_>) -> WorkingDiffSlotFingerprint {
-    match slot {
-        HeadSlotView::None => WorkingDiffSlotFingerprint {
-            kind: WORKING_DIFF_SLOT_NONE,
-            hash: [0; JSON_REF_BYTES],
-        },
-        HeadSlotView::Ref(json_ref) => WorkingDiffSlotFingerprint {
-            kind: WORKING_DIFF_SLOT_REF,
-            hash: *json_ref.as_hash_array(),
-        },
-        HeadSlotView::Inline(json) => WorkingDiffSlotFingerprint {
+fn working_diff_snapshot_fingerprint(payload: Option<&[u8]>) -> WorkingDiffSlotFingerprint {
+    payload.map_or_else(WorkingDiffSlotFingerprint::none, |payload| {
+        WorkingDiffSlotFingerprint {
             kind: WORKING_DIFF_SLOT_INLINE,
-            hash: *JsonRef::for_content(json.as_bytes()).as_hash_array(),
-        },
-        HeadSlotView::InlineFingerprinted { json_ref, .. } => WorkingDiffSlotFingerprint {
-            kind: WORKING_DIFF_SLOT_INLINE,
-            hash: *json_ref.as_hash_array(),
-        },
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum HeadSlotEncode<'a> {
-    None,
-    Ref(JsonRef),
-    Inline {
-        json_ref: Option<JsonRef>,
-        json: &'a str,
-    },
-}
-
-impl<'a> From<JsonSlotRef<'a>> for HeadSlotEncode<'a> {
-    fn from(value: JsonSlotRef<'a>) -> Self {
-        match value {
-            JsonSlotRef::None => Self::None,
-            JsonSlotRef::Ref(value) => Self::Ref(*value),
-            JsonSlotRef::Inline(json) => Self::Inline {
-                json_ref: None,
-                json,
-            },
+            hash: *JsonRef::for_content(payload).as_hash_array(),
         }
-    }
-}
-
-impl<'a> From<HeadSlotView<'a>> for HeadSlotEncode<'a> {
-    fn from(value: HeadSlotView<'a>) -> Self {
-        match value {
-            HeadSlotView::None => Self::None,
-            HeadSlotView::Ref(value) => Self::Ref(value),
-            HeadSlotView::Inline(json) => Self::Inline {
-                json_ref: None,
-                json,
-            },
-            HeadSlotView::InlineFingerprinted { json_ref, json } => Self::Inline {
-                json_ref: Some(json_ref),
-                json,
-            },
-        }
-    }
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1603,8 +1536,8 @@ struct HeadValueEncode<'a> {
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    snapshot: HeadSlotEncode<'a>,
-    metadata: HeadSlotEncode<'a>,
+    snapshot: Option<&'a [u8]>,
+    metadata: Option<&'a lix_schema::Jsonb>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
 }
@@ -1628,8 +1561,8 @@ fn append_head_value(
             deleted: value.deleted,
             created_at: value.created_at,
             updated_at: value.updated_at,
-            snapshot: value.snapshot.into(),
-            metadata: value.metadata.into(),
+            snapshot: value.snapshot,
+            metadata: value.metadata,
             columnar_base_coordinate: value.columnar_base_coordinate,
             working_diff_baseline: value.working_diff_baseline,
         },
@@ -1640,6 +1573,11 @@ fn reencode_head_value_with_baseline(
     value: HeadValueView<'_>,
     working_diff_baseline: WorkingDiffBaseline,
 ) -> Result<Vec<u8>, LixError> {
+    let metadata = value
+        .metadata
+        .map(|bytes| lix_schema::Jsonb::from_binary_vec(bytes.to_vec()))
+        .transpose()
+        .map_err(|error| head_value_error(&format!("invalid JSONB metadata: {error}")))?;
     encode_head_value_parts(HeadValueEncode {
         change_id: value.change_id,
         commit_id: value.commit_id,
@@ -1647,8 +1585,8 @@ fn reencode_head_value_with_baseline(
         deleted: value.deleted,
         created_at: value.created_at,
         updated_at: value.updated_at,
-        snapshot: value.snapshot.into(),
-        metadata: value.metadata.into(),
+        snapshot: value.snapshot,
+        metadata: metadata.as_ref(),
         columnar_base_coordinate: value.columnar_base_coordinate,
         working_diff_baseline,
     })
@@ -1664,15 +1602,27 @@ fn append_head_value_parts(
     bytes: &mut Vec<u8>,
     value: HeadValueEncode<'_>,
 ) -> Result<std::ops::Range<usize>, LixError> {
-    let fingerprint_inline = matches!(
-        value.working_diff_baseline,
-        WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. }
-    );
-    let snapshot_kind = encoded_slot_kind(value.snapshot, fingerprint_inline);
-    let metadata_kind = encoded_slot_kind(value.metadata, fingerprint_inline);
-    if value.deleted && (snapshot_kind != HEAD_SLOT_NONE || metadata_kind != HEAD_SLOT_NONE) {
+    let metadata = value
+        .metadata
+        .map(lix_schema::Jsonb::binary)
+        .transpose()
+        .map_err(|error| head_value_error(&format!("cannot encode JSONB metadata: {error}")))?;
+    let snapshot = value.snapshot.unwrap_or_default();
+    let snapshot = if snapshot.is_empty() {
+        snapshot.to_vec()
+    } else {
+        crate::plugin::runtime::compress_hot_payload(snapshot.to_vec()).map_err(|error| {
+            head_value_error(format!("cannot compress typed row payload: {error:?}"))
+        })?
+    };
+    if value.deleted != snapshot.is_empty() {
         return Err(head_value_error(
-            "deleted current-state rows must not carry JSON payloads",
+            "live current-state rows require exactly one typed payload and deletes require none",
+        ));
+    }
+    if value.deleted && (metadata.is_some() || !snapshot.is_empty()) {
+        return Err(head_value_error(
+            "deleted current-state rows must not carry payloads",
         ));
     }
     // Encode-side half of the untracked identity invariant documented on
@@ -1726,11 +1676,10 @@ fn append_head_value_parts(
             "columnar base coordinate must carry a non-nil owner commit",
         ));
     }
-    let snapshot_len = encoded_slot_len(value.snapshot, fingerprint_inline);
-    let metadata_len = encoded_slot_len(value.metadata, fingerprint_inline);
-    let capacity = HEAD_VALUE_HEADER_BYTES
-        .checked_add(snapshot_len)
-        .and_then(|bytes| bytes.checked_add(metadata_len))
+    let metadata_len = metadata.as_deref().map_or(0, <[u8]>::len);
+    let header_bytes = HEAD_VALUE_TYPED_HEADER_BYTES;
+    let capacity = header_bytes
+        .checked_add(metadata_len)
         .and_then(|bytes| {
             bytes.checked_add(match value.working_diff_baseline {
                 WorkingDiffBaseline::BeforePresent { .. } => {
@@ -1747,6 +1696,7 @@ fn append_head_value_parts(
                     .map_or(0, |_| COLUMNAR_BASE_COORDINATE_BYTES),
             )
         })
+        .and_then(|bytes| bytes.checked_add(snapshot.len()))
         .ok_or_else(|| head_value_error("encoded row length overflow"))?;
     let start = bytes.len();
     bytes.reserve(capacity);
@@ -1755,8 +1705,6 @@ fn append_head_value_parts(
     if value.untracked {
         flags |= HEAD_VALUE_UNTRACKED;
     }
-    flags |= snapshot_kind << HEAD_VALUE_SNAPSHOT_SHIFT;
-    flags |= metadata_kind << HEAD_VALUE_METADATA_SHIFT;
     flags |= encode_working_diff_baseline_tag(value.working_diff_baseline)
         << HEAD_VALUE_WORKING_DIFF_SHIFT;
     bytes.push(flags);
@@ -1765,18 +1713,19 @@ fn append_head_value_parts(
     bytes.extend_from_slice(&value.created_at.packed().to_be_bytes());
     bytes.extend_from_slice(&value.updated_at.packed().to_be_bytes());
     bytes.extend_from_slice(
-        &u32::try_from(snapshot_len)
-            .map_err(|_| head_value_error("snapshot payload exceeds v8 u32 limit"))?
-            .to_be_bytes(),
-    );
-    bytes.extend_from_slice(
         &u32::try_from(metadata_len)
-            .map_err(|_| head_value_error("metadata payload exceeds v8 u32 limit"))?
+            .map_err(|_| head_value_error("metadata payload exceeds v11 u32 limit"))?
             .to_be_bytes(),
     );
     bytes.push(u8::from(value.columnar_base_coordinate.is_some()));
-    append_slot_payload(bytes, value.snapshot, fingerprint_inline);
-    append_slot_payload(bytes, value.metadata, fingerprint_inline);
+    bytes.extend_from_slice(
+        &u32::try_from(snapshot.len())
+            .map_err(|_| head_value_error("snapshot exceeds u32 limit"))?
+            .to_be_bytes(),
+    );
+    if let Some(metadata) = metadata.as_deref() {
+        bytes.extend_from_slice(metadata);
+    }
     match value.working_diff_baseline {
         WorkingDiffBaseline::BeforeAbsent {
             checkpoint_commit_id,
@@ -1795,6 +1744,7 @@ fn append_head_value_parts(
         bytes.extend_from_slice(&coordinate.group_index.to_be_bytes());
         bytes.extend_from_slice(&coordinate.row_index.to_be_bytes());
     }
+    bytes.extend_from_slice(&snapshot);
     debug_assert_eq!(bytes.len() - start, capacity);
     Ok(start..bytes.len())
 }
@@ -1808,37 +1758,10 @@ fn encode_working_diff_baseline_tag(baseline: WorkingDiffBaseline) -> u8 {
     }
 }
 
-fn encoded_slot_kind(slot: HeadSlotEncode<'_>, fingerprint_inline: bool) -> u8 {
-    match slot {
-        HeadSlotEncode::None => HEAD_SLOT_NONE,
-        HeadSlotEncode::Ref(_) => HEAD_SLOT_REF,
-        HeadSlotEncode::Inline { .. } if fingerprint_inline => HEAD_SLOT_INLINE_FINGERPRINTED,
-        HeadSlotEncode::Inline { .. } => HEAD_SLOT_INLINE,
-    }
-}
-
-fn encoded_slot_len(slot: HeadSlotEncode<'_>, fingerprint_inline: bool) -> usize {
-    match slot {
-        HeadSlotEncode::None => 0,
-        HeadSlotEncode::Ref(_) => JSON_REF_BYTES,
-        HeadSlotEncode::Inline { json, .. } if fingerprint_inline => {
-            JSON_REF_BYTES.saturating_add(json.len())
-        }
-        HeadSlotEncode::Inline { json, .. } => json.len(),
-    }
-}
-
-fn append_slot_payload(bytes: &mut Vec<u8>, slot: HeadSlotEncode<'_>, fingerprint_inline: bool) {
-    match slot {
-        HeadSlotEncode::None => {}
-        HeadSlotEncode::Ref(json_ref) => bytes.extend_from_slice(json_ref.as_hash_bytes()),
-        HeadSlotEncode::Inline { json_ref, json } if fingerprint_inline => {
-            let json_ref = json_ref.unwrap_or_else(|| JsonRef::for_content(json.as_bytes()));
-            bytes.extend_from_slice(json_ref.as_hash_bytes());
-            bytes.extend_from_slice(json.as_bytes());
-        }
-        HeadSlotEncode::Inline { json, .. } => bytes.extend_from_slice(json.as_bytes()),
-    }
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) fn encode_snapshot(row: &WasmTypedRow) -> Result<Vec<u8>, LixError> {
+    typed_wire::encode_native_row_payload(&row.schema_fingerprint, &row.row_pk, &row.row)
+        .map_err(|error| head_value_error(format!("cannot encode typed row payload: {error:?}")))
 }
 
 fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
@@ -1852,7 +1775,7 @@ fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
 
 fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     if bytes.len() < HEAD_VALUE_HEADER_BYTES {
-        return Err(head_value_error("row is shorter than the v8 fixed header"));
+        return Err(head_value_error("row is shorter than the fixed header"));
     }
     if bytes[0] != HEAD_VALUE_VERSION {
         return Err(head_value_error(&format!(
@@ -1860,40 +1783,39 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
             bytes[0]
         )));
     }
+    if bytes.len() < HEAD_VALUE_TYPED_HEADER_BYTES {
+        return Err(head_value_error("row is shorter than the v11 fixed header"));
+    }
+    let header_bytes = HEAD_VALUE_TYPED_HEADER_BYTES;
     let flags = bytes[1];
-    let snapshot_kind = (flags >> HEAD_VALUE_SNAPSHOT_SHIFT) & HEAD_VALUE_SLOT_MASK;
-    let metadata_kind = (flags >> HEAD_VALUE_METADATA_SHIFT) & HEAD_VALUE_SLOT_MASK;
     let change_uuid = uuid_from_head_bytes(&bytes[2..18], "change id")?;
     let commit_uuid = uuid_from_head_bytes(&bytes[18..34], "commit id")?;
     let created_at = LixTimestamp::from_packed(read_u64(&bytes[34..42], "created_at")?)
         .map_err(|error| head_value_error(&format!("invalid created_at: {error}")))?;
     let updated_at = LixTimestamp::from_packed(read_u64(&bytes[42..50], "updated_at")?)
         .map_err(|error| head_value_error(&format!("invalid updated_at: {error}")))?;
-    let snapshot_len = usize::try_from(read_u32(&bytes[50..54], "snapshot length")?)
-        .map_err(|_| head_value_error("snapshot length exceeds usize"))?;
-    let metadata_len = usize::try_from(read_u32(&bytes[54..58], "metadata length")?)
+    let metadata_len = usize::try_from(read_u32(&bytes[50..54], "metadata length")?)
         .map_err(|_| head_value_error("metadata length exceeds usize"))?;
-    let has_columnar_base_coordinate = match bytes[58] {
+    let has_columnar_base_coordinate = match bytes[54] {
         0 => false,
         1 => true,
         _ => return Err(head_value_error("invalid columnar base-coordinate tag")),
     };
-    let snapshot_end = HEAD_VALUE_HEADER_BYTES
-        .checked_add(snapshot_len)
-        .ok_or_else(|| head_value_error("snapshot payload length overflow"))?;
-    let metadata_end = snapshot_end
+    let typed_len = usize::try_from(read_u32(&bytes[55..59], "typed payload length")?)
+        .map_err(|_| head_value_error("typed payload length exceeds usize"))?;
+    let metadata_end = header_bytes
         .checked_add(metadata_len)
         .ok_or_else(|| head_value_error("metadata payload length overflow"))?;
-    let snapshot = decode_slot(
-        snapshot_kind,
-        &bytes[HEAD_VALUE_HEADER_BYTES..snapshot_end],
-        "snapshot",
-    )?;
-    let metadata = decode_slot(
-        metadata_kind,
-        &bytes[snapshot_end..metadata_end],
-        "metadata",
-    )?;
+    let metadata = if metadata_len == 0 {
+        None
+    } else {
+        let metadata = bytes
+            .get(header_bytes..metadata_end)
+            .ok_or_else(|| head_value_error("metadata payload is truncated"))?;
+        lix_schema::validate_binary(metadata)
+            .map_err(|error| head_value_error(&format!("invalid JSONB metadata: {error}")))?;
+        Some(metadata)
+    };
     let baseline_tag = (flags >> HEAD_VALUE_WORKING_DIFF_SHIFT) & HEAD_VALUE_WORKING_DIFF_MASK;
     let mut baseline_offset = metadata_end;
     let working_diff_baseline = match baseline_tag {
@@ -1939,6 +1861,19 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     } else {
         None
     };
+    let typed_end = baseline_offset
+        .checked_add(typed_len)
+        .ok_or_else(|| head_value_error("typed payload length overflow"))?;
+    let snapshot = if typed_len == 0 {
+        None
+    } else {
+        Some(
+            bytes
+                .get(baseline_offset..typed_end)
+                .ok_or_else(|| head_value_error("typed payload is truncated"))?,
+        )
+    };
+    baseline_offset = typed_end;
     if baseline_offset != bytes.len() {
         return Err(head_value_error(
             "row payload lengths do not match the buffer",
@@ -1946,9 +1881,14 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     }
     let deleted = flags & HEAD_VALUE_DELETED != 0;
     let untracked = flags & HEAD_VALUE_UNTRACKED != 0;
-    if deleted && (snapshot != HeadSlotView::None || metadata != HeadSlotView::None) {
+    if deleted != snapshot.is_none() {
         return Err(head_value_error(
-            "deleted current-state rows must not carry JSON payloads",
+            "live current-state rows require exactly one typed payload and deletes require none",
+        ));
+    }
+    if deleted && (metadata.is_some() || snapshot.is_some()) {
+        return Err(head_value_error(
+            "deleted current-state rows must not carry payloads",
         ));
     }
     let (change_id, commit_id) = if untracked {
@@ -1991,7 +1931,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         deleted,
         created_at,
         updated_at,
-        snapshot,
+        snapshot: snapshot,
         metadata,
         payload_slots_materialized: true,
         columnar_base_coordinate,
@@ -2018,7 +1958,7 @@ fn take_head_bytes<'a>(
 fn uuid_from_head_bytes(bytes: &[u8], field: &str) -> Result<uuid::Uuid, LixError> {
     let bytes: [u8; UUID_BYTES] = bytes.try_into().map_err(|_| {
         head_value_error(&format!(
-            "{field} must have {UUID_BYTES} bytes in the v8 header"
+            "{field} must have {UUID_BYTES} bytes in the v11 header"
         ))
     })?;
     Ok(uuid::Uuid::from_bytes(bytes))
@@ -2038,53 +1978,6 @@ fn read_u32(bytes: &[u8], field: &str) -> Result<u32, LixError> {
     Ok(u32::from_be_bytes(bytes))
 }
 
-fn decode_slot<'a>(kind: u8, bytes: &'a [u8], field: &str) -> Result<HeadSlotView<'a>, LixError> {
-    match kind {
-        HEAD_SLOT_NONE if bytes.is_empty() => Ok(HeadSlotView::None),
-        HEAD_SLOT_NONE => Err(head_value_error(&format!(
-            "{field} none slot must have an empty payload"
-        ))),
-        HEAD_SLOT_REF if bytes.len() == JSON_REF_BYTES => {
-            let hash: [u8; JSON_REF_BYTES] = bytes.try_into().map_err(|_| {
-                head_value_error(&format!(
-                    "{field} ref payload must have {JSON_REF_BYTES} bytes"
-                ))
-            })?;
-            Ok(HeadSlotView::Ref(JsonRef::from_hash_bytes(hash)))
-        }
-        HEAD_SLOT_REF => Err(head_value_error(&format!(
-            "{field} ref payload must have {JSON_REF_BYTES} bytes"
-        ))),
-        HEAD_SLOT_INLINE => std::str::from_utf8(bytes)
-            .map(HeadSlotView::Inline)
-            .map_err(|error| {
-                head_value_error(&format!("{field} inline payload is not UTF-8: {error}"))
-            }),
-        HEAD_SLOT_INLINE_FINGERPRINTED if bytes.len() >= JSON_REF_BYTES => {
-            let (hash, json) = bytes.split_at(JSON_REF_BYTES);
-            let hash: [u8; JSON_REF_BYTES] = hash.try_into().map_err(|_| {
-                head_value_error(&format!(
-                    "{field} inline fingerprint must have {JSON_REF_BYTES} bytes"
-                ))
-            })?;
-            std::str::from_utf8(json)
-                .map(|json| HeadSlotView::InlineFingerprinted {
-                    json_ref: JsonRef::from_hash_bytes(hash),
-                    json,
-                })
-                .map_err(|error| {
-                    head_value_error(&format!("{field} inline payload is not UTF-8: {error}"))
-                })
-        }
-        HEAD_SLOT_INLINE_FINGERPRINTED => Err(head_value_error(&format!(
-            "{field} inline payload is shorter than its {JSON_REF_BYTES}-byte fingerprint"
-        ))),
-        _ => Err(head_value_error(&format!(
-            "{field} has an unknown slot kind {kind}"
-        ))),
-    }
-}
-
 fn head_value_error(message: impl std::fmt::Display) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
@@ -2092,19 +1985,11 @@ fn head_value_error(message: impl std::fmt::Display) -> LixError {
     )
 }
 
-#[derive(Clone, Copy)]
-enum DeferredJsonField {
-    Snapshot,
-    Metadata,
-}
-
-struct DeferredJson {
-    row_index: usize,
-    field: DeferredJsonField,
-    json_ref: JsonRef,
-}
-
 trait LiveMaterializationIdentity {
+    fn schema_key(&self) -> &str;
+
+    fn row_pk(&self) -> &RowPk;
+
     #[allow(clippy::too_many_arguments)]
     fn push_materialized(
         self,
@@ -2123,6 +2008,14 @@ trait LiveMaterializationIdentity {
 }
 
 impl LiveMaterializationIdentity for HeadRowIdentity {
+    fn schema_key(&self) -> &str {
+        &self.schema_key
+    }
+
+    fn row_pk(&self) -> &RowPk {
+        &self.row_pk
+    }
+
     fn push_materialized(
         self,
         rows: &mut MaterializedHotStateBatchBuilder,
@@ -2156,6 +2049,14 @@ impl LiveMaterializationIdentity for HeadRowIdentity {
 }
 
 impl LiveMaterializationIdentity for TrackedStateKeyRef<'_> {
+    fn schema_key(&self) -> &str {
+        self.schema_key
+    }
+
+    fn row_pk(&self) -> &RowPk {
+        self.row_pk
+    }
+
     fn push_materialized(
         self,
         rows: &mut MaterializedHotStateBatchBuilder,
@@ -2188,12 +2089,9 @@ impl LiveMaterializationIdentity for TrackedStateKeyRef<'_> {
     }
 }
 
-/// Builds serving rows directly from a V5 hot-row value. Inline JSON remains a
-/// range over the immutable head-value buffer, while out-of-band JSON retains
-/// the `JsonStore` buffer. There is no per-row payload `String` or intermediate
-/// `HeadValue`/`MaterializedTrackedStateRow` staging layer.
+/// Builds serving rows directly from a hot-row value.
 async fn materialize_live_entries<I>(
-    store: &(impl StorageAdapterRead + ?Sized),
+    _store: &(impl StorageAdapterRead + ?Sized),
     entries: Vec<(I, Bytes)>,
     projection: ChangeRecordProjection,
     branch_id: &str,
@@ -2203,30 +2101,50 @@ where
     I: LiveMaterializationIdentity,
 {
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
-    let mut json_refs = Vec::new();
-    let mut deferred = Vec::new();
     let mut rows = MaterializedHotStateBatchBuilder::with_capacity(entries.len());
     for (identity, bytes) in entries {
         let value = decode_head_value(&bytes)?;
+        let decoded_snapshot = if projection.snapshot_content || projection.snapshot {
+            value
+                .snapshot
+                .map(|payload| {
+                    WasmTypedRow::decode_durable_payload(
+                        Arc::from(payload),
+                        identity.schema_key(),
+                        identity.row_pk(),
+                    )
+                })
+                .transpose()?
+                .map(Arc::new)
+        } else {
+            None
+        };
+        let raw_snapshot = if projection.raw_snapshot {
+            value.snapshot.map(|payload| bytes.slice_ref(payload))
+        } else {
+            None
+        };
         let row_index = rows.len();
-        let snapshot_content = materialize_live_slot(
-            !value.deleted && projection.snapshot_content,
-            &bytes,
-            value.snapshot,
-            &mut json_refs,
-            &mut deferred,
-            row_index,
-            DeferredJsonField::Snapshot,
-        );
-        let metadata = materialize_live_slot(
-            !value.deleted && projection.metadata,
-            &bytes,
-            value.metadata,
-            &mut json_refs,
-            &mut deferred,
-            row_index,
-            DeferredJsonField::Metadata,
-        );
+        let snapshot_content = if !value.deleted && projection.snapshot_content {
+            decoded_snapshot
+                .as_deref()
+                .map(WasmTypedRow::to_json_shared)
+                .transpose()?
+        } else {
+            None
+        };
+        let metadata = if !value.deleted && projection.metadata {
+            value
+                .metadata
+                .map(lix_schema::binary_to_json_string)
+                .transpose()
+                .map_err(|error| {
+                    head_value_error(&format!("cannot decode JSONB metadata: {error}"))
+                })?
+                .map(SharedStr::from)
+        } else {
+            None
+        };
         identity.push_materialized(
             &mut rows,
             snapshot_content,
@@ -2243,82 +2161,21 @@ where
         if let Some(coordinate) = value.columnar_base_coordinate {
             rows.set_columnar_base_coordinate(row_index, coordinate);
         }
+        if decoded_snapshot.is_some() {
+            rows.set_decoded_snapshot(row_index, decoded_snapshot);
+        }
+        if raw_snapshot.is_some() {
+            rows.set_raw_snapshot(row_index, raw_snapshot);
+        }
         rows.set_durable_predecessor(row_index, CertifiedCurrentStatePredecessor::Encoded(bytes));
     }
-    if json_refs.is_empty() {
-        return Ok(rows.finish());
-    }
-    let mut json_reader = JsonStoreContext::new().reader(store);
-    let mut json_values = json_reader
-        .load_bytes_many(JsonLoadRequestRef {
-            refs: &json_refs,
-            scope: JsonReadScopeRef::OutOfBand,
-        })
-        .await?
-        .into_values();
-    for (index, deferred) in deferred.into_iter().enumerate() {
-        let bytes = json_values
-            .get_mut(index)
-            .ok_or_else(|| head_value_error("lost an out-of-band JSON value index"))?
-            .take()
-            .ok_or_else(|| {
-                head_value_error(&format!(
-                    "row is missing JSON payload '{}'",
-                    deferred.json_ref.to_hex()
-                ))
-            })?;
-        let json = SharedStr::from_utf8(bytes).map_err(|error| {
-            head_value_error(&format!("out-of-band JSON payload is not UTF-8: {error}"))
-        })?;
-        match deferred.field {
-            DeferredJsonField::Snapshot => {
-                rows.set_snapshot_content(deferred.row_index, json);
-            }
-            DeferredJsonField::Metadata => rows.set_metadata(deferred.row_index, json),
-        }
-    }
     Ok(rows.finish())
-}
-
-fn materialize_live_slot(
-    include: bool,
-    owner: &Bytes,
-    slot: HeadSlotView<'_>,
-    json_refs: &mut Vec<JsonRef>,
-    deferred: &mut Vec<DeferredJson>,
-    row_index: usize,
-    field: DeferredJsonField,
-) -> Option<SharedStr> {
-    if !include {
-        return None;
-    }
-    match slot {
-        HeadSlotView::None => None,
-        HeadSlotView::Inline(json) | HeadSlotView::InlineFingerprinted { json, .. } => {
-            #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_hot_scan_value_handle_clone();
-            Some(
-                SharedStr::from_utf8_slice(owner.clone(), json)
-                    .expect("decoded inline JSON points into its head-value buffer"),
-            )
-        }
-        HeadSlotView::Ref(json_ref) => {
-            json_refs.push(json_ref);
-            deferred.push(DeferredJson {
-                row_index,
-                field,
-                json_ref,
-            });
-            None
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::branch::{BranchHeadControl, stage_branch_head_control};
-    use crate::json_store::{JsonWritePlacementRef, NormalizedJsonRef};
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     async fn scan_test_space(
@@ -2341,6 +2198,11 @@ mod tests {
         LixTimestamp::expect_parse("test timestamp", value)
     }
 
+    fn typed_row(row_pk: &RowPk, snapshot: &str) -> WasmTypedRow {
+        let value = serde_json::from_str(snapshot).expect("test snapshot should parse");
+        WasmTypedRow::from_test_json_unchecked(row_pk, &value).expect("test snapshot should type")
+    }
+
     fn identity(branch_id: &str, generation: CommitId, row: &str) -> HeadIdentity {
         HeadIdentity {
             branch_id: branch_id.to_string(),
@@ -2352,6 +2214,11 @@ mod tests {
     }
 
     fn head_value(change: &str, commit_id: CommitId) -> HeadValue {
+        let row_pk = RowPk::single("row");
+        let snapshot = typed_row(&row_pk, "{\"value\":true}")
+            .durable_payload()
+            .expect("typed payload")
+            .to_vec();
         HeadValue {
             change_id: Some(ChangeId::for_test_label(change)),
             commit_id: Some(commit_id),
@@ -2359,8 +2226,8 @@ mod tests {
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
-            snapshot: JsonSlot::from_json("{\"value\":true}"),
-            metadata: JsonSlot::None,
+            snapshot: Some(snapshot),
+            metadata: None,
             columnar_base_coordinate: None,
         }
     }
@@ -2401,8 +2268,12 @@ mod tests {
             deleted,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts(updated_at),
-            snapshot: JsonSlotRef::Inline(snapshot),
-            metadata: metadata.map_or(JsonSlotRef::None, JsonSlotRef::Inline),
+            snapshot: Some(snapshot),
+            metadata: metadata.map(|metadata| {
+                lix_schema::Jsonb::from_value(
+                    serde_json::from_str(metadata).expect("test metadata should parse"),
+                )
+            }),
         }
     }
 
@@ -2483,8 +2354,10 @@ mod tests {
     }
 
     #[test]
-    fn v8_value_codec_roundtrips_clean_inline_ref_and_base_coordinate() {
-        let snapshot_ref = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
+    fn v10_value_codec_roundtrips_clean_inline_ref_and_base_coordinate() {
+        let metadata = lix_schema::Jsonb::from_value(serde_json::json!({"source": "test"}));
+        let typed = typed_row(&RowPk::single("row"), "{\"snapshot\":true}");
+        let snapshot = typed.durable_payload().expect("typed payload");
         let columnar_base_coordinate = ColumnarBaseCoordinate {
             base_commit_id: CommitId::for_test_label("columnar-base"),
             group_index: 17,
@@ -2497,22 +2370,16 @@ mod tests {
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
-            snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
-            metadata: JsonSlotRef::Ref(&snapshot_ref),
+            snapshot: Some(snapshot.as_ref()),
+            metadata: Some(&metadata),
             columnar_base_coordinate: Some(columnar_base_coordinate),
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
 
-        let bytes = encode_head_value(&value).expect("encode v8 row");
+        let bytes = encode_head_value(&value).expect("encode v10 row");
         assert_eq!(bytes[0], HEAD_VALUE_VERSION);
-        assert_eq!(
-            bytes.len(),
-            HEAD_VALUE_HEADER_BYTES
-                + "{\"snapshot\":true}".len()
-                + JSON_REF_BYTES
-                + COLUMNAR_BASE_COORDINATE_BYTES
-        );
-        let decoded = decode_head_value(&bytes).expect("decode v8 row");
+        assert!(bytes.len() > HEAD_VALUE_TYPED_HEADER_BYTES);
+        let decoded = decode_head_value(&bytes).expect("decode v10 row");
         assert_eq!(decoded.change_id, value.change_id);
         assert_eq!(decoded.commit_id, value.commit_id);
         assert_eq!(decoded.created_at, value.created_at);
@@ -2521,15 +2388,85 @@ mod tests {
             decoded.columnar_base_coordinate,
             Some(columnar_base_coordinate)
         );
+        assert!(decoded.snapshot.is_some());
         assert_eq!(
-            decoded.snapshot,
-            HeadSlotView::Inline("{\"snapshot\":true}")
+            lix_schema::binary_to_json_string(decoded.metadata.expect("metadata"))
+                .expect("decode metadata"),
+            r#"{"source":"test"}"#
         );
-        assert_eq!(decoded.metadata, HeadSlotView::Ref(snapshot_ref));
+    }
+
+    #[test]
+    fn typed_value_codec_roundtrips_fingerprinted_native_row() {
+        let typed = WasmTypedRow {
+            schema_fingerprint: [9; 32],
+            row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+            row: lix_schema::Row::from([("value".to_owned(), lix_schema::Value::Int8(42))]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        };
+        let snapshot = typed.durable_payload().expect("typed payload");
+        let value = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("typed-change")),
+            commit_id: Some(CommitId::for_test_label("typed-commit")),
+            untracked: false,
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            snapshot: Some(snapshot.as_ref()),
+            metadata: None,
+            columnar_base_coordinate: None,
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        };
+
+        let bytes = encode_head_value(&value).expect("encode typed row");
+        assert_eq!(bytes[0], HEAD_VALUE_VERSION);
+        assert!(bytes.len() > HEAD_VALUE_TYPED_HEADER_BYTES);
+        let decoded = decode_head_value(&bytes).expect("decode typed row");
+        let decoded_typed = WasmTypedRow::decode_durable_payload(
+            Arc::from(
+                decoded
+                    .snapshot
+                    .expect("typed row payload should be present"),
+            ),
+            "test_schema",
+            &RowPk::single("row-1"),
+        )
+        .expect("decode native typed row payload against its durable envelope");
+        assert_eq!(decoded_typed, typed);
+    }
+
+    #[test]
+    fn v9_rows_are_rejected_without_a_compatibility_reader() {
+        let typed = typed_row(&RowPk::single("row"), "{\"value\":true}");
+        let snapshot = typed.durable_payload().expect("typed payload");
+        let value = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("hard-cut-change")),
+            commit_id: Some(CommitId::for_test_label("hard-cut-commit")),
+            untracked: false,
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            snapshot: Some(snapshot.as_ref()),
+            metadata: None,
+            columnar_base_coordinate: None,
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        };
+        let mut bytes = encode_head_value(&value).expect("encode hard-cut row");
+        bytes[0] = 9;
+        let error = decode_head_value(&bytes).expect_err("v9 rows must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported row format version 9")
+        );
     }
 
     #[test]
     fn materialized_inline_fields_share_the_head_value_buffer() {
+        let typed = typed_row(&RowPk::single("row"), "{\"snapshot\":true}");
+        let snapshot = typed.durable_payload().expect("typed payload");
+        let native_metadata = lix_schema::Jsonb::from_value(serde_json::json!({"source": "test"}));
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("shared-fields-change")),
             commit_id: Some(CommitId::for_test_label("shared-fields-commit")),
@@ -2537,45 +2474,22 @@ mod tests {
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
-            snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
-            metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
+            snapshot: Some(snapshot.as_ref()),
+            metadata: Some(&native_metadata),
             columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
-        let bytes = Bytes::from(encode_head_value(&value).expect("encode v8 row"));
-        let decoded = decode_head_value(&bytes).expect("decode v8 row");
-        let mut json_refs = Vec::new();
-        let mut deferred = Vec::new();
-        let snapshot = materialize_live_slot(
-            true,
-            &bytes,
-            decoded.snapshot,
-            &mut json_refs,
-            &mut deferred,
-            0,
-            DeferredJsonField::Snapshot,
-        )
-        .expect("snapshot view");
-        let metadata = materialize_live_slot(
-            true,
-            &bytes,
-            decoded.metadata,
-            &mut json_refs,
-            &mut deferred,
-            0,
-            DeferredJsonField::Metadata,
-        )
-        .expect("metadata view");
-
-        assert!(snapshot.shares_buffer_with(&metadata));
-        assert_eq!(snapshot.retained_buffer_len(), bytes.len());
-        assert_eq!(metadata.retained_buffer_len(), bytes.len());
-        assert!(json_refs.is_empty());
-        assert!(deferred.is_empty());
+        let bytes = Bytes::from(encode_head_value(&value).expect("encode v10 row"));
+        let decoded = decode_head_value(&bytes).expect("decode v10 row");
+        assert_eq!(
+            lix_schema::binary_to_json_string(decoded.metadata.expect("metadata"))
+                .expect("decode metadata"),
+            r#"{"source":"test"}"#
+        );
     }
 
     #[test]
-    fn v8_value_codec_embeds_a_checkpoint_owned_tracked_first_before_baseline() {
+    fn v10_value_codec_embeds_a_checkpoint_owned_tracked_first_before_baseline() {
         let checkpoint_commit_id = CommitId::for_test_label("baseline-checkpoint");
         let baseline = WorkingDiffVersion {
             change_id: ChangeId::for_test_label("before-change"),
@@ -2592,6 +2506,8 @@ mod tests {
                 hash: [0; JSON_REF_BYTES],
             },
         };
+        let typed = typed_row(&RowPk::single("row"), "{\"current\":true}");
+        let snapshot = typed.durable_payload().expect("typed payload");
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("current-change")),
             commit_id: Some(CommitId::for_test_label("current-commit")),
@@ -2599,8 +2515,8 @@ mod tests {
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
-            snapshot: JsonSlotRef::Inline("{\"current\":true}"),
-            metadata: JsonSlotRef::None,
+            snapshot: Some(snapshot.as_ref()),
+            metadata: None,
             columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::BeforePresent {
                 checkpoint_commit_id,
@@ -2608,16 +2524,14 @@ mod tests {
             },
         };
 
-        let bytes = encode_head_value(&value).expect("encode v8 row with baseline");
-        assert_eq!(
-            bytes.len(),
-            HEAD_VALUE_HEADER_BYTES
-                + JSON_REF_BYTES
-                + "{\"current\":true}".len()
-                + WORKING_DIFF_CHECKPOINT_BYTES
-                + WORKING_DIFF_VERSION_BYTES
+        let bytes = encode_head_value(&value).expect("encode v10 row with baseline");
+        assert!(
+            bytes.len()
+                > HEAD_VALUE_TYPED_HEADER_BYTES
+                    + WORKING_DIFF_CHECKPOINT_BYTES
+                    + WORKING_DIFF_VERSION_BYTES
         );
-        let decoded = decode_head_value(&bytes).expect("decode v8 row with baseline");
+        let decoded = decode_head_value(&bytes).expect("decode v10 row with baseline");
         assert_eq!(
             decoded.working_diff_baseline,
             WorkingDiffBaseline::BeforePresent {
@@ -3202,8 +3116,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     updated_at: ts("2026-01-01T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"value\":\"one\"}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"value\":\"one\"}"),
+                    metadata: None,
                 }],
                 &BTreeSet::new(),
                 None,
@@ -3256,8 +3170,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     updated_at: ts("2026-01-02T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"value\":\"two\"}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"value\":\"two\"}"),
+                    metadata: None,
                 }],
                 &BTreeSet::new(),
                 None,
@@ -3336,8 +3250,17 @@ mod tests {
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
-            snapshot: JsonSlotRef::Inline("{\"value\":\"two\"}"),
-            metadata: JsonSlotRef::None,
+            snapshot: Some("{\"value\":\"two\"}"),
+            metadata: None,
+        };
+        let selected_json =
+            serde_json::from_str(r#"{"value":"two"}"#).expect("selected snapshot should parse");
+        let selected_typed = WasmTypedRow::from_test_json_unchecked(&row_pk, &selected_json)
+            .expect("selected snapshot should type");
+        let selected_payload = selected_typed.durable_payload().expect("typed payload");
+        let selected_current = CurrentStateDeltaRef {
+            snapshot: Some(selected_payload.as_ref()),
+            ..selected.as_current()
         };
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
@@ -3345,7 +3268,7 @@ mod tests {
                 branch_id,
                 checkpoint,
                 no_op_checkpoint,
-                &[selected.as_current()],
+                &[selected_current],
                 &BTreeSet::new(),
                 no_op_checkpoint,
                 &mut no_op_coverage,
@@ -3491,8 +3414,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     updated_at: ts("2026-01-03T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"value\":\"three\"}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"value\":\"three\"}"),
+                    metadata: None,
                 }],
                 &BTreeSet::new(),
                 None,
@@ -3653,20 +3576,10 @@ mod tests {
         };
         let snapshot_content = r#"{"snapshot":true}"#;
         let long_metadata = format!("\"{}\"", "x".repeat(300));
+        let native_metadata = lix_schema::Jsonb::from_value(
+            serde_json::from_str(&long_metadata).expect("metadata should parse"),
+        );
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
-        let refs = json_writer
-            .stage_batch(
-                &mut writes,
-                JsonWritePlacementRef::OutOfBand,
-                [
-                    NormalizedJsonRef::new(snapshot_content),
-                    NormalizedJsonRef::new(&long_metadata),
-                ],
-            )
-            .expect("stage out-of-band JSON");
-        let snapshot_ref = refs[0];
-        let metadata_ref = refs[1];
         let row_identity = identity(branch_id, generation, "row");
         stage_put(
             &mut writes,
@@ -3678,8 +3591,11 @@ mod tests {
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-02T00:00:00Z"),
-                snapshot: JsonSlot::Ref(snapshot_ref),
-                metadata: JsonSlot::Ref(metadata_ref),
+                snapshot: Some(
+                    encode_snapshot(&typed_row(&row_identity.row_pk, snapshot_content))
+                        .expect("typed payload"),
+                ),
+                metadata: Some(native_metadata),
                 columnar_base_coordinate: None,
             },
         )
@@ -3694,8 +3610,8 @@ mod tests {
                 deleted: true,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-02T00:00:00Z"),
-                snapshot: JsonSlot::None,
-                metadata: JsonSlot::None,
+                snapshot: None,
+                metadata: None,
                 columnar_base_coordinate: None,
             },
         )
@@ -3847,8 +3763,14 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     updated_at: ts("2026-01-01T00:00:00Z"),
-                    snapshot: JsonSlot::from_json(&format!(r#"{{"row":"{row}"}}"#)),
-                    metadata: JsonSlot::None,
+                    snapshot: Some(
+                        encode_snapshot(&typed_row(
+                            &identity.row_pk,
+                            &format!(r#"{{"row":"{row}"}}"#),
+                        ))
+                        .expect("typed payload"),
+                    ),
+                    metadata: None,
                     columnar_base_coordinate: None,
                 },
             )
@@ -3907,8 +3829,8 @@ mod tests {
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-01T00:00:00Z"),
-                snapshot: JsonSlotRef::Inline("{\"value\":\"none\"}"),
-                metadata: JsonSlotRef::None,
+                snapshot: Some("{\"value\":\"none\"}"),
+                metadata: None,
             },
             TrackedHeadDeltaRef {
                 schema_key: "schema",
@@ -3919,8 +3841,8 @@ mod tests {
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-01T00:00:00Z"),
-                snapshot: JsonSlotRef::Inline("{\"value\":\"a\"}"),
-                metadata: JsonSlotRef::None,
+                snapshot: Some("{\"value\":\"a\"}"),
+                metadata: None,
             },
             TrackedHeadDeltaRef {
                 schema_key: "schema",
@@ -3931,8 +3853,8 @@ mod tests {
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-01T00:00:00Z"),
-                snapshot: JsonSlotRef::Inline("{\"value\":\"b\"}"),
-                metadata: JsonSlotRef::None,
+                snapshot: Some("{\"value\":\"b\"}"),
+                metadata: None,
             },
             TrackedHeadDeltaRef {
                 schema_key: "schema",
@@ -3943,8 +3865,8 @@ mod tests {
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-01T00:00:00Z"),
-                snapshot: JsonSlotRef::Inline("{\"value\":\"second-b\"}"),
-                metadata: JsonSlotRef::None,
+                snapshot: Some("{\"value\":\"second-b\"}"),
+                metadata: None,
             },
         ];
         let read = storage
@@ -4281,8 +4203,11 @@ mod tests {
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:01Z"),
-            snapshot: JsonSlot::from_json("{\"id\":\"row\"}"),
-            metadata: JsonSlot::None,
+            snapshot: Some(
+                encode_snapshot(&typed_row(&identity.row_pk, "{\"id\":\"row\"}"))
+                    .expect("typed payload"),
+            ),
+            metadata: None,
             columnar_base_coordinate: None,
         };
         let mut writes = StorageWriteSet::new();
@@ -4359,8 +4284,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     updated_at: ts("2026-01-01T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"value\":1}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"value\":1}"),
+                    metadata: None,
                 }],
                 &BTreeSet::new(),
                 None,
@@ -4393,8 +4318,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-02T00:00:00Z"),
                     updated_at: ts("2026-01-02T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"value\":2}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"value\":2}"),
+                    metadata: None,
                 }],
                 &BTreeSet::new(),
                 None,
@@ -4489,8 +4414,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-02T00:00:00Z"),
                     updated_at: ts("2026-01-02T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"value\":2}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"value\":2}"),
+                    metadata: None,
                 }],
                 &BTreeSet::new(),
                 None,
@@ -4651,8 +4576,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-02T00:00:00Z"),
                     updated_at: ts("2026-01-02T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"value\":2}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"value\":2}"),
+                    metadata: None,
                 }],
                 &BTreeSet::new(),
                 None,
@@ -4743,8 +4668,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-02T00:00:00Z"),
                     updated_at: ts("2026-01-02T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"value\":2}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"value\":2}"),
+                    metadata: None,
                 }],
                 &absence_guards,
                 None,
@@ -4786,8 +4711,8 @@ mod tests {
                         deleted: false,
                         created_at: ts("2026-01-01T00:00:00Z"),
                         updated_at: ts("2026-01-01T00:00:00Z"),
-                        snapshot: JsonSlotRef::Inline("{\"name\":\"a\"}"),
-                        metadata: JsonSlotRef::None,
+                        snapshot: Some("{\"name\":\"a\"}"),
+                        metadata: None,
                     },
                     TrackedHeadDeltaRef {
                         schema_key: "semantic",
@@ -4798,8 +4723,8 @@ mod tests {
                         deleted: false,
                         created_at: ts("2026-01-01T00:00:00Z"),
                         updated_at: ts("2026-01-01T00:00:00Z"),
-                        snapshot: JsonSlotRef::Inline("{\"value\":1}"),
-                        metadata: JsonSlotRef::None,
+                        snapshot: Some("{\"value\":1}"),
+                        metadata: None,
                     },
                     TrackedHeadDeltaRef {
                         schema_key: "semantic",
@@ -4810,8 +4735,8 @@ mod tests {
                         deleted: false,
                         created_at: ts("2026-01-01T00:00:00Z"),
                         updated_at: ts("2026-01-01T00:00:00Z"),
-                        snapshot: JsonSlotRef::Inline("{\"value\":2}"),
-                        metadata: JsonSlotRef::None,
+                        snapshot: Some("{\"value\":2}"),
+                        metadata: None,
                     },
                 ],
                 &BTreeSet::new(),
@@ -4845,8 +4770,8 @@ mod tests {
                     deleted: true,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     updated_at: ts("2026-01-02T00:00:00Z"),
-                    snapshot: JsonSlotRef::None,
-                    metadata: JsonSlotRef::None,
+                    snapshot: None,
+                    metadata: None,
                 }],
                 &BTreeSet::new(),
                 None,
@@ -4906,8 +4831,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-03T00:00:00Z"),
                     updated_at: ts("2026-01-03T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"name\":\"a\"}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"name\":\"a\"}"),
+                    metadata: None,
                 }],
                 &BTreeSet::new(),
                 None,
@@ -4952,8 +4877,8 @@ mod tests {
         let mut tombstone = head_value("first-delete", generation);
         tombstone.deleted = true;
         tombstone.updated_at = ts("2026-01-02T00:00:00Z");
-        tombstone.snapshot = JsonSlot::None;
-        tombstone.metadata = JsonSlot::None;
+        tombstone.snapshot = None;
+        tombstone.metadata = None;
         let mut writes = StorageWriteSet::new();
         stage_put(&mut writes, &identity, &tombstone).expect("stage existing tombstone");
         stage_test_current_control(&mut writes, branch_id, generation, generation, None)
@@ -4988,8 +4913,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-03T00:00:00Z"),
                     updated_at: ts("2026-01-03T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"value\":2}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"value\":2}"),
+                    metadata: None,
                 }],
                 &absence_guards,
                 None,
@@ -5033,11 +4958,13 @@ mod tests {
         let row_pk = RowPk::single("row");
         let parent_head = CommitId::for_test_label("parent-head");
         let child_head = CommitId::for_test_label("child-head");
+        let parent_typed = Arc::new(typed_row(&row_pk, "{\"value\":1}"));
         let parent_rows = vec![MaterializedTrackedStateRow {
             row_pk: row_pk.clone(),
             schema_key: "schema".to_string(),
             file_id: None,
-            snapshot_content: Some("{\"value\":1}".into()),
+            snapshot_content: None,
+            decoded_snapshot: Some(parent_typed),
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
@@ -5065,8 +4992,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-02T00:00:00Z"),
                     updated_at: ts("2026-01-02T00:00:00Z"),
-                    snapshot: JsonSlotRef::Inline("{\"value\":2}"),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some("{\"value\":2}"),
+                    metadata: None,
                 }],
                 &BTreeSet::new(),
                 Some(parent_rows),

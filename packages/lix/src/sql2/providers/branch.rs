@@ -944,19 +944,13 @@ fn parse_snapshot(
     row: MaterializedHotStateRowRef<'_>,
     schema_key: &str,
 ) -> Result<JsonValue, LixError> {
-    let snapshot_content = row
-        .snapshot_content()
-        .map(|content| content.as_str())
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("{schema_key} row is missing snapshot_content"),
-            )
-        })?;
-    serde_json::from_str(snapshot_content).map_err(|error| {
+    if let Some(typed) = row.decoded_snapshot() {
+        return typed.to_json_value();
+    }
+    row.snapshot_json_value()?.ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("{schema_key} snapshot_content is invalid JSON: {error}"),
+            format!("{schema_key} row is missing snapshot"),
         )
     })
 }

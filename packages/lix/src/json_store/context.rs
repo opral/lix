@@ -19,47 +19,24 @@ impl JsonStoreContext {
         Self
     }
 
-    #[expect(clippy::unused_self)]
-    pub(crate) fn reader<S>(&self, store: S) -> JsonStoreReader<S>
+    /// Protocol-v68 migrations still need to resolve retired out-of-band JSON
+    /// references even though protocol-v69 live rows never create them.
+    pub(crate) async fn load_bytes_many<S>(
+        &self,
+        store: &S,
+        request: JsonLoadRequestRef<'_>,
+    ) -> Result<JsonLoadBatch, LixError>
     where
-        S: StorageAdapterRead,
+        S: StorageAdapterRead + ?Sized,
     {
-        JsonStoreReader { store }
+        store::load_json_bytes_many_in_scope(store, request.refs, request.scope)
+            .await
+            .map(JsonLoadBatch::new)
     }
 
     #[expect(clippy::unused_self)]
     pub(crate) fn writer(&self) -> JsonStoreWriter {
         JsonStoreWriter::new()
-    }
-}
-
-pub(crate) struct JsonStoreReader<S> {
-    store: S,
-}
-
-impl<S> Clone for JsonStoreReader<S>
-where
-    S: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            store: self.store.clone(),
-        }
-    }
-}
-
-impl<S> JsonStoreReader<S>
-where
-    S: StorageAdapterRead,
-{
-    #[expect(clippy::needless_pass_by_ref_mut)]
-    pub(crate) async fn load_bytes_many(
-        &mut self,
-        request: JsonLoadRequestRef<'_>,
-    ) -> Result<JsonLoadBatch, LixError> {
-        store::load_json_bytes_many_in_scope(&self.store, request.refs, request.scope)
-            .await
-            .map(JsonLoadBatch::new)
     }
 }
 
@@ -229,9 +206,8 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let mut reader = JsonStoreContext::new().reader(read);
-        let loaded = reader
-            .load_bytes_many(JsonLoadRequestRef {
+        let loaded = JsonStoreContext::new()
+            .load_bytes_many(&read, JsonLoadRequestRef {
                 refs: &refs,
                 scope: JsonReadScopeRef::OutOfBand,
             })

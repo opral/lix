@@ -90,7 +90,7 @@ zip = { version = "8", default-features = false }
 # unconditional; they cost build time on a bench-only invocation but cannot
 # change what a bench measures, since nothing loads them without `sdk-tests`.
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
-plugin_conversation = { path = "../../plugins/conversation", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+test_plugin_column_merger = { path = "fixtures/column-merger", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_excalidraw = { path = "../../plugins/excalidraw", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_markdown = { path = "../../plugins/markdown", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
@@ -384,12 +384,6 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
-name = "branch_checkpoint_retirement"
-path = "benches/branch_checkpoint_retirement.rs"
-harness = false
-required-features = ["storage-benches", "slatedb"]
-
-[[bench]]
 name = "branch_storage_sharing"
 path = "benches/branch_storage_sharing.rs"
 harness = false
@@ -514,11 +508,6 @@ required-features = ["plugin-tests"]
 name = "server_protocol_plugin_convergence"
 path = "tests/server_protocol_plugin_convergence.rs"
 required-features = ["plugin-tests", "server-protocol"]
-
-[[test]]
-name = "untracked_plugin_cold_open_bench"
-path = "tests/untracked_plugin_cold_open_bench.rs"
-required-features = ["sdk-tests", "storage-benches", "slatedb"]
 
 [[example]]
 name = "branch_merge_benchmark"

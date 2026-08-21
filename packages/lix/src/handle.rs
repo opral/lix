@@ -1135,6 +1135,7 @@ where
         close_result?;
         Ok(())
     }
+
 }
 
 #[expect(missing_debug_implementations)]

@@ -69,7 +69,7 @@ pub(crate) struct BranchHeadControlCache {
 /// rebuilt from canonical records on any change, never an authority.
 #[derive(Debug, Default)]
 pub(crate) struct GlobalKeyValueRowCache {
-    entries: StdMutex<Vec<(BranchHeadControl, String, Option<MaterializedHotStateRow>)>>,
+    entries: StdMutex<Vec<(BranchHeadControl, String, Option<serde_json::Value>)>>,
 }
 
 const GLOBAL_KEY_VALUE_ROW_CACHE_MAX_ENTRIES: usize = 8;
@@ -79,7 +79,7 @@ impl GlobalKeyValueRowCache {
         &self,
         control: BranchHeadControl,
         key: &str,
-    ) -> Option<Option<MaterializedHotStateRow>> {
+    ) -> Option<Option<serde_json::Value>> {
         let entries = self
             .entries
             .lock()
@@ -94,7 +94,7 @@ impl GlobalKeyValueRowCache {
         &self,
         control: BranchHeadControl,
         key: &str,
-        row: Option<MaterializedHotStateRow>,
+        row: Option<serde_json::Value>,
     ) {
         let mut entries = self
             .entries
@@ -137,6 +137,65 @@ struct RowColumnarLayoutCache {
     // execution, so a tiny vector keeps the synchronization and bookkeeping
     // cost below that of a second index.
     entries: StdMutex<Vec<std::sync::Arc<CachedRowColumnarLayout>>>,
+}
+
+const EXCLUSIVE_CERTIFIED_BATCH_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExclusiveCertifiedBatchCacheKey {
+    branch_id: String,
+    head_commit_id: CommitId,
+    generation: CommitId,
+    current_state_revision: u64,
+    schema_key: String,
+}
+
+#[derive(Debug)]
+struct ExclusiveCertifiedBatchCacheEntry {
+    key: ExclusiveCertifiedBatchCacheKey,
+    batch: std::sync::Arc<crate::tracked_state::EnvelopeCertifiedNativeProjectionBatch>,
+}
+
+#[derive(Debug, Default)]
+struct ExclusiveCertifiedBatchCache {
+    entry: StdMutex<Option<ExclusiveCertifiedBatchCacheEntry>>,
+}
+
+impl ExclusiveCertifiedBatchCache {
+    fn get(
+        &self,
+        key: &ExclusiveCertifiedBatchCacheKey,
+    ) -> Option<std::sync::Arc<crate::tracked_state::EnvelopeCertifiedNativeProjectionBatch>> {
+        let batch = self
+            .entry
+            .lock()
+            .expect("exclusive certified batch cache lock poisoned")
+            .as_ref()
+            .filter(|entry| entry.key == *key)
+            .map(|entry| std::sync::Arc::clone(&entry.batch));
+        if let Some(batch) = &batch {
+            batch.mark_reused();
+        }
+        batch
+    }
+
+    fn insert(
+        &self,
+        key: ExclusiveCertifiedBatchCacheKey,
+        batch: &std::sync::Arc<crate::tracked_state::EnvelopeCertifiedNativeProjectionBatch>,
+    ) {
+        if batch.cache_weight() > EXCLUSIVE_CERTIFIED_BATCH_CACHE_MAX_BYTES {
+            return;
+        }
+        *self
+            .entry
+            .lock()
+            .expect("exclusive certified batch cache lock poisoned") =
+            Some(ExclusiveCertifiedBatchCacheEntry {
+                key,
+                batch: std::sync::Arc::clone(batch),
+            });
+    }
 }
 
 impl RowColumnarLayoutCache {
@@ -252,6 +311,7 @@ fn estimated_row_columnar_layout_bytes(
                     row.row_pk
                         .estimated_heap_bytes()
                         .saturating_add(row.snapshot_content.as_ref().map_or(0, Bytes::len))
+                        .saturating_add(row.raw_snapshot.as_ref().map_or(0, Bytes::len))
                 })
                 .sum(),
         )
@@ -267,6 +327,7 @@ pub(crate) struct HotStateContext {
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
     row_columnar_layout_cache: std::sync::Arc<RowColumnarLayoutCache>,
+    exclusive_certified_batch_cache: std::sync::Arc<ExclusiveCertifiedBatchCache>,
     row_columnar_scan_cache:
         std::sync::Arc<std::sync::Mutex<crate::hot_state::RowColumnarShadowMaskCache>>,
     row_decoded_column_cache: crate::hot_state::RowDecodedColumnCache,
@@ -292,6 +353,7 @@ impl HotStateContext {
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
             row_columnar_layout_cache: std::sync::Arc::new(RowColumnarLayoutCache::default()),
+            exclusive_certified_batch_cache: std::sync::Arc::default(),
             row_columnar_scan_cache: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::hot_state::RowColumnarShadowMaskCache::with_array_budget(
                     std::sync::Arc::clone(&row_columnar_array_budget),
@@ -326,6 +388,9 @@ impl HotStateContext {
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             row_columnar_layout_cache: std::sync::Arc::clone(&self.row_columnar_layout_cache),
+            exclusive_certified_batch_cache: std::sync::Arc::clone(
+                &self.exclusive_certified_batch_cache,
+            ),
             branch_head_control_cache: None,
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
@@ -347,6 +412,9 @@ impl HotStateContext {
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             row_columnar_layout_cache: std::sync::Arc::clone(&self.row_columnar_layout_cache),
+            exclusive_certified_batch_cache: std::sync::Arc::clone(
+                &self.exclusive_certified_batch_cache,
+            ),
             branch_head_control_cache: Some(branch_head_control_cache),
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
@@ -378,6 +446,9 @@ impl HotStateContext {
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             row_columnar_layout_cache: std::sync::Arc::new(RowColumnarLayoutCache::default()),
+            exclusive_certified_batch_cache: std::sync::Arc::clone(
+                &self.exclusive_certified_batch_cache,
+            ),
             branch_head_control_cache: None,
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
         }
@@ -401,6 +472,7 @@ pub(crate) struct HotStateContextReader<S> {
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
     row_columnar_layout_cache: std::sync::Arc<RowColumnarLayoutCache>,
+    exclusive_certified_batch_cache: std::sync::Arc<ExclusiveCertifiedBatchCache>,
     branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
     root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
 }
@@ -429,38 +501,8 @@ where
             .await
     }
 
-    /// Returns raw current-state snapshot bytes for one current SQL row scan.
-    ///
-    /// `None` means the normal materialized visibility path remains
-    /// authoritative: a global branch projection, multiple result branch
-    /// scopes, or commit-derived state all require its full visibility
-    /// semantics.
-    pub(crate) async fn scan_direct_row_snapshots(
-        &self,
-        request: &HotStateScanRequest,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        let Some((requested_branch_id, requested_control, schema_key)) =
-            self.direct_row_snapshot_scope(request).await?
-        else {
-            return Ok(None);
-        };
-        let snapshots = self
-            .tracked_head
-            .reader(&self.store)
-            .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
-            .scan_row_snapshots(
-                &requested_branch_id,
-                requested_control,
-                &schema_key,
-                &request.filter.row_pks,
-                request.limit,
-            )
-            .await?;
-        Ok(Some(snapshots))
-    }
-
     /// Returns committed row identities under the same narrow visibility
-    /// proof as [`Self::scan_direct_row_snapshots`].  The packed reader
+    /// proof as [`Self::scan_direct_row_snapshots`]. The packed reader
     /// still resolves the authoritative current rows; callers may avoid JSON
     /// decoding only when their projected SQL fields are exact key components.
     pub(crate) async fn scan_direct_row_primary_keys(
@@ -484,6 +526,55 @@ where
             )
             .await
             .map(Some)
+    }
+
+    pub(crate) async fn scan_direct_row_snapshots(
+        &self,
+        request: &HotStateScanRequest,
+    ) -> Result<Option<crate::tracked_state::ExclusiveRowSnapshotBatch>, LixError> {
+        let Some((branch_id, control, schema_key)) =
+            self.direct_row_snapshot_scope(request).await?
+        else {
+            return Ok(None);
+        };
+        if !request.filter.row_pks.is_empty() {
+            let rows = self
+                .tracked_head
+                .reader(&self.store)
+                .scan_native_row_snapshots(
+                    &branch_id,
+                    control,
+                    &schema_key,
+                    &request.filter.row_pks,
+                    request.limit,
+                )
+                .await?;
+            return Ok(Some(crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(
+                rows,
+            )));
+        }
+        let key = ExclusiveCertifiedBatchCacheKey {
+            branch_id: branch_id.clone(),
+            head_commit_id: control.head_commit_id,
+            generation: control.tracked_generation,
+            current_state_revision: control.current_state_revision,
+            schema_key: schema_key.clone(),
+        };
+        if let Some(batch) = self.exclusive_certified_batch_cache.get(&key) {
+            return Ok(Some(
+                crate::tracked_state::ExclusiveRowSnapshotBatch::CertifiedNative(batch),
+            ));
+        }
+        let rows = self
+            .tracked_head
+            .reader(&self.store)
+            .scan_exclusive_row_snapshots(&branch_id, control, &schema_key)
+            .await?;
+        if let Some(crate::tracked_state::ExclusiveRowSnapshotBatch::CertifiedNative(batch)) = &rows
+        {
+            self.exclusive_certified_batch_cache.insert(key, batch);
+        }
+        Ok(rows)
     }
 
     pub(crate) async fn plan_direct_row_columnar_scan(
@@ -563,27 +654,6 @@ where
             control.current_state_revision,
             layout.live_count,
         )))
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn row_columnar_overlay_len_for_test(
-        &self,
-        branch_id: &str,
-        schema_key: &str,
-    ) -> Result<Option<usize>, LixError> {
-        let Some(control) = BranchHeadControlContext::new()
-            .reader(&self.store)
-            .load(branch_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-        Ok(self
-            .tracked_head
-            .reader(&self.store)
-            .row_columnar_layout(branch_id, control, schema_key)
-            .await?
-            .map(|(_, _, overlay, _)| overlay.len()))
     }
 
     async fn direct_row_snapshot_scope(
@@ -1789,6 +1859,8 @@ async fn load_branch_head_control_ids(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::NullableKeyFilter;
     use crate::changelog::{
@@ -1800,6 +1872,7 @@ mod tests {
         HotStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
     };
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+    use crate::plugin::runtime::WasmTypedRow;
     use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
@@ -1845,8 +1918,8 @@ mod tests {
         let hit = cache
             .get(&columnar_cache_key(7))
             .expect("same revision should hit");
-        assert!(std::sync::Arc::ptr_eq(&inserted, &hit));
-        assert!(std::sync::Arc::ptr_eq(&inserted.overlay, &hit.overlay));
+        assert!(Arc::ptr_eq(&inserted, &hit));
+        assert!(Arc::ptr_eq(&inserted.overlay, &hit.overlay));
     }
 
     #[test]
@@ -1949,8 +2022,8 @@ mod tests {
                     deleted: false,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     updated_at: ts("2026-01-01T00:00:00Z"),
-                    snapshot: crate::json_store::JsonSlotRef::Inline(snapshot),
-                    metadata: crate::json_store::JsonSlotRef::None,
+                    snapshot: Some(snapshot),
+                    metadata: None,
                 }],
                 &std::collections::BTreeSet::new(),
                 None,
@@ -1997,11 +2070,8 @@ mod tests {
                 deleted: row.deleted,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-01T00:00:00Z"),
-                snapshot: row.snapshot.map_or(
-                    crate::json_store::JsonSlotRef::None,
-                    crate::json_store::JsonSlotRef::Inline,
-                ),
-                metadata: crate::json_store::JsonSlotRef::None,
+                snapshot: row.snapshot,
+                metadata: None,
             })
             .collect::<Vec<_>>();
         TrackedHeadContext::new()
@@ -2164,7 +2234,7 @@ mod tests {
         branch_id: &str,
         schema_key: &str,
         row_pks: &[RowPk],
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+    ) -> Result<Option<crate::tracked_state::ExclusiveRowSnapshotBatch>, LixError> {
         hot_state
             .reader(
                 storage
@@ -2379,16 +2449,34 @@ mod tests {
         .await
         .expect("exact tracked row scan should execute")
         .expect("tracked-only exact row scan should use direct snapshots");
+        let crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(snapshots) = snapshots else {
+            panic!("an exact primary-key scan should return raw native payloads");
+        };
         assert_eq!(
             snapshots
                 .iter()
-                .map(|snapshot| snapshot
-                    .as_deref()
-                    .and_then(|bytes| std::str::from_utf8(bytes).ok()))
+                .map(|(row_pk, payload)| {
+                    let decoded = WasmTypedRow::decode_durable_payload(
+                        Arc::from(payload.as_ref()),
+                        schema_key,
+                        row_pk,
+                    )
+                    .expect("direct snapshot must be a valid native payload");
+                    (
+                        row_pk.clone().into_parts(),
+                        decoded.row.get("value").cloned(),
+                    )
+                })
                 .collect::<Vec<_>>(),
             vec![
-                Some(r#"{"id":"first","value":"one"}"#),
-                Some(r#"{"id":"second","value":"two"}"#),
+                (
+                    vec!["first".to_string()],
+                    Some(lix_schema::Value::Text("one".to_string())),
+                ),
+                (
+                    vec!["second".to_string()],
+                    Some(lix_schema::Value::Text("two".to_string())),
+                ),
             ]
         );
     }
@@ -2734,18 +2822,6 @@ mod tests {
                 );
                 continue;
             }
-            if let Some(snapshot) = row.snapshot_content.as_deref() {
-                json_writer
-                    .stage_batch(
-                        &mut writes,
-                        JsonWritePlacementRef::OutOfBand,
-                        [NormalizedJsonRef::trusted_prehashed(
-                            snapshot,
-                            JsonRef::for_content(snapshot.as_bytes()),
-                        )],
-                    )
-                    .expect("untracked snapshot should stage");
-            }
             if let Some(metadata) = row.metadata.as_deref() {
                 json_writer
                     .stage_batch(
@@ -2798,19 +2874,28 @@ mod tests {
             let snapshots = branch_rows
                 .iter()
                 .map(|row| {
-                    row.snapshot_content.as_deref().map_or(
-                        crate::json_store::JsonSlot::None,
-                        crate::json_store::JsonSlot::from_json,
-                    )
+                    row.snapshot_content.as_deref().map(|snapshot| {
+                        let value = serde_json::from_str(snapshot)
+                            .expect("test current-state snapshot should parse");
+                        WasmTypedRow::from_builtin_json(&row.schema_key, &row.row_pk, &value)
+                            .or_else(|_| {
+                                WasmTypedRow::from_test_json_unchecked(&row.row_pk, &value)
+                            })
+                            .expect("test current-state snapshot should type")
+                            .durable_payload()
+                            .expect("test current-state snapshot should encode")
+                            .to_vec()
+                    })
                 })
                 .collect::<Vec<_>>();
             let metadata = branch_rows
                 .iter()
                 .map(|row| {
-                    row.metadata.as_deref().map_or(
-                        crate::json_store::JsonSlot::None,
-                        crate::json_store::JsonSlot::from_json,
-                    )
+                    row.metadata.as_deref().map(|metadata| {
+                        lix_schema::Jsonb::from_value(
+                            serde_json::from_str(metadata).expect("test metadata should parse"),
+                        )
+                    })
                 })
                 .collect::<Vec<_>>();
             let deltas = branch_rows
@@ -2827,8 +2912,8 @@ mod tests {
                     deleted: row.deleted,
                     created_at: ts(&row.created_at),
                     updated_at: ts(&row.updated_at),
-                    snapshot: snapshot.as_ref_slot(),
-                    metadata: metadata.as_ref_slot(),
+                    snapshot: snapshot.as_deref(),
+                    metadata: metadata.as_ref(),
                     columnar_base_coordinate: None,
                 })
                 .collect::<Vec<_>>();
@@ -2847,7 +2932,6 @@ mod tests {
                     &deltas,
                     &std::collections::BTreeSet::new(),
                     Some(parent_rows),
-                    None,
                     None,
                     &mut working_diff_coverage,
                 )
@@ -2881,19 +2965,28 @@ mod tests {
             let snapshots = branch_rows
                 .iter()
                 .map(|row| {
-                    row.snapshot_content.as_deref().map_or(
-                        crate::json_store::JsonSlot::None,
-                        crate::json_store::JsonSlot::from_json,
-                    )
+                    row.snapshot_content.as_deref().map(|snapshot| {
+                        let value = serde_json::from_str(snapshot)
+                            .expect("test current-state snapshot should parse");
+                        WasmTypedRow::from_builtin_json(&row.schema_key, &row.row_pk, &value)
+                            .or_else(|_| {
+                                WasmTypedRow::from_test_json_unchecked(&row.row_pk, &value)
+                            })
+                            .expect("test current-state snapshot should type")
+                            .durable_payload()
+                            .expect("test current-state snapshot should encode")
+                            .to_vec()
+                    })
                 })
                 .collect::<Vec<_>>();
             let metadata = branch_rows
                 .iter()
                 .map(|row| {
-                    row.metadata.as_deref().map_or(
-                        crate::json_store::JsonSlot::None,
-                        crate::json_store::JsonSlot::from_json,
-                    )
+                    row.metadata.as_deref().map(|metadata| {
+                        lix_schema::Jsonb::from_value(
+                            serde_json::from_str(metadata).expect("test metadata should parse"),
+                        )
+                    })
                 })
                 .collect::<Vec<_>>();
             let deltas = branch_rows
@@ -2910,8 +3003,8 @@ mod tests {
                     deleted: row.deleted,
                     created_at: ts(&row.created_at),
                     updated_at: ts(&row.updated_at),
-                    snapshot: snapshot.as_ref_slot(),
-                    metadata: metadata.as_ref_slot(),
+                    snapshot: snapshot.as_deref(),
+                    metadata: metadata.as_ref(),
                     columnar_base_coordinate: None,
                 })
                 .collect::<Vec<_>>();
@@ -2924,7 +3017,6 @@ mod tests {
                     control.head_commit_id,
                     &deltas,
                     &std::collections::BTreeSet::new(),
-                    None,
                     None,
                     None,
                     &mut working_diff_coverage,
@@ -3411,8 +3503,8 @@ mod tests {
                 .zip(&root_deltas)
                 .map(|((change, _, _), delta)| TrackedStateCommitDeltaRef {
                     delta: *delta,
-                    snapshot: change.snapshot.as_ref_slot(),
-                    metadata: change.metadata.as_ref_slot(),
+                    metadata: change.metadata.as_ref(),
+                    snapshot: change.snapshot.as_deref(),
                     origin_key: change.origin_key.as_deref(),
                     base_coordinate: None,
                     authored: true,
@@ -3453,16 +3545,6 @@ mod tests {
         json_writer: &mut crate::json_store::JsonStoreWriter,
         row: &MaterializedTrackedStateRow,
     ) -> Result<(), LixError> {
-        if let Some(snapshot) = row.snapshot_content.as_deref() {
-            json_writer.stage_batch(
-                writes,
-                JsonWritePlacementRef::OutOfBand,
-                [NormalizedJsonRef::trusted_prehashed(
-                    snapshot,
-                    JsonRef::for_content(snapshot.as_bytes()),
-                )],
-            )?;
-        }
         if let Some(metadata) = row.metadata.as_ref() {
             let serialized = crate::serialize_row_metadata(metadata);
             json_writer.stage_batch(

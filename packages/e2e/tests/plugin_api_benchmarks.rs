@@ -5,6 +5,8 @@
 //! worktree and an API-refactor worktree; each worktree supplies its own plugin
 //! components and manifests through Cargo artifact dependencies.
 
+#![recursion_limit = "512"]
+
 #[allow(dead_code)]
 mod benchmark_metrics;
 

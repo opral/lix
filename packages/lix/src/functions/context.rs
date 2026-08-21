@@ -131,11 +131,11 @@ fn deterministic_sequence_change_id(highest_seen: i64) -> ChangeId {
 mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
-    use crate::row_pk::RowPk;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};
     use crate::hot_state::HotStateContext;
     use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext};
+    use crate::row_pk::RowPk;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
@@ -289,7 +289,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let sequence = load_sequence(&read, None).await.expect("sequence should load");
+        let sequence = load_sequence(&read, None)
+            .await
+            .expect("sequence should load");
         assert_eq!(sequence, DeterministicSequence { highest_seen: 0 });
 
         // Deterministic mode must stamp the bookkeeping row from the
@@ -365,7 +367,17 @@ mod tests {
             .await
             .expect("global branch control should load")
             .expect("global branch control should exist");
-        let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
+        let snapshot_value: serde_json::Value =
+            serde_json::from_str(&snapshot_content).expect("snapshot should parse");
+        let decoded_snapshot = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+            "lix_key_value",
+            &row_pk,
+            &snapshot_value,
+        )
+        .expect("key-value snapshot should type");
+        let snapshot = decoded_snapshot
+            .durable_payload_ref()
+            .expect("typed payload");
         let mut next_control = control
             .next_current_state_revision()
             .expect("global control revision should advance");
@@ -384,8 +396,8 @@ mod tests {
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
-                    snapshot: snapshot.as_ref_slot(),
-                    metadata: crate::json_store::JsonSlotRef::None,
+                    snapshot: Some(snapshot),
+                    metadata: None,
                     columnar_base_coordinate: None,
                 }],
                 &std::collections::BTreeSet::new(),

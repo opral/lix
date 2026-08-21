@@ -16,8 +16,8 @@ resources. A localized byte edit can therefore produce sparse row changes,
 and a localized row change can produce sparse byte edits, without crossing
 the component boundary with the rest of the file.
 
-The current production contract is WIT package `lix:plugin@1.0.0` and packet format
-`packet-v1`. The public Rust authoring surface and canonical WIT copy live in
+The current production contract is WIT package `lix:plugin@2.0.0` and the
+single typed-page v2 format. The public Rust authoring surface and canonical WIT copy live in
 [`lix::plugin`](../../packages/lix/PLUGIN.md). The engine and
 Rust SDK retain package-local WIT mirrors for generated host bindings; CI
 enforces byte-for-byte parity so every published crate remains self-contained.

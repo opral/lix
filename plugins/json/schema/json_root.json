@@ -1,7 +1,7 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "json_root",
-  "description": "The stable root node of one JSON document. Scalar JSON is stored as text so durable snapshots remain number-free.",
+  "description": "The stable root node of one JSON document. Scalar JSON is stored as a native JSONB value.",
   "columns": [
     {
       "name": "empty_json",
@@ -29,9 +29,9 @@
     },
     {
       "name": "scalar_json",
-      "type": "text",
+      "type": "jsonb",
       "nullable": true,
-      "description": "The complete raw JSON scalar encoded as text. Omitted for object and array roots."
+      "description": "The JSON scalar value. Omitted for object and array roots."
     },
     {
       "name": "suffix_json",

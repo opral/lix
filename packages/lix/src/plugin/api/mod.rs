@@ -1,4 +1,4 @@
-//! Row-first authoring layer for Lix's Component API v1.
+//! Row-first authoring layer for Lix's Component API v2.
 
 #![allow(
     clippy::missing_errors_doc,
@@ -34,8 +34,10 @@ use self::combined_bindings::lix::plugin::types::{
     ParseChangesRequest as WitParseChangesRequest, ParseRequest as WitParseRequest, PluginError,
     SerializeChangesRequest as WitSerializeChangesRequest, SerializeRequest as WitSerializeRequest,
 };
-use super::wire::{Operation, Page as WirePage, Representation, encode_single_section};
+use super::wire::typed::{self, ChangeEffect as TypedChangeEffect, Mutation as TypedMutation};
+use std::collections::VecDeque;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -59,6 +61,22 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Schema v1 typed values used at the plugin boundary. JSONB values remain
+/// JSON values, but the surrounding row never becomes a JSON object.
+pub type TypedRow = lix_schema::Row;
+pub type TypedValue = lix_schema::Value;
+
+/// Computes the fingerprint carried by every typed-row page for one Schema v1
+/// definition. Plugins normally pass an embedded schema document here.
+pub fn schema_fingerprint(schema_json: &str) -> Result<[u8; 32]> {
+    let schema = lix_schema::from_json(schema_json)
+        .map_err(|error| Error::invalid_input(format!("invalid Schema v1 definition: {error}")))?;
+    Ok(*schema
+        .wire_fingerprint()
+        .map_err(|error| Error::invalid_input(format!("failed to fingerprint schema: {error}")))?
+        .as_bytes())
+}
 
 fn plugin_error(error: Error) -> PluginError {
     match error {
@@ -123,24 +141,22 @@ trait SnapshotHost {
 }
 
 trait RowSourceHost {
-    fn next_page(&self, max_bytes: u32) -> std::result::Result<Option<Vec<u8>>, CommonHostError>;
-    fn read_attachment(
+    fn next_page(
         &self,
-        ordinal: u32,
-        offset: u64,
-        length: u32,
-    ) -> std::result::Result<Option<Vec<u8>>, CommonHostError>;
+        max_bytes: u32,
+    ) -> std::result::Result<Option<(Vec<u8>, Vec<Vec<u8>>)>, CommonHostError>;
 }
 
 trait TransitionHost {
     fn max_batch_bytes(&self) -> u32;
     fn put_state(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), CommonHostError>;
     fn delete_state(&self, key: &[u8]) -> std::result::Result<(), CommonHostError>;
-    fn emit_rows(&self, payload: Vec<u8>) -> std::result::Result<(), CommonHostError>;
+    fn emit_rows(
+        &self,
+        payload: Vec<u8>,
+        attachments: Vec<Vec<u8>>,
+    ) -> std::result::Result<(), CommonHostError>;
     fn replace_all_rows(&self) -> std::result::Result<(), CommonHostError>;
-    fn begin_row_attachment(&self, length: u64) -> std::result::Result<u32, CommonHostError>;
-    fn write_row_attachment(&self, chunk: &[u8]) -> std::result::Result<(), CommonHostError>;
-    fn finish_row_attachment(&self) -> std::result::Result<(), CommonHostError>;
     fn emit_file_edit(
         &self,
         offset: u64,
@@ -156,7 +172,8 @@ trait TransitionHost {
 struct CommonColumnMergeMeta {
     ordinal: u32,
     schema_key: String,
-    row_pk: Vec<String>,
+    primary_key: Vec<Vec<u8>>,
+    schema_fingerprint: Vec<u8>,
     file_id: Option<String>,
     column: String,
     base_len: Option<u64>,
@@ -246,18 +263,9 @@ macro_rules! impl_projection_hosts {
             fn next_page(
                 &self,
                 max_bytes: u32,
-            ) -> std::result::Result<Option<Vec<u8>>, CommonHostError> {
+            ) -> std::result::Result<Option<(Vec<u8>, Vec<Vec<u8>>)>, CommonHostError> {
                 self.next_page(max_bytes)
-                    .map(|page| page.map(|page| page.payload))
-                    .map_err(map_host_error)
-            }
-            fn read_attachment(
-                &self,
-                ordinal: u32,
-                offset: u64,
-                length: u32,
-            ) -> std::result::Result<Option<Vec<u8>>, CommonHostError> {
-                self.read_attachment(ordinal, offset, length)
+                    .map(|page| page.map(|page| (page.payload, page.attachments)))
                     .map_err(map_host_error)
             }
         }
@@ -276,27 +284,19 @@ macro_rules! impl_projection_hosts {
             fn delete_state(&self, key: &[u8]) -> std::result::Result<(), CommonHostError> {
                 self.delete_state(key).map_err(map_host_error)
             }
-            fn emit_rows(&self, payload: Vec<u8>) -> std::result::Result<(), CommonHostError> {
-                self.emit_rows(&$bindings::lix::plugin::host::RowPage { payload })
-                    .map_err(map_host_error)
+            fn emit_rows(
+                &self,
+                payload: Vec<u8>,
+                attachments: Vec<Vec<u8>>,
+            ) -> std::result::Result<(), CommonHostError> {
+                self.emit_rows(&$bindings::lix::plugin::host::RowPage {
+                    payload,
+                    attachments,
+                })
+                .map_err(map_host_error)
             }
             fn replace_all_rows(&self) -> std::result::Result<(), CommonHostError> {
                 self.replace_all_rows().map_err(map_host_error)
-            }
-            fn begin_row_attachment(
-                &self,
-                length: u64,
-            ) -> std::result::Result<u32, CommonHostError> {
-                self.begin_row_attachment(length).map_err(map_host_error)
-            }
-            fn write_row_attachment(
-                &self,
-                chunk: &[u8],
-            ) -> std::result::Result<(), CommonHostError> {
-                self.write_row_attachment(chunk).map_err(map_host_error)
-            }
-            fn finish_row_attachment(&self) -> std::result::Result<(), CommonHostError> {
-                self.finish_row_attachment().map_err(map_host_error)
             }
             fn emit_file_edit(
                 &self,
@@ -369,7 +369,8 @@ macro_rules! impl_column_hosts {
                     .map(|meta| CommonColumnMergeMeta {
                         ordinal: meta.ordinal,
                         schema_key: meta.schema_key,
-                        row_pk: meta.row_pk,
+                        primary_key: meta.primary_key,
+                        schema_fingerprint: meta.schema_fingerprint,
                         file_id: meta.file_id,
                         column: meta.column,
                         base_len: meta.base_len,
@@ -452,14 +453,16 @@ impl CreateContext {
         bytes
     }
 
-    pub fn id(self, local_ref: u32) -> String {
+    /// Returns the deterministic UUID reserved for a transition-local create.
+    pub fn id(self, local_ref: u32) -> uuid::Uuid {
         let mut bytes = [0_u8; 16];
         bytes[..12].copy_from_slice(&self.namespace_bytes());
         bytes[12..].copy_from_slice(&local_ref.to_be_bytes());
-        uuid::Uuid::from_bytes(bytes).to_string()
+        uuid::Uuid::from_bytes(bytes)
     }
 }
 
+/// Immutable source for accepted file bytes and private plugin state.
 pub struct Snapshot<'a> {
     inner: &'a dyn SnapshotHost,
 }
@@ -571,13 +574,57 @@ impl Snapshot<'_> {
     }
 }
 
+struct TypedPageBuffer {
+    schema_key: String,
+    schema_fingerprint: [u8; 32],
+    columns: Vec<std::sync::Arc<str>>,
+    payload: Vec<u8>,
+    attachments: Vec<Vec<u8>>,
+    attachment_bytes: usize,
+    record_count: u32,
+}
+
+impl TypedPageBuffer {
+    fn new(schema_key: &str, schema_fingerprint: [u8; 32]) -> Self {
+        Self {
+            schema_key: schema_key.to_owned(),
+            schema_fingerprint,
+            columns: Vec::new(),
+            payload: Vec::new(),
+            attachments: Vec::new(),
+            attachment_bytes: 0,
+            record_count: 0,
+        }
+    }
+
+    fn begin(&mut self, row: Option<&TypedRow>) -> Result<()> {
+        self.columns = row.map_or_else(Vec::new, |row| row.shared_keys().cloned().collect());
+        self.payload = typed::begin_page_payload(&self.columns)
+            .map_err(|error| Error::invalid_input(format!("invalid typed row page: {error:?}")))?;
+        Ok(())
+    }
+
+    fn buffered_bytes(&self) -> Option<usize> {
+        super::wire::typed_page_overhead(&self.schema_key)
+            .ok()?
+            .checked_add(self.payload.len())?
+            .checked_add(self.attachment_bytes)?
+            .checked_add(
+                self.attachments
+                    .len()
+                    .checked_mul(typed::ATTACHMENT_TABLE_ENTRY_BYTES)?,
+            )
+    }
+}
+
 struct TransitionOutput<'a> {
     inner: &'a dyn TransitionHost,
     max_page_bytes: u32,
     max_batch_bytes: u32,
-    row_payload: Vec<u8>,
-    row_records: u32,
-    row_creates_only: Option<bool>,
+    typed_page_target_bytes: u32,
+    typed_pages: Vec<TypedPageBuffer>,
+    typed_active_page: Option<usize>,
+    coalesce_typed_schemas: bool,
 }
 
 impl std::fmt::Debug for TransitionOutput<'_> {
@@ -590,10 +637,18 @@ impl std::fmt::Debug for TransitionOutput<'_> {
 }
 
 impl<'a> TransitionOutput<'a> {
+    fn buffered_typed_bytes(&self) -> Option<usize> {
+        self.typed_pages.iter().try_fold(0usize, |total, page| {
+            total.checked_add(page.buffered_bytes()?)
+        })
+    }
+
     fn new(inner: &'a dyn TransitionHost) -> std::result::Result<Self, Error> {
         let max_page_bytes = inner.max_batch_bytes();
-        let snapshot_overhead = 24;
-        if max_page_bytes <= snapshot_overhead {
+        let page_overhead = super::wire::typed_page_overhead("")
+            .map_err(|error| Error::internal(format!("invalid typed page overhead: {error:?}")))?
+            as u32;
+        if max_page_bytes <= page_overhead {
             return Err(Error::limit_exceeded(
                 "max-batch-bytes cannot hold a row page".to_owned(),
             ));
@@ -601,14 +656,15 @@ impl<'a> TransitionOutput<'a> {
         Ok(TransitionOutput {
             inner,
             max_page_bytes,
-            max_batch_bytes: max_page_bytes - snapshot_overhead,
-            row_payload: Vec::with_capacity(
-                usize::try_from(max_page_bytes - snapshot_overhead)
-                    .expect("u32 fits usize")
-                    .min(64 * 1024),
-            ),
-            row_records: 0,
-            row_creates_only: None,
+            max_batch_bytes: max_page_bytes,
+            // Cold-file admission may raise the hard batch ceiling to carry
+            // one legitimately large record. Keep ordinary typed rows on the
+            // normal 1 MiB schedule so a large source file does not make the
+            // guest retain multi-megabyte aggregate page buffers.
+            typed_page_target_bytes: max_page_bytes.min(1024 * 1024),
+            typed_pages: Vec::new(),
+            typed_active_page: None,
+            coalesce_typed_schemas: false,
         })
     }
 
@@ -625,21 +681,21 @@ impl<'a> TransitionOutput<'a> {
     }
 
     fn replace_all_rows(&mut self) -> Result<()> {
-        self.flush_rows()?;
+        self.flush_typed_rows()?;
         self.inner
             .replace_all_rows()
             .map_err(|error| host_error("host rejected complete row replacement", error))
     }
 
     fn file_edit(&mut self, offset: u64, delete_len: u64, insert: &[u8]) -> Result<()> {
-        self.flush_rows()?;
+        self.flush_typed_rows()?;
         self.inner
             .emit_file_edit(offset, delete_len, insert)
             .map_err(|error| host_error("host rejected file edit", error))
     }
 
     pub fn replace_file(&mut self, bytes: &[u8]) -> Result<()> {
-        self.flush_rows()?;
+        self.flush_typed_rows()?;
         self.inner
             .begin_file_replacement(bytes.len() as u64)
             .map_err(|error| host_error("host rejected file replacement", error))?;
@@ -653,147 +709,247 @@ impl<'a> TransitionOutput<'a> {
             .map_err(|error| host_error("host rejected file replacement finish", error))
     }
 
-    /// Emits one typed mutation. The SDK owns record framing, bounded batching,
-    /// create-page separation, record counts, and final flushing.
-    pub fn row(&mut self, mutation: RowMutation<'_>) -> Result<()> {
-        let max_batch_bytes = self.max_batch_bytes as usize;
-        // Smaller durable pages keep later point reads bounded without exposing
-        // paging policy to authors. A single large record may still use the
-        // full host limit; only multi-record batching uses this target.
-        let target_page_bytes = max_batch_bytes.min(256 * 1024);
-        let oversized_snapshot = match mutation {
-            RowMutation::Create { snapshot, .. } | RowMutation::Upsert { snapshot, .. } => {
-                snapshot.len() > max_batch_bytes
-            }
-            RowMutation::Delete { .. } => false,
+    fn typed_row(
+        &mut self,
+        schema_key: &str,
+        schema_fingerprint: [u8; 32],
+        mutation: TypedMutation<'_>,
+    ) -> Result<()> {
+        let row = match &mutation {
+            TypedMutation::Create { row, .. } | TypedMutation::Upsert { row, .. } => Some(*row),
+            TypedMutation::Delete { .. } => None,
         };
-        if oversized_snapshot {
-            return self.emit_attached_row(mutation);
-        }
-
-        let start = self.row_payload.len();
-        let creates_only = encode_row_mutation(&mut self.row_payload, mutation, None)?;
-        if self.row_records > 0
-            && (self.row_payload.len() > target_page_bytes
-                || self.row_creates_only != Some(creates_only))
-        {
-            self.row_payload.truncate(start);
-            self.flush_rows()?;
-            let repeated = encode_row_mutation(&mut self.row_payload, mutation, None)?;
-            debug_assert_eq!(repeated, creates_only);
-        }
-        if self.row_payload.len() > max_batch_bytes {
-            self.row_payload.clear();
-            return self.emit_attached_row(mutation);
-        }
-        self.row_records = self
-            .row_records
-            .checked_add(1)
-            .ok_or_else(|| Error::limit_exceeded("row mutation count overflowed"))?;
-        self.row_creates_only = Some(creates_only);
-        Ok(())
-    }
-
-    fn emit_attached_row(&mut self, mutation: RowMutation<'_>) -> Result<()> {
-        self.flush_rows()?;
-        let snapshot = match mutation {
-            RowMutation::Create { snapshot, .. } | RowMutation::Upsert { snapshot, .. } => snapshot,
-            RowMutation::Delete { .. } => {
+        let page_index = if let Some(index) = self.typed_pages.iter().position(|page| {
+            page.schema_key == schema_key && page.schema_fingerprint == schema_fingerprint
+        }) {
+            index
+        } else {
+            if self.coalesce_typed_schemas && self.typed_pages.len() >= 16 {
                 return Err(Error::limit_exceeded(
-                    "one row key exceeds the host page limit",
+                    "schema-coalesced output exceeds 16 page buffers",
                 ));
             }
+            self.typed_pages
+                .push(TypedPageBuffer::new(schema_key, schema_fingerprint));
+            self.typed_pages.len() - 1
         };
-        let length = u64::try_from(snapshot.len())
-            .map_err(|_| Error::limit_exceeded("row snapshot exceeds u64"))?;
-        let ordinal = self
-            .inner
-            .begin_row_attachment(length)
-            .map_err(|error| host_error("host rejected row attachment", error))?;
-        for chunk in snapshot.chunks(self.max_page_bytes as usize) {
-            self.inner
-                .write_row_attachment(chunk)
-                .map_err(|error| host_error("host rejected row attachment chunk", error))?;
+        if let Some(active_page) = self.typed_active_page
+            && active_page != page_index
+            && !self.coalesce_typed_schemas
+        {
+            self.flush_typed_page(active_page)?;
         }
-        self.inner
-            .finish_row_attachment()
-            .map_err(|error| host_error("host rejected row attachment finish", error))?;
-        let creates_only =
-            encode_row_mutation(&mut self.row_payload, mutation, Some((ordinal, length)))?;
-        if self.row_payload.len() > self.max_batch_bytes as usize {
-            self.row_payload.clear();
-            return Err(Error::limit_exceeded(
-                "one row mutation metadata exceeds the host page limit",
-            ));
+        self.typed_active_page = Some(page_index);
+        // A delete-only page has no row from which to derive its canonical
+        // column layout. Finish it before the first complete row rather than
+        // retaining names on every record.
+        let must_flush = {
+            let page = &self.typed_pages[page_index];
+            let layout_changed = row.is_some_and(|row| {
+                row.len() != page.columns.len()
+                    || row
+                        .shared_keys()
+                        .zip(&page.columns)
+                        .any(|(actual, expected)| {
+                            !std::sync::Arc::ptr_eq(actual, expected) && actual != expected
+                        })
+            });
+            page.record_count == typed::MAX_RECORDS_PER_PAGE
+                || (page.record_count > 0 && layout_changed)
+        };
+        if must_flush {
+            self.flush_typed_page(page_index)?;
+            self.typed_active_page = Some(page_index);
         }
-        self.row_records = 1;
-        self.row_creates_only = Some(creates_only);
+        if self.typed_pages[page_index].record_count == 0 {
+            self.typed_pages[page_index].begin(row)?;
+        }
+
+        let buffered_records_before = if self.coalesce_typed_schemas {
+            self.typed_pages
+                .iter()
+                .map(|page| u64::from(page.record_count))
+                .sum::<u64>()
+        } else {
+            0
+        };
+        let (payload_checkpoint, attachment_checkpoint, attachment_bytes_checkpoint) = {
+            let page = &mut self.typed_pages[page_index];
+            let payload_checkpoint = page.payload.len();
+            let attachment_checkpoint = page.attachments.len();
+            let attachment_bytes_checkpoint = page.attachment_bytes;
+            if let Err(error) = typed::append_mutation(
+                &mut page.payload,
+                &mut page.attachments,
+                &mutation,
+                &page.columns,
+            ) {
+                page.payload.truncate(payload_checkpoint);
+                page.attachments.truncate(attachment_checkpoint);
+                return Err(Error::invalid_input(format!(
+                    "invalid typed row page: {error:?}"
+                )));
+            }
+            page.attachment_bytes = page.attachments[attachment_checkpoint..]
+                .iter()
+                .try_fold(attachment_bytes_checkpoint, |total, attachment| {
+                    total.checked_add(attachment.len())
+                })
+                .unwrap_or(usize::MAX);
+            page.record_count += 1;
+            (
+                payload_checkpoint,
+                attachment_checkpoint,
+                attachment_bytes_checkpoint,
+            )
+        };
+        let page_overfull = self.typed_pages[page_index]
+            .buffered_bytes()
+            .is_none_or(|bytes| bytes > self.typed_page_target_bytes as usize)
+            && self.typed_pages[page_index].record_count > 1;
+        let aggregate_overfull = self.coalesce_typed_schemas
+            && buffered_records_before > 0
+            && self
+                .buffered_typed_bytes()
+                .is_none_or(|bytes| bytes > self.typed_page_target_bytes as usize);
+        if page_overfull || aggregate_overfull {
+            let page = &mut self.typed_pages[page_index];
+            page.payload.truncate(payload_checkpoint);
+            page.attachments.truncate(attachment_checkpoint);
+            page.attachment_bytes = attachment_bytes_checkpoint;
+            page.record_count -= 1;
+            if aggregate_overfull {
+                self.flush_typed_rows()?;
+            } else {
+                self.flush_typed_page(page_index)?;
+            }
+            self.typed_active_page = Some(page_index);
+            let page = &mut self.typed_pages[page_index];
+            page.begin(row)?;
+            typed::append_mutation(
+                &mut page.payload,
+                &mut page.attachments,
+                &mutation,
+                &page.columns,
+            )
+            .map_err(|error| Error::invalid_input(format!("invalid typed row page: {error:?}")))?;
+            page.attachment_bytes = page
+                .attachments
+                .iter()
+                .try_fold(0usize, |total, attachment| {
+                    total.checked_add(attachment.len())
+                })
+                .ok_or_else(|| Error::limit_exceeded("typed row attachment bytes overflowed"))?;
+            page.record_count = 1;
+        }
         Ok(())
     }
 
-    fn flush_rows(&mut self) -> Result<()> {
-        if self.row_records == 0 {
+    fn flush_typed_page(&mut self, page_index: usize) -> Result<()> {
+        let page = &mut self.typed_pages[page_index];
+        if page.record_count == 0 {
             return Ok(());
         }
-        let payload = std::mem::replace(
-            &mut self.row_payload,
-            Vec::with_capacity((self.max_batch_bytes as usize).min(64 * 1024)),
-        );
-        let records = std::mem::take(&mut self.row_records);
-        self.row_creates_only = None;
-        let page = RowPage::snapshots(records, payload)?;
+        let payload = std::mem::take(&mut page.payload);
+        page.columns.clear();
+        let attachments = std::mem::take(&mut page.attachments);
+        page.attachment_bytes = 0;
+        let record_count = std::mem::take(&mut page.record_count);
+        let (page, attachments) = typed::finish_page_parts(
+            &page.schema_key,
+            &page.schema_fingerprint,
+            record_count,
+            payload,
+            attachments,
+        )
+        .map_err(|error| Error::invalid_input(format!("invalid typed row page: {error:?}")))?;
         self.inner
-            .emit_rows(page.payload)
-            .map_err(|error| host_error("host rejected row page", error))
+            .emit_rows(page, attachments)
+            .map_err(|error| host_error("host rejected typed row page", error))?;
+        if self.typed_active_page == Some(page_index) {
+            self.typed_active_page = None;
+        }
+        Ok(())
+    }
+
+    fn flush_typed_rows(&mut self) -> Result<()> {
+        for page_index in 0..self.typed_pages.len() {
+            self.flush_typed_page(page_index)?;
+        }
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<()> {
-        self.flush_rows()
+        self.flush_typed_rows()
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RowMutation<'a> {
-    Create {
-        schema_key: &'a str,
-        local_ref: u32,
-        snapshot: &'a [u8],
-    },
-    Upsert {
-        schema_key: &'a str,
-        row_pk: &'a [String],
-        snapshot: &'a [u8],
-        effect: ChangeEffect,
-    },
-    Delete {
-        schema_key: &'a str,
-        row_pk: &'a [String],
-    },
-}
-
-/// Complete rows produced by [`FileProjection::parse`] or the full-reparse
-/// fallback of [`FileProjection::parse_changes`].
+/// Complete rows produced by [`FileProjection::parse`] or cold reconciliation
+/// in [`FileProjection::parse_changes`].
 #[derive(Debug)]
 pub struct RowOutput<'output, 'host> {
     inner: &'output mut TransitionOutput<'host>,
 }
 
 impl RowOutput<'_, '_> {
-    pub fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> Result<()> {
-        self.inner.row(RowMutation::Create {
-            schema_key,
-            local_ref,
-            snapshot,
-        })
+    /// Groups initial complete rows into one bounded page stream per schema.
+    ///
+    /// This explicitly changes emission order from call order to first-seen
+    /// schema order and is therefore available only for initial complete-row
+    /// projections, whose output is a set. Sparse change streams retain exact
+    /// guest order. At most sixteen schema buffers may be active.
+    pub fn coalesce_schema_pages(&mut self) -> Result<()> {
+        if self
+            .inner
+            .typed_pages
+            .iter()
+            .any(|page| page.record_count > 0)
+        {
+            return Err(Error::invalid_input(
+                "schema page coalescing must be enabled before emitting rows",
+            ));
+        }
+        self.inner.coalesce_typed_schemas = true;
+        Ok(())
     }
 
-    pub fn upsert(&mut self, schema_key: &str, row_pk: &[String], snapshot: &[u8]) -> Result<()> {
-        self.inner.row(RowMutation::Upsert {
+    pub fn create(
+        &mut self,
+        schema_key: &str,
+        schema_fingerprint: [u8; 32],
+        local_ref: u32,
+        row: &TypedRow,
+    ) -> Result<()> {
+        self.inner.typed_row(
             schema_key,
-            row_pk,
-            snapshot,
-            effect: ChangeEffect::Content,
-        })
+            schema_fingerprint,
+            TypedMutation::Create { local_ref, row },
+        )
+    }
+
+    pub fn upsert(
+        &mut self,
+        schema_key: &str,
+        schema_fingerprint: [u8; 32],
+        primary_key: Vec<TypedValue>,
+        row: &TypedRow,
+    ) -> Result<()> {
+        self.inner.typed_row(
+            schema_key,
+            schema_fingerprint,
+            TypedMutation::Upsert {
+                row_pk: &primary_key,
+                row,
+                effect: TypedChangeEffect::Content,
+            },
+        )
+    }
+
+    /// Emits the currently buffered typed rows as one page. This is useful for
+    /// large, single-schema outputs that need a tighter guest-memory bound than
+    /// the host's maximum page size.
+    pub fn flush_page(&mut self) -> Result<()> {
+        self.inner.flush_typed_rows()
     }
 
     pub fn put_state(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -812,31 +968,60 @@ pub struct RowChangeOutput<'output, 'host> {
 }
 
 impl<'host> RowChangeOutput<'_, 'host> {
-    pub fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> Result<()> {
-        self.inner.row(RowMutation::Create {
+    pub fn create(
+        &mut self,
+        schema_key: &str,
+        schema_fingerprint: [u8; 32],
+        local_ref: u32,
+        row: &TypedRow,
+    ) -> Result<()> {
+        self.inner.typed_row(
             schema_key,
-            local_ref,
-            snapshot,
-        })
+            schema_fingerprint,
+            TypedMutation::Create { local_ref, row },
+        )
     }
 
     pub fn upsert(
         &mut self,
         schema_key: &str,
-        row_pk: &[String],
-        snapshot: &[u8],
+        schema_fingerprint: [u8; 32],
+        primary_key: Vec<TypedValue>,
+        row: &TypedRow,
         effect: ChangeEffect,
     ) -> Result<()> {
-        self.inner.row(RowMutation::Upsert {
+        self.inner.typed_row(
             schema_key,
-            row_pk,
-            snapshot,
-            effect,
-        })
+            schema_fingerprint,
+            TypedMutation::Upsert {
+                row_pk: &primary_key,
+                row,
+                effect: match effect {
+                    ChangeEffect::Content => TypedChangeEffect::Content,
+                    ChangeEffect::FormatOnly => TypedChangeEffect::FormatOnly,
+                },
+            },
+        )
     }
 
-    pub fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> Result<()> {
-        self.inner.row(RowMutation::Delete { schema_key, row_pk })
+    pub fn delete(
+        &mut self,
+        schema_key: &str,
+        schema_fingerprint: [u8; 32],
+        primary_key: Vec<TypedValue>,
+    ) -> Result<()> {
+        self.inner.typed_row(
+            schema_key,
+            schema_fingerprint,
+            TypedMutation::Delete {
+                row_pk: &primary_key,
+            },
+        )
+    }
+
+    /// Emits the currently buffered typed mutations as one page.
+    pub fn flush_page(&mut self) -> Result<()> {
+        self.inner.flush_typed_rows()
     }
 
     pub fn replace_all_rows(&mut self) -> Result<RowOutput<'_, 'host>> {
@@ -897,117 +1082,6 @@ impl FileEditOutput<'_, '_> {
     }
 }
 
-fn encode_row_mutation(
-    output: &mut Vec<u8>,
-    mutation: RowMutation<'_>,
-    attachment: Option<(u32, u64)>,
-) -> Result<bool> {
-    let start = output.len();
-    output.extend_from_slice(&0_u32.to_le_bytes());
-    let is_create = match mutation {
-        RowMutation::Create {
-            schema_key,
-            local_ref,
-            snapshot,
-        } => {
-            output.push(2);
-            encode_text(output, schema_key)?;
-            output.extend_from_slice(&u64::from(local_ref).to_le_bytes());
-            encode_snapshot(output, snapshot, attachment)?;
-            true
-        }
-        RowMutation::Upsert {
-            schema_key,
-            row_pk,
-            snapshot,
-            effect,
-        } => {
-            output.push(0);
-            encode_key(output, schema_key, row_pk)?;
-            output.push(match effect {
-                ChangeEffect::Content => 0,
-                ChangeEffect::FormatOnly => 1,
-            });
-            encode_snapshot(output, snapshot, attachment)?;
-            false
-        }
-        RowMutation::Delete { schema_key, row_pk } => {
-            output.push(1);
-            encode_key(output, schema_key, row_pk)?;
-            false
-        }
-    };
-    let length = u32::try_from(output.len() - start - 4)
-        .map_err(|_| Error::limit_exceeded("row mutation exceeds u32 framing"))?;
-    output[start..start + 4].copy_from_slice(&length.to_le_bytes());
-    Ok(is_create)
-}
-
-fn encode_key(output: &mut Vec<u8>, schema_key: &str, row_pk: &[String]) -> Result<()> {
-    encode_text(output, schema_key)?;
-    output.extend_from_slice(
-        &u32::try_from(row_pk.len())
-            .map_err(|_| Error::limit_exceeded("row primary key has too many components"))?
-            .to_le_bytes(),
-    );
-    for component in row_pk {
-        encode_text(output, component)?;
-    }
-    Ok(())
-}
-
-fn encode_text(output: &mut Vec<u8>, value: &str) -> Result<()> {
-    output.extend_from_slice(
-        &u32::try_from(value.len())
-            .map_err(|_| Error::limit_exceeded("row text exceeds u32 framing"))?
-            .to_le_bytes(),
-    );
-    output.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-fn encode_snapshot(
-    output: &mut Vec<u8>,
-    snapshot: &[u8],
-    attachment: Option<(u32, u64)>,
-) -> Result<()> {
-    if let Some((ordinal, length)) = attachment {
-        output.push(1);
-        output.extend_from_slice(&ordinal.to_le_bytes());
-        output.extend_from_slice(&length.to_le_bytes());
-    } else {
-        output.push(0);
-        output.extend_from_slice(
-            &u32::try_from(snapshot.len())
-                .map_err(|_| Error::limit_exceeded("row snapshot exceeds u32 framing"))?
-                .to_le_bytes(),
-        );
-        output.extend_from_slice(snapshot);
-    }
-    Ok(())
-}
-
-/// One universal row output page.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RowPage {
-    payload: Vec<u8>,
-}
-
-impl RowPage {
-    fn snapshots(record_count: u32, payload: Vec<u8>) -> Result<Self> {
-        encode_single_section(
-            Representation::Snapshots,
-            Operation::Mixed,
-            "",
-            &[],
-            record_count,
-            payload,
-        )
-        .map(|payload| Self { payload })
-        .map_err(|error| Error::invalid_input(format!("invalid row page: {error:?}")))
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileEdit {
     pub offset: u64,
@@ -1051,7 +1125,7 @@ impl ColumnValue<'_> {
         self.len.is_none()
     }
 
-    pub fn read(&self) -> Result<Option<Vec<u8>>> {
+    fn read_bytes(&self) -> Result<Option<Vec<u8>>> {
         const READ_BYTES: u32 = 1024 * 1024;
         let Some(len) = self.len else {
             return Ok(None);
@@ -1078,53 +1152,50 @@ impl ColumnValue<'_> {
         Ok(Some(output))
     }
 
-    /// Decodes the canonical JSON representation of this column. A missing
-    /// optional column remains `None`; an explicit JSON `null` is decoded by
-    /// `T` in the ordinary serde way.
-    pub fn decode_json<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
-        self.read()?
-            .map(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    Error::invalid_input(format!("invalid column JSON value: {error}"))
-                })
-            })
-            .transpose()
-    }
-
-    /// Convenience for the dominant custom-merge case: a text column.
-    pub fn text(&self) -> Result<Option<String>> {
-        self.decode_json::<String>()
+    /// Reads the native Schema v1 value supplied by the host. A missing
+    /// optional column is `None`; an explicit null value is
+    /// `Some(TypedValue::Null)`.
+    pub fn value(&self) -> Result<Option<TypedValue>> {
+        let Some(bytes) = self.read_bytes()? else {
+            return Ok(None);
+        };
+        typed::decode_value_bytes(&bytes)
+            .map(Some)
+            .map_err(|error| Error::invalid_input(format!("invalid typed column value: {error:?}")))
     }
 }
 
 #[derive(Debug)]
 pub struct RowIdentity {
     pub schema_key: String,
-    pub row_pk: Vec<String>,
+    pub schema_fingerprint: [u8; 32],
+    /// Native Schema v1 primary-key components in schema declaration order.
+    pub primary_key: Vec<TypedValue>,
     pub file_id: Option<String>,
 }
 
-pub struct RowSnapshot<'a> {
+/// One complete native row payload supplied as merge context.
+pub struct RowPayload<'a> {
     source: &'a dyn ColumnMergeSourceHost,
     index: u32,
     side: MergeSide,
     len: u64,
 }
 
-impl std::fmt::Debug for RowSnapshot<'_> {
+impl std::fmt::Debug for RowPayload<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("RowSnapshot")
+            .debug_struct("RowPayload")
             .field("len", &self.len)
             .finish()
     }
 }
 
-impl RowSnapshot<'_> {
-    pub fn read(&self) -> Result<Vec<u8>> {
+impl RowPayload<'_> {
+    fn read_bytes(&self) -> Result<Vec<u8>> {
         const READ_BYTES: u32 = 1024 * 1024;
         let capacity = usize::try_from(self.len)
-            .map_err(|_| Error::limit_exceeded("row snapshot exceeds guest address space"))?;
+            .map_err(|_| Error::limit_exceeded("row payload exceeds guest address space"))?;
         let mut output = Vec::with_capacity(capacity);
         while output.len() < capacity {
             let length = u32::try_from((capacity - output.len()).min(READ_BYTES as usize))
@@ -1142,13 +1213,18 @@ impl RowSnapshot<'_> {
         }
         Ok(output)
     }
+
+    pub fn typed(&self) -> Result<TypedRow> {
+        typed::decode_row_bytes(&self.read_bytes()?)
+            .map_err(|error| Error::invalid_input(format!("invalid typed row context: {error:?}")))
+    }
 }
 
 #[derive(Debug)]
-pub struct RowVersions<'a> {
-    pub base: RowSnapshot<'a>,
-    pub a: RowSnapshot<'a>,
-    pub b: RowSnapshot<'a>,
+pub struct RowPayloadVersions<'a> {
+    pub base: RowPayload<'a>,
+    pub a: RowPayload<'a>,
+    pub b: RowPayload<'a>,
 }
 
 #[derive(Debug)]
@@ -1158,47 +1234,22 @@ pub struct ColumnMerge<'a> {
     pub base: ColumnValue<'a>,
     pub a: ColumnValue<'a>,
     pub b: ColumnValue<'a>,
-    pub rows: RowVersions<'a>,
+    pub row_payloads: RowPayloadVersions<'a>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum OwnedColumnValue {
-    Value(Vec<u8>),
+    Typed(TypedValue),
     Missing,
 }
 
 impl OwnedColumnValue {
-    /// Uses an already encoded canonical JSON column value.
-    pub fn json(bytes: impl Into<Vec<u8>>) -> Self {
-        Self::Value(bytes.into())
-    }
-
-    pub fn text(value: impl AsRef<str>) -> Self {
-        let mut json = String::with_capacity(value.as_ref().len() + 2);
-        json.push('"');
-        for character in value.as_ref().chars() {
-            match character {
-                '"' => json.push_str("\\\""),
-                '\\' => json.push_str("\\\\"),
-                '\u{08}' => json.push_str("\\b"),
-                '\u{0c}' => json.push_str("\\f"),
-                '\n' => json.push_str("\\n"),
-                '\r' => json.push_str("\\r"),
-                '\t' => json.push_str("\\t"),
-                character if character <= '\u{1f}' => {
-                    use std::fmt::Write as _;
-                    write!(json, "\\u{:04x}", character as u32)
-                        .expect("writing to a String cannot fail");
-                }
-                character => json.push(character),
-            }
-        }
-        json.push('"');
-        Self::Value(json.into_bytes())
+    pub fn typed(value: &TypedValue) -> Result<Self> {
+        Ok(Self::Typed(value.clone()))
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ColumnMergeResult {
     UseLww,
     Replace(OwnedColumnValue),
@@ -1210,74 +1261,99 @@ pub enum ChangeEffect {
     FormatOnly,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RowChange {
-    pub schema_key: String,
-    pub row_pk: Vec<String>,
-    pub snapshot: Option<Vec<u8>>,
+/// One complete Schema v1 row delivered to a plugin without an outer JSON
+/// representation. The fingerprint lets a plugin select the exact schema
+/// plan before interpreting the typed values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypedRowRecord {
+    pub schema_key: Arc<str>,
+    pub schema_fingerprint: [u8; 32],
+    /// Native Schema v1 primary-key components in schema declaration order.
+    pub primary_key: Vec<TypedValue>,
+    pub row: TypedRow,
+}
+
+/// One typed sparse row change. Creates carry their host-local reference and
+/// the complete row; upserts carry the typed identity and row; deletes carry
+/// only the typed identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypedRowChange {
+    pub schema_key: Arc<str>,
+    pub schema_fingerprint: [u8; 32],
+    /// Native Schema v1 primary-key components in schema declaration order.
+    /// Creates leave this empty until the host resolves generated identities.
+    pub primary_key: Vec<TypedValue>,
+    pub row: Option<TypedRow>,
+    pub local_ref: Option<u32>,
     pub effect: ChangeEffect,
 }
 
-pub struct RowChangeReader<'a> {
-    source: &'a dyn RowSourceHost,
-    page: Option<InputPage>,
-    max_page_bytes: u32,
-    next: u32,
-    eof: bool,
+#[derive(Debug)]
+struct TypedInputPage {
+    schema_key: Arc<str>,
+    schema_fingerprint: [u8; 32],
+    mutations: VecDeque<typed::OwnedMutation>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Row {
-    pub schema_key: String,
-    pub row_pk: Vec<String>,
-    pub snapshot: Vec<u8>,
+/// Reads complete typed rows from host pages and intentionally accepts only
+/// upserts, since durable current state cannot contain creates or tombstones.
+pub struct TypedRowReader<'a> {
+    changes: TypedRowChangeReader<'a>,
 }
 
-/// Validated current rows used by restore and cold transitions. Durable
-/// current state cannot contain tombstones, so plugins never branch on them.
-pub struct RowReader<'a> {
-    changes: RowChangeReader<'a>,
-}
-
-impl std::fmt::Debug for RowReader<'_> {
+impl std::fmt::Debug for TypedRowReader<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("RowReader")
+            .debug_struct("TypedRowReader")
             .field("changes", &self.changes)
             .finish()
     }
 }
 
-impl RowReader<'_> {
-    fn new(source: &dyn RowSourceHost, max_page_bytes: u32) -> RowReader<'_> {
-        RowReader {
-            changes: RowChangeReader::new(source, max_page_bytes),
+impl TypedRowReader<'_> {
+    fn new(source: &dyn RowSourceHost, max_page_bytes: u32) -> TypedRowReader<'_> {
+        TypedRowReader {
+            changes: TypedRowChangeReader::new(source, max_page_bytes),
         }
     }
 
-    pub fn next(&mut self) -> Result<Option<Row>> {
+    pub fn next(&mut self) -> Result<Option<TypedRowRecord>> {
         let Some(change) = self.changes.next()? else {
             return Ok(None);
         };
-        let snapshot = change.snapshot.ok_or_else(|| {
-            Error::invalid_input("durable current rows cannot contain tombstones")
+        let row = change.row.ok_or_else(|| {
+            Error::invalid_input("durable typed rows cannot contain creates or tombstones")
         })?;
-        Ok(Some(Row {
+        if change.local_ref.is_some() {
+            return Err(Error::invalid_input(
+                "durable typed rows cannot contain create references",
+            ));
+        }
+        Ok(Some(TypedRowRecord {
             schema_key: change.schema_key,
-            row_pk: change.row_pk,
-            snapshot,
+            schema_fingerprint: change.schema_fingerprint,
+            primary_key: change.primary_key,
+            row,
         }))
     }
 }
 
-impl std::fmt::Debug for RowChangeReader<'_> {
+/// Reads typed sparse changes from host pages. A page is decoded once and its
+/// owned values are retained only until the plugin consumes the page.
+pub struct TypedRowChangeReader<'a> {
+    source: &'a dyn RowSourceHost,
+    page: Option<TypedInputPage>,
+    max_page_bytes: u32,
+    eof: bool,
+}
+
+impl std::fmt::Debug for TypedRowChangeReader<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("RowChangeReader")
-            .field("next", &self.next)
+            .debug_struct("TypedRowChangeReader")
             .field(
                 "buffered",
-                &self.page.as_ref().map_or(0, |page| page.remaining),
+                &self.page.as_ref().map_or(0, |page| page.mutations.len()),
             )
             .field("max_page_bytes", &self.max_page_bytes)
             .field("eof", &self.eof)
@@ -1285,275 +1361,94 @@ impl std::fmt::Debug for RowChangeReader<'_> {
     }
 }
 
-impl RowChangeReader<'_> {
-    fn new(source: &dyn RowSourceHost, max_page_bytes: u32) -> RowChangeReader<'_> {
-        RowChangeReader {
+impl TypedRowChangeReader<'_> {
+    fn new(source: &dyn RowSourceHost, max_page_bytes: u32) -> TypedRowChangeReader<'_> {
+        TypedRowChangeReader {
             source,
             page: None,
             max_page_bytes,
-            next: 0,
             eof: false,
         }
     }
 
-    pub fn next(&mut self) -> Result<Option<RowChange>> {
-        if self.page.as_ref().is_none_or(|page| page.remaining == 0) {
+    pub fn next(&mut self) -> Result<Option<TypedRowChange>> {
+        loop {
+            if self
+                .page
+                .as_ref()
+                .is_some_and(|page| !page.mutations.is_empty())
+            {
+                break;
+            }
             if self.eof {
                 return Ok(None);
             }
-            let Some(page) = self
+            let Some((bytes, attachments)) = self
                 .source
                 .next_page(self.max_page_bytes)
-                .map_err(|error| host_error("host row-change page read failed", error))?
+                .map_err(|error| host_error("host typed-row page read failed", error))?
             else {
                 self.eof = true;
                 return Ok(None);
             };
-            self.page = Some(decode_input_page(page)?);
+            let (schema_key, schema_fingerprint, mutations) =
+                typed::decode_page_parts(&bytes, attachments).map_err(|error| {
+                    Error::invalid_input(format!("invalid typed-row page: {error:?}"))
+                })?;
+            if mutations.is_empty() {
+                return Err(Error::invalid_input("typed-row page must not be empty"));
+            }
+            self.page = Some(TypedInputPage {
+                schema_key: schema_key.into(),
+                schema_fingerprint,
+                mutations: mutations.into(),
+            });
         }
-        let index = self.next;
-        self.next += 1;
-        let change = self
-            .page
-            .as_mut()
-            .expect("a non-empty row-change page has a first record");
-        let change = change.next(index)?;
-        let snapshot = match change.snapshot {
-            Some(InputSnapshot::Inline(bytes)) => Some(bytes),
-            Some(InputSnapshot::Attachment { ordinal, length }) => Some(read_row_attachment(
-                self.source,
-                ordinal,
-                length,
-                self.max_page_bytes,
-            )?),
-            None => None,
+
+        let page = self.page.as_mut().expect("checked typed page is non-empty");
+        let mutation = page
+            .mutations
+            .pop_front()
+            .expect("checked typed page has a next mutation");
+        let (primary_key, row, local_ref, effect) = match mutation {
+            typed::OwnedMutation::Create { local_ref, row } => (
+                Vec::new(),
+                Some(row),
+                Some(local_ref),
+                ChangeEffect::Content,
+            ),
+            typed::OwnedMutation::Upsert {
+                row_pk,
+                row,
+                effect,
+            } => (
+                row_pk,
+                Some(row),
+                None,
+                match effect {
+                    TypedChangeEffect::Content => ChangeEffect::Content,
+                    TypedChangeEffect::FormatOnly => ChangeEffect::FormatOnly,
+                },
+            ),
+            typed::OwnedMutation::Delete { row_pk } => (row_pk, None, None, ChangeEffect::Content),
         };
-        debug_assert_eq!(index, change.ordinal);
-        Ok(Some(RowChange {
-            schema_key: change.schema_key,
-            row_pk: change.row_pk,
-            snapshot,
-            effect: change.effect,
+        let page = self.page.as_ref().expect("typed page remains buffered");
+        Ok(Some(TypedRowChange {
+            schema_key: page.schema_key.clone(),
+            schema_fingerprint: page.schema_fingerprint,
+            primary_key,
+            row,
+            local_ref,
+            effect,
         }))
     }
 }
 
 #[derive(Debug)]
-struct InputChange {
-    ordinal: u32,
-    schema_key: String,
-    row_pk: Vec<String>,
-    snapshot: Option<InputSnapshot>,
-    effect: ChangeEffect,
-}
-
-#[derive(Debug)]
-struct InputPage {
-    payload: Vec<u8>,
-    offset: usize,
-    remaining: u32,
-}
-
-impl InputPage {
-    fn next(&mut self, ordinal: u32) -> Result<InputChange> {
-        if self.remaining == 0 {
-            return Err(Error::invalid_input("row input page is exhausted"));
-        }
-        let mut framed = InputReader::new(&self.payload[self.offset..]);
-        let record_len = framed.u32()? as usize;
-        let mut record = framed.reader(record_len)?;
-        let tag = record.u8()?;
-        let (schema_key, row_pk, snapshot, effect) = match tag {
-            0 => {
-                let (schema_key, row_pk) = record.key()?;
-                let effect = match record.u8()? {
-                    0 => ChangeEffect::Content,
-                    1 => ChangeEffect::FormatOnly,
-                    _ => return Err(Error::invalid_input("unknown row change effect")),
-                };
-                (schema_key, row_pk, Some(record.snapshot()?), effect)
-            }
-            1 => {
-                let (schema_key, row_pk) = record.key()?;
-                (schema_key, row_pk, None, ChangeEffect::Content)
-            }
-            _ => {
-                return Err(Error::invalid_input(
-                    "row input page contains an unresolved create",
-                ));
-            }
-        };
-        record.finish()?;
-        self.offset = self
-            .offset
-            .checked_add(4 + record_len)
-            .ok_or_else(|| Error::limit_exceeded("row input page offset overflowed"))?;
-        self.remaining -= 1;
-        if self.remaining == 0 && self.offset != self.payload.len() {
-            return Err(Error::invalid_input("row input page has trailing bytes"));
-        }
-        Ok(InputChange {
-            ordinal,
-            schema_key,
-            row_pk,
-            snapshot,
-            effect,
-        })
-    }
-}
-
-#[derive(Debug)]
-enum InputSnapshot {
-    Inline(Vec<u8>),
-    Attachment { ordinal: u32, length: u64 },
-}
-
-fn decode_input_page(mut bytes: Vec<u8>) -> Result<InputPage> {
-    let page = WirePage::decode(&bytes)
-        .map_err(|error| Error::invalid_input(format!("invalid row page: {error:?}")))?;
-    let section = page
-        .section()
-        .map_err(|error| Error::invalid_input(format!("invalid row page: {error:?}")))?;
-    if section.representation != Representation::Snapshots
-        || section.operation != Operation::Mixed
-        || !section.schema_key.is_empty()
-        || !section.layout.is_empty()
-    {
-        return Err(Error::invalid_input(
-            "row input page must use the mixed snapshot representation",
-        ));
-    }
-    let payload_len = section.payload.len();
-    let remaining = section.record_count;
-    bytes.truncate(payload_len);
-    Ok(InputPage {
-        payload: bytes,
-        offset: 0,
-        remaining,
-    })
-}
-
-struct InputReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> InputReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn exact(&mut self, length: usize) -> Result<&'a [u8]> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .filter(|end| *end <= self.bytes.len())
-            .ok_or_else(|| Error::invalid_input("truncated row input page"))?;
-        let bytes = &self.bytes[self.offset..end];
-        self.offset = end;
-        Ok(bytes)
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.exact(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(
-            self.exact(4)?.try_into().expect("four bytes"),
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(
-            self.exact(8)?.try_into().expect("eight bytes"),
-        ))
-    }
-
-    fn text(&mut self) -> Result<String> {
-        let length = self.u32()? as usize;
-        String::from_utf8(self.exact(length)?.to_vec())
-            .map_err(|_| Error::invalid_input("row input text is not UTF-8"))
-    }
-
-    fn key(&mut self) -> Result<(String, Vec<String>)> {
-        let schema_key = self.text()?;
-        let count = self.u32()? as usize;
-        if count > self.bytes.len().saturating_sub(self.offset) / 4 {
-            return Err(Error::invalid_input(
-                "row primary key count exceeds page bounds",
-            ));
-        }
-        let mut row_pk = Vec::with_capacity(count);
-        for _ in 0..count {
-            row_pk.push(self.text()?);
-        }
-        Ok((schema_key, row_pk))
-    }
-
-    fn snapshot(&mut self) -> Result<InputSnapshot> {
-        match self.u8()? {
-            0 => {
-                let length = self.u32()? as usize;
-                Ok(InputSnapshot::Inline(self.exact(length)?.to_vec()))
-            }
-            1 => Ok(InputSnapshot::Attachment {
-                ordinal: self.u32()?,
-                length: self.u64()?,
-            }),
-            _ => Err(Error::invalid_input("unknown row attachment tag")),
-        }
-    }
-
-    fn reader(&mut self, length: usize) -> Result<InputReader<'a>> {
-        Ok(InputReader::new(self.exact(length)?))
-    }
-
-    fn finish(self) -> Result<()> {
-        if self.offset != self.bytes.len() {
-            return Err(Error::invalid_input("row input page has trailing bytes"));
-        }
-        Ok(())
-    }
-}
-
-fn read_row_attachment(
-    source: &dyn RowSourceHost,
-    ordinal: u32,
-    length: u64,
-    max_page_bytes: u32,
-) -> Result<Vec<u8>> {
-    const READ_BYTES: u32 = 1024 * 1024;
-    let capacity = usize::try_from(length)
-        .map_err(|_| Error::limit_exceeded("row snapshot exceeds guest address space"))?;
-    let mut output = Vec::with_capacity(capacity);
-    while output.len() < capacity {
-        let offset = output.len() as u64;
-        let chunk =
-            u32::try_from((capacity - output.len()).min(READ_BYTES.min(max_page_bytes) as usize))
-                .expect("bounded row snapshot read fits u32");
-        let bytes = source
-            .read_attachment(ordinal, offset, chunk)
-            .map_err(|error| host_error("host row attachment read failed", error))?
-            .ok_or_else(|| Error::invalid_input("host row attachment disappeared"))?;
-        if bytes.is_empty() {
-            return Err(Error::invalid_input(
-                "host row attachment returned a short read",
-            ));
-        }
-        output.extend_from_slice(&bytes);
-    }
-    Ok(output)
-}
-
-pub type FileSnapshot<'a> = Snapshot<'a>;
-pub type ProjectionSnapshot<'a> = Snapshot<'a>;
-
-#[derive(Debug)]
 pub struct ParseInput<'a> {
     pub file_id: &'a str,
     pub path: &'a str,
-    pub file: FileSnapshot<'a>,
+    pub file: Snapshot<'a>,
     pub creates: CreateContext,
 }
 
@@ -1573,11 +1468,12 @@ pub struct ParseChangesInput<'a> {
     pub file_id: &'a str,
     pub before_path: &'a str,
     pub after_path: &'a str,
-    pub before: ProjectionSnapshot<'a>,
+    pub before: Snapshot<'a>,
     pub file_edits: FileEditReader<'a>,
-    /// Complete accepted rows when this is a cold transition. Warm incremental
-    /// transitions omit them so the host does not hydrate untouched rows.
-    pub rows: Option<RowReader<'a>>,
+    /// Complete accepted typed rows when this is a cold transition. Warm
+    /// incremental transitions omit them so the host does not hydrate
+    /// untouched rows.
+    pub typed_rows: Option<TypedRowReader<'a>>,
     pub creates: CreateContext,
 }
 
@@ -1585,16 +1481,16 @@ pub struct ParseChangesInput<'a> {
 pub struct SerializeInput<'a> {
     pub file_id: &'a str,
     pub path: &'a str,
-    pub rows: RowReader<'a>,
-    pub before: Option<ProjectionSnapshot<'a>>,
+    pub typed_rows: TypedRowReader<'a>,
+    pub before: Option<Snapshot<'a>>,
 }
 
 #[derive(Debug)]
 pub struct SerializeChangesInput<'a> {
     pub file_id: &'a str,
     pub path: &'a str,
-    pub before: ProjectionSnapshot<'a>,
-    pub row_changes: RowChangeReader<'a>,
+    pub before: Snapshot<'a>,
+    pub typed_row_changes: TypedRowChangeReader<'a>,
 }
 
 /// Optional capability that improves the host's column-based LWW result.
@@ -1650,26 +1546,40 @@ fn apply_column_merges<C: ColumnMerger>(
             side,
             len,
         };
-        let row = |side, len| RowSnapshot {
+        let row_payload = |side, len| RowPayload {
             source: input,
             index,
             side,
             len,
         };
+        let schema_fingerprint: [u8; 32] =
+            meta.schema_fingerprint.as_slice().try_into().map_err(|_| {
+                Error::invalid_input("host column merge metadata has an invalid schema fingerprint")
+            })?;
+        let primary_key = meta
+            .primary_key
+            .iter()
+            .map(|component| {
+                typed::decode_value_bytes(component).map_err(|error| {
+                    Error::invalid_input(format!("invalid typed row identity: {error:?}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let merge = ColumnMerge {
             row: RowIdentity {
                 schema_key: meta.schema_key,
-                row_pk: meta.row_pk,
+                schema_fingerprint,
+                primary_key,
                 file_id: meta.file_id,
             },
             column: meta.column,
             base: value(MergeSide::Base, meta.base_len),
             a: value(MergeSide::A, meta.a_len),
             b: value(MergeSide::B, meta.b_len),
-            rows: RowVersions {
-                base: row(MergeSide::Base, meta.base_row_len),
-                a: row(MergeSide::A, meta.a_row_len),
-                b: row(MergeSide::B, meta.b_row_len),
+            row_payloads: RowPayloadVersions {
+                base: row_payload(MergeSide::Base, meta.base_row_len),
+                a: row_payload(MergeSide::A, meta.a_row_len),
+                b: row_payload(MergeSide::B, meta.b_row_len),
             },
         };
         match C::merge(merge)? {
@@ -1678,7 +1588,12 @@ fn apply_column_merges<C: ColumnMerger>(
                 .map_err(|error| host_error("host rejected column LWW result", error))?,
             ColumnMergeResult::Replace(replacement) => {
                 let (length, bytes) = match replacement {
-                    OwnedColumnValue::Value(bytes) => (Some(bytes.len() as u64), Some(bytes)),
+                    OwnedColumnValue::Typed(value) => {
+                        let bytes = typed::encode_value_bytes(&value).map_err(|error| {
+                            Error::invalid_input(format!("invalid typed replacement: {error:?}"))
+                        })?;
+                        (Some(bytes.len() as u64), Some(bytes))
+                    }
                     OwnedColumnValue::Missing => (None, None),
                 };
                 output
@@ -1761,17 +1676,17 @@ impl<C: 'static, F: FileProjection> CombinedFileProjectionGuest for Component<C,
         let projection = Snapshot {
             inner: &input.before,
         };
-        let rows = input
+        let typed_rows = input
             .rows
             .as_ref()
-            .map(|rows| RowReader::new(rows, max_batch_bytes));
+            .map(|rows| TypedRowReader::new(rows, max_batch_bytes));
         let update = ParseChangesInput {
             file_id: &input.file_id,
             before_path: &input.before_path,
             after_path: &input.after_path,
             before: projection,
             file_edits: FileEditReader { edits: &edits },
-            rows,
+            typed_rows,
             creates: CreateContext {
                 high: input.creates.high,
                 low: input.creates.low,
@@ -1793,11 +1708,11 @@ impl<C: 'static, F: FileProjection> CombinedFileProjectionGuest for Component<C,
             .before
             .as_ref()
             .map(|before| Snapshot { inner: before });
-        let rows = RowReader::new(&input.rows, max_batch_bytes);
+        let typed_rows = TypedRowReader::new(&input.rows, max_batch_bytes);
         let serialize = SerializeInput {
             file_id: &input.file_id,
             path: &input.path,
-            rows,
+            typed_rows,
             before,
         };
         let mut transition = TransitionOutput::new(output).map_err(plugin_error)?;
@@ -1819,7 +1734,7 @@ impl<C: 'static, F: FileProjection> CombinedFileProjectionGuest for Component<C,
             before: Snapshot {
                 inner: &input.before,
             },
-            row_changes: RowChangeReader::new(&input.row_changes, max_batch_bytes),
+            typed_row_changes: TypedRowChangeReader::new(&input.row_changes, max_batch_bytes),
         };
         let mut transition = TransitionOutput::new(output).map_err(plugin_error)?;
         let mut edits = FileEditOutput {
@@ -1870,10 +1785,10 @@ impl<F: FileProjection> file_projection_bindings::exports::lix::plugin::file_pro
             })
             .collect();
         let mut transition = TransitionOutput::new(output).map_err(projection_plugin_error)?;
-        let rows = input
+        let typed_rows = input
             .rows
             .as_ref()
-            .map(|rows| RowReader::new(rows, max_batch_bytes));
+            .map(|rows| TypedRowReader::new(rows, max_batch_bytes));
         let update = ParseChangesInput {
             file_id: &input.file_id,
             before_path: &input.before_path,
@@ -1882,7 +1797,7 @@ impl<F: FileProjection> file_projection_bindings::exports::lix::plugin::file_pro
                 inner: &input.before,
             },
             file_edits: FileEditReader { edits: &edits },
-            rows,
+            typed_rows,
             creates: CreateContext {
                 high: input.creates.high,
                 low: input.creates.low,
@@ -1907,7 +1822,7 @@ impl<F: FileProjection> file_projection_bindings::exports::lix::plugin::file_pro
         let serialize = SerializeInput {
             file_id: &input.file_id,
             path: &input.path,
-            rows: RowReader::new(&input.rows, max_batch_bytes),
+            typed_rows: TypedRowReader::new(&input.rows, max_batch_bytes),
             before,
         };
         let mut transition = TransitionOutput::new(output).map_err(projection_plugin_error)?;
@@ -1929,7 +1844,7 @@ impl<F: FileProjection> file_projection_bindings::exports::lix::plugin::file_pro
             before: Snapshot {
                 inner: &input.before,
             },
-            row_changes: RowChangeReader::new(&input.row_changes, max_batch_bytes),
+            typed_row_changes: TypedRowChangeReader::new(&input.row_changes, max_batch_bytes),
         };
         let mut transition = TransitionOutput::new(output).map_err(projection_plugin_error)?;
         let mut edits = FileEditOutput {
@@ -1976,4 +1891,523 @@ macro_rules! __lix_export_capabilities {
             __LixPluginComponent with_types_in $crate::plugin::api::file_projection_bindings
         );
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct RecordingTransitionHost {
+        pages: Mutex<Vec<(Vec<u8>, Vec<Vec<u8>>)>>,
+        max_batch_bytes: u32,
+    }
+
+    impl Default for RecordingTransitionHost {
+        fn default() -> Self {
+            Self {
+                pages: Mutex::new(Vec::new()),
+                max_batch_bytes: 64 * 1024,
+            }
+        }
+    }
+
+    impl RecordingTransitionHost {
+        fn with_max_batch_bytes(max_batch_bytes: u32) -> Self {
+            Self {
+                pages: Mutex::new(Vec::new()),
+                max_batch_bytes,
+            }
+        }
+    }
+
+    impl TransitionHost for RecordingTransitionHost {
+        fn max_batch_bytes(&self) -> u32 {
+            self.max_batch_bytes
+        }
+        fn put_state(&self, _: &[u8], _: &[u8]) -> std::result::Result<(), CommonHostError> {
+            Ok(())
+        }
+        fn delete_state(&self, _: &[u8]) -> std::result::Result<(), CommonHostError> {
+            Ok(())
+        }
+        fn emit_rows(
+            &self,
+            payload: Vec<u8>,
+            attachments: Vec<Vec<u8>>,
+        ) -> std::result::Result<(), CommonHostError> {
+            self.pages.lock().unwrap().push((payload, attachments));
+            Ok(())
+        }
+        fn replace_all_rows(&self) -> std::result::Result<(), CommonHostError> {
+            Ok(())
+        }
+        fn emit_file_edit(
+            &self,
+            _: u64,
+            _: u64,
+            _: &[u8],
+        ) -> std::result::Result<(), CommonHostError> {
+            Ok(())
+        }
+        fn begin_file_replacement(&self, _: u64) -> std::result::Result<(), CommonHostError> {
+            Ok(())
+        }
+        fn write_file_replacement(&self, _: &[u8]) -> std::result::Result<(), CommonHostError> {
+            Ok(())
+        }
+        fn finish_file_replacement(&self) -> std::result::Result<(), CommonHostError> {
+            Ok(())
+        }
+    }
+
+    fn recorded_schemas(host: &RecordingTransitionHost) -> Vec<(String, usize)> {
+        host.pages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(page, attachments)| {
+                let (schema, _, mutations) = typed::decode_page_parts(page, attachments.clone())
+                    .expect("valid recorded page");
+                (schema, mutations.len())
+            })
+            .collect()
+    }
+
+    fn resident_page_bytes(payload: &[u8], attachments: &[Vec<u8>]) -> usize {
+        payload.len()
+            + attachments.iter().map(Vec::len).sum::<usize>()
+            + attachments.len() * typed::ATTACHMENT_TABLE_ENTRY_BYTES
+    }
+
+    fn recorded_typed_totals(host: &RecordingTransitionHost) -> (usize, usize) {
+        host.pages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(page, attachments)| {
+                let (_, _, mutations) = typed::decode_page_parts(page, attachments.clone())
+                    .expect("valid recorded page");
+                let text_bytes = mutations
+                    .iter()
+                    .filter_map(|mutation| match mutation {
+                        typed::OwnedMutation::Create { row, .. }
+                        | typed::OwnedMutation::Upsert { row, .. } => Some(row),
+                        typed::OwnedMutation::Delete { .. } => None,
+                    })
+                    .flat_map(TypedRow::values)
+                    .filter_map(|value| match value {
+                        TypedValue::Text(value) => Some(value.len()),
+                        _ => None,
+                    })
+                    .sum::<usize>();
+                (mutations.len(), text_bytes)
+            })
+            .fold((0, 0), |(records, bytes), page| {
+                (records + page.0, bytes + page.1)
+            })
+    }
+
+    #[test]
+    fn typed_output_preserves_schema_transition_order_by_default() {
+        let host = RecordingTransitionHost::default();
+        let mut output = TransitionOutput::new(&host).unwrap();
+        let row = TypedRow::from([("id".to_owned(), TypedValue::Text("x".to_owned()))]);
+        output
+            .typed_row(
+                "a",
+                [1; 32],
+                TypedMutation::Create {
+                    local_ref: 0,
+                    row: &row,
+                },
+            )
+            .unwrap();
+        output
+            .typed_row(
+                "b",
+                [2; 32],
+                TypedMutation::Create {
+                    local_ref: 1,
+                    row: &row,
+                },
+            )
+            .unwrap();
+        output
+            .typed_row(
+                "a",
+                [1; 32],
+                TypedMutation::Create {
+                    local_ref: 2,
+                    row: &row,
+                },
+            )
+            .unwrap();
+        output.finish().unwrap();
+        assert_eq!(
+            recorded_schemas(&host),
+            vec![("a".into(), 1), ("b".into(), 1), ("a".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn initial_output_may_explicitly_coalesce_schema_pages() {
+        let host = RecordingTransitionHost::default();
+        let mut output = TransitionOutput::new(&host).unwrap();
+        output.coalesce_typed_schemas = true;
+        let row = TypedRow::from([("id".to_owned(), TypedValue::Text("x".to_owned()))]);
+        for (schema, fingerprint, local_ref) in
+            [("a", [1; 32], 0), ("b", [2; 32], 1), ("a", [1; 32], 2)]
+        {
+            output
+                .typed_row(
+                    schema,
+                    fingerprint,
+                    TypedMutation::Create {
+                        local_ref,
+                        row: &row,
+                    },
+                )
+                .unwrap();
+        }
+        output.finish().unwrap();
+        assert_eq!(
+            recorded_schemas(&host),
+            vec![("a".into(), 2), ("b".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn typed_output_splits_mixed_create_and_complete_layouts() {
+        let host = RecordingTransitionHost::default();
+        let mut output = TransitionOutput::new(&host).unwrap();
+        let create = TypedRow::from([("body".to_owned(), TypedValue::Text("a".to_owned()))]);
+        let complete = TypedRow::from([
+            ("body".to_owned(), TypedValue::Text("b".to_owned())),
+            ("id".to_owned(), TypedValue::Uuid(uuid::Uuid::nil())),
+        ]);
+        output
+            .typed_row(
+                "row",
+                [3; 32],
+                TypedMutation::Create {
+                    local_ref: 0,
+                    row: &create,
+                },
+            )
+            .unwrap();
+        output
+            .typed_row(
+                "row",
+                [3; 32],
+                TypedMutation::Upsert {
+                    row_pk: &[TypedValue::Uuid(uuid::Uuid::nil())],
+                    row: &complete,
+                    effect: TypedChangeEffect::Content,
+                },
+            )
+            .unwrap();
+        output.finish().unwrap();
+        assert_eq!(
+            recorded_schemas(&host),
+            vec![("row".into(), 1), ("row".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn typed_output_flushes_at_the_codec_record_limit() {
+        let host = RecordingTransitionHost::with_max_batch_bytes(u32::MAX);
+        let mut output = TransitionOutput::new(&host).unwrap();
+        let row = TypedRow::default();
+        for local_ref in 0..=typed::MAX_RECORDS_PER_PAGE {
+            output
+                .typed_row(
+                    "row",
+                    [4; 32],
+                    TypedMutation::Create {
+                        local_ref,
+                        row: &row,
+                    },
+                )
+                .unwrap();
+        }
+        output.finish().unwrap();
+
+        assert_eq!(
+            recorded_schemas(&host),
+            vec![
+                ("row".into(), typed::MAX_RECORDS_PER_PAGE as usize),
+                ("row".into(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_output_counts_attachment_storage_when_splitting_pages() {
+        let max_batch_bytes = 32 * 1024;
+        let host = RecordingTransitionHost::with_max_batch_bytes(max_batch_bytes);
+        let mut output = TransitionOutput::new(&host).unwrap();
+        let row = TypedRow::from([("body".to_owned(), TypedValue::Text("x".repeat(9 * 1024)))]);
+        for local_ref in 0..10 {
+            output
+                .typed_row(
+                    "row",
+                    [5; 32],
+                    TypedMutation::Create {
+                        local_ref,
+                        row: &row,
+                    },
+                )
+                .unwrap();
+        }
+        output.finish().unwrap();
+
+        let pages = host.pages.lock().unwrap();
+        assert_eq!(pages.len(), 4);
+        for (payload, attachments) in pages.iter() {
+            let guest_page_bytes = payload.len()
+                + attachments.iter().map(Vec::len).sum::<usize>()
+                + attachments.len() * typed::ATTACHMENT_TABLE_ENTRY_BYTES;
+            assert!(guest_page_bytes <= max_batch_bytes as usize);
+        }
+    }
+
+    #[test]
+    fn typed_output_bounds_ordinary_pages_at_one_mib_under_a_larger_hard_max() {
+        const TARGET_BYTES: usize = 1024 * 1024;
+        const RECORD_BYTES: usize = 4 * 1024;
+        const RECORDS: usize = 600;
+
+        let host = RecordingTransitionHost::with_max_batch_bytes(4 * TARGET_BYTES as u32);
+        let mut output = TransitionOutput::new(&host).unwrap();
+        let row = TypedRow::from([(
+            "body".to_owned(),
+            TypedValue::Text("x".repeat(RECORD_BYTES)),
+        )]);
+        for local_ref in 0..RECORDS as u32 {
+            output
+                .typed_row(
+                    "row",
+                    [6; 32],
+                    TypedMutation::Create {
+                        local_ref,
+                        row: &row,
+                    },
+                )
+                .unwrap();
+        }
+        output.finish().unwrap();
+
+        let pages = host.pages.lock().unwrap();
+        assert_eq!(pages.len(), 3, "one host callback per bounded page");
+        assert!(pages.iter().all(|(payload, attachments)| {
+            attachments.is_empty() && resident_page_bytes(payload, attachments) <= TARGET_BYTES
+        }));
+        drop(pages);
+        assert_eq!(
+            recorded_typed_totals(&host),
+            (RECORDS, RECORDS * RECORD_BYTES)
+        );
+    }
+
+    #[test]
+    fn typed_output_counts_attachments_against_the_one_mib_target() {
+        const TARGET_BYTES: usize = 1024 * 1024;
+        const RECORD_BYTES: usize = TARGET_BYTES / 2;
+
+        let host = RecordingTransitionHost::with_max_batch_bytes(4 * TARGET_BYTES as u32);
+        let mut output = TransitionOutput::new(&host).unwrap();
+        let row = TypedRow::from([(
+            "body".to_owned(),
+            TypedValue::Text("x".repeat(RECORD_BYTES)),
+        )]);
+        for local_ref in 0..2 {
+            output
+                .typed_row(
+                    "row",
+                    [7; 32],
+                    TypedMutation::Create {
+                        local_ref,
+                        row: &row,
+                    },
+                )
+                .unwrap();
+        }
+        output.finish().unwrap();
+
+        let pages = host.pages.lock().unwrap();
+        assert_eq!(pages.len(), 2, "attachment bytes force a second callback");
+        assert!(pages.iter().all(|(payload, attachments)| {
+            attachments.len() == 1 && resident_page_bytes(payload, attachments) <= TARGET_BYTES
+        }));
+        drop(pages);
+        assert_eq!(recorded_typed_totals(&host), (2, 2 * RECORD_BYTES));
+    }
+
+    #[test]
+    fn typed_output_allows_one_oversized_record_up_to_the_host_hard_max() {
+        const TARGET_BYTES: usize = 1024 * 1024;
+        const OVERSIZED_BYTES: usize = TARGET_BYTES + 256 * 1024;
+        const ORDINARY_BYTES: usize = 64 * 1024;
+
+        let host = RecordingTransitionHost::with_max_batch_bytes(4 * TARGET_BYTES as u32);
+        let mut output = TransitionOutput::new(&host).unwrap();
+        for (local_ref, bytes) in [(0, OVERSIZED_BYTES), (1, ORDINARY_BYTES)] {
+            let row = TypedRow::from([("body".to_owned(), TypedValue::Text("x".repeat(bytes)))]);
+            output
+                .typed_row(
+                    "row",
+                    [8; 32],
+                    TypedMutation::Create {
+                        local_ref,
+                        row: &row,
+                    },
+                )
+                .unwrap();
+        }
+        output.finish().unwrap();
+
+        let pages = host.pages.lock().unwrap();
+        assert_eq!(pages.len(), 2, "the oversized singleton is one callback");
+        let page_bytes = pages
+            .iter()
+            .map(|(payload, attachments)| resident_page_bytes(payload, attachments))
+            .collect::<Vec<_>>();
+        assert!(page_bytes[0] > TARGET_BYTES);
+        assert!(page_bytes[0] <= host.max_batch_bytes as usize);
+        assert!(page_bytes[1] <= TARGET_BYTES);
+        drop(pages);
+        assert_eq!(
+            recorded_typed_totals(&host),
+            (2, OVERSIZED_BYTES + ORDINARY_BYTES)
+        );
+    }
+
+    #[test]
+    fn schema_coalescing_uses_the_one_mib_aggregate_target() {
+        const TARGET_BYTES: usize = 1024 * 1024;
+        const RECORD_BYTES: usize = 96 * 1024;
+        const SCHEMAS: usize = 16;
+
+        let host = RecordingTransitionHost::with_max_batch_bytes(4 * TARGET_BYTES as u32);
+        let mut output = TransitionOutput::new(&host).unwrap();
+        output.coalesce_typed_schemas = true;
+        for index in 0..SCHEMAS as u8 {
+            let row = TypedRow::from([(
+                "body".to_owned(),
+                TypedValue::Text(char::from(b'a' + index).to_string().repeat(RECORD_BYTES)),
+            )]);
+            output
+                .typed_row(
+                    &format!("schema-{index}"),
+                    [index; 32],
+                    TypedMutation::Create {
+                        local_ref: u32::from(index),
+                        row: &row,
+                    },
+                )
+                .unwrap();
+            assert!(output.buffered_typed_bytes().unwrap() <= TARGET_BYTES);
+        }
+        output.finish().unwrap();
+
+        let pages = host.pages.lock().unwrap();
+        assert_eq!(pages.len(), SCHEMAS, "every schema page reaches the host");
+        assert!(pages.iter().all(|(payload, attachments)| {
+            resident_page_bytes(payload, attachments) <= TARGET_BYTES
+        }));
+        drop(pages);
+        assert_eq!(
+            recorded_typed_totals(&host),
+            (SCHEMAS, SCHEMAS * RECORD_BYTES)
+        );
+    }
+
+    #[test]
+    fn schema_coalescing_keeps_total_guest_page_buffers_bounded() {
+        let max_batch_bytes = 32 * 1024;
+        let host = RecordingTransitionHost::with_max_batch_bytes(max_batch_bytes);
+        let mut output = TransitionOutput::new(&host).unwrap();
+        output.coalesce_typed_schemas = true;
+        for index in 0..16_u8 {
+            let row = TypedRow::from([(
+                "body".to_owned(),
+                TypedValue::Text(char::from(b'a' + index).to_string().repeat(9 * 1024)),
+            )]);
+            output
+                .typed_row(
+                    &format!("schema-{index}"),
+                    [index; 32],
+                    TypedMutation::Create {
+                        local_ref: u32::from(index),
+                        row: &row,
+                    },
+                )
+                .unwrap();
+            assert!(
+                output.buffered_typed_bytes().unwrap() <= max_batch_bytes as usize,
+                "coalesced schema buffers exceeded the guest-side page budget"
+            );
+        }
+        output.finish().unwrap();
+        assert_eq!(
+            host.pages
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, attachments)| attachments.len())
+                .sum::<usize>(),
+            16
+        );
+    }
+
+    #[test]
+    fn create_context_returns_native_uuid() {
+        let namespace = [
+            0x01, 0x8f, 0x0f, 0x31, 0x8f, 0x50, 0x7e, 0xb0, 0x9b, 0x5b, 0x7f, 0xc8,
+        ];
+        let context = CreateContext::from_namespace_bytes(namespace);
+        let id = context.id(0xfe9f_5250);
+
+        assert_eq!(id.as_bytes()[..12], namespace);
+        assert_eq!(&id.as_bytes()[12..], &0xfe9f_5250_u32.to_be_bytes());
+    }
+
+    #[test]
+    fn public_row_identities_preserve_native_schema_values() {
+        let primary_key = vec![
+            TypedValue::Uuid(
+                uuid::Uuid::parse_str("018f0f31-8f50-7eb0-9b5b-7fc8fe9f5250").unwrap(),
+            ),
+            TypedValue::Int8(i64::MIN),
+            TypedValue::Boolean(true),
+            TypedValue::Jsonb(serde_json::json!({ "scope": [1, null, false] }).into()),
+        ];
+
+        let record = TypedRowRecord {
+            schema_key: "example".into(),
+            schema_fingerprint: [7; 32],
+            primary_key: primary_key.clone(),
+            row: TypedRow::default(),
+        };
+        let change = TypedRowChange {
+            schema_key: "example".into(),
+            schema_fingerprint: [7; 32],
+            primary_key: primary_key.clone(),
+            row: None,
+            local_ref: None,
+            effect: ChangeEffect::Content,
+        };
+        let merge_identity = RowIdentity {
+            schema_key: "example".to_owned(),
+            schema_fingerprint: [7; 32],
+            primary_key: primary_key.clone(),
+            file_id: None,
+        };
+
+        assert_eq!(record.primary_key, primary_key);
+        assert_eq!(change.primary_key, primary_key);
+        assert_eq!(merge_identity.primary_key, primary_key);
+    }
 }

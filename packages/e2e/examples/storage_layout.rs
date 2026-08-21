@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use lix::registered_spaces::{HOT_ROW_SPACE, PLUGIN_CHECKPOINT_SPACE};
+use lix::registered_spaces::HOT_ROW_SPACE;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{
     binary_cas_owner_layout_accounting, binary_manifest_layout_accounting,
@@ -93,7 +93,6 @@ async fn main() {
     print_commit_delta_inventory(&read).await;
     print_binary_manifest_layout(&read).await;
     print_binary_cas_owners(&read).await;
-    print_plugin_checkpoint_layout(&read).await;
 
     let inventory = space_inventory(&read, HOT_ROW_SPACE.name).await;
     let mut groups = BTreeMap::<Vec<u8>, HotGroup>::new();
@@ -202,51 +201,6 @@ async fn print_binary_cas_owners(read: &impl lix::storage_adapter::StorageAdapte
             owner.encoded_chunk_bytes,
         );
     }
-}
-
-async fn print_plugin_checkpoint_layout(read: &impl lix::storage_adapter::StorageAdapterRead) {
-    const HEADER_BYTES: usize = 92;
-
-    const DIGEST_BYTES: usize = 32;
-
-    let inventory = space_inventory(read, PLUGIN_CHECKPOINT_SPACE.name).await;
-    let mut runtime_bytes = 0_u64;
-    let mut authority_bytes = 0_u64;
-    let mut unique_runtime = BTreeSet::new();
-    let mut unique_authority = BTreeSet::new();
-    for (_key, value) in &inventory {
-        let runtime_len = u32::from_le_bytes(
-            value[84..88]
-                .try_into()
-                .expect("plugin checkpoint runtime length"),
-        ) as usize;
-        let authority_len = u32::from_le_bytes(
-            value[88..92]
-                .try_into()
-                .expect("plugin checkpoint authority length"),
-        ) as usize;
-        let runtime_end = HEADER_BYTES + runtime_len;
-        let authority_end = runtime_end + authority_len;
-        assert_eq!(
-            authority_end + DIGEST_BYTES,
-            value.len(),
-            "plugin checkpoint value length"
-        );
-        runtime_bytes += runtime_len as u64;
-        authority_bytes += authority_len as u64;
-        unique_runtime.insert(value[HEADER_BYTES..runtime_end].to_vec());
-        unique_authority.insert(value[runtime_end..authority_end].to_vec());
-    }
-    println!(
-        "PLUGIN_CHECKPOINT\trows={}\truntime_bytes={}\tauthority_bytes={}\tunique_runtimes={}\tunique_runtime_bytes={}\tunique_authorities={}\tunique_authority_bytes={}",
-        inventory.len(),
-        runtime_bytes,
-        authority_bytes,
-        unique_runtime.len(),
-        unique_runtime.iter().map(Vec::len).sum::<usize>(),
-        unique_authority.len(),
-        unique_authority.iter().map(Vec::len).sum::<usize>(),
-    );
 }
 
 async fn print_binary_manifest_layout(read: &impl lix::storage_adapter::StorageAdapterRead) {

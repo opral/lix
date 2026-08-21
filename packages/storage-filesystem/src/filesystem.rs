@@ -540,6 +540,14 @@ impl StorageWrite for FilesystemStorageWrite {
         self.inner.put_many(space, entries)
     }
 
+    fn replace_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.inner.replace_many(space, entries)
+    }
+
     fn delete_many(
         &mut self,
         space: StorageSpace,
@@ -562,7 +570,11 @@ impl StorageWrite for FilesystemStorageWrite {
             if let Some(inner) = self.supervisor.and_then(|inner| inner.upgrade()) {
                 if thread::current().name() != Some("lix-sdk-filesystem-sync") {
                     let supervisor = FilesystemSupervisor { inner };
-                    supervisor.sync_from_lix().await?;
+                    supervisor.sync_from_lix().await.map_err(|error| {
+                        StorageError::CommitOutcomeUnknown(format!(
+                            "repository commit succeeded before filesystem synchronization failed: {error}"
+                        ))
+                    })?;
                 }
             }
             Ok(result)

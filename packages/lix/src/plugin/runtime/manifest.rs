@@ -60,7 +60,7 @@ impl PluginContentMatcher {
 }
 
 /// Validates the resolved durable ABI. Author manifests do not repeat these
-/// constants; the component package is canonically `lix:plugin@1.0.0`.
+/// constants; the component package is canonically `lix:plugin@2.0.0`.
 pub(crate) fn validate_runtime_api_version(
     runtime: PluginRuntime,
     api_version: &str,

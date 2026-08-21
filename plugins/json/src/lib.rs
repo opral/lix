@@ -1,26 +1,31 @@
-//! JSON support for the row-first Component API v1.
+//! JSON support for the row-first Component API v2.
 #![allow(dead_code)]
 
 mod core;
 
 use core::{
-    ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, FileEdit, IdNamespace, RowChange,
-    RowImportBuilder, RowRecord,
+    ARRAY_ITEM_SCHEMA_KEY, ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, FileEdit,
+    IdNamespace, OBJECT_MEMBER_SCHEMA_KEY, ROOT_SCHEMA_KEY, RowChange, RowImportBuilder, RowRecord,
 };
 use lix::plugin as sdk;
+use std::sync::OnceLock;
 
 struct JsonPlugin;
 
 const SCALAR_INDEX_STATE: &[u8] = b"json/scalar-index";
 const SCALAR_SHIFTS_STATE: &[u8] = b"json/scalar-shifts";
 const ID_NAMESPACE_STATE: &[u8] = b"json/id-namespace";
-const FALLBACK_ROWS_STATE: &[u8] = b"json/fallback-rows";
-const SCALAR_INDEX_MAGIC: &[u8; 4] = b"JSS2";
-const FALLBACK_ROWS_MAGIC: &[u8; 4] = b"JFE2";
+const SCALAR_INDEX_MAGIC: &[u8; 4] = b"JSS3";
 const SCALAR_INDEX_HEADER_BYTES: u32 = 16;
 const SCALAR_INDEX_ENTRY_BYTES: u32 = 20;
 const SCALAR_PAGE_BYTES: usize = 1024 * 1024;
 const STATE_PAGE_BYTES: usize = 1024 * 1024;
+const ROOT_SCHEMA_JSON: &str = include_str!("../schema/json_root.json");
+const OBJECT_MEMBER_SCHEMA_JSON: &str = include_str!("../schema/json_object_member.json");
+const ARRAY_ITEM_SCHEMA_JSON: &str = include_str!("../schema/json_array_item.json");
+static ROOT_SCHEMA_FINGERPRINT: OnceLock<[u8; 32]> = OnceLock::new();
+static OBJECT_MEMBER_SCHEMA_FINGERPRINT: OnceLock<[u8; 32]> = OnceLock::new();
+static ARRAY_ITEM_SCHEMA_FINGERPRINT: OnceLock<[u8; 32]> = OnceLock::new();
 
 fn cold_parse_changes(
     update: &mut sdk::ParseChangesInput<'_>,
@@ -29,19 +34,22 @@ fn cold_parse_changes(
     let accepted = update.before.read_all()?;
     let mut builder = RowImportBuilder::new();
     let rows = update
-        .rows
+        .typed_rows
         .as_mut()
-        .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable rows"))?;
+        .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable typed rows"))?;
+    let mut accepted_namespace = None;
     while let Some(row) = rows.next()? {
+        accepted_namespace = accepted_namespace.or_else(|| namespace_from_row_pk(&row.primary_key));
         builder
             .push(RowRecord {
                 schema_key: row.schema_key,
-                row_pk: row.row_pk,
-                snapshot: row.snapshot,
+                row_pk: row.primary_key,
+                row: row.row,
             })
             .map_err(sdk::Error::invalid_input)?;
     }
     let create_namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
+    let accepted_namespace = accepted_namespace.unwrap_or(create_namespace);
     let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
     if !document.bytes_equal(&accepted) {
         let reconcile = [FileEdit {
@@ -69,14 +77,10 @@ fn cold_parse_changes(
             insert,
         })
         .collect::<Vec<_>>();
-    let (document, changes) = document
+    let (_, changes) = document
         .file_changed(&splices, create_namespace)
         .map_err(sdk::Error::invalid_input)?;
-    sink.put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
-    store_fallback_rows_fresh(
-        sink,
-        &document.row_records().map_err(sdk::Error::invalid_input)?,
-    )?;
+    sink.put_state(ID_NAMESPACE_STATE, &accepted_namespace.0[..12])?;
     emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
     Ok(())
 }
@@ -88,29 +92,42 @@ impl sdk::FileProjection for JsonPlugin {
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
-        while let Some(change) = update.row_changes.next()? {
+        while let Some(change) = update.typed_row_changes.next()? {
             changes.push(RowChange {
                 schema_key: change.schema_key,
-                row_pk: change.row_pk,
-                snapshot: change.snapshot,
+                row_pk: change.primary_key,
+                row: change.row,
                 effect: match change.effect {
                     sdk::ChangeEffect::Content => ChangeEffect::Content,
                     sdk::ChangeEffect::FormatOnly => ChangeEffect::FormatOnly,
                 },
             });
         }
+        if let Some((edits, shifts)) = sparse_semantic_changes(&update.before, &changes)? {
+            for edit in edits {
+                sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
+            }
+            if shifts.is_empty() {
+                if update.before.state_len(SCALAR_SHIFTS_STATE)?.is_some() {
+                    sink.delete_state(SCALAR_SHIFTS_STATE)?;
+                }
+            } else {
+                sink.put_state(SCALAR_SHIFTS_STATE, &encode_scalar_shifts(&shifts))?;
+            }
+            return Ok(());
+        }
         let namespace = read_namespace(&update.before, ID_NAMESPACE_STATE)?
             .or_else(|| namespace_from_changes(&changes))
             .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        let document =
-            read_fallback_document(&update.before, before.clone(), Some(update.path), namespace)?;
-        let (successor, edits) = document
+        let document = Document::open_file(before, Some(update.path), namespace)
+            .map(|(document, _)| document)
+            .map_err(sdk::Error::invalid_input)?;
+        let (_, edits) = document
             .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         for edit in edits {
             sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
         }
-        store_fallback_rows(&update.before, sink, &successor)?;
         Ok(())
     }
 
@@ -119,31 +136,28 @@ impl sdk::FileProjection for JsonPlugin {
         sink: &mut sdk::FileOutput<'_, '_>,
     ) -> sdk::Result<()> {
         let mut builder = RowImportBuilder::new();
-        let mut records = Vec::new();
-        while let Some(row) = input.rows.next()? {
+        while let Some(row) = input.typed_rows.next()? {
             let record = RowRecord {
                 schema_key: row.schema_key,
-                row_pk: row.row_pk,
-                snapshot: row.snapshot,
+                row_pk: row.primary_key,
+                row: row.row,
             };
-            builder
-                .push(record.clone())
-                .map_err(sdk::Error::invalid_input)?;
-            records.push(record);
+            builder.push(record).map_err(sdk::Error::invalid_input)?;
         }
         let (document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
-        store_fallback_rows_fresh(sink, &records)?;
+        store_scalar_state(sink, &document)?;
         sink.write(&document.bytes())
     }
 
     fn parse(input: sdk::ParseInput<'_>, sink: &mut sdk::RowOutput<'_, '_>) -> sdk::Result<()> {
+        sink.coalesce_schema_pages()?;
         let bytes = input.file.read_all()?;
         let namespace = IdNamespace::from_namespace_bytes(input.creates.namespace_bytes());
         let (document, changes) = Document::open_fresh_file(bytes, Some(input.path), namespace)
             .map_err(sdk::Error::invalid_input)?;
         sink.put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
         store_scalar_state(sink, &document)?;
-        emit_changes(changes, input.creates, sink)?;
+        emit_initial_changes(changes, input.creates, sink)?;
         Ok(())
     }
 
@@ -151,9 +165,7 @@ impl sdk::FileProjection for JsonPlugin {
         mut update: sdk::ParseChangesInput<'_>,
         sink: &mut sdk::RowChangeOutput<'_, '_>,
     ) -> sdk::Result<()> {
-        if update.before.state_len(SCALAR_INDEX_STATE)?.is_none()
-            && update.before.state_len(FALLBACK_ROWS_STATE)?.is_none()
-        {
+        if update.before.state_len(SCALAR_INDEX_STATE)?.is_none() {
             return cold_parse_changes(&mut update, sink);
         }
         let create_namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
@@ -174,8 +186,7 @@ impl sdk::FileProjection for JsonPlugin {
                 insert,
             })
             .collect::<Vec<_>>();
-        if update.before.state_len(FALLBACK_ROWS_STATE)?.is_none()
-            && update.before_path == update.after_path
+        if update.before_path == update.after_path
             && update.file_edits.iter().len() == 1
             && let Some(edit) = update.file_edits.iter().next()
             && let Some((change, shifts)) = sparse_scalar_change(&update, edit, &inserts[0])?
@@ -192,17 +203,15 @@ impl sdk::FileProjection for JsonPlugin {
         }
 
         let before_bytes = update.before.read_all()?;
-        let document = read_fallback_document(
-            &update.before,
-            before_bytes,
-            Some(update.before_path),
-            accepted_namespace,
-        )?;
-        let (document, changes) = document
+        let document =
+            Document::open_file(before_bytes, Some(update.before_path), accepted_namespace)
+                .map(|(document, _)| document)
+                .map_err(sdk::Error::invalid_input)?;
+        let (successor, changes) = document
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
-        store_fallback_rows_in_transaction(&update.before, sink, &document)?;
-        let (old_index_page_count, old_scalar_page_count) = scalar_page_counts_root(&update.before)?;
+        let (old_index_page_count, old_scalar_page_count) =
+            scalar_page_counts_root(&update.before)?;
         sink.delete_state(SCALAR_INDEX_STATE)?;
         for ordinal in 0..old_index_page_count {
             sink.delete_state(&scalar_index_page_key(ordinal))?;
@@ -211,271 +220,10 @@ impl sdk::FileProjection for JsonPlugin {
             sink.delete_state(&scalar_page_key(ordinal))?;
         }
         sink.delete_state(SCALAR_SHIFTS_STATE)?;
+        store_scalar_state(sink, &successor)?;
         emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
         Ok(())
     }
-}
-
-fn read_fallback_document(
-    root: &sdk::Snapshot<'_>,
-    accepted: Vec<u8>,
-    path: Option<&str>,
-    namespace: IdNamespace,
-) -> sdk::Result<Document> {
-    let Some(manifest) = root.get_state(FALLBACK_ROWS_STATE)? else {
-        return Document::open_file(accepted, path, namespace)
-            .map(|(document, _)| document)
-            .map_err(sdk::Error::invalid_input);
-    };
-    let (record_count, page_count) = decode_fallback_manifest(&manifest)?;
-    let mut pages = Vec::with_capacity(page_count as usize);
-    for ordinal in 0..page_count {
-        pages.push(
-            root.get_state(&fallback_row_page_key(ordinal))?
-                .ok_or_else(|| sdk::Error::invalid_input("JSON fallback page disappeared"))?,
-        );
-    }
-    let (document, _) = Document::open_rows(decode_row_records(record_count, pages)?)
-        .map_err(sdk::Error::invalid_input)?;
-    let rendered = document.bytes();
-    if rendered == accepted {
-        return Ok(document);
-    }
-    let reconcile = [FileEdit {
-        offset: 0,
-        delete_len: rendered.len() as u64,
-        insert: &accepted,
-    }];
-    document
-        .file_changed(&reconcile, namespace)
-        .map(|(document, _)| document)
-        .map_err(sdk::Error::invalid_input)
-}
-
-fn store_fallback_rows(
-    before: &sdk::Snapshot<'_>,
-    sink: &mut impl StateOutput,
-    document: &Document,
-) -> sdk::Result<()> {
-    let records = document.row_records().map_err(sdk::Error::invalid_input)?;
-    let old_page_count = fallback_row_page_count(before)?;
-    let (manifest, pages) = encode_row_records(&records)?;
-    sink.put_state(FALLBACK_ROWS_STATE, &manifest)?;
-    for (ordinal, page) in pages.iter().enumerate() {
-        sink.put_state(&fallback_row_page_key(ordinal as u32), page)?;
-    }
-    for ordinal in pages.len() as u32..old_page_count {
-        sink.delete_state(&fallback_row_page_key(ordinal))?;
-    }
-    let (index_page_count, scalar_page_count) = scalar_page_counts_root(before)?;
-    sink.delete_state(SCALAR_INDEX_STATE)?;
-    for ordinal in 0..index_page_count {
-        sink.delete_state(&scalar_index_page_key(ordinal))?;
-    }
-    for ordinal in 0..scalar_page_count {
-        sink.delete_state(&scalar_page_key(ordinal))?;
-    }
-    sink.delete_state(SCALAR_SHIFTS_STATE)?;
-    Ok(())
-}
-
-fn store_fallback_rows_in_transaction(
-    before: &sdk::Snapshot<'_>,
-    successor: &mut impl StateOutput,
-    document: &Document,
-) -> sdk::Result<()> {
-    let records = document.row_records().map_err(sdk::Error::invalid_input)?;
-    let old_page_count = fallback_row_page_count(before)?;
-    let (manifest, pages) = encode_row_records(&records)?;
-    successor.put_state(FALLBACK_ROWS_STATE, &manifest)?;
-    for (ordinal, page) in pages.iter().enumerate() {
-        successor.put_state(&fallback_row_page_key(ordinal as u32), page)?;
-    }
-    for ordinal in pages.len() as u32..old_page_count {
-        successor.delete_state(&fallback_row_page_key(ordinal))?;
-    }
-    Ok(())
-}
-
-fn store_fallback_rows_fresh(
-    successor: &mut impl StateOutput,
-    records: &[RowRecord],
-) -> sdk::Result<()> {
-    let (manifest, pages) = encode_row_records(records)?;
-    successor.put_state(FALLBACK_ROWS_STATE, &manifest)?;
-    for (ordinal, page) in pages.iter().enumerate() {
-        successor.put_state(&fallback_row_page_key(ordinal as u32), page)?;
-    }
-    Ok(())
-}
-
-fn encode_row_records(records: &[RowRecord]) -> sdk::Result<(Vec<u8>, Vec<Vec<u8>>)> {
-    let record_count = u32::try_from(records.len())
-        .map_err(|_| sdk::Error::limit_exceeded("too many JSON fallback rows"))?;
-    let mut pages = Vec::new();
-    let mut page = Vec::with_capacity(STATE_PAGE_BYTES);
-    for record in records {
-        let mut encoded = Vec::new();
-        push_text(&mut encoded, &record.schema_key)?;
-        encoded.extend_from_slice(
-            &u32::try_from(record.row_pk.len())
-                .map_err(|_| sdk::Error::limit_exceeded("too many JSON key components"))?
-                .to_le_bytes(),
-        );
-        for component in &record.row_pk {
-            push_text(&mut encoded, component)?;
-        }
-        encoded.extend_from_slice(
-            &u32::try_from(record.snapshot.len())
-                .map_err(|_| sdk::Error::limit_exceeded("JSON snapshot is too large"))?
-                .to_le_bytes(),
-        );
-        encoded.extend_from_slice(&record.snapshot);
-        push_paged_state(&mut pages, &mut page, &encoded);
-    }
-    if !page.is_empty() {
-        pages.push(page);
-    }
-    let mut manifest = Vec::with_capacity(12);
-    manifest.extend_from_slice(FALLBACK_ROWS_MAGIC);
-    manifest.extend_from_slice(&record_count.to_le_bytes());
-    manifest.extend_from_slice(
-        &u32::try_from(pages.len())
-            .map_err(|_| sdk::Error::limit_exceeded("too many JSON fallback pages"))?
-            .to_le_bytes(),
-    );
-    Ok((manifest, pages))
-}
-
-fn push_paged_state(pages: &mut Vec<Vec<u8>>, page: &mut Vec<u8>, mut bytes: &[u8]) {
-    while !bytes.is_empty() {
-        let available = STATE_PAGE_BYTES - page.len();
-        let take = available.min(bytes.len());
-        page.extend_from_slice(&bytes[..take]);
-        bytes = &bytes[take..];
-        if page.len() == STATE_PAGE_BYTES {
-            pages.push(std::mem::replace(
-                page,
-                Vec::with_capacity(STATE_PAGE_BYTES),
-            ));
-        }
-    }
-}
-
-fn decode_fallback_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32)> {
-    if bytes.len() != 12 || bytes.get(..4) != Some(FALLBACK_ROWS_MAGIC) {
-        return Err(sdk::Error::invalid_input(
-            "unsupported JSON fallback row manifest",
-        ));
-    }
-    Ok((
-        u32::from_le_bytes(bytes[4..8].try_into().expect("record count")),
-        u32::from_le_bytes(bytes[8..12].try_into().expect("page count")),
-    ))
-}
-
-fn fallback_row_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
-    root.get_state(FALLBACK_ROWS_STATE)?
-        .map(|manifest| decode_fallback_manifest(&manifest).map(|(_, pages)| pages))
-        .transpose()
-        .map(Option::unwrap_or_default)
-}
-
-fn decode_row_records(record_count: u32, pages: Vec<Vec<u8>>) -> sdk::Result<Vec<RowRecord>> {
-    let mut input = PagedStateReader::new(pages);
-    let mut records = Vec::with_capacity(record_count as usize);
-    for _ in 0..record_count {
-        let schema_key = input.text()?;
-        let component_count = input.u32()? as usize;
-        let mut row_pk = Vec::with_capacity(component_count.min(4));
-        for _ in 0..component_count {
-            row_pk.push(input.text()?);
-        }
-        let snapshot_len = input.u32()? as usize;
-        let snapshot = input.bytes(snapshot_len)?;
-        records.push(RowRecord {
-            schema_key,
-            row_pk,
-            snapshot,
-        });
-    }
-    if !input.finished() {
-        return Err(sdk::Error::invalid_input(
-            "JSON fallback state contains trailing bytes",
-        ));
-    }
-    Ok(records)
-}
-
-struct PagedStateReader {
-    pages: Vec<Vec<u8>>,
-    page: usize,
-    offset: usize,
-}
-
-impl PagedStateReader {
-    fn new(pages: Vec<Vec<u8>>) -> Self {
-        Self {
-            pages,
-            page: 0,
-            offset: 0,
-        }
-    }
-
-    fn bytes(&mut self, mut length: usize) -> sdk::Result<Vec<u8>> {
-        let mut output = Vec::with_capacity(length);
-        while length > 0 {
-            let page = self
-                .pages
-                .get(self.page)
-                .ok_or_else(|| sdk::Error::invalid_input("JSON fallback state is truncated"))?;
-            let available = page.len().saturating_sub(self.offset);
-            if available == 0 {
-                self.page += 1;
-                self.offset = 0;
-                continue;
-            }
-            let take = available.min(length);
-            output.extend_from_slice(&page[self.offset..self.offset + take]);
-            self.offset += take;
-            length -= take;
-        }
-        Ok(output)
-    }
-
-    fn u32(&mut self) -> sdk::Result<u32> {
-        Ok(u32::from_le_bytes(
-            self.bytes(4)?
-                .try_into()
-                .expect("paged reader returned four bytes"),
-        ))
-    }
-
-    fn text(&mut self) -> sdk::Result<String> {
-        let length = self.u32()? as usize;
-        String::from_utf8(self.bytes(length)?)
-            .map_err(|_| sdk::Error::invalid_input("JSON fallback text is not UTF-8"))
-    }
-
-    fn finished(&self) -> bool {
-        match self.pages.get(self.page) {
-            None => true,
-            Some(page) => {
-                self.offset == page.len()
-                    && self
-                        .pages
-                        .iter()
-                        .skip(self.page.saturating_add(1))
-                        .all(Vec::is_empty)
-            }
-        }
-    }
-}
-
-fn fallback_row_page_key(ordinal: u32) -> Vec<u8> {
-    let mut key = b"json/fallback-row-page/".to_vec();
-    key.extend_from_slice(&ordinal.to_le_bytes());
-    key
 }
 
 fn read_namespace(root: &sdk::Snapshot<'_>, key: &[u8]) -> sdk::Result<Option<IdNamespace>> {
@@ -496,8 +244,16 @@ fn read_namespace(root: &sdk::Snapshot<'_>, key: &[u8]) -> sdk::Result<Option<Id
 fn namespace_from_changes(changes: &[RowChange]) -> Option<IdNamespace> {
     changes
         .iter()
-        .flat_map(|change| &change.row_pk)
-        .find_map(|component| uuid::Uuid::parse_str(component).ok())
+        .find_map(|change| namespace_from_row_pk(&change.row_pk))
+}
+
+fn namespace_from_row_pk(row_pk: &[sdk::TypedValue]) -> Option<IdNamespace> {
+    row_pk
+        .iter()
+        .find_map(|component| match component {
+            sdk::TypedValue::Uuid(value) => Some(*value),
+            _ => None,
+        })
         .map(|id| {
             let bytes = id.into_bytes();
             IdNamespace::from_halves(
@@ -670,6 +426,95 @@ fn sparse_scalar_change(
     Ok(Some((change, encode_scalar_shifts(&shifts))))
 }
 
+fn sparse_semantic_changes(
+    before: &sdk::Snapshot<'_>,
+    changes: &[RowChange],
+) -> sdk::Result<Option<(Vec<core::ByteEdit>, Vec<(u32, i64)>)>> {
+    let Some(header) = before.read_state_range(SCALAR_INDEX_STATE, 0, SCALAR_INDEX_HEADER_BYTES)?
+    else {
+        return Ok(None);
+    };
+    if header.get(..4) != Some(SCALAR_INDEX_MAGIC) {
+        return Err(sdk::Error::invalid_input("unsupported JSON scalar index"));
+    }
+    let count = u32::from_le_bytes(header[4..8].try_into().expect("scalar count"));
+    let mut shifts = decode_scalar_shifts(
+        before
+            .get_state(SCALAR_SHIFTS_STATE)?
+            .as_deref()
+            .unwrap_or_default(),
+    )?;
+    let base_shifts = shifts.clone();
+    let mut edits = Vec::with_capacity(changes.len());
+    for change in changes {
+        let mut matched = None;
+        for ordinal in 0..count {
+            let entry = read_scalar_entry_root(before, ordinal)?;
+            let bytes = before
+                .read_state_range(
+                    &scalar_page_key(entry.page),
+                    u64::from(entry.blob_offset),
+                    entry.blob_len,
+                )?
+                .ok_or_else(|| sdk::Error::invalid_input("JSON scalar page disappeared"))?;
+            let metadata = decode_scalar_metadata(&bytes)?;
+            let schema_key = match metadata.relation {
+                ArenaJsonRelation::Snapshot => ROOT_SCHEMA_KEY,
+                ArenaJsonRelation::Object => OBJECT_MEMBER_SCHEMA_KEY,
+                ArenaJsonRelation::Array => ARRAY_ITEM_SCHEMA_KEY,
+            };
+            if schema_key == change.schema_key.as_ref() && metadata.row_pk == change.row_pk {
+                matched = Some((ordinal, entry, metadata));
+                break;
+            }
+        }
+        let Some((ordinal, entry, mut metadata)) = matched else {
+            return Err(sdk::Error::invalid_input(format!(
+                "JSON scalar index has no semantic row {}.{:?}; JSON semantic writes support existing scalar values only",
+                change.schema_key, change.row_pk,
+            )));
+        };
+        let start = effective_scalar_start(entry.start, ordinal, &base_shifts)?;
+        let length = effective_scalar_length(entry.length, ordinal, &base_shifts)?;
+        metadata.start = u32::try_from(start)
+            .map_err(|_| sdk::Error::invalid_input("JSON scalar start exceeds u32"))?;
+        metadata.length = u32::try_from(length)
+            .map_err(|_| sdk::Error::invalid_input("JSON scalar length exceeds u32"))?;
+        let current = before.read_range(start, length)?;
+        let Some(edit) =
+            Document::scalar_edit_from_arena(metadata, &current, change).map_err(|error| {
+                sdk::Error::invalid_input(format!(
+                    "JSON indexed semantic row {}.{:?}: {error}",
+                    change.schema_key, change.row_pk
+                ))
+            })?
+        else {
+            continue;
+        };
+        let insert_len = i64::try_from(edit.insert.len())
+            .map_err(|_| sdk::Error::limit_exceeded("JSON scalar insert exceeds i64"))?;
+        let delete_len = i64::try_from(edit.delete_len)
+            .map_err(|_| sdk::Error::limit_exceeded("JSON scalar deletion exceeds i64"))?;
+        let delta = insert_len - delete_len;
+        if delta != 0 {
+            match shifts.binary_search_by_key(&ordinal, |(changed, _)| *changed) {
+                Ok(index) => {
+                    shifts[index].1 = shifts[index].1.checked_add(delta).ok_or_else(|| {
+                        sdk::Error::limit_exceeded("JSON scalar shift exceeds i64")
+                    })?;
+                    if shifts[index].1 == 0 {
+                        shifts.remove(index);
+                    }
+                }
+                Err(index) => shifts.insert(index, (ordinal, delta)),
+            }
+        }
+        edits.push(edit);
+    }
+    edits.sort_unstable_by_key(|edit| edit.offset);
+    Ok(Some((edits, shifts)))
+}
+
 struct EncodedScalarState {
     manifest: Vec<u8>,
     index_pages: Vec<Vec<u8>>,
@@ -749,8 +594,13 @@ fn encode_scalar_state(scalars: &[ArenaJsonScalar]) -> sdk::Result<EncodedScalar
 fn encode_scalar_metadata(scalar: &ArenaJsonScalar) -> sdk::Result<Vec<u8>> {
     let mut output = Vec::new();
     match (scalar.relation, scalar.row_pk.as_slice()) {
-        (ArenaJsonRelation::Snapshot, [id]) if id == "root" => output.push(0),
-        (ArenaJsonRelation::Object, [parent_id, key]) => {
+        (ArenaJsonRelation::Snapshot, [sdk::TypedValue::Text(id)]) if id == "root" => {
+            output.push(0)
+        }
+        (
+            ArenaJsonRelation::Object,
+            [sdk::TypedValue::Text(parent_id), sdk::TypedValue::Text(key)],
+        ) => {
             output.push(1);
             push_state_bytes(&mut output, parent_id.as_bytes())?;
             push_state_bytes(&mut output, key.as_bytes())?;
@@ -765,9 +615,9 @@ fn encode_scalar_metadata(scalar: &ArenaJsonScalar) -> sdk::Result<Vec<u8>> {
                     .as_bytes(),
             )?;
         }
-        (ArenaJsonRelation::Array, [id]) => {
+        (ArenaJsonRelation::Array, [sdk::TypedValue::Uuid(id)]) => {
             output.push(2);
-            push_state_bytes(&mut output, id.as_bytes())?;
+            output.extend_from_slice(id.as_bytes());
             push_state_bytes(
                 &mut output,
                 scalar
@@ -817,22 +667,28 @@ fn decode_scalar_metadata(bytes: &[u8]) -> sdk::Result<ArenaJsonScalar> {
     let (relation, row_pk, parent_id, order_key) = match relation {
         0 => (
             ArenaJsonRelation::Snapshot,
-            vec!["root".to_owned()],
+            vec![sdk::TypedValue::Text("root".to_owned())],
             None,
             None,
         ),
         1 => (
             ArenaJsonRelation::Object,
-            vec![take_state_text(&mut input)?, take_state_text(&mut input)?],
+            vec![
+                sdk::TypedValue::Text(take_state_text(&mut input)?),
+                sdk::TypedValue::Text(take_state_text(&mut input)?),
+            ],
             None,
             Some(take_state_text(&mut input)?),
         ),
-        2 => (
-            ArenaJsonRelation::Array,
-            vec![take_state_text(&mut input)?],
-            Some(take_state_text(&mut input)?),
-            Some(take_state_text(&mut input)?),
-        ),
+        2 => {
+            let id = take_state_uuid(&mut input)?;
+            (
+                ArenaJsonRelation::Array,
+                vec![sdk::TypedValue::Uuid(id)],
+                Some(take_state_text(&mut input)?),
+                Some(take_state_text(&mut input)?),
+            )
+        }
         _ => {
             return Err(sdk::Error::invalid_input(
                 "unsupported JSON scalar relation",
@@ -888,6 +744,10 @@ fn read_scalar_entry(
     update: &sdk::ParseChangesInput<'_>,
     ordinal: u32,
 ) -> sdk::Result<ScalarEntry> {
+    read_scalar_entry_root(&update.before, ordinal)
+}
+
+fn read_scalar_entry_root(root: &sdk::Snapshot<'_>, ordinal: u32) -> sdk::Result<ScalarEntry> {
     let entries_per_page = u32::try_from(STATE_PAGE_BYTES / SCALAR_INDEX_ENTRY_BYTES as usize)
         .expect("scalar index page capacity fits u32");
     let page = ordinal / entries_per_page;
@@ -895,8 +755,7 @@ fn read_scalar_entry(
     let offset = u64::from(page_ordinal)
         .checked_mul(u64::from(SCALAR_INDEX_ENTRY_BYTES))
         .ok_or_else(|| sdk::Error::invalid_input("JSON scalar index offset overflowed"))?;
-    let bytes = update
-        .before
+    let bytes = root
         .read_state_range(
             &scalar_index_page_key(page),
             offset,
@@ -1037,6 +896,16 @@ fn take_state_text(input: &mut &[u8]) -> sdk::Result<String> {
         .map_err(|error| sdk::Error::invalid_input(format!("invalid JSON scalar state: {error}")))
 }
 
+fn take_state_uuid(input: &mut &[u8]) -> sdk::Result<uuid::Uuid> {
+    let bytes: [u8; 16] = input
+        .get(..16)
+        .ok_or_else(|| sdk::Error::invalid_input("truncated JSON scalar UUID"))?
+        .try_into()
+        .expect("sixteen-byte UUID field");
+    *input = &input[16..];
+    Ok(uuid::Uuid::from_bytes(bytes))
+}
+
 fn emit_changes<I>(
     changes: I,
     creates: sdk::CreateContext,
@@ -1047,31 +916,53 @@ where
 {
     for change in changes {
         let change = change.map_err(sdk::Error::invalid_input)?;
-        match change.snapshot {
-            Some(snapshot) => {
-                let local_ref = change
-                    .row_pk
-                    .first()
-                    .filter(|_| change.row_pk.len() == 1)
-                    .and_then(|id| local_ref(creates, id));
-                if let Some(local_ref) = local_ref {
-                    sink.create(&change.schema_key, local_ref, &snapshot)?;
-                } else {
-                    sink.upsert(
-                        &change.schema_key,
-                        &change.row_pk,
-                        &snapshot,
-                        match change.effect {
-                            ChangeEffect::Content => sdk::ChangeEffect::Content,
-                            ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
-                        },
-                    )?;
-                }
-            }
-            None => sink.delete(&change.schema_key, &change.row_pk)?,
-        }
+        emit_change(change, creates, sink)?;
     }
     Ok(())
+}
+
+fn emit_initial_changes<I>(
+    changes: I,
+    creates: sdk::CreateContext,
+    sink: &mut sdk::RowOutput<'_, '_>,
+) -> sdk::Result<()>
+where
+    I: IntoIterator<Item = Result<RowChange, String>>,
+{
+    for change in changes {
+        emit_change(change.map_err(sdk::Error::invalid_input)?, creates, sink)?;
+    }
+    Ok(())
+}
+
+fn emit_change(
+    change: RowChange,
+    creates: sdk::CreateContext,
+    sink: &mut impl MutationOutput,
+) -> sdk::Result<()> {
+    match change.row {
+        Some(row) => {
+            let local_ref = change
+                .row_pk
+                .first()
+                .filter(|_| change.row_pk.len() == 1)
+                .and_then(|id| local_ref(creates, id));
+            if let Some(local_ref) = local_ref {
+                sink.create(&change.schema_key, local_ref, &row)
+            } else {
+                sink.upsert(
+                    &change.schema_key,
+                    change.row_pk,
+                    &row,
+                    match change.effect {
+                        ChangeEffect::Content => sdk::ChangeEffect::Content,
+                        ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
+                    },
+                )
+            }
+        }
+        None => sink.delete(&change.schema_key, change.row_pk),
+    }
 }
 
 trait StateOutput {
@@ -1096,43 +987,89 @@ impl_state_output!(sdk::FileOutput<'_, '_>);
 impl_state_output!(sdk::FileEditOutput<'_, '_>);
 
 trait MutationOutput {
-    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()>;
+    fn create(&mut self, schema_key: &str, local_ref: u32, row: &sdk::TypedRow) -> sdk::Result<()>;
     fn upsert(
         &mut self,
         schema_key: &str,
-        row_pk: &[String],
-        snapshot: &[u8],
+        row_pk: Vec<sdk::TypedValue>,
+        row: &sdk::TypedRow,
         effect: sdk::ChangeEffect,
     ) -> sdk::Result<()>;
-    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()>;
+    fn delete(&mut self, schema_key: &str, row_pk: Vec<sdk::TypedValue>) -> sdk::Result<()>;
 }
 impl MutationOutput for sdk::RowOutput<'_, '_> {
-    fn create(&mut self, s: &str, l: u32, v: &[u8]) -> sdk::Result<()> {
-        self.create(s, l, v)
+    fn create(&mut self, s: &str, l: u32, row: &sdk::TypedRow) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(s)?;
+        self.create(schema_key, fingerprint, l, row)
     }
-    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], _: sdk::ChangeEffect) -> sdk::Result<()> {
-        self.upsert(s, k, v)
+    fn upsert(
+        &mut self,
+        s: &str,
+        k: Vec<sdk::TypedValue>,
+        row: &sdk::TypedRow,
+        _: sdk::ChangeEffect,
+    ) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(s)?;
+        self.upsert(schema_key, fingerprint, k, row)
     }
-    fn delete(&mut self, _: &str, _: &[String]) -> sdk::Result<()> {
+    fn delete(&mut self, _: &str, _: Vec<sdk::TypedValue>) -> sdk::Result<()> {
         Err(sdk::Error::invalid_input(
             "initial JSON parse produced a deletion",
         ))
     }
 }
 impl MutationOutput for sdk::RowChangeOutput<'_, '_> {
-    fn create(&mut self, s: &str, l: u32, v: &[u8]) -> sdk::Result<()> {
-        self.create(s, l, v)
+    fn create(&mut self, s: &str, l: u32, row: &sdk::TypedRow) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(s)?;
+        self.create(schema_key, fingerprint, l, row)
     }
-    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], e: sdk::ChangeEffect) -> sdk::Result<()> {
-        self.upsert(s, k, v, e)
+    fn upsert(
+        &mut self,
+        s: &str,
+        k: Vec<sdk::TypedValue>,
+        row: &sdk::TypedRow,
+        e: sdk::ChangeEffect,
+    ) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(s)?;
+        self.upsert(schema_key, fingerprint, k, row, e)
     }
-    fn delete(&mut self, s: &str, k: &[String]) -> sdk::Result<()> {
-        self.delete(s, k)
+    fn delete(&mut self, s: &str, k: Vec<sdk::TypedValue>) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(s)?;
+        self.delete(schema_key, fingerprint, k)
     }
 }
 
-fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
-    let id = uuid::Uuid::parse_str(id).ok()?;
+fn typed_schema(schema_key: &str) -> sdk::Result<(&'static str, [u8; 32])> {
+    let (schema_key, schema_json, fingerprint) = match schema_key {
+        "json_root" => ("json_root", ROOT_SCHEMA_JSON, &ROOT_SCHEMA_FINGERPRINT),
+        "json_object_member" => (
+            "json_object_member",
+            OBJECT_MEMBER_SCHEMA_JSON,
+            &OBJECT_MEMBER_SCHEMA_FINGERPRINT,
+        ),
+        "json_array_item" => (
+            "json_array_item",
+            ARRAY_ITEM_SCHEMA_JSON,
+            &ARRAY_ITEM_SCHEMA_FINGERPRINT,
+        ),
+        _ => {
+            return Err(sdk::Error::invalid_input(format!(
+                "JSON plugin does not support schema '{schema_key}'"
+            )));
+        }
+    };
+    Ok((
+        schema_key,
+        *fingerprint.get_or_init(|| {
+            sdk::schema_fingerprint(schema_json).expect("embedded JSON schema must be valid")
+        }),
+    ))
+}
+
+fn local_ref(creates: sdk::CreateContext, id: &sdk::TypedValue) -> Option<u32> {
+    let sdk::TypedValue::Uuid(id) = id else {
+        return None;
+    };
     let bytes = id.as_bytes();
     if bytes[..12] != creates.namespace_bytes() {
         return None;
@@ -1176,7 +1113,7 @@ mod tests {
             start: 0,
             length: 4,
             relation: ArenaJsonRelation::Snapshot,
-            row_pk: vec!["root".to_owned()],
+            row_pk: vec![sdk::TypedValue::Text("root".to_owned())],
             parent_id: None,
             order_key: None,
             prefix_json: None,
@@ -1198,34 +1135,189 @@ mod tests {
     }
 
     #[test]
-    fn fallback_rows_roundtrip_across_bounded_state_pages() {
-        let records = (0..16_000)
-            .map(|ordinal| RowRecord {
-                schema_key: "json_object_member".to_owned(),
-                row_pk: vec!["root".to_owned(), format!("key-{ordinal}")],
-                snapshot: vec![b'x'; 128],
-            })
-            .collect::<Vec<_>>();
+    fn scalar_arena_change_carries_native_jsonb() {
+        let metadata = ArenaJsonScalar {
+            start: 0,
+            length: 1,
+            relation: ArenaJsonRelation::Snapshot,
+            row_pk: vec![sdk::TypedValue::Text("root".to_owned())],
+            parent_id: None,
+            order_key: None,
+            prefix_json: None,
+            suffix_json: None,
+            empty_json: None,
+        };
 
-        let (manifest, pages) = encode_row_records(&records).expect("large fallback state");
-        let (record_count, page_count) =
-            decode_fallback_manifest(&manifest).expect("fallback manifest");
-        assert!(pages.len() > 1);
-        assert_eq!(page_count as usize, pages.len());
-        assert!(pages.iter().all(|page| page.len() <= STATE_PAGE_BYTES));
+        let change = Document::scalar_change_from_arena(metadata, b"1")
+            .expect("valid scalar")
+            .expect("scalar change");
         assert_eq!(
-            decode_row_records(record_count, pages).expect("paged fallback roundtrip"),
-            records
+            change.row.and_then(|row| row.get("scalar_json").cloned()),
+            Some(sdk::TypedValue::Jsonb(serde_json::json!(1).into()))
         );
     }
 
     #[test]
-    fn scalar_sparse_path_falls_back_when_edit_adds_a_sibling() {
+    fn scalar_state_preserves_native_uuid_identity() {
+        let id = uuid::Uuid::from_u128(0x1234);
+        let scalar = ArenaJsonScalar {
+            start: 7,
+            length: 4,
+            relation: ArenaJsonRelation::Array,
+            row_pk: vec![sdk::TypedValue::Uuid(id)],
+            parent_id: Some("root".to_owned()),
+            order_key: Some("01".to_owned()),
+            prefix_json: Some(" ".to_owned()),
+            suffix_json: None,
+            empty_json: None,
+        };
+
+        let encoded = encode_scalar_metadata(&scalar).expect("typed scalar metadata");
+        let decoded = decode_scalar_metadata(&encoded).expect("typed scalar metadata roundtrip");
+        assert_eq!(decoded.row_pk, vec![sdk::TypedValue::Uuid(id)]);
+        assert_eq!(decoded.relation, ArenaJsonRelation::Array);
+        assert_eq!(decoded.parent_id.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn nested_document_emits_every_typed_row() {
+        let source = br#"{"profile":{"name":"Ada","active":true},"items":[{"label":"one"},{"label":"two"}]}"#.to_vec();
+        let (document, _) =
+            Document::open_fresh_file(source, Some("nested.json"), IdNamespace::from_halves(1, 2))
+                .expect("nested JSON document");
+        let rows = document.row_records().expect("nested typed rows");
+
+        assert_eq!(rows.len(), 9);
+        let name = rows
+            .iter()
+            .find(|record| record.row.get("key") == Some(&sdk::TypedValue::Text("name".to_owned())))
+            .expect("nested name row");
+        assert!(matches!(
+            name.row_pk.as_slice(),
+            [sdk::TypedValue::Text(_), sdk::TypedValue::Text(key)] if key == "name"
+        ));
+        assert_eq!(
+            name.row.get("scalar_json"),
+            Some(&sdk::TypedValue::Jsonb(serde_json::json!("Ada").into()))
+        );
+    }
+
+    #[test]
+    fn ten_mib_flat_document_streams_all_native_jsonb_rows() {
+        use std::io::Write as _;
+
+        const BYTES: usize = 10 * 1024 * 1024;
+        const PROPERTIES: usize = 4_096;
+        let mut source = Vec::with_capacity(BYTES);
+        source.push(b'{');
+        let fixed_bytes = 2 + PROPERTIES * 12 + PROPERTIES.saturating_sub(1);
+        let padding = BYTES - fixed_bytes;
+        for index in 0..PROPERTIES {
+            if index > 0 {
+                source.push(b',');
+            }
+            write!(&mut source, "\"p{index:06}\":\"").expect("write property prefix");
+            let property_padding = padding / PROPERTIES + usize::from(index < padding % PROPERTIES);
+            source.extend(std::iter::repeat_n(b'x', property_padding));
+            source.push(b'"');
+        }
+        source.push(b'}');
+        assert_eq!(source.len(), BYTES);
+
+        let (_, changes) =
+            Document::open_fresh_file(source, Some("large.json"), IdNamespace::from_halves(1, 2))
+                .expect("large JSON document");
+        let mut rows = 0usize;
+        for change in changes {
+            let change = change.expect("large typed row");
+            if rows > 0 {
+                assert!(matches!(
+                    change.row.as_ref().and_then(|row| row.get("scalar_json")),
+                    Some(sdk::TypedValue::Jsonb(value))
+                        if matches!(value.as_value(), serde_json::Value::String(_))
+                ));
+            }
+            rows += 1;
+        }
+        assert_eq!(rows, PROPERTIES + 1);
+    }
+
+    #[test]
+    fn typed_rows_roundtrip_native_jsonb_scalars() {
+        let source = br#"{"number":1,"boolean":true,"null":null,"string":"value"}"#.to_vec();
+        let (document, _) = Document::open_fresh_file(
+            source.clone(),
+            Some("document.json"),
+            IdNamespace::from_halves(1, 2),
+        )
+        .expect("valid JSON document");
+        let records = document.row_records().expect("typed rows");
+
+        for (key, expected) in [
+            ("number", serde_json::json!(1)),
+            ("boolean", serde_json::json!(true)),
+            ("null", serde_json::Value::Null),
+            ("string", serde_json::json!("value")),
+        ] {
+            let row = records
+                .iter()
+                .find(|record| {
+                    record.row.get("key") == Some(&sdk::TypedValue::Text(key.to_owned()))
+                })
+                .unwrap_or_else(|| panic!("missing row for {key}"));
+            assert_eq!(
+                row.row.get("scalar_json"),
+                Some(&sdk::TypedValue::Jsonb(expected.into()))
+            );
+        }
+
+        let (roundtrip, _) = Document::open_rows(records).expect("valid typed rows");
+        assert_eq!(roundtrip.bytes(), source);
+    }
+
+    #[test]
+    fn semantic_scalar_write_consumes_native_jsonb() {
+        let source = br#"{"value":1}"#.to_vec();
+        let (document, _) = Document::open_file(
+            source,
+            Some("document.json"),
+            IdNamespace::from_halves(1, 2),
+        )
+        .expect("valid JSON document");
+        let mut record = document
+            .row_records()
+            .expect("typed rows")
+            .into_iter()
+            .find(|record| record.schema_key.as_ref() == "json_object_member")
+            .expect("object member row");
+        record.row.insert(
+            "scalar_json".to_owned(),
+            sdk::TypedValue::Jsonb(serde_json::json!(2).into()),
+        );
+        let change = RowChange {
+            schema_key: record.schema_key,
+            row_pk: record.row_pk,
+            row: Some(record.row),
+            effect: ChangeEffect::Content,
+        };
+
+        let (_, edits) = document.rows_changed(&[change]).expect("semantic write");
+        assert_eq!(
+            apply_edits(document.bytes(), &edits).expect("valid edits"),
+            br#"{"value":2}"#
+        );
+    }
+
+    #[test]
+    fn scalar_sparse_path_defers_to_complete_document_when_edit_adds_a_sibling() {
         let metadata = ArenaJsonScalar {
             start: 5,
             length: 1,
             relation: ArenaJsonRelation::Object,
-            row_pk: vec!["root".to_owned(), "a".to_owned()],
+            row_pk: vec![
+                sdk::TypedValue::Text("root".to_owned()),
+                sdk::TypedValue::Text("a".to_owned()),
+            ],
             parent_id: None,
             order_key: Some("80".to_owned()),
             prefix_json: Some("\"a\":".to_owned()),

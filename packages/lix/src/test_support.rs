@@ -44,6 +44,32 @@ fn test_change_id(value: &str) -> ChangeId {
     ChangeId::for_test_label(value)
 }
 
+#[cfg(any(test, feature = "storage-benches"))]
+fn test_decoded_snapshot(
+    schema_key: &str,
+    row_pk: &crate::row_pk::RowPk,
+    snapshot_content: Option<&str>,
+) -> Option<std::sync::Arc<crate::plugin::runtime::WasmTypedRow>> {
+    let snapshot: serde_json::Value = serde_json::from_str(snapshot_content?).ok()?;
+    let typed =
+        crate::plugin::runtime::WasmTypedRow::from_builtin_json(schema_key, row_pk, &snapshot)
+            .or_else(|_| {
+                crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(row_pk, &snapshot)
+            })
+            .ok()?;
+    Some(std::sync::Arc::new(typed))
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+fn test_snapshot(
+    schema_key: &str,
+    row_pk: &crate::row_pk::RowPk,
+    snapshot_content: Option<&str>,
+) -> Option<Vec<u8>> {
+    test_decoded_snapshot(schema_key, row_pk, snapshot_content)
+        .and_then(|typed| typed.durable_payload().ok().map(|payload| payload.to_vec()))
+}
+
 /// Seeds a branch head and matching tracked root for unit tests.
 ///
 /// A branch ref that points at a commit without a tracked root is invalid for
@@ -92,8 +118,13 @@ pub(crate) async fn seed_branch_head_with_rows(
     let branch_ref_snapshot = serde_json::json!({
         "id": branch_id,
         "commit_id": commit_id,
-    })
-    .to_string();
+    });
+    let branch_ref_typed = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+        crate::branch::BRANCH_REF_SCHEMA_KEY,
+        &branch_ref_row_pk,
+        &branch_ref_snapshot,
+    )
+    .expect("embedded branch-ref schema should encode test row");
     {
         let mut changelog_read = &mut read;
         ChangelogContext::new()
@@ -106,8 +137,13 @@ pub(crate) async fn seed_branch_head_with_rows(
                     row_pk: branch_ref_row_pk.clone(),
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    snapshot: crate::json_store::JsonSlot::from_json(&branch_ref_snapshot),
-                    metadata: crate::json_store::JsonSlot::None,
+                    metadata: None,
+                    snapshot: Some(
+                        branch_ref_typed
+                            .durable_payload()
+                            .expect("branch-ref payload should encode")
+                            .to_vec(),
+                    ),
                     created_at: test_timestamp(),
                     origin_key: None,
                 }],
@@ -119,21 +155,28 @@ pub(crate) async fn seed_branch_head_with_rows(
     let snapshots = rows
         .iter()
         .map(|row| {
-            row.snapshot_content.as_deref().map_or(
-                crate::json_store::JsonSlot::None,
-                crate::json_store::JsonSlot::from_json,
+            test_decoded_snapshot(
+                &row.schema_key,
+                &row.row_pk,
+                row.snapshot_content.as_deref(),
             )
+            .map(|typed| {
+                typed
+                    .durable_payload()
+                    .expect("test snapshot should encode")
+                    .to_vec()
+            })
         })
         .collect::<Vec<_>>();
     let metadata = rows
         .iter()
         .map(|row| {
-            row.metadata
-                .as_ref()
-                .map_or(crate::json_store::JsonSlot::None, |value| {
-                    let serialized = crate::serialize_row_metadata(value);
-                    crate::json_store::JsonSlot::from_json(&serialized)
-                })
+            row.metadata.as_ref().map(|value| {
+                lix_schema::Jsonb::from_value(
+                    serde_json::from_str(&crate::serialize_row_metadata(value))
+                        .expect("test metadata should parse"),
+                )
+            })
         })
         .collect::<Vec<_>>();
     let deltas = rows
@@ -150,8 +193,8 @@ pub(crate) async fn seed_branch_head_with_rows(
             deleted: row.deleted,
             created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.created_at),
             updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),
-            snapshot: snapshot.as_ref_slot(),
-            metadata: metadata.as_ref_slot(),
+            snapshot: snapshot.as_deref(),
+            metadata: metadata.as_ref(),
             columnar_base_coordinate: None,
         })
         .collect::<Vec<_>>();
@@ -164,7 +207,6 @@ pub(crate) async fn seed_branch_head_with_rows(
             commit_id,
             &deltas,
             &BTreeSet::new(),
-            None,
             None,
             None,
             &mut working_diff_coverage,
@@ -274,8 +316,8 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
             let change = &changes[*row_index];
             TrackedStateCommitDeltaRef {
                 delta,
-                snapshot: change.snapshot.as_ref_slot(),
-                metadata: change.metadata.as_ref_slot(),
+                metadata: change.metadata.as_ref(),
+                snapshot: change.snapshot.as_deref(),
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
@@ -357,8 +399,8 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
             let change = &changes[*row_index];
             TrackedStateCommitDeltaRef {
                 delta,
-                snapshot: change.snapshot.as_ref_slot(),
-                metadata: change.metadata.as_ref_slot(),
+                metadata: change.metadata.as_ref(),
+                snapshot: change.snapshot.as_deref(),
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
@@ -427,8 +469,8 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             let change = &changes[*row_index];
             TrackedStateCommitDeltaRef {
                 delta,
-                snapshot: change.snapshot.as_ref_slot(),
-                metadata: change.metadata.as_ref_slot(),
+                metadata: change.metadata.as_ref(),
+                snapshot: change.snapshot.as_deref(),
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
@@ -742,8 +784,7 @@ struct TestStagedChangelogCommit {
 fn final_state_row_winner_indices(
     rows: &[MaterializedTrackedStateRow],
 ) -> Result<Vec<usize>, crate::LixError> {
-    let mut winners =
-        BTreeMap::<(String, Option<String>, crate::row_pk::RowPk), usize>::new();
+    let mut winners = BTreeMap::<(String, Option<String>, crate::row_pk::RowPk), usize>::new();
     for (index, row) in rows.iter().enumerate() {
         winners.insert(
             (
@@ -760,14 +801,9 @@ fn final_state_row_winner_indices(
 }
 
 fn json_payloads_from_materialized(row: &MaterializedTrackedStateRow) -> Vec<(JsonRef, String)> {
-    // Mirror production staging: only payloads above the inline threshold
-    // get json_store rows.
+    // Native row payloads never enter json_store. Metadata remains an
+    // independently encoded JSON boundary.
     let mut payloads = Vec::new();
-    if let Some(snapshot) = row.snapshot_content.as_deref() {
-        if snapshot.len() > crate::json_store::JSON_INLINE_MAX_BYTES {
-            payloads.push((prepare_json_ref(snapshot), snapshot.to_string()));
-        }
-    }
     if let Some(metadata) = row.metadata.as_ref() {
         let serialized = crate::serialize_row_metadata(metadata);
         if serialized.len() > crate::json_store::JSON_INLINE_MAX_BYTES {
@@ -793,7 +829,6 @@ fn stage_json_payloads(
     Ok(())
 }
 
-#[expect(clippy::unnecessary_wraps)]
 pub(crate) fn tracked_change_from_materialized(
     row: &MaterializedTrackedStateRow,
 ) -> Result<ChangeRecord, crate::LixError> {
@@ -804,19 +839,30 @@ pub(crate) fn tracked_change_from_materialized(
         row_pk: row.row_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        snapshot: row
-            .snapshot_content
-            .as_deref()
-            .map_or(crate::json_store::JsonSlot::None, |content| {
-                crate::json_store::JsonSlot::from_json(content)
-            }),
-        metadata: row
-            .metadata
-            .as_ref()
-            .map_or(crate::json_store::JsonSlot::None, |value| {
-                let serialized = crate::serialize_row_metadata(value);
-                crate::json_store::JsonSlot::from_json(&serialized)
-            }),
+        snapshot: if row.deleted {
+            None
+        } else if let Some(typed) = row.decoded_snapshot.as_deref() {
+            Some(
+                typed
+                    .durable_payload()
+                    .map_err(|error| {
+                        crate::LixError::unknown(format!("test typed payload: {error:?}"))
+                    })?
+                    .to_vec(),
+            )
+        } else {
+            test_snapshot(
+                &row.schema_key,
+                &row.row_pk,
+                row.snapshot_content.as_deref(),
+            )
+        },
+        metadata: row.metadata.as_ref().map(|value| {
+            let serialized = crate::serialize_row_metadata(value);
+            lix_schema::Jsonb::from_value(
+                serde_json::from_str(&serialized).expect("serialized row metadata is valid JSON"),
+            )
+        }),
         created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.updated_at),
         origin_key: None,
     })

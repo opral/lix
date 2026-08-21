@@ -1,4 +1,4 @@
-package lix:plugin@1.0.0;
+package lix:plugin@2.0.0;
 
 interface host {
   type bytes = list<u8>;
@@ -28,15 +28,13 @@ interface host {
   /// One bounded, self-describing page of row mutations.
   record row-page {
     payload: bytes,
+    /// Large typed values are carried out-of-band from the page descriptor.
+    /// Payload records reference these page-local attachments by ordinal.
+    attachments: list<bytes>,
   }
 
   resource row-source {
     next-page: func(max-bytes: u32) -> result<option<row-page>, host-error>;
-    read-attachment: func(
-      ordinal: u32,
-      offset: u64,
-      length: u32,
-    ) -> result<option<bytes>, host-error>;
   }
 
   record file-edit {
@@ -53,9 +51,6 @@ interface host {
     delete-state: func(key: bytes) -> result<_, host-error>;
     emit-rows: func(page: row-page) -> result<_, host-error>;
     replace-all-rows: func() -> result<_, host-error>;
-    begin-row-attachment: func(total-length: u64) -> result<u32, host-error>;
-    write-row-attachment: func(chunk: bytes) -> result<_, host-error>;
-    finish-row-attachment: func() -> result<_, host-error>;
     emit-file-edit: func(edit: file-edit) -> result<_, host-error>;
     begin-file-replacement: func(total-length: u64) -> result<_, host-error>;
     write-file-replacement: func(chunk: bytes) -> result<_, host-error>;
@@ -71,7 +66,10 @@ interface host {
   record column-merge-meta {
     ordinal: u32,
     schema-key: string,
-    row-pk: list<string>,
+    /// Each primary-key component is one Schema v1 value encoded by the
+    /// canonical typed-value codec, never a lossy textual identity.
+    primary-key: list<bytes>,
+    schema-fingerprint: list<u8>,
     file-id: option<string>,
     column: string,
     base-len: option<u64>,
@@ -92,12 +90,14 @@ interface host {
       offset: u64,
       length: u32,
     ) -> result<option<bytes>, host-error>;
+    /// The range contains canonical typed-value bytes.
     read-row: func(
       index: u32,
       side: merge-side,
       offset: u64,
       length: u32,
     ) -> result<bytes, host-error>;
+    /// The range contains one canonical typed-row encoding.
   }
 
   /// Ordered column merge results. Omitted results are invalid; `use-lww`
@@ -141,8 +141,8 @@ interface types {
     after-path: string,
     before: own<snapshot>,
     file-edits: list<file-edit>,
-    /// Cold execution receives current durable rows so a full-reparse fallback
-    /// can preserve semantic identities. Warm incremental execution omits them.
+    /// Cold reconciliation receives current durable typed rows to preserve
+    /// semantic identities. Warm incremental execution omits them.
     rows: option<own<row-source>>,
     creates: create-context,
   }

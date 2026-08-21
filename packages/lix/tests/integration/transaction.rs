@@ -1644,6 +1644,14 @@ impl StorageWrite for BlockingCommitWrite {
         self.inner.put_many(space, entries).await
     }
 
+    async fn replace_many(
+        &mut self,
+        space: lix::storage::StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        self.inner.replace_many(space, entries).await
+    }
+
     async fn delete_many(
         &mut self,
         space: lix::storage::StorageSpace,
@@ -1847,6 +1855,15 @@ impl StorageWrite for RecordingWrite {
     ) -> Result<(), StorageError> {
         self.fail_if_space_matches(space)?;
         self.inner.put_many(space, entries).await
+    }
+
+    async fn replace_many(
+        &mut self,
+        space: lix::storage::StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        self.fail_if_space_matches(space)?;
+        self.inner.replace_many(space, entries).await
     }
 
     async fn delete_many(

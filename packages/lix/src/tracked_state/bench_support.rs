@@ -1,8 +1,5 @@
 use crate::changelog::{ChangeId, CommitId};
 use crate::row_pk::RowPk;
-use crate::json_store::{
-    JsonRef, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
-};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageReadOptions,
@@ -181,8 +178,8 @@ where
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{}"),
-            metadata: JsonSlotRef::None,
+            snapshot: Some(b"typed-bench-row"),
+            metadata: None,
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -236,8 +233,8 @@ where
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{}"),
-            metadata: JsonSlotRef::None,
+            snapshot: Some(b"typed-bench-row"),
+            metadata: None,
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -314,8 +311,8 @@ where
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{}"),
-            metadata: JsonSlotRef::None,
+            snapshot: Some(b"typed-bench-row"),
+            metadata: None,
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -906,41 +903,13 @@ where
     let commits_per_storage_batch = (storage_batch_changes / commit_width).max(1);
     let mut staged_puts = 0;
     let mut written_bytes = 0;
-    let shared_large_ref = if let Some(payload) = options.shared_large_payload {
-        let mut writes = storage.new_write_set();
-        let [json_ref] = JsonStoreContext::new()
-            .writer()
-            .stage_batch(
-                &mut writes,
-                JsonWritePlacementRef::OutOfBand,
-                [NormalizedJsonRef::new(payload)],
-            )
-            .expect("stage packed-history shared large payload")
-            .try_into()
-            .expect("one shared payload produces one JSON ref");
-        let (_commit, stats) = storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit packed-history shared large payload");
-        staged_puts += stats.staged_puts;
-        written_bytes += stats.written_bytes;
-        Some(json_ref)
-    } else {
-        None
-    };
     for commit_batch_start in (0..commits).step_by(commits_per_storage_batch) {
         let commit_batch_end = (commit_batch_start + commits_per_storage_batch).min(commits);
         let mut writes = storage.new_write_set();
         for commit_index in commit_batch_start..commit_batch_end {
             let owned = (0..commit_width)
                 .map(|row_index| {
-                    PackedHistoryDelta::new(
-                        commit_index,
-                        row_index,
-                        commit_width,
-                        options,
-                        shared_large_ref,
-                    )
+                    PackedHistoryDelta::new(commit_index, row_index, commit_width, options)
                 })
                 .collect::<Vec<_>>();
             let deltas = owned
@@ -1065,8 +1034,7 @@ struct PackedHistoryDelta {
     row_pk: RowPk,
     schema_key: String,
     deleted: bool,
-    payload: BenchPackedHistoryPayload,
-    shared_large_ref: Option<JsonRef>,
+    snapshot: Option<Vec<u8>>,
     created_at: crate::common::LixTimestamp,
     updated_at: crate::common::LixTimestamp,
 }
@@ -1077,7 +1045,6 @@ impl PackedHistoryDelta {
         row_index: usize,
         commit_width: usize,
         options: BenchPackedHistoryOptions<'_>,
-        shared_large_ref: Option<JsonRef>,
     ) -> Self {
         let change_index = commit_index
             .checked_mul(commit_width)
@@ -1096,14 +1063,35 @@ impl PackedHistoryDelta {
         };
         let deleted = matches!(options.shape, BenchPackedHistoryShape::DeleteReinsert)
             && (change_index / options.live_rows) % 2 == 1;
+        let snapshot = (!deleted).then(|| {
+            let snapshot = match options.payload {
+                BenchPackedHistoryPayload::None => serde_json::json!({}),
+                BenchPackedHistoryPayload::SmallInline => {
+                    serde_json::json!({"value": "small"})
+                }
+                BenchPackedHistoryPayload::SharedLarge => serde_json::from_str(
+                    options
+                        .shared_large_payload
+                        .expect("shared large benchmark payload"),
+                )
+                .expect("shared large benchmark payload is JSON"),
+            };
+            crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+                &RowPk::single(row_pk.clone()),
+                &snapshot,
+            )
+            .expect("packed history benchmark row should type")
+            .durable_payload()
+            .expect("packed history benchmark row should encode")
+            .to_vec()
+        });
         Self {
             change_id: packed_history_change_id(commit_index, row_index),
             commit_id: packed_history_commit_id(commit_index),
             row_pk: RowPk::single(row_pk),
             schema_key: "packed_history".to_string(),
             deleted,
-            payload: options.payload,
-            shared_large_ref,
+            snapshot,
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
                 "2026-07-28T00:00:00.000Z",
@@ -1116,20 +1104,6 @@ impl PackedHistoryDelta {
     }
 
     fn as_commit_ref(&self) -> TrackedStateCommitDeltaRef<'_> {
-        const SMALL_PAYLOAD: &str = r#"{"value":"small"}"#;
-        let snapshot = if self.deleted {
-            JsonSlotRef::None
-        } else {
-            match self.payload {
-                BenchPackedHistoryPayload::None => JsonSlotRef::None,
-                BenchPackedHistoryPayload::SmallInline => JsonSlotRef::Inline(SMALL_PAYLOAD),
-                BenchPackedHistoryPayload::SharedLarge => JsonSlotRef::Ref(
-                    self.shared_large_ref
-                        .as_ref()
-                        .expect("shared-large packed history has a JSON ref"),
-                ),
-            }
-        };
         TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key: &self.schema_key,
@@ -1141,8 +1115,8 @@ impl PackedHistoryDelta {
                 created_at: self.created_at,
                 updated_at: self.updated_at,
             },
-            snapshot,
-            metadata: JsonSlotRef::None,
+            snapshot: self.snapshot.as_deref(),
+            metadata: None,
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1237,7 +1211,6 @@ mod packed_history_tests {
                 BenchPackedHistoryShape::RepeatedUpdates,
                 BenchPackedHistoryPayload::None,
             ),
-            None,
         );
         let second = PackedHistoryDelta::new(
             1,
@@ -1247,7 +1220,6 @@ mod packed_history_tests {
                 BenchPackedHistoryShape::RepeatedUpdates,
                 BenchPackedHistoryPayload::None,
             ),
-            None,
         );
 
         assert_eq!(first.row_pk, second.row_pk);
@@ -1261,24 +1233,18 @@ mod packed_history_tests {
             BenchPackedHistoryShape::DeleteReinsert,
             BenchPackedHistoryPayload::SmallInline,
         );
-        let insert = PackedHistoryDelta::new(0, 0, 10, options, None);
-        let delete = PackedHistoryDelta::new(1, 0, 10, options, None);
-        let reinsert = PackedHistoryDelta::new(2, 0, 10, options, None);
+        let insert = PackedHistoryDelta::new(0, 0, 10, options);
+        let delete = PackedHistoryDelta::new(1, 0, 10, options);
+        let reinsert = PackedHistoryDelta::new(2, 0, 10, options);
 
         assert_eq!(insert.row_pk, delete.row_pk);
         assert_eq!(delete.row_pk, reinsert.row_pk);
         assert!(!insert.deleted);
         assert!(delete.deleted);
         assert!(!reinsert.deleted);
-        assert_eq!(
-            insert.as_commit_ref().snapshot,
-            JsonSlotRef::Inline(r#"{"value":"small"}"#)
-        );
-        assert_eq!(delete.as_commit_ref().snapshot, JsonSlotRef::None);
-        assert_eq!(
-            reinsert.as_commit_ref().snapshot,
-            JsonSlotRef::Inline(r#"{"value":"small"}"#)
-        );
+        assert!(insert.as_commit_ref().snapshot.is_some());
+        assert!(delete.as_commit_ref().snapshot.is_none());
+        assert!(reinsert.as_commit_ref().snapshot.is_some());
     }
 
     #[test]
@@ -1294,8 +1260,7 @@ mod packed_history_tests {
     }
 
     #[test]
-    fn shared_large_payload_uses_one_json_reference() {
-        let json_ref = JsonRef::from_hash_bytes([7; 32]);
+    fn shared_large_payload_is_encoded_as_snapshot() {
         let delta = PackedHistoryDelta::new(
             0,
             0,
@@ -1304,10 +1269,9 @@ mod packed_history_tests {
                 BenchPackedHistoryShape::UniqueInserts,
                 BenchPackedHistoryPayload::SharedLarge,
             ),
-            Some(json_ref),
         );
 
-        assert_eq!(delta.as_commit_ref().snapshot, JsonSlotRef::Ref(&json_ref));
+        assert!(delta.as_commit_ref().snapshot.is_some());
     }
 }
 

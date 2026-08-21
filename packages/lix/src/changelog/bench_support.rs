@@ -505,6 +505,7 @@ fn direct_append_with_shape(
             let change_id = format!("{name}-change-{next_change}");
             let typed_change_id = ChangeId::for_test_label(&change_id);
             let row_pk = RowPk::single(format!("row-{next_change}"));
+            let snapshot = serde_json::json!({"value": next_change});
             append.changes.push(ChangeRecord {
                 format_version: 1,
                 change_id: typed_change_id,
@@ -512,10 +513,16 @@ fn direct_append_with_shape(
                 schema_key: "message".to_string(),
                 row_pk: row_pk.clone(),
                 file_id: None,
-                snapshot: crate::json_store::JsonSlot::from_json(&format!(
-                    "{{\"value\":{next_change}}}"
-                )),
-                metadata: crate::json_store::JsonSlot::None,
+                snapshot: Some(
+                    crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+                        &row_pk, &snapshot,
+                    )
+                    .expect("changelog benchmark row should type")
+                    .durable_payload()
+                    .expect("changelog benchmark row should encode")
+                    .to_vec(),
+                ),
+                metadata: None,
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
                     "2026-05-20T00:00:00Z",

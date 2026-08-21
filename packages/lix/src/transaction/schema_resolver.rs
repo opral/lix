@@ -98,6 +98,33 @@ impl TransactionSchemaResolver {
         );
     }
 
+    /// Compiles and indexes both catalogs under the revision published by a
+    /// successful schema mutation. Schema registration already pays this work;
+    /// doing it at that boundary prevents the next ordinary transaction from
+    /// becoming the accidental cold-compile path.
+    pub(crate) async fn warm_committed_catalogs(
+        &self,
+        hot_state: &dyn HotStateReader,
+        branch_id: &str,
+        revision: &crate::catalog::CatalogRevision,
+    ) -> Result<(), LixError> {
+        self.context
+            .compiled_catalog_for_transaction_open(
+                hot_state,
+                &Domain::schema_catalog(branch_id.to_string(), true),
+                Some(revision),
+            )
+            .await?;
+        self.context
+            .compiled_catalog_for_transaction_open(
+                hot_state,
+                &Domain::schema_catalog(branch_id.to_string(), false),
+                Some(revision),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Drops transaction-private compiled catalogs after a statement rollback.
     /// The next normalization or validation lazily rebuilds from the restored
     /// staging overlay, retaining registrations from earlier successful

@@ -1,15 +1,14 @@
 use crate::model as lix;
+use ::lix::plugin::TypedValue;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde_json::{Value, json};
 
 use crate::core::{Document, FileEdit, LINE_SCHEMA_KEY, Line};
 use crate::{STATE_PAGE_BYTES, decode_identities, decode_identity_manifest, encode_identities};
 
 fn open(bytes: &[u8]) -> (Document, Vec<lix::RowChange>) {
-    let (document, changes) =
-        Document::open_file(bytes.to_vec(), |ordinal| format!("line-{ordinal}"))
-            .expect("Text document should open");
+    let (document, changes) = Document::open_file(bytes.to_vec(), |ordinal| test_id(1, ordinal))
+        .expect("Text document should open");
     (
         document,
         changes
@@ -18,36 +17,41 @@ fn open(bytes: &[u8]) -> (Document, Vec<lix::RowChange>) {
     )
 }
 
-fn ids(document: &Document) -> Vec<String> {
-    document
-        .lines()
-        .iter()
-        .map(|line| line.id().to_owned())
-        .collect()
+fn test_id(namespace: u8, ordinal: u64) -> uuid::Uuid {
+    let mut bytes = [0; 16];
+    bytes[0] = namespace;
+    bytes[8..].copy_from_slice(&ordinal.to_be_bytes());
+    uuid::Uuid::from_bytes(bytes)
+}
+
+fn ids(document: &Document) -> Vec<uuid::Uuid> {
+    document.lines().iter().map(|line| line.id()).collect()
+}
+
+fn row_pk(id: uuid::Uuid) -> [TypedValue; 1] {
+    [TypedValue::Uuid(id)]
 }
 
 fn records(changes: &[lix::RowChange]) -> Vec<lix::RowRecord> {
     changes
         .iter()
         .filter_map(|change| {
-            change.snapshot.as_ref().map(|snapshot| lix::RowRecord {
+            change.row.as_ref().map(|row| lix::RowRecord {
                 schema_key: change.schema_key.clone(),
                 row_pk: change.row_pk.clone(),
-                snapshot: snapshot.clone(),
+                row: row.clone(),
             })
         })
         .collect()
 }
 
-fn snapshot_with_bytes(line: &Line, bytes: &[u8]) -> Vec<u8> {
-    let mut snapshot: Value = serde_json::from_slice(
-        &line
-            .snapshot_bytes()
-            .expect("line snapshot should serialize"),
-    )
-    .expect("line snapshot should be JSON");
-    snapshot["content_base64"] = json!(URL_SAFE_NO_PAD.encode(bytes));
-    serde_json::to_vec(&snapshot).expect("edited line snapshot should serialize")
+fn row_with_bytes(line: &Line, bytes: &[u8]) -> ::lix::plugin::TypedRow {
+    let mut row = line.typed_row().expect("test line should have a UUID id");
+    row.insert(
+        "content_base64".to_owned(),
+        TypedValue::Text(URL_SAFE_NO_PAD.encode(bytes)),
+    );
+    row
 }
 
 fn apply_edits(before: &[u8], edits: &[lix::ByteEdit]) -> Vec<u8> {
@@ -83,13 +87,13 @@ fn empty_document_has_zero_rows_and_nonempty_to_empty_tombstones_each_line() {
                 delete_len: u64::try_from(nonempty.bytes().len()).unwrap(),
                 insert: Vec::new(),
             }],
-            |ordinal| format!("new-{ordinal}"),
+            |ordinal| test_id(2, ordinal),
         )
         .expect("deleting every line should succeed");
     assert!(after.lines().is_empty());
     assert_eq!(after.bytes(), b"");
     assert_eq!(changes.len(), 2);
-    assert!(changes.iter().all(|change| change.snapshot.is_none()));
+    assert!(changes.iter().all(|change| change.row.is_none()));
 }
 
 #[test]
@@ -117,15 +121,15 @@ fn localized_line_edit_preserves_that_lines_id_and_leaves_unrelated_rows_untouch
                 delete_len: 4,
                 insert: b"BETA".to_vec(),
             }],
-            |ordinal| format!("new-{ordinal}"),
+            |ordinal| test_id(2, ordinal),
         )
         .expect("localized edit should reconcile");
 
     assert_eq!(after.bytes(), b"alpha\nBETA\ngamma\n");
     assert_eq!(ids(&after), before_ids);
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].row_pk, ["line-1"]);
-    assert!(changes[0].snapshot.is_some());
+    assert_eq!(changes[0].row_pk, row_pk(test_id(1, 1)));
+    assert!(changes[0].row.is_some());
 }
 
 #[test]
@@ -139,15 +143,15 @@ fn adding_a_duplicate_line_allocates_a_new_identity() {
                 delete_len: 0,
                 insert: b"a\n".to_vec(),
             }],
-            |ordinal| format!("new-{ordinal}"),
+            |ordinal| test_id(2, ordinal),
         )
         .expect("a duplicate successor line should reconcile");
 
     assert_eq!(after.bytes(), b"a\na\n");
-    assert_eq!(ids(&after), [before_ids[0].clone(), "new-0".to_owned()]);
+    assert_eq!(ids(&after), [before_ids[0].clone(), test_id(2, 0)]);
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].row_pk, ["new-0"]);
-    assert!(changes[0].snapshot.is_some());
+    assert_eq!(changes[0].row_pk, row_pk(test_id(2, 0)));
+    assert!(changes[0].row.is_some());
 }
 
 #[test]
@@ -161,22 +165,18 @@ fn line_insertion_adds_one_row_without_rewriting_existing_line_rows() {
                 delete_len: 0,
                 insert: b"middle\n".to_vec(),
             }],
-            |ordinal| format!("new-{ordinal}"),
+            |ordinal| test_id(2, ordinal),
         )
         .expect("line insertion should reconcile");
 
     assert_eq!(after.bytes(), b"alpha\nmiddle\nomega\n");
     assert_eq!(
         ids(&after),
-        [
-            before_ids[0].clone(),
-            "new-0".to_owned(),
-            before_ids[1].clone()
-        ]
+        [before_ids[0].clone(), test_id(2, 0), before_ids[1].clone()]
     );
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].row_pk, ["new-0"]);
-    assert!(changes[0].snapshot.is_some());
+    assert_eq!(changes[0].row_pk, row_pk(test_id(2, 0)));
+    assert!(changes[0].row.is_some());
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn durable_identities_survive_insert_reopen_and_second_edit() {
                 delete_len: 0,
                 insert: b"middle\n".to_vec(),
             }],
-            |ordinal| format!("created-{ordinal}"),
+            |ordinal| test_id(3, ordinal),
         )
         .expect("line insertion should reconcile");
     let inserted_id = ids(&after_insert)[1].clone();
@@ -206,20 +206,20 @@ fn durable_identities_survive_insert_reopen_and_second_edit() {
                 delete_len: 6,
                 insert: b"MIDDLE".to_vec(),
             }],
-            |ordinal| format!("second-{ordinal}"),
+            |ordinal| test_id(4, ordinal),
         )
         .expect("second edit should reconcile");
 
     assert_eq!(ids(&after_edit)[1], inserted_id);
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].row_pk, [inserted_id]);
+    assert_eq!(changes[0].row_pk, row_pk(inserted_id));
 }
 
 #[test]
 fn large_identity_mapping_is_split_into_bounded_pages() {
     let identities = (0..30_000)
         .map(|ordinal| crate::core::LineIdentity {
-            id: format!("line-{ordinal:08}"),
+            id: test_id(5, ordinal),
             order_key: "80".repeat(8),
         })
         .collect::<Vec<_>>();
@@ -246,7 +246,7 @@ fn reorder_preserves_ids_and_updates_only_the_moved_rows_order_key() {
                 delete_len: u64::try_from(document.bytes().len()).unwrap(),
                 insert: b"gamma\nalpha\nbeta\n".to_vec(),
             }],
-            |ordinal| format!("new-{ordinal}"),
+            |ordinal| test_id(2, ordinal),
         )
         .expect("reorder should reconcile");
 
@@ -260,15 +260,15 @@ fn reorder_preserves_ids_and_updates_only_the_moved_rows_order_key() {
         ]
     );
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].row_pk, [before_ids[2].clone()]);
-    let snapshot: Value = serde_json::from_slice(
-        changes[0]
-            .snapshot
-            .as_ref()
-            .expect("moved row should be upserted"),
-    )
-    .unwrap();
-    assert_ne!(snapshot["order_key"], document.lines()[2].order_key());
+    assert_eq!(changes[0].row_pk, row_pk(before_ids[2]));
+    let row = changes[0]
+        .row
+        .as_ref()
+        .expect("moved row should be upserted");
+    assert_ne!(
+        row.get("order_key"),
+        Some(&TypedValue::Text(document.lines()[2].order_key()))
+    );
 }
 
 #[test]
@@ -279,13 +279,13 @@ fn independent_semantic_line_updates_render_as_independent_exact_byte_edits() {
     let semantic_changes = [
         lix::RowChange::upsert(
             LINE_SCHEMA_KEY,
-            vec![alpha.id().to_owned()],
-            snapshot_with_bytes(alpha, b"ALPHA\n"),
+            vec![TypedValue::Uuid(alpha.id())],
+            row_with_bytes(alpha, b"ALPHA\n"),
         ),
         lix::RowChange::upsert(
             LINE_SCHEMA_KEY,
-            vec![gamma.id().to_owned()],
-            snapshot_with_bytes(gamma, b"GAMMA\n"),
+            vec![TypedValue::Uuid(gamma.id())],
+            row_with_bytes(gamma, b"GAMMA\n"),
         ),
     ];
     let (after, edits) = document
@@ -301,13 +301,17 @@ fn independent_semantic_line_updates_render_as_independent_exact_byte_edits() {
 
 #[test]
 fn text_nul_window_rejects_early_nul_and_allows_nul_after_eight_kib() {
-    assert!(Document::open_file(b"text\0binary".to_vec(), |ordinal| ordinal.to_string()).is_err());
+    assert!(
+        Document::open_file(b"text\0binary".to_vec(), |ordinal| {
+            uuid::Uuid::from_u128(u128::from(ordinal))
+        })
+        .is_err()
+    );
 
     let mut source = vec![b'x'; 8_000];
     source.extend_from_slice(b"\0still-text\n");
-    let (document, changes) =
-        Document::open_file(source.clone(), |ordinal| format!("line-{ordinal}"))
-            .expect("a NUL after Git's scan window remains text");
+    let (document, changes) = Document::open_file(source.clone(), |ordinal| test_id(1, ordinal))
+        .expect("a NUL after Git's scan window remains text");
     let changes = changes
         .collect::<Result<Vec<_>, _>>()
         .expect("late-NUL changes should serialize");
@@ -320,13 +324,27 @@ fn text_nul_window_rejects_early_nul_and_allows_nul_after_eight_kib() {
 fn semantic_rows_cannot_smuggle_multiple_logical_lines_into_one_row() {
     let (document, _) = open(b"alpha\nbeta\n");
     let alpha = &document.lines()[0];
-    let malformed = snapshot_with_bytes(alpha, b"alpha\nbeta\n");
+    let malformed = row_with_bytes(alpha, b"alpha\nbeta\n");
     let error = document
         .rows_changed([lix::RowChange::upsert(
             LINE_SCHEMA_KEY,
-            vec![alpha.id().to_owned()],
+            vec![TypedValue::Uuid(alpha.id())],
             malformed,
         )])
         .expect_err("one row cannot represent multiple logical text lines");
     assert!(error.contains("embedded LF"));
+}
+
+#[test]
+fn text_row_keys_require_native_uuid_values() {
+    let (document, _) = open(b"alpha\n");
+    let alpha = &document.lines()[0];
+    let error = document
+        .rows_changed([lix::RowChange::upsert(
+            LINE_SCHEMA_KEY,
+            vec![TypedValue::Text(alpha.id().to_string())],
+            alpha.typed_row().expect("line should produce a typed row"),
+        )])
+        .expect_err("a textual UUID primary key must not cross the typed boundary");
+    assert!(error.contains("UUID primary-key component"));
 }

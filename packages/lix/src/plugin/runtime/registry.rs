@@ -299,6 +299,19 @@ impl PluginRegistry {
         self.plugin(key)
     }
 
+    /// Whether an active plugin claims semantic ownership of this schema.
+    /// Engine catalog, registry, and filesystem schemas are intentionally not
+    /// inferred from where their rows originated; only manifest-declared
+    /// semantic schema keys belong to the typed plugin boundary.
+    pub(crate) fn owns_schema(&self, schema_key: &str) -> bool {
+        self.plugins.iter().any(|plugin| {
+            plugin
+                .schema_keys()
+                .binary_search_by(|key| key.as_str().cmp(schema_key))
+                .is_ok()
+        })
+    }
+
     pub(crate) fn upsert(
         &mut self,
         plugin: PluginRegistryEntry,
@@ -374,7 +387,7 @@ impl PluginRegistry {
     }
 
     pub(crate) fn from_optional_hot_state_row(
-        row: Option<&MaterializedHotStateRow>,
+        row: Option<crate::hot_state::MaterializedHotStateRowRef<'_>>,
         branch_id: &str,
     ) -> Result<Self, LixError> {
         let Some(row) = row else {
@@ -382,12 +395,37 @@ impl PluginRegistry {
         };
         // The branch registry is branch-global with no file, so it is always
         // tracked regardless of any file's lane.
-        validate_hot_state_identity(row, PLUGIN_REGISTRY_KEY, None, branch_id, false)?;
-        if row.deleted || row.snapshot_content.is_none() {
+        validate_hot_state_identity_ref(row, PLUGIN_REGISTRY_KEY, None, branch_id, false)?;
+        if row.deleted() {
             return Ok(Self::empty());
         }
-        let snapshot = parse_snapshot_content(row, "plugin registry")?;
-        Self::from_optional_snapshot(Some(&snapshot))
+        let typed = row.decoded_snapshot().map(Arc::as_ref).ok_or_else(|| {
+            invalid_registry("live plugin registry row has no native typed payload")
+        })?;
+        Self::from_typed_key_value_row(typed, PLUGIN_REGISTRY_KEY)
+    }
+
+    fn from_typed_key_value_row(
+        row: &crate::plugin::runtime::WasmTypedRow,
+        expected_key: &str,
+    ) -> Result<Self, LixError> {
+        match row.row.get("key") {
+            Some(lix_schema::Value::Text(key)) if key == expected_key => {}
+            _ => {
+                return Err(invalid_registry(
+                    "typed plugin registry row has the wrong key",
+                ));
+            }
+        }
+        let value = match row.row.get("value") {
+            Some(lix_schema::Value::Jsonb(value)) => value.as_value(),
+            _ => {
+                return Err(invalid_registry(
+                    "typed plugin registry row has no JSONB value",
+                ));
+            }
+        };
+        Self::from_optional_value(Some(value))
     }
 
     pub(crate) fn to_value(&self) -> Result<JsonValue, LixError> {
@@ -496,21 +534,16 @@ where
         .await?
         .into_rows();
     let row = rows.into_iter().next().flatten();
-    let snapshot = match row {
-        None => None,
-        Some(row) if row.deleted || row.snapshot_content.is_none() => None,
-        Some(row) => Some(
-            serde_json::from_str(row.snapshot_content.as_deref().expect("checked")).map_err(
-                |error| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        format!("historical plugin registry snapshot is invalid JSON: {error}"),
-                    )
-                },
-            )?,
-        ),
-    };
-    PluginRegistry::from_optional_snapshot(snapshot.as_ref())
+    match row {
+        None => Ok(PluginRegistry::empty()),
+        Some(row) if row.deleted => Ok(PluginRegistry::empty()),
+        Some(row) => {
+            let typed = row.decoded_snapshot.as_deref().ok_or_else(|| {
+                invalid_registry("historical plugin registry row has no native typed payload")
+            })?;
+            PluginRegistry::from_typed_key_value_row(typed, PLUGIN_REGISTRY_KEY)
+        }
+    }
 }
 
 /// Re-derives every WASM payload root owned by current and retained plugin
@@ -542,8 +575,8 @@ where
         .await?;
     let mut roots = BTreeSet::new();
     for (branch_id, rows) in current {
-        for row in rows.into_rows() {
-            let registry = PluginRegistry::from_optional_hot_state_row(Some(&row), &branch_id)?;
+        for row in rows.iter() {
+            let registry = PluginRegistry::from_optional_hot_state_row(Some(row), &branch_id)?;
             extend_registry_wasm_roots(&registry, &mut roots)?;
         }
     }
@@ -563,19 +596,12 @@ where
             {
                 continue;
             }
-            let snapshot: JsonValue = serde_json::from_str(
-                row.snapshot.as_deref().ok_or_else(|| {
-                    invalid_registry(format!(
-                        "historical plugin registry mutation in commit '{commit_id}' has no snapshot"
-                    ))
-                })?,
-            )
-            .map_err(|error| {
+            let typed = row.decoded_snapshot.as_deref().ok_or_else(|| {
                 invalid_registry(format!(
-                    "historical plugin registry mutation in commit '{commit_id}' is invalid JSON: {error}"
+                    "historical plugin registry mutation in commit '{commit_id}' has no native payload"
                 ))
             })?;
-            let registry = PluginRegistry::from_optional_snapshot(Some(&snapshot))?;
+            let registry = PluginRegistry::from_typed_key_value_row(typed, PLUGIN_REGISTRY_KEY)?;
             extend_registry_wasm_roots(&registry, &mut roots)?;
         }
     }
@@ -667,7 +693,7 @@ impl PluginFileOwner {
             invalid_registry("plugin owner row is missing its file_id storage identity")
         })?;
         validate_hot_state_identity(row, PLUGIN_OWNER_KEY, Some(file_id), branch_id, untracked)?;
-        if row.deleted || row.snapshot_content.is_none() {
+        if row.deleted {
             return Ok(None);
         }
         let snapshot = parse_snapshot_content(row, "plugin owner")?;
@@ -686,8 +712,11 @@ impl PluginFileOwner {
                 "tracked plugin owner row has an invalid storage identity",
             ));
         }
-        if row.deleted || row.snapshot_content.is_none() {
+        if row.deleted {
             return Ok(None);
+        }
+        if let Some(typed) = row.decoded_snapshot.as_deref() {
+            return Self::from_typed_row(file_id, typed).map(Some);
         }
         let snapshot = serde_json::from_str(
             row.snapshot_content.as_deref().expect("checked above"),
@@ -713,18 +742,13 @@ impl PluginFileOwner {
                 "tracked plugin owner row has an invalid storage identity",
             ));
         }
-        if row.deleted() || row.snapshot_content().is_none() {
+        if row.deleted() {
             return Ok(None);
         }
-        let snapshot = serde_json::from_str(
-            row.snapshot_content().expect("checked above").as_str(),
-        )
-        .map_err(|error| {
-            invalid_registry(format!(
-                "tracked plugin owner snapshot is invalid JSON: {error}"
-            ))
+        let typed = row.decoded_snapshot().map(Arc::as_ref).ok_or_else(|| {
+            invalid_registry("tracked plugin owner row has no native typed payload")
         })?;
-        Self::from_snapshot(file_id, &snapshot).map(Some)
+        Self::from_typed_row(file_id, typed).map(Some)
     }
 
     pub(crate) fn from_snapshot(
@@ -739,6 +763,34 @@ impl PluginFileOwner {
                     "plugin owner payload has an invalid shape: {error}"
                 ))
             })?;
+        if owner_value.version != PLUGIN_FILE_OWNER_FORMAT_VERSION {
+            return Err(invalid_registry(format!(
+                "plugin owner version {} is unsupported; expected {PLUGIN_FILE_OWNER_FORMAT_VERSION}",
+                owner_value.version
+            )));
+        }
+        Self::new(file_id, owner_value.plugin_key, owner_value.schema_keys)
+    }
+
+    fn from_typed_row(
+        file_id: impl Into<String>,
+        row: &crate::plugin::runtime::WasmTypedRow,
+    ) -> Result<Self, LixError> {
+        match row.row.get("key") {
+            Some(lix_schema::Value::Text(key)) if key == PLUGIN_OWNER_KEY => {}
+            _ => return Err(invalid_registry("typed plugin owner row has the wrong key")),
+        }
+        let value = match row.row.get("value") {
+            Some(lix_schema::Value::Jsonb(value)) => value.as_value().clone(),
+            _ => {
+                return Err(invalid_registry(
+                    "typed plugin owner row has no JSONB value",
+                ));
+            }
+        };
+        let owner_value: PluginFileOwnerValue = serde_json::from_value(value).map_err(|error| {
+            invalid_registry(format!("typed plugin owner value is invalid: {error}"))
+        })?;
         if owner_value.version != PLUGIN_FILE_OWNER_FORMAT_VERSION {
             return Err(invalid_registry(format!(
                 "plugin owner version {} is unsupported; expected {PLUGIN_FILE_OWNER_FORMAT_VERSION}",
@@ -1293,12 +1345,34 @@ fn validate_hot_state_identity(
         || row.row_pk.as_single_string().ok() != Some(key)
         || row.file_id.as_deref() != expected_file_id
         || row.global
+        || row.untracked != expected_untracked
+        || row.branch_id.as_ref() != branch_id
+    {
+        return Err(invalid_registry(format!(
+            "reserved plugin row '{key}' has invalid branch-local storage identity"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_hot_state_identity_ref(
+    row: crate::hot_state::MaterializedHotStateRowRef<'_>,
+    key: &str,
+    expected_file_id: Option<&str>,
+    branch_id: &str,
+    expected_untracked: bool,
+) -> Result<(), LixError> {
+    validate_branch_local_scope(branch_id)?;
+    if row.schema_key() != KEY_VALUE_SCHEMA_KEY
+        || row.row_pk().as_single_string().ok() != Some(key)
+        || row.file_id() != expected_file_id
+        || row.global()
         // A file-scoped reserved row lives in its own file's lane. The branch
         // registry stays tracked (it is branch-global with no file), but an
         // owner row for an untracked file is untracked, and reading it back
         // must accept exactly the lane it was written in.
-        || row.untracked != expected_untracked
-        || row.branch_id.as_ref() != branch_id
+        || row.untracked() != expected_untracked
+        || row.branch_id() != branch_id
     {
         return Err(invalid_registry(format!(
             "reserved plugin row '{key}' has invalid branch-local storage identity"
@@ -1397,7 +1471,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
+            api_version: "2.0.0".to_string(),
             capabilities: PluginCapabilities {
                 column_merger: true,
                 file_projection: true,
@@ -1422,7 +1496,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
+            api_version: "2.0.0".to_string(),
             capabilities: PluginCapabilities {
                 column_merger: true,
                 file_projection: true,
@@ -1459,7 +1533,7 @@ mod tests {
             PluginRegistry::from_wire(wire).expect_err("durable non-v1 components must hard fail");
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert!(error.message.contains("lix:plugin"));
-        assert!(error.message.contains("1.0.0"));
+        assert!(error.message.contains("2.0.0"));
     }
 
     #[test]
@@ -1629,7 +1703,16 @@ mod tests {
         assert!(!row.global);
         assert!(!row.untracked);
         assert_eq!(row.branch_id, "main");
-        assert_eq!(row.snapshot.unwrap().value()["key"], PLUGIN_OWNER_KEY);
+        let snapshot = row.snapshot.unwrap();
+        assert_eq!(snapshot.value()["key"], PLUGIN_OWNER_KEY);
+        assert_eq!(
+            PluginFileOwner::from_snapshot(
+                "01920000-0000-7000-8000-0000000000a2",
+                snapshot.value(),
+            )
+            .unwrap(),
+            owner
+        );
         assert_eq!(owner.schema_keys(), ["plugin_a_meta", "plugin_a_note"]);
 
         let registry_row = PluginRegistry::empty().write_row("main").unwrap();
@@ -1646,7 +1729,7 @@ mod tests {
         let mut input = PluginRegistryEntryInput {
             key: "plugin_a".to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
+            api_version: "2.0.0".to_string(),
             capabilities: PluginCapabilities {
                 column_merger: true,
                 file_projection: true,

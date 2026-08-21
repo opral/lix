@@ -14,6 +14,7 @@ use crate::common::{
     FastHashBuilder, LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder,
     fast_hash_builder,
 };
+use crate::plugin::runtime::WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::{NullableKeyFilter, Value};
@@ -84,6 +85,8 @@ pub(crate) struct MaterializedHotStateBatch {
     branch_ids: Vec<BranchIdId>,
     row_pks: Vec<RowPk>,
     snapshot_content: Vec<Option<SharedStr>>,
+    decoded_snapshots: Vec<Option<Arc<WasmTypedRow>>>,
+    raw_snapshots: Vec<Option<Bytes>>,
     metadata: Vec<Option<SharedStr>>,
     deleted: Vec<bool>,
     created_at: Vec<LixTimestamp>,
@@ -110,6 +113,8 @@ pub(crate) struct MaterializedHotStateBatch {
 #[derive(Debug, Clone)]
 struct MaterializedHotStateSingleton {
     row: MaterializedHotStateRow,
+    decoded_snapshot: Option<Arc<WasmTypedRow>>,
+    raw_snapshot: Option<Bytes>,
     durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
     columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
@@ -307,6 +312,8 @@ impl MaterializedHotStateBatch {
         retain_by_mask(&mut self.branch_ids, &mask);
         retain_by_mask(&mut self.row_pks, &mask);
         retain_by_mask(&mut self.snapshot_content, &mask);
+        retain_by_mask(&mut self.decoded_snapshots, &mask);
+        retain_by_mask(&mut self.raw_snapshots, &mask);
         retain_by_mask(&mut self.metadata, &mask);
         retain_by_mask(&mut self.deleted, &mask);
         retain_by_mask(&mut self.created_at, &mask);
@@ -467,6 +474,72 @@ impl<'a> MaterializedHotStateRowRef<'a> {
             || self.batch.snapshot_content[self.index].as_ref(),
             |singleton| singleton.row.snapshot_content.as_ref(),
         )
+    }
+
+    pub(crate) fn decoded_snapshot(self) -> Option<&'a Arc<WasmTypedRow>> {
+        self.singleton().map_or_else(
+            || self.batch.decoded_snapshots[self.index].as_ref(),
+            |singleton| singleton.decoded_snapshot.as_ref(),
+        )
+    }
+
+    pub(crate) fn raw_snapshot(self) -> Option<&'a Bytes> {
+        self.singleton().map_or_else(
+            || self.batch.raw_snapshots[self.index].as_ref(),
+            |singleton| singleton.raw_snapshot.as_ref(),
+        )
+    }
+
+    /// Returns the native typed row from either an already decoded serving
+    /// view or the exact durable bytes retained by a staged mutation journal.
+    pub(crate) fn materialize_decoded_snapshot(
+        self,
+    ) -> Result<Option<Arc<WasmTypedRow>>, crate::LixError> {
+        if let Some(snapshot) = self.decoded_snapshot() {
+            return Ok(Some(Arc::clone(snapshot)));
+        }
+        let Some(snapshot) = self.raw_snapshot() else {
+            return Ok(None);
+        };
+        WasmTypedRow::decode_durable_payload(
+            Arc::from(snapshot.as_ref()),
+            self.schema_key(),
+            self.row_pk(),
+        )
+        .map(Arc::new)
+        .map(Some)
+    }
+
+    /// Materializes the logical row from whichever transient serving view is
+    /// already retained. Durable storage still has one typed `snapshot`
+    /// field; JSON exists only at this explicit consumer boundary.
+    pub(crate) fn snapshot_json_value(self) -> Result<Option<serde_json::Value>, crate::LixError> {
+        if let Some(snapshot) = self.decoded_snapshot() {
+            return snapshot.to_json_value().map(Some);
+        }
+        if let Some(snapshot) = self.snapshot_content() {
+            return serde_json::from_str(snapshot.as_str())
+                .map(Some)
+                .map_err(|error| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_STORAGE_ERROR,
+                        format!(
+                            "live row '{}' has invalid snapshot JSON: {error}",
+                            self.schema_key()
+                        ),
+                    )
+                });
+        }
+        let Some(snapshot) = self.raw_snapshot() else {
+            return Ok(None);
+        };
+        WasmTypedRow::decode_durable_payload(
+            Arc::from(snapshot.as_ref()),
+            self.schema_key(),
+            self.row_pk(),
+        )?
+        .to_json_value()
+        .map(Some)
     }
 
     pub(crate) fn metadata(self) -> Option<&'a SharedStr> {
@@ -797,6 +870,8 @@ pub(crate) struct MaterializedHotStateBatchBuilder {
     branch_ids: Vec<BranchIdId>,
     row_pks: Vec<RowPk>,
     snapshot_content: Vec<Option<SharedStr>>,
+    decoded_snapshots: Vec<Option<Arc<WasmTypedRow>>>,
+    raw_snapshots: Vec<Option<Bytes>>,
     metadata: Vec<Option<SharedStr>>,
     deleted: Vec<bool>,
     created_at: Vec<LixTimestamp>,
@@ -864,6 +939,8 @@ impl MaterializedHotStateBatchBuilder {
             branch_ids: Vec::with_capacity(column_capacity),
             row_pks: Vec::with_capacity(column_capacity),
             snapshot_content: Vec::with_capacity(column_capacity),
+            decoded_snapshots: Vec::with_capacity(column_capacity),
+            raw_snapshots: Vec::with_capacity(column_capacity),
             metadata: Vec::with_capacity(column_capacity),
             deleted: Vec::with_capacity(column_capacity),
             created_at: Vec::with_capacity(column_capacity),
@@ -895,13 +972,15 @@ impl MaterializedHotStateBatchBuilder {
         if self.singleton_capacity && self.singleton.is_none() && self.row_pks.is_empty() {
             self.singleton = Some(Box::new(MaterializedHotStateSingleton {
                 row,
+                decoded_snapshot: None,
+                raw_snapshot: None,
                 durable_predecessor: None,
                 columnar_base_coordinate: None,
             }));
             return;
         }
         self.promote_singleton();
-        self.push_owned_columnar(row, None, None);
+        self.push_owned_columnar(row, None, None, None, None);
     }
 
     fn promote_singleton(&mut self) {
@@ -912,6 +991,8 @@ impl MaterializedHotStateBatchBuilder {
         self.singleton_capacity = false;
         self.push_owned_columnar(
             singleton.row,
+            singleton.decoded_snapshot,
+            singleton.raw_snapshot,
             singleton.durable_predecessor,
             singleton.columnar_base_coordinate,
         );
@@ -920,6 +1001,8 @@ impl MaterializedHotStateBatchBuilder {
     fn push_owned_columnar(
         &mut self,
         row: MaterializedHotStateRow,
+        decoded_snapshot: Option<Arc<WasmTypedRow>>,
+        raw_snapshot: Option<Bytes>,
         durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
         columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     ) {
@@ -956,6 +1039,14 @@ impl MaterializedHotStateBatchBuilder {
             commit_id,
             untracked,
         );
+        *self
+            .decoded_snapshots
+            .last_mut()
+            .expect("pushed live-state row has a typed snapshot slot") = decoded_snapshot;
+        *self
+            .raw_snapshots
+            .last_mut()
+            .expect("pushed live-state row has a raw typed payload slot") = raw_snapshot;
         *self
             .durable_predecessor
             .last_mut()
@@ -1144,7 +1235,11 @@ impl MaterializedHotStateBatchBuilder {
             let branch_id = branch_override.map_or_else(|| row.branch_owner(), Arc::from);
             let durable_predecessor = row.durable_predecessor().cloned();
             let columnar_base_coordinate = row.columnar_base_coordinate();
+            let decoded_snapshot = row.decoded_snapshot().cloned();
+            let raw_snapshot = row.raw_snapshot().cloned();
             self.push_owned(row.to_owned_with_branch(branch_id));
+            self.set_decoded_snapshot(ordinal, decoded_snapshot);
+            self.set_raw_snapshot(ordinal, raw_snapshot);
             if let Some(durable_predecessor) = durable_predecessor {
                 self.set_durable_predecessor(ordinal, durable_predecessor);
             }
@@ -1174,6 +1269,8 @@ impl MaterializedHotStateBatchBuilder {
             row.commit_id(),
             row.untracked(),
         );
+        self.set_decoded_snapshot(ordinal, row.decoded_snapshot().cloned());
+        self.set_raw_snapshot(ordinal, row.raw_snapshot().cloned());
         self.durable_predecessor
             .last_mut()
             .expect("pushed live-state row has a predecessor slot")
@@ -1206,6 +1303,8 @@ impl MaterializedHotStateBatchBuilder {
         self.branch_ids.push(branch_id);
         self.row_pks.push(row_pk);
         self.snapshot_content.push(snapshot_content);
+        self.decoded_snapshots.push(None);
+        self.raw_snapshots.push(None);
         self.metadata.push(metadata);
         self.deleted.push(deleted);
         self.created_at.push(created_at);
@@ -1227,6 +1326,24 @@ impl MaterializedHotStateBatchBuilder {
             return;
         }
         self.snapshot_content[row] = Some(value);
+    }
+
+    pub(crate) fn set_decoded_snapshot(&mut self, row: usize, value: Option<Arc<WasmTypedRow>>) {
+        if let Some(singleton) = self.singleton.as_mut() {
+            assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
+            singleton.decoded_snapshot = value;
+            return;
+        }
+        self.decoded_snapshots[row] = value;
+    }
+
+    pub(crate) fn set_raw_snapshot(&mut self, row: usize, value: Option<Bytes>) {
+        if let Some(singleton) = self.singleton.as_mut() {
+            assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
+            singleton.raw_snapshot = value;
+            return;
+        }
+        self.raw_snapshots[row] = value;
     }
 
     pub(crate) fn set_metadata(&mut self, row: usize, value: SharedStr) {
@@ -1276,6 +1393,8 @@ impl MaterializedHotStateBatchBuilder {
             branch_ids: self.branch_ids,
             row_pks: self.row_pks,
             snapshot_content: self.snapshot_content,
+            decoded_snapshots: self.decoded_snapshots,
+            raw_snapshots: self.raw_snapshots,
             metadata: self.metadata,
             deleted: self.deleted,
             created_at: self.created_at,
@@ -1318,6 +1437,7 @@ impl TryFrom<&MaterializedHotStateRow> for MaterializedTrackedStateRow {
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot_content.clone(),
+            decoded_snapshot: None,
             metadata: row.metadata.clone(),
             deleted: row.deleted,
             created_at: row.created_at.to_string(),
@@ -1541,6 +1661,8 @@ pub(crate) struct HotStateRowIdentityRef<'a> {
 
 #[cfg(test)]
 mod batch_tests {
+    use std::sync::OnceLock;
+
     use super::*;
 
     fn row(row_pk: RowPk) -> MaterializedHotStateRow {
@@ -1852,6 +1974,53 @@ mod batch_tests {
             filtered.row(0).schema_key().as_ptr(),
             filtered.row(499).schema_key().as_ptr()
         );
+    }
+
+    #[test]
+    fn filtering_keeps_snapshots_aligned_with_surviving_rows() {
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(2);
+        builder.push_owned(row(RowPk::single("tombstone")));
+        builder.push_owned(row(RowPk::single("live")));
+        let typed = Arc::new(WasmTypedRow {
+            schema_fingerprint: [7; 32],
+            row_pk: Arc::from([lix_schema::Value::Text("live".to_owned())]),
+            row: lix_schema::Row::from([("kind", lix_schema::Value::Text("paragraph".to_owned()))]),
+            native_payload: OnceLock::new(),
+            boundary_create_validation: OnceLock::new(),
+        });
+        builder.set_decoded_snapshot(1, Some(Arc::clone(&typed)));
+        let raw = Bytes::from_static(b"durable typed payload");
+        builder.set_raw_snapshot(1, Some(raw.clone()));
+
+        let filtered = builder
+            .finish()
+            .filter(|row| row.decoded_snapshot().is_some(), None);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.row(0).row_pk(), &RowPk::single("live"));
+        assert!(Arc::ptr_eq(
+            filtered.row(0).decoded_snapshot().expect("typed payload"),
+            &typed
+        ));
+        assert_eq!(
+            filtered.row(0).raw_snapshot(),
+            Some(&raw),
+            "raw payload must follow the same retained row"
+        );
+    }
+
+    #[test]
+    fn singleton_promotion_preserves_snapshot_owners() {
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(1);
+        builder.push_owned(row(RowPk::single("first")));
+        let raw = Bytes::from_static(b"raw");
+        builder.set_raw_snapshot(0, Some(raw.clone()));
+        builder.push_owned(row(RowPk::single("second")));
+
+        let batch = builder.finish();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch.row(0).raw_snapshot(), Some(&raw));
+        assert_eq!(batch.row(1).raw_snapshot(), None);
     }
 
     #[test]

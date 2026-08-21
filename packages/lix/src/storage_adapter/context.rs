@@ -150,6 +150,20 @@ where
         )
     }
 
+    pub(crate) fn mutation_revision_precondition(expected: Option<Bytes>) -> Precondition {
+        expected.map_or_else(
+            || Precondition::KeyAbsent {
+                space: REVISION_SPACE,
+                key: revision_key(REVISION_KEY_MUTATION),
+            },
+            |expected| Precondition::KeyValueEquals {
+                space: REVISION_SPACE,
+                key: revision_key(REVISION_KEY_MUTATION),
+                expected,
+            },
+        )
+    }
+
     pub(crate) fn stage_tracked_mutation_revision(write_set: &mut StorageWriteSet) {
         write_set.put(
             REVISION_SPACE,
@@ -216,7 +230,7 @@ where
     }
 }
 
-async fn stage_mutation_revision<W>(write: &mut W) -> Result<(), StorageError>
+pub(crate) async fn stage_mutation_revision<W>(write: &mut W) -> Result<(), StorageError>
 where
     W: StorageWrite,
 {

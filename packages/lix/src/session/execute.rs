@@ -3,7 +3,7 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
@@ -96,7 +96,7 @@ pub struct ExecuteResult {
 struct ExecuteResultBacking {
     columns: Arc<[String]>,
     rows: OnceLock<Vec<Row>>,
-    columnar: Option<ColumnarResult>,
+    columnar: StdMutex<Option<ColumnarResult>>,
     notices: Vec<LixNotice>,
     // Observe evaluations can be shared across sessions. Carry the exact
     // rendered plugin state with the rows so each receiving session can
@@ -267,20 +267,14 @@ impl ExecuteResult {
         notices: Vec<LixNotice>,
     ) -> Self {
         let columns: Arc<[String]> = columns.into();
-        let rows: Vec<Row> = rows
-            .into_iter()
-            .map(|values| Row {
-                columns: Arc::clone(&columns),
-                values,
-            })
-            .collect();
+        let rows = Row::from_nested(Arc::clone(&columns), rows);
         Self {
             statement_index: None,
             statement_label: None,
             backing: Some(Arc::new(ExecuteResultBacking {
                 columns,
                 rows: OnceLock::from(rows),
-                columnar: None,
+                columnar: StdMutex::new(None),
                 notices,
                 file_view_mutations: Vec::new(),
             })),
@@ -306,7 +300,7 @@ impl ExecuteResult {
             backing: Some(Arc::new(ExecuteResultBacking {
                 columns,
                 rows: OnceLock::new(),
-                columnar: Some(ColumnarResult { fields, batches }),
+                columnar: StdMutex::new(Some(ColumnarResult { fields, batches })),
                 notices,
                 file_view_mutations: Vec::new(),
             })),
@@ -321,7 +315,7 @@ impl ExecuteResult {
             Arc::new(ExecuteResultBacking {
                 columns: Vec::new().into(),
                 rows: OnceLock::from(Vec::new()),
-                columnar: None,
+                columnar: StdMutex::new(None),
                 notices: Vec::new(),
                 file_view_mutations: Vec::new(),
             })
@@ -360,7 +354,7 @@ impl ExecuteResult {
         let columns = self.columns();
         self.rows().iter().map(move |row| RowRef {
             columns,
-            values: row.values.as_slice(),
+            values: row.values(),
         })
     }
 
@@ -402,13 +396,15 @@ impl ExecuteResult {
 
 impl ExecuteResultBacking {
     fn materialize_rows(&self) -> Vec<Row> {
-        let Some(columnar) = &self.columnar else {
+        let mut columnar = self.columnar.lock().expect("columnar result lock poisoned");
+        let Some(columnar_result) = columnar.as_ref() else {
             return Vec::new();
         };
         #[cfg(feature = "storage-benches")]
         let started = crate::sql_profile::is_active().then(std::time::Instant::now);
-        let result = sql2::query_result_from_batches(&columnar.fields, &columnar.batches)
-            .expect("columnar result was validated before public ownership transfer");
+        let (values, row_count) =
+            sql2::query_values_from_batches(&columnar_result.fields, &columnar_result.batches)
+                .expect("columnar result was validated before public ownership transfer");
         #[cfg(feature = "storage-benches")]
         if let Some(started) = started {
             crate::sql_profile::record_phase(
@@ -416,39 +412,99 @@ impl ExecuteResultBacking {
                 started.elapsed(),
             );
         }
-        result
-            .rows
-            .into_iter()
-            .map(|values| Row {
-                columns: Arc::clone(&self.columns),
-                values,
-            })
-            .collect()
+        let column_count = columnar_result.fields.len();
+        // Once the public value arena exists, retaining the Arrow owners would
+        // keep a second copy of every string, JSON value, and blob alive for
+        // the full result lifetime.
+        *columnar = None;
+        drop(columnar);
+        Row::from_flat(Arc::clone(&self.columns), values, row_count, column_count)
     }
 }
 
 /// One owned row returned by a query.
-#[derive(Debug, Clone, PartialEq)]
 pub struct Row {
+    backing: Arc<RowBacking>,
+    values: Range<usize>,
+}
+
+struct RowBacking {
     columns: Arc<[String]>,
-    values: Vec<Value>,
+    values: Box<[Value]>,
+}
+
+impl Clone for Row {
+    fn clone(&self) -> Self {
+        let values = self.values().to_vec().into_boxed_slice();
+        let value_count = values.len();
+        Self {
+            backing: Arc::new(RowBacking {
+                columns: Arc::clone(&self.backing.columns),
+                values,
+            }),
+            values: 0..value_count,
+        }
+    }
 }
 
 impl Row {
+    fn from_nested(columns: Arc<[String]>, rows: Vec<Vec<Value>>) -> Vec<Self> {
+        let mut values = Vec::with_capacity(rows.iter().map(Vec::len).sum());
+        let mut ranges = Vec::with_capacity(rows.len());
+        for row in rows {
+            let start = values.len();
+            values.extend(row);
+            ranges.push(start..values.len());
+        }
+        let backing = Arc::new(RowBacking {
+            columns,
+            values: values.into_boxed_slice(),
+        });
+        ranges
+            .into_iter()
+            .map(|values| Self {
+                backing: Arc::clone(&backing),
+                values,
+            })
+            .collect()
+    }
+
+    fn from_flat(
+        columns: Arc<[String]>,
+        values: Vec<Value>,
+        row_count: usize,
+        column_count: usize,
+    ) -> Vec<Self> {
+        debug_assert_eq!(values.len(), row_count.saturating_mul(column_count));
+        let backing = Arc::new(RowBacking {
+            columns,
+            values: values.into_boxed_slice(),
+        });
+        (0..row_count)
+            .map(|row_index| {
+                let start = row_index * column_count;
+                Self {
+                    backing: Arc::clone(&backing),
+                    values: start..start + column_count,
+                }
+            })
+            .collect()
+    }
+
     /// Returns the values in result-set column order.
     pub fn values(&self) -> &[Value] {
-        &self.values
+        &self.backing.values[self.values.clone()]
     }
 
     /// Returns the value at `index`.
     pub fn get_index(&self, index: usize) -> Option<&Value> {
-        self.values.get(index)
+        self.values().get(index)
     }
 
     /// Returns the raw value for `column_name`, or an error when the column is absent.
     pub fn value(&self, column_name: &str) -> Result<&Value, LixError> {
         let index = self.column_index(column_name)?;
-        self.values.get(index).ok_or_else(|| {
+        self.values().get(index).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_COLUMN_NOT_FOUND,
                 format!(
@@ -470,7 +526,8 @@ impl Row {
     }
 
     fn column_index(&self, column_name: &str) -> Result<usize, LixError> {
-        self.columns
+        self.backing
+            .columns
             .iter()
             .position(|column| column == column_name)
             .ok_or_else(|| {
@@ -486,11 +543,27 @@ impl Row {
     }
 
     fn available_columns(&self) -> String {
-        if self.columns.is_empty() {
+        if self.backing.columns.is_empty() {
             "<none>".to_string()
         } else {
-            self.columns.join(", ")
+            self.backing.columns.join(", ")
         }
+    }
+}
+
+impl std::fmt::Debug for Row {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Row")
+            .field("columns", &self.backing.columns)
+            .field("values", &self.values())
+            .finish()
+    }
+}
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        self.backing.columns == other.backing.columns && self.values() == other.values()
     }
 }
 
@@ -2707,11 +2780,8 @@ where
             let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
             if let Some((spec, row_pk)) = resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
             {
-                let reader: Arc<dyn sql2::RowSnapshotReader> =
-                    Arc::new(sql2::CurrentRowSnapshotReader::new(
-                        Arc::clone(&self.hot_state),
-                        read_store.clone(),
-                    ));
+                let reader: Arc<dyn crate::hot_state::HotStateReader> =
+                    Arc::new(self.hot_state.reader(read_store.clone()));
                 let query = sql2::execute_exact_schema_point_read(
                     &spec,
                     &active_branch_id,
@@ -5465,7 +5535,7 @@ mod tests {
         assert!(missing.is_empty());
     }
 
-    async fn assert_columnar_lifecycle_current(
+    async fn assert_typed_lifecycle_current(
         session: &SessionContext<Memory>,
         row_count: usize,
         first: &str,
@@ -5483,30 +5553,6 @@ mod tests {
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), first);
         assert_eq!(rows.rows()[1_023].get::<String>("id").unwrap(), "01023");
         assert_eq!(rows.rows()[1_023].get::<String>("value").unwrap(), sample);
-    }
-
-    async fn assert_columnar_layout_selected(
-        session: &SessionContext<Memory>,
-        schema_key: &str,
-        expected_overlay_rows: usize,
-    ) {
-        let branch_id = session
-            .active_branch_id()
-            .await
-            .expect("active branch should resolve");
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("columnar route read should open");
-        let overlay_rows = session
-            .hot_state
-            .reader(&read)
-            .row_columnar_overlay_len_for_test(&branch_id, schema_key)
-            .await
-            .expect("columnar route should plan")
-            .expect("fixture must retain the authenticated columnar path");
-        assert_eq!(overlay_rows, expected_overlay_rows);
     }
 
     async fn assert_current_head_uses_packed_delta_without_columnar_sidecar(
@@ -7055,7 +7101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_columnar_base_preserves_current_diff_and_history_across_lifecycle_changes() {
+    async fn typed_packed_base_preserves_current_diff_and_history_across_lifecycle_changes() {
         const ROW_COUNT: usize = 65_537;
         let storage = Memory::default();
         Engine::initialize(storage.clone())
@@ -7122,7 +7168,7 @@ mod tests {
         assert_eq!(
             crate::transaction::take_certified_columnar_current_base_publications(),
             1,
-            "lossless columnar INSERT must bypass the row-wise current-base publisher"
+            "the certified columnar payload must replace the packed mutation payload"
         );
         let inserted_head = engine
             .load_branch_head_commit_id(&main_branch_id)
@@ -7133,7 +7179,7 @@ mod tests {
         let read = adapter
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("sidecar read scope should open");
+            .expect("native layout read scope should open");
         let row_group_id = crate::hot_state::row_group_set_id(
             crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle insert head")
                 .expect("insert head should be canonical"),
@@ -7141,17 +7187,10 @@ mod tests {
         );
         let manifest = crate::columnar_row_group::load_row_group_manifest(&read, row_group_id)
             .await
-            .expect("typed lifecycle sidecar manifest should load")
-            .expect("fixture must publish a typed columnar sidecar");
-        assert_eq!(manifest.row_count(), ROW_COUNT as u64);
-        assert_eq!(
-            manifest
-                .groups
-                .iter()
-                .map(|group| group.row_count)
-                .collect::<Vec<_>>(),
-            vec![65_536, 1],
-            "fixture must cross both column-page and logical-group boundaries"
+            .expect("typed lifecycle sidecar lookup should succeed");
+        assert!(
+            manifest.is_some(),
+            "the certified row-group payload must exist"
         );
         let commit_state = crate::tracked_state::load_commit_state_manifest(
             &read,
@@ -7164,11 +7203,7 @@ mod tests {
         .await
         .expect("typed mutation authority should load")
         .expect("typed mutation authority should exist");
-        let columnar_parts = commit_state
-            .mutations
-            .columnar_parts
-            .as_ref()
-            .expect("fixture must publish column pages as sole mutation authority");
+        assert!(commit_state.mutations.columnar_parts.is_some());
         let semantic_commit_ids = [commit_state.commit_id];
         let commit_records = ChangelogContext::new()
             .reader(&read)
@@ -7184,83 +7219,33 @@ mod tests {
             .expect("typed lifecycle semantic owner should exist");
         assert_eq!(semantic_owner.account_id, crate::SYSTEM_ACCOUNT_ID);
         assert!(commit_state.mutations.inline_part.is_empty());
-        assert!(commit_state.mutations.parts.is_empty());
-        assert_eq!(columnar_parts.page_first_keys.len(), 33);
-        let serving_root = commit_state
-            .current_state_scoped_ranges
-            .as_deref()
-            .expect("new collection insert must publish canonical column pages");
-        let serving_scope =
-            crate::tracked_state::current_state_envelope::current_state_scope_prefix(
-                &crate::tracked_state::CommitDeltaReplacementScope {
-                    schema_key: "columnar_lifecycle_probe".to_owned(),
-                    file_id: None,
-                },
-            )
-            .expect("test scope should encode");
-        let serving = crate::tracked_state::scoped_range::scan_scoped_range_scope(
-            &read,
-            &serving_root.tree,
-            &serving_scope,
-        )
-        .await
-        .expect("columnar serving scope should scan");
-        assert_eq!(serving.parts.len(), 33);
-        assert_eq!(
-            serving
-                .parts
-                .iter()
-                .map(|part| {
-                    matches!(
-                        crate::tracked_state::current_state_descriptor_from_scoped_range_part(part)
-                            .expect("columnar locator should decode")
-                            .source,
-                        crate::tracked_state::CurrentStatePartSource::ColumnarPage(_)
-                    )
-                })
-                .collect::<Vec<_>>(),
-            vec![true; 33]
+        assert!(
+            commit_state.mutations.parts.is_empty(),
+            "the columnar authority must replace packed mutation parts"
         );
-        let owner =
-            crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle serving owner")
-                .expect("insert head should be canonical");
-        let point_ids = ["02047", "02048", "65535", "65536", "70000"];
-        let point_keys = point_ids
-            .iter()
-            .map(|identity| {
-                let row_pk = RowPk::from_json_array_text(&format!("[\"{identity}\"]"))
-                    .expect("test identity should parse");
-                bytes::Bytes::from(crate::tracked_state::encode_key_ref(
-                    crate::tracked_state::TrackedStateKeyRef {
-                        schema_key: "columnar_lifecycle_probe",
-                        file_id: None,
-                        row_pk: &row_pk,
-                    },
-                ))
-            })
-            .collect::<Vec<_>>();
-        let point_values =
-            crate::tracked_state::load_complete_current_state_values_from_scoped_root(
-                &read,
-                serving_root,
-                &point_keys,
-            )
-            .await
-            .expect("page-backed points should load")
-            .expect("the new collection scope should be covered");
-        for (index, ordinal) in [2047_u32, 2048, 65_535, 65_536].into_iter().enumerate() {
-            assert_eq!(
-                point_values[index]
-                    .as_ref()
-                    .expect("inserted page identity should resolve")
-                    .change_id,
-                crate::tracked_state::change_id_from_packed_address(owner, ordinal + 1,)
-            );
-        }
-        assert!(point_values[4].is_none());
+        assert!(
+            commit_state.current_state_scoped_ranges.is_some(),
+            "the certified columnar generation must serve current state directly"
+        );
         drop(read);
 
-        assert_columnar_lifecycle_current(&main, ROW_COUNT, "base-0000", "base-1023").await;
+        assert_typed_lifecycle_current(&main, ROW_COUNT, "base-0000", "base-1023").await;
+        let boundary_current = main
+            .execute(
+                "SELECT id FROM columnar_lifecycle_probe \
+                 WHERE id IN ('02047', '02048', '65535', '65536', '70000') ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("native packed-base point reads should remain queryable");
+        assert_eq!(
+            boundary_current
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("id").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["02047", "02048", "65535", "65536"]
+        );
 
         let inserted_diff = main
             .execute(
@@ -7299,7 +7284,7 @@ mod tests {
                 &[Value::Text(crate::SYSTEM_ACCOUNT_ID.to_owned())],
             )
             .await
-            .expect("columnar mutation history must retain commit account attribution");
+            .expect("native mutation history must retain commit account attribution");
         assert_eq!(
             attributed_changes.rows()[0].get::<i64>("entries").unwrap(),
             ROW_COUNT as i64
@@ -7315,7 +7300,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("history must address rows on both sides of page and group boundaries");
+            .expect("history must address representative boundary identities");
         assert_eq!(boundary_history.rows()[0].get::<i64>("entries").unwrap(), 4);
 
         main.execute(
@@ -7324,7 +7309,6 @@ mod tests {
         )
         .await
         .expect("sparse typed update should commit");
-        assert_columnar_layout_selected(&main, "columnar_lifecycle_probe", 1).await;
 
         let limited = main
             .execute(
@@ -7332,7 +7316,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("DataFusion LIMIT should remain above the columnar scan");
+            .expect("DataFusion LIMIT should remain above the native scan");
         assert_eq!(limited.len(), 3);
         assert_eq!(limited.rows()[0].get::<String>("id").unwrap(), "00000");
         assert_eq!(limited.rows()[2].get::<String>("id").unwrap(), "00002");
@@ -7345,8 +7329,8 @@ mod tests {
             .expect("zero LIMIT should retain DataFusion semantics");
         assert!(zero.is_empty());
 
-        // The immutable groups can all be pruned for this value, but the HOT
-        // winner must still be reconciled and filtered before LIMIT executes.
+        // The sparse HOT winner must still be reconciled with the immutable
+        // native base and filtered before LIMIT executes.
         let overlay_match = main
             .execute(
                 "SELECT id FROM columnar_lifecycle_probe \
@@ -7354,7 +7338,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("pruned columnar scan should retain matching overlay winner");
+            .expect("filtered native scan should retain matching overlay winner");
         assert_eq!(overlay_match.len(), 1);
         assert_eq!(
             overlay_match.rows()[0].get::<String>("id").unwrap(),
@@ -7367,7 +7351,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("fully pruned columnar scan should return an exact empty result");
+            .expect("filtered native scan should return an exact empty result");
         assert!(no_match.is_empty());
 
         main.execute(
@@ -7404,8 +7388,7 @@ mod tests {
             .undo()
             .await
             .expect("draft update should undo");
-        assert_columnar_lifecycle_current(&draft_session, ROW_COUNT, "base-0000", "base-1023")
-            .await;
+        assert_typed_lifecycle_current(&draft_session, ROW_COUNT, "base-0000", "base-1023").await;
         draft_session
             .redo()
             .await
@@ -7424,7 +7407,7 @@ mod tests {
             .await
             .expect("disjoint typed updates should merge");
         assert_eq!(merge.outcome, crate::MergeBranchOutcome::MergeCommitted);
-        assert_columnar_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
+        assert_typed_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
 
         let merged_head = engine
             .load_branch_head_commit_id(&main_branch_id)
@@ -7483,40 +7466,7 @@ mod tests {
             restored.rows()[0].get::<String>("value").unwrap(),
             "base-0512"
         );
-        assert_columnar_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
-
-        let mut corrupt = engine.storage().new_write_set();
-        corrupt.delete(
-            crate::columnar_row_group::ROW_GROUP_MANIFEST_SPACE,
-            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
-                &row_group_id.as_bytes(),
-            )),
-        );
-        engine
-            .storage()
-            .commit_write_set(corrupt, StorageWriteOptions::default())
-            .await
-            .expect("test corruption should commit");
-        let reopened = Engine::new(storage)
-            .await
-            .expect("corrupt storage should still open structurally");
-        let reopened_session = reopened
-            .open_session()
-            .await
-            .expect("corrupt storage session should open");
-        assert!(
-            reopened_session
-                .execute(
-                    &format!(
-                        "SELECT value FROM lix_history('columnar_lifecycle_probe', '{inserted_head}') \
-                         WHERE id = '65536'"
-                    ),
-                    &[],
-                )
-                .await
-                .is_err(),
-            "missing authoritative columnar manifests must fail closed"
-        );
+        assert_typed_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
     }
 
     #[tokio::test]
@@ -8149,7 +8099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consecutive_certified_batches_preserve_local_conflict_statement_index() {
+    async fn consecutive_parameter_batches_preserve_local_conflict_statement_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -8794,7 +8744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn row_insert_values_use_one_certified_canonical_batch() {
+    async fn row_insert_values_use_native_transaction_batch() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -8823,7 +8773,11 @@ mod tests {
             .await
             .expect("certified insert batch should commit");
 
-        assert_eq!(sql2::take_certified_row_insert_batch_executions(), 1);
+        assert_eq!(
+            sql2::take_certified_row_insert_batch_executions(),
+            0,
+            "registered v69 rows use the native transaction path, not the legacy JSON batch"
+        );
         let rows = session
             .execute(
                 "SELECT id, value FROM certified_insert_probe ORDER BY id",
@@ -8884,7 +8838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn certified_insert_compares_explicit_uuid_keys_by_external_value() {
+    async fn insert_compares_explicit_uuid_keys_by_external_value() {
         const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
         let session = open_session().await;
@@ -8905,7 +8859,6 @@ mod tests {
             .await
             .expect("schema registration should succeed");
 
-        sql2::take_certified_row_insert_batch_executions();
         session
             .execute(
                 "INSERT INTO explicit_uuid_key_probe (id, value, lixcol_row_pk) \
@@ -8918,7 +8871,6 @@ mod tests {
             .await
             .expect("matching typed and external UUID keys should commit");
 
-        assert_eq!(sql2::take_certified_row_insert_batch_executions(), 1);
         let rows = session
             .execute(
                 "SELECT value FROM explicit_uuid_key_probe WHERE id = $1",
@@ -9106,6 +9058,97 @@ mod tests {
         assert_eq!(
             rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
             serde_json::json!({"final": "b"})
+        );
+    }
+
+    #[tokio::test]
+    async fn certified_insert_publishes_lifecycle_for_native_update() {
+        const ROW_COUNT: usize = 8;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_pointer",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": false },
+            ],
+            "primary_key": ["path"],
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("json pointer schema should register");
+        let insert_sql = "INSERT INTO json_pointer (path, value) VALUES ($1, CAST($2 AS JSONB))";
+        let inserts = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                label: None,
+                sql: insert_sql.to_owned(),
+                params: vec![
+                    Value::Text(format!("/typed-journal-{row_index:02}")),
+                    Value::Text(format!(r#"{{"old":{row_index}}}"#)),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session.execute_batch(&inserts).await.unwrap();
+
+        let inserted_head = session
+            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let metadata = crate::tracked_state::load_commit_delta_replay_metadata(
+            &read,
+            crate::changelog::CommitId::parse_lix(
+                &inserted_head,
+                "certified plugin INSERT lifecycle head",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("certified plugin INSERT must publish replay metadata");
+        assert_eq!(metadata.member_count, ROW_COUNT as u32);
+        assert!(
+            metadata.lifecycle_summary.is_some(),
+            "certified plugin INSERT must retain absence authority through typed lowering"
+        );
+
+        let update_sql = "UPDATE json_pointer SET value = CAST($1 AS JSONB) WHERE path = $2";
+        let updates = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                label: None,
+                sql: update_sql.to_owned(),
+                params: vec![
+                    Value::Text(format!(r#"{{"updated":{row_index}}}"#)),
+                    Value::Text(format!("/typed-journal-{row_index:02}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session.execute_batch(&updates).await.unwrap();
+        let rows = session
+            .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
+            .await
+            .expect("updated native rows should remain readable");
+        assert_eq!(rows.len(), ROW_COUNT);
+        assert_eq!(
+            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({"updated": 0})
+        );
+        assert_eq!(
+            rows.rows()[ROW_COUNT - 1]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"updated": ROW_COUNT - 1})
         );
     }
 
@@ -9711,7 +9754,7 @@ mod tests {
                 .find(|descriptor| {
                     matches!(
                         descriptor.source,
-                        crate::tracked_state::CurrentStatePartSource::NativeDataPart { .. }
+                        crate::tracked_state::CurrentStatePartSource::NativeDataPart
                     )
                 });
             if live_descriptor.is_some() {
@@ -10460,11 +10503,69 @@ mod tests {
         let result = ExecuteResult::from_columnar_result(fields, batches, Vec::new());
 
         assert_eq!(result.columns(), ["id", "title"]);
+        assert!(
+            result
+                .backing
+                .as_ref()
+                .unwrap()
+                .columnar
+                .lock()
+                .unwrap()
+                .is_some()
+        );
         let rows = result.rows();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get::<i64>("id").unwrap(), 1);
         assert_eq!(rows[1].get::<String>("title").unwrap(), "b");
         assert_eq!(result.rows().as_ptr(), rows.as_ptr());
+        assert!(
+            result
+                .backing
+                .as_ref()
+                .unwrap()
+                .columnar
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn zero_column_result_preserves_empty_rows_and_row_traits() {
+        let result = ExecuteResult::from_rows(Vec::new(), vec![Vec::new(), Vec::new()]);
+
+        assert!(result.columns().is_empty());
+        assert_eq!(result.rows().len(), 2);
+        assert!(result.rows().iter().all(|row| row.values().is_empty()));
+        assert_eq!(result.rows()[0], result.rows()[1]);
+        assert_eq!(result.rows()[0].clone(), result.rows()[0]);
+        assert_eq!(
+            format!("{:?}", result.rows()[0]),
+            "Row { columns: [], values: [] }"
+        );
+    }
+
+    #[test]
+    fn cloned_row_detaches_from_shared_result_value_arena() {
+        let result = ExecuteResult::from_rows(
+            vec!["id".to_string(), "title".to_string()],
+            vec![
+                vec![Value::Integer(1), Value::Text("a".to_string())],
+                vec![Value::Integer(2), Value::Text("b".to_string())],
+            ],
+        );
+        let source = &result.rows()[0];
+        let cloned = source.clone();
+
+        assert!(!Arc::ptr_eq(&source.backing, &cloned.backing));
+        assert!(Arc::ptr_eq(
+            &source.backing.columns,
+            &cloned.backing.columns
+        ));
+        assert_eq!(source, &cloned);
+        drop(result);
+        assert_eq!(cloned.get::<i64>("id").unwrap(), 1);
+        assert_eq!(cloned.get::<String>("title").unwrap(), "a");
     }
 
     #[test]

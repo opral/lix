@@ -208,7 +208,7 @@ mod tests {
 /// The threshold is applied deterministically at staging time, so identical
 /// content always produces the same variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum JsonSlot {
+pub(crate) enum LegacyJsonValue {
     None,
     Ref(JsonRef),
     Inline(Box<str>),
@@ -218,7 +218,7 @@ pub(crate) enum JsonSlot {
 /// json_store entirely.
 pub(crate) const JSON_INLINE_MAX_BYTES: usize = 1024;
 
-impl JsonSlot {
+impl LegacyJsonValue {
     pub(crate) fn from_json(json: &str) -> Self {
         if json.len() <= JSON_INLINE_MAX_BYTES {
             Self::Inline(json.into())
@@ -231,42 +231,38 @@ impl JsonSlot {
         matches!(self, Self::None)
     }
 
-    pub(crate) fn is_some(&self) -> bool {
-        !self.is_none()
-    }
-
-    pub(crate) fn as_ref_slot(&self) -> JsonSlotRef<'_> {
+    pub(crate) fn as_ref_slot(&self) -> LegacyJsonValueRef<'_> {
         match self {
-            Self::None => JsonSlotRef::None,
-            Self::Ref(json_ref) => JsonSlotRef::Ref(json_ref),
-            Self::Inline(json) => JsonSlotRef::Inline(json),
+            Self::None => LegacyJsonValueRef::None,
+            Self::Ref(json_ref) => LegacyJsonValueRef::Ref(json_ref),
+            Self::Inline(json) => LegacyJsonValueRef::Inline(json),
         }
     }
 }
 
-/// Borrowed form of [`JsonSlot`] for zero-copy staging paths.
+/// Borrowed form of [`LegacyJsonValue`] for zero-copy staging paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JsonSlotRef<'a> {
+pub(crate) enum LegacyJsonValueRef<'a> {
     None,
     Ref(&'a JsonRef),
     Inline(&'a str),
 }
 
-/// Musli codec for [`JsonSlot`]: tag byte 0/1/2, then the payload.
+/// Musli codec for [`LegacyJsonValue`]: tag byte 0/1/2, then the payload.
 pub(crate) mod json_slot_storage {
     use musli::Context;
     use musli::de::SequenceDecoder;
 
-    use super::{JsonRef, JsonSlot};
+    use super::{JsonRef, LegacyJsonValue};
 
-    pub(crate) fn encode<E>(value: &JsonSlot, encoder: E) -> Result<(), E::Error>
+    pub(crate) fn encode<E>(value: &LegacyJsonValue, encoder: E) -> Result<(), E::Error>
     where
         E: musli::Encoder,
     {
         super::json_slot_storage_ref::encode(&value.as_ref_slot(), encoder)
     }
 
-    pub(crate) fn decode<'de, D>(decoder: D) -> Result<JsonSlot, D::Error>
+    pub(crate) fn decode<'de, D>(decoder: D) -> Result<LegacyJsonValue, D::Error>
     where
         D: musli::Decoder<'de>,
     {
@@ -274,13 +270,13 @@ pub(crate) mod json_slot_storage {
         decoder.decode_pack(|pack| {
             let tag: u8 = pack.next()?;
             match tag {
-                0 => Ok(JsonSlot::None),
-                1 => Ok(JsonSlot::Ref(pack.next::<JsonRef>()?)),
+                0 => Ok(LegacyJsonValue::None),
+                1 => Ok(LegacyJsonValue::Ref(pack.next::<JsonRef>()?)),
                 2 => {
                     let bytes: Vec<u8> = pack.next()?;
                     String::from_utf8(bytes).map_or_else(
                         |_| Err(cx.message(format_args!("inline json payload is not UTF-8"))),
-                        |json| Ok(JsonSlot::Inline(json.into_boxed_str())),
+                        |json| Ok(LegacyJsonValue::Inline(json.into_boxed_str())),
                     )
                 }
                 other => Err(cx.message(format_args!("unknown json slot tag {other}"))),
@@ -289,23 +285,23 @@ pub(crate) mod json_slot_storage {
     }
 }
 
-/// Encode-only musli codec for borrowed [`JsonSlotRef`] fields.
+/// Encode-only musli codec for borrowed [`LegacyJsonValueRef`] fields.
 pub(crate) mod json_slot_storage_ref {
     use musli::en::SequenceEncoder;
 
-    use super::JsonSlotRef;
+    use super::LegacyJsonValueRef;
 
-    pub(crate) fn encode<E>(value: &JsonSlotRef<'_>, encoder: E) -> Result<(), E::Error>
+    pub(crate) fn encode<E>(value: &LegacyJsonValueRef<'_>, encoder: E) -> Result<(), E::Error>
     where
         E: musli::Encoder,
     {
         encoder.encode_pack_fn(|pack| match value {
-            JsonSlotRef::None => pack.push(0u8),
-            JsonSlotRef::Ref(json_ref) => {
+            LegacyJsonValueRef::None => pack.push(0u8),
+            LegacyJsonValueRef::Ref(json_ref) => {
                 pack.push(1u8)?;
                 pack.push(*json_ref)
             }
-            JsonSlotRef::Inline(json) => {
+            LegacyJsonValueRef::Inline(json) => {
                 pack.push(2u8)?;
                 pack.push(json.as_bytes())
             }

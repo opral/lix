@@ -23,7 +23,7 @@ pub(crate) use json_pointer::parse_json_pointer;
 pub use lix_path::{LixPath, validate_lix_path_segment};
 pub(crate) use lix_path::{compose_directory_path, compose_file_path};
 pub(crate) use metadata::{
-    parse_row_metadata, parse_row_metadata_value, serialize_row_metadata, validate_row_metadata,
+    parse_row_metadata_value, serialize_row_metadata, validate_row_metadata,
 };
 pub(crate) use string_dictionary::{
     FastHashBuilder, StringDictionary, StringDictionaryBuilder, fast_hash_builder,

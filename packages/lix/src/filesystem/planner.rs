@@ -10,11 +10,11 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::binary_cas::BlobId;
 use crate::common::{LixPath, compose_file_path};
-use crate::row_pk::RowPk;
 use crate::hot_state::{
     HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateRow,
     MaterializedHotStateRowRef,
 };
+use crate::row_pk::RowPk;
 
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -1407,7 +1407,10 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
     let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
     let mut file_rows = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
     for row in rows.iter() {
-        let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
+        if row.deleted() {
+            continue;
+        }
+        let Some(snapshot) = row.snapshot_json_value()? else {
             continue;
         };
         let storage_branch_id = if row.global() {
@@ -1423,7 +1426,7 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
                     row.untracked(),
                     None,
                 );
-                let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
+                let snapshot: DirectoryDescriptorSnapshot = serde_json::from_value(snapshot)
                     .map_err(|error| {
                         LixError::new(
                             "LIX_ERROR_UNKNOWN",
@@ -1446,8 +1449,8 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
                     row.untracked(),
                     None,
                 );
-                let snapshot: FileDescriptorSnapshot = serde_json::from_str(snapshot_content)
-                    .map_err(|error| {
+                let snapshot: FileDescriptorSnapshot =
+                    serde_json::from_value(snapshot).map_err(|error| {
                         LixError::new(
                             "LIX_ERROR_UNKNOWN",
                             format!("invalid lix_file_descriptor snapshot JSON: {error}"),
@@ -1863,8 +1866,8 @@ mod tests {
     use crate::common::LixPath;
     use crate::filesystem::VisibleFilesystem;
     use crate::{
-        row_pk::RowPk,
         hot_state::{MaterializedHotStateBatch, MaterializedHotStateRow},
+        row_pk::RowPk,
     };
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
@@ -2235,7 +2238,13 @@ mod tests {
         assert!(plan.file_content.is_empty());
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(plan.rows.row(0).schema_key, "lix_file_descriptor");
-        let snapshot: JsonValue = plan.rows.row(0).snapshot.unwrap().value().clone();
+        let snapshot: JsonValue = plan
+            .rows
+            .row(0)
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(snapshot["id"], "file-generated-readme");
         assert_eq!(snapshot["directory_id"], JsonValue::Null);
         assert_eq!(snapshot["name"], "readme.md");
@@ -2301,7 +2310,11 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be planned");
-        let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
+        let snapshot: JsonValue = file_row
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
         assert_eq!(snapshot["name"], "readme.md");
@@ -2344,7 +2357,11 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be planned");
-        let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
+        let snapshot: JsonValue = file_row
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(
             snapshot["directory_id"],
             "01920000-0000-7000-8000-000000000313"
@@ -2391,7 +2408,11 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be planned");
-        let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
+        let snapshot: JsonValue = file_row
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(
             snapshot["directory_id"],
@@ -2529,7 +2550,13 @@ mod tests {
                 .all(|row| row.schema_key != "lix_binary_blob_ref")
         );
 
-        let snapshot: JsonValue = plan.rows.row(0).snapshot.unwrap().value().clone();
+        let snapshot: JsonValue = plan
+            .rows
+            .row(0)
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(
             snapshot["directory_id"],
@@ -2576,7 +2603,11 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be planned");
-        let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
+        let snapshot: JsonValue = file_row
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
         assert_eq!(snapshot["name"], "readme.md");
     }

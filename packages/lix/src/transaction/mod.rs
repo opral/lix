@@ -4,7 +4,6 @@ mod commit;
 mod commit_coordinator;
 mod context;
 mod normalization;
-pub(crate) mod plugin_checkpoint;
 mod schema_resolver;
 mod staged_commit_changes;
 mod staging;
@@ -34,7 +33,6 @@ pub(crate) use commit::take_rootless_replacement_generation_publications;
 pub(crate) use commit_coordinator::CommitCoordinator;
 // Owner facade for the storage-space registry (`crate::storage_spaces`),
 // which is compiled in every configuration.
-pub(crate) use context::CertifiedHistoryStoreReader;
 #[cfg(test)]
 pub(crate) use context::CommitBoundaryGuard;
 pub(crate) use context::CommitBoundaryState;
@@ -48,7 +46,5 @@ pub(crate) use context::open_transaction;
 pub(crate) use context::open_transaction_with_runtime_boundary;
 pub(crate) use context::transaction_is_file_cohort_eligible;
 pub(crate) use context::transactions_can_share_cohort;
-pub(crate) use plugin_checkpoint::PLUGIN_CHECKPOINT_SPACE;
-pub(crate) use plugin_checkpoint::stage_delete_branch_plugin_checkpoints;
 pub(crate) use staged_commit_changes::StagedCommitChangeBatchBuilder;
 pub(crate) use staging::duplicate_insert_identity_message;

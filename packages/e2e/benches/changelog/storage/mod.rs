@@ -119,6 +119,17 @@ impl StorageWrite for ChangelogScoreWrite {
         }
     }
 
+    async fn replace_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Unit(write) => write.replace_many(space, entries).await,
+            Self::RocksDB(write) => write.replace_many(space, entries).await,
+        }
+    }
+
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         match self {
             Self::Unit(write) => write.delete_many(space, keys).await,

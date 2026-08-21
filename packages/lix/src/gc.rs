@@ -22,7 +22,7 @@ use crate::changelog::{ChangeScanRequest, ChangelogContext, ChangelogReader};
 use crate::commit_graph::CommitGraphContext;
 use crate::hot_state::TrackedHeadContext;
 use crate::hot_state::stage_collect_stale_working_diff_indexes;
-use crate::json_store::{JsonRef, JsonSlot, JsonStoreContext};
+use crate::json_store::{JsonRef, JsonStoreContext};
 #[cfg(test)]
 use crate::storage_adapter::StorageCoreProjection;
 use crate::storage_adapter::{
@@ -863,12 +863,6 @@ struct AuthenticatedServingDependencyClosure {
     mutation_nodes: BTreeSet<[u8; 32]>,
     scoped_nodes: BTreeSet<[u8; 32]>,
     native_parts: BTreeSet<[u8; 32]>,
-    /// Payload-ref summary digests of the retained native current-state parts.
-    ///
-    /// The scoped-range descriptor is the only place the `content_digest ->
-    /// payload_refs_digest` pairing exists, so the walk has to carry it out.
-    /// Rediscovering it later would mean re-reading the scoped-range trees.
-    native_part_refs_digests: BTreeSet<[u8; 32]>,
     /// Graph-reachable commits with no physical manifest, i.e. commits whose
     /// history delta a pre-fix sweep already reclaimed. Counted so the
     /// condition is observable; never a retention input.
@@ -1002,7 +996,6 @@ where
 
     let mut scoped_nodes = BTreeSet::new();
     let mut native_parts = BTreeSet::new();
-    let mut native_part_refs_digests = BTreeSet::new();
     let scoped_roots = manifests
         .values()
         .filter_map(|manifest| {
@@ -1030,11 +1023,8 @@ where
                         source.owner_commit_id,
                     )));
                 }
-                crate::tracked_state::CurrentStatePartSource::NativeDataPart {
-                    payload_refs_digest,
-                } => {
+                crate::tracked_state::CurrentStatePartSource::NativeDataPart => {
                     native_parts.insert(descriptor.content_digest);
-                    native_part_refs_digests.insert(payload_refs_digest);
                 }
             }
         }
@@ -1146,7 +1136,6 @@ where
         mutation_nodes,
         scoped_nodes,
         native_parts,
-        native_part_refs_digests,
         history_manifests_missing,
     })
 }
@@ -1254,150 +1243,12 @@ where
     crate::tracked_state::scan_commit_state_manifest_commit_ids(store).await
 }
 
-/// Plans which out-of-band JSON payloads this sweep may reclaim.
-///
-/// Every owner class that can hold a `JsonSlot::Ref` after the write set
-/// commits is enumerated here, and each one is reached from the walk rather
-/// than from a scan of the payload plane or of the changelog:
-///
-/// 1. **Published hot rows.** The serving plane of every live branch
-///    generation, tracked rows included. Untracked rows are the only owner of
-///    their payload; tracked rows are a derived cache, but a serving read
-///    materializes a payload straight out of this plane, so a ref here that no
-///    longer resolves is a read failure.
-/// 2. **Retained native current-state parts.** Their payload-ref summaries are
-///    carried out of the scoped-range walk by the retention closure.
-/// 3. **Surviving commit deltas.** `surviving_commits` is exactly the candidate
-///    set this sweep could not prove retirable, which is exactly the set of
-///    physical manifests still standing afterwards, so this is a bounded
-///    per-commit inventory walk over the commits GC has already decided to
-///    keep — not a repository-global commit scan.
-/// 4. **Standalone branch-ref facts.** The shipping sweep never deletes a
-///    standalone change, so the fact each control names stays an owner. Branch
-///    ref snapshots are small enough to inline today; enumerating them anyway
-///    costs one point read per branch and removes the dependence on that.
-///
-/// Being a superset here is always safe and being a subset never is, so where
-/// the two arguments were close — the tracked hot rows, the branch-ref facts —
-/// this deliberately takes the wider set.
-struct JsonPayloadReclamation {
-    live: BTreeSet<[u8; 32]>,
-    sweep: Vec<JsonRef>,
-}
-
-async fn plan_json_payload_reclamation<S>(
-    store: &S,
-    controls: &[(String, BranchHeadControl)],
-    retired_commits: &BTreeSet<CommitId>,
-    surviving_commits: &BTreeSet<CommitId>,
-    released_part_refs_digests: &BTreeSet<[u8; 32]>,
-    retained_part_refs_digests: &BTreeSet<[u8; 32]>,
-) -> Result<JsonPayloadReclamation, LixError>
-where
-    S: StorageAdapterRead + Clone + Send + Sync,
-{
-    // Every await here is boxed. This planner is reached from
-    // `stage_repository_gc_with_preconditions`, whose future is already close
-    // to the test harness's 2 MiB worker stack; inlining these state machines
-    // aborted `cas_gc_history_retention` with a stack overflow, which passes on
-    // the parent commit. Keep them boxed.
-    //
-    // Candidates: named only by state this sweep is deleting.
-    let mut candidates = BTreeSet::new();
-    for commit_id in retired_commits {
-        Box::pin(crate::tracked_state::collect_local_commit_delta_json_refs(
-            store,
-            *commit_id,
-            &mut candidates,
-        ))
-        .await?;
-    }
-    Box::pin(crate::tracked_state::collect_current_state_part_json_refs(
-        store,
-        released_part_refs_digests,
-        &mut candidates,
-    ))
-    .await?;
-
-    // Live: named by state that outlives this sweep.
-    let mut live = BTreeSet::new();
-    Box::pin(
-        TrackedHeadContext::new()
-            .reader(store.clone())
-            .collect_hot_json_refs(controls, false, &mut live),
-    )
-    .await?;
-    Box::pin(crate::tracked_state::collect_current_state_part_json_refs(
-        store,
-        retained_part_refs_digests,
-        &mut live,
-    ))
-    .await?;
-    for commit_id in surviving_commits {
-        Box::pin(crate::tracked_state::collect_local_commit_delta_json_refs(
-            store, *commit_id, &mut live,
-        ))
-        .await?;
-    }
-    let ref_change_ids = controls
-        .iter()
-        .map(|(_, control)| control.ref_change_id)
-        .collect::<BTreeSet<_>>();
-    for record in Box::pin(crate::changelog::load_change_records(
-        store,
-        ref_change_ids.into_iter(),
-    ))
-    .await?
-    .values()
-    {
-        for slot in [&record.snapshot, &record.metadata] {
-            if let JsonSlot::Ref(json_ref) = slot {
-                live.insert(*json_ref.as_hash_array());
-            }
-        }
-    }
-
-    let sweep = candidates
-        .difference(&live)
-        .copied()
-        .map(JsonRef::from_hash_bytes)
-        .collect::<Vec<_>>();
-    Ok(JsonPayloadReclamation { live, sweep })
-}
-
 /// Plans and stages logical repository GC against one pinned read.
 ///
 /// The caller must serialize this operation with repository writes and commit
 /// `writes` atomically. Planning and mutation are deliberately separated from
 /// storage commit so checkpoint/session code can retain lifecycle control.
 /// Content-addressed tree/CAS orphan repair is intentionally an offline path.
-///
-/// **Out-of-band JSON payloads are reclaimed here**, by descending the same
-/// walk one level further rather than by any second authority. Until this
-/// change the plane leaked at **one payload per superseded edit**, independent
-/// of checkpoint cadence: measured by `e2e/examples/e1_json_leak.rs` over a
-/// shape x cadence x edits matrix, rewriting one row 1000 times left 1004
-/// payload rows where 1 was live, at every cadence (never / every 10 / every
-/// 100). The `insert` control arm, where every payload stays live, leaked
-/// exactly 3 rows at every size, so `leaked = edits + 3` and the rewrite arm's
-/// growth was the superseded payloads and nothing else.
-///
-/// **That baseline is only meaningful because the probe checkpoints.** Without
-/// one the sweep proves *nothing* retirable -- 0 commit-state manifests retired
-/// across 1000 edits -- so "0 payloads reclaimed" was equally consistent with
-/// "the sweep had no work to do". With a checkpoint every 10 edits the same
-/// stream retires 1095 manifests, which is what established that the owning
-/// commits really were being retired underneath the payloads.
-///
-/// The reclamation keeps the plane's two halves on opposite sides of the
-/// retirement decision. A hash becomes a **candidate** only because this write
-/// set is deleting the row that named it — a retired commit's own delta
-/// members, or a native current-state part whose payload-ref summary this
-/// retirement removes. It is **live** if any owner that outlives the sweep
-/// names it; see [`plan_json_payload_reclamation`] for that enumeration.
-/// Neither half scans the payload plane, so an unreferenced row that no
-/// retirement produced is left alone rather than swept on the strength of a
-/// live set being complete.
 ///
 /// Ordinary GC derives its candidates from the physical manifest inventory and
 /// proves liveness only from refs: branch-head controls and checkpoint recovery
@@ -1462,7 +1313,6 @@ where
         mutation_nodes: active_mutation_nodes,
         scoped_nodes: active_scoped_nodes,
         native_parts: active_current_parts,
-        native_part_refs_digests: active_current_part_refs_digests,
         history_manifests_missing,
     } = load_authenticated_repository_retention(&store, &controls).await?;
 
@@ -1504,6 +1354,9 @@ where
         .chain(active_cas_dependency_ids.iter().copied())
         .chain(blocked_history_dependency_ids.iter().copied())
         .collect::<BTreeSet<_>>();
+    // Plugin generations are executable only from current branch roots. The
+    // broader physical and semantic dependency sets contain implementation
+    // history that cannot activate a registry and would leak retired WASM.
     let mut blob_roots =
         crate::filesystem::collect_gc_binary_blob_roots(&store, &controls, &retained_cas_root_ids)
             .await?;
@@ -1511,7 +1364,7 @@ where
         crate::plugin::runtime::collect_gc_wasm_blob_roots(
             &store,
             &controls,
-            &retained_cas_root_ids,
+            &active_roots,
         )
         .await?,
     );
@@ -1531,7 +1384,6 @@ where
     // candidate behind it forever.
     let mut reclaimed_commits = BTreeSet::new();
     let mut reclaimed_semantic_commits = BTreeSet::new();
-    let mut released_part_refs_digests = BTreeSet::new();
     for commit_id in candidates {
         if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
             && reclaimed_semantic_commits.insert(commit_id)
@@ -1551,38 +1403,9 @@ where
                     scoped_nodes: &active_scoped_nodes,
                     native_parts: &active_current_parts,
                 },
-                &mut released_part_refs_digests,
             )
             .await?;
         }
-    }
-    // One boxed step, not three awaits inlined here. This function's future is
-    // already close to the harness's 2 MiB worker stack: three inline await
-    // points over the segment-decode and hot-scan chains aborted
-    // `cas_gc_history_retention` with a stack overflow, which passes on the
-    // parent commit.
-    let JsonPayloadReclamation {
-        live: live_json_hashes,
-        sweep: sweep_json_payloads,
-    } = Box::pin(plan_json_payload_reclamation(
-        &store,
-        &controls,
-        &reclaimed_commits,
-        &blocked_physical_dependency_ids,
-        &released_part_refs_digests,
-        &active_current_part_refs_digests,
-    ))
-    .await?;
-    if !sweep_json_payloads.is_empty() {
-        JsonStoreContext::new()
-            .writer()
-            .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
-        Box::pin(crate::json_store::stage_json_reclamation_fence(
-            &store,
-            writes,
-            &mut staged_preconditions,
-        ))
-        .await?;
     }
     if !reclaimed_semantic_commits.is_empty() {
         writes.seal_changelog_gc();
@@ -1604,16 +1427,13 @@ where
             live: GcLiveSet {
                 commits: retained_root_ids.into_iter().collect(),
                 changes: Vec::new(),
-                payloads: live_json_hashes
-                    .into_iter()
-                    .map(JsonRef::from_hash_bytes)
-                    .collect(),
+                payloads: Vec::new(),
             },
             sweep: GcSweepSet {
                 commits: Vec::new(),
                 commit_change_ids: Vec::new(),
                 changes: Vec::new(),
-                json_payloads: sweep_json_payloads,
+                json_payloads: Vec::new(),
             },
         },
         sweep: RepositoryGcSweep {
@@ -1837,8 +1657,6 @@ where
     }
     let mut live_scoped_range_nodes = BTreeSet::<[u8; 32]>::new();
     let mut live_current_state_data_parts = BTreeSet::<[u8; 32]>::new();
-    let mut live_current_state_ref_summaries = BTreeMap::<[u8; 32], [u8; 32]>::new();
-    let mut live_current_state_payload_hashes = BTreeSet::<[u8; 32]>::new();
     let mut scoped_roots = BTreeMap::new();
     let mut authority_manifests = BTreeMap::new();
     let live_commit_ids = live_commits.iter().copied().collect::<Vec<_>>();
@@ -1934,19 +1752,8 @@ where
                 }
                 retained_authority_commits.insert(owner);
             }
-            crate::tracked_state::CurrentStatePartSource::NativeDataPart {
-                payload_refs_digest,
-            } => {
+            crate::tracked_state::CurrentStatePartSource::NativeDataPart => {
                 live_current_state_data_parts.insert(descriptor.content_digest);
-                if let Some(previous) = live_current_state_ref_summaries
-                    .insert(descriptor.content_digest, payload_refs_digest)
-                    && previous != payload_refs_digest
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "native scoped-range descriptors disagree about payload refs",
-                    ));
-                }
             }
             crate::tracked_state::CurrentStatePartSource::ColumnarPage(source) => {
                 let owner = CommitId::new(uuid::Uuid::from_bytes(source.owner_commit_id));
@@ -1990,33 +1797,10 @@ where
         }
     }
 
-    let native_keys = live_current_state_ref_summaries
-        .keys()
+    let native_keys = live_current_state_data_parts
+        .iter()
         .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
         .collect::<Vec<_>>();
-    let native_refs = PointReadPlan::new(
-        crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-        &native_keys,
-    )
-    .materialize(store, StorageGetOptions::default())
-    .await?;
-    for ((_, refs_digest), value) in live_current_state_ref_summaries
-        .iter()
-        .zip(native_refs.value)
-    {
-        let bytes = match value {
-            Some(StorageProjectedValue::FullValue(bytes)) => bytes,
-            Some(StorageProjectedValue::KeyOnly) | None => {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "live current-state directory references a missing payload-ref summary",
-                ));
-            }
-        };
-        live_current_state_payload_hashes.extend(
-            crate::tracked_state::decode_current_state_data_part_refs(refs_digest, &bytes)?,
-        );
-    }
     let native_part_presence = PointReadPlan::new(
         crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
         &native_keys,
@@ -2113,22 +1897,13 @@ where
     }
 
     let mut live_change_ids = standalone_root_ids.clone();
-    let mut live_payload_hashes = roots
+    let live_payload_hashes = roots
         .iter()
         .filter_map(|root| match root {
             GcRoot::CurrentPayload(json_ref) => Some(*json_ref.as_hash_array()),
             GcRoot::BranchHead(_) | GcRoot::StandaloneChange(_) => None,
         })
         .collect::<BTreeSet<_>>();
-    live_payload_hashes.extend(live_current_state_payload_hashes);
-    for change_id in &standalone_root_ids {
-        collect_change_payload_hashes(
-            standalone_changes
-                .get(change_id)
-                .expect("standalone GC root existence validated"),
-            &mut live_payload_hashes,
-        );
-    }
     for commit_id in &retained_authority_commits {
         let entry = packed
             .commits
@@ -2136,7 +1911,6 @@ where
             .expect("retained mutation authorities were validated");
         for member in &entry.members {
             live_change_ids.insert(member.value.change_id);
-            collect_change_payload_hashes(&member.change, &mut live_payload_hashes);
         }
     }
 
@@ -2151,27 +1925,7 @@ where
         .copied()
         .collect::<Vec<_>>();
 
-    let mut dead_payload_hashes = BTreeSet::new();
-    for commit_id in &sweep_authority_commits {
-        if let Some(entry) = packed.commits.get(commit_id) {
-            for member in &entry.members {
-                collect_change_payload_hashes(&member.change, &mut dead_payload_hashes);
-            }
-        }
-    }
-    for change_id in &sweep_changes {
-        collect_change_payload_hashes(
-            standalone_changes
-                .get(change_id)
-                .expect("sweep change came from standalone inventory"),
-            &mut dead_payload_hashes,
-        );
-    }
-    let sweep_json_payloads = dead_payload_hashes
-        .difference(&live_payload_hashes)
-        .copied()
-        .map(JsonRef::from_hash_bytes)
-        .collect::<Vec<_>>();
+    let sweep_json_payloads = Vec::new();
 
     let dead_packed_change_ids = sweep_authority_commits
         .iter()
@@ -2390,15 +2144,6 @@ where
     Ok(changes)
 }
 
-#[cfg(test)]
-fn collect_change_payload_hashes(change: &ChangeRecord, hashes: &mut BTreeSet<[u8; 32]>) {
-    for slot in [&change.snapshot, &change.metadata] {
-        if let JsonSlot::Ref(json_ref) = slot {
-            hashes.insert(*json_ref.as_hash_array());
-        }
-    }
-}
-
 fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
@@ -2427,7 +2172,7 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::json_store::{
-        JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
+        JsonRef, JsonStoreContext, JsonWritePlacementRef, LegacyJsonValue, NormalizedJson,
         NormalizedJsonRef,
     };
     use crate::row_pk::RowPk;
@@ -3173,7 +2918,7 @@ mod tests {
         let selected_change = packed_change(
             "rootless-selected-owner-change",
             "rootless-selected-owner-row",
-            JsonSlot::Inline(r#"{"selected":true}"#.into()),
+            LegacyJsonValue::Inline(r#"{"selected":true}"#.into()),
         );
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
@@ -3281,7 +3026,7 @@ mod tests {
         let selected_change = packed_change(
             "selected-owner-change",
             "selected-owner-row",
-            JsonSlot::Inline(r#"{"selected":true}"#.into()),
+            LegacyJsonValue::Inline(r#"{"selected":true}"#.into()),
         );
 
         let mut writes = storage.new_write_set();
@@ -3645,8 +3390,8 @@ mod tests {
                 created_at: timestamp,
                 updated_at: timestamp,
             },
-            snapshot: JsonSlot::Inline(r#"{"native":true}"#.into()),
-            metadata: JsonSlot::None,
+            metadata: None,
+            snapshot: vec![1],
         };
         let encoded = crate::tracked_state::encode_current_state_data_part(
             std::slice::from_ref(&row),
@@ -3661,9 +3406,7 @@ mod tests {
             first_key: encoded.first_key.clone(),
             last_key: encoded.last_key.clone(),
             content_digest: encoded.digest,
-            source: crate::tracked_state::CurrentStatePartSource::NativeDataPart {
-                payload_refs_digest: encoded.refs_digest,
-            },
+            source: crate::tracked_state::CurrentStatePartSource::NativeDataPart,
             source_row_offset: 0,
             row_count: encoded.row_count,
             fragmented: false,
@@ -3685,13 +3428,6 @@ mod tests {
             StorageKey(Bytes::copy_from_slice(&encoded.digest)),
             StorageValue {
                 bytes: encoded.bytes.clone(),
-            },
-        );
-        writes.put(
-            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
-            StorageKey(Bytes::copy_from_slice(&encoded.refs_digest)),
-            StorageValue {
-                bytes: encoded.refs_bytes,
             },
         );
         let tree = crate::tracked_state::scoped_range::stage_scoped_range_tree(
@@ -4090,7 +3826,7 @@ mod tests {
         let mut retired_change = packed_change(
             "shared-offline-retired-ref",
             "shared-offline-retired-row",
-            JsonSlot::Inline(r#"{"retained":true}"#.into()),
+            LegacyJsonValue::Inline(r#"{"retained":true}"#.into()),
         );
         retired_change.change_id = retired_ref;
         let mut read = storage
@@ -4271,59 +4007,6 @@ mod tests {
             .await
             .expect_err("a recovery ref no live control still serves is not a branchable root");
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
-    }
-
-    /// A snapshot whose normalized JSON is comfortably past
-    /// `JSON_INLINE_MAX_BYTES`, and distinct for every `revision`.
-    ///
-    /// Both properties are load-bearing and both were got wrong by an earlier
-    /// probe: a payload at or under 1 KiB never reaches the store at all, and
-    /// the store is content addressed, so re-writing byte-identical content
-    /// dedups onto one row and leaks nothing.
-    #[cfg(feature = "storage-benches")]
-    fn out_of_band_payload(revision: usize) -> String {
-        let filler = format!("rev-{revision:08}-");
-        let mut body = String::with_capacity(2_048);
-        while body.len() < 1_800 {
-            body.push_str(&filler);
-        }
-        serde_json::json!({ "revision": revision, "body": body }).to_string()
-    }
-
-    /// Registers one of several **identically shaped** payload tables.
-    ///
-    /// A row's out-of-band payload is its whole snapshot, and the snapshot
-    /// carries the row's primary key — so two rows can only share a payload
-    /// when their snapshots are byte-identical, which means the same key with
-    /// the same value under a *different* schema. The schema key lives in the
-    /// storage key, not in the snapshot, so these tables are exactly the
-    /// distinct owners a co-ownership fixture needs. (An earlier version used
-    /// two different paths, believed it had proved dedup, and was measuring two
-    /// unrelated payloads.)
-    #[cfg(feature = "storage-benches")]
-    async fn register_payload_schema<S>(
-        session: &crate::session::SessionContext<S>,
-        schema_key: &str,
-    ) where
-        S: crate::storage::Storage + Clone + Send + Sync + 'static,
-    {
-        let schema = serde_json::json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": schema_key,
-            "columns": [
-                { "name": "path", "type": "text", "nullable": false },
-                { "name": "value", "type": "jsonb", "nullable": false },
-            ],
-            "primary_key": ["path"],
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (CAST($1 AS JSONB), false, false)",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .expect("payload fixture schema should register");
     }
 
     /// Undo-to-last-checkpoint must survive reclaim at any cadence.
@@ -4625,352 +4308,6 @@ mod tests {
         plan
     }
 
-    #[cfg(feature = "storage-benches")]
-    async fn json_payload_refs(backend: &Memory) -> BTreeSet<JsonRef> {
-        let storage = StorageAdapter::new(backend.clone());
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("payload census read should open");
-        space_inventory(&read, crate::json_store::JSON_SPACE)
-            .await
-            .into_iter()
-            .map(|(key, _)| {
-                JsonRef::from_hash_bytes(
-                    <[u8; 32]>::try_from(key.as_ref()).expect("payload keys are 32-byte hashes"),
-                )
-            })
-            .collect()
-    }
-
-    /// Names the payload row one statement added, without reproducing the
-    /// engine's JSON normalization in the test. Re-deriving the content address
-    /// here would make the fixture depend on a normalization detail rather than
-    /// on the reachability behaviour under test.
-    #[cfg(feature = "storage-benches")]
-    async fn payload_ref_added_by<F, Fut>(backend: &Memory, publish: F) -> JsonRef
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        let before = json_payload_refs(backend).await;
-        publish().await;
-        let after = json_payload_refs(backend).await;
-        let mut added = after.difference(&before).copied().collect::<Vec<_>>();
-        assert_eq!(
-            added.len(),
-            1,
-            "the fixture statement must add exactly one out-of-band payload row"
-        );
-        added.pop().expect("one added payload ref")
-    }
-
-    /// A payload named by two owners, one of which this sweep retires, must
-    /// survive.
-    ///
-    /// This is the case the reclamation exists to *not* break, and it states
-    /// the dedup hazard exactly: the store is content addressed, so the second
-    /// owner does **not** write a second payload — it resolves onto the row the
-    /// first owner already produced. Retiring the commit that happened to
-    /// author it first must therefore not be read as "nobody names this".
-    #[cfg(feature = "storage-benches")]
-    #[tokio::test]
-    async fn repository_gc_keeps_a_payload_a_second_owner_still_names() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("shared-payload repository should initialize");
-        let engine = Engine::new(backend.clone())
-            .await
-            .expect("shared-payload repository should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("shared-payload session should open");
-        register_payload_schema(&session, "gc_payload_row").await;
-        register_payload_schema(&session, "gc_payload_mirror").await;
-
-        let shared = out_of_band_payload(0);
-        let shared_ref = payload_ref_added_by(&backend, || async {
-            session
-                .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ('/shared', CAST($1 AS JSONB))",
-                    &[Value::Text(shared.clone())],
-                )
-                .await
-                .expect("first owner should publish");
-        })
-        .await;
-        let before_mirror = json_payload_refs(&backend).await;
-        session
-            .execute(
-                "INSERT INTO gc_payload_mirror (path, value) VALUES ('/shared', CAST($1 AS JSONB))",
-                &[Value::Text(shared.clone())],
-            )
-            .await
-            .expect("second owner should publish");
-        assert_eq!(
-            json_payload_refs(&backend).await,
-            before_mirror,
-            "the premise of this test is that identical content dedups onto one row"
-        );
-
-        // Churn only the first owner, so the commit that authored the shared
-        // payload becomes retirable while the mirror row keeps naming it.
-        for revision in 1..=8 {
-            session
-                .execute(
-                    "UPDATE gc_payload_row SET value = CAST($1 AS JSONB) WHERE path = '/shared'",
-                    &[Value::Text(out_of_band_payload(revision))],
-                )
-                .await
-                .expect("churn should publish");
-            session
-                .create_checkpoint()
-                .await
-                .expect("churn checkpoint should publish");
-        }
-        session
-            .create_checkpoint()
-            .await
-            .expect("releasing checkpoint should publish");
-
-        let plan = run_shipping_repository_gc(&backend).await;
-        assert!(
-            !plan.sweep.tracked_commit_roots.is_empty(),
-            "the fixture must actually retire commits, or nothing is being tested"
-        );
-        assert!(
-            !plan.changelog.sweep.json_payloads.contains(&shared_ref),
-            "a payload a second owner still names must never be proposed for deletion"
-        );
-        assert!(
-            plan.changelog.live.payloads.contains(&shared_ref),
-            "the shared payload must be proven live, not merely absent from the sweep"
-        );
-        assert!(
-            json_ref_exists(&backend, crate::json_store::JSON_SPACE, shared_ref).await,
-            "the shared payload row must survive the sweep"
-        );
-
-        let value = session
-            .execute(
-                "SELECT value FROM gc_payload_mirror WHERE path = '/shared'",
-                &[],
-            )
-            .await
-            .expect("second owner should still read")
-            .rows()[0]
-            .get::<serde_json::Value>("value")
-            .expect("second owner should still carry its payload");
-        assert!(
-            value.to_string().contains("rev-00000000-"),
-            "the surviving owner must materialize the original payload: {value}"
-        );
-    }
-
-    /// The co-ownership case a naive per-commit delete gets wrong: one payload
-    /// named by tracked history *and* by more than one untracked row.
-    ///
-    /// Untracked rows live only in the hot serving plane — no commit names
-    /// them — so a live set derived from commits alone deletes this payload out
-    /// from under both of them.
-    #[cfg(feature = "storage-benches")]
-    #[tokio::test]
-    async fn repository_gc_keeps_a_payload_co_owned_by_history_and_untracked_rows() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("co-owned payload repository should initialize");
-        let engine = Engine::new(backend.clone())
-            .await
-            .expect("co-owned payload repository should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("co-owned payload session should open");
-        for schema_key in [
-            "gc_payload_row",
-            "gc_payload_untracked_a",
-            "gc_payload_untracked_b",
-        ] {
-            register_payload_schema(&session, schema_key).await;
-        }
-
-        let shared = out_of_band_payload(0);
-        let shared_ref = payload_ref_added_by(&backend, || async {
-            session
-                .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ('/co', CAST($1 AS JSONB))",
-                    &[Value::Text(shared.clone())],
-                )
-                .await
-                .expect("tracked owner should publish");
-        })
-        .await;
-        let before_untracked = json_payload_refs(&backend).await;
-        for table in ["gc_payload_untracked_a", "gc_payload_untracked_b"] {
-            session
-                .execute(
-                    &format!(
-                        "INSERT INTO {table} (path, value, lixcol_untracked) \
-                         VALUES ('/co', CAST($1 AS JSONB), true)"
-                    ),
-                    &[Value::Text(shared.clone())],
-                )
-                .await
-                .expect("untracked owner should publish");
-        }
-        assert_eq!(
-            json_payload_refs(&backend).await,
-            before_untracked,
-            "both untracked rows must resolve onto the payload row history already owns"
-        );
-
-        // Retire the tracked owner's commit while both untracked rows stay.
-        session
-            .execute("DELETE FROM gc_payload_row WHERE path = '/co'", &[])
-            .await
-            .expect("tracked owner should delete");
-        for revision in 1..=6 {
-            session
-                .execute(
-                    "INSERT INTO gc_payload_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                    &[
-                        Value::Text(format!("/churn-{revision}")),
-                        Value::Text(out_of_band_payload(revision)),
-                    ],
-                )
-                .await
-                .expect("churn should publish");
-            session
-                .create_checkpoint()
-                .await
-                .expect("churn checkpoint should publish");
-        }
-        session
-            .create_checkpoint()
-            .await
-            .expect("releasing checkpoint should publish");
-
-        let plan = run_shipping_repository_gc(&backend).await;
-        assert!(
-            !plan.sweep.tracked_commit_roots.is_empty(),
-            "the fixture must actually retire commits, or nothing is being tested"
-        );
-        assert!(
-            !plan.changelog.sweep.json_payloads.contains(&shared_ref),
-            "a payload two untracked rows still name must never be proposed for deletion"
-        );
-        assert!(
-            json_ref_exists(&backend, crate::json_store::JSON_SPACE, shared_ref).await,
-            "the co-owned payload row must survive the sweep"
-        );
-        for table in ["gc_payload_untracked_a", "gc_payload_untracked_b"] {
-            let rows = session
-                .execute(
-                    &format!("SELECT value FROM {table} WHERE path = '/co'"),
-                    &[],
-                )
-                .await
-                .expect("untracked owner should still read");
-            assert_eq!(
-                rows.rows().len(),
-                1,
-                "untracked row in '{table}' must survive"
-            );
-            let value = rows.rows()[0]
-                .get::<serde_json::Value>("value")
-                .expect("untracked owner should still carry its payload");
-            assert!(
-                value.to_string().contains("rev-00000000-"),
-                "the untracked owner must materialize the original payload: {value}"
-            );
-        }
-    }
-
-    /// The leak this reclamation exists to close: superseded payloads are
-    /// actually reclaimed, and the live one is not.
-    #[cfg(feature = "storage-benches")]
-    #[tokio::test]
-    async fn repository_gc_reclaims_superseded_out_of_band_payloads() {
-        let backend = Memory::new();
-        Engine::initialize(backend.clone())
-            .await
-            .expect("superseded payload repository should initialize");
-        let engine = Engine::new(backend.clone())
-            .await
-            .expect("superseded payload repository should open");
-        let session = engine
-            .open_session()
-            .await
-            .expect("superseded payload session should open");
-        register_payload_schema(&session, "gc_payload_row").await;
-
-        session
-            .execute(
-                "INSERT INTO gc_payload_row (path, value) VALUES ('/row', CAST($1 AS JSONB))",
-                &[Value::Text(out_of_band_payload(0))],
-            )
-            .await
-            .expect("first revision should publish");
-        let mut live_ref = JsonRef::default();
-        for revision in 1..=16 {
-            live_ref = payload_ref_added_by(&backend, || async {
-                session
-                    .execute(
-                        "UPDATE gc_payload_row SET value = CAST($1 AS JSONB) WHERE path = '/row'",
-                        &[Value::Text(out_of_band_payload(revision))],
-                    )
-                    .await
-                    .expect("rewrite should publish");
-            })
-            .await;
-            if revision % 4 == 0 {
-                session
-                    .create_checkpoint()
-                    .await
-                    .expect("cadence checkpoint should publish");
-            }
-        }
-        session
-            .create_checkpoint()
-            .await
-            .expect("releasing checkpoint should publish");
-
-        let before = json_payload_refs(&backend).await.len();
-        let plan = run_shipping_repository_gc(&backend).await;
-        let after = json_payload_refs(&backend).await.len();
-        assert!(
-            !plan.changelog.sweep.json_payloads.is_empty(),
-            "superseded payloads must be proposed for deletion"
-        );
-        assert_eq!(
-            before - after,
-            plan.changelog.sweep.json_payloads.len(),
-            "every proposed payload delete must actually remove a row"
-        );
-        assert!(
-            after < before,
-            "the payload plane must shrink: {before} -> {after}"
-        );
-        assert!(
-            json_ref_exists(&backend, crate::json_store::JSON_SPACE, live_ref).await,
-            "the surviving revision's payload must not be reclaimed"
-        );
-        let value = session
-            .execute("SELECT value FROM gc_payload_row WHERE path = '/row'", &[])
-            .await
-            .expect("live row should still read")
-            .rows()[0]
-            .get::<serde_json::Value>("value")
-            .expect("live row should still carry its payload");
-        assert!(
-            value.to_string().contains("rev-00000016-"),
-            "the live row must still materialize its payload: {value}"
-        );
-    }
-
     #[tokio::test]
     async fn repository_gc_keeps_current_untracked_file_blob_across_cold_reopen() {
         let backend = Memory::new();
@@ -5089,9 +4426,7 @@ mod tests {
                 "generation": "corrupt",
                 "plugins": [],
             },
-        })
-        .to_string();
-        let corrupt_snapshot = stage_bare_json(&backend, &corrupt_registry).await;
+        });
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -5107,6 +4442,13 @@ mod tests {
         let timestamp =
             LixTimestamp::expect_parse("corrupt registry timestamp", "2026-01-01T00:00:00Z");
         let row_pk = RowPk::single(crate::plugin::runtime::PLUGIN_REGISTRY_KEY);
+        let corrupt_typed = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+            "lix_key_value",
+            &row_pk,
+            &corrupt_registry,
+        )
+        .expect("corrupt semantic registry remains a valid typed key-value row");
+        let corrupt_snapshot = corrupt_typed.durable_payload_ref().expect("typed payload");
         let mut writes = storage.new_write_set();
         let mut coverage = WorkingDiffIndexCoverage::default();
         TrackedHeadContext::new()
@@ -5125,12 +4467,11 @@ mod tests {
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
-                    snapshot: JsonSlot::Ref(corrupt_snapshot).as_ref_slot(),
-                    metadata: JsonSlotRef::None,
+                    snapshot: Some(corrupt_snapshot),
+                    metadata: None,
                     columnar_base_coordinate: None,
                 }],
                 &BTreeSet::new(),
-                None,
                 None,
                 None,
                 &mut coverage,
@@ -5229,7 +4570,6 @@ mod tests {
                 scoped_nodes: &BTreeSet::new(),
                 native_parts: &BTreeSet::new(),
             },
-            &mut BTreeSet::new(),
         )
         .await
         .expect("orphan physical state should retire");
@@ -5311,7 +4651,6 @@ mod tests {
             crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
             crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
             for node_id in [live_id, dead_id] {
                 writes.put(
@@ -5361,7 +4700,6 @@ mod tests {
             crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
             crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
             let loaded = PointReadPlan::new(space, &keys)
                 .materialize(&read, StorageGetOptions::default())
@@ -5481,12 +4819,12 @@ mod tests {
         let source_change = packed_change(
             "gc-tombstone-alias-source-change",
             "deleted-source-member",
-            JsonSlot::None,
+            LegacyJsonValue::None,
         );
         let marker_change = packed_change(
             "gc-tombstone-alias-marker-change",
             "deleted-local-marker",
-            JsonSlot::None,
+            LegacyJsonValue::None,
         );
         let timestamp =
             LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
@@ -5721,23 +5059,23 @@ mod tests {
         let live_member = packed_change(
             "authority-gc-live-member",
             "live-member",
-            JsonSlot::Ref(shared_ref),
+            LegacyJsonValue::Ref(shared_ref),
         );
         let dead_shared_member = live_member.clone();
         let dead_only_member = packed_change(
             "authority-gc-dead-only-member",
             "dead-only-member",
-            JsonSlot::Ref(dead_only_ref),
+            LegacyJsonValue::Ref(dead_only_ref),
         );
         let live_standalone = packed_change(
             "authority-gc-live-standalone",
             "live-standalone",
-            JsonSlot::Ref(live_standalone_ref),
+            LegacyJsonValue::Ref(live_standalone_ref),
         );
         let dead_standalone = packed_change(
             "authority-gc-dead-standalone",
             "dead-standalone",
-            JsonSlot::Ref(dead_only_ref),
+            LegacyJsonValue::Ref(dead_only_ref),
         );
         let timestamp =
             LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
@@ -6026,7 +5364,11 @@ mod tests {
         json_ref
     }
 
-    fn packed_change(change_label: &str, row_label: &str, snapshot: JsonSlot) -> ChangeRecord {
+    fn packed_change(
+        change_label: &str,
+        row_label: &str,
+        snapshot: LegacyJsonValue,
+    ) -> ChangeRecord {
         ChangeRecord {
             format_version: 2,
             change_id: ChangeId::for_test_label(change_label),
@@ -6034,8 +5376,8 @@ mod tests {
             row_pk: RowPk::single(row_label),
             schema_key: "authority_gc".to_string(),
             file_id: None,
-            snapshot,
-            metadata: JsonSlot::None,
+            metadata: None,
+            snapshot: (!snapshot.is_none()).then(|| vec![1]),
             created_at: LixTimestamp::expect_parse(
                 "authority GC change timestamp",
                 "2026-01-01T00:00:00.000Z",
@@ -6131,8 +5473,8 @@ mod tests {
                 commit_id,
                 created_at: timestamp,
                 updated_at: timestamp,
-                snapshot: JsonSlotRef::Inline("{}"),
-                metadata: JsonSlotRef::None,
+                metadata: None,
+                snapshot: b"{}",
             })),
             &generation,
         )
@@ -6436,8 +5778,8 @@ mod tests {
                     created_at: change.created_at,
                     updated_at: change.created_at,
                 },
-                snapshot: change.snapshot.as_ref_slot(),
-                metadata: change.metadata.as_ref_slot(),
+                metadata: change.metadata.as_ref(),
+                snapshot: change.snapshot.as_deref(),
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,

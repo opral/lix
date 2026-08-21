@@ -1,4 +1,4 @@
-//! A row-only merger for conversation bodies.
+//! Test-only row plugin that exercises per-column merge callbacks.
 
 #![cfg_attr(
     not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")),
@@ -7,19 +7,23 @@
 
 use lix::plugin as sdk;
 
-struct ConversationColumnMerger;
+struct TestColumnMerger;
 
-impl sdk::ColumnMerger for ConversationColumnMerger {
+impl sdk::ColumnMerger for TestColumnMerger {
     fn merge(input: sdk::ColumnMerge<'_>) -> sdk::Result<sdk::ColumnMergeResult> {
-        if input.row.schema_key != "conversation" || input.column != "body" {
+        if input.row.schema_key != "merge_test_row" || input.column != "body" {
             return Ok(sdk::ColumnMergeResult::UseLww);
         }
         if input.row.file_id.is_some() {
             return Err(sdk::Error::invalid_input(
-                "conversation rows must not be owned by a file projection",
+                "merge test rows must not be owned by a file projection",
             ));
         }
-        let (Some(base), Some(a), Some(b)) = (input.base.text()?, input.a.text()?, input.b.text()?)
+        let (
+            Some(sdk::TypedValue::Text(base)),
+            Some(sdk::TypedValue::Text(a)),
+            Some(sdk::TypedValue::Text(b)),
+        ) = (input.base.value()?, input.a.value()?, input.b.value()?)
         else {
             return Ok(sdk::ColumnMergeResult::UseLww);
         };
@@ -27,7 +31,7 @@ impl sdk::ColumnMerger for ConversationColumnMerger {
             return Ok(sdk::ColumnMergeResult::UseLww);
         };
         Ok(sdk::ColumnMergeResult::Replace(
-            sdk::OwnedColumnValue::text(merged),
+            sdk::OwnedColumnValue::typed(&sdk::TypedValue::Text(merged))?,
         ))
     }
 }
@@ -81,7 +85,7 @@ fn floor_char_boundary(value: &str, mut index: usize) -> usize {
 }
 
 lix::plugin::export_capabilities! {
-    column_merger: ConversationColumnMerger,
+    column_merger: TestColumnMerger,
 }
 
 #[cfg(test)]
@@ -89,7 +93,7 @@ mod tests {
     use super::merge_disjoint_text;
 
     #[test]
-    fn merges_disjoint_paragraph_edits() {
+    fn merges_disjoint_text_edits() {
         assert_eq!(
             merge_disjoint_text(
                 "Alice said hello.\n\nBob said goodbye.",
