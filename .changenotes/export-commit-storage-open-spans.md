@@ -2,6 +2,6 @@
 type: patch
 ---
 
-Production traces now show the real commit, storage, notify, checkpoint, and session-open phases.
+Production telemetry now uses one stable eleven-name contract across native tracing and JavaScript callbacks.
 
-The phases that can take tens of milliseconds after a SQL batch already existed as debug-only `lix_perf` spans. They now emit at the same INFO `lix_sql` / `lix` plane as `SQL batch` and `lix.opened`, so a write batch can split materialize vs storage flush vs notify, checkpoint/create carries `commit_id`, and a cold open shows engine and session construction instead of only the instantaneous bind.
+SQL is hard-cut to `lix.sql.query`, `lix.sql.batch`, and `lix.sql.coherent_read_batch`; repository binding is `lix.repository.opened`; cold open is `lix.engine.open` plus `lix.session.open`. Writes expose additive `lix.transaction.materialize`, `lix.transaction.storage`, and `lix.transaction.notify` phases with a shared `lix.commit_cohort_id`. Callback spans use schema v2 and carry trace, span, and parent IDs. Fine-grained `lix_perf` diagnostics remain DEBUG-only.

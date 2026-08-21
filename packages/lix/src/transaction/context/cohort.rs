@@ -244,7 +244,7 @@ where
     }
     let result = leader
         .transaction
-        .commit_prepared(&leader.runtime_functions, merged_writes)
+        .commit_prepared(&leader.runtime_functions, merged_writes, member_count)
         .instrument(tracing::debug_span!(
             target: "lix_transaction",
             "lix.transaction.commit_cohort.execute",
@@ -641,7 +641,7 @@ where
         outcomes.push(
             member
                 .transaction
-                .commit_prepared(&member.runtime_functions, member.prepared_writes)
+                .commit_prepared(&member.runtime_functions, member.prepared_writes, 1)
                 .await,
         );
     }

@@ -3,10 +3,12 @@ use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_stage_row};
 use crate::gc::CheckpointGcState;
 use crate::storage_adapter::Storage;
+use crate::telemetry::{
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySpanClass, TelemetrySpanStatus,
+};
 use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow};
 use crate::transaction::StagedCommitChangeBatchBuilder;
 use crate::transaction_types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
-use tracing::Instrument as _;
 
 use super::context::SessionContext;
 
@@ -52,130 +54,155 @@ where
     /// collection runs asynchronously so a history-sized sweep cannot extend
     /// the foreground checkpoint latency.
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
-        let span = tracing::info_span!(
-            target: "lix",
-            "lix.checkpoint.create",
-            "lix.commit_id" = tracing::field::Empty,
-            "lix.parent_commit_id" = tracing::field::Empty,
-        );
-        let outcome = self
-            .with_write_transaction_lending(async move |transaction| {
-                let branch_id = transaction.active_branch_id().to_string();
-                let (previous_recovery, mut gc_state) =
-                    transaction.checkpoint_publication_state(&branch_id).await?;
-                let head_commit_id = {
-                    let reader = transaction.branch_ref_reader().await;
-                    BranchLifecycle::new(&reader)
-                        .require_existing_commit_id(
-                            &branch_id,
-                            BranchOperation::CreateCheckpoint,
-                            BranchReferenceRole::Target,
+        let span = self.telemetry.as_ref().and_then(|sink| {
+            ActiveTelemetrySpan::start_if_enabled(
+                sink,
+                TelemetrySpanClass::Lifecycle,
+                "lix.checkpoint.create",
+                Vec::new(),
+            )
+        });
+        let operation = self.with_write_transaction_lending(async move |transaction| {
+            let branch_id = transaction.active_branch_id().to_string();
+            let (previous_recovery, mut gc_state) =
+                transaction.checkpoint_publication_state(&branch_id).await?;
+            let head_commit_id = {
+                let reader = transaction.branch_ref_reader().await;
+                BranchLifecycle::new(&reader)
+                    .require_existing_commit_id(
+                        &branch_id,
+                        BranchOperation::CreateCheckpoint,
+                        BranchReferenceRole::Target,
+                    )
+                    .await?
+            };
+            let direct_working_diff = transaction
+                .working_diff_at_head(
+                    &branch_id,
+                    head_commit_id,
+                    &TrackedStateDiffRequest::default(),
+                )
+                .await?;
+            let previous_checkpoint_commit_id = if let Some(direct) = &direct_working_diff {
+                direct.checkpoint_commit_id
+            } else {
+                transaction
+                    .checkpoint_commit_id_at_head(&branch_id, head_commit_id)
+                    .await?
+            };
+            let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
+            let selected_changes = {
+                let entries = if let Some(direct) = direct_working_diff {
+                    direct.diff.entries
+                } else {
+                    let mut reader = transaction.tracked_state_reader().await;
+                    reader
+                        .diff_commits(
+                            &previous_checkpoint_commit_id.to_string(),
+                            &head_commit_id.to_string(),
+                            &TrackedStateDiffRequest::default(),
                         )
                         .await?
+                        .entries
                 };
-                let direct_working_diff = transaction
-                    .working_diff_at_head(
-                        &branch_id,
-                        head_commit_id,
-                        &TrackedStateDiffRequest::default(),
-                    )
-                    .await?;
-                let previous_checkpoint_commit_id = if let Some(direct) = &direct_working_diff {
-                    direct.checkpoint_commit_id
-                } else {
-                    transaction
-                        .checkpoint_commit_id_at_head(&branch_id, head_commit_id)
-                        .await?
-                };
-                let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
-                let selected_changes = {
-                    let entries = if let Some(direct) = direct_working_diff {
-                        direct.diff.entries
-                    } else {
-                        let mut reader = transaction.tracked_state_reader().await;
-                        reader
-                            .diff_commits(
-                                &previous_checkpoint_commit_id.to_string(),
-                                &head_commit_id.to_string(),
-                                &TrackedStateDiffRequest::default(),
-                            )
-                            .await?
-                            .entries
-                    };
-                    let mut selected_changes =
-                        StagedCommitChangeBatchBuilder::with_capacity(entries.len());
-                    let mut source_membership_exact = true;
-                    for entry in entries.into_iter().filter(|entry| {
-                        entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
-                            && entry.identity.schema_key()
-                                != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
-                    }) {
-                        let row = entry.after.ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                format!(
-                                    "working diff for schema '{}' row {:?} has no target row",
-                                    entry.identity.schema_key(),
-                                    entry.identity.row_pk()
-                                ),
-                            )
-                        })?;
-                        source_membership_exact &=
-                            push_selected_change(&mut selected_changes, row, entry.kind);
-                    }
-                    if source_membership_exact {
-                        selected_changes.finish_source_certified()
-                    } else {
-                        selected_changes.finish()
-                    }
-                };
-                gc_state.checkpoint_sequence =
-                    gc_state.checkpoint_sequence.checked_add(1).ok_or_else(|| {
+                let mut selected_changes =
+                    StagedCommitChangeBatchBuilder::with_capacity(entries.len());
+                let mut source_membership_exact = true;
+                for entry in entries.into_iter().filter(|entry| {
+                    entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
+                        && entry.identity.schema_key()
+                            != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                }) {
+                    let row = entry.after.ok_or_else(|| {
                         LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
-                            "checkpoint sequence overflow",
+                            format!(
+                                "working diff for schema '{}' row {:?} has no target row",
+                                entry.identity.schema_key(),
+                                entry.identity.row_pk()
+                            ),
                         )
                     })?;
-                if let Some(previous_recovery) = previous_recovery {
-                    gc_state.add_collectible_interval(previous_recovery.interval_has_commits);
+                    source_membership_exact &=
+                        push_selected_change(&mut selected_changes, row, entry.kind);
                 }
-                let gc_due = checkpoint_gc_due(gc_state)?;
+                if source_membership_exact {
+                    selected_changes.finish_source_certified()
+                } else {
+                    selected_changes.finish()
+                }
+            };
+            gc_state.checkpoint_sequence =
+                gc_state.checkpoint_sequence.checked_add(1).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "checkpoint sequence overflow",
+                    )
+                })?;
+            if let Some(previous_recovery) = previous_recovery {
+                gc_state.add_collectible_interval(previous_recovery.interval_has_commits);
+            }
+            let gc_due = checkpoint_gc_due(gc_state)?;
 
-                let commit_id = transaction.stage_checkpoint_commit(
-                    branch_id,
-                    previous_checkpoint_commit_id,
-                    head_commit_id,
-                    interval_has_commits,
-                    gc_state,
-                    selected_changes,
-                )?;
-                let checkpoint_commit_id =
-                    crate::changelog::CommitId::parse_lix(&commit_id, "checkpoint commit id")?;
-                let change_id = transaction.functions().call_uuid_v7().to_string();
-                let mut checkpoint_rows = RawWriteBatch::with_capacity(1);
-                checkpoint_rows.push(checkpoint_stage_row(
-                    &checkpoint_commit_id,
-                    change_id.clone(),
-                ));
-                transaction
-                    .stage_write(TransactionWrite::Rows {
-                        mode: TransactionWriteMode::Replace,
-                        rows: checkpoint_rows,
-                    })
-                    .await?;
-                Ok(CreateCheckpointOutcome {
-                    receipt: CreateCheckpointReceipt {
-                        commit_id,
-                        change_id,
-                    },
-                    parent_commit_id: previous_checkpoint_commit_id.to_string(),
-                    gc_due,
+            let commit_id = transaction.stage_checkpoint_commit(
+                branch_id,
+                previous_checkpoint_commit_id,
+                head_commit_id,
+                interval_has_commits,
+                gc_state,
+                selected_changes,
+            )?;
+            let checkpoint_commit_id =
+                crate::changelog::CommitId::parse_lix(&commit_id, "checkpoint commit id")?;
+            let change_id = transaction.functions().call_uuid_v7().to_string();
+            let mut checkpoint_rows = RawWriteBatch::with_capacity(1);
+            checkpoint_rows.push(checkpoint_stage_row(
+                &checkpoint_commit_id,
+                change_id.clone(),
+            ));
+            transaction
+                .stage_write(TransactionWrite::Rows {
+                    mode: TransactionWriteMode::Replace,
+                    rows: checkpoint_rows,
                 })
+                .await?;
+            Ok(CreateCheckpointOutcome {
+                receipt: CreateCheckpointReceipt {
+                    commit_id,
+                    change_id,
+                },
+                parent_commit_id: previous_checkpoint_commit_id.to_string(),
+                gc_due,
             })
-            .instrument(span.clone())
-            .await?;
-        span.record("lix.commit_id", outcome.receipt.commit_id.as_str());
-        span.record("lix.parent_commit_id", outcome.parent_commit_id.as_str());
+        });
+        let result = match span.as_ref() {
+            Some(span) => span.instrument(operation).await,
+            None => operation.await,
+        };
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(span) = span {
+                    span.finish(
+                        TelemetrySpanStatus::Error,
+                        vec![TelemetryAttribute::string("error.type", error.code.clone())],
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if let Some(span) = span {
+            span.finish(
+                TelemetrySpanStatus::Ok,
+                vec![
+                    TelemetryAttribute::string("lix.commit_id", outcome.receipt.commit_id.clone()),
+                    TelemetryAttribute::string(
+                        "lix.parent_commit_id",
+                        outcome.parent_commit_id.clone(),
+                    ),
+                ],
+            );
+        }
         if outcome.gc_due {
             // GC debt is durable in the checkpoint transaction. The sweep is
             // therefore safely retryable and does not need to delay the user

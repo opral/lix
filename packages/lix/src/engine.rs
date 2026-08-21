@@ -25,11 +25,12 @@ use crate::storage_adapter::{
 };
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::sync::SyncModeState;
-use crate::telemetry::TelemetrySink;
+use crate::telemetry::{
+    ActiveTelemetrySpan, TelemetrySink, TelemetrySpanClass, instrument_lix_result,
+};
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
 use crate::{LixError, NullableKeyFilter};
-use tracing::Instrument as _;
 
 #[derive(Clone)]
 pub(crate) struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
@@ -150,7 +151,15 @@ where
         storage: StorageImpl,
         options: EngineOptions,
     ) -> Result<Self, LixError> {
-        async move {
+        let span = options.telemetry.as_ref().and_then(|sink| {
+            ActiveTelemetrySpan::start_if_enabled(
+                sink,
+                TelemetrySpanClass::Lifecycle,
+                "lix.engine.open",
+                Vec::new(),
+            )
+        });
+        instrument_lix_result(span, async move {
             let storage = StorageAdapter::new(storage);
             let wasm_runtime = options
                 .wasm_runtime
@@ -179,6 +188,7 @@ where
             let commit_coordinator = Arc::new(CommitCoordinator::new(
                 Arc::clone(&collaboration_write_gate),
                 Arc::clone(&observe_invalidation),
+                options.telemetry.clone(),
             ));
             Ok(Self {
                 binary_cas: Arc::new(BinaryCasContext::new()),
@@ -198,11 +208,7 @@ where
                 telemetry: options.telemetry,
                 lix_id,
             })
-        }
-        .instrument(tracing::info_span!(
-            target: "lix",
-            "lix.engine.open"
-        ))
+        })
         .await
     }
 
@@ -286,7 +292,15 @@ where
         active_branch_id: impl Into<String>,
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
-        async move {
+        let span = self.telemetry.as_ref().and_then(|sink| {
+            ActiveTelemetrySpan::start_if_enabled(
+                sink,
+                TelemetrySpanClass::Lifecycle,
+                "lix.session.open",
+                Vec::new(),
+            )
+        });
+        instrument_lix_result(span, async move {
             let active_account_id = active_account_id.into();
             self.validate_active_account(&active_account_id).await?;
             Ok(SessionContext::new(
@@ -308,11 +322,7 @@ where
                 self.plugin_host.clone(),
                 self.telemetry.clone(),
             ))
-        }
-        .instrument(tracing::info_span!(
-            target: "lix",
-            "lix.session.open"
-        ))
+        })
         .await
     }
 
@@ -325,7 +335,15 @@ where
         &self,
         active_account_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
-        async move {
+        let span = self.telemetry.as_ref().and_then(|sink| {
+            ActiveTelemetrySpan::start_if_enabled(
+                sink,
+                TelemetrySpanClass::Lifecycle,
+                "lix.session.open",
+                Vec::new(),
+            )
+        });
+        instrument_lix_result(span, async move {
             let active_account_id = active_account_id.into();
             self.validate_active_account(&active_account_id).await?;
             SessionContext::open_default(
@@ -347,11 +365,7 @@ where
                 self.telemetry.clone(),
             )
             .await
-        }
-        .instrument(tracing::info_span!(
-            target: "lix",
-            "lix.session.open"
-        ))
+        })
         .await
     }
 

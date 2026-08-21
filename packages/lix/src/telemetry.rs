@@ -1,16 +1,19 @@
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::task::{Context, Poll};
 
-/// A stable category that lets sinks filter spans before Lix builds attributes.
+/// A stable, coarse category that lets sinks filter telemetry without making
+/// every Lix operation a public Rust enum variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TelemetrySpanKind {
-    SqlQuery,
-    SqlBatch,
-    SqlCoherentReadBatch,
-    /// A client session bound to a Lix. Not engine construction or cache-admit.
-    LixOpened,
+pub enum TelemetrySpanClass {
+    Sql,
+    Lifecycle,
+    Performance,
 }
 
 /// One vendor-neutral telemetry attribute.
@@ -46,16 +49,38 @@ pub enum TelemetryValue {
 /// Information available when an engine operation begins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetrySpanStart {
-    pub kind: TelemetrySpanKind,
+    pub class: TelemetrySpanClass,
     pub name: &'static str,
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
     pub started_at_unix_ms: u64,
     pub attributes: Vec<TelemetryAttribute>,
+}
+
+impl TelemetrySpanStart {
+    pub fn new(
+        class: TelemetrySpanClass,
+        name: &'static str,
+        attributes: Vec<TelemetryAttribute>,
+    ) -> Self {
+        Self {
+            class,
+            name,
+            trace_id: String::new(),
+            span_id: String::new(),
+            parent_span_id: None,
+            started_at_unix_ms: unix_time_ms(),
+            attributes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetrySpanStatus {
     Ok,
     Error,
+    Cancelled,
 }
 
 /// Information available when an engine operation finishes.
@@ -75,9 +100,9 @@ pub struct CompletedTelemetrySpan {
 
 /// Per-engine telemetry destination. Lix never installs a global exporter.
 pub trait TelemetrySink: Send + Sync {
-    /// Called before Lix sanitizes or fingerprints SQL. Returning false makes
-    /// the disabled path avoid all telemetry-specific work.
-    fn enabled(&self, _kind: TelemetrySpanKind) -> bool {
+    /// Called before Lix builds attributes. The class is deliberately coarse;
+    /// `name` is the stable telemetry contract.
+    fn enabled(&self, _class: TelemetrySpanClass, _name: &'static str) -> bool {
         true
     }
 
@@ -141,7 +166,7 @@ impl TelemetrySpanHandle for CallbackTelemetrySpan {
 /// Explicit adapter from engine telemetry into the Rust `tracing` ecosystem.
 ///
 /// Production subscribers export INFO `lix_sql` (SQL batch / query) and INFO
-/// `lix` (`lix.opened`). Commit, storage, notify, checkpoint, and session /
+/// `lix` (`lix.repository.opened`). Commit, storage, notify, checkpoint, and session /
 /// engine-open phases that can take tens of milliseconds use those same
 /// targets at INFO so they appear in the same tree. Debug-only `lix_perf`
 /// micro-phases stay off the production plane.
@@ -155,14 +180,12 @@ impl TracingTelemetrySink {
 }
 
 impl TelemetrySink for TracingTelemetrySink {
-    fn enabled(&self, kind: TelemetrySpanKind) -> bool {
-        match kind {
-            TelemetrySpanKind::SqlQuery
-            | TelemetrySpanKind::SqlBatch
-            | TelemetrySpanKind::SqlCoherentReadBatch => {
+    fn enabled(&self, class: TelemetrySpanClass, _name: &'static str) -> bool {
+        match class {
+            TelemetrySpanClass::Sql | TelemetrySpanClass::Performance => {
                 tracing::enabled!(target: "lix_sql", tracing::Level::INFO)
             }
-            TelemetrySpanKind::LixOpened => {
+            TelemetrySpanClass::Lifecycle => {
                 tracing::enabled!(target: "lix", tracing::Level::INFO)
             }
         }
@@ -191,13 +214,23 @@ impl TelemetrySpanHandle for TracingTelemetrySpan {
         for attribute in &end.attributes {
             record_attribute(&self.span, attribute);
         }
+        self.span.record(
+            "otel.status_code",
+            match end.status {
+                TelemetrySpanStatus::Ok => "OK",
+                TelemetrySpanStatus::Error | TelemetrySpanStatus::Cancelled => "ERROR",
+            },
+        );
+        if end.status == TelemetrySpanStatus::Cancelled {
+            self.span.record("error.type", "cancelled");
+        }
         drop(self);
     }
 }
 
 fn tracing_span(start: &TelemetrySpanStart) -> tracing::Span {
-    let span = match start.kind {
-        TelemetrySpanKind::SqlQuery => tracing::info_span!(
+    let span = match start.name {
+        "lix.sql.query" => tracing::info_span!(
             target: "lix_sql",
             "lix.sql.query",
             "otel.name" = tracing::field::Empty,
@@ -214,7 +247,7 @@ fn tracing_span(start: &TelemetrySpanStart) -> tracing::Span {
             "error.type" = tracing::field::Empty,
             "otel.status_code" = tracing::field::Empty,
         ),
-        TelemetrySpanKind::SqlBatch => tracing::info_span!(
+        "lix.sql.batch" => tracing::info_span!(
             target: "lix_sql",
             "lix.sql.batch",
             "otel.name" = tracing::field::Empty,
@@ -225,7 +258,7 @@ fn tracing_span(start: &TelemetrySpanStart) -> tracing::Span {
             "error.type" = tracing::field::Empty,
             "otel.status_code" = tracing::field::Empty,
         ),
-        TelemetrySpanKind::SqlCoherentReadBatch => tracing::info_span!(
+        "lix.sql.coherent_read_batch" => tracing::info_span!(
             target: "lix_sql",
             "lix.sql.coherent_read_batch",
             "otel.name" = tracing::field::Empty,
@@ -236,18 +269,93 @@ fn tracing_span(start: &TelemetrySpanStart) -> tracing::Span {
             "error.type" = tracing::field::Empty,
             "otel.status_code" = tracing::field::Empty,
         ),
-        TelemetrySpanKind::LixOpened => tracing::info_span!(
+        "lix.repository.opened" => tracing::info_span!(
             target: "lix",
-            "lix.opened",
+            "lix.repository.opened",
             "lix.id" = tracing::field::Empty,
             "lix.branch_id" = tracing::field::Empty,
             "lix.account_id" = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
         ),
+        "lix.engine.open" => lifecycle_tracing_span("lix.engine.open"),
+        "lix.session.open" => lifecycle_tracing_span("lix.session.open"),
+        "lix.checkpoint.create" => tracing::info_span!(
+            target: "lix",
+            "lix.checkpoint.create",
+            "lix.commit_id" = tracing::field::Empty,
+            "lix.parent_commit_id" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+        ),
+        "lix.transaction.wait" => performance_tracing_span("lix.transaction.wait"),
+        "lix.transaction.materialize" => performance_tracing_span("lix.transaction.materialize"),
+        "lix.transaction.storage" => performance_tracing_span("lix.transaction.storage"),
+        "lix.transaction.notify" => performance_tracing_span("lix.transaction.notify"),
+        _ => {
+            debug_assert!(false, "unknown production telemetry span: {}", start.name);
+            tracing::Span::none()
+        }
     };
     for attribute in &start.attributes {
         record_attribute(&span, attribute);
     }
     span
+}
+
+fn lifecycle_tracing_span(name: &'static str) -> tracing::Span {
+    match name {
+        "lix.engine.open" => tracing::info_span!(
+            target: "lix",
+            "lix.engine.open",
+            "error.type" = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+        ),
+        "lix.session.open" => tracing::info_span!(
+            target: "lix",
+            "lix.session.open",
+            "error.type" = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+        ),
+        _ => tracing::Span::none(),
+    }
+}
+
+fn performance_tracing_span(name: &'static str) -> tracing::Span {
+    match name {
+        "lix.transaction.wait" => tracing::info_span!(
+            target: "lix_sql",
+            "lix.transaction.wait",
+            "lix.commit_cohort_id" = tracing::field::Empty,
+            "lix.wait.reason" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+        ),
+        "lix.transaction.materialize" => tracing::info_span!(
+            target: "lix_sql",
+            "lix.transaction.materialize",
+            "lix.commit_cohort_id" = tracing::field::Empty,
+            "lix.transaction.count" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+        ),
+        "lix.transaction.storage" => tracing::info_span!(
+            target: "lix_sql",
+            "lix.transaction.storage",
+            "lix.commit_cohort_id" = tracing::field::Empty,
+            "lix.transaction.count" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+        ),
+        "lix.transaction.notify" => tracing::info_span!(
+            target: "lix_sql",
+            "lix.transaction.notify",
+            "lix.commit_cohort_id" = tracing::field::Empty,
+            "lix.transaction.count" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+        ),
+        _ => tracing::Span::none(),
+    }
 }
 
 fn record_attribute(span: &tracing::Span, attribute: &TelemetryAttribute) {
@@ -258,17 +366,166 @@ fn record_attribute(span: &tracing::Span, attribute: &TelemetryAttribute) {
     };
 }
 
+#[derive(Clone)]
+pub(crate) struct TelemetryContext {
+    sink: Arc<dyn TelemetrySink>,
+    trace_id: String,
+    span_id: String,
+    commit_cohort_id: Option<String>,
+}
+
+thread_local! {
+    static CURRENT_TELEMETRY: RefCell<Vec<TelemetryContext>> = const { RefCell::new(Vec::new()) };
+}
+
+static NEXT_TELEMETRY_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_span_id() -> String {
+    format!("{:016x}", NEXT_TELEMETRY_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+pub(crate) fn next_commit_cohort_id() -> String {
+    next_span_id()
+}
+
+fn next_trace_id() -> String {
+    format!("{:016x}{}", unix_time_ms(), next_span_id())
+}
+
+fn current_context_for(sink: &Arc<dyn TelemetrySink>) -> Option<TelemetryContext> {
+    CURRENT_TELEMETRY.with(|current| {
+        current
+            .borrow()
+            .last()
+            .filter(|context| Arc::ptr_eq(&context.sink, sink))
+            .cloned()
+    })
+}
+
+pub(crate) fn current_telemetry_context() -> Option<TelemetryContext> {
+    CURRENT_TELEMETRY.with(|current| current.borrow().last().cloned())
+}
+
+pub(crate) fn current_commit_cohort_id() -> Option<String> {
+    current_telemetry_context().and_then(|context| context.commit_cohort_id)
+}
+
+struct CurrentTelemetryGuard;
+
+impl Drop for CurrentTelemetryGuard {
+    fn drop(&mut self) {
+        CURRENT_TELEMETRY.with(|current| {
+            current.borrow_mut().pop();
+        });
+    }
+}
+
+impl TelemetryContext {
+    pub(crate) fn root(sink: Arc<dyn TelemetrySink>) -> Self {
+        Self {
+            sink,
+            trace_id: next_trace_id(),
+            span_id: String::new(),
+            commit_cohort_id: None,
+        }
+    }
+
+    pub(crate) fn with_commit_cohort_id(mut self, commit_cohort_id: String) -> Self {
+        self.commit_cohort_id = Some(commit_cohort_id);
+        self
+    }
+
+    fn enter(&self) -> CurrentTelemetryGuard {
+        CURRENT_TELEMETRY.with(|current| current.borrow_mut().push(self.clone()));
+        CurrentTelemetryGuard
+    }
+
+    pub(crate) fn instrument<F>(&self, future: F) -> TelemetryContextFuture<'_, F>
+    where
+        F: Future,
+    {
+        TelemetryContextFuture {
+            future: Box::pin(future),
+            context: self,
+        }
+    }
+}
+
+pub(crate) struct TelemetryContextFuture<'a, F> {
+    future: Pin<Box<F>>,
+    context: &'a TelemetryContext,
+}
+
+impl<F: Future> Future for TelemetryContextFuture<'_, F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Self::Output> {
+        let _entered = self.context.enter();
+        self.future.as_mut().poll(task)
+    }
+}
+
 pub(crate) struct ActiveTelemetrySpan {
-    handle: Box<dyn TelemetrySpanHandle>,
+    handle: Option<Box<dyn TelemetrySpanHandle>>,
     started: web_time::Instant,
+    context: TelemetryContext,
 }
 
 impl ActiveTelemetrySpan {
-    pub(crate) fn start(sink: &Arc<dyn TelemetrySink>, start: TelemetrySpanStart) -> Self {
-        Self {
-            handle: sink.start_span(start),
-            started: web_time::Instant::now(),
+    pub(crate) fn start(sink: &Arc<dyn TelemetrySink>, mut start: TelemetrySpanStart) -> Self {
+        let parent = current_context_for(sink);
+        if start.class == TelemetrySpanClass::Performance
+            && !start
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "lix.commit_cohort_id")
+            && let Some(commit_cohort_id) = parent
+                .as_ref()
+                .and_then(|parent| parent.commit_cohort_id.as_deref())
+        {
+            start.attributes.push(TelemetryAttribute::string(
+                "lix.commit_cohort_id",
+                commit_cohort_id,
+            ));
         }
+        start.trace_id = parent
+            .as_ref()
+            .map_or_else(next_trace_id, |parent| parent.trace_id.clone());
+        start.span_id = next_span_id();
+        start.parent_span_id = parent
+            .as_ref()
+            .filter(|parent| !parent.span_id.is_empty())
+            .map(|parent| parent.span_id.clone());
+        let context = TelemetryContext {
+            sink: Arc::clone(sink),
+            trace_id: start.trace_id.clone(),
+            span_id: start.span_id.clone(),
+            commit_cohort_id: parent.and_then(|parent| parent.commit_cohort_id),
+        };
+        Self {
+            handle: Some(sink.start_span(start)),
+            started: web_time::Instant::now(),
+            context,
+        }
+    }
+
+    pub(crate) fn start_if_enabled(
+        sink: &Arc<dyn TelemetrySink>,
+        class: TelemetrySpanClass,
+        name: &'static str,
+        attributes: Vec<TelemetryAttribute>,
+    ) -> Option<Self> {
+        sink.enabled(class, name)
+            .then(|| Self::start(sink, TelemetrySpanStart::new(class, name, attributes)))
+    }
+
+    pub(crate) fn start_current(
+        class: TelemetrySpanClass,
+        name: &'static str,
+        attributes: Vec<TelemetryAttribute>,
+    ) -> Option<Self> {
+        let context = current_telemetry_context()?;
+        Self::start_if_enabled(&context.sink, class, name, attributes)
     }
 
     pub(crate) fn instrument<F>(&self, future: F) -> TelemetryInstrumentedFuture<'_, F>
@@ -277,23 +534,98 @@ impl ActiveTelemetrySpan {
     {
         TelemetryInstrumentedFuture {
             future: Box::pin(future),
-            handle: self.handle.as_ref(),
+            span: self,
         }
     }
 
-    pub(crate) fn finish(self, status: TelemetrySpanStatus, attributes: Vec<TelemetryAttribute>) {
+    pub(crate) fn finish(
+        mut self,
+        status: TelemetrySpanStatus,
+        attributes: Vec<TelemetryAttribute>,
+    ) {
         let duration_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.handle.finish(TelemetrySpanEnd {
+        if let Some(handle) = self.handle.take() {
+            handle.finish(TelemetrySpanEnd {
+                duration_ns,
+                status,
+                attributes,
+            });
+        }
+    }
+
+    pub(crate) fn enter(&self) -> ActiveTelemetryEnterGuard<'_> {
+        let current = self.context.enter();
+        let sink = self
+            .handle
+            .as_ref()
+            .expect("active telemetry span has a handle")
+            .enter();
+        ActiveTelemetryEnterGuard {
+            _sink: sink,
+            _current: current,
+        }
+    }
+}
+
+pub(crate) async fn instrument_lix_result<T, F>(
+    span: Option<ActiveTelemetrySpan>,
+    future: F,
+) -> Result<T, crate::LixError>
+where
+    F: Future<Output = Result<T, crate::LixError>>,
+{
+    let result = match span.as_ref() {
+        Some(span) => span.instrument(future).await,
+        None => future.await,
+    };
+    if let Some(span) = span {
+        match &result {
+            Ok(_) => span.finish(TelemetrySpanStatus::Ok, Vec::new()),
+            Err(error) => span.finish(
+                TelemetrySpanStatus::Error,
+                vec![TelemetryAttribute::string("error.type", error.code.clone())],
+            ),
+        }
+    }
+    result
+}
+
+pub(crate) async fn instrument_value<T, F>(span: Option<ActiveTelemetrySpan>, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let value = match span.as_ref() {
+        Some(span) => span.instrument(future).await,
+        None => future.await,
+    };
+    if let Some(span) = span {
+        span.finish(TelemetrySpanStatus::Ok, Vec::new());
+    }
+    value
+}
+
+impl Drop for ActiveTelemetrySpan {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let duration_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        handle.finish(TelemetrySpanEnd {
             duration_ns,
-            status,
-            attributes,
+            status: TelemetrySpanStatus::Cancelled,
+            attributes: Vec::new(),
         });
     }
 }
 
+pub(crate) struct ActiveTelemetryEnterGuard<'a> {
+    _sink: Box<dyn TelemetrySpanEnterGuard + 'a>,
+    _current: CurrentTelemetryGuard,
+}
+
 pub(crate) struct TelemetryInstrumentedFuture<'a, F> {
     future: Pin<Box<F>>,
-    handle: &'a dyn TelemetrySpanHandle,
+    span: &'a ActiveTelemetrySpan,
 }
 
 impl<F> Future for TelemetryInstrumentedFuture<'_, F>
@@ -303,7 +635,7 @@ where
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let _entered = self.handle.enter();
+        let _entered = self.span.enter();
         self.future.as_mut().poll(context)
     }
 }
@@ -318,7 +650,7 @@ pub(crate) fn unix_time_ms() -> u64 {
 
 /// Records that a client session has bound to a Lix.
 ///
-/// This is the only place that starts a [`TelemetrySpanKind::LixOpened`] span.
+/// This is the only place that emits `lix.repository.opened`.
 /// Handshake session creation and in-process [`crate::open_lix`] call it.
 /// Protocol roots opened with [`crate::OpenLixBuilder::as_protocol_root`]
 /// skip it so a cached runtime can inherit a sink without emitting.
@@ -326,7 +658,7 @@ pub(crate) fn unix_time_ms() -> u64 {
 /// context, cache hit) should call the same helper instead of opening another
 /// engine.
 ///
-/// No-op when `sink` is absent or `enabled(LixOpened)` is false. Those paths
+/// No-op when `sink` is absent or lifecycle telemetry is disabled. Those paths
 /// do not build attributes or timestamps.
 pub fn bind_session(
     sink: Option<&Arc<dyn TelemetrySink>>,
@@ -337,7 +669,7 @@ pub fn bind_session(
     let Some(sink) = sink else {
         return;
     };
-    if !sink.enabled(TelemetrySpanKind::LixOpened) {
+    if !sink.enabled(TelemetrySpanClass::Lifecycle, "lix.repository.opened") {
         return;
     }
     let mut attributes = vec![
@@ -349,12 +681,11 @@ pub fn bind_session(
     }
     let span = ActiveTelemetrySpan::start(
         sink,
-        TelemetrySpanStart {
-            kind: TelemetrySpanKind::LixOpened,
-            name: "lix.opened",
-            started_at_unix_ms: unix_time_ms(),
+        TelemetrySpanStart::new(
+            TelemetrySpanClass::Lifecycle,
+            "lix.repository.opened",
             attributes,
-        },
+        ),
     );
     span.finish(TelemetrySpanStatus::Ok, Vec::new());
 }
@@ -368,7 +699,7 @@ mod tests {
         opened_enabled: bool,
         sql_enabled: bool,
         started: Mutex<Vec<TelemetrySpanStart>>,
-        enabled_kinds: Mutex<Vec<TelemetrySpanKind>>,
+        enabled_names: Mutex<Vec<&'static str>>,
     }
 
     impl RecordingSink {
@@ -377,7 +708,7 @@ mod tests {
                 opened_enabled,
                 sql_enabled: true,
                 started: Mutex::new(Vec::new()),
-                enabled_kinds: Mutex::new(Vec::new()),
+                enabled_names: Mutex::new(Vec::new()),
             }
         }
 
@@ -387,13 +718,11 @@ mod tests {
     }
 
     impl TelemetrySink for RecordingSink {
-        fn enabled(&self, kind: TelemetrySpanKind) -> bool {
-            self.enabled_kinds.lock().expect("enabled kinds").push(kind);
-            match kind {
-                TelemetrySpanKind::LixOpened => self.opened_enabled,
-                TelemetrySpanKind::SqlQuery
-                | TelemetrySpanKind::SqlBatch
-                | TelemetrySpanKind::SqlCoherentReadBatch => self.sql_enabled,
+        fn enabled(&self, class: TelemetrySpanClass, name: &'static str) -> bool {
+            self.enabled_names.lock().expect("enabled names").push(name);
+            match class {
+                TelemetrySpanClass::Lifecycle => self.opened_enabled,
+                TelemetrySpanClass::Sql | TelemetrySpanClass::Performance => self.sql_enabled,
             }
         }
 
@@ -437,8 +766,8 @@ mod tests {
         let trait_sink = Arc::clone(&sink).into_sink();
         bind_session(Some(&trait_sink), "lix-id", "branch-id", Some("account-id"));
         assert_eq!(
-            *sink.enabled_kinds.lock().expect("enabled kinds"),
-            [TelemetrySpanKind::LixOpened]
+            *sink.enabled_names.lock().expect("enabled names"),
+            ["lix.repository.opened"]
         );
         assert!(sink.started.lock().expect("started spans").is_empty());
     }
@@ -450,8 +779,8 @@ mod tests {
         bind_session(Some(&trait_sink), "lix-id", "branch-id", Some("account-id"));
         let started = sink.started.lock().expect("started spans").clone();
         assert_eq!(started.len(), 1);
-        assert_eq!(started[0].kind, TelemetrySpanKind::LixOpened);
-        assert_eq!(started[0].name, "lix.opened");
+        assert_eq!(started[0].class, TelemetrySpanClass::Lifecycle);
+        assert_eq!(started[0].name, "lix.repository.opened");
         assert_eq!(attribute_string(&started[0], "lix.id"), Some("lix-id"));
         assert_eq!(
             attribute_string(&started[0], "lix.branch_id"),

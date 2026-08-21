@@ -8,7 +8,9 @@ use crate::observe_invalidation::ObserveInvalidation;
 use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Memory;
 use crate::storage_adapter::Storage;
-use crate::telemetry::TelemetrySink;
+use crate::telemetry::{
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanClass, TelemetrySpanStatus,
+};
 use tokio::sync::Notify;
 
 use crate::LixError;
@@ -178,11 +180,22 @@ where
         let outcome = result?;
         drop(self.write_access.take());
         {
-            let _span = tracing::info_span!(
-                target: "lix_sql",
-                "lix.perf.transaction_notify"
-            )
-            .entered();
+            let notify = already_serialized
+                .then(|| {
+                    ActiveTelemetrySpan::start_current(
+                        TelemetrySpanClass::Performance,
+                        "lix.transaction.notify",
+                        vec![
+                            TelemetryAttribute::u64("lix.transaction.count", 1),
+                            TelemetryAttribute::string(
+                                "lix.commit_cohort_id",
+                                outcome.commit_cohort_id.clone().unwrap_or_default(),
+                            ),
+                        ],
+                    )
+                })
+                .flatten();
+            let _entered = notify.as_ref().map(ActiveTelemetrySpan::enter);
             self.observe_invalidation
                 .bump_if_storage_changed(&outcome.storage_stats);
             // Explicit transactions publish the same canonical event lane as
@@ -192,6 +205,10 @@ where
             // automatic sync-apply sessions.
             if !self.session.sync_outbox_suppressed {
                 self.sync_mode.notify_sync_change();
+            }
+            drop(_entered);
+            if let Some(notify) = notify {
+                notify.finish(TelemetrySpanStatus::Ok, Vec::new());
             }
         }
         Ok(())

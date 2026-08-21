@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, oneshot};
-use tracing::Instrument as _;
+use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
 use super::{
     Transaction, TransactionCommitOutcome, commit_transaction_cohort,
@@ -13,6 +13,10 @@ use crate::LixError;
 use crate::functions::FunctionContext;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::storage_adapter::Storage;
+use crate::telemetry::{
+    ActiveTelemetrySpan, TelemetryAttribute, TelemetryContext, TelemetrySink, TelemetrySpanClass,
+    TelemetrySpanStatus, current_telemetry_context, next_commit_cohort_id,
+};
 
 const COMMIT_QUEUE_CAPACITY: usize = 256;
 const COMMIT_COHORT_CAPACITY: usize = 256;
@@ -24,6 +28,9 @@ where
     runtime_functions: FunctionContext,
     result: oneshot::Sender<Result<TransactionCommitOutcome, LixError>>,
     file_cohort_eligible: bool,
+    telemetry_context: Option<TelemetryContext>,
+    tracing_parent: tracing::Span,
+    tracing_dispatch: tracing::Dispatch,
     _capacity: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -42,6 +49,7 @@ where
     collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
     observe_invalidation: Arc<ObserveInvalidation>,
     capacity: Arc<Semaphore>,
+    telemetry: Option<Arc<dyn TelemetrySink>>,
     state: Mutex<CommitCoordinatorState<StorageImpl>>,
     #[cfg(test)]
     stats: CommitCoordinatorStats,
@@ -82,12 +90,14 @@ where
     pub(crate) fn new(
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Self {
         Self {
             inner: Arc::new(CommitCoordinatorInner {
                 collaboration_write_gate,
                 observe_invalidation,
                 capacity: Arc::new(Semaphore::new(COMMIT_QUEUE_CAPACITY)),
+                telemetry,
                 state: Mutex::new(CommitCoordinatorState::default()),
                 #[cfg(test)]
                 stats: CommitCoordinatorStats::default(),
@@ -105,12 +115,21 @@ where
             .await
             .map_err(|_| coordinator_closed())?;
         let file_cohort_eligible = transaction_is_file_cohort_eligible(&transaction);
+        let telemetry_context = current_telemetry_context().or_else(|| {
+            self.inner
+                .telemetry
+                .as_ref()
+                .map(|sink| TelemetryContext::root(Arc::clone(sink)))
+        });
         let (result, receive) = oneshot::channel();
         let leads = self.enqueue(CommitRequest {
             transaction,
             runtime_functions,
             result,
             file_cohort_eligible,
+            telemetry_context,
+            tracing_parent: tracing::Span::current(),
+            tracing_dispatch: tracing::dispatcher::get_default(Clone::clone),
             _capacity: capacity,
         });
         if leads {
@@ -213,23 +232,54 @@ where
                     cohort_size = cohort.len(),
                 ))
                 .await;
-            let mut senders = Vec::with_capacity(cohort.len());
+            let transaction_count = cohort.len();
+            let telemetry_context = cohort
+                .first()
+                .and_then(|request| request.telemetry_context.clone())
+                .map(|context| context.with_commit_cohort_id(next_commit_cohort_id()));
+            let tracing_parent = cohort.first().map_or_else(tracing::Span::none, |request| {
+                request.tracing_parent.clone()
+            });
+            let tracing_dispatch = cohort
+                .first()
+                .map(|request| request.tracing_dispatch.clone());
+            let mut senders = Vec::with_capacity(transaction_count);
             let mut inputs = Vec::with_capacity(cohort.len());
             for request in cohort {
                 senders.push((request.result, request._capacity));
                 inputs.push((request.transaction, request.runtime_functions));
             }
-            let mut outcomes = Box::pin(commit_transaction_cohort(inputs)).await;
-            if let Some(outcome) = outcomes.iter().find_map(|result| result.as_ref().ok()) {
-                let _span = tracing::info_span!(
-                    target: "lix_sql",
-                    "lix.perf.transaction_cohort_notify"
-                )
-                .entered();
-                self.inner
-                    .observe_invalidation
-                    .bump_if_storage_changed(&outcome.storage_stats);
+            let commit_and_notify = async {
+                let outcomes = Box::pin(commit_transaction_cohort(inputs)).await;
+                if let Some(outcome) = outcomes.iter().find_map(|result| result.as_ref().ok()) {
+                    let notify = ActiveTelemetrySpan::start_current(
+                        TelemetrySpanClass::Performance,
+                        "lix.transaction.notify",
+                        vec![TelemetryAttribute::u64(
+                            "lix.transaction.count",
+                            u64::try_from(transaction_count).unwrap_or(u64::MAX),
+                        )],
+                    );
+                    let _entered = notify.as_ref().map(ActiveTelemetrySpan::enter);
+                    self.inner
+                        .observe_invalidation
+                        .bump_if_storage_changed(&outcome.storage_stats);
+                    drop(_entered);
+                    if let Some(notify) = notify {
+                        notify.finish(TelemetrySpanStatus::Ok, Vec::new());
+                    }
+                }
+                outcomes
             }
+            .instrument(tracing_parent);
+            let commit_and_notify = match tracing_dispatch {
+                Some(dispatch) => commit_and_notify.with_subscriber(dispatch),
+                None => commit_and_notify.with_current_subscriber(),
+            };
+            let mut outcomes = match telemetry_context.as_ref() {
+                Some(context) => Box::pin(context.instrument(commit_and_notify)).await,
+                None => Box::pin(commit_and_notify).await,
+            };
             for outcome in outcomes.iter_mut().flatten() {
                 *outcome = TransactionCommitOutcome::default();
             }
@@ -308,6 +358,7 @@ mod tests {
         let coordinator = CommitCoordinator::<Memory>::new(
             Arc::new(tokio::sync::Mutex::new(())),
             Arc::new(ObserveInvalidation::new()),
+            None,
         );
         assert_eq!(coordinator.stats(), (0, 0, 0));
     }

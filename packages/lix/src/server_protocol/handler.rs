@@ -1343,7 +1343,7 @@ where
     /// Creates a protocol server with the default session limits.
     ///
     /// Open `root` with [`lix::OpenLixBuilder::as_protocol_root`] so attaching
-    /// a sink does not emit `lix.opened` for the internal handle. Handshake
+    /// a sink does not emit `lix.repository.opened` for the internal handle. Handshake
     /// session creation remains the client bind.
     pub fn new(root: Arc<Lix<S>>) -> Self {
         Self::with_options(root, ServerProtocolOptions::default())
@@ -4790,9 +4790,7 @@ mod tests {
         MemoryWrite, PutBatch, ReadDurability, ReadOptions, ScanCursor, SpaceId, Storage,
         StorageError, StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
-    use lix::telemetry::{
-        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TracingTelemetrySink,
-    };
+    use lix::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, TracingTelemetrySink};
     use lix::{Blob, Memory, open_lix};
     use serde_json::{Value as JsonValue, json};
     use std::io::Write as _;
@@ -7241,7 +7239,7 @@ mod tests {
     fn opened_spans(spans: &[CompletedTelemetrySpan]) -> Vec<&CompletedTelemetrySpan> {
         spans
             .iter()
-            .filter(|span| span.start.kind == TelemetrySpanKind::LixOpened)
+            .filter(|span| span.start.name == "lix.repository.opened")
             .collect()
     }
 
@@ -7293,9 +7291,7 @@ mod tests {
             let spans = spans.lock().expect("spans");
             assert_eq!(opened_spans(&spans).len(), 1);
             assert!(
-                spans
-                    .iter()
-                    .any(|span| span.start.kind == TelemetrySpanKind::SqlQuery),
+                spans.iter().any(|span| span.start.name == "lix.sql.query"),
                 "SQL spans still work after handshake bind"
             );
         }
@@ -10931,13 +10927,21 @@ mod tests {
         let spans = spans.lock().expect("capture spans");
         let batch = require_span(&spans, "lix.sql.batch");
         require_span(&spans, "lix.sql.query");
-        let materialize = require_span(&spans, "lix.perf.transaction_materialization");
-        let storage_commit = require_span(&spans, "lix.perf.transaction_storage_commit");
-        require_span(&spans, "lix.perf.storage_commit_accepted_visible");
-        let notify = require_span(&spans, "lix.perf.transaction_notify");
+        let materialize = require_span(&spans, "lix.transaction.materialize");
+        let storage_commit = require_span(&spans, "lix.transaction.storage");
+        let notify = require_span(&spans, "lix.transaction.notify");
         assert_eq!(materialize.parent.as_ref(), Some(&batch.id));
         assert_eq!(storage_commit.parent.as_ref(), Some(&batch.id));
         assert_eq!(notify.parent.as_ref(), Some(&batch.id));
+        let cohort_id = materialize
+            .fields
+            .get("lix.commit_cohort_id")
+            .expect("materialize cohort id");
+        assert_eq!(
+            storage_commit.fields.get("lix.commit_cohort_id"),
+            Some(cohort_id)
+        );
+        assert_eq!(notify.fields.get("lix.commit_cohort_id"), Some(cohort_id));
         assert_no_bound_parameter_or_bytea_fields(&spans);
     }
 
@@ -10991,8 +10995,8 @@ mod tests {
             "checkpoint span should record the parent commit, got {:?}",
             checkpoint.fields.get("lix.parent_commit_id")
         );
-        let materialize = require_span(&spans, "lix.perf.transaction_materialization");
-        let storage_commit = require_span(&spans, "lix.perf.transaction_storage_commit");
+        let materialize = require_span(&spans, "lix.transaction.materialize");
+        let storage_commit = require_span(&spans, "lix.transaction.storage");
         assert_eq!(materialize.parent.as_ref(), Some(&checkpoint.id));
         assert_eq!(storage_commit.parent.as_ref(), Some(&checkpoint.id));
         assert_no_bound_parameter_or_bytea_fields(&spans);
@@ -11064,7 +11068,7 @@ mod tests {
         assert_eq!(
             spans
                 .iter()
-                .filter(|span| span.name == "lix.perf.transaction_notify")
+                .filter(|span| span.name == "lix.transaction.notify")
                 .count(),
             1,
             "an explicit transaction must emit one per-transaction notify span"
@@ -11078,14 +11082,21 @@ mod tests {
         let spans = Arc::clone(&capture.spans);
         let _subscriber =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
-        let _lix = open_lix().await.expect("open lix");
+        let _lix = open_lix()
+            .with_telemetry(Arc::new(TracingTelemetrySink::new()))
+            .await
+            .expect("open lix");
 
         let spans = spans.lock().expect("capture spans");
         require_span(&spans, "lix.engine.open");
         require_span(&spans, "lix.session.open");
-        assert!(
-            spans.iter().all(|span| span.name != "lix.opened"),
-            "lix.opened stays bind-only and requires an attached sink"
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.name == "lix.repository.opened")
+                .count(),
+            1,
+            "the public session binds exactly once"
         );
         assert_no_bound_parameter_or_bytea_fields(&spans);
     }

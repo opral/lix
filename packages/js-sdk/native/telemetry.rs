@@ -8,6 +8,10 @@ use serde::Serialize;
 pub(crate) struct TelemetrySpanDto {
     schema_version: u8,
     name: &'static str,
+    trace_id: String,
+    span_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_span_id: Option<String>,
     started_at_unix_ms: f64,
     duration_ms: f64,
     status: &'static str,
@@ -30,13 +34,17 @@ impl From<CompletedTelemetrySpan> for TelemetrySpanDto {
             attributes.insert(attribute.key, value);
         }
         Self {
-            schema_version: 1,
+            schema_version: 2,
             name: span.start.name,
+            trace_id: span.start.trace_id,
+            span_id: span.start.span_id,
+            parent_span_id: span.start.parent_span_id,
             started_at_unix_ms: span.start.started_at_unix_ms as f64,
             duration_ms: span.end.duration_ns as f64 / 1_000_000.0,
             status: match span.end.status {
                 TelemetrySpanStatus::Ok => "ok",
                 TelemetrySpanStatus::Error => "error",
+                TelemetrySpanStatus::Cancelled => "cancelled",
             },
             attributes,
         }
