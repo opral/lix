@@ -2055,7 +2055,8 @@ fn file_history_plugin_events(
             // the durable owner and a direct parent proves that the schema was
             // part of the prior owner's rendering contract. This covers owner
             // deletion, A -> B replacement, and same-key contract updates.
-            if plugin_state.entry.change.snapshot_content.is_some()
+            if (plugin_state.entry.change.snapshot_content.is_some()
+                || plugin_state.entry.change.decoded_snapshot.is_some())
                 || !owner_changes.contains(&(observed_commit_id, plugin_state.file_id.as_str()))
             {
                 return false;
@@ -2643,6 +2644,7 @@ mod tests {
                 file_id: Some(file_id.to_string()),
                 snapshot_content: snapshot_content.map(Into::into),
                 metadata: None,
+                decoded_snapshot: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 origin_key: None,
             },
@@ -2749,6 +2751,7 @@ mod tests {
                     schema_key: change.schema_key,
                     file_id: change.file_id,
                     snapshot_content: change.snapshot_content,
+                    decoded_snapshot: None,
                     metadata: change.metadata,
                     deleted,
                     created_at: change.created_at.clone(),
@@ -2880,7 +2883,7 @@ mod tests {
         let entry = PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: plugin_key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
+            api_version: "2.0.0".to_string(),
             capabilities: crate::plugin::runtime::PluginCapabilities {
                 column_merger: false,
                 file_projection: true,

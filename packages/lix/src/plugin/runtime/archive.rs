@@ -866,8 +866,8 @@ fn ensure_valid_plugin_wasm(bytes: &[u8]) -> Result<(), LixError> {
 }
 
 fn detect_plugin_capabilities(bytes: &[u8]) -> Result<PluginCapabilities, LixError> {
-    const COLUMN_MERGER_EXPORT: &str = "lix:plugin/column-merger@1.0.0";
-    const FILE_PROJECTION_EXPORT: &str = "lix:plugin/file-projection@1.0.0";
+    const COLUMN_MERGER_EXPORT: &str = "lix:plugin/column-merger@2.0.0";
+    const FILE_PROJECTION_EXPORT: &str = "lix:plugin/file-projection@2.0.0";
 
     let mut capabilities = PluginCapabilities::default();
     let mut saw_root = false;
@@ -967,7 +967,7 @@ mod tests {
         "columns":[{"name":"id","type":"text","nullable":false}],
         "primary_key":["id"]
     }"#;
-    const FILE_PROJECTION_EXPORT: &str = "lix:plugin/file-projection@1.0.0";
+    const FILE_PROJECTION_EXPORT: &str = "lix:plugin/file-projection@2.0.0";
 
     #[test]
     fn archive_path_parsing_is_slash_based() {
@@ -1710,7 +1710,7 @@ mod benchmark_probe {
             std::iter::empty::<(&str, ComponentExportKind, u32)>(),
         );
         component.export(
-            "lix:plugin/file-projection@1.0.0",
+            "lix:plugin/file-projection@2.0.0",
             ComponentExportKind::Instance,
             instance,
             None,

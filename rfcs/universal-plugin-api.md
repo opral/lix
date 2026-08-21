@@ -1,11 +1,11 @@
-# Universal plugin API v1 experiment
+# Universal plugin API v2
 
 ## Decision target
 
-Find the smallest complete API that lets an agent author a correct and
+Provide the smallest complete API that lets an agent author a correct and
 performant plugin in one pass across CSV, JSON, Markdown, Excalidraw, and future
-formats. The canonical Component package remains exactly `lix:plugin@1.0.0`.
-This is an intentional hard cut: there is no compatibility adapter.
+formats. The canonical Component package is `lix:plugin@2.0.0`. Version 2 is a
+hard cut and has one row representation: fingerprinted native Schema v1 values.
 
 A small measured regression is acceptable when it removes author-facing or
 engine surface. Per-record Component calls, unbounded buffering, format-key
@@ -14,7 +14,7 @@ branches in the engine, or incomplete cold/reopen behavior are not acceptable.
 ## Selected author surface
 
 Capabilities are independent. Ordinary schemas need no executable component:
-Lix merges row snapshots column by column, using deterministic LWW only for a
+Lix merges typed rows column by column, using deterministic LWW only for a
 column changed differently on both sides. A schema-owning plugin may opt into
 `ColumnMerger` for those overlaps:
 
@@ -55,33 +55,38 @@ shapes: column merger only, file projection only, or both. There are no
 manifest capability flags and no disabled placeholder exports. A schemas-only
 plugin has neither `entry` nor Wasm.
 
-Normal row output remains one typed call:
+Normal row output is one typed call:
 
 ```rust
-let id = input.creates.id(0);
-let snapshot = format!(r#"{{"body":"hello","id":"{id}"}}"#);
-output.create("note", 0, snapshot.as_bytes())?;
+let local_ref = 0;
+let mut row = lix::plugin::TypedRow::new();
+row.insert(
+    "id".into(),
+    lix::plugin::TypedValue::Uuid(input.creates.id(local_ref)),
+);
+row.insert(
+    "body".into(),
+    lix::plugin::TypedValue::Text("hello".into()),
+);
+let fingerprint =
+    lix::plugin::schema_fingerprint(include_str!("../schema/note.json"))?;
+output.create("note", fingerprint, local_ref, &row)?;
 ```
 
-`RowOutput` owns record framing, page limits, create-page separation,
-record counts, automatic flushing, and host errors. Authors do not implement a
-packet codec. Creates carry the complete canonical snapshot; the host validates
-its generated primary key against `local_ref`. This is the only row output
+`RowOutput` owns record framing, page limits, attachment selection, batching,
+automatic flushing, and host errors. Authors provide the schema key, its exact
+32-byte wire fingerprint, and native values. The host validates the fingerprint,
+row shape, types, nullability, and generated primary key. `text`, `uuid`, `int8`,
+`float8`, `boolean`, `jsonb`, and `timestamptz` retain their native Schema v1
+types; only a `jsonb` column contains JSON data. This is the only row output
 path for every format, including dense CSV imports.
 
-An ordinary snapshot is a duplicate-free, number-free JSON object in canonical
-form. Object keys are lexicographically sorted at every nesting level; arrays
-retain their order; the encoding has no insignificant whitespace; and strings
-use the shortest JSON escapes (`\b`, `\t`, `\n`, `\f`, `\r`, `\"`, `\\`, or
-lowercase `\u00xx` for the remaining controls). Values may be objects, arrays,
-strings, booleans, or null. Encode numeric domain values as schema-approved
-strings. In Rust, serialize recursively ordered maps (for example `BTreeMap`)
-with `serde_json`, or declare every struct's serialized fields in lexical
-order; do not hand-build JSON unless you also preserve these rules. For
-example, `{"body":"hello","id":"..."}` is canonical while
-`{"id":"...", "body":"hello"}` is not.
+“Column” is retained deliberately: `lix-schema` names row members, primary-key
+members, and foreign-key groups as columns. It is schema terminology here, not
+a dependency on a particular query language.
 
-`CreateContext` is opaque. It exposes deterministic `id(local_ref)`, the
+`CreateContext` is opaque. It exposes deterministic
+`id(local_ref) -> uuid::Uuid`, the
 12-byte namespace for persisted plugin state, and reconstruction from those
 bytes. Its host representation is not author API.
 
@@ -95,9 +100,9 @@ pub struct ParseChangesInput<'a> {
     pub file_id: &'a str,
     pub before_path: &'a str,
     pub after_path: &'a str,
-    pub before: ProjectionSnapshot<'a>,
+    pub before: Snapshot<'a>,
     pub file_edits: FileEditReader<'a>,
-    pub rows: Option<RowReader<'a>>,
+    pub typed_rows: Option<TypedRowReader<'a>>,
     pub creates: CreateContext,
 }
 ```
@@ -106,28 +111,30 @@ Every file projection path has a stable file ID and resolved path. Column
 merging does not: `file_id` is optional, so the same merger works for ordinary
 application rows (for example a conversation body) and rows projected from a
 file. Creation/deletion races remain whole-row LWW; plugins cannot change row
-identity or raise cross-row conflicts in v1.
+identity or raise cross-row conflicts.
 
 ## One row page in both directions
 
-Every row input and output crosses the Component boundary as the same
-bounded `row-page` byte envelope. A page has exactly one snapshot section;
-the codec does not expose representations, layouts, or manual page sizing.
-The typed SDK batches `RowOutput` mutations and flushes pages automatically.
+Every row input and output crosses the Component boundary as the same bounded
+typed-row page envelope. A page contains exactly one schema key, its exact
+Schema v1 wire fingerprint, and one mixed mutation section. Create records carry
+a `local_ref` and complete typed row; upserts carry a typed primary key, complete
+typed row, and change effect; deletes carry only the typed primary key. Primary
+key components and column values use native value tags rather than text coercion.
 
-Large snapshots use a bounded attachment referenced by the page. Inputs and
-outputs remain paged; neither side requires a complete row collection or a
-per-row ABI call.
+Large values use page-local bounded attachments. Inputs and outputs remain
+paged; neither side requires a complete row collection or a per-row ABI call.
+The SDK chooses framing, attachments, and page boundaries.
 
 The SDK targets 256 KiB of records per normal output page. This is an internal
 batching choice, not author-facing API: a single record may grow to the host
-page limit, and a larger snapshot automatically uses an attachment. Profiling
+page limit, and a larger value automatically uses an attachment. Profiling
 showed that this target preserves sparse point reads while amortizing Component
 calls on dense imports.
 
-`serialize` and cold `parse_changes` expose `RowReader`, whose items always
-contain a snapshot. Only `serialize_changes` uses `RowChangeReader` and can yield a
-tombstone, so plugin authors do not repeat impossible-state checks.
+`serialize` and cold `parse_changes` expose `TypedRowReader`, whose items always
+contain complete rows. Only `serialize_changes` uses `TypedRowChangeReader` and
+can yield a delete, so plugin authors do not repeat impossible-state checks.
 
 The engine validates complete typed creates generically; it does not branch on
 CSV, Markdown, text, or any plugin/schema key.
@@ -135,7 +142,7 @@ CSV, Markdown, text, or any plugin/schema key.
 ### CSV A/B result
 
 The 10.68 MB / 220,001-row RocksDB import benchmark compared the removed dense
-row encoding with streaming `RowOutput` snapshots. The universal path
+row encoding with streaming typed `RowOutput` records. The universal path
 kept guest high-water memory unchanged at 28,639,232 bytes and changed median
 latency from 1,234.95 ms to 1,272.17 ms (+3.01%). P95 changed from 1,830.85 ms
 to 1,880.19 ms (+2.69%). Allocated bytes increased 0.13%, allocation count fell
@@ -164,7 +171,7 @@ matcher; a schemas-only plugin has neither:
 
 File bytes always use blob durability. `materialization`, `runtime`, and
 `api_version` are removed and rejected. The installed component and durable
-registry are validated against `lix:plugin@1.0.0` instead.
+registry are validated against `lix:plugin@2.0.0`.
 
 Content matching is generic: UTF-8 text, binary, or a bounded
 `prefix_excludes { byte, bytes }` predicate. The engine contains no MIME catalog
@@ -215,7 +222,7 @@ bounded.
 
 ## Row-first hard-cut profile
 
-The public SQL workflow benchmark compares this cut with exact `origin/main`
+The public repository workflow benchmark compares this cut with exact `origin/main`
 `d2c634b2aeb780aff46013ec04902fcbb5c6f846`. Both worktrees use byte-identical
 fixtures and benchmark code, optimized builds, and 51 recorded samples per
 lane. Projection lanes verify exact bytes. Merge lanes verify the intended

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
 #[cfg(test)]
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::LixError;
 use crate::changelog::{
@@ -10,6 +11,7 @@ use crate::changelog::{
     CommitId, MaterializedChangePayload, materialize_known_change_payloads,
 };
 use crate::common::{LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder};
+use crate::plugin::runtime::WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
@@ -22,6 +24,7 @@ struct MaterializedTrackedStateDescriptor {
     file_id: Option<u32>,
     snapshot_content: Option<SharedStr>,
     metadata: Option<SharedStr>,
+    decoded_snapshot: Option<Arc<WasmTypedRow>>,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
@@ -70,7 +73,7 @@ impl MaterializedTrackedStateBatch {
     #[cfg(test)]
     pub(crate) fn from_rows(rows: Vec<MaterializedTrackedStateRow>) -> Result<Self, LixError> {
         let mut builder = MaterializedTrackedStateBatchBuilder::with_capacity(rows.len());
-        for row in rows {
+        for (index, row) in rows.into_iter().enumerate() {
             let created_at = LixTimestamp::parse(&row.created_at).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -99,6 +102,9 @@ impl MaterializedTrackedStateBatch {
                 row.snapshot_content,
                 row.metadata,
             );
+            if let Some(snapshot) = row.decoded_snapshot {
+                builder.set_decoded_snapshot(index, Some(snapshot));
+            }
         }
         Ok(builder.finish())
     }
@@ -175,6 +181,10 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
         self.descriptor().metadata.as_ref()
     }
 
+    pub(crate) fn decoded_snapshot(self) -> Option<&'a Arc<WasmTypedRow>> {
+        self.descriptor().decoded_snapshot.as_ref()
+    }
+
     pub(crate) fn deleted(self) -> bool {
         self.descriptor().deleted
     }
@@ -202,6 +212,7 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
             schema_key: self.schema_key().to_owned(),
             file_id: self.file_id().map(str::to_owned),
             snapshot_content: self.snapshot_content().cloned(),
+            decoded_snapshot: self.decoded_snapshot().cloned(),
             metadata: self.metadata().cloned(),
             deleted: self.deleted(),
             created_at: self.created_at().to_string(),
@@ -337,6 +348,7 @@ impl MaterializedTrackedStateBatchBuilder {
             file_id,
             snapshot_content,
             metadata,
+            decoded_snapshot: None,
             deleted: value.deleted(),
             created_at: value.created_at(),
             updated_at: value.updated_at(),
@@ -360,6 +372,7 @@ impl MaterializedTrackedStateBatchBuilder {
             file_id,
             snapshot_content,
             metadata,
+            decoded_snapshot: None,
             deleted: value.deleted(),
             created_at: value.created_at(),
             updated_at: value.updated_at(),
@@ -373,6 +386,10 @@ impl MaterializedTrackedStateBatchBuilder {
             strings: self.strings.finish(),
             rows: self.rows,
         }
+    }
+
+    fn set_decoded_snapshot(&mut self, ordinal: usize, snapshot: Option<Arc<WasmTypedRow>>) {
+        self.rows[ordinal].decoded_snapshot = snapshot;
     }
 }
 
@@ -463,7 +480,7 @@ where
             records.push(record);
         }
     }
-    materialize_known_change_payloads(store, records.into_iter(), projection).await
+    materialize_known_change_payloads(records.into_iter(), projection)
 }
 
 /// Materializes tracked-state index entries into one typed batch.
@@ -489,7 +506,7 @@ where
         dictionary_entry_capacity,
         0,
     );
-    if !materialization.snapshot_content && !materialization.metadata {
+    if !materialization.requires_payload() {
         for (key, value) in entries {
             rows.push(key, value, None, None);
         }
@@ -513,8 +530,8 @@ where
     .await?;
 
     for (key, value) in entries {
-        let (snapshot_content, metadata) = if value.deleted {
-            (None, None)
+        let (snapshot_content, metadata, snapshot) = if value.deleted {
+            (None, None, None)
         } else {
             shared_payload_fields(
                 &payloads,
@@ -526,7 +543,9 @@ where
                 value.change_id,
             )?
         };
+        let ordinal = rows.rows.len();
         rows.push(key, value, snapshot_content, metadata);
+        rows.set_decoded_snapshot(ordinal, snapshot);
     }
     Ok(rows.finish())
 }
@@ -553,7 +572,7 @@ where
         dictionary_entry_capacity,
         0,
     );
-    if !materialization.snapshot_content && !materialization.metadata {
+    if !materialization.requires_payload() {
         for (key, value) in entries {
             rows.push_ref(key, value, None, None);
         }
@@ -568,12 +587,14 @@ where
     .await?;
 
     for (key, value) in entries {
-        let (snapshot_content, metadata) = if value.deleted {
-            (None, None)
+        let (snapshot_content, metadata, snapshot) = if value.deleted {
+            (None, None, None)
         } else {
             shared_payload_fields(&payloads, key, value.change_id)?
         };
+        let ordinal = rows.rows.len();
         rows.push_ref(key, value, snapshot_content, metadata);
+        rows.set_decoded_snapshot(ordinal, snapshot);
     }
     Ok(rows.finish())
 }
@@ -587,7 +608,14 @@ fn shared_payload_fields(
     payloads: &HashMap<ChangeId, MaterializedChangePayload>,
     key: TrackedStateKeyRef<'_>,
     change_id: ChangeId,
-) -> Result<(Option<SharedStr>, Option<SharedStr>), LixError> {
+) -> Result<
+    (
+        Option<SharedStr>,
+        Option<SharedStr>,
+        Option<Arc<WasmTypedRow>>,
+    ),
+    LixError,
+> {
     let payload = payloads.get(&change_id).ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -608,7 +636,11 @@ fn shared_payload_fields(
             ),
         ));
     }
-    Ok((payload.snapshot_content.clone(), payload.metadata.clone()))
+    Ok((
+        payload.snapshot_content.clone(),
+        payload.metadata.clone(),
+        payload.decoded_snapshot.clone(),
+    ))
 }
 
 #[cfg(test)]
@@ -617,7 +649,6 @@ mod tests {
     use crate::changelog::{
         ChangeRecord, ChangelogAppend, ChangelogWriter, MaterializedChangeIdentity,
     };
-    use crate::json_store::JsonSlot;
     use crate::row_pk::{RowPk, RowPkComponent};
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
@@ -630,8 +661,8 @@ mod tests {
     async fn sparse_sync_snapshot_materializes_standalone_hot_row_payload() {
         let storage = StorageAdapter::new(Memory::new());
         let key = TrackedStateKey {
-            schema_key: "message".to_owned(),
-            file_id: Some("untitled.md".to_owned()),
+            schema_key: "lix_key_value".to_owned(),
+            file_id: None,
             row_pk: RowPk::single("heading"),
         };
         let change_id = ChangeId::for_test_label("snapshot-change");
@@ -653,8 +684,18 @@ mod tests {
                     row_pk: key.row_pk.clone(),
                     schema_key: key.schema_key.clone(),
                     file_id: key.file_id.clone(),
-                    snapshot: JsonSlot::from_json(r#"{"text":"Hello worlds"}"#),
-                    metadata: JsonSlot::None,
+                    snapshot: Some(
+                        WasmTypedRow::from_builtin_json(
+                            &key.schema_key,
+                            &key.row_pk,
+                            &serde_json::json!({"key":"heading","value":"Hello worlds"}),
+                        )
+                        .expect("builtin row should type-check")
+                        .durable_payload()
+                        .expect("builtin row should encode")
+                        .to_vec(),
+                    ),
+                    metadata: None,
                     created_at: updated_at,
                     origin_key: None,
                 }],
@@ -691,7 +732,7 @@ mod tests {
 
         assert_eq!(
             batch.row(0).snapshot_content().map(SharedStr::as_str),
-            Some(r#"{"text":"Hello worlds"}"#)
+            Some(r#"{"key":"heading","value":"Hello worlds"}"#)
         );
         assert_eq!(batch.row(0).commit_id(), omitted_owner);
     }
@@ -1149,6 +1190,7 @@ mod tests {
             }),
             snapshot_content: Some(snapshot.clone()),
             metadata: None,
+            decoded_snapshot: None,
         };
         (
             change_id,

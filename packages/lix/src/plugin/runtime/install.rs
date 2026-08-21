@@ -151,8 +151,9 @@ mod tests {
         assert_eq!(schema_row.branch_id, "draft");
         assert_eq!(
             schema_row
-                .snapshot
-                .expect("schema install row needs a snapshot")["value"]["key"],
+                .snapshot_json()
+                .expect("schema install row needs a snapshot")
+                .value()["value"]["key"],
             "plugin_test_note"
         );
     }
@@ -292,7 +293,7 @@ mod tests {
             std::iter::empty::<(&str, ComponentExportKind, u32)>(),
         );
         component.export(
-            "lix:plugin/file-projection@1.0.0",
+            "lix:plugin/file-projection@2.0.0",
             ComponentExportKind::Instance,
             instance,
             None,

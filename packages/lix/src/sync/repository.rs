@@ -28,9 +28,6 @@ use crate::hot_state::{
     CompleteWorkingDiffMode, CurrentStateDeltaRef, HotTrackedSnapshot, TrackedHeadContext,
     TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
 };
-use crate::json_store::{
-    JSON_INLINE_MAX_BYTES, JsonSlot, JsonWritePlacementRef, NormalizedJsonRef,
-};
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{
     Storage, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
@@ -133,6 +130,42 @@ async fn load_existing_sync_change(
     match stored {
         Some(change) => Ok(Some(change)),
         None => load_change_record_by_id(read, change_id).await,
+    }
+}
+
+fn sync_change_records_equal(
+    existing: &ChangeRecord,
+    incoming: &ChangeRecord,
+) -> Result<bool, LixError> {
+    if existing.format_version != incoming.format_version
+        || existing.change_id != incoming.change_id
+        || existing.account_id != incoming.account_id
+        || existing.schema_key != incoming.schema_key
+        || existing.row_pk != incoming.row_pk
+        || existing.file_id != incoming.file_id
+        || existing.metadata != incoming.metadata
+        || existing.created_at != incoming.created_at
+        || existing.origin_key != incoming.origin_key
+    {
+        return Ok(false);
+    }
+    match (&existing.snapshot, &incoming.snapshot) {
+        (None, None) => Ok(true),
+        (Some(left), Some(right)) if left == right => Ok(true),
+        (Some(left), Some(right)) => {
+            let left = crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+                left.clone().into(),
+                &existing.schema_key,
+                &existing.row_pk,
+            )?;
+            let right = crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+                right.clone().into(),
+                &incoming.schema_key,
+                &incoming.row_pk,
+            )?;
+            Ok(left == right)
+        }
+        (None, Some(_)) | (Some(_), None) => Ok(false),
     }
 }
 
@@ -649,8 +682,8 @@ struct ParsedMember {
     deleted: bool,
     snapshot_json: Option<String>,
     metadata_json: Option<String>,
-    snapshot: JsonSlot,
-    metadata: JsonSlot,
+    snapshot: Option<Vec<u8>>,
+    metadata: Option<lix_schema::Jsonb>,
     row_created_at: LixTimestamp,
     row_updated_at: LixTimestamp,
     change_created_at: LixTimestamp,
@@ -672,8 +705,8 @@ struct ParsedSnapshotRow {
     origin_key: Option<String>,
     snapshot_json: String,
     metadata_json: Option<String>,
-    snapshot: JsonSlot,
-    metadata: JsonSlot,
+    snapshot: Vec<u8>,
+    metadata: Option<lix_schema::Jsonb>,
 }
 
 impl ParsedSnapshotRow {
@@ -685,7 +718,7 @@ impl ParsedSnapshotRow {
             schema_key: self.schema_key.clone(),
             row_pk: self.row_pk.clone(),
             file_id: self.file_id.clone(),
-            snapshot: self.snapshot.clone(),
+            snapshot: Some(self.snapshot.clone()),
             metadata: self.metadata.clone(),
             created_at: self.change_created_at,
             origin_key: self.origin_key.clone(),
@@ -716,19 +749,28 @@ fn snapshot_rows_hot_snapshot<'a>(
                 branch_id == crate::GLOBAL_BRANCH_ID
                     || row.schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
             })
-            .map(|row| MaterializedTrackedStateRow {
-                row_pk: row.row_pk.clone(),
-                schema_key: row.schema_key.clone(),
-                file_id: row.file_id.clone(),
-                snapshot_content: Some(row.snapshot_json.clone().into()),
-                metadata: row.metadata_json.clone().map(Into::into),
-                deleted: false,
-                created_at: row.created_at.to_string(),
-                updated_at: row.updated_at.to_string(),
-                change_id: row.change_id,
-                commit_id: row.commit_id,
+            .map(|row| {
+                Ok(MaterializedTrackedStateRow {
+                    row_pk: row.row_pk.clone(),
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    snapshot_content: Some(row.snapshot_json.clone().into()),
+                    decoded_snapshot: Some(std::sync::Arc::new(
+                    crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+                        std::sync::Arc::from(row.snapshot.clone()),
+                        &row.schema_key,
+                        &row.row_pk,
+                    )?,
+                    )),
+                    metadata: row.metadata_json.clone().map(Into::into),
+                    deleted: false,
+                    created_at: row.created_at.to_string(),
+                    updated_at: row.updated_at.to_string(),
+                    change_id: row.change_id,
+                    commit_id: row.commit_id,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, LixError>>()?,
     )
 }
 
@@ -773,8 +815,8 @@ impl ParsedMember {
                 created_at: self.row_created_at,
                 updated_at: self.row_updated_at,
             },
-            snapshot: self.snapshot.as_ref_slot(),
-            metadata: self.metadata.as_ref_slot(),
+            snapshot: self.snapshot.as_deref(),
+            metadata: self.metadata.as_ref(),
             origin_key: self.origin_key.as_deref(),
             base_coordinate: None,
             authored: self.authored,
@@ -792,8 +834,8 @@ impl ParsedMember {
             deleted: self.deleted,
             created_at: self.row_created_at,
             updated_at: self.row_updated_at,
-            snapshot: self.snapshot.as_ref_slot(),
-            metadata: self.metadata.as_ref_slot(),
+            snapshot: self.snapshot.as_deref(),
+            metadata: self.metadata.as_ref(),
             columnar_base_coordinate: None,
         }
     }
@@ -1055,24 +1097,27 @@ fn parse_sync_member(member: &SyncCommitMember) -> Result<ParsedMember, LixError
         .map(serde_json::to_string)
         .transpose()
         .map_err(|error| LixError::unknown(format!("encode sync member metadata: {error}")))?;
+    let row_pk = RowPk::from_typed_json_array_value(&member.row_pk).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("sync member rowPk is invalid: {error}"),
+        )
+    })?;
+    let snapshot = member
+        .snapshot
+        .as_ref()
+        .map(|value| encode_sync_typed_snapshot(&member.schema_key, &row_pk, value))
+        .transpose()?;
+    let metadata = member.metadata.clone().map(lix_schema::Jsonb::from_value);
     Ok(ParsedMember {
         change_id: ChangeId::parse_lix(&member.change_id, "sync member change id")?,
         authored: member.authored,
         schema_key: member.schema_key.clone(),
         file_id: member.file_id.clone(),
-        row_pk: RowPk::from_typed_json_array_value(&member.row_pk).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                format!("sync member rowPk is invalid: {error}"),
-            )
-        })?,
+        row_pk,
         deleted: member.deleted,
-        snapshot: snapshot_json
-            .as_deref()
-            .map_or(JsonSlot::None, JsonSlot::from_json),
-        metadata: metadata_json
-            .as_deref()
-            .map_or(JsonSlot::None, JsonSlot::from_json),
+        snapshot,
+        metadata,
         snapshot_json,
         metadata_json,
         row_created_at: parse_sync_timestamp("sync member rowCreatedAt", &member.row_created_at)?,
@@ -1114,16 +1159,22 @@ fn parse_snapshot_row(row: &SyncSnapshotRow) -> Result<ParsedSnapshotRow, LixErr
         .map(serde_json::to_string)
         .transpose()
         .map_err(|error| LixError::unknown(format!("encode sync snapshot metadata: {error}")))?;
+    let row_pk = RowPk::from_typed_json_array_value(&row.row_pk).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("sync snapshot rowPk is invalid: {error}"),
+        )
+    })?;
+    let snapshot_value = row
+        .snapshot
+        .as_ref()
+        .expect("live sync snapshot was checked above");
+    let typed_snapshot = encode_sync_typed_snapshot(&row.schema_key, &row_pk, snapshot_value)?;
     Ok(ParsedSnapshotRow {
         branch_id: row.branch_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        row_pk: RowPk::from_typed_json_array_value(&row.row_pk).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                format!("sync snapshot rowPk is invalid: {error}"),
-            )
-        })?,
+        row_pk,
         change_id: ChangeId::parse_lix(&row.change_id, "sync snapshot change id")?,
         commit_id: CommitId::parse_lix(&row.commit_id, "sync snapshot row commit id")?,
         created_at: parse_sync_timestamp("sync snapshot createdAt", &row.created_at)?,
@@ -1136,11 +1187,34 @@ fn parse_snapshot_row(row: &SyncSnapshotRow) -> Result<ParsedSnapshotRow, LixErr
         origin_key: row.origin_key.clone(),
         snapshot_json: snapshot.clone(),
         metadata_json: metadata.clone(),
-        snapshot: JsonSlot::from_json(&snapshot),
-        metadata: metadata
-            .as_deref()
-            .map_or(JsonSlot::None, JsonSlot::from_json),
+        snapshot: typed_snapshot,
+        metadata: row.metadata.clone().map(lix_schema::Jsonb::from_value),
     })
+}
+
+fn encode_sync_typed_snapshot(
+    schema_key: &str,
+    row_pk: &RowPk,
+    snapshot: &serde_json::Value,
+) -> Result<Vec<u8>, LixError> {
+    crate::plugin::runtime::WasmTypedRow::from_builtin_json(schema_key, row_pk, snapshot)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "sync row for schema '{schema_key}' has different content than its declared Schema v1 identity: {}",
+                    error.message
+                ),
+            )
+        })?
+        .durable_payload()
+        .map(|payload| payload.to_vec())
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("sync row for schema '{schema_key}' is not durably encodable: {error:?}"),
+            )
+        })
 }
 
 async fn load_commit_record(
@@ -1210,52 +1284,29 @@ fn sync_ref_change_record(
     account_id: &str,
     created_at: LixTimestamp,
 ) -> Result<ChangeRecord, LixError> {
-    let snapshot = serde_json::to_string(&serde_json::json!({
+    let snapshot = serde_json::json!({
         "id": branch_id,
         "commit_id": head.to_string(),
-    }))
-    .map_err(|error| LixError::unknown(format!("encode sync branch ref: {error}")))?;
+    });
+    let row_pk = RowPk::uuid_from_canonical(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("sync branch id is not a canonical UUID: {error}"),
+        )
+    })?;
+    let snapshot = encode_sync_typed_snapshot(BRANCH_REF_SCHEMA_KEY, &row_pk, &snapshot)?;
     Ok(ChangeRecord {
         format_version: 2,
         change_id: sync_ref_change_id(branch_id, Some(head)),
         account_id: account_id.to_owned(),
         schema_key: BRANCH_REF_SCHEMA_KEY.to_owned(),
-        row_pk: RowPk::uuid_from_canonical(branch_id).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                format!("sync branch id is not a canonical UUID: {error}"),
-            )
-        })?,
+        row_pk,
         file_id: None,
-        snapshot: JsonSlot::from_json(&snapshot),
-        metadata: JsonSlot::None,
+        snapshot: Some(snapshot),
+        metadata: None,
         created_at,
         origin_key: None,
     })
-}
-
-fn stage_large_json_payloads<'a>(
-    writes: &mut StorageWriteSet,
-    commits: impl IntoIterator<Item = &'a ParsedCommit>,
-) -> Result<(), LixError> {
-    let payloads = commits
-        .into_iter()
-        .flat_map(|commit| &commit.members)
-        .flat_map(|member| {
-            [
-                member.snapshot_json.as_deref(),
-                member.metadata_json.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-        })
-        .filter(|json| json.len() > JSON_INLINE_MAX_BYTES)
-        .map(NormalizedJsonRef::new)
-        .collect::<Vec<_>>();
-    crate::json_store::JsonStoreContext::new()
-        .writer()
-        .stage_batch(writes, JsonWritePlacementRef::OutOfBand, payloads)?;
-    Ok(())
 }
 
 async fn load_sync_hot_snapshot(
@@ -1307,7 +1358,6 @@ async fn stage_sync_hot_delta(
             head,
             deltas,
             absence_guards,
-            None,
             None,
             Some(checkpoint),
             coverage,
@@ -2690,36 +2740,6 @@ where
                 stage_commit_history_deferred(&mut writes, commit_id);
             }
         }
-        let head_json = parsed_heads
-            .iter()
-            .filter(|(commit_id, _)| snapshot_body_ids.contains(commit_id))
-            .map(|(_, commit)| commit)
-            .flat_map(|commit| &commit.members)
-            .flat_map(|member| {
-                [
-                    member.snapshot_json.as_deref(),
-                    member.metadata_json.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-            });
-        let snapshot_json = parsed_rows
-            .iter()
-            .flat_map(|row| {
-                [
-                    Some(row.snapshot_json.as_str()),
-                    row.metadata_json.as_deref(),
-                ]
-            })
-            .flatten()
-            .chain(head_json)
-            .filter(|json| json.len() > JSON_INLINE_MAX_BYTES)
-            .map(NormalizedJsonRef::new)
-            .collect::<Vec<_>>();
-        crate::json_store::JsonStoreContext::new()
-            .writer()
-            .stage_batch(&mut writes, JsonWritePlacementRef::OutOfBand, snapshot_json)?;
-
         let mut changes = BTreeMap::<ChangeId, ChangeRecord>::new();
         for row in &parsed_rows {
             let change = row.change_record();
@@ -3512,23 +3532,6 @@ where
             )
             .await?;
         }
-        stage_large_json_payloads(&mut writes, parsed.values())?;
-        let boundary_json = boundary_rows
-            .values()
-            .flatten()
-            .flat_map(|row| {
-                [
-                    Some(row.snapshot_json.as_str()),
-                    row.metadata_json.as_deref(),
-                ]
-            })
-            .flatten()
-            .filter(|json| json.len() > JSON_INLINE_MAX_BYTES)
-            .map(NormalizedJsonRef::new)
-            .collect::<Vec<_>>();
-        crate::json_store::JsonStoreContext::new()
-            .writer()
-            .stage_batch(&mut writes, JsonWritePlacementRef::OutOfBand, boundary_json)?;
         for commit_id in parsed.keys().copied() {
             stage_commit_history_available(&mut writes, commit_id);
         }
@@ -3764,11 +3767,9 @@ where
                         ));
                     }
                     let (_, payload) = materialize_known_change_payloads_in_order(
-                        &read,
                         std::iter::once(change),
                         ChangeRecordProjection::full(),
-                    )
-                    .await?
+                    )?
                     .into_iter()
                     .next()
                     .expect("one selected change materializes once");
@@ -3865,7 +3866,7 @@ where
             for member in &commit.members {
                 let change = member.change_record();
                 match load_existing_sync_change(&read, change.change_id).await? {
-                    Some(existing) if existing != change => {
+                    Some(existing) if !sync_change_records_equal(&existing, &change)? => {
                         return Err(LixError::new(
                             LixError::CODE_INVALID_PARAM,
                             format!(
@@ -4075,7 +4076,7 @@ where
                 record.created_at,
             )?;
             match load_existing_sync_change(&read, change.change_id).await? {
-                Some(existing) if existing != change => {
+                    Some(existing) if !sync_change_records_equal(&existing, &change)? => {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PARAM,
                         "sync branch ref change id collides with different content",
@@ -4321,8 +4322,8 @@ where
                             deleted: after.deleted,
                             created_at: after.created_at,
                             updated_at: after.updated_at,
-                            snapshot: payload.snapshot.as_ref_slot(),
-                            metadata: payload.metadata.as_ref_slot(),
+                            snapshot: payload.snapshot,
+                            metadata: payload.metadata,
                             columnar_base_coordinate: None,
                         });
                     }
@@ -5017,6 +5018,16 @@ mod tests {
     }
 
     impl StorageWrite for SyncAccountingWrite {
+        async fn replace_many(
+            &mut self,
+            space: StorageSpace,
+            entries: PutBatch,
+        ) -> Result<(), StorageError> {
+            self.touches_branch_control |= space == crate::branch::BRANCH_HEAD_CONTROL_SPACE;
+            self.touches_replica_state |= space == SYNC_REPLICA_STATE_SPACE;
+            self.inner.replace_many(space, entries).await
+        }
+
         async fn put_many(
             &mut self,
             space: StorageSpace,

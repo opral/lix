@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use crate::model as lix;
 use crate::order_key::OrderKey;
+use ::lix::plugin::{TypedRow, TypedValue};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::Deserialize;
+use uuid::Uuid;
 
 pub(crate) const LINE_SCHEMA_KEY: &str = "text_line";
 const TEXT_PREFIX_SCAN_BYTES: usize = 8_000;
@@ -26,7 +27,7 @@ pub(crate) struct Document(Arc<DocumentInner>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LineIdentity {
-    pub(crate) id: String,
+    pub(crate) id: Uuid,
     pub(crate) order_key: String,
 }
 
@@ -39,7 +40,7 @@ struct DocumentInner {
 /// A durable line row. `bytes` includes its trailing LF when present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Line {
-    id: String,
+    id: Uuid,
     order_key: OrderKey,
     bytes: LineBytes,
 }
@@ -99,18 +100,10 @@ impl Iterator for AllUpserts {
 
 impl ExactSizeIterator for AllUpserts {}
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LineSnapshot {
-    id: String,
-    order_key: String,
-    content_base64: String,
-}
-
 impl Document {
     pub(crate) fn open_file(
         bytes: Vec<u8>,
-        mut id_for_ordinal: impl FnMut(u64) -> String,
+        mut id_for_ordinal: impl FnMut(u64) -> Uuid,
     ) -> Result<(Self, AllUpserts), String> {
         validate_text(&bytes)?;
         let bytes = Arc::new(bytes);
@@ -191,10 +184,10 @@ impl Document {
         for record in records {
             let record = record?;
             validate_row_key(&record.schema_key, &record.row_pk)?;
-            let line = Line::from_snapshot(&record.snapshot)?;
-            if record.row_pk[0] != line.id {
+            let line = Line::from_typed_row(&record.row)?;
+            if record.row_pk[0] != TypedValue::Uuid(line.id) {
                 return Err(format!(
-                    "line row primary key '{}' does not match snapshot id '{}'",
+                    "line row primary key '{:?}' does not match row id '{}'",
                     record.row_pk[0], line.id
                 ));
             }
@@ -206,7 +199,7 @@ impl Document {
     pub(crate) fn file_changed(
         &self,
         splices: &[FileEdit],
-        mut id_for_ordinal: impl FnMut(u64) -> String,
+        mut id_for_ordinal: impl FnMut(u64) -> Uuid,
     ) -> Result<(Self, Vec<lix::RowChange>), String> {
         let bytes = Arc::new(apply_splices(self.bytes(), splices)?);
         validate_text(&bytes)?;
@@ -294,11 +287,7 @@ impl Document {
         }
 
         let order_keys = self.reconciled_order_keys(&old_for_new)?;
-        let mut known_ids = self
-            .lines()
-            .iter()
-            .map(|line| line.id.as_str())
-            .collect::<Vec<_>>();
+        let mut known_ids = self.lines().iter().map(|line| line.id).collect::<Vec<_>>();
         known_ids.sort_unstable();
         let mut new_ids = BTreeSet::new();
         let mut next_ordinal = 0u64;
@@ -311,8 +300,7 @@ impl Document {
                     next_ordinal = next_ordinal
                         .checked_add(1)
                         .ok_or_else(|| "line ID ordinal overflow".to_owned())?;
-                    if known_ids.binary_search(&id.as_str()).is_ok() || !new_ids.insert(id.clone())
-                    {
+                    if known_ids.binary_search(&id).is_ok() || !new_ids.insert(id) {
                         return Err(format!(
                             "new line ID '{id}' collides with an existing line identity"
                         ));
@@ -356,20 +344,22 @@ impl Document {
 
         for change in changes {
             validate_row_key(&change.schema_key, &change.row_pk)?;
-            let id = &change.row_pk[0];
-            match change.snapshot {
-                Some(snapshot) => {
-                    let line = Line::from_snapshot(&snapshot)?;
-                    if line.id != *id {
+            let TypedValue::Uuid(id) = change.row_pk[0] else {
+                unreachable!("validated Text row key must contain one UUID")
+            };
+            match change.row {
+                Some(row) => {
+                    let line = Line::from_typed_row(&row)?;
+                    if line.id != id {
                         return Err(format!(
-                            "line row primary key '{id}' does not match snapshot id '{}'",
+                            "line row primary key '{id}' does not match row id '{}'",
                             line.id
                         ));
                     }
-                    lines.insert(id.clone(), line);
+                    lines.insert(id, line);
                 }
                 None => {
-                    if lines.remove(id).is_none() {
+                    if lines.remove(&id).is_none() {
                         return Err(format!("cannot delete unknown line row '{id}'"));
                     }
                 }
@@ -393,9 +383,6 @@ impl Document {
         let mut ids = BTreeSet::new();
         let mut order_keys = BTreeSet::new();
         for line in &lines {
-            if line.id.is_empty() {
-                return Err("line IDs must not be empty".to_owned());
-            }
             validate_line_bytes(line.bytes.as_slice())?;
             if !ids.insert(line.id.clone()) {
                 return Err(format!("duplicate line row ID '{}'", line.id));
@@ -432,12 +419,12 @@ impl Document {
         let mut before = self
             .lines()
             .iter()
-            .map(|line| (line.id.as_str(), line))
+            .map(|line| (line.id, line))
             .collect::<Vec<_>>();
         let mut after_by_id = after
             .lines()
             .iter()
-            .map(|line| (line.id.as_str(), line))
+            .map(|line| (line.id, line))
             .collect::<Vec<_>>();
         before.sort_unstable_by_key(|(id, _)| *id);
         after_by_id.sort_unstable_by_key(|(id, _)| *id);
@@ -452,7 +439,7 @@ impl Document {
                         std::cmp::Ordering::Less => {
                             changes.push(lix::RowChange::delete(
                                 LINE_SCHEMA_KEY,
-                                vec![(*before_id).to_owned()],
+                                vec![TypedValue::Uuid(*before_id)],
                             ));
                             before_index += 1;
                         }
@@ -472,7 +459,7 @@ impl Document {
                 (Some((before_id, _)), None) => {
                     changes.push(lix::RowChange::delete(
                         LINE_SCHEMA_KEY,
-                        vec![(*before_id).to_owned()],
+                        vec![TypedValue::Uuid(*before_id)],
                     ));
                     before_index += 1;
                 }
@@ -580,8 +567,8 @@ impl Document {
 
 impl Line {
     #[cfg(test)]
-    pub(crate) fn id(&self) -> &str {
-        &self.id
+    pub(crate) fn id(&self) -> Uuid {
+        self.id
     }
 
     #[cfg(test)]
@@ -594,55 +581,48 @@ impl Line {
         self.bytes.as_slice()
     }
 
-    pub(crate) fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
-        let id = serde_json::to_vec(&self.id)
-            .map_err(|error| format!("failed to serialize line ID: {error}"))?;
-        let order_key = serde_json::to_vec(&self.order_key.to_snapshot_string())
-            .map_err(|error| format!("failed to serialize line order key: {error}"))?;
-        let content_len = base64::encoded_len(self.bytes.len(), false)
-            .ok_or_else(|| "base64 line snapshot length overflow".to_owned())?;
-        let prefix_len = b"{\"content_base64\":\"".len()
-            + b",\"id\":".len()
-            + id.len()
-            + b",\"order_key\":".len()
-            + order_key.len();
-        let capacity = prefix_len
-            .checked_add(content_len)
-            .and_then(|length| length.checked_add(b"\"}".len()))
-            .ok_or_else(|| "line snapshot length overflow".to_owned())?;
-
-        let mut snapshot = Vec::with_capacity(capacity);
-        // Certified snapshots use the engine's canonical lexicographic object
-        // key order, avoiding a host-side normalization allocation.
-        snapshot.extend_from_slice(b"{\"content_base64\":\"");
-        let content_start = snapshot.len();
-        snapshot.resize(content_start + content_len, 0);
-        let written = URL_SAFE_NO_PAD
-            .encode_slice(self.bytes.as_slice(), &mut snapshot[content_start..])
-            .map_err(|error| format!("failed to base64-encode line snapshot: {error}"))?;
-        snapshot.truncate(content_start + written);
-        snapshot.extend_from_slice(b"\",\"id\":");
-        snapshot.extend_from_slice(&id);
-        snapshot.extend_from_slice(b",\"order_key\":");
-        snapshot.extend_from_slice(&order_key);
-        snapshot.push(b'}');
-        Ok(snapshot)
+    pub(crate) fn typed_row(&self) -> Result<TypedRow, String> {
+        let mut row = TypedRow::new();
+        row.insert(
+            "content_base64".to_owned(),
+            TypedValue::Text(URL_SAFE_NO_PAD.encode(self.bytes.as_slice())),
+        );
+        row.insert("id".to_owned(), TypedValue::Uuid(self.id));
+        row.insert(
+            "order_key".to_owned(),
+            TypedValue::Text(self.order_key.to_snapshot_string()),
+        );
+        Ok(row)
     }
 
-    fn from_snapshot(snapshot: &[u8]) -> Result<Self, String> {
-        let snapshot = serde_json::from_slice::<LineSnapshot>(snapshot)
-            .map_err(|error| format!("line snapshot must be valid JSON: {error}"))?;
-        if snapshot.id.is_empty() {
-            return Err("line snapshot id must not be empty".to_owned());
+    fn from_typed_row(row: &TypedRow) -> Result<Self, String> {
+        if let Some(field) = row
+            .keys()
+            .find(|field| !matches!(*field, "content_base64" | "id" | "order_key"))
+        {
+            return Err(format!(
+                "line typed row contains unsupported field '{field}'"
+            ));
         }
-        let order_key = OrderKey::from_snapshot_string(&snapshot.order_key)
-            .map_err(|error| format!("invalid line order key: {error}"))?;
+        let id = match row.get("id") {
+            Some(TypedValue::Uuid(value)) => *value,
+            _ => return Err("line typed row id must be a UUID".to_owned()),
+        };
+        let order_key = match row.get("order_key") {
+            Some(TypedValue::Text(value)) => OrderKey::from_snapshot_string(value)
+                .map_err(|error| format!("invalid line order key: {error}"))?,
+            _ => return Err("line typed row order_key must be text".to_owned()),
+        };
+        let content_base64 = match row.get("content_base64") {
+            Some(TypedValue::Text(value)) => value,
+            _ => return Err("line typed row content_base64 must be text".to_owned()),
+        };
         let bytes = URL_SAFE_NO_PAD
-            .decode(snapshot.content_base64)
+            .decode(content_base64)
             .map_err(|error| format!("invalid line content_base64: {error}"))?;
         validate_line_bytes(&bytes)?;
         Ok(Self {
-            id: snapshot.id,
+            id,
             order_key,
             bytes: LineBytes::owned(bytes),
         })
@@ -651,8 +631,8 @@ impl Line {
     fn upsert_change(&self) -> Result<lix::RowChange, String> {
         Ok(lix::RowChange::upsert(
             LINE_SCHEMA_KEY,
-            vec![self.id.clone()],
-            self.snapshot_bytes()?,
+            vec![TypedValue::Uuid(self.id)],
+            self.typed_row()?,
         ))
     }
 }
@@ -729,18 +709,15 @@ fn render_lines(lines: &[Line]) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn validate_row_key(schema_key: &str, row_pk: &[String]) -> Result<(), String> {
+fn validate_row_key(schema_key: &str, row_pk: &[TypedValue]) -> Result<(), String> {
     if schema_key != LINE_SCHEMA_KEY {
         return Err(format!(
             "Text plugin only accepts schema '{LINE_SCHEMA_KEY}', got '{schema_key}'"
         ));
     }
-    let [id] = row_pk else {
-        return Err("Text line rows need exactly one primary-key component".to_owned());
+    let [TypedValue::Uuid(_)] = row_pk else {
+        return Err("Text line rows need exactly one UUID primary-key component".to_owned());
     };
-    if id.is_empty() {
-        return Err("Text line row primary key must not be empty".to_owned());
-    }
     Ok(())
 }
 

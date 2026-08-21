@@ -443,10 +443,26 @@ where
                 .entry(key)
                 .or_default()
                 .push(CohortSemanticCandidate {
-                    payload: row.snapshot.map(|snapshot| StaleConflictPayload {
-                        snapshot: snapshot.materialize_shared(),
-                        metadata: row.metadata.map(|metadata| metadata.materialize_shared()),
-                    }),
+                    payload: row
+                        .snapshot
+                        .map(|snapshot| {
+                            Ok::<_, LixError>(StaleConflictPayload {
+                                snapshot: None,
+                                decoded_snapshot: Some(Arc::new(
+                                    WasmTypedRow::decode_durable_payload(
+                                        Arc::from(snapshot),
+                                        row.schema_key.as_str(),
+                                        row.row_pk,
+                                    )?,
+                                )),
+                                metadata: row
+                                    .metadata
+                                    .map(|metadata| metadata.to_json_string().map(SharedStr::from))
+                                    .transpose()
+                                    .map_err(|error| LixError::unknown(error.to_string()))?,
+                            })
+                        })
+                        .transpose()?,
                     rank: ConflictRank::new(row.updated_at, change_id),
                 });
         }
@@ -465,9 +481,8 @@ where
     // them here would stage the old blob reference and then generate its
     // successor a second time, forcing the cohort onto the serialized
     // fallback through a duplicate-primary-key error.
-    candidates.retain(|key, _| {
-        key.file_id.is_none() || registry_owns_schema(&opening_registry, &key.schema_key)
-    });
+    candidates
+        .retain(|key, _| key.file_id.is_none() || opening_registry.owns_schema(&key.schema_key));
     let keys = candidates.keys().cloned().collect::<Vec<_>>();
     let base_rows = tracked
         .load_projected_batch_at_commit(
@@ -482,6 +497,7 @@ where
         current: Option<StaleConflictPayload>,
         remaining: VecDeque<Option<StaleConflictPayload>>,
         primary_key_columns: BTreeSet<String>,
+        typed: bool,
         plugin: Option<PluginRegistryEntry>,
     }
     let mut frontiers = BTreeMap::<TrackedStateKey, CohortFrontier>::new();
@@ -502,11 +518,12 @@ where
                     .binary_search_by(|schema| schema.as_str().cmp(key.schema_key.as_str()))
                     .is_ok()
         });
+        let typed = opening_registry.owns_schema(&key.schema_key);
         let primary_key_columns = primary_keys_by_key
             .get(key)
             .cloned()
             .expect("candidate row has primary-key metadata");
-        let (current, remaining) = if plugin.is_none() {
+        let (current, remaining) = if !typed {
             (
                 reconcile_native_frontier(base.as_ref(), versions, &primary_key_columns)?,
                 VecDeque::new(),
@@ -528,6 +545,7 @@ where
                 current,
                 remaining,
                 primary_key_columns,
+                typed,
                 plugin: plugin.cloned(),
             },
         );
@@ -559,6 +577,7 @@ where
                 a: frontier.current.clone(),
                 b: next,
                 primary_key_columns: frontier.primary_key_columns.clone(),
+                typed: frontier.typed,
                 plugin: frontier.plugin.clone(),
             });
         }
@@ -577,6 +596,10 @@ where
             &mut rows,
             &key,
             frontier.current.as_ref(),
+            frontier
+                .current
+                .as_ref()
+                .and_then(|payload| payload.decoded_snapshot.clone()),
             &transaction.active_branch_id,
         );
     }
@@ -604,30 +627,58 @@ pub(super) fn push_cohort_payload(
     rows: &mut RawWriteBatch,
     key: &TrackedStateKey,
     payload: Option<&StaleConflictPayload>,
+    decoded_snapshot: Option<Arc<WasmTypedRow>>,
     branch_id: &str,
 ) {
-    rows.push_parts(
+    let common = (
         Some(key.row_pk.clone()),
         SharedStr::from(key.schema_key.as_str()),
         key.file_id.as_deref().map(SharedStr::from),
-        payload.map(|payload| {
-            TransactionJson::from_unvalidated_shared_normalized_content(payload.snapshot.clone())
-        }),
         payload.and_then(|payload| {
             payload
                 .metadata
                 .clone()
                 .map(TransactionJson::from_unvalidated_shared_normalized_content)
         }),
-        None,
-        None,
-        None,
-        false,
-        None,
-        None,
-        false,
         SharedStr::from(branch_id),
     );
+    if let Some(decoded_snapshot) = decoded_snapshot {
+        rows.push_typed_parts(
+            common.0,
+            common.1,
+            common.2,
+            Some(decoded_snapshot),
+            common.3,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            common.4,
+        );
+    } else {
+        rows.push_parts(
+            common.0,
+            common.1,
+            common.2,
+            payload
+                .and_then(|payload| payload.snapshot.clone())
+                .map(|snapshot| {
+                    TransactionJson::from_unvalidated_shared_normalized_content(snapshot)
+                }),
+            common.3,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            common.4,
+        );
+    }
 }
 
 async fn commit_prepared_individually<StorageImpl>(

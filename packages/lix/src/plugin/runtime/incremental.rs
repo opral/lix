@@ -5,31 +5,28 @@
 //! conflict-resolution, observation, or actor-publication policy.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use serde::Deserialize;
-use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use sha2::{Digest as _, Sha256};
 use tracing::Instrument as _;
 
-use crate::catalog::{CatalogSnapshot, SchemaPlan, SchemaPlanFingerprint};
-use crate::common::{RequestBlobSpliceProvenance, SharedStr};
+use crate::catalog::{CatalogSnapshot, SchemaPlan};
+use crate::common::RequestBlobSpliceProvenance;
 use crate::hot_state::MaterializedHotStateBatch;
 use crate::plugin::runtime::{
-    EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
-    WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedRowBatch,
+    CURRENT_PACKET_FORMAT, EDIT_SPLICE_METADATA_BYTES, WasmByteOutputsHandle, WasmByteSource,
     WasmChangeDrainValidator, WasmChangePage, WasmColumnMergePage, WasmColumnMergeResult,
     WasmColumnMergeSource, WasmColumnMergeTransition, WasmComponentActor, WasmDocumentHandle,
-    WasmEditDrainValidator, WasmEditPage, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
-    WasmHostColumnMerge, WasmHostRow, WasmHostRowChanges, WasmInputBytes, WasmInputSplice,
-    WasmOutputRange, WasmRow, WasmRowChange, WasmRowChangeSource, WasmRowChanges, WasmRowKey,
-    WasmRowPage, WasmRowSource, WasmRowTransition, WasmSourceRange, WasmTransitionCounters,
-    WasmTransitionHandle, WasmTransitionLimits, validate_change_cursor_key_uniqueness,
+    WasmEditDrainValidator, WasmEditPage, WasmFileTransition, WasmGuestBytes, WasmGuestColumnValue,
+    WasmGuestRowPayload, WasmHostBytes, WasmHostColumnMerge, WasmHostRow, WasmHostRowChanges,
+    WasmInputBytes, WasmInputSplice, WasmOutputRange, WasmRow, WasmRowChange, WasmRowChangeSource,
+    WasmRowChanges, WasmRowKey, WasmRowPage, WasmRowSource, WasmRowTransition, WasmSourceRange,
+    WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits, WasmTypedRow,
+    validate_change_cursor_key_uniqueness,
 };
-use crate::row_pk::RowPk;
+use crate::plugin::wire::typed as typed_wire;
 use crate::{Blob, LixError};
 
 /// Exact SHA-256 identity for one actor-owned byte version.
@@ -133,124 +130,6 @@ impl WasmByteSource for ArcByteSource {
             .fetch_add(result.len() as u64, Ordering::Relaxed);
         Ok(result)
     }
-}
-
-/// Builds one host row while keeping an indivisible oversized snapshot out
-/// of the packet's inline record arena.
-///
-/// Packet-v1 records cannot cross pages. The row key, blob tag/length, and
-/// four-byte record frame all consume the record/page limits, so deciding from
-/// the snapshot length alone has an off-by-overhead failure at the boundary.
-/// A lazy source keeps the record bounded while retaining immutable ownership
-/// of the complete Snapshot JSON for the guest to read on demand.
-pub(crate) fn host_row_with_lazy_snapshot(
-    key: WasmRowKey,
-    snapshot: Bytes,
-    limits: WasmTransitionLimits,
-) -> Result<WasmHostRow, LixError> {
-    let limits = limits.validate()?;
-    let mut row = WasmRow {
-        key,
-        snapshot_content: WasmHostBytes::Inline(snapshot),
-    };
-    if host_row_record_fits(&row, limits) {
-        return Ok(row);
-    }
-
-    row.snapshot_content = lazy_source_from_inline(row.snapshot_content);
-    validate_host_row(&row)?;
-    require_framed_record_fits(encoded_row_record_bytes(&row)?, limits, "row")?;
-    Ok(row)
-}
-
-/// Change-record counterpart of [`host_row_with_lazy_snapshot`].
-pub(crate) fn host_row_change_with_lazy_snapshot(
-    key: WasmRowKey,
-    snapshot: Bytes,
-    effect: crate::plugin::runtime::WasmChangeEffect,
-    limits: WasmTransitionLimits,
-) -> Result<WasmRowChange<WasmHostBytes>, LixError> {
-    let limits = limits.validate()?;
-    let mut change = WasmRowChange::Upsert {
-        row: WasmRow {
-            key,
-            snapshot_content: WasmHostBytes::Inline(snapshot),
-        },
-        effect,
-    };
-    if host_change_record_fits(&change, limits) {
-        return Ok(change);
-    }
-
-    let WasmRowChange::Upsert { row, .. } = &mut change else {
-        unreachable!("the helper constructs an upsert")
-    };
-    let snapshot = std::mem::replace(
-        &mut row.snapshot_content,
-        WasmHostBytes::Inline(Bytes::new()),
-    );
-    row.snapshot_content = lazy_source_from_inline(snapshot);
-    validate_host_row(row)?;
-    require_framed_record_fits(
-        encoded_row_change_record_bytes(&change)?,
-        limits,
-        "row change",
-    )?;
-    Ok(change)
-}
-
-fn lazy_source_from_inline(bytes: WasmHostBytes) -> WasmHostBytes {
-    let WasmHostBytes::Inline(bytes) = bytes else {
-        return bytes;
-    };
-    let length = bytes.len() as u64;
-    WasmHostBytes::Source(crate::plugin::runtime::WasmSourceSlice {
-        source: Arc::new(ArcByteSource::new(bytes.into())),
-        range: WasmSourceRange { offset: 0, length },
-    })
-}
-
-fn host_row_record_fits(row: &WasmHostRow, limits: WasmTransitionLimits) -> bool {
-    encoded_row_record_bytes(row)
-        .ok()
-        .is_some_and(|bytes| framed_record_fits(bytes, limits))
-}
-
-fn host_change_record_fits(
-    change: &WasmRowChange<WasmHostBytes>,
-    limits: WasmTransitionLimits,
-) -> bool {
-    encoded_row_change_record_bytes(change)
-        .ok()
-        .is_some_and(|bytes| framed_record_fits(bytes, limits))
-}
-
-fn framed_record_fits(bytes: u64, limits: WasmTransitionLimits) -> bool {
-    bytes <= u64::from(limits.max_record_bytes)
-        && bytes
-            .checked_add(4)
-            .is_some_and(|framed| framed <= u64::from(limits.max_page_bytes))
-}
-
-fn require_framed_record_fits(
-    bytes: u64,
-    limits: WasmTransitionLimits,
-    kind: &str,
-) -> Result<(), LixError> {
-    if bytes > u64::from(limits.max_record_bytes) {
-        return Err(invalid_input(format!(
-            "component {kind} record exceeds max_record_bytes even with a lazy snapshot attachment"
-        )));
-    }
-    if bytes
-        .checked_add(4)
-        .is_none_or(|framed| framed > u64::from(limits.max_page_bytes))
-    {
-        return Err(invalid_input(format!(
-            "component {kind} record does not fit max_page_bytes even with a lazy snapshot attachment"
-        )));
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,570 +510,68 @@ impl SchemaAllowlist {
             .plan_for_key(schema_key)
             .map(|(_, plan)| plan)
     }
-}
 
-struct NumberFreeJsonValue(serde_json::Value);
-
-impl<'de> Deserialize<'de> for NumberFreeJsonValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer
-            .deserialize_any(NumberFreeJsonValueVisitor)
-            .map(Self)
-    }
-}
-
-struct NumberFreeJsonValueVisitor;
-
-impl<'de> Visitor<'de> for NumberFreeJsonValueVisitor {
-    type Value = serde_json::Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("number-free JSON")
+    fn validate_typed_row(&self, schema_key: &str, row: &WasmTypedRow) -> Result<(), LixError> {
+        self.validate_typed_row_with_plan(schema_key, row, self.schema_plan(schema_key))
     }
 
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Null)
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Null)
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Bool(value))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(serde_json::Value::String(value.to_owned()))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::String(value))
-    }
-
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Err(E::custom(
-            "JSON numbers are not enabled for production component",
-        ))
-    }
-
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Err(E::custom(
-            "JSON numbers are not enabled for production component",
-        ))
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Err(E::custom(
-            "JSON numbers are not enabled for production component",
-        ))
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
-        while let Some(NumberFreeJsonValue(value)) = sequence.next_element()? {
-            values.push(value);
-        }
-        Ok(serde_json::Value::Array(values))
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut values = serde_json::Map::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if values.contains_key(&key) {
-                return Err(A::Error::custom(format!(
-                    "duplicate decoded JSON object key '{key}'"
-                )));
+    fn validate_typed_row_with_plan(
+        &self,
+        schema_key: &str,
+        row: &WasmTypedRow,
+        plan: Option<&SchemaPlan>,
+    ) -> Result<(), LixError> {
+        let Some(plan) = plan else {
+            // Unit-level runtime tests can intentionally omit a catalog. The
+            // allowlist still authenticates the schema key in that mode; the
+            // catalog-backed production path performs the full typed check.
+            if row.row.is_empty() {
+                return Err(invalid_guest("typed row must contain at least one column"));
             }
-            let NumberFreeJsonValue(value) = map.next_value()?;
-            values.insert(key, value);
-        }
-        Ok(serde_json::Value::Object(values))
-    }
-}
-
-/// Parses, duplicate-checks, number-gates, and canonically encodes one component
-/// snapshot. Snapshot roots must be objects.
-pub(crate) fn canonicalize_snapshot(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
-    let value = parse_number_free_snapshot(bytes)?;
-    if !value.is_object() {
-        return Err(invalid_guest(
-            "component row snapshots must be JSON objects",
-        ));
-    }
-    let mut canonical = Vec::new();
-    encode_number_free_json(&value, &mut canonical)?;
-    Ok(canonical)
-}
-
-#[derive(Debug)]
-struct CanonicalJsonBatchBuilder {
-    row_kinds: Vec<CanonicalJsonBatchRowKind>,
-    decoded_values: Vec<serde_json::Value>,
-    certified_normalized: Vec<SharedStr>,
-    certified_row_pks: Vec<RowPk>,
-    schema_fingerprints: Vec<Arc<SchemaPlanFingerprint>>,
-    schema_fingerprint_indices: Vec<u32>,
-    normalized_ends: Vec<u32>,
-    parse_count: usize,
-    serialize_count: usize,
-    normalized_len: u32,
-    row_capacity: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum CanonicalJsonBatchRowKind {
-    Decoded,
-    Certified,
-}
-
-impl CanonicalJsonBatchBuilder {
-    fn with_row_capacity(row_count: usize) -> Self {
-        Self {
-            row_kinds: Vec::with_capacity(row_count),
-            decoded_values: Vec::new(),
-            certified_normalized: Vec::new(),
-            certified_row_pks: Vec::new(),
-            schema_fingerprints: Vec::new(),
-            schema_fingerprint_indices: Vec::new(),
-            normalized_ends: Vec::with_capacity(row_count),
-            parse_count: 0,
-            serialize_count: 0,
-            normalized_len: 0,
-            row_capacity: row_count,
-        }
-    }
-
-    fn reserve_decoded_column(&mut self) {
-        if self.decoded_values.capacity() == 0 {
-            self.decoded_values.reserve_exact(self.row_capacity);
-        }
-    }
-
-    fn reserve_certified_columns(&mut self) {
-        if self.certified_normalized.capacity() == 0 {
-            self.certified_normalized.reserve_exact(self.row_capacity);
-            self.certified_row_pks.reserve_exact(self.row_capacity);
-            self.schema_fingerprint_indices
-                .reserve_exact(self.row_capacity);
-        }
-    }
-
-    fn schema_fingerprint_index(
-        &mut self,
-        fingerprint: Arc<SchemaPlanFingerprint>,
-    ) -> Result<u32, LixError> {
-        if let Some(index) = self
-            .schema_fingerprints
-            .iter()
-            .position(|existing| Arc::ptr_eq(existing, &fingerprint))
-        {
-            return u32::try_from(index)
-                .map_err(|_| invalid_guest("component canonical JSON page has too many schemas"));
-        }
-        let index = u32::try_from(self.schema_fingerprints.len())
-            .map_err(|_| invalid_guest("component canonical JSON page has too many schemas"))?;
-        self.schema_fingerprints.push(fingerprint);
-        Ok(index)
-    }
-
-    fn push(&mut self, bytes: &[u8]) -> Result<usize, LixError> {
-        self.parse_count = self.parse_count.saturating_add(1);
-        let value = parse_number_free_snapshot(bytes)?;
-        if !value.is_object() {
-            return Err(invalid_guest(
-                "component row snapshots must be JSON objects",
-            ));
-        }
-
-        let encoded_len = canonical_json_encoded_len(&value)?;
-        let start = self.normalized_len;
-        let end = start
-            .checked_add(encoded_len)
-            .ok_or_else(|| invalid_guest("component canonical JSON page exceeds u32"))?;
-        self.normalized_len = end;
-        let row = self.row_kinds.len();
-        self.reserve_decoded_column();
-        self.decoded_values.push(value);
-        self.row_kinds.push(CanonicalJsonBatchRowKind::Decoded);
-        self.normalized_ends.push(end);
-        Ok(row)
-    }
-
-    fn push_plugin(
-        &mut self,
-        bytes: Bytes,
-        key: &WasmRowKey,
-        schemas: &SchemaAllowlist,
-    ) -> Result<usize, LixError> {
-        self.parse_count = self.parse_count.saturating_add(1);
-        let plan = schemas.schema_plan(&key.schema_key);
-        let certificate = if let Some(plan) = plan {
-            plan.certify_or_normalize_plugin_row(&bytes, key)?
-                .map(|row| (row, plan.shared_fingerprint()))
-        } else {
-            None
+            return Ok(());
         };
-        if let Some((certified, schema_fingerprint)) = certificate {
-            let normalized = match certified.normalized {
-                Some(normalized) => {
-                    self.serialize_count = self.serialize_count.saturating_add(1);
-                    Bytes::from(normalized)
-                }
-                None => bytes,
-            };
-            let encoded_len = u32::try_from(normalized.len())
-                .map_err(|_| invalid_guest("component canonical JSON row exceeds u32"))?;
-            let start = self.normalized_len;
-            let end = start
-                .checked_add(encoded_len)
-                .ok_or_else(|| invalid_guest("component canonical JSON page exceeds u32"))?;
-            self.normalized_len = end;
-            let row = self.row_kinds.len();
-            self.reserve_certified_columns();
-            let schema_fingerprint_index = self.schema_fingerprint_index(schema_fingerprint)?;
-            self.certified_normalized.push(
-                SharedStr::from_utf8(normalized)
-                    .map_err(|_| invalid_guest("certified canonical JSON row is not UTF-8"))?,
-            );
-            self.certified_row_pks.push(certified.row_pk);
-            self.schema_fingerprint_indices
-                .push(schema_fingerprint_index);
-            self.row_kinds.push(CanonicalJsonBatchRowKind::Certified);
-            self.normalized_ends.push(end);
-            return Ok(row);
+        if !plan.fingerprint().matches_bytes(&row.schema_fingerprint) {
+            return Err(invalid_guest(format!(
+                "typed row fingerprint does not match schema '{schema_key}'"
+            )));
         }
-
-        // Plans that cannot use the streaming certificate parser take one DOM
-        // pass and serialize once at batch finalization.
-        let value = parse_number_free_snapshot(&bytes)?;
-        if !value.is_object() {
-            return Err(invalid_guest(
-                "component row snapshots must be JSON objects",
-            ));
+        let primary_key = plan.compiled_schema.primary_key();
+        if row.row_pk.is_empty() {
+            // A create may omit its defaulted identity. The create context
+            // materializer supplies that typed value before staging.
+            plan.compiled_schema
+                .validate_create_row(&row.row)
+                .map_err(|error| invalid_guest(format!("typed create row is invalid: {error}")))?;
+            row.certify_boundary_create_validation();
+            return Ok(());
         }
-        if let Some(plan) = plan {
-            if let Err(error) = plan.compiled_schema.validate(&value) {
+        plan.compiled_schema
+            .validate_complete_row(&row.row)
+            .map_err(|error| invalid_guest(format!("typed row is incomplete: {error}")))?;
+        if row.row_pk.len() != primary_key.len() {
+            return Err(invalid_guest(format!(
+                "typed row identity for schema '{schema_key}' has the wrong component count"
+            )));
+        }
+        for (column, expected) in primary_key.iter().zip(row.row_pk.iter()) {
+            let actual = row.row.get(column).ok_or_else(|| {
+                invalid_guest(format!("typed row identity column '{column}' is missing"))
+            })?;
+            if actual != expected {
                 return Err(invalid_guest(format!(
-                    "component snapshot failed schema validation: {error}"
+                    "typed row identity does not match column '{column}'"
                 )));
             }
-            let primary_key = plan.primary_key.as_deref().ok_or_else(|| {
-                invalid_guest("component snapshot schema has no primary-key definition")
+        }
+        if !plan.compiled_schema.defaults_would_apply(&row.row) {
+            row.certify_boundary_validation().map_err(|error| {
+                invalid_guest(format!("typed row is not durably encodable: {error:?}"))
             })?;
-            let emitted = json_pointer_components(&value, primary_key)?;
-            if emitted.as_slice() != key.row_pk.as_slice() {
-                return Err(invalid_guest(
-                    "component snapshot primary key does not match its row key",
-                ));
-            }
-            let component_types = plan.primary_key_component_types.as_deref().ok_or_else(|| {
-                invalid_guest("component snapshot schema has no typed primary key")
-            })?;
-            let row_pk = RowPk::from_external_parts(emitted, component_types)
-                .map_err(|error| invalid_guest(format!("component row key is invalid: {error}")))?;
-            let encoded_len = canonical_json_encoded_len(&value)?;
-            let mut normalized = Vec::with_capacity(encoded_len as usize);
-            encode_number_free_json(&value, &mut normalized)?;
-            self.serialize_count = self.serialize_count.saturating_add(1);
-            let start = self.normalized_len;
-            let end = start
-                .checked_add(encoded_len)
-                .ok_or_else(|| invalid_guest("component canonical JSON page exceeds u32"))?;
-            self.normalized_len = end;
-            let row = self.row_kinds.len();
-            self.reserve_certified_columns();
-            let schema_fingerprint_index =
-                self.schema_fingerprint_index(plan.shared_fingerprint())?;
-            self.certified_normalized.push(
-                SharedStr::from_utf8(Bytes::from(normalized))
-                    .map_err(|_| invalid_guest("certified canonical JSON row is not UTF-8"))?,
-            );
-            self.certified_row_pks.push(row_pk);
-            self.schema_fingerprint_indices
-                .push(schema_fingerprint_index);
-            self.row_kinds.push(CanonicalJsonBatchRowKind::Certified);
-            self.normalized_ends.push(end);
-            return Ok(row);
-        }
-        let encoded_len = canonical_json_encoded_len(&value)?;
-        let start = self.normalized_len;
-        let end = start
-            .checked_add(encoded_len)
-            .ok_or_else(|| invalid_guest("component canonical JSON page exceeds u32"))?;
-        self.normalized_len = end;
-        let row = self.row_kinds.len();
-        self.reserve_decoded_column();
-        self.decoded_values.push(value);
-        self.row_kinds.push(CanonicalJsonBatchRowKind::Decoded);
-        self.normalized_ends.push(end);
-        Ok(row)
-    }
-
-    fn finish(self) -> Result<Vec<WasmCanonicalJson>, LixError> {
-        if self.decoded_values.is_empty()
-            && self.certified_normalized.len() == self.row_kinds.len()
-            && self.serialize_count == 0
-        {
-            debug_assert!(
-                self.row_kinds
-                    .iter()
-                    .all(|kind| *kind == CanonicalJsonBatchRowKind::Certified)
-            );
-            debug_assert_eq!(
-                self.certified_normalized
-                    .iter()
-                    .map(|row| row.len())
-                    .sum::<usize>(),
-                self.normalized_len as usize
-            );
-            return WasmCanonicalJson::from_certified_batch_parts(
-                self.certified_normalized,
-                self.certified_row_pks,
-                self.schema_fingerprints,
-                self.schema_fingerprint_indices,
-                self.parse_count,
-            );
-        }
-
-        let mut normalized = Vec::with_capacity(self.normalized_len as usize);
-        let mut values = Vec::with_capacity(self.row_kinds.len());
-        let mut certificates = Vec::with_capacity(self.row_kinds.len());
-        let mut offsets = Vec::with_capacity(self.row_kinds.len());
-        let mut decoded_values = self.decoded_values.into_iter();
-        let mut certified_normalized = self.certified_normalized.into_iter();
-        let mut certified_row_pks = self.certified_row_pks.into_iter();
-        let mut schema_fingerprint_indices = self.schema_fingerprint_indices.into_iter();
-        let mut serialize_count = self.serialize_count;
-        let mut start = 0_u32;
-        for (kind, end) in self.row_kinds.into_iter().zip(self.normalized_ends) {
-            debug_assert_eq!(normalized.len(), start as usize);
-            match kind {
-                CanonicalJsonBatchRowKind::Decoded => {
-                    let value = decoded_values
-                        .next()
-                        .expect("decoded canonical JSON row has a value");
-                    encode_number_free_json(&value, &mut normalized)?;
-                    values.push(Some(value));
-                    certificates.push(None);
-                    serialize_count += 1;
-                }
-                CanonicalJsonBatchRowKind::Certified => {
-                    let canonical = certified_normalized
-                        .next()
-                        .expect("certified canonical JSON row has bytes");
-                    let row_pk = certified_row_pks
-                        .next()
-                        .expect("certified canonical JSON row has a row identity");
-                    let schema_fingerprint_index = schema_fingerprint_indices
-                        .next()
-                        .expect("certified canonical JSON row has a schema index");
-                    let schema_fingerprint = self
-                        .schema_fingerprints
-                        .get(schema_fingerprint_index as usize)
-                        .expect("certified canonical JSON row schema index was interned")
-                        .clone();
-                    normalized.extend_from_slice(canonical.as_bytes());
-                    values.push(None);
-                    certificates.push(Some(WasmCanonicalJsonCertificate::new(
-                        row_pk,
-                        schema_fingerprint,
-                    )));
-                }
-            }
-            debug_assert_eq!(normalized.len(), end as usize);
-            offsets.push((start, end));
-            start = end;
-        }
-        #[cfg(debug_assertions)]
-        {
-            assert!(decoded_values.next().is_none());
-            assert!(certified_normalized.next().is_none());
-            assert!(certified_row_pks.next().is_none());
-            assert!(schema_fingerprint_indices.next().is_none());
-        }
-        debug_assert_eq!(normalized.len(), normalized.capacity());
-        WasmCanonicalJson::from_mixed_batch_parts(
-            values,
-            certificates,
-            normalized,
-            offsets,
-            self.parse_count,
-            serialize_count,
-        )
-    }
-}
-
-fn canonical_json_encoded_len(value: &serde_json::Value) -> Result<u32, LixError> {
-    fn add(total: &mut u64, value: u64) -> Result<(), LixError> {
-        *total = total
-            .checked_add(value)
-            .ok_or_else(|| invalid_guest("component canonical JSON size overflowed"))?;
-        Ok(())
-    }
-
-    fn visit(value: &serde_json::Value, total: &mut u64) -> Result<(), LixError> {
-        match value {
-            serde_json::Value::Null => add(total, 4),
-            serde_json::Value::Bool(true) => add(total, 4),
-            serde_json::Value::Bool(false) => add(total, 5),
-            serde_json::Value::Number(_) => Err(invalid_guest(
-                "JSON numbers are not enabled for production component",
-            )),
-            serde_json::Value::String(value) => encoded_json_string_len(value, total),
-            serde_json::Value::Array(values) => {
-                add(total, 2)?;
-                if values.len() > 1 {
-                    add(total, (values.len() - 1) as u64)?;
-                }
-                for value in values {
-                    visit(value, total)?;
-                }
-                Ok(())
-            }
-            serde_json::Value::Object(values) => {
-                add(total, 2)?;
-                if values.len() > 1 {
-                    add(total, (values.len() - 1) as u64)?;
-                }
-                for (key, value) in values {
-                    encoded_json_string_len(key, total)?;
-                    add(total, 1)?;
-                    visit(value, total)?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn encoded_json_string_len(value: &str, total: &mut u64) -> Result<(), LixError> {
-        add(total, 2)?;
-        for scalar in value.chars() {
-            add(
-                total,
-                match scalar {
-                    '"' | '\\' | '\u{08}' | '\t' | '\n' | '\u{0c}' | '\r' => 2,
-                    scalar if scalar <= '\u{1f}' => 6,
-                    scalar => scalar.len_utf8() as u64,
-                },
-            )?;
         }
         Ok(())
     }
-
-    let mut total = 0;
-    visit(value, &mut total)?;
-    u32::try_from(total).map_err(|_| invalid_guest("component canonical JSON row exceeds u32"))
 }
 
-fn parse_number_free_snapshot(bytes: &[u8]) -> Result<serde_json::Value, LixError> {
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let NumberFreeJsonValue(value) =
-        NumberFreeJsonValue::deserialize(&mut deserializer).map_err(|error| {
-            invalid_guest(format!(
-                "component snapshot must be duplicate-free number-free UTF-8 JSON: {error}"
-            ))
-        })?;
-    deserializer.end().map_err(|error| {
-        invalid_guest(format!(
-            "component snapshot contains trailing or invalid JSON input: {error}"
-        ))
-    })?;
-    Ok(value)
-}
-
-fn encode_number_free_json(
-    value: &serde_json::Value,
-    output: &mut Vec<u8>,
-) -> Result<(), LixError> {
-    match value {
-        serde_json::Value::Null => output.extend_from_slice(b"null"),
-        serde_json::Value::Bool(true) => output.extend_from_slice(b"true"),
-        serde_json::Value::Bool(false) => output.extend_from_slice(b"false"),
-        serde_json::Value::String(value) => encode_json_string(value, output),
-        serde_json::Value::Array(values) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                encode_number_free_json(value, output)?;
-            }
-            output.push(b']');
-        }
-        serde_json::Value::Object(values) => {
-            output.push(b'{');
-            for (index, (key, value)) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                encode_json_string(key, output);
-                output.push(b':');
-                encode_number_free_json(value, output)?;
-            }
-            output.push(b'}');
-        }
-        serde_json::Value::Number(_) => {
-            return Err(invalid_guest(
-                "JSON numbers are not enabled for production component",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn encode_json_string(value: &str, output: &mut Vec<u8>) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    output.push(b'"');
-    for scalar in value.chars() {
-        match scalar {
-            '"' => output.extend_from_slice(br#"\""#),
-            '\\' => output.extend_from_slice(br#"\\"#),
-            '\u{08}' => output.extend_from_slice(br#"\b"#),
-            '\t' => output.extend_from_slice(br#"\t"#),
-            '\n' => output.extend_from_slice(br#"\n"#),
-            '\u{0c}' => output.extend_from_slice(br#"\f"#),
-            '\r' => output.extend_from_slice(br#"\r"#),
-            scalar if scalar <= '\u{1f}' => {
-                let scalar = scalar as usize;
-                output.extend_from_slice(b"\\u00");
-                output.push(HEX[(scalar >> 4) & 0x0f]);
-                output.push(HEX[scalar & 0x0f]);
-            }
-            scalar => {
-                let mut encoded = [0_u8; 4];
-                output.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
-            }
-        }
-    }
-    output.push(b'"');
-}
-
-/// Vec-backed complete-row packet source for cold rendering. Construction
-/// enforces packet-v1's global key order.
-#[derive(Debug)]
 pub(crate) struct VecRowSource {
     rows: VecDeque<WasmHostRow>,
     state: VecSourceState,
@@ -1228,9 +605,14 @@ impl WasmRowSource for VecRowSource {
         }
 
         let mut page_bytes = 0u64;
-        let mut page_refs = 0u32;
-        let mut rows = Vec::new();
+        let mut rows: Vec<WasmHostRow> = Vec::new();
         while let Some(row) = self.rows.front() {
+            if let Some(first) = rows.first()
+                && (first.key.schema_key != row.key.schema_key
+                    || first.key.schema_fingerprint != row.key.schema_fingerprint)
+            {
+                break;
+            }
             let record_bytes = encoded_row_record_bytes(row)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
                 return Err(invalid_input(
@@ -1252,12 +634,9 @@ impl WasmRowSource for VecRowSource {
                 break;
             }
             page_bytes += framed_bytes;
-            page_refs = page_refs
-                .checked_add(host_bytes_attachment_refs(&row.snapshot_content))
-                .ok_or_else(|| invalid_input("component row attachment count overflowed"))?;
             rows.push(self.rows.pop_front().expect("front row was just inspected"));
         }
-        self.state.accept_page(page_bytes, page_refs)?;
+        self.state.accept_page(page_bytes, 0)?;
         Ok(Some(WasmRowPage { rows }))
     }
 }
@@ -1275,7 +654,7 @@ pub(crate) struct LiveBatchRowSource {
 }
 
 impl LiveBatchRowSource {
-    pub(crate) fn new(
+    pub(crate) fn new_typed(
         rows: MaterializedHotStateBatch,
         ordinals: Vec<u32>,
         limits: WasmTransitionLimits,
@@ -1311,21 +690,23 @@ impl LiveBatchRowSource {
                 "plugin state selection references a row outside its batch owner",
             )
         })?;
-        let snapshot = row.snapshot_content().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "plugin state selection references a tombstoned row",
-            )
-        })?;
-        host_row_with_lazy_snapshot(
-            WasmRowKey::from_owned_parts(
-                row.schema_key().to_owned(),
-                row.row_pk().clone().into_parts(),
+        if let Some(typed) = row.decoded_snapshot() {
+            return Ok(Some(WasmRow {
+                key: WasmRowKey::from_typed_parts(
+                    row.schema_key().to_owned(),
+                    typed.schema_fingerprint,
+                    typed.row_pk.clone(),
+                )?,
+                payload: WasmHostBytes::Typed(Arc::clone(typed)),
+            }));
+        }
+        Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "plugin state row '{}' has no native typed payload",
+                row.schema_key()
             ),
-            snapshot.clone().into_bytes(),
-            self.state.limits,
-        )
-        .map(Some)
+        ))
     }
 }
 
@@ -1336,8 +717,7 @@ impl WasmRowSource for LiveBatchRowSource {
         }
         let page_limit = self.state.page_limit(max_bytes)?;
         let mut page_bytes = 0_u64;
-        let mut page_refs = 0_u32;
-        let mut rows = Vec::new();
+        let mut rows: Vec<WasmHostRow> = Vec::new();
         while let Some(row) = self.next_row()? {
             let record_bytes = encoded_row_record_bytes(&row)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
@@ -1360,17 +740,21 @@ impl WasmRowSource for LiveBatchRowSource {
                 self.pending = Some(row);
                 break;
             }
+            if let Some(first) = rows.first()
+                && (first.key.schema_key != row.key.schema_key
+                    || first.key.schema_fingerprint != row.key.schema_fingerprint)
+            {
+                self.pending = Some(row);
+                break;
+            }
             page_bytes += framed_bytes;
-            page_refs = page_refs
-                .checked_add(host_bytes_attachment_refs(&row.snapshot_content))
-                .ok_or_else(|| invalid_input("component row attachment count overflowed"))?;
             rows.push(row);
         }
         if rows.is_empty() {
             self.state.reached_eof = true;
             return Ok(None);
         }
-        self.state.accept_page(page_bytes, page_refs)?;
+        self.state.accept_page(page_bytes, 0)?;
         Ok(Some(WasmRowPage { rows }))
     }
 }
@@ -1425,9 +809,17 @@ impl WasmRowChangeSource for VecRowChangeSource {
         }
 
         let mut page_bytes = 0u64;
-        let mut page_refs = 0u32;
-        let mut changes = Vec::new();
+        let mut changes: Vec<WasmRowChange<WasmHostBytes>> = Vec::new();
         while let Some(change) = self.changes.front() {
+            let change_key = change.row_key().ok_or_else(|| {
+                invalid_input("host-to-guest row changes require a resolved typed key")
+            })?;
+            if let Some(first_key) = changes.first().and_then(WasmRowChange::row_key)
+                && (first_key.schema_key != change_key.schema_key
+                    || first_key.schema_fingerprint != change_key.schema_fingerprint)
+            {
+                break;
+            }
             let record_bytes = encoded_row_change_record_bytes(change)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
                 return Err(invalid_input(
@@ -1449,16 +841,13 @@ impl WasmRowChangeSource for VecRowChangeSource {
                 break;
             }
             page_bytes += framed_bytes;
-            page_refs = page_refs
-                .checked_add(change_attachment_refs(change))
-                .ok_or_else(|| invalid_input("component change attachment count overflowed"))?;
             changes.push(
                 self.changes
                     .pop_front()
                     .expect("front change was just inspected"),
             );
         }
-        self.state.accept_page(page_bytes, page_refs)?;
+        self.state.accept_page(page_bytes, 0)?;
         Ok(Some(WasmRowChanges { changes }))
     }
 }
@@ -1485,11 +874,20 @@ impl VecColumnMergeSource {
                     "column merge source requires contiguous ordinals, a row key, and a column",
                 ));
             }
+            if merge.schema_fingerprint != merge.base_row.schema_fingerprint
+                || merge.schema_fingerprint != merge.a_row.schema_fingerprint
+                || merge.schema_fingerprint != merge.b_row.schema_fingerprint
+            {
+                return Err(invalid_input(
+                    "column merge rows must share the declared schema fingerprint",
+                ));
+            }
             for row in [&merge.base_row, &merge.a_row, &merge.b_row] {
-                validate_host_row(&WasmRow {
-                    key: merge.key.clone(),
-                    snapshot_content: row.clone(),
-                })?;
+                if row.row.is_empty() || row.row_pk.is_empty() {
+                    return Err(invalid_input(
+                        "column merge context rows must contain typed identity and values",
+                    ));
+                }
             }
         }
         Ok(Self {
@@ -1513,25 +911,13 @@ impl WasmColumnMergeSource for VecColumnMergeSource {
         let mut page_refs = 0u32;
         let mut merges = Vec::new();
         while let Some(merge) = self.merges.front() {
-            let mut record_bytes = encoded_row_key_bytes(&merge.key)?
+            // Values and context rows stay host-side and are exposed through
+            // range reads. Only metadata references are admitted to this page.
+            let record_bytes = encoded_row_key_bytes(&merge.key)?
                 .saturating_add(merge.column.len() as u64)
                 .saturating_add(merge.file_id.as_ref().map_or(0, |id| id.len()) as u64)
                 .saturating_add(64);
-            let mut record_refs = 0u32;
-            for value in [
-                merge.base.as_ref(),
-                merge.a.as_ref(),
-                merge.b.as_ref(),
-                Some(&merge.base_row),
-                Some(&merge.a_row),
-                Some(&merge.b_row),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                record_bytes = record_bytes.saturating_add(encoded_host_bytes_ref_bytes(value)?);
-                record_refs = record_refs.saturating_add(host_bytes_attachment_refs(value));
-            }
+            let record_refs = 0u32;
             if page_bytes.saturating_add(record_bytes) > page_limit {
                 if merges.is_empty() {
                     return Err(invalid_input(
@@ -1645,8 +1031,10 @@ fn validate_host_row(row: &WasmHostRow) -> Result<(), LixError> {
             "component row primary keys must not be empty",
         ));
     }
-    if let WasmHostBytes::Source(slice) = &row.snapshot_content {
-        slice.validate()?;
+    if !matches!(row.payload, WasmHostBytes::Typed(_)) {
+        return Err(invalid_input(
+            "component host rows must use native typed-row payloads",
+        ));
     }
     Ok(())
 }
@@ -1656,21 +1044,23 @@ fn encoded_row_record_bytes(row: &WasmHostRow) -> Result<u64, LixError> {
         .row_pk
         .iter()
         .try_fold(row.key.schema_key.len() as u64 + 32, |size, component| {
-            size.checked_add(component.len() as u64)
+            let encoded_len = typed_wire::encoded_key_value_size(component)
+                .map_err(|_| invalid_input("component row key contains an invalid value"))?;
+            size.checked_add(encoded_len as u64)
                 .ok_or_else(|| invalid_input("component row record size overflowed"))
         })?
-        .checked_add(encoded_host_bytes_ref_bytes(&row.snapshot_content)?)
+        .checked_add(encoded_host_bytes_ref_bytes(&row.payload)?)
         .ok_or_else(|| invalid_input("component row record size overflowed"))
 }
 
 fn encoded_row_change_record_bytes(change: &WasmRowChange<WasmHostBytes>) -> Result<u64, LixError> {
     if let WasmRowChange::Create {
         schema_key,
-        snapshot_content,
+        payload,
         ..
     } = change
     {
-        let snapshot_bytes = encoded_host_bytes_ref_bytes(snapshot_content)?;
+        let snapshot_bytes = encoded_host_bytes_ref_bytes(payload)?;
         return (schema_key.len() as u64)
             .checked_add(32)
             .and_then(|size| size.checked_add(snapshot_bytes))
@@ -1681,12 +1071,14 @@ fn encoded_row_change_record_bytes(change: &WasmRowChange<WasmHostBytes>) -> Res
         key.row_pk
             .iter()
             .try_fold(key.schema_key.len() as u64 + 32, |size, component| {
-                size.checked_add(component.len() as u64)
+                let encoded_len = typed_wire::encoded_key_value_size(component)
+                    .map_err(|_| invalid_input("component row key contains an invalid value"))?;
+                size.checked_add(encoded_len as u64)
                     .ok_or_else(|| invalid_input("component change record size overflowed"))
             })?;
     if let WasmRowChange::Upsert { row, .. } = change {
         size = size
-            .checked_add(encoded_host_bytes_ref_bytes(&row.snapshot_content)?)
+            .checked_add(encoded_host_bytes_ref_bytes(&row.payload)?)
             .ok_or_else(|| invalid_input("component change record size overflowed"))?;
     }
     Ok(size)
@@ -1701,11 +1093,13 @@ fn encoded_row_key_bytes(key: &WasmRowKey) -> Result<u64, LixError> {
     let _ = u32::try_from(key.row_pk.len())
         .map_err(|_| invalid_input("component row primary key has too many components"))?;
     let mut size = encoded_text_bytes(&key.schema_key)?
-        .checked_add(4)
+        .checked_add(32 + 4)
         .ok_or_else(|| invalid_input("component row key size overflowed"))?;
-    for component in &key.row_pk {
+    for component in key.row_pk.iter() {
+        let component_len = typed_wire::encoded_key_value_size(component)
+            .map_err(|_| invalid_input("component row key contains an invalid value"))?;
         size = size
-            .checked_add(encoded_text_bytes(component)?)
+            .checked_add(4 + component_len as u64)
             .ok_or_else(|| invalid_input("component row key size overflowed"))?;
     }
     Ok(size)
@@ -1719,34 +1113,7 @@ fn encoded_text_bytes(value: &str) -> Result<u64, LixError> {
 
 fn encoded_host_bytes_ref_bytes(value: &WasmHostBytes) -> Result<u64, LixError> {
     match value {
-        WasmHostBytes::Inline(bytes) => {
-            let length = u32::try_from(bytes.len())
-                .map_err(|_| invalid_input("component inline snapshot exceeds u32 framing"))?;
-            Ok(1 + 4 + u64::from(length))
-        }
-        WasmHostBytes::CanonicalJson(json) => {
-            let length = u32::try_from(json.normalized().len())
-                .map_err(|_| invalid_input("component inline snapshot exceeds u32 framing"))?;
-            Ok(1 + 4 + u64::from(length))
-        }
-        WasmHostBytes::Source(slice) => {
-            slice.validate()?;
-            Ok(1 + 4 + 8 + 8)
-        }
-    }
-}
-
-fn host_bytes_attachment_refs(value: &WasmHostBytes) -> u32 {
-    u32::from(matches!(value, WasmHostBytes::Source(_)))
-}
-
-fn change_attachment_refs(change: &WasmRowChange<WasmHostBytes>) -> u32 {
-    match change {
-        WasmRowChange::Create {
-            snapshot_content, ..
-        } => u32::from(matches!(snapshot_content, WasmHostBytes::Source(_))),
-        WasmRowChange::Upsert { row, .. } => host_bytes_attachment_refs(&row.snapshot_content),
-        WasmRowChange::Delete(_) => 0,
+        WasmHostBytes::Typed(row) => Ok(1 + 4 + row.estimated_size()),
     }
 }
 
@@ -1754,14 +1121,13 @@ fn change_attachment_refs(change: &WasmRowChange<WasmHostBytes>) -> u32 {
 pub(crate) struct ValidatedFileTransition {
     pub(crate) document: WasmDocumentHandle,
     pub(crate) changes: WasmHostRowChanges,
-    pub(crate) certified_batches: Vec<WasmCertifiedRowBatch>,
     pub(crate) replace_all_rows: bool,
     pub(crate) counters: WasmTransitionCounters,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedColumnMergeTransition {
-    pub(crate) results: Vec<WasmColumnMergeResult<WasmHostBytes>>,
+    pub(crate) results: Vec<WasmColumnMergeResult<lix_schema::Value>>,
     pub(crate) counters: WasmTransitionCounters,
 }
 
@@ -1799,530 +1165,6 @@ pub(crate) struct ValidatedRowTransition {
     pub(crate) counters: WasmTransitionCounters,
 }
 
-fn validate_certified_row_batches(
-    batches: &mut [WasmCertifiedRowBatch],
-    schemas: &SchemaAllowlist,
-) -> Result<(), LixError> {
-    for batch in batches {
-        for schema_key in &batch.schema_keys {
-            schemas.validate(schema_key)?;
-        }
-        match batch.format {
-            2 => validate_certified_snapshot_packets(batch, schemas)?,
-            format => {
-                return Err(invalid_guest(format!(
-                    "unknown certified row batch format {format}"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-const HOST_CERTIFIED_PACKET_TARGET_BYTES: usize = 256 * 1024;
-const HOST_CERTIFIED_PACKET_MIN_ROWS: usize = 64;
-
-/// Retains a complete, eagerly validated generic-text import in dense packet
-/// pages. The ordinary component change list remains intact for changelog and
-/// transaction materialization; the tracked-head writer may use this complete
-/// batch as the authoritative current-state owner instead of persisting a
-/// second expanded HOT row per line.
-pub(crate) fn certify_dense_fresh_file(
-    transition: &mut ValidatedFileTransition,
-    creates: crate::plugin::runtime::WasmCreateContext,
-    schemas: &SchemaAllowlist,
-) -> Result<(), LixError> {
-    if !transition.certified_batches.is_empty()
-        || transition.changes.changes.len() < HOST_CERTIFIED_PACKET_MIN_ROWS
-    {
-        return Ok(());
-    }
-    let Some(schema_key) = transition.changes.changes.first().and_then(|change| {
-        let WasmRowChange::Create { schema_key, .. } = change else {
-            return None;
-        };
-        Some(schema_key.as_str())
-    }) else {
-        return Ok(());
-    };
-    if !transition.changes.changes.iter().all(|change| {
-        matches!(
-            change,
-            WasmRowChange::Create {
-                schema_key: candidate_schema_key,
-                resolved_key: None,
-                snapshot_content: WasmHostBytes::CanonicalJson(_),
-                ..
-            } if candidate_schema_key == schema_key
-        )
-    }) {
-        return Ok(());
-    }
-    schemas.validate(schema_key)?;
-    let plan = schemas.schema_plan(schema_key).ok_or_else(|| {
-        invalid_guest(format!(
-            "dense batch schema '{schema_key}' has no validation plan"
-        ))
-    })?;
-    if plan
-        .primary_key
-        .as_ref()
-        .is_none_or(|paths| paths.len() != 1)
-    {
-        return Ok(());
-    }
-    let primary_key_path = &plan.primary_key.as_ref().expect("checked above")[0];
-    let snapshot_bytes = transition
-        .changes
-        .changes
-        .iter()
-        .filter_map(|change| match change {
-            WasmRowChange::Create {
-                snapshot_content: WasmHostBytes::CanonicalJson(snapshot),
-                ..
-            } => Some(snapshot.normalized().len()),
-            _ => None,
-        })
-        .sum::<usize>();
-    let compressed_pages = snapshot_bytes >= 1024 * 1024;
-
-    let mut pages = Vec::new();
-    let mut page = Vec::with_capacity(HOST_CERTIFIED_PACKET_TARGET_BYTES);
-    let mut page_first_local_ref = None;
-    let mut page_last_local_ref = None;
-    for change in &transition.changes.changes {
-        let WasmRowChange::Create {
-            schema_key,
-            local_ref,
-            snapshot_content: WasmHostBytes::CanonicalJson(snapshot),
-            ..
-        } = change
-        else {
-            unreachable!("dense text eligibility was checked above");
-        };
-        let schema_bytes = schema_key.as_bytes();
-        let id = creates.component(*local_ref)?;
-        let snapshot_bytes = crate::plugin::wire::insert_generated_id(
-            snapshot.normalized().as_bytes(),
-            primary_key_path,
-            &id,
-        )
-        .map_err(|error| {
-            invalid_guest(format!(
-                "dense batch generated identity is invalid: {error}"
-            ))
-        })?;
-        let record_len = 1_usize
-            .checked_add(4)
-            .and_then(|len| len.checked_add(schema_bytes.len()))
-            .and_then(|len| len.checked_add(4 + 4 + id.len() + 1 + 4))
-            .and_then(|len| len.checked_add(snapshot_bytes.len()))
-            .ok_or_else(|| invalid_guest("host certified packet record size overflowed"))?;
-        let framed_len = 4_usize
-            .checked_add(record_len)
-            .ok_or_else(|| invalid_guest("host certified packet frame size overflowed"))?;
-        let page_local_ref = u32::try_from(*local_ref)
-            .map_err(|_| invalid_guest("host certified packet local reference exceeds u32"))?;
-        if !page.is_empty()
-            && page.len().saturating_add(framed_len) > HOST_CERTIFIED_PACKET_TARGET_BYTES
-        {
-            pages.push(finish_host_certified_packet_page(
-                std::mem::take(&mut page),
-                page_first_local_ref
-                    .take()
-                    .expect("non-empty packet page has a first local ref"),
-                page_last_local_ref
-                    .take()
-                    .expect("non-empty packet page has a last local ref"),
-                compressed_pages,
-            )?);
-            page = Vec::with_capacity(HOST_CERTIFIED_PACKET_TARGET_BYTES.max(framed_len));
-        }
-        page_first_local_ref.get_or_insert(page_local_ref);
-        page_last_local_ref = Some(page_local_ref);
-        page.extend_from_slice(
-            &u32::try_from(record_len)
-                .map_err(|_| invalid_guest("host certified packet record exceeds u32"))?
-                .to_le_bytes(),
-        );
-        page.push(3);
-        page.extend_from_slice(
-            &u32::try_from(schema_bytes.len())
-                .map_err(|_| invalid_guest("host certified packet schema exceeds u32"))?
-                .to_le_bytes(),
-        );
-        page.extend_from_slice(schema_bytes);
-        page.extend_from_slice(&1_u32.to_le_bytes());
-        page.extend_from_slice(
-            &u32::try_from(id.len())
-                .map_err(|_| invalid_guest("generated identity exceeds u32"))?
-                .to_le_bytes(),
-        );
-        page.extend_from_slice(id.as_bytes());
-        page.push(0);
-        page.extend_from_slice(
-            &u32::try_from(snapshot_bytes.len())
-                .map_err(|_| invalid_guest("host certified packet snapshot exceeds u32"))?
-                .to_le_bytes(),
-        );
-        page.extend_from_slice(&snapshot_bytes);
-    }
-    if !page.is_empty() {
-        pages.push(finish_host_certified_packet_page(
-            page,
-            page_first_local_ref.expect("non-empty packet page has a first local ref"),
-            page_last_local_ref.expect("non-empty packet page has a last local ref"),
-            compressed_pages,
-        )?);
-    }
-    let batch = WasmCertifiedRowBatch {
-        // Formats 3 and 4 are host-only equivalents of the format-2 packet
-        // codec. Guest batches are validated before this synthesis point and
-        // the guest-facing validator intentionally rejects both formats.
-        format: if compressed_pages {
-            crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
-        } else {
-            crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT
-        },
-        schema_keys: vec![schema_key.to_owned()],
-        row_count: transition.changes.changes.len() as u64,
-        creates,
-        create_ranges: Vec::new(),
-        complete_file_state: true,
-        pages,
-    };
-    transition.certified_batches.push(batch);
-    Ok(())
-}
-
-fn finish_host_certified_packet_page(
-    page: Vec<u8>,
-    first_local_ref: u32,
-    last_local_ref: u32,
-    compressed: bool,
-) -> Result<Bytes, LixError> {
-    if !compressed {
-        return Ok(Bytes::from(page));
-    }
-    let compressed = crate::compression::compress_zstd_level_1(&page).map_err(|error| {
-        LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!("host-certified packet compression failed: {error}"),
-        )
-    })?;
-    let mut encoded = Vec::with_capacity(12 + compressed.len());
-    encoded.extend_from_slice(&first_local_ref.to_le_bytes());
-    encoded.extend_from_slice(&last_local_ref.to_le_bytes());
-    encoded.extend_from_slice(
-        &u32::try_from(page.len())
-            .map_err(|_| invalid_guest("host-certified packet page exceeds u32"))?
-            .to_le_bytes(),
-    );
-    encoded.extend_from_slice(&compressed);
-    Ok(Bytes::from(encoded))
-}
-
-fn validate_certified_snapshot_packets(
-    batch: &mut WasmCertifiedRowBatch,
-    schemas: &SchemaAllowlist,
-) -> Result<(), LixError> {
-    let mut rows = 0_u64;
-    let mut encountered = BTreeSet::new();
-    let validate_relationships =
-        batch
-            .schema_keys
-            .iter()
-            .try_fold(false, |found, schema_key| {
-                let plan = schemas.schema_plan(schema_key).ok_or_else(|| {
-                    invalid_guest(format!(
-                        "certified batch schema '{schema_key}' has no validation plan"
-                    ))
-                })?;
-                Ok::<_, LixError>(found || !plan.foreign_keys.is_empty())
-            })?;
-    let mut row_keys = BTreeSet::new();
-    let mut foreign_keys = Vec::new();
-    for page in &batch.pages {
-        let mut page = CertifiedPacketReader::new(page);
-        while !page.finished() {
-            let record_len = page.u32()? as usize;
-            let record_bytes = page.bytes(record_len)?;
-            let mut record = CertifiedPacketReader::new(record_bytes);
-            let tag = record.u8()?;
-            let schema_key = record.text()?;
-            schemas.validate(schema_key)?;
-            encountered.insert(schema_key);
-            let normalized = match tag {
-                0 => {
-                    let component_count = record.u32()? as usize;
-                    if component_count == 0 {
-                        return Err(invalid_guest(
-                            "certified packet upsert key has no components",
-                        ));
-                    }
-                    let mut components = smallvec::SmallVec::<[&str; 2]>::new();
-                    for _ in 0..component_count {
-                        components.push(record.text()?);
-                    }
-                    if record.u8()? > 1 {
-                        return Err(invalid_guest("certified packet upsert has invalid effect"));
-                    }
-                    let snapshot = record.inline_blob()?;
-                    let plan = schemas.schema_plan(schema_key).ok_or_else(|| {
-                        invalid_guest(format!(
-                            "certified batch schema '{schema_key}' has no validation plan"
-                        ))
-                    })?;
-                    validate_certified_record(
-                        plan,
-                        schema_key,
-                        &components,
-                        snapshot,
-                        batch.complete_file_state,
-                        validate_relationships,
-                        &mut row_keys,
-                        &mut foreign_keys,
-                    )?
-                }
-                2 => {
-                    let local_ref = record.u64()?;
-                    let id = batch.creates.component(local_ref)?;
-                    let snapshot = record.inline_blob()?;
-                    let plan = schemas.schema_plan(schema_key).ok_or_else(|| {
-                        invalid_guest(format!(
-                            "certified batch schema '{schema_key}' has no validation plan"
-                        ))
-                    })?;
-                    let [_primary_key_path] = plan.primary_key.as_deref().unwrap_or_default()
-                    else {
-                        return Err(invalid_guest(
-                            "certified creates require exactly one generated primary-key field",
-                        ));
-                    };
-                    let normalized = validate_certified_record(
-                        plan,
-                        schema_key,
-                        &[id.as_str()],
-                        snapshot,
-                        batch.complete_file_state,
-                        validate_relationships,
-                        &mut row_keys,
-                        &mut foreign_keys,
-                    )?;
-                    normalized
-                }
-                _ => {
-                    return Err(invalid_guest(
-                        "certified snapshot packet contains a non-snapshot change",
-                    ));
-                }
-            };
-            record.finish()?;
-            if normalized.is_some() {
-                return Err(invalid_guest(
-                    "certified batch snapshot is not in canonical storage form",
-                ));
-            }
-            rows = rows
-                .checked_add(1)
-                .ok_or_else(|| invalid_guest("certified batch row count overflowed"))?;
-        }
-    }
-    if rows != batch.row_count {
-        return Err(invalid_guest(format!(
-            "certified batch declared {} rows but validated {rows}",
-            batch.row_count
-        )));
-    }
-    if encountered.len() != batch.schema_keys.len()
-        || !batch
-            .schema_keys
-            .iter()
-            .all(|schema_key| encountered.contains(schema_key.as_str()))
-    {
-        return Err(invalid_guest(
-            "certified batch schema header does not match its records",
-        ));
-    }
-    if let Some((schema_key, components)) = foreign_keys.iter().find(|key| !row_keys.contains(*key))
-    {
-        return Err(invalid_guest(format!(
-            "certified foreign key '{}:{components:?}' is absent from the complete batch",
-            schema_key
-        )));
-    }
-    Ok(())
-}
-
-type CertifiedRowKey = (String, Vec<String>);
-
-fn validate_certified_record(
-    plan: &SchemaPlan,
-    schema_key: &str,
-    components: &[&str],
-    snapshot: &[u8],
-    complete_file_state: bool,
-    validate_relationships: bool,
-    row_keys: &mut BTreeSet<CertifiedRowKey>,
-    foreign_keys: &mut Vec<CertifiedRowKey>,
-) -> Result<Option<Vec<u8>>, LixError> {
-    if let Some(normalized) =
-        plan.certify_or_normalize_plugin_row_parts(snapshot, schema_key, components)?
-    {
-        if validate_relationships {
-            row_keys.insert((
-                schema_key.to_owned(),
-                components.iter().map(|value| (*value).to_owned()).collect(),
-            ));
-        }
-        return Ok(normalized);
-    }
-    if !complete_file_state && !plan.foreign_keys.is_empty() {
-        return Err(invalid_guest(
-            "a certified batch with foreign keys must contain complete file state",
-        ));
-    }
-    // Parse once with the stricter component-row decoder, then reuse that DOM
-    // for schema/relationship validation and canonical encoding below.
-    let value = parse_number_free_snapshot(snapshot)?;
-    if !value.is_object() {
-        return Err(invalid_guest(
-            "component row snapshots must be JSON objects",
-        ));
-    }
-    if let Err(error) = plan.compiled_schema.validate(&value) {
-        return Err(invalid_guest(format!(
-            "certified snapshot failed schema validation: {error}"
-        )));
-    }
-    let primary_key = plan
-        .primary_key
-        .as_deref()
-        .ok_or_else(|| invalid_guest("certified snapshot schema has no primary-key definition"))?;
-    let emitted = json_pointer_components(&value, primary_key)?;
-    if emitted
-        .iter()
-        .map(String::as_str)
-        .ne(components.iter().copied())
-    {
-        return Err(invalid_guest(
-            "certified snapshot primary key does not match its row key",
-        ));
-    }
-    if validate_relationships {
-        row_keys.insert((schema_key.to_owned(), emitted));
-        for foreign_key in &plan.foreign_keys {
-            let values = json_pointer_components_optional(&value, &foreign_key.local_properties)?;
-            if let Some(values) = values {
-                foreign_keys.push((foreign_key.referenced_schema.schema_key.clone(), values));
-            }
-        }
-    }
-    let mut canonical = Vec::with_capacity(snapshot.len());
-    encode_number_free_json(&value, &mut canonical)?;
-    Ok((canonical.as_slice() != snapshot).then_some(canonical))
-}
-
-fn json_pointer_components(
-    value: &serde_json::Value,
-    paths: &[Vec<String>],
-) -> Result<Vec<String>, LixError> {
-    json_pointer_components_optional(value, paths)?
-        .ok_or_else(|| invalid_guest("certified primary-key component cannot be null"))
-}
-
-fn json_pointer_components_optional(
-    value: &serde_json::Value,
-    paths: &[Vec<String>],
-) -> Result<Option<Vec<String>>, LixError> {
-    let mut components = Vec::with_capacity(paths.len());
-    for path in paths {
-        let mut current = value;
-        for segment in path {
-            current = current.get(segment).ok_or_else(|| {
-                invalid_guest(format!(
-                    "certified snapshot is missing pointer '/{}'",
-                    path.join("/")
-                ))
-            })?;
-        }
-        match current {
-            serde_json::Value::Null => return Ok(None),
-            serde_json::Value::String(value) => components.push(value.clone()),
-            _ => {
-                return Err(invalid_guest(
-                    "certified key components must be strings or null",
-                ));
-            }
-        }
-    }
-    Ok(Some(components))
-}
-
-struct CertifiedPacketReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> CertifiedPacketReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn bytes(&mut self, length: usize) -> Result<&'a [u8], LixError> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .filter(|end| *end <= self.bytes.len())
-            .ok_or_else(|| invalid_guest("certified packet ended early"))?;
-        let value = &self.bytes[self.offset..end];
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, LixError> {
-        Ok(self.bytes(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, LixError> {
-        Ok(u32::from_le_bytes(
-            self.bytes(4)?.try_into().expect("fixed packet u32"),
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64, LixError> {
-        Ok(u64::from_le_bytes(
-            self.bytes(8)?.try_into().expect("fixed packet u64"),
-        ))
-    }
-
-    fn text(&mut self) -> Result<&'a str, LixError> {
-        let length = self.u32()? as usize;
-        std::str::from_utf8(self.bytes(length)?)
-            .map_err(|error| invalid_guest(format!("certified packet text is invalid: {error}")))
-    }
-
-    fn inline_blob(&mut self) -> Result<&'a [u8], LixError> {
-        if self.u8()? != 0 {
-            return Err(invalid_guest("certified packet snapshot is not inline"));
-        }
-        let length = self.u32()? as usize;
-        self.bytes(length)
-    }
-
-    fn finished(&self) -> bool {
-        self.offset == self.bytes.len()
-    }
-
-    fn finish(&self) -> Result<(), LixError> {
-        if self.finished() {
-            Ok(())
-        } else {
-            Err(invalid_guest("certified packet record has trailing bytes"))
-        }
-    }
-}
-
 /// Drains and validates every change before returning any proposed semantic
 /// state to transaction code. Validation of a page's key shape, attachment
 /// count, and aggregate budget happens before the first attachment method is
@@ -2331,12 +1173,12 @@ impl<'a> CertifiedPacketReader<'a> {
 pub(crate) async fn drain_file_transition_changes(
     actor: &mut dyn WasmComponentActor,
     transition: WasmFileTransition,
-    creates: crate::plugin::runtime::WasmCreateContext,
+    _creates: crate::plugin::runtime::WasmCreateContext,
     schemas: &SchemaAllowlist,
     limits: WasmTransitionLimits,
 ) -> Result<ValidatedFileTransition, LixError> {
     let transition_handle = transition.transition;
-    match drain_file_transition_changes_inner(actor, transition, creates, schemas, limits).await {
+    match drain_file_transition_changes_inner(actor, transition, schemas, limits).await {
         Ok(validated) => Ok(validated),
         Err(error) => Err(cleanup_rejected_transition(actor, transition_handle, error).await),
     }
@@ -2345,7 +1187,6 @@ pub(crate) async fn drain_file_transition_changes(
 async fn drain_file_transition_changes_inner(
     actor: &mut dyn WasmComponentActor,
     transition: WasmFileTransition,
-    creates: crate::plugin::runtime::WasmCreateContext,
     schemas: &SchemaAllowlist,
     limits: WasmTransitionLimits,
 ) -> Result<ValidatedFileTransition, LixError> {
@@ -2370,6 +1211,7 @@ async fn drain_file_transition_changes_inner(
             validator.accept_eof();
             break;
         };
+        let validation_started = std::time::Instant::now();
         tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.plugin_drain_prevalidate_page"
@@ -2381,150 +1223,50 @@ async fn drain_file_transition_changes_inner(
                     error.message
                 ))
             })?;
-            prevalidate_change_page(&page, schemas, &mut budget)
+            prevalidate_change_page(&page, schemas, &mut budget, &mut local_counters)
         })?;
+        local_counters.typed_row_schema_validation_nanos = local_counters
+            .typed_row_schema_validation_nanos
+            .saturating_add(
+                u64::try_from(validation_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
         local_counters.packet_pages = local_counters.packet_pages.saturating_add(1);
         local_counters.packet_records = local_counters
             .packet_records
             .saturating_add(page.changes.changes.len() as u64);
 
-        let page_row_count = page.changes.changes.len();
-        let page_snapshot_count = page
-            .changes
-            .changes
-            .iter()
-            .filter(|change| !matches!(change, WasmRowChange::Delete(_)))
-            .count();
-        let page_start = changes.len();
-        changes.reserve(page_row_count);
-        let mut snapshots = CanonicalJsonBatchBuilder::with_row_capacity(page_snapshot_count);
-        let outputs = page.outputs;
-        async {
-            let mut page_snapshot_ordinal = 0usize;
-            for change in page.changes.changes {
-                let resolved = match change {
-                    WasmRowChange::Create {
-                        schema_key,
-                        local_ref,
-                        mut resolved_key,
-                        snapshot_content,
-                    } => {
-                        let snapshot = resolve_guest_bytes(
-                            actor,
-                            transition.transition,
-                            outputs,
-                            snapshot_content,
-                            &mut budget,
-                            &mut local_counters,
-                        )
-                        .await?;
-                        let snapshot_row = match &resolved_key {
-                            Some(key) => snapshots.push_plugin(snapshot, key, schemas)?,
-                            None => {
-                                let plan = schemas.schema_plan(&schema_key).ok_or_else(|| {
-                                    invalid_guest(format!(
-                                        "created schema '{schema_key}' has no validation plan"
-                                    ))
-                                })?;
-                                let [primary_key_path] =
-                                    plan.primary_key.as_deref().unwrap_or_default()
-                                else {
-                                    return Err(invalid_guest(
-                                        "created rows require exactly one generated primary-key field",
-                                    ));
-                                };
-                                let id = creates.component(local_ref)?;
-                                crate::plugin::wire::validate_generated_id(
-                                    &snapshot,
-                                    primary_key_path,
-                                    &id,
-                                )
-                                .map_err(|error| {
-                                    invalid_guest(format!(
-                                        "created row identity is invalid: {error}"
-                                    ))
-                                })?;
-                                let key = WasmRowKey::from_owned_parts(
-                                    schema_key.clone(),
-                                    vec![id],
-                                );
-                                let row = snapshots.push_plugin(snapshot, &key, schemas)?;
-                                resolved_key = Some(key);
-                                row
-                            }
-                        };
-                        debug_assert_eq!(snapshot_row, page_snapshot_ordinal);
-                        page_snapshot_ordinal += 1;
-                        WasmRowChange::Create {
-                            schema_key,
-                            local_ref,
-                            resolved_key,
-                            // Patched with the page-owned canonical row after
-                            // every snapshot validates.
-                            snapshot_content: WasmHostBytes::Inline(Bytes::new()),
-                        }
-                    }
-                    WasmRowChange::Delete(key) => WasmRowChange::Delete(key),
-                    WasmRowChange::Upsert { row, effect } => {
-                        let snapshot = resolve_guest_bytes(
-                            actor,
-                            transition.transition,
-                            outputs,
-                            row.snapshot_content,
-                            &mut budget,
-                            &mut local_counters,
-                        )
-                        .await?;
-                        let snapshot_row = snapshots.push_plugin(snapshot, &row.key, schemas)?;
-                        debug_assert_eq!(snapshot_row, page_snapshot_ordinal);
-                        page_snapshot_ordinal += 1;
-                        WasmRowChange::Upsert {
-                            row: WasmRow {
-                                key: row.key,
-                                // The canonical page does not exist until every
-                                // snapshot has validated. Patch this sentinel in
-                                // place after `finish`, retaining source order
-                                // without a second page-sized row vector.
-                                snapshot_content: WasmHostBytes::Inline(Bytes::new()),
-                            },
-                            effect,
-                        }
-                    }
-                };
-                changes.push(resolved);
-            }
-            debug_assert_eq!(page_snapshot_ordinal, page_snapshot_count);
-            Ok::<(), LixError>(())
-        }
-        .instrument(tracing::debug_span!(
-            target: "lix_perf",
-            "lix.perf.plugin_drain_resolve_page"
-        ))
-        .await?;
-
-        let mut canonical = snapshots.finish()?.into_iter();
-        debug_assert_eq!(changes.len() - page_start, page_row_count);
-        for change in &mut changes[page_start..] {
-            let snapshot_content = match change {
+        changes.reserve(page.changes.changes.len());
+        for change in page.changes.changes {
+            let resolved = match change {
                 WasmRowChange::Create {
-                    snapshot_content, ..
-                } => Some(snapshot_content),
-                WasmRowChange::Upsert { row, .. } => Some(&mut row.snapshot_content),
-                WasmRowChange::Delete(_) => None,
+                    schema_key,
+                    local_ref,
+                    resolved_key,
+                    payload: WasmGuestRowPayload::Typed(row),
+                } => WasmRowChange::Create {
+                    schema_key,
+                    local_ref,
+                    resolved_key,
+                    payload: WasmHostBytes::Typed(row),
+                },
+                WasmRowChange::Upsert {
+                    row:
+                        WasmRow {
+                            key,
+                            payload: WasmGuestRowPayload::Typed(row),
+                        },
+                    effect,
+                } => WasmRowChange::Upsert {
+                    row: WasmRow {
+                        key,
+                        payload: WasmHostBytes::Typed(row),
+                    },
+                    effect,
+                },
+                WasmRowChange::Delete(key) => WasmRowChange::Delete(key),
             };
-            if let Some(snapshot_content) = snapshot_content {
-                debug_assert!(matches!(
-                    snapshot_content,
-                    WasmHostBytes::Inline(bytes) if bytes.is_empty()
-                ));
-                let snapshot = canonical
-                    .next()
-                    .expect("one canonical snapshot exists for every appended write");
-                *snapshot_content = WasmHostBytes::CanonicalJson(snapshot);
-            }
+            changes.push(resolved);
         }
-        #[cfg(debug_assertions)]
-        assert!(canonical.next().is_none());
     }
 
     validate_change_cursor_key_uniqueness(&changes).map_err(|error| {
@@ -2533,8 +1275,6 @@ async fn drain_file_transition_changes_inner(
             error.message
         ))
     })?;
-    let mut certified_batches = actor.take_certified_row_batches(transition.transition);
-    validate_certified_row_batches(&mut certified_batches, schemas)?;
     let runtime_counters = actor
         .finish_transition(transition.transition)
         .instrument(tracing::debug_span!(
@@ -2545,7 +1285,6 @@ async fn drain_file_transition_changes_inner(
     Ok(ValidatedFileTransition {
         document: transition.document,
         changes: WasmRowChanges { changes },
-        certified_batches,
         replace_all_rows: transition.replace_all_rows,
         counters: merge_counter_snapshots(local_counters, runtime_counters),
     })
@@ -2577,7 +1316,7 @@ pub(crate) async fn drain_column_merge_transition_results(
             else {
                 break;
             };
-            if page.format_version != PACKET_FORMAT_V1
+            if page.format_version != CURRENT_PACKET_FORMAT
                 || page.ordinals.len() != page.results.len()
                 || page.results.is_empty()
             {
@@ -2586,7 +1325,7 @@ pub(crate) async fn drain_column_merge_transition_results(
             let has_output_refs = page.results.iter().any(|result| {
                 matches!(
                     result,
-                    WasmColumnMergeResult::Replace(Some(WasmGuestBytes::Output(_)))
+                    WasmColumnMergeResult::Replace(Some(WasmGuestColumnValue::Output(_)))
                 )
             });
             if has_output_refs != page.outputs.is_some() {
@@ -2609,17 +1348,27 @@ pub(crate) async fn drain_column_merge_transition_results(
                 let result = match result {
                     WasmColumnMergeResult::UseLww => WasmColumnMergeResult::UseLww,
                     WasmColumnMergeResult::Replace(None) => WasmColumnMergeResult::Replace(None),
-                    WasmColumnMergeResult::Replace(Some(value)) => {
-                        let value = resolve_guest_bytes(
+                    WasmColumnMergeResult::Replace(Some(WasmGuestColumnValue::Output(range))) => {
+                        let outputs = page.outputs.ok_or_else(|| {
+                            invalid_guest(
+                                "component output range is missing its page-local output table",
+                            )
+                        })?;
+                        let value = read_output_range(
                             actor,
                             transition.transition,
-                            page.outputs,
-                            value,
+                            outputs,
+                            range,
                             &mut budget,
                             &mut counters,
                         )
                         .await?;
-                        WasmColumnMergeResult::Replace(Some(WasmHostBytes::Inline(value)))
+                        let value = typed_wire::decode_value_bytes(&value).map_err(|error| {
+                            invalid_guest(format!(
+                                "column merger returned an invalid typed value: {error:?}"
+                            ))
+                        })?;
+                        WasmColumnMergeResult::Replace(Some(value))
                     }
                 };
                 results.push(result);
@@ -2911,17 +1660,25 @@ fn validate_resolved_output_against_known_delta(
 fn prevalidate_change_page(
     page: &WasmChangePage,
     schemas: &SchemaAllowlist,
-    budget: &mut OutputDrainBudget,
+    _budget: &mut OutputDrainBudget,
+    counters: &mut WasmTransitionCounters,
 ) -> Result<(), LixError> {
-    if page.format_version != PACKET_FORMAT_V1 {
+    if page.format_version != CURRENT_PACKET_FORMAT {
         return Err(invalid_guest("unsupported component change packet format"));
     }
     let mut inline_bytes = 0u64;
-    let mut output_bytes = 0u64;
-    let mut minimum_attachment_reads = 0u64;
-    let mut references = 0u32;
+    let output_bytes = 0u64;
+    let minimum_attachment_reads = 0u64;
+    let references = 0u32;
+    let mut validated_schema_key = None;
+    let mut schema_plan = None;
     for change in &page.changes.changes {
-        schemas.validate(change.schema_key())?;
+        let change_schema_key = change.schema_key();
+        if validated_schema_key != Some(change_schema_key) {
+            schemas.validate(change_schema_key)?;
+            schema_plan = schemas.schema_plan(change_schema_key);
+            validated_schema_key = Some(change_schema_key);
+        }
         if let Some(key) = change.row_key()
             && key.row_pk.is_empty()
         {
@@ -2930,39 +1687,39 @@ fn prevalidate_change_page(
             ));
         }
         let snapshot = match change {
-            WasmRowChange::Create {
-                snapshot_content, ..
-            } => Some(snapshot_content),
-            WasmRowChange::Upsert { row, .. } => Some(&row.snapshot_content),
+            WasmRowChange::Create { payload, .. } => Some(payload),
+            WasmRowChange::Upsert { row, .. } => Some(&row.payload),
             WasmRowChange::Delete(_) => None,
         };
         if let Some(snapshot) = snapshot {
             match snapshot {
-                WasmGuestBytes::Inline(bytes) => {
-                    inline_bytes =
-                        inline_bytes
-                            .checked_add(bytes.len() as u64)
-                            .ok_or_else(|| {
-                                invalid_guest("component inline snapshot bytes overflowed")
-                            })?;
-                }
-                WasmGuestBytes::Output(range) => {
-                    output_bytes = output_bytes.checked_add(range.length).ok_or_else(|| {
-                        invalid_guest("component output snapshot bytes overflowed")
-                    })?;
-                    minimum_attachment_reads = minimum_attachment_reads
-                        .checked_add(budget.minimum_attachment_reads(range.length))
-                        .ok_or_else(|| {
-                            invalid_guest("component attachment page count overflowed")
-                        })?;
-                    references = references
-                        .checked_add(1)
-                        .ok_or_else(|| invalid_guest("component output references overflowed"))?;
+                WasmGuestRowPayload::Typed(row) => {
+                    if let WasmRowChange::Upsert { row: emitted, .. } = change
+                        && (emitted.key.schema_fingerprint != row.schema_fingerprint
+                            || emitted.key.row_pk.as_ref() != row.row_pk.as_ref())
+                    {
+                        return Err(invalid_guest(
+                            "component row key does not match its typed payload identity",
+                        ));
+                    }
+                    let estimated_size = row.estimated_size();
+                    let encoded_bytes = estimated_size
+                        .checked_add(1 + 4)
+                        .ok_or_else(|| invalid_guest("typed row payload size overflowed"))?;
+                    inline_bytes = inline_bytes
+                        .checked_add(encoded_bytes)
+                        .ok_or_else(|| invalid_guest("typed row page bytes overflowed"))?;
+                    counters.typed_row_schema_validation_calls =
+                        counters.typed_row_schema_validation_calls.saturating_add(1);
+                    counters.typed_row_schema_validation_bytes = counters
+                        .typed_row_schema_validation_bytes
+                        .saturating_add(estimated_size);
+                    schemas.validate_typed_row_with_plan(change_schema_key, row, schema_plan)?;
                 }
             }
         }
     }
-    budget.preflight_cursor_page(
+    _budget.preflight_cursor_page(
         inline_bytes,
         output_bytes,
         0,
@@ -3283,6 +2040,66 @@ fn merge_counter_snapshots(
         row_output_attachment_bytes: local
             .row_output_attachment_bytes
             .max(runtime.row_output_attachment_bytes),
+        typed_row_decode_records: local
+            .typed_row_decode_records
+            .max(runtime.typed_row_decode_records),
+        typed_row_decode_bytes: local
+            .typed_row_decode_bytes
+            .max(runtime.typed_row_decode_bytes),
+        typed_row_decode_nanos: local
+            .typed_row_decode_nanos
+            .max(runtime.typed_row_decode_nanos),
+        typed_row_encode_records: local
+            .typed_row_encode_records
+            .max(runtime.typed_row_encode_records),
+        typed_row_encode_bytes: local
+            .typed_row_encode_bytes
+            .max(runtime.typed_row_encode_bytes),
+        typed_row_schema_validation_calls: local
+            .typed_row_schema_validation_calls
+            .max(runtime.typed_row_schema_validation_calls),
+        typed_row_schema_validation_bytes: local
+            .typed_row_schema_validation_bytes
+            .max(runtime.typed_row_schema_validation_bytes),
+        typed_row_schema_validation_nanos: local
+            .typed_row_schema_validation_nanos
+            .max(runtime.typed_row_schema_validation_nanos),
+        typed_transaction_validation_calls: local
+            .typed_transaction_validation_calls
+            .max(runtime.typed_transaction_validation_calls),
+        typed_transaction_validation_bytes: local
+            .typed_transaction_validation_bytes
+            .max(runtime.typed_transaction_validation_bytes),
+        row_page_callback_calls: local
+            .row_page_callback_calls
+            .max(runtime.row_page_callback_calls),
+        row_input_page_eof_callbacks: local
+            .row_input_page_eof_callbacks
+            .max(runtime.row_input_page_eof_callbacks),
+        outer_row_json_parse_calls: local
+            .outer_row_json_parse_calls
+            .max(runtime.outer_row_json_parse_calls),
+        outer_row_json_parse_bytes: local
+            .outer_row_json_parse_bytes
+            .max(runtime.outer_row_json_parse_bytes),
+        outer_row_json_serialize_calls: local
+            .outer_row_json_serialize_calls
+            .max(runtime.outer_row_json_serialize_calls),
+        outer_row_json_serialize_bytes: local
+            .outer_row_json_serialize_bytes
+            .max(runtime.outer_row_json_serialize_bytes),
+        outer_row_json_canonicalize_calls: local
+            .outer_row_json_canonicalize_calls
+            .max(runtime.outer_row_json_canonicalize_calls),
+        outer_row_json_canonicalize_bytes: local
+            .outer_row_json_canonicalize_bytes
+            .max(runtime.outer_row_json_canonicalize_bytes),
+        outer_row_json_dom_fallback_calls: local
+            .outer_row_json_dom_fallback_calls
+            .max(runtime.outer_row_json_dom_fallback_calls),
+        outer_row_json_dom_fallback_bytes: local
+            .outer_row_json_dom_fallback_bytes
+            .max(runtime.outer_row_json_dom_fallback_bytes),
         component_import_calls: local
             .component_import_calls
             .max(runtime.component_import_calls),
@@ -3354,16 +2171,13 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
 
     use async_trait::async_trait;
+    use serde_json::json;
 
     use super::*;
     use crate::plugin::runtime::{
         WasmChangeCursorHandle, WasmChangeEffect, WasmCreateContext, WasmEditCursorHandle,
         WasmOpenFileInput, WasmOpenRowsInput, WasmOutputSplice,
     };
-
-    const UUID_A: &str = "019a0000-0000-7000-8000-000000000001";
-    const UUID_B: &str = "019a0000-0000-7000-8000-000000000002";
-    const UUID_C: &str = "019a0000-0000-7000-8000-000000000003";
 
     fn test_creates() -> WasmCreateContext {
         WasmCreateContext {
@@ -3373,35 +2187,117 @@ mod tests {
     }
 
     fn key(id: &str) -> WasmRowKey {
-        WasmRowKey::from_owned_parts("csv_row", vec![id.to_owned()])
+        WasmRowKey::from_typed_parts(
+            "csv_row",
+            [0; 32],
+            vec![lix_schema::Value::Text(id.to_owned())],
+        )
+        .unwrap()
     }
 
     fn host_row(id: &str) -> WasmHostRow {
+        let id = id.to_owned();
         WasmRow {
-            key: key(id),
-            snapshot_content: WasmHostBytes::Inline(
-                format!(r#"{{"cells":[],"id":"{id}","order_key":"a"}}"#)
-                    .into_bytes()
-                    .into(),
-            ),
+            key: key(&id),
+            payload: WasmHostBytes::Typed(Arc::new(WasmTypedRow {
+                schema_fingerprint: [0; 32],
+                row_pk: vec![lix_schema::Value::Text(id.clone())].into(),
+                row: lix_schema::Row::from([
+                    (
+                        "cells".to_owned(),
+                        lix_schema::Value::Jsonb(serde_json::Value::Array(Vec::new()).into()),
+                    ),
+                    ("id".to_owned(), lix_schema::Value::Text(id)),
+                    (
+                        "order_key".to_owned(),
+                        lix_schema::Value::Text("a".to_owned()),
+                    ),
+                ]),
+                native_payload: std::sync::OnceLock::new(),
+                boundary_create_validation: std::sync::OnceLock::new(),
+            })),
+        }
+    }
+
+    fn host_row_for_schema(id: &str, schema_key: &str, fingerprint: [u8; 32]) -> WasmHostRow {
+        let mut row = host_row(id);
+        row.key.schema_key = schema_key.into();
+        row.key.schema_fingerprint = fingerprint;
+        let WasmHostBytes::Typed(payload) = &mut row.payload;
+        Arc::make_mut(payload).schema_fingerprint = fingerprint;
+        row
+    }
+
+    fn guest_row(id: &str) -> WasmGuestRowPayload {
+        match host_row(id).payload {
+            WasmHostBytes::Typed(row) => WasmGuestRowPayload::Typed(row),
         }
     }
 
     #[test]
-    fn compressed_host_certified_packet_page_roundtrips() {
-        let packet = vec![b'x'; 32 * 1024];
-        let encoded = finish_host_certified_packet_page(packet.clone(), 7, 11, true).unwrap();
-        let first = u32::from_le_bytes(encoded[..4].try_into().unwrap());
-        let last = u32::from_le_bytes(encoded[4..8].try_into().unwrap());
-        let uncompressed_len = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
-        let compressed = &encoded[12..];
-        assert_eq!((first, last), (7, 11));
-        assert_eq!(uncompressed_len, packet.len());
-        assert!(compressed.len() < packet.len());
-        assert_eq!(
-            crate::compression::decompress_zstd(compressed, uncompressed_len).unwrap(),
-            packet
+    fn catalog_boundary_validation_certifies_only_fully_validated_native_rows() {
+        let schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "native_row",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "body", "type": "jsonb", "nullable": false }
+            ],
+            "primary_key": ["id"]
+        });
+        let catalog = Arc::new(
+            CatalogSnapshot::from_visible_schemas(&[schema])
+                .expect("native boundary test catalog should build"),
         );
+        let fingerprint = catalog
+            .plan_for_key("native_row")
+            .expect("native row schema should resolve")
+            .1
+            .fingerprint()
+            .bytes();
+        let allowlist = SchemaAllowlist::from_catalog(&["native_row".to_owned()], catalog)
+            .expect("native boundary allowlist should build");
+        let row = WasmTypedRow {
+            schema_fingerprint: fingerprint,
+            row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+            row: lix_schema::Row::from([
+                (
+                    "body".to_owned(),
+                    lix_schema::Value::Jsonb(json!({ "value": true }).into()),
+                ),
+                ("id".to_owned(), lix_schema::Value::Text("row-1".to_owned())),
+            ]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        };
+
+        assert!(!row.boundary_validation_certified());
+        allowlist
+            .validate_typed_row("native_row", &row)
+            .expect("complete native row should validate");
+        assert!(row.boundary_validation_certified());
+        assert!(
+            !row.clone().boundary_validation_certified(),
+            "cloning a row owner must not copy its boundary certificate"
+        );
+    }
+
+    #[test]
+    fn durable_encoding_does_not_forge_a_boundary_validation_certificate() {
+        let row = WasmTypedRow {
+            schema_fingerprint: [7; 32],
+            row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+            row: lix_schema::Row::from([(
+                "id".to_owned(),
+                lix_schema::Value::Text("row-1".to_owned()),
+            )]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        };
+
+        row.durable_payload()
+            .expect("ordinary durable encoding should succeed");
+        assert!(!row.boundary_validation_certified());
     }
 
     #[test]
@@ -3659,410 +2555,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_csv_json_rejects_numbers_and_decoded_duplicate_keys() {
-        let canonical =
-            canonicalize_snapshot(r#"{"z":"\n","a":[true,null,"é"],"slash":"/"}"#.as_bytes())
-                .unwrap();
-        assert_eq!(
-            canonical,
-            r#"{"a":[true,null,"é"],"slash":"/","z":"\n"}"#.as_bytes()
-        );
-        let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(1);
-        batch
-            .push(r#"{"z":"\n","a":[true,null,"é"],"slash":"/"}"#.as_bytes())
-            .unwrap();
-        let json = batch.finish().unwrap().pop().unwrap();
-        assert_eq!(
-            json.normalized(),
-            r#"{"a":[true,null,"é"],"slash":"/","z":"\n"}"#
-        );
-        assert_eq!(json.value()["z"], "\n");
-        assert_eq!(json.value()["a"][0], true);
-
-        assert!(canonicalize_snapshot(br#"{"nested":{"n":1}}"#).is_err());
-        let duplicate = canonicalize_snapshot(br#"{"a":"x","\u0061":"y"}"#)
-            .expect_err("escaped and literal decoded keys are duplicates");
-        assert!(duplicate.message.contains("duplicate"), "{duplicate:?}");
-        assert!(canonicalize_snapshot(br#"["not","an","object"]"#).is_err());
-    }
-
-    #[test]
-    fn canonical_json_uses_exact_serde_control_escape_spelling() {
-        let canonical = canonicalize_snapshot(
-            br#"{"controls":"\b\t\n\f\r\u0001\u001f","quote":"\"","slash":"\\","solidus":"/"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            canonical,
-            br#"{"controls":"\b\t\n\f\r\u0001\u001f","quote":"\"","slash":"\\","solidus":"/"}"#
-        );
-    }
-
-    #[test]
-    fn canonical_json_rows_share_one_arena_and_validate_once() {
-        let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(2);
-        batch.push(br#"{"id":"a","value":"first"}"#).unwrap();
-        batch.push(br#"{"id":"b","value":"second"}"#).unwrap();
-        let rows = batch.finish().unwrap();
-
-        assert_eq!(rows.len(), 2);
-        assert!(rows[0].shares_batch_with(&rows[1]));
-        assert_eq!(rows[0].row_index(), 0);
-        assert_eq!(rows[1].row_index(), 1);
-        assert_eq!(rows[0].batch_row_count(), 2);
-        assert_eq!(
-            rows[0].batch_arena_len(),
-            rows[0].normalized().len() + rows[1].normalized().len()
-        );
-        assert_eq!(rows[0].validation_counts(), (2, 2));
-        assert_eq!(rows[0].batch_arena_allocation_count(), 1);
-        assert_eq!(rows[0].value()["id"], "a");
-        assert_eq!(rows[1].value()["id"], "b");
-    }
-
-    #[test]
-    fn certified_builder_uses_sub_64k_parallel_columns_for_a_cursor_page() {
-        const PAGE_ROWS: usize = 1_024;
-        const LARGE_ALLOCATION_BYTES: usize = 64 * 1_024;
-
-        let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(PAGE_ROWS);
-        batch.reserve_decoded_column();
-        batch.reserve_certified_columns();
-
-        assert_eq!(size_of::<CanonicalJsonBatchRowKind>(), 1);
-        assert!(
-            batch.row_kinds.capacity() * size_of::<CanonicalJsonBatchRowKind>()
-                < LARGE_ALLOCATION_BYTES
-        );
-        assert!(
-            batch.decoded_values.capacity() * size_of::<serde_json::Value>()
-                < LARGE_ALLOCATION_BYTES
-        );
-        assert!(
-            batch.certified_normalized.capacity() * size_of::<SharedStr>() < LARGE_ALLOCATION_BYTES
-        );
-        assert!(batch.certified_row_pks.capacity() * size_of::<RowPk>() < LARGE_ALLOCATION_BYTES);
-        assert!(
-            batch.schema_fingerprint_indices.capacity() * size_of::<u32>() < LARGE_ALLOCATION_BYTES
-        );
-        assert!(batch.normalized_ends.capacity() * size_of::<u32>() < LARGE_ALLOCATION_BYTES);
-    }
-
-    #[test]
-    fn certified_plugin_rows_retain_source_buffers_without_an_arena() {
-        let schema = serde_json::from_str(include_str!(
-            "../../../../../plugins/csv/schema/csv_row.json"
-        ))
-        .expect("CSV row schema");
-        let catalog =
-            CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
-                crate::domain::Domain::schema_catalog("main", false),
-                crate::schema::SchemaKey::new("csv_row"),
-                schema,
-            )])
-            .expect("CSV row catalog");
-        let schemas = SchemaAllowlist::from_catalog(&["csv_row".to_owned()], Arc::new(catalog))
-            .expect("CSV allowlist");
-
-        let first = Bytes::from(
-            br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
-                .as_slice()
-                .to_vec(),
-        );
-        let second = Bytes::from(
-            br#"{"cells":["b"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"03"}"#
-                .as_slice()
-                .to_vec(),
-        );
-        let first_ptr = first.as_ptr();
-        let second_ptr = second.as_ptr();
-        let normalized_len = first.len() + second.len();
-        let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(2);
-        batch
-            .push_plugin(
-                first,
-                &WasmRowKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]),
-                &schemas,
-            )
-            .expect("first canonical row");
-        batch
-            .push_plugin(
-                second,
-                &WasmRowKey::from_owned_parts("csv_row", vec![UUID_B.to_owned()]),
-                &schemas,
-            )
-            .expect("second canonical row");
-        let rows = batch.finish().expect("certified canonical batch");
-
-        assert_eq!(rows.len(), 2);
-        assert!(rows[0].shares_batch_with(&rows[1]));
-        assert_eq!(rows[0].row_index(), 0);
-        assert_eq!(rows[1].row_index(), 1);
-        assert_eq!(rows[0].batch_row_count(), 2);
-        assert_eq!(rows[0].batch_arena_len(), normalized_len);
-        assert_eq!(rows[0].batch_arena_allocation_count(), 0);
-        assert_eq!(rows[0].validation_counts(), (2, 0));
-        assert_eq!(rows[0].batch_decoded_value_count(), 0);
-        assert_eq!(rows[0].batch_certified_schema_count(), 1);
-        assert!(rows.iter().all(|row| row.certificate().is_some()));
-        assert_eq!(
-            rows[0].certificate().expect("first certificate").row_pk(),
-            &RowPk::uuid_from_canonical(UUID_A).expect("canonical UUID")
-        );
-        assert_eq!(
-            rows[1].certificate().expect("second certificate").row_pk(),
-            &RowPk::uuid_from_canonical(UUID_B).expect("canonical UUID")
-        );
-        assert_eq!(
-            rows[0].normalized(),
-            r#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
-        );
-        assert_eq!(
-            rows[1].normalized(),
-            r#"{"cells":["b"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"03"}"#
-        );
-        assert_eq!(rows[0].normalized_shared().as_bytes().as_ptr(), first_ptr);
-        assert_eq!(rows[1].normalized_shared().as_bytes().as_ptr(), second_ptr);
-    }
-
-    #[test]
-    fn canonical_plugin_rows_skip_dom_and_share_the_normalized_arena() {
-        let schema = serde_json::from_str(include_str!(
-            "../../../../../plugins/csv/schema/csv_row.json"
-        ))
-        .expect("CSV row schema");
-        let catalog =
-            CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
-                crate::domain::Domain::schema_catalog("main", false),
-                crate::schema::SchemaKey::new("csv_row"),
-                schema,
-            )])
-            .expect("CSV row catalog");
-        let schemas = SchemaAllowlist::from_catalog(&["csv_row".to_owned()], Arc::new(catalog))
-            .expect("CSV allowlist");
-        let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(2);
-        batch
-            .push_plugin(
-                Bytes::from_static(
-                    br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
-                ),
-                &WasmRowKey::from_owned_parts(
-                    "csv_row",
-                    vec![UUID_A.to_owned()],
-                ),
-                &schemas,
-            )
-            .expect("canonical row");
-        batch
-            .push_plugin(
-                Bytes::from_static(
-                    br#"{"id":"019a0000-0000-7000-8000-000000000002","order_key":"03","cells":["b"]}"#,
-                ),
-                &WasmRowKey::from_owned_parts(
-                    "csv_row",
-                    vec![UUID_B.to_owned()],
-                ),
-                &schemas,
-            )
-            .expect("compatibility row");
-        let rows = batch.finish().expect("mixed canonical batch");
-
-        assert!(rows[0].certificate().is_some());
-        assert!(rows[1].certificate().is_some());
-        assert_eq!(rows[0].batch_decoded_value_count(), 0);
-        assert_eq!(rows[0].validation_counts(), (2, 1));
-        assert_eq!(rows[0].batch_arena_allocation_count(), 1);
-        assert!(rows[0].shares_batch_with(&rows[1]));
-        assert_eq!(
-            rows[0].normalized(),
-            r#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
-        );
-        assert_eq!(
-            rows[1].normalized(),
-            r#"{"cells":["b"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"03"}"#
-        );
-    }
-
-    #[test]
-    fn plugin_row_parser_counts_one_pass_for_canonical_compatibility_and_invalid_rows() {
-        let schema = serde_json::from_str(include_str!(
-            "../../../../../plugins/csv/schema/csv_row.json"
-        ))
-        .expect("CSV row schema");
-        let catalog =
-            CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
-                crate::domain::Domain::schema_catalog("main", false),
-                crate::schema::SchemaKey::new("csv_row"),
-                schema,
-            )])
-            .expect("CSV row catalog");
-        let schemas = SchemaAllowlist::from_catalog(&["csv_row".to_owned()], Arc::new(catalog))
-            .expect("CSV allowlist");
-
-        let mut canonical = CanonicalJsonBatchBuilder::with_row_capacity(1);
-        canonical
-            .push_plugin(
-                Bytes::from_static(
-                    br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
-                ),
-                &WasmRowKey::from_owned_parts(
-                    "csv_row",
-                    vec![UUID_A.to_owned()],
-                ),
-                &schemas,
-            )
-            .expect("canonical row");
-        let canonical = canonical.finish().expect("canonical batch");
-        assert_eq!(canonical[0].validation_counts(), (1, 0));
-        assert_eq!(canonical[0].batch_arena_allocation_count(), 0);
-
-        let mut compatibility = CanonicalJsonBatchBuilder::with_row_capacity(1);
-        compatibility
-            .push_plugin(
-                Bytes::from_static(
-                    br#" { "id":"019a0000-0000-7000-8000-000000000002", "order_key":"03", "cells":["b"] } "#,
-                ),
-                &WasmRowKey::from_owned_parts(
-                    "csv_row",
-                    vec![UUID_B.to_owned()],
-                ),
-                &schemas,
-            )
-            .expect("compatibility row");
-        let compatibility = compatibility.finish().expect("compatibility batch");
-        assert_eq!(compatibility[0].validation_counts(), (1, 1));
-        assert_eq!(compatibility[0].batch_decoded_value_count(), 0);
-        assert!(compatibility[0].certificate().is_some());
-        assert_eq!(
-            compatibility[0].normalized(),
-            r#"{"cells":["b"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"03"}"#
-        );
-
-        let mut invalid = CanonicalJsonBatchBuilder::with_row_capacity(1);
-        let error = invalid
-            .push_plugin(
-                Bytes::from_static(
-                    br#"{"cells":[1],"id":"019a0000-0000-7000-8000-000000000003","order_key":"05"}"#,
-                ),
-                &WasmRowKey::from_owned_parts(
-                    "csv_row",
-                    vec![UUID_C.to_owned()],
-                ),
-                &schemas,
-            )
-            .expect_err("number-bearing plugin row must fail");
-        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-        assert_eq!(invalid.parse_count, 1);
-        assert_eq!(invalid.serialize_count, 0);
-        assert!(invalid.row_kinds.is_empty());
-    }
-
-    #[test]
-    fn streaming_plugin_parser_matches_dom_canonicalization_for_compatibility_corpus() {
-        let row_schema = serde_json::from_str(include_str!(
-            "../../../../../plugins/csv/schema/csv_row.json"
-        ))
-        .expect("CSV row schema");
-        let table_schema = serde_json::from_str(include_str!(
-            "../../../../../plugins/csv/schema/csv_table.json"
-        ))
-        .expect("CSV table schema");
-        let catalog = CatalogSnapshot::from_schema_facts(&[
-            crate::catalog::SchemaCatalogFact::new(
-                crate::domain::Domain::schema_catalog("main", false),
-                crate::schema::SchemaKey::new("csv_row"),
-                row_schema,
-            ),
-            crate::catalog::SchemaCatalogFact::new(
-                crate::domain::Domain::schema_catalog("main", false),
-                crate::schema::SchemaKey::new("csv_table"),
-                table_schema,
-            ),
-        ])
-        .expect("CSV catalog");
-        let schemas = SchemaAllowlist::from_catalog(
-            &["csv_row".to_owned(), "csv_table".to_owned()],
-            Arc::new(catalog),
-        )
-        .expect("CSV allowlist");
-
-        let valid = [
-            (
-                br#" { "id":"019a0000-0000-7000-8000-000000000001", "order_key":"01", "cells":[ "a", "b" ] } "#.as_slice(),
-                WasmRowKey::from_owned_parts(
-                    "csv_row",
-                    vec![UUID_A.to_owned()],
-                ),
-            ),
-            (
-                br#"{"cells":["\uD83D\uDE00","line\u000Abreak"],"\u0069d":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
-                    .as_slice(),
-                WasmRowKey::from_owned_parts(
-                    "csv_row",
-                    vec![UUID_A.to_owned()],
-                ),
-            ),
-            (
-                br#" { "id":"root", "dialect": { "terminator":"\u000A", "quote":"\u0022", "\u0064elimiter":"," } } "#
-                    .as_slice(),
-                WasmRowKey::from_owned_parts(
-                    "csv_table",
-                    vec!["root".to_owned()],
-                ),
-            ),
-        ];
-        for (input, key) in valid {
-            let expected = canonicalize_snapshot(input).expect("DOM compatibility oracle");
-            let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(1);
-            batch
-                .push_plugin(Bytes::copy_from_slice(input), &key, &schemas)
-                .expect("streaming compatibility row");
-            let rows = batch.finish().expect("streaming compatibility batch");
-
-            assert_eq!(rows[0].normalized().as_bytes(), expected);
-            assert_eq!(rows[0].validation_counts(), (1, 1));
-            assert_eq!(rows[0].batch_decoded_value_count(), 0);
-            assert_eq!(
-                rows[0]
-                    .certificate()
-                    .expect("streaming row certificate")
-                    .row_pk()
-                    .clone(),
-                if key.schema_key == "csv_row" {
-                    RowPk::uuid_from_canonical(&key.row_pk[0]).expect("canonical UUID")
-                } else {
-                    RowPk::single(key.row_pk[0].as_str())
-                }
-            );
-        }
-
-        for input in [
-            br#"{"id":"019a0000-0000-7000-8000-000000000001","order_key":"01","\u0069d":"019a0000-0000-7000-8000-000000000001","cells":["a"]}"#.as_slice(),
-            br#"{"cells":["\x"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
-            br#"{"cells":["\uD83D"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
-            br#"{"cells":["\uDE00"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
-        ] {
-            let dom_error =
-                canonicalize_snapshot(input).expect_err("DOM oracle must reject hostile input");
-            let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(1);
-            let streaming_error = batch
-                .push_plugin(
-                    Bytes::copy_from_slice(input),
-                    &WasmRowKey::from_owned_parts(
-                        "csv_row",
-                        vec![UUID_A.to_owned()],
-                    ),
-                    &schemas,
-                )
-                .expect_err("streaming parser must reject hostile input");
-            assert_eq!(streaming_error.code, dom_error.code, "{input:?}");
-            assert_eq!(batch.parse_count, 1);
-            assert_eq!(batch.serialize_count, 0);
-            assert!(batch.row_kinds.is_empty());
-        }
-    }
-
-    #[test]
     fn vec_row_sources_page_without_splitting_records() {
         let first = host_row("a");
         let first_page_bytes = encoded_row_record_bytes(&first).unwrap() + 4;
@@ -4073,12 +2565,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first_page.rows.len(), 1);
-        assert_eq!(first_page.rows[0].key.row_pk[0], "a");
+        assert_eq!(
+            first_page.rows[0].key.row_pk[0],
+            lix_schema::Value::Text("a".to_owned())
+        );
         let second_page = source
             .next_page(WasmTransitionLimits::default().max_page_bytes)
             .unwrap()
             .unwrap();
-        assert_eq!(second_page.rows[0].key.row_pk[0], "b");
+        assert_eq!(
+            second_page.rows[0].key.row_pk[0],
+            lix_schema::Value::Text("b".to_owned())
+        );
         assert!(source.next_page(1).unwrap().is_none());
         assert!(source.next_page(1).unwrap().is_none());
 
@@ -4102,6 +2600,24 @@ mod tests {
             .expect("one row page");
 
         assert_eq!(page.rows.len(), 1);
+    }
+
+    #[test]
+    fn vec_row_source_splits_pages_at_schema_and_fingerprint_boundaries() {
+        let limits = WasmTransitionLimits::default();
+        let rows = vec![
+            host_row_for_schema("a", "csv_row", [0; 32]),
+            host_row_for_schema("b", "csv_row", [1; 32]),
+            host_row_for_schema("c", "json_node", [2; 32]),
+        ];
+        let mut source = VecRowSource::new(rows, limits).unwrap();
+
+        for expected_fingerprint in [[0; 32], [1; 32], [2; 32]] {
+            let page = source.next_page(limits.max_page_bytes).unwrap().unwrap();
+            assert_eq!(page.rows.len(), 1);
+            assert_eq!(page.rows[0].key.schema_fingerprint, expected_fingerprint);
+        }
+        assert!(source.next_page(limits.max_page_bytes).unwrap().is_none());
     }
 
     #[test]
@@ -4139,6 +2655,29 @@ mod tests {
             1
         );
         assert!(source.next_page(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn vec_change_source_splits_pages_at_schema_and_fingerprint_boundaries() {
+        let limits = WasmTransitionLimits::default();
+        let changes = WasmRowChanges {
+            changes: vec![
+                WasmRowChange::Delete(host_row_for_schema("a", "csv_row", [0; 32]).key),
+                WasmRowChange::Delete(host_row_for_schema("b", "csv_row", [1; 32]).key),
+                WasmRowChange::Delete(host_row_for_schema("c", "json_node", [2; 32]).key),
+            ],
+        };
+        let mut source = VecRowChangeSource::new(changes, limits).unwrap();
+
+        for expected_fingerprint in [[0; 32], [1; 32], [2; 32]] {
+            let page = source.next_page(limits.max_page_bytes).unwrap().unwrap();
+            assert_eq!(page.changes.len(), 1);
+            assert_eq!(
+                page.changes[0].row_key().unwrap().schema_fingerprint,
+                expected_fingerprint
+            );
+        }
+        assert!(source.next_page(limits.max_page_bytes).unwrap().is_none());
     }
 
     struct FakeActor {
@@ -4304,235 +2843,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn change_drain_validates_before_reading_and_canonicalizes_attachments() {
-        let outputs = WasmByteOutputsHandle(7);
-        let snapshot = br#"{"order_key":"a","id":"row","cells":[]}"#.to_vec();
-        let second_snapshot = br#"{"order_key":"b","id":"row2","cells":[]}"#.to_vec();
-        let page = WasmChangePage {
-            format_version: PACKET_FORMAT_V1,
-            changes: WasmRowChanges {
-                changes: vec![
-                    WasmRowChange::Upsert {
-                        row: WasmRow {
-                            key: key("row"),
-                            snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
-                                index: 0,
-                                offset: 0,
-                                length: snapshot.len() as u64,
-                            }),
-                        },
-                        effect: WasmChangeEffect::Content,
-                    },
-                    WasmRowChange::Upsert {
-                        row: WasmRow {
-                            key: key("row2"),
-                            snapshot_content: WasmGuestBytes::Inline(second_snapshot.into()),
-                        },
-                        effect: WasmChangeEffect::Content,
-                    },
-                ],
-            },
-            outputs: Some(outputs),
-        };
-        let mut actor = FakeActor {
-            change_pages: [page].into(),
-            max_read_prefix: 7,
-            runtime_counters: WasmTransitionCounters {
-                source_read_calls: 2,
-                ..WasmTransitionCounters::default()
-            },
-            ..FakeActor::default()
-        };
-        actor.outputs.insert((outputs, 0), snapshot);
-        let transition = WasmFileTransition {
-            transition: WasmTransitionHandle(1),
-            document: WasmDocumentHandle(2),
-            changes: WasmChangeCursorHandle(3),
-            replace_all_rows: false,
-        };
-        let schemas = SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
-
-        let drained = drain_file_transition_changes(
-            &mut actor,
-            transition,
-            test_creates(),
-            &schemas,
-            WasmTransitionLimits::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(drained.document, WasmDocumentHandle(2));
-        let WasmRowChange::Upsert { row, .. } = &drained.changes.changes[0] else {
-            panic!("expected upsert")
-        };
-        let WasmHostBytes::CanonicalJson(json) = &row.snapshot_content else {
-            panic!("resolved snapshots must retain parsed canonical JSON")
-        };
-        assert_eq!(
-            json.normalized(),
-            r#"{"cells":[],"id":"row","order_key":"a"}"#
-        );
-        assert_eq!(json.value()["id"], "row");
-        let WasmRowChange::Upsert { row, .. } = &drained.changes.changes[1] else {
-            panic!("expected second upsert")
-        };
-        let WasmHostBytes::CanonicalJson(second_json) = &row.snapshot_content else {
-            panic!("resolved snapshots must retain parsed canonical JSON")
-        };
-        assert!(json.shares_batch_with(second_json));
-        assert_eq!(json.validation_counts(), (2, 2));
-        assert_eq!(json.batch_arena_allocation_count(), 1);
-        assert!(drained.counters.attachment_reads > 1);
-        assert_eq!(drained.counters.source_read_calls, 2);
-        assert!(actor.finished);
-    }
-
-    #[tokio::test]
-    async fn change_drain_bounds_canonical_arenas_to_cursor_pages() {
-        let page = |id: &str| WasmChangePage {
-            format_version: PACKET_FORMAT_V1,
-            changes: WasmRowChanges {
-                changes: vec![WasmRowChange::Upsert {
-                    row: WasmRow {
-                        key: key(id),
-                        snapshot_content: WasmGuestBytes::Inline(
-                            format!(r#"{{"id":"{id}"}}"#).into_bytes().into(),
-                        ),
-                    },
-                    effect: WasmChangeEffect::Content,
-                }],
-            },
-            outputs: None,
-        };
-        let mut actor = FakeActor {
-            change_pages: [page("a"), page("b")].into(),
-            ..FakeActor::default()
-        };
-        let transition = WasmFileTransition {
-            transition: WasmTransitionHandle(11),
-            document: WasmDocumentHandle(12),
-            changes: WasmChangeCursorHandle(13),
-            replace_all_rows: false,
-        };
-        let schemas = SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
-
-        let drained = drain_file_transition_changes(
-            &mut actor,
-            transition,
-            test_creates(),
-            &schemas,
-            WasmTransitionLimits::default(),
-        )
-        .await
-        .unwrap();
-        let rows = drained
-            .changes
-            .changes
-            .iter()
-            .map(|change| match change {
-                WasmRowChange::Upsert {
-                    row:
-                        WasmRow {
-                            snapshot_content: WasmHostBytes::CanonicalJson(json),
-                            ..
-                        },
-                    ..
-                } => json,
-                _ => panic!("test pages contain only canonical upserts"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 2);
-        assert!(!rows[0].shares_batch_with(rows[1]));
-        assert_eq!(rows[0].batch_row_count(), 1);
-        assert_eq!(rows[1].batch_row_count(), 1);
-        assert_eq!(rows[0].validation_counts(), (1, 1));
-        assert_eq!(rows[1].validation_counts(), (1, 1));
-        assert_eq!(rows[0].batch_arena_allocation_count(), 1);
-        assert_eq!(rows[1].batch_arena_allocation_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn change_drain_patches_only_appended_page_ranges_in_source_order() {
-        let upsert = |id: &str| WasmRowChange::Upsert {
-            row: WasmRow {
-                key: key(id),
-                snapshot_content: WasmGuestBytes::Inline(
-                    format!(r#"{{"id":"{id}"}}"#).into_bytes().into(),
-                ),
-            },
-            effect: WasmChangeEffect::Content,
-        };
-        let page = |changes| WasmChangePage {
-            format_version: PACKET_FORMAT_V1,
-            changes: WasmRowChanges { changes },
-            outputs: None,
-        };
-        let mut actor = FakeActor {
-            change_pages: [
-                page(vec![
-                    upsert("a"),
-                    WasmRowChange::Delete(key("gone-a")),
-                    upsert("b"),
-                ]),
-                page(vec![WasmRowChange::Delete(key("gone-b")), upsert("c")]),
-            ]
-            .into(),
-            ..FakeActor::default()
-        };
-        let transition = WasmFileTransition {
-            transition: WasmTransitionHandle(14),
-            document: WasmDocumentHandle(15),
-            changes: WasmChangeCursorHandle(16),
-            replace_all_rows: false,
-        };
-        let schemas = SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
-
-        let drained = drain_file_transition_changes(
-            &mut actor,
-            transition,
-            test_creates(),
-            &schemas,
-            WasmTransitionLimits::default(),
-        )
-        .await
-        .expect("interleaved rows should retain exact source order");
-        let changes = &drained.changes.changes;
-        assert_eq!(changes.len(), 5);
-        assert_eq!(changes[0].row_key().expect("row key").row_pk[0], "a");
-        assert_eq!(changes[1].row_key().expect("row key").row_pk[0], "gone-a");
-        assert_eq!(changes[2].row_key().expect("row key").row_pk[0], "b");
-        assert_eq!(changes[3].row_key().expect("row key").row_pk[0], "gone-b");
-        assert_eq!(changes[4].row_key().expect("row key").row_pk[0], "c");
-        assert!(matches!(changes[1], WasmRowChange::Delete(_)));
-        assert!(matches!(changes[3], WasmRowChange::Delete(_)));
-
-        fn canonical(change: &WasmRowChange<WasmHostBytes>) -> &WasmCanonicalJson {
-            match change {
-                WasmRowChange::Upsert {
-                    row:
-                        WasmRow {
-                            snapshot_content: WasmHostBytes::CanonicalJson(json),
-                            ..
-                        },
-                    ..
-                } => json,
-                _ => panic!("expected canonical upsert"),
-            }
-        }
-        let first = canonical(&changes[0]);
-        let second = canonical(&changes[2]);
-        let third = canonical(&changes[4]);
-        assert_eq!(first.normalized(), r#"{"id":"a"}"#);
-        assert_eq!(second.normalized(), r#"{"id":"b"}"#);
-        assert_eq!(third.normalized(), r#"{"id":"c"}"#);
-        assert!(first.shares_batch_with(second));
-        assert!(!second.shares_batch_with(third));
-    }
-
-    #[tokio::test]
     async fn change_drain_rejects_duplicate_keys_across_pages() {
         let duplicate = WasmChangePage {
-            format_version: PACKET_FORMAT_V1,
+            format_version: CURRENT_PACKET_FORMAT,
             changes: WasmRowChanges {
                 changes: vec![WasmRowChange::Delete(key("row"))],
             },
@@ -4570,29 +2883,28 @@ mod tests {
 
     #[tokio::test]
     async fn host_validation_rejection_discards_transition_and_allows_retry() {
-        let outputs = WasmByteOutputsHandle(7);
         let page = WasmChangePage {
-            format_version: PACKET_FORMAT_V1,
+            format_version: CURRENT_PACKET_FORMAT,
             changes: WasmRowChanges {
                 changes: vec![WasmRowChange::Upsert {
                     row: WasmRow {
-                        key: WasmRowKey::from_owned_parts("not_allowed", vec!["row".to_owned()]),
-                        snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
-                            index: 0,
-                            offset: 0,
-                            length: 2,
-                        }),
+                        key: WasmRowKey::from_typed_parts(
+                            "not_allowed",
+                            [0; 32],
+                            vec![lix_schema::Value::Text("row".to_owned())],
+                        )
+                        .unwrap(),
+                        payload: guest_row("row"),
                     },
                     effect: WasmChangeEffect::Content,
                 }],
             },
-            outputs: Some(outputs),
+            outputs: None,
         };
         let mut actor = FakeActor {
             change_pages: [page].into(),
             ..FakeActor::default()
         };
-        actor.outputs.insert((outputs, 0), b"{}".to_vec());
         let error = drain_file_transition_changes(
             &mut actor,
             WasmFileTransition {
@@ -4614,7 +2926,7 @@ mod tests {
         assert!(!actor.retired);
 
         actor.change_pages.push_back(WasmChangePage {
-            format_version: PACKET_FORMAT_V1,
+            format_version: CURRENT_PACKET_FORMAT,
             changes: WasmRowChanges {
                 changes: vec![WasmRowChange::Delete(key("row"))],
             },
@@ -4644,12 +2956,16 @@ mod tests {
     async fn uncertain_transition_cleanup_retires_the_actor() {
         let mut actor = FakeActor {
             change_pages: [WasmChangePage {
-                format_version: PACKET_FORMAT_V1,
+                format_version: CURRENT_PACKET_FORMAT,
                 changes: WasmRowChanges {
-                    changes: vec![WasmRowChange::Delete(WasmRowKey::from_owned_parts(
-                        "not_allowed",
-                        vec!["row".to_owned()],
-                    ))],
+                    changes: vec![WasmRowChange::Delete(
+                        WasmRowKey::from_typed_parts(
+                            "not_allowed",
+                            [0; 32],
+                            vec![lix_schema::Value::Text("row".to_owned())],
+                        )
+                        .unwrap(),
+                    )],
                 },
                 outputs: None,
             }]

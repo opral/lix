@@ -24,9 +24,9 @@ pub(crate) const MUTATION_DIRECTORY_NODE_SPACE: StorageSpace = StorageSpace::dec
     ValueSemantics::Immutable,
 );
 
-const NODE_MAGIC: &[u8] = b"LXMD1";
-const NODE_HASH_CONTEXT: &str = "lix commit mutation directory node v1";
-const ROOT_HASH_CONTEXT: &str = "lix commit mutation directory root v1";
+const NODE_MAGIC: &[u8] = b"LXMD3";
+const NODE_HASH_CONTEXT: &str = "lix commit mutation directory node v3";
+const ROOT_HASH_CONTEXT: &str = "lix commit mutation directory root v3";
 const FANOUT: usize = 128;
 
 // A pass-through counting allocator, test builds only.  It delegates every
@@ -430,6 +430,7 @@ pub(crate) mod seekable_prototype {
                 part: CommitStateMutationPart {
                     first_key,
                     last_key,
+                    content_digest: [1; 32],
                     replacement_part: None,
                 },
                 direct_row_count,
@@ -1117,6 +1118,7 @@ enum StoredEntry {
         first_key: Vec<u8>,
         #[musli(bytes)]
         last_key: Vec<u8>,
+        content_digest: [u8; 32],
         #[musli(with = storage_codec::option)]
         replacement_part: Option<super::types::StoredReplacementPart>,
         direct_row_count: u16,
@@ -1248,6 +1250,7 @@ pub(crate) fn build_bounded_mutation_directory(
         .map(|(index, part)| StoredEntry::Bounded {
             first_key: part.first_key.clone(),
             last_key: part.last_key.clone(),
+            content_digest: part.content_digest,
             replacement_part: part.replacement_part.clone(),
             direct_row_count: direct_row_counts.map_or(0, |rows| rows[index]),
         });
@@ -2510,6 +2513,7 @@ fn stored_entry(entry: &MutationDirectoryEntry) -> StoredEntry {
         } => StoredEntry::Bounded {
             first_key: part.first_key.clone(),
             last_key: part.last_key.clone(),
+            content_digest: part.content_digest,
             replacement_part: part.replacement_part.clone(),
             direct_row_count: *direct_row_count,
         },
@@ -2531,12 +2535,14 @@ fn runtime_entry(entry: StoredEntry) -> Result<MutationDirectoryEntry, LixError>
         StoredEntry::Bounded {
             first_key,
             last_key,
+            content_digest,
             replacement_part,
             direct_row_count,
         } => MutationDirectoryEntry::Bounded {
             part: CommitStateMutationPart {
                 first_key,
                 last_key,
+                content_digest,
                 replacement_part,
             },
             direct_row_count,
@@ -2659,6 +2665,7 @@ mod tests {
                 part: CommitStateMutationPart {
                     first_key,
                     last_key,
+                    content_digest: [1; 32],
                     replacement_part: None,
                 },
                 direct_row_count: 7,
@@ -2759,6 +2766,7 @@ mod tests {
                     |(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
                         first_key: first_key.clone(),
                         last_key: last_key.clone(),
+                        content_digest: [1; 32],
                         replacement_part: None,
                         direct_row_count: *direct_row_count,
                     },
@@ -2835,6 +2843,7 @@ mod tests {
                         |(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
                             first_key: first_key.clone(),
                             last_key: last_key.clone(),
+                            content_digest: [1; 32],
                             replacement_part: None,
                             direct_row_count: *direct_row_count,
                         },
@@ -2998,6 +3007,7 @@ mod tests {
                         |(first_key, last_key, direct_row_count)| StoredEntry::Bounded {
                             first_key: first_key.clone(),
                             last_key: last_key.clone(),
+                            content_digest: [1; 32],
                             replacement_part: None,
                             direct_row_count: *direct_row_count,
                         },
@@ -3059,6 +3069,7 @@ mod tests {
             part: CommitStateMutationPart {
                 first_key,
                 last_key,
+                content_digest: [1; 32],
                 replacement_part: None,
             },
             direct_row_count: 7,

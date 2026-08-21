@@ -91,6 +91,36 @@ export class BufferedOpfsWrite implements LixStorageWrite {
 		this.#stats.storageCalls += 1;
 	}
 
+	async replaceMany(
+		space: LixStorageSpace,
+		entries: LixStoragePutEntry[],
+	): Promise<void> {
+		this.#assertOpen();
+		if (
+			space.valueSemantics !== "immutable" ||
+			space.valueIntegrity === "contentAddressed"
+		) {
+			throw storageError(
+				"LIX_STORAGE_CORRUPTION",
+				"replaceMany requires an immutable non-content-addressed storage space",
+			);
+		}
+		for (const entry of entries) {
+			const id = storageKey(space.id, entry.key);
+			const staged = {
+				space,
+				key: new Uint8Array(entry.key),
+				value: new Uint8Array(entry.value),
+			};
+			this.#immutablePuts.delete(id);
+			this.#deletes.delete(id);
+			this.#puts.set(id, staged);
+			this.#stats.putEntries += 1;
+			this.#stats.writtenBytes += entry.value.byteLength;
+		}
+		this.#stats.storageCalls += 1;
+	}
+
 	async deleteMany(space: LixStorageSpace, keys: Uint8Array[]): Promise<void> {
 		this.#assertOpen();
 		for (const key of keys) {

@@ -337,36 +337,45 @@ impl FilesystemPathIndex {
             if row.schema_key() != BLOB_REF_SCHEMA_KEY || row.deleted() {
                 continue;
             }
-            let Some(snapshot_content) = row.snapshot_content().map(|content| content.as_str())
-            else {
-                continue;
-            };
-            let snapshot: serde_json::Value =
-                serde_json::from_str(snapshot_content).map_err(|error| {
-                    LixError::unknown(format!(
-                        "invalid lix_binary_blob_ref snapshot JSON: {error}"
-                    ))
-                })?;
+            let snapshot = row.snapshot_json_value()?.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "live lix_binary_blob_ref row has no payload",
+                )
+            })?;
+            let snapshot_content = snapshot.to_string();
             let id = snapshot
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
                     LixError::unknown("lix_binary_blob_ref snapshot is missing string id")
                 })?;
+            let mut owned = row.to_owned();
+            // The persistent filesystem index is an API projection boundary.
+            // Preserve a transient JSON projection for the existing eager-CAS
+            // cache without putting JSON back into durable row storage.
+            if owned.snapshot_content.is_none() {
+                owned.snapshot_content = Some(snapshot_content.into());
+            }
             blob_rows.insert(
                 FilesystemBlobRefKey::from_live_row_ref(row, id.to_string()),
-                row.to_owned(),
+                owned,
             );
         }
 
         for row in rows.iter() {
-            let Some(snapshot_content) = row.snapshot_content().map(|content| content.as_str())
-            else {
+            if row.deleted() {
                 continue;
-            };
+            }
+            let snapshot = row.snapshot_json_value()?.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("live filesystem row '{}' has no payload", row.schema_key()),
+                )
+            })?;
             match row.schema_key() {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                    let snapshot: DirectorySnapshot = serde_json::from_str(snapshot_content)
+                    let snapshot: DirectorySnapshot = serde_json::from_value(snapshot)
                         .map_err(|error| {
                             LixError::unknown(format!(
                                 "invalid lix_directory_descriptor snapshot JSON: {error}"
@@ -390,7 +399,7 @@ impl FilesystemPathIndex {
                 }
                 FILE_DESCRIPTOR_SCHEMA_KEY => {
                     let snapshot: FileSnapshot =
-                        serde_json::from_str(snapshot_content).map_err(|error| {
+                        serde_json::from_value(snapshot).map_err(|error| {
                             LixError::unknown(format!(
                                 "invalid lix_file_descriptor snapshot JSON: {error}"
                             ))
@@ -755,7 +764,7 @@ impl FilesystemPathIndex {
             return Ok(());
         };
         let mut next = (*entry).clone();
-        if row.deleted || row.snapshot_content.is_none() {
+        if row.deleted {
             next.blob_ref = None;
         } else {
             next.blob_ref = Some(row.clone());
@@ -837,7 +846,7 @@ impl FilesystemPathIndex {
                 self.remove_entry(&entry);
             }
         }
-        if row.deleted || row.snapshot_content.is_none() {
+        if row.deleted {
             for descendant in descendants {
                 self.remove_entry(&descendant);
             }

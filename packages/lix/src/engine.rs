@@ -467,13 +467,13 @@ where
         let snapshot = row.snapshot_content.ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("account '{account_id}' has no snapshot"),
+                format!("account '{account_id}' has no snapshot projection"),
             )
         })?;
         let value: serde_json::Value = serde_json::from_str(&snapshot).map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("account '{account_id}' has invalid JSON: {error}"),
+                format!("account '{account_id}' has invalid projected JSON: {error}"),
             )
         })?;
         if value.get("status").and_then(serde_json::Value::as_str) != Some("active") {
@@ -514,7 +514,11 @@ where
                 None => Err(not_initialized_error()),
             }
         }
-        crate::init::RepositoryProtocolStatus::Unsupported => {
+        crate::init::RepositoryProtocolStatus::MigrationRequired { found_version } => {
+            Err(crate::init::migration_required_error(found_version))
+        }
+        crate::init::RepositoryProtocolStatus::TooNew { .. }
+        | crate::init::RepositoryProtocolStatus::Malformed => {
             Err(crate::init::unsupported_repository_protocol_error())
         }
         crate::init::RepositoryProtocolStatus::Missing => {

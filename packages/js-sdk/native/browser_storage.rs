@@ -99,6 +99,17 @@ impl StorageWrite for BrowserWrite {
         }
     }
 
+    async fn replace_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(write) => write.replace_many(space, entries).await,
+            Self::Js(write) => write.replace_many(space, entries).await,
+        }
+    }
+
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         match self {
             Self::Memory(write) => write.delete_many(space, keys).await,

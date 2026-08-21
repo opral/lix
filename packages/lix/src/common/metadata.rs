@@ -1,13 +1,5 @@
 use crate::LixError;
 
-pub(crate) fn parse_row_metadata(
-    value: &str,
-    context: impl AsRef<str>,
-) -> Result<String, LixError> {
-    let metadata = parse_row_metadata_value(value, context)?;
-    Ok(serde_json::to_string(&metadata).expect("serde_json::Value metadata serializes"))
-}
-
 pub(crate) fn parse_row_metadata_value(
     value: &str,
     context: impl AsRef<str>,

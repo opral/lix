@@ -22,7 +22,6 @@ use crate::hot_state::{
     HotStateContext, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateProjection,
     HotStateReader,
 };
-use crate::json_store::JsonStoreContext;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::runtime::PluginRuntimeHost;
@@ -40,7 +39,7 @@ use crate::telemetry::{
     TelemetrySpanStatus, instrument_value,
 };
 use crate::tracked_state::TrackedStateContext;
-use crate::transaction::{CertifiedHistoryStoreReader, Transaction, open_transaction};
+use crate::transaction::{Transaction, open_transaction};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
 use crate::transaction::CommitCoordinator;
@@ -74,24 +73,19 @@ pub(crate) async fn load_default_branch_id_from_index(
             "repository default branch is missing lix_key_value:lix_default_branch_id",
         )
     })?;
-    let snapshot_content = row
-        .snapshot_content()
-        .map(|value| value.as_ref())
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "repository default branch is missing snapshot_content",
-            )
-        })?;
-    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+    let typed = row.decoded_snapshot().map(Arc::as_ref).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("repository default branch snapshot is invalid JSON: {error}"),
+            "repository default branch is missing its typed payload",
         )
     })?;
-    let branch_id = snapshot
+    let branch_id = typed
+        .row
         .get("value")
-        .and_then(JsonValue::as_str)
+        .and_then(|value| match value {
+            lix_schema::Value::Jsonb(value) => value.as_value().as_str(),
+            _ => None,
+        })
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             LixError::new(
@@ -779,10 +773,6 @@ where
     ) -> SqlHistoryQuerySource<Self::ReadStore> {
         HistoryQuerySource {
             store: self.read_store.clone(),
-            json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
-            certified_history_reader: Some(Arc::new(CertifiedHistoryStoreReader::new(
-                self.read_store.clone(),
-            ))),
             default_as_of_commit_id,
         }
     }
@@ -790,7 +780,6 @@ where
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
             store: self.read_store.clone(),
-            json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
         }
     }
 

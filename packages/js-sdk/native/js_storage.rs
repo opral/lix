@@ -69,6 +69,13 @@ extern "C" {
     #[wasm_bindgen(method, js_name = putMany)]
     fn put_many(this: &JsStorageWriteHandle, space: JsValue, entries: JsValue) -> js_sys::Promise;
 
+    #[wasm_bindgen(method, js_name = replaceMany)]
+    fn replace_many(
+        this: &JsStorageWriteHandle,
+        space: JsValue,
+        entries: JsValue,
+    ) -> js_sys::Promise;
+
     #[wasm_bindgen(method, js_name = deleteMany)]
     fn delete_many(this: &JsStorageWriteHandle, space: JsValue, keys: JsValue) -> js_sys::Promise;
 
@@ -510,6 +517,27 @@ impl StorageWrite for JsStorageWrite {
             .collect::<Vec<_>>();
         let entries = to_js(&entries, "put entries")?;
         SendJsFuture(JsFuture::from(self.handle.0.put_many(space, entries)))
+            .await
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
+    async fn replace_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        let space = to_js(&storage_space_dto(space), "replace space")?;
+        let entries = entries
+            .entries
+            .into_iter()
+            .map(|entry| PutEntryDto {
+                key: ByteDto(entry.key.0.to_vec()),
+                value: ByteDto(entry.value.bytes.to_vec()),
+            })
+            .collect::<Vec<_>>();
+        let entries = to_js(&entries, "replace entries")?;
+        SendJsFuture(JsFuture::from(self.handle.0.replace_many(space, entries)))
             .await
             .map_err(storage_error)?;
         Ok(())

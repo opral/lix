@@ -303,6 +303,15 @@ impl<W: StorageWrite> StorageWrite for CrashWrite<W> {
         self.inner.put_many(space, entries)
     }
 
+    fn replace_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.killer.tick("replace_many");
+        self.inner.replace_many(space, entries)
+    }
+
     fn delete_many(
         &mut self,
         space: StorageSpace,

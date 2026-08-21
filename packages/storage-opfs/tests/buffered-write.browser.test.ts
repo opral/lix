@@ -41,6 +41,19 @@ for (const mode of ["direct", "shared"] as const) {
 			});
 		});
 
+		test("stages explicit immutable replacements as ordinary puts", async () => {
+			const { write, committed } = createHarness(mode);
+			await write.replaceMany(IMMUTABLE_SPACE, [entry(1, 2)]);
+			await write.commit();
+
+			const payload = committed();
+			expect(payload.immutablePuts).toEqual([]);
+			expect(payload.puts.map((put) => [...put.value])).toEqual([[2]]);
+			await expect(
+				createHarness(mode).write.replaceMany(MUTABLE_SPACE, [entry(1, 2)]),
+			).rejects.toMatchObject({ code: "LIX_STORAGE_CORRUPTION" });
+		});
+
 		test("stages range deletes and reports exact stats", async () => {
 			const { write, committed } = createHarness(mode);
 			await write.putMany(MUTABLE_SPACE, [

@@ -1789,6 +1789,47 @@ fn directory_path_resolver_key(context: &FilesystemRowContext) -> String {
     )
 }
 
+fn directory_snapshot_from_live_row(
+    row: MaterializedHotStateRowRef<'_>,
+) -> Result<Option<DirectoryDescriptorSnapshot>, LixError> {
+    if let Some(typed) = row.decoded_snapshot() {
+        let string = |field: &str| match typed.row.get(field) {
+            Some(lix_schema::Value::Text(value)) => Ok(value.clone()),
+            Some(lix_schema::Value::Uuid(value)) => Ok(value.to_string()),
+            _ => Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("lix_directory_descriptor typed field '{field}' must be a string"),
+            )),
+        };
+        let parent_id = match typed.row.get("parent_id") {
+            None | Some(lix_schema::Value::Null) => None,
+            Some(lix_schema::Value::Text(value)) => Some(value.clone()),
+            Some(lix_schema::Value::Uuid(value)) => Some(value.to_string()),
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    "lix_directory_descriptor typed field 'parent_id' must be a string or null",
+                ));
+            }
+        };
+        return Ok(Some(DirectoryDescriptorSnapshot {
+            id: string("id")?,
+            parent_id,
+            name: string("name")?,
+        }));
+    }
+    row.snapshot_json_value()?
+        .map(|snapshot| {
+            serde_json::from_value(snapshot).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("invalid lix_directory_descriptor snapshot: {error}"),
+                )
+            })
+        })
+        .transpose()
+}
+
 fn lix_directory_record_batch(
     schema: &SchemaRef,
     rows: &MaterializedHotStateBatch,
@@ -1799,16 +1840,9 @@ fn lix_directory_record_batch(
         if row.schema_key() != DIRECTORY_SCHEMA_KEY {
             continue;
         }
-        let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
+        let Some(snapshot) = directory_snapshot_from_live_row(row)? else {
             continue;
         };
-        let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
-                )
-            })?;
         let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
         directory_rows.push(DirectoryDescriptorRecord {
             id: snapshot.id,
@@ -2950,7 +2984,8 @@ mod tests {
         .expect("directory path batch should decode");
 
         assert_eq!(rows.len(), 1);
-        let snapshot = rows.row(0).snapshot.unwrap();
+        let row = rows.row(0);
+        let snapshot = row.snapshot_json().unwrap().value();
         assert_eq!(snapshot["id"], "01920000-0000-7000-8000-000000000343");
         assert_eq!(
             snapshot["parent_id"],
@@ -3119,7 +3154,8 @@ mod tests {
             panic!("expected one directory staged write");
         };
         assert_eq!(rows.len(), 1);
-        let snapshot = rows.row(0).snapshot.unwrap();
+        let row = rows.row(0);
+        let snapshot = row.snapshot_json().unwrap().value();
         assert_eq!(snapshot["id"], "01920000-0000-7000-8000-000000000343");
         assert_eq!(
             snapshot["parent_id"],
@@ -3165,7 +3201,11 @@ mod tests {
             panic!("expected one directory staged write");
         };
         assert_eq!(rows.len(), 1);
-        let snapshot = rows.row(0).snapshot.expect("staged descriptor snapshot");
+        let row = rows.row(0);
+        let snapshot = row
+            .snapshot_json()
+            .expect("staged descriptor snapshot")
+            .value();
         assert_eq!(snapshot["id"], "01920000-0000-7000-8000-000000000343");
         assert_eq!(
             snapshot["parent_id"],
@@ -3202,7 +3242,11 @@ mod tests {
             panic!("expected one directory staged write");
         };
         assert_eq!(rows.len(), 1);
-        let snapshot = rows.row(0).snapshot.expect("staged descriptor snapshot");
+        let row = rows.row(0);
+        let snapshot = row
+            .snapshot_json()
+            .expect("staged descriptor snapshot")
+            .value();
         assert_eq!(
             snapshot["parent_id"],
             "01920000-0000-7000-8000-0000000000d3"

@@ -20,17 +20,14 @@ use crate::hot_state::{
     HotStateExactBatchRequest, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateExactBatch,
 };
-use crate::json_store::JsonStoreReader;
 use crate::plugin::runtime::PluginRuntimeHost;
+use crate::plugin::runtime::UnsupportedWasmRuntime;
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::TrackedStateScanRequest;
 use crate::transaction_types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, RawWriteBatch,
     TransactionWrite, TransactionWriteMode, TransactionWriteOutcome, TypedMutationJournalBatch,
 };
-use crate::plugin::runtime::UnsupportedWasmRuntime;
 
-use super::change_materialization::MaterializedChange;
 use super::{PublicCatalog, SessionFileViews};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,37 +46,19 @@ pub(crate) struct DiffCommandOutcome {
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
 
-pub(crate) struct CertifiedHistoryChange {
-    pub(crate) commit_id: CommitId,
-    pub(crate) change: MaterializedChange,
-}
-
-#[async_trait]
-pub(crate) trait CertifiedHistoryReader: Send + Sync {
-    async fn scan(
-        &self,
-        commit_ids: &BTreeSet<CommitId>,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Vec<CertifiedHistoryChange>, LixError>;
-}
-
 #[derive(Clone)]
 pub(crate) struct HistoryQuerySource<S> {
     pub(crate) store: S,
-    pub(crate) json_reader: JsonStoreReader<S>,
-    pub(crate) certified_history_reader: Option<Arc<dyn CertifiedHistoryReader>>,
     /// Active-branch head pinned by the SQL session that owns this provider.
     ///
     /// History scans use this commit when the query does not provide an
-    /// explicit time-travel anchor. Keeping it beside the snapshot-scoped JSON
-    /// reader prevents a later branch-head lookup from mixing snapshots.
+    /// explicit time-travel anchor.
     pub(crate) default_as_of_commit_id: String,
 }
 
 #[derive(Clone)]
 pub(crate) struct ChangelogQuerySource<S> {
     pub(crate) store: S,
-    pub(crate) json_reader: JsonStoreReader<S>,
 }
 
 /// Read-only context used while executing one SQL statement.
@@ -199,6 +178,19 @@ pub(crate) trait SqlWriteExecutionContext: Send {
     }
     fn schema_catalog_snapshot(&self) -> Option<Arc<crate::catalog::CatalogSnapshot>> {
         None
+    }
+    /// Catalog visible to tracked writes in the active branch.
+    ///
+    /// SQL binding may also see untracked schema registrations. Certified
+    /// tracked write lanes must pin their plan against this narrower catalog
+    /// or defer to transaction normalization.
+    fn tracked_schema_catalog_snapshot(&self) -> Option<Arc<crate::catalog::CatalogSnapshot>> {
+        None
+    }
+    /// Whether the active plugin registry owns this schema's durable rows.
+    /// Engine schemas also have compiled plans but retain generic JSON rows.
+    fn plugin_owns_schema(&self, _schema_key: &str) -> bool {
+        false
     }
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
@@ -382,8 +374,6 @@ impl Default for WriteContextLiveness {
         Self::new()
     }
 }
-
-
 
 /// Values captured from the write execution context at construction time.
 ///

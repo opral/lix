@@ -3,8 +3,6 @@ use std::ops::Deref;
 
 use crate::LixError;
 use crate::changelog::ChangeId;
-#[cfg(test)]
-use crate::json_store::JsonSlot;
 use crate::tracked_state::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffRow,
     TrackedStatePayloadBatch, TrackedStatePayloadRef,
@@ -628,13 +626,13 @@ mod tests {
         // Different change ids with identical content: each diff retains the
         // payload owner loaded during validation, so merge analysis must not
         // reload either record.
-        let same = JsonSlot::from_json("{\"value\":\"same\"}");
+        let same = b"same-native-snapshot".to_vec();
         let target = TrackedStateDiff::from_entries_with_payloads(
             vec![target],
             TrackedStatePayloadBatch::from_payloads([(
                 ChangeId::for_test_label("target"),
-                same.clone(),
-                JsonSlot::None,
+                Some(same.clone()),
+                None,
             )])
             .expect("target payload batch should seal"),
         );
@@ -642,8 +640,8 @@ mod tests {
             vec![source],
             TrackedStatePayloadBatch::from_payloads([(
                 ChangeId::for_test_label("source"),
-                same,
-                JsonSlot::None,
+                Some(same),
+                None,
             )])
             .expect("source payload batch should seal"),
         );

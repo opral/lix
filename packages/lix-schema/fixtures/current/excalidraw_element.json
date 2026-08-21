@@ -1,13 +1,13 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "excalidraw_element",
-  "description": "One Excalidraw element keyed by its native stable ID. Numeric geometry stays inside element_json until packet snapshots support numbers directly.",
+  "description": "One Excalidraw element keyed by its native stable ID. Numeric geometry is stored in native JSONB.",
   "columns": [
     {
       "name": "element_json",
-      "type": "text",
+      "type": "jsonb",
       "nullable": false,
-      "description": "The complete exact JSON object encoded as text, including all numeric geometry and forward-compatible fields."
+      "description": "The complete JSON object, including numeric geometry and forward-compatible fields."
     },
     {
       "name": "element_type",

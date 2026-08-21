@@ -1,8 +1,8 @@
 use crate::LixError;
 use crate::common::LixTimestamp;
 use crate::common::{ExactBatch, ExactValue};
+use crate::json_store::JsonRef;
 use crate::row_pk::RowPk;
-use crate::json_store::{JsonRef, JsonSlot};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -661,6 +661,78 @@ pub(crate) struct CommitScanBatch {
     pub(crate) next_start_after: Option<CommitId>,
 }
 
+/// Packed codec for optional native JSONB metadata.
+///
+/// The field keeps the historical option prefix at its existing packed
+/// ordinal, followed by one length-prefixed canonical binary JSONB value.
+pub(crate) mod jsonb_option_storage {
+    use musli::Context;
+    use musli::de::SequenceDecoder;
+    use musli::en::SequenceEncoder;
+
+    pub(crate) fn encode<E>(value: &Option<lix_schema::Jsonb>, encoder: E) -> Result<(), E::Error>
+    where
+        E: musli::Encoder,
+    {
+        let cx = encoder.cx();
+        let binary = value
+            .as_ref()
+            .map(lix_schema::Jsonb::binary)
+            .transpose()
+            .map_err(|error| cx.message(format_args!("cannot encode JSONB metadata: {error}")))?;
+        encoder.encode_pack_fn(|pack| {
+            pack.push(binary.is_some())?;
+            if let Some(binary) = binary.as_deref() {
+                pack.push(binary)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn decode<'de, D>(decoder: D) -> Result<Option<lix_schema::Jsonb>, D::Error>
+    where
+        D: musli::Decoder<'de>,
+    {
+        let cx = decoder.cx();
+        decoder.decode_pack(|pack| {
+            if !pack.next()? {
+                return Ok(None);
+            }
+            let bytes: Vec<u8> = pack.next()?;
+            lix_schema::Jsonb::from_binary_vec(bytes)
+                .map(Some)
+                .map_err(|error| {
+                    cx.message(format_args!("invalid canonical binary JSONB: {error}"))
+                })
+        })
+    }
+}
+
+/// Encode-only counterpart for borrowed optional native JSONB metadata.
+pub(crate) mod jsonb_option_ref_storage {
+    use musli::Context;
+    use musli::en::SequenceEncoder;
+
+    #[expect(clippy::ref_option_ref)]
+    pub(crate) fn encode<E>(value: &Option<&lix_schema::Jsonb>, encoder: E) -> Result<(), E::Error>
+    where
+        E: musli::Encoder,
+    {
+        let cx = encoder.cx();
+        let binary = value
+            .map(lix_schema::Jsonb::binary)
+            .transpose()
+            .map_err(|error| cx.message(format_args!("cannot encode JSONB metadata: {error}")))?;
+        encoder.encode_pack_fn(|pack| {
+            pack.push(binary.is_some())?;
+            if let Some(binary) = binary.as_deref() {
+                pack.push(binary)?;
+            }
+            Ok(())
+        })
+    }
+}
+
 /// In-memory change record. The stored form (`ChangeRecordRef` /
 /// `ChangeRecordView`) omits `change_id`: it is the storage key and gets
 /// reconstructed on decode.
@@ -672,8 +744,9 @@ pub(crate) struct ChangeRecord {
     pub(crate) schema_key: String,
     pub(crate) row_pk: RowPk,
     pub(crate) file_id: Option<String>,
-    pub(crate) snapshot: JsonSlot,
-    pub(crate) metadata: JsonSlot,
+    /// Native Schema v1 payload. `Some` is a live row; `None` is a delete.
+    pub(crate) snapshot: Option<Vec<u8>>,
+    pub(crate) metadata: Option<lix_schema::Jsonb>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<String>,
 }
@@ -687,10 +760,10 @@ pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) row_pk: &'a RowPk,
     #[musli(with = crate::storage_codec::option_id_string)]
     pub(crate) file_id: Option<&'a str>,
-    #[musli(with = crate::json_store::json_slot_storage_ref)]
-    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
-    #[musli(with = crate::json_store::json_slot_storage_ref)]
-    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) snapshot: Option<&'a [u8]>,
+    #[musli(with = jsonb_option_ref_storage)]
+    pub(crate) metadata: Option<&'a lix_schema::Jsonb>,
     pub(crate) created_at: LixTimestamp,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) origin_key: Option<&'a str>,
@@ -711,8 +784,8 @@ pub(crate) struct TransactionChangeRecordRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) row_pk: &'a RowPk,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
-    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) snapshot: Option<&'a [u8]>,
+    pub(crate) metadata: Option<&'a lix_schema::Jsonb>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) origin_key: Option<&'a str>,
 }
@@ -726,8 +799,8 @@ impl<'a> From<&'a ChangeRecord> for TransactionChangeRecordRef<'a> {
             schema_key: &record.schema_key,
             row_pk: &record.row_pk,
             file_id: record.file_id.as_deref(),
-            snapshot: record.snapshot.as_ref_slot(),
-            metadata: record.metadata.as_ref_slot(),
+            metadata: record.metadata.as_ref(),
+            snapshot: record.snapshot.as_deref(),
             created_at: record.created_at,
             origin_key: record.origin_key.as_deref(),
         }
@@ -754,10 +827,10 @@ pub(crate) struct ChangeRecordView<'a> {
     pub(crate) row_pk: RowPk,
     #[musli(with = crate::storage_codec::option_id_string)]
     pub(crate) file_id: Option<String>,
-    #[musli(with = crate::json_store::json_slot_storage)]
-    pub(crate) snapshot: JsonSlot,
-    #[musli(with = crate::json_store::json_slot_storage)]
-    pub(crate) metadata: JsonSlot,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) snapshot: Option<Vec<u8>>,
+    #[musli(with = jsonb_option_storage)]
+    pub(crate) metadata: Option<lix_schema::Jsonb>,
     pub(crate) created_at: LixTimestamp,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) origin_key: Option<String>,

@@ -13,8 +13,8 @@ use super::{PluginCapabilities, contract::WasmComponentFactory};
 pub mod v1 {
     pub use crate::plugin::runtime::arena::{
         Acceptance, Archive, ByteArena, ByteEdit, Digest, Error, FormatLayout, MapArena, Metrics,
-        PerformanceMeasurement, REQUIRED_V1_MEMORY_REDUCTION, REQUIRED_V1_SPEEDUP, Root,
-        StatePageLayout, Store, Transaction, compare_to_baseline,
+        PerformanceMeasurement, REQUIRED_BASELINE_MEMORY_REDUCTION, REQUIRED_BASELINE_SPEEDUP,
+        Root, StatePageLayout, Store, Transaction, compare_to_baseline,
     };
 }
 

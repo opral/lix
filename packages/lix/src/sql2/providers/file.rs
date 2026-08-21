@@ -2284,6 +2284,58 @@ struct BlobRefSnapshot {
     blob_hash: String,
 }
 
+fn typed_row_string(
+    row: &lix_schema::Row,
+    schema_key: &str,
+    field: &str,
+) -> Result<String, LixError> {
+    match row.get(field) {
+        Some(lix_schema::Value::Text(value)) => Ok(value.clone()),
+        Some(lix_schema::Value::Uuid(value)) => Ok(value.to_string()),
+        _ => Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("{schema_key} typed payload field '{field}' must be a string"),
+        )),
+    }
+}
+
+fn optional_typed_row_string(
+    row: &lix_schema::Row,
+    schema_key: &str,
+    field: &str,
+) -> Result<Option<String>, LixError> {
+    match row.get(field) {
+        None | Some(lix_schema::Value::Null) => Ok(None),
+        Some(lix_schema::Value::Text(value)) => Ok(Some(value.clone())),
+        Some(lix_schema::Value::Uuid(value)) => Ok(Some(value.to_string())),
+        _ => Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("{schema_key} typed payload field '{field}' must be a string or null"),
+        )),
+    }
+}
+
+fn blob_ref_snapshot_from_live_row(
+    row: MaterializedHotStateRowRef<'_>,
+) -> Result<Option<BlobRefSnapshot>, LixError> {
+    if let Some(typed) = row.decoded_snapshot() {
+        return Ok(Some(BlobRefSnapshot {
+            id: typed_row_string(&typed.row, BLOB_REF_SCHEMA_KEY, "id")?,
+            blob_hash: typed_row_string(&typed.row, BLOB_REF_SCHEMA_KEY, "blob_hash")?,
+        }));
+    }
+    row.snapshot_json_value()?
+        .map(|snapshot| {
+            serde_json::from_value(snapshot).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("invalid lix_binary_blob_ref snapshot: {error}"),
+                )
+            })
+        })
+        .transpose()
+}
+
 fn blob_ref_record_from_live_row(
     row: MaterializedHotStateRowRef<'_>,
     handle: HotStateRowHandle,
@@ -2291,15 +2343,9 @@ fn blob_ref_record_from_live_row(
     if row.schema_key() != BLOB_REF_SCHEMA_KEY {
         return Ok(None);
     }
-    let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
+    let Some(snapshot) = blob_ref_snapshot_from_live_row(row)? else {
         return Ok(None);
     };
-    let snapshot: BlobRefSnapshot = serde_json::from_str(snapshot_content).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
-        )
-    })?;
     let key = FilesystemBlobRefKey::from_live_row_ref(row, snapshot.id);
     Ok(Some((
         key,
@@ -2316,6 +2362,58 @@ struct DirectoryDescriptorSnapshot {
     id: String,
     parent_id: Option<String>,
     name: String,
+}
+
+fn file_descriptor_snapshot_from_live_row(
+    row: MaterializedHotStateRowRef<'_>,
+) -> Result<Option<FileDescriptorSnapshot>, LixError> {
+    if let Some(typed) = row.decoded_snapshot() {
+        return Ok(Some(FileDescriptorSnapshot {
+            id: typed_row_string(&typed.row, FILE_DESCRIPTOR_SCHEMA_KEY, "id")?,
+            directory_id: optional_typed_row_string(
+                &typed.row,
+                FILE_DESCRIPTOR_SCHEMA_KEY,
+                "directory_id",
+            )?,
+            name: typed_row_string(&typed.row, FILE_DESCRIPTOR_SCHEMA_KEY, "name")?,
+        }));
+    }
+    row.snapshot_json_value()?
+        .map(|snapshot| {
+            serde_json::from_value(snapshot).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("invalid lix_file_descriptor snapshot: {error}"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn directory_descriptor_snapshot_from_live_row(
+    row: MaterializedHotStateRowRef<'_>,
+) -> Result<Option<DirectoryDescriptorSnapshot>, LixError> {
+    if let Some(typed) = row.decoded_snapshot() {
+        return Ok(Some(DirectoryDescriptorSnapshot {
+            id: typed_row_string(&typed.row, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, "id")?,
+            parent_id: optional_typed_row_string(
+                &typed.row,
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+                "parent_id",
+            )?,
+            name: typed_row_string(&typed.row, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, "name")?,
+        }));
+    }
+    row.snapshot_json_value()?
+        .map(|snapshot| {
+            serde_json::from_value(snapshot).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("invalid lix_directory_descriptor snapshot: {error}"),
+                )
+            })
+        })
+        .transpose()
 }
 
 #[derive(Debug, Default)]
@@ -3049,10 +3147,7 @@ async fn load_exact_existing_materializations(
         // A malformed old snapshot still proves that a blob row must be
         // replaced; only the optional CAS-reuse shortcut is lost.
         materialization.has_blob_ref = true;
-        materialization.blob_hash = row
-            .snapshot_content()
-            .map(|snapshot| snapshot.as_str())
-            .and_then(|snapshot| serde_json::from_str::<BlobRefSnapshot>(snapshot).ok())
+        materialization.blob_hash = blob_ref_snapshot_from_live_row(row)?
             .filter(|snapshot| snapshot.id == request.file_id.as_deref().unwrap_or_default())
             .and_then(|snapshot| BlobId::from_hex(&snapshot.blob_hash).ok());
     }
@@ -3438,16 +3533,9 @@ fn blob_ref_keys_from_live_rows(
         if row.schema_key() != BLOB_REF_SCHEMA_KEY {
             continue;
         }
-        let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
+        let Some(snapshot) = blob_ref_snapshot_from_live_row(row)? else {
             continue;
         };
-        let snapshot: BlobRefSnapshot =
-            serde_json::from_str(snapshot_content).map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
-                )
-            })?;
         keys.insert(FilesystemBlobRefKey::from_live_row_ref(row, snapshot.id));
     }
     Ok(keys)
@@ -4349,17 +4437,9 @@ fn prepare_lix_file_rows(
         let row = live_rows.row(handle);
         match row.schema_key() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
-                let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str())
-                else {
+                let Some(snapshot) = file_descriptor_snapshot_from_live_row(row)? else {
                     continue;
                 };
-                let snapshot: FileDescriptorSnapshot = serde_json::from_str(snapshot_content)
-                    .map_err(|error| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!("invalid lix_file_descriptor snapshot JSON: {error}"),
-                        )
-                    })?;
                 let key = FilesystemDescriptorKey::from_file_descriptor_live_row_ref(
                     row,
                     snapshot.id.clone(),
@@ -4381,17 +4461,9 @@ fn prepare_lix_file_rows(
                 }
             }
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str())
-                else {
+                let Some(snapshot) = directory_descriptor_snapshot_from_live_row(row)? else {
                     continue;
                 };
-                let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
-                    .map_err(|error| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
-                        )
-                    })?;
                 directory_rows.push(DirectoryDescriptorRecord {
                     key: FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone()),
                     parent_id: snapshot.parent_id,
@@ -5381,9 +5453,7 @@ async fn load_plugin_render_branches(
                             && !row.global()
                             && !row.untracked()
                     });
-                    let row = row.map(MaterializedHotStateRowRef::to_owned);
-                    let registry =
-                        PluginRegistry::from_optional_hot_state_row(row.as_ref(), &branch_id)?;
+                    let registry = PluginRegistry::from_optional_hot_state_row(row, &branch_id)?;
                     Ok::<_, LixError>((branch_id, registry))
                 }
             });
@@ -8608,6 +8678,35 @@ mod tests {
         scan_requests: Arc<Mutex<Vec<HotStateScanRequest>>>,
     }
 
+    fn typed_fixture_batch(
+        rows: impl IntoIterator<Item = MaterializedHotStateRow>,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
+        let rows = rows.into_iter().collect::<Vec<_>>();
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(rows.len());
+        for row in rows {
+            let typed = match row.snapshot_content.as_deref() {
+                Some(snapshot) if !row.deleted => {
+                    let value: serde_json::Value =
+                        serde_json::from_str(snapshot).map_err(|error| {
+                            LixError::unknown(format!("invalid test live-row JSON: {error}"))
+                        })?;
+                    crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+                        &row.schema_key,
+                        &row.row_pk,
+                        &value,
+                    )
+                    .ok()
+                    .map(Arc::new)
+                }
+                _ => None,
+            };
+            let ordinal = builder.len();
+            builder.push_owned(row);
+            builder.set_decoded_snapshot(ordinal, typed);
+        }
+        Ok(builder.finish())
+    }
+
     #[async_trait]
     impl HotStateReader for RecordingHotStateReader {
         async fn scan_batch(
@@ -8618,7 +8717,7 @@ mod tests {
                 .lock()
                 .expect("live-state request mutex should not be poisoned")
                 .push(request.clone());
-            Ok(self.rows.clone().into())
+            typed_fixture_batch(self.rows.clone())
         }
 
         async fn load_exact_batch(
@@ -8775,7 +8874,7 @@ mod tests {
             &self,
             _request: &HotStateScanRequest,
         ) -> Result<MaterializedHotStateBatch, LixError> {
-            Ok(self.rows.clone().into())
+            typed_fixture_batch(self.rows.clone())
         }
     }
 
@@ -8913,7 +9012,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "1.0.0".to_string(),
+            api_version: "2.0.0".to_string(),
             capabilities: crate::plugin::runtime::PluginCapabilities {
                 column_merger: false,
                 file_projection: true,
@@ -9016,7 +9115,7 @@ mod tests {
             std::iter::empty::<(&str, ComponentExportKind, u32)>(),
         );
         component.export(
-            "lix:plugin/file-projection@1.0.0",
+            "lix:plugin/file-projection@2.0.0",
             ComponentExportKind::Instance,
             instance,
             None,
@@ -10358,7 +10457,11 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be staged");
-        let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
+        let snapshot: JsonValue = descriptor
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(
             snapshot["directory_id"],
@@ -10445,7 +10548,13 @@ mod tests {
                 .all(|row| row.schema_key != "lix_directory_descriptor")
         );
 
-        let snapshot: JsonValue = staged.state_rows.row(0).snapshot.unwrap().value().clone();
+        let snapshot: JsonValue = staged
+            .state_rows
+            .row(0)
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(
             snapshot["directory_id"],
             "01920000-0000-7000-8000-0000000000d3"
@@ -10500,7 +10609,11 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor should be staged");
-        let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
+        let snapshot: JsonValue = descriptor
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(
             snapshot["directory_id"],
             "01920000-0000-7000-8000-000000000353"
@@ -10603,8 +10716,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("data update should stage blob ref row");
         let snapshot: serde_json::Value = blob_ref_row
-            .snapshot
-            .as_ref()
+            .snapshot_json()
             .expect("blob ref should carry snapshot")
             .value()
             .clone();
@@ -10774,8 +10886,7 @@ mod tests {
         );
         assert_eq!(staged.file_content_writes[0].content(), b"hello");
         let snapshot: serde_json::Value = blob_ref_row
-            .snapshot
-            .as_ref()
+            .snapshot_json()
             .expect("blob ref should carry snapshot")
             .value()
             .clone();
@@ -10925,7 +11036,11 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be staged");
-        let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
+        let snapshot: JsonValue = descriptor
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(
             snapshot["directory_id"],
@@ -10965,7 +11080,11 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be staged");
-        let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
+        let snapshot: JsonValue = descriptor
+            .snapshot_json()
+            .expect("file descriptor should carry JSON")
+            .value()
+            .clone();
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
     }
 
@@ -11120,7 +11239,11 @@ mod tests {
         let TransactionWrite::Rows { rows, .. } = &write_context.writes[0] else {
             panic!("descriptor update should stage state rows");
         };
-        let snapshot = rows.row(0).snapshot.expect("updated snapshot").value();
+        let row = rows.row(0);
+        let snapshot = row
+            .snapshot_json()
+            .expect("updated snapshot should remain JSON")
+            .value();
         assert_eq!(snapshot["name"], "README.md");
     }
 
@@ -11519,8 +11642,7 @@ mod tests {
             .find(|row| row.schema_key == super::BLOB_REF_SCHEMA_KEY)
             .expect("prepared path write should stage its final blob reference directly");
         let snapshot = blob_ref
-            .snapshot
-            .as_ref()
+            .snapshot_json()
             .expect("prepared blob ref should have a snapshot")
             .value();
         let blob_id_hex = blob_id.to_hex();
@@ -12028,7 +12150,11 @@ mod tests {
                     .iter()
                     .find(|row| row.schema_key == "lix_file_descriptor")
                     .expect("file descriptor row should be staged");
-                let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
+                let snapshot: JsonValue = descriptor
+                    .snapshot_json()
+                    .expect("file descriptor should carry JSON")
+                    .value()
+                    .clone();
                 assert_eq!(
                     snapshot["directory_id"],
                     "01920000-0000-7000-8000-000000000313"

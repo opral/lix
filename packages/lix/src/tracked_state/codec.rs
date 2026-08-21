@@ -196,6 +196,34 @@ impl DecodedLeafNodeRef {
             .map(|span| &self.arena[span.key_start..span.key_end])
     }
 
+    /// Retains one key as a slice of the decoded leaf arena without copying
+    /// its bytes. Shared identity decoders use this when returned row-primary
+    /// key components must outlive the leaf scan.
+    pub(crate) fn key_owned(&self, index: usize) -> Option<Bytes> {
+        self.entries
+            .get(index)
+            .map(|span| self.arena.slice(span.key_start..span.key_end))
+    }
+
+    /// Shares the immutable decoded key arena with compact exact key ranges.
+    /// This is the certified projection handoff: callers retain one arena
+    /// owner instead of one refcounted `Bytes` slice per row.
+    pub(crate) fn shared_key_arena_and_ranges(
+        &self,
+    ) -> Result<(Bytes, Box<[Range<u32>]>), LixError> {
+        let ranges = self
+            .entries
+            .iter()
+            .map(|span| {
+                Ok(u32::try_from(span.key_start)
+                    .map_err(|_| key_codec_error("leaf key offset exceeds u32"))?
+                    ..u32::try_from(span.key_end)
+                        .map_err(|_| key_codec_error("leaf key offset exceeds u32"))?)
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        Ok((self.arena.clone(), ranges.into_boxed_slice()))
+    }
+
     /// Materializes per-entry buffers only for mutation paths that need to
     /// retain leaf entries after this decoded node is consumed. Read and diff
     /// paths keep using the arena-backed view above.
@@ -657,6 +685,46 @@ pub(crate) fn decode_key_with_trusted_prefix(
         file_id: file_id.map(str::to_string),
         row_pk,
     })
+}
+
+/// Materializes only the row identity after matching an exact encoded
+/// schema/file prefix. Unlike [`decode_key_with_trusted_prefix`], this does not
+/// allocate owned copies of batch-wide schema and file strings.
+pub(crate) fn decode_row_pk_with_trusted_prefix(
+    bytes: &[u8],
+    trusted_prefix: &[u8],
+) -> Result<crate::row_pk::RowPk, LixError> {
+    if !bytes.starts_with(trusted_prefix) {
+        return Err(key_codec_error(
+            "does not match its trusted schema/file prefix",
+        ));
+    }
+    let mut offset = trusted_prefix.len();
+    let row_pk = read_row_pk(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err(key_codec_error("has trailing bytes"));
+    }
+    Ok(row_pk)
+}
+
+/// Shared-arena variant of [`decode_row_pk_with_trusted_prefix`]. Unescaped
+/// string and byte components retain slices of `bytes`; escaped values take
+/// the codec's existing owned fallback.
+pub(crate) fn decode_row_pk_shared_with_trusted_prefix(
+    bytes: Bytes,
+    trusted_prefix: &[u8],
+) -> Result<crate::row_pk::RowPk, LixError> {
+    if !bytes.starts_with(trusted_prefix) {
+        return Err(key_codec_error(
+            "does not match its trusted schema/file prefix",
+        ));
+    }
+    let mut offset = trusted_prefix.len();
+    let row_pk = read_row_pk_shared(&bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err(key_codec_error("has trailing bytes"));
+    }
+    Ok(row_pk)
 }
 
 // The key byte format is shared with the hot-head serving index and lives in
@@ -2729,6 +2797,49 @@ mod tests {
                 .expect("key suffix should decode"),
             key
         );
+        assert_eq!(
+            decode_row_pk_with_trusted_prefix(&encoded, &prefix)
+                .expect("row suffix should decode without owning its prefix"),
+            key.row_pk
+        );
+
+        let wrong_prefix = encode_schema_file_prefix("schema", None);
+        assert!(decode_row_pk_with_trusted_prefix(&encoded, &wrong_prefix).is_err());
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_row_pk_with_trusted_prefix(&trailing, &prefix).is_err());
+    }
+
+    #[test]
+    fn shared_trusted_prefix_row_decoder_retains_key_arena() {
+        let row_pk = RowPk::from_components(smallvec::smallvec![
+            crate::row_pk::RowPkComponent::String("row".into()),
+            crate::row_pk::RowPkComponent::Bytes(Bytes::from_static(b"suffix")),
+        ])
+        .expect("composite row pk");
+        let key = TrackedStateKey {
+            schema_key: "schema".to_string(),
+            file_id: None,
+            row_pk: row_pk.clone(),
+        };
+        let encoded = Bytes::from(encode_key(&key));
+        let arena_start = encoded.as_ptr() as usize;
+        let arena_end = arena_start + encoded.len();
+        let prefix = encode_schema_file_prefix("schema", None);
+        let decoded = decode_row_pk_shared_with_trusted_prefix(encoded, &prefix)
+            .expect("shared row suffix should decode");
+
+        assert_eq!(decoded, row_pk);
+        for component in &decoded.components {
+            let (pointer, len) = match component {
+                crate::row_pk::RowPkComponent::String(value) => value.retained_buffer_identity(),
+                crate::row_pk::RowPkComponent::Bytes(value) => (value.as_ptr(), value.len()),
+                _ => continue,
+            };
+            let start = pointer as usize;
+            assert!(start >= arena_start && start.saturating_add(len) <= arena_end);
+        }
     }
 
     #[test]

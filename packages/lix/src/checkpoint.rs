@@ -22,13 +22,12 @@ const CHECKPOINT_RECORD_SCAN_PAGE_SIZE: usize = 1_024;
 #[cfg(feature = "storage-benches")]
 pub(crate) type CheckpointCommitRecords = HashMap<CommitId, CommitGraphNode>;
 
-pub(crate) fn checkpoint_snapshot(commit_id: &CommitId) -> String {
+pub(crate) fn checkpoint_snapshot(commit_id: &CommitId) -> serde_json::Value {
     let commit_id = commit_id.to_string();
     json!({
         "id": commit_id.clone(),
         "commit_id": commit_id,
     })
-    .to_string()
 }
 
 pub(crate) fn checkpoint_stage_row(commit_id: &CommitId, change_id: String) -> TransactionWriteRow {

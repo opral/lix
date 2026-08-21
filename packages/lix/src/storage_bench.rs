@@ -227,7 +227,9 @@ where
     R: StorageAdapterRead,
 {
     let generation = if phantom {
-        crate::changelog::CommitId::new(uuid::Uuid::from_u128(0x0e53_0e53_0e53_0e53_0e53_0e53_0e53_0e53))
+        crate::changelog::CommitId::new(uuid::Uuid::from_u128(
+            0x0e53_0e53_0e53_0e53_0e53_0e53_0e53_0e53,
+        ))
     } else {
         crate::branch::BranchHeadControlContext::new()
             .reader(read)
@@ -462,11 +464,9 @@ pub struct CertifiedRowInsertParameterBatchCounters {
 /// Reads the cumulative certified parameter-batch INSERT phase counters
 /// without resetting them. Callers measuring one fixture/sample must subtract
 /// a pre-operation snapshot from a post-operation snapshot.
-pub fn certified_row_insert_parameter_batch_counters()
--> CertifiedRowInsertParameterBatchCounters {
+pub fn certified_row_insert_parameter_batch_counters() -> CertifiedRowInsertParameterBatchCounters {
     CertifiedRowInsertParameterBatchCounters {
-        certifications: CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS
-            .load(Ordering::Relaxed),
+        certifications: CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS.load(Ordering::Relaxed),
         executions: CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS.load(Ordering::Relaxed),
     }
 }
@@ -820,10 +820,8 @@ pub fn take_hot_index_probe_census() -> HotIndexProbeCensus {
         equality_probes_engaged: HOT_INDEX_EQUALITY_PROBES_ENGAGED.swap(0, Ordering::Relaxed),
         range_probes_engaged: HOT_INDEX_RANGE_PROBES_ENGAGED.swap(0, Ordering::Relaxed),
         range_probe_candidates: HOT_INDEX_RANGE_PROBE_CANDIDATES.swap(0, Ordering::Relaxed),
-        probes_refused_unwitnessed: HOT_INDEX_PROBES_REFUSED_UNWITNESSED
-            .swap(0, Ordering::Relaxed),
-        probes_refused_over_budget: HOT_INDEX_PROBES_REFUSED_OVER_BUDGET
-            .swap(0, Ordering::Relaxed),
+        probes_refused_unwitnessed: HOT_INDEX_PROBES_REFUSED_UNWITNESSED.swap(0, Ordering::Relaxed),
+        probes_refused_over_budget: HOT_INDEX_PROBES_REFUSED_OVER_BUDGET.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -1963,10 +1961,18 @@ where
             "commit graph benchmark member commit",
         )?;
         let row_pk = crate::row_pk::RowPk::single(format!("bench-member-{index:08}"));
-        let snapshot = crate::json_store::JsonSlot::from_json(&format!(
-            "{{\"index\":{index},\"payload\":\"{}\"}}",
-            "x".repeat(192)
-        ));
+        let snapshot = serde_json::json!({
+            "index": index,
+            "payload": "x".repeat(192),
+        });
+        let typed =
+            crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(&row_pk, &snapshot)?;
+        let snapshot = typed.durable_payload().map_err(|error| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                format!("cannot encode benchmark typed row: {error:?}"),
+            )
+        })?;
         stage_bench_commit_deltas(
             &mut writes,
             &[crate::tracked_state::TrackedStateCommitDeltaRef {
@@ -1982,8 +1988,8 @@ where
                     created_at,
                     updated_at: created_at,
                 },
-                snapshot: snapshot.as_ref_slot(),
-                metadata: crate::json_store::JsonSlotRef::None,
+                snapshot: Some(snapshot.as_ref()),
+                metadata: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -2026,169 +2032,6 @@ pub struct RepositoryGcBenchResult {
     pub changelog_us: u64,
     pub tracked_root_stage_us: u64,
     pub total_us: u64,
-}
-
-/// Isolates the branch-owned derived checkpoint retirement path.  This is a
-/// benchmark-only bridge: the checkpoint rows are seeded directly into their
-/// derived space, then the production branch-prefix retirement planner is
-/// measured without SQL, commit-graph, or GC setup in the timed region.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BranchCheckpointDeleteBenchResult {
-    pub matched_entries: usize,
-    pub staged_deletes: u64,
-    pub read_us: u64,
-    pub total_us: u64,
-    pub commit_us: u64,
-    pub delete_descriptor_capacity: usize,
-}
-
-pub async fn seed_branch_plugin_checkpoints_for_bench<StorageImpl>(
-    storage: &StorageAdapter<StorageImpl>,
-    branch_id: &str,
-    file_count: usize,
-    batch_size: usize,
-) -> Result<(), crate::LixError>
-where
-    StorageImpl: Storage,
-{
-    let batch_size = batch_size.max(1);
-    let branch = uuid::Uuid::parse_str(branch_id).map_err(|error| {
-        crate::LixError::new(
-            crate::LixError::CODE_INTERNAL_ERROR,
-            format!("checkpoint benchmark branch id is not a UUID: {error}"),
-        )
-    })?;
-    let generation = crate::binary_cas::BlobId::from_content(b"checkpoint-bench-generation");
-    let blob_hash = crate::binary_cas::BlobId::from_content(b"checkpoint-bench-blob");
-    let semantic_root = uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0004);
-    let mut next = 0usize;
-    while next < file_count {
-        let end = next.saturating_add(batch_size).min(file_count);
-        let mut writes = storage.new_write_set();
-        for index in next..end {
-            let file_id = uuid::Uuid::from_u128(
-                0x0192_0000_0000_7000_8000_0000_1000_0000u128.saturating_add(index as u128),
-            );
-            crate::transaction::plugin_checkpoint::stage_current_plugin_checkpoint(
-                &mut writes,
-                &branch.to_string(),
-                &file_id.to_string(),
-                &generation.to_hex(),
-                &semantic_root.to_string(),
-                blob_hash,
-                b"checkpoint-runtime",
-                b"checkpoint-authority",
-            )?;
-        }
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .map_err(crate::LixError::from)?;
-        next = end;
-    }
-    Ok(())
-}
-
-/// Loads one checkpoint produced by [`seed_branch_plugin_checkpoints_for_bench`]
-/// through the production decoder. This keeps corruption qualification on the
-/// real persisted format without exposing checkpoint internals to applications.
-pub async fn load_seeded_branch_plugin_checkpoint_for_bench<StorageImpl>(
-    storage: &StorageAdapter<StorageImpl>,
-    branch_id: &str,
-    file_id: &str,
-) -> Result<Option<(Vec<u8>, Vec<u8>)>, crate::LixError>
-where
-    StorageImpl: Storage,
-{
-    let generation = crate::binary_cas::BlobId::from_content(b"checkpoint-bench-generation");
-    let blob_hash = crate::binary_cas::BlobId::from_content(b"checkpoint-bench-blob");
-    let semantic_root = uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0004);
-    let read = storage.begin_read(ReadOptions::default()).await?;
-    crate::transaction::plugin_checkpoint::load_current_plugin_checkpoint(
-        &read,
-        branch_id,
-        file_id,
-        &generation.to_hex(),
-        &semantic_root.to_string(),
-        blob_hash,
-    )
-    .await
-    .map(|checkpoint| {
-        checkpoint.map(|checkpoint| {
-            (
-                checkpoint.runtime.as_ref().to_vec(),
-                checkpoint.authority.as_ref().to_vec(),
-            )
-        })
-    })
-}
-
-pub async fn delete_branch_plugin_checkpoints_for_bench<StorageImpl>(
-    storage: &StorageAdapter<StorageImpl>,
-    branch_id: &str,
-) -> Result<BranchCheckpointDeleteBenchResult, crate::LixError>
-where
-    StorageImpl: Storage,
-{
-    let read = crate::storage_adapter::SharedStorageAdapterRead::new(
-        storage.begin_read(ReadOptions::default()).await?,
-    );
-    let mut writes = storage.new_write_set();
-    let started = std::time::Instant::now();
-    crate::transaction::plugin_checkpoint::stage_delete_branch_plugin_checkpoints(
-        &read,
-        &mut writes,
-        branch_id,
-    )
-    .await?;
-    let total_us = started.elapsed().as_micros() as u64;
-    let stats = writes.stats();
-    let arena = writes.arena_stats();
-    Ok(BranchCheckpointDeleteBenchResult {
-        matched_entries: stats.staged_deletes as usize,
-        staged_deletes: stats.staged_deletes,
-        read_us: total_us,
-        total_us,
-        commit_us: 0,
-        delete_descriptor_capacity: arena.delete_descriptor_capacity,
-    })
-}
-
-pub async fn delete_and_commit_branch_plugin_checkpoints_for_bench<StorageImpl>(
-    storage: &StorageAdapter<StorageImpl>,
-    branch_id: &str,
-) -> Result<BranchCheckpointDeleteBenchResult, crate::LixError>
-where
-    StorageImpl: Storage,
-{
-    let read = crate::storage_adapter::SharedStorageAdapterRead::new(
-        storage.begin_read(ReadOptions::default()).await?,
-    );
-    let mut writes = storage.new_write_set();
-    let started = std::time::Instant::now();
-    crate::transaction::plugin_checkpoint::stage_delete_branch_plugin_checkpoints(
-        &read,
-        &mut writes,
-        branch_id,
-    )
-    .await?;
-    let read_us = started.elapsed().as_micros() as u64;
-    let stats = writes.stats();
-    let arena = writes.arena_stats();
-    let commit_started = std::time::Instant::now();
-    storage
-        .commit_write_set(writes, StorageWriteOptions::default())
-        .await
-        .map_err(crate::LixError::from)?;
-    let commit_us = commit_started.elapsed().as_micros() as u64;
-    Ok(BranchCheckpointDeleteBenchResult {
-        matched_entries: stats.staged_deletes as usize,
-        staged_deletes: stats.staged_deletes,
-        read_us,
-        total_us: read_us.saturating_add(commit_us),
-        commit_us,
-        delete_descriptor_capacity: arena.delete_descriptor_capacity,
-    })
 }
 
 /// Plans production repository GC without committing its staged sweep.
@@ -3338,13 +3181,10 @@ pub async fn binary_cas_owner_layout_accounting<R>(
 where
     R: StorageAdapterRead,
 {
-    use crate::json_store::JsonSlot;
-
     let inventory = crate::tracked_state::scan_commit_delta_inventory(read).await?;
     let mut seen_changes = std::collections::BTreeSet::new();
     let mut references = std::collections::BTreeMap::<String, u64>::new();
     let mut owners = std::collections::BTreeMap::<crate::binary_cas::BlobId, String>::new();
-    let mut json_ref_hashes = std::collections::BTreeSet::new();
     for member in inventory
         .commits
         .values()
@@ -3353,32 +3193,13 @@ where
         if !seen_changes.insert(member.change.change_id) {
             continue;
         }
-        match &member.change.snapshot {
-            JsonSlot::Inline(snapshot) => {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(snapshot) {
-                    collect_binary_cas_json_owners(&value, &mut references, &mut owners);
-                }
-            }
-            JsonSlot::Ref(json_ref) => {
-                json_ref_hashes.insert(*json_ref.as_hash_array());
-            }
-            JsonSlot::None => {}
-        }
-    }
-    let json_refs = json_ref_hashes
-        .into_iter()
-        .map(crate::json_store::JsonRef::from_hash_bytes)
-        .collect::<Vec<_>>();
-    let mut json_reader = crate::json_store::JsonStoreContext::new().reader(read);
-    let loaded = json_reader
-        .load_bytes_many(crate::json_store::JsonLoadRequestRef {
-            refs: &json_refs,
-            scope: crate::json_store::JsonReadScopeRef::OutOfBand,
-        })
-        .await?;
-    for value in loaded.into_values().into_iter().flatten() {
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&value) {
-            collect_binary_cas_json_owners(&value, &mut references, &mut owners);
+        if let Some(payload) = member.change.snapshot.as_deref() {
+            let typed = crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+                std::sync::Arc::from(payload),
+                &member.change.schema_key,
+                &member.change.row_pk,
+            )?;
+            collect_binary_cas_json_owners(&typed.to_json_value()?, &mut references, &mut owners);
         }
     }
 
@@ -4183,10 +4004,7 @@ mod tests {
             first.delete_counts_by_space,
             vec![
                 (crate::hot_state::DIFF_SPACE.id.0, 100), // retired checkpoint working-diff rows
-                (
-                    crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE.id.0,
-                    1,
-                ), // retired checkpoint epoch marker
+                (crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE.id.0, 1,), // retired checkpoint epoch marker
                 (
                     crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
                         .id
@@ -4229,9 +4047,7 @@ mod tests {
         const WORKING_DIFF_MARKER_KEY_BYTES: usize = 37;
         let working_diff_deletes = 100;
         let marker_deletes = 1;
-        let uuid_deletes = first.staged_deletes as usize
-            - working_diff_deletes
-            - marker_deletes;
+        let uuid_deletes = first.staged_deletes as usize - working_diff_deletes - marker_deletes;
         assert_eq!(
             first.key_shared_bytes,
             uuid_deletes * UUID_KEY_BYTES
@@ -4334,8 +4150,7 @@ pub fn take_hot_scan_route_census() -> [HotScanRouteCensus; CRUD_PHASE_COUNT] {
         fallback_with_row_pks: HOT_SCAN_FALLBACK_WITH_PKS[phase].swap(0, Ordering::Relaxed),
         fallback_entries_decoded: HOT_SCAN_FALLBACK_DECODED[phase].swap(0, Ordering::Relaxed),
         fallback_entries_matched: HOT_SCAN_FALLBACK_MATCHED[phase].swap(0, Ordering::Relaxed),
-        file_member_guard_reads: HOT_SCAN_FILE_MEMBER_GUARD_READS[phase]
-            .swap(0, Ordering::Relaxed),
+        file_member_guard_reads: HOT_SCAN_FILE_MEMBER_GUARD_READS[phase].swap(0, Ordering::Relaxed),
     })
 }
 
@@ -4379,10 +4194,6 @@ pub(crate) fn record_hot_scan_row_decoded() {
 
 pub(crate) fn record_hot_scan_key_handle_clone() {
     HOT_SCAN_KEY_HANDLE_CLONES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_hot_scan_value_handle_clone() {
-    HOT_SCAN_VALUE_HANDLE_CLONES.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_hot_scan_row_handle_clones(count: usize) {

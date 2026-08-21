@@ -1,16 +1,13 @@
 // Several benchmark/profiling helpers remain useful to ignored and ad-hoc
 // probes even when their former public-SDK tests are not compiled.
-#![allow(dead_code, unused_imports)]
+#![recursion_limit = "512"]
+#![allow(dead_code, unused_imports, unused_attributes)]
 
 mod benchmark_metrics;
 
 use bytes::Bytes;
 use lix::plugin::runtime::{
-    PluginCapabilities, WasmByteSource, WasmColdFileUpdate, WasmComponentActor,
-    WasmComponentFactory, WasmCreateContext, WasmFileDescriptor, WasmFileTransition,
-    WasmFileUpdate, WasmHostBytes, WasmHostRow, WasmInputBytes, WasmInputSplice, WasmOpenRowsInput,
-    WasmPluginSelection, WasmRow, WasmRowChange, WasmRowKey, WasmRowPage, WasmRowSource,
-    WasmRuntime, WasmSourceRange, WasmSourceSlice, WasmTransitionCounters, WasmTransitionLimits,
+    PluginCapabilities, WasmComponentFactory, WasmRuntime, WasmTransitionCounters,
 };
 use lix::storage::{
     BeginScanOptions, CoreProjection, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
@@ -70,6 +67,13 @@ struct StartedPerfSpan {
 
 fn is_exported_or_debug_perf_target(target: &str) -> bool {
     matches!(target, "lix_perf" | "lix_sql")
+}
+
+fn jsonb_column_contains(row: &lix::Row, column: &str, needle: &str) -> bool {
+    matches!(
+        row.get::<Value>(column),
+        Ok(Value::Jsonb(value)) if value.to_value().to_string().contains(needle)
+    )
 }
 
 fn is_import_perf_span(name: &str) -> bool {
@@ -407,8 +411,8 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
         .expect("plugin-derived row should query");
     assert_eq!(member.len(), 1);
     assert_eq!(
-        member.rows()[0].get::<String>("scalar_json").unwrap(),
-        r#""plugin""#
+        member.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!("plugin").into())
     );
     assert_eq!(
         read_file(&lix, PATH).await.unwrap(),
@@ -510,7 +514,10 @@ async fn untracked_json_file_produces_the_same_plugin_rows_as_a_tracked_one() {
         .await
         .try_into()
         .unwrap_or_else(|_| panic!("expected four projected columns for the tracked plugin row"));
-    assert_eq!(tracked_scalar, Value::Text(r#""plugin""#.to_owned()));
+    assert_eq!(
+        tracked_scalar,
+        Value::Jsonb(serde_json::json!("plugin").into())
+    );
     assert_eq!(tracked_untracked, Value::Boolean(false));
     assert!(
         matches!(&tracked_change_id, Value::Text(value)
@@ -562,9 +569,12 @@ async fn untracked_json_file_produces_the_same_plugin_rows_as_a_tracked_one() {
         (UNTRACKED_FILE_ID, UNTRACKED_PATH),
     ] {
         lix.execute(
-            "UPDATE json_object_member SET scalar_json = '\"edited\"' \
-             WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
-            &[Value::Text(file_id.to_owned())],
+            "UPDATE json_object_member SET scalar_json = $1 \
+             WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $2",
+            &[
+                Value::Jsonb(serde_json::json!("edited").into()),
+                Value::Text(file_id.to_owned()),
+            ],
         )
         .await
         .unwrap_or_else(|error| panic!("row edit on '{path}' should commit: {error:?}"));
@@ -582,8 +592,8 @@ async fn untracked_json_file_produces_the_same_plugin_rows_as_a_tracked_one() {
 
 /// Foreign-key equivalence across lanes on the ordinary decode path.
 ///
-/// A tracked complete parse is retained as a certified packet, whose foreign
-/// keys are checked *within the batch* (`validate_certified_snapshot_packets`).
+/// A tracked complete parse is retained as a typed row packet, whose foreign
+/// keys are checked within the batch.
 /// An untracked complete parse takes the ordinary decode path instead, where
 /// foreign keys are resolved against live state by ordinary transaction
 /// validation. Those are different mechanisms, so equivalence has to be
@@ -1299,10 +1309,9 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_row_edit() {
         )
         .await
         .unwrap()
-        .rows()[0]
-            .get::<String>("payload_json")
-            .unwrap()
-            .contains("TAIL")
+        .rows()
+        .first()
+        .is_some_and(|row| jsonb_column_contains(row, "payload_json", "TAIL"))
     );
 
     lix.close().await.unwrap();
@@ -1350,10 +1359,10 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
         .unwrap();
     assert_eq!(current.rows().len(), 3);
     assert!(
-        current.rows().iter().any(|row| {
-            row.get::<String>("payload_json")
-                .is_ok_and(|payload| payload.contains("a tail"))
-        }),
+        current
+            .rows()
+            .iter()
+            .any(|row| jsonb_column_contains(row, "payload_json", "a tail")),
         "the sparse successor must overlay the immutable opening segment"
     );
     let historical = lix
@@ -1366,10 +1375,10 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
         .unwrap();
     assert_eq!(historical.rows().len(), 3);
     assert!(
-        historical.rows().iter().any(|row| {
-            row.get::<String>("payload_json")
-                .is_ok_and(|payload| payload.contains("bold"))
-        }),
+        historical
+            .rows()
+            .iter()
+            .any(|row| jsonb_column_contains(row, "payload_json", "bold")),
         "the opening certified segment must remain queryable through history"
     );
     lix.close().await.unwrap();
@@ -1444,10 +1453,7 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
     let inserted = rows
         .rows()
         .iter()
-        .find(|row| {
-            row.get::<String>("payload_json")
-                .is_ok_and(|payload| payload.contains("New paragraph."))
-        })
+        .find(|row| jsonb_column_contains(row, "payload_json", "New paragraph."))
         .and_then(|row| row.get::<String>("id").ok())
         .expect("inserted paragraph identity");
     assert_ne!(inserted, original);
@@ -1500,10 +1506,7 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
     let retained_id = retained
         .rows()
         .iter()
-        .find(|row| {
-            row.get::<String>("payload_json")
-                .is_ok_and(|payload| payload.contains("Edited after hydration."))
-        })
+        .find(|row| jsonb_column_contains(row, "payload_json", "Edited after hydration."))
         .and_then(|row| row.get::<String>("id").ok())
         .expect("edited paragraph remains queryable");
     assert_eq!(retained_id, inserted);
@@ -1560,8 +1563,9 @@ async fn v3_markdown_noncanonical_source_stays_in_file_arena_not_semantic_root()
     assert_eq!(document.rows().len(), 1);
     assert!(
         !document.rows()[0]
-            .get::<String>("format_json")
+            .get::<serde_json::Value>("format_json")
             .unwrap()
+            .to_string()
             .contains("lexical_fallback_base64"),
         "v3 semantic state must not duplicate accepted source bytes"
     );
@@ -1617,10 +1621,7 @@ where
     let edited_id = paragraphs
         .rows()
         .iter()
-        .find(|row| {
-            row.get::<String>("payload_json")
-                .is_ok_and(|payload| payload.contains("Peer 12 has"))
-        })
+        .find(|row| jsonb_column_contains(row, "payload_json", "Peer 12 has"))
         .and_then(|row| row.get::<String>("id").ok())
         .expect("restored Markdown target paragraph");
     lix.execute(
@@ -1998,10 +1999,7 @@ async fn v2_markdown_merges_unrelated_rows_and_regenerates_derived_bytes() {
         paragraphs
             .rows()
             .iter()
-            .find(|row| {
-                row.get::<String>("payload_json")
-                    .is_ok_and(|payload| payload.contains(needle))
-            })
+            .find(|row| jsonb_column_contains(row, "payload_json", needle))
             .and_then(|row| row.get::<String>("id").ok())
             .unwrap_or_else(|| panic!("paragraph containing '{needle}' should exist"))
     };
@@ -2362,7 +2360,7 @@ async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
 }
 
 #[tokio::test]
-async fn v2_json_unrelated_row_branch_merge_accepts_certified_snapshots() {
+async fn v2_json_unrelated_row_branch_merge_accepts_typed_rows() {
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
@@ -2388,9 +2386,12 @@ async fn v2_json_unrelated_row_branch_merge_accepts_certified_snapshots() {
         .unwrap();
 
     lix.execute(
-        "UPDATE json_object_member SET scalar_json = '\"target\"' \
-         WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())],
+        "UPDATE json_object_member SET scalar_json = $1 \
+         WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
+        &[
+            Value::Jsonb(serde_json::json!("target").into()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .expect("target JSON member should update");
@@ -2400,9 +2401,12 @@ async fn v2_json_unrelated_row_branch_merge_accepts_certified_snapshots() {
     .await
     .unwrap();
     lix.execute(
-        "UPDATE json_object_member SET scalar_json = '\"source\"' \
-         WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())],
+        "UPDATE json_object_member SET scalar_json = $1 \
+         WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $2",
+        &[
+            Value::Jsonb(serde_json::json!("source").into()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .expect("source JSON member should update");
@@ -2417,13 +2421,13 @@ async fn v2_json_unrelated_row_branch_merge_accepts_certified_snapshots() {
             source_branch_id: source.id.clone(),
         })
         .await
-        .expect("unrelated certified JSON rows should preview");
+        .expect("unrelated typed JSON rows should preview");
     assert!(preview.conflicts.is_empty());
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
     .await
-    .expect("certified JSON rows must not be decoded while fingerprinting the merge batch");
+    .expect("typed JSON rows must remain native while fingerprinting the merge batch");
 
     let merged = lix
         .execute(
@@ -2436,19 +2440,19 @@ async fn v2_json_unrelated_row_branch_merge_accepts_certified_snapshots() {
         .expect("merged JSON rows should query");
     assert_eq!(merged.len(), 2);
     assert_eq!(
-        merged.rows()[0].get::<String>("scalar_json").unwrap(),
-        r#""target""#
+        merged.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!("target").into())
     );
     assert_eq!(
-        merged.rows()[1].get::<String>("scalar_json").unwrap(),
-        r#""source""#
+        merged.rows()[1].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!("source").into())
     );
 
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn v2_json_same_row_branch_merge_runs_static_resolver_on_certified_snapshots() {
+async fn v2_json_same_row_branch_merge_runs_static_resolver_on_typed_rows() {
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
@@ -2474,9 +2478,12 @@ async fn v2_json_same_row_branch_merge_runs_static_resolver_on_certified_snapsho
         .unwrap();
 
     lix.execute(
-        "UPDATE json_object_member SET scalar_json = '\"target\"' \
-         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())],
+        "UPDATE json_object_member SET scalar_json = $1 \
+         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $2",
+        &[
+            Value::Jsonb(serde_json::json!("target").into()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .unwrap();
@@ -2486,9 +2493,12 @@ async fn v2_json_same_row_branch_merge_runs_static_resolver_on_certified_snapsho
     .await
     .unwrap();
     lix.execute(
-        "UPDATE json_object_member SET scalar_json = '\"source\"' \
-         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())],
+        "UPDATE json_object_member SET scalar_json = $1 \
+         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $2",
+        &[
+            Value::Jsonb(serde_json::json!("source").into()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .unwrap();
@@ -2502,7 +2512,7 @@ async fn v2_json_same_row_branch_merge_runs_static_resolver_on_certified_snapsho
         source_branch_id: source.id,
     })
     .await
-    .expect("the JSON static resolver should accept certified snapshots");
+    .expect("the JSON static resolver should accept typed rows");
 
     let merged = lix
         .execute(
@@ -2514,8 +2524,8 @@ async fn v2_json_same_row_branch_merge_runs_static_resolver_on_certified_snapsho
         .unwrap();
     assert_eq!(merged.len(), 1);
     assert_eq!(
-        merged.rows()[0].get::<String>("scalar_json").unwrap(),
-        r#""source""#
+        merged.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!("source").into())
     );
 
     lix.close().await.unwrap();
@@ -2548,9 +2558,12 @@ async fn v3_json_same_row_branch_merge_uses_fused_conflict_and_renderer_sinks() 
         .unwrap();
 
     lix.execute(
-        "UPDATE json_object_member SET scalar_json = '\"target\"' \
-         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())],
+        "UPDATE json_object_member SET scalar_json = $1 \
+         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $2",
+        &[
+            Value::Jsonb(serde_json::json!("target").into()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .unwrap();
@@ -2560,9 +2573,12 @@ async fn v3_json_same_row_branch_merge_uses_fused_conflict_and_renderer_sinks() 
     .await
     .unwrap();
     lix.execute(
-        "UPDATE json_object_member SET scalar_json = '\"source\"' \
-         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())],
+        "UPDATE json_object_member SET scalar_json = $1 \
+         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $2",
+        &[
+            Value::Jsonb(serde_json::json!("source").into()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .unwrap();
@@ -2588,8 +2604,8 @@ async fn v3_json_same_row_branch_merge_uses_fused_conflict_and_renderer_sinks() 
         .unwrap();
     assert_eq!(merged.len(), 1);
     assert_eq!(
-        merged.rows()[0].get::<String>("scalar_json").unwrap(),
-        r#""source""#
+        merged.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!("source").into())
     );
     assert_eq!(
         read_file(&lix, path).await.unwrap().as_deref(),
@@ -2976,8 +2992,8 @@ async fn json_first_structural_fallback_preserves_accepted_array_identities() {
         .unwrap();
     assert_eq!(after.rows().len(), 2);
     assert_eq!(
-        after.rows()[0].get::<String>("scalar_json").unwrap(),
-        r#""alpha""#
+        after.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!("alpha").into())
     );
     assert_eq!(after.rows()[0].get::<String>("id").unwrap(), alpha_id);
     assert_eq!(after.rows()[1].get::<String>("id").unwrap(), beta_id);
@@ -2986,7 +3002,7 @@ async fn json_first_structural_fallback_preserves_accepted_array_identities() {
         "UPDATE json_array_item SET scalar_json = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
         &[
-            Value::Text(r#""BETA""#.to_owned()),
+            Value::Jsonb(serde_json::json!("BETA").into()),
             Value::Text(beta_id),
             Value::Text(file_id),
         ],
@@ -3033,7 +3049,10 @@ async fn json_scalar_to_container_edit_uses_full_reconciliation() {
         .unwrap();
     assert_eq!(member.len(), 1);
     assert_eq!(member.rows()[0].get::<String>("kind").unwrap(), "object");
-    assert!(member.rows()[0].get::<String>("scalar_json").is_err());
+    assert_eq!(
+        member.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Null
+    );
 
     lix.close().await.unwrap();
 }
@@ -3069,7 +3088,10 @@ async fn json_scalar_boundary_insert_adds_sibling_through_full_reconciliation() 
     assert_eq!(members.len(), 2);
     assert_eq!(members.rows()[0].get::<String>("key").unwrap(), "a");
     assert_eq!(members.rows()[1].get::<String>("key").unwrap(), "b");
-    assert_eq!(members.rows()[1].get::<String>("scalar_json").unwrap(), "2");
+    assert_eq!(
+        members.rows()[1].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!(2).into())
+    );
 
     lix.close().await.unwrap();
 }
@@ -3107,8 +3129,8 @@ async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
     assert_eq!(members.len(), 1);
     assert_eq!(members.rows()[0].get::<String>("kind").unwrap(), "string");
     assert_eq!(
-        members.rows()[0].get::<String>("scalar_json").unwrap(),
-        r#""Ada""#
+        members.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!("Ada").into())
     );
 
     let edited = String::from_utf8(source)
@@ -3122,7 +3144,7 @@ async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
 
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'name'",
-        &[Value::Text(r#""Grace""#.to_string())],
+        &[Value::Jsonb(serde_json::json!("Grace").into())],
     )
     .await
     .unwrap();
@@ -3167,7 +3189,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
             &[
-                Value::Text(r#""ONE-A""#.to_owned()),
+                Value::Jsonb(serde_json::json!("ONE-A").into()),
                 Value::Text(file_id.clone()),
             ],
         )
@@ -3178,7 +3200,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $2",
             &[
-                Value::Text(r#""TWO-B""#.to_owned()),
+                Value::Jsonb(serde_json::json!("TWO-B").into()),
                 Value::Text(file_id.clone()),
             ],
         )
@@ -3200,7 +3222,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
             &[
-                Value::Text(r#""LWW-A""#.to_owned()),
+                Value::Jsonb(serde_json::json!("LWW-A").into()),
                 Value::Text(file_id.clone()),
             ],
         )
@@ -3211,7 +3233,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
             &[
-                Value::Text(r#""LWW-B""#.to_owned()),
+                Value::Jsonb(serde_json::json!("LWW-B").into()),
                 Value::Text(file_id.clone()),
             ],
         )
@@ -3241,7 +3263,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $2",
         &[
-            Value::Text(r#""AFTER-DIRECT-REJECT""#.to_owned()),
+            Value::Jsonb(serde_json::json!("AFTER-DIRECT-REJECT").into()),
             Value::Text(file_id.clone()),
         ],
     )
@@ -3257,7 +3279,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
         "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND lixcol_file_id = $2",
         &[
-            Value::Text(r#""BULK""#.to_owned()),
+            Value::Jsonb(serde_json::json!("BULK").into()),
             Value::Text(file_id.clone()),
         ],
     )
@@ -3316,7 +3338,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
         &[
-            Value::Text(r#""AFTER-FENCE""#.to_owned()),
+            Value::Jsonb(serde_json::json!("AFTER-FENCE").into()),
             Value::Text(file_id),
         ],
     )
@@ -3522,7 +3544,7 @@ async fn v2_json_ten_mib_unrelated_row_merge_benchmark() {
 /// End-to-end RocksDB gate for a same-row conflict over the same large
 /// tracked tree as the adjacent unrelated-row benchmark. The tiny built-in
 /// control row keeps the frozen reference runnable even when its JSON plugin
-/// merge path cannot fingerprint certified snapshots.
+/// merge path cannot fingerprint typed plugin rows.
 #[tokio::test]
 #[ignore = "10 MiB JSON same-row conflict-resolution merge benchmark"]
 async fn v2_json_ten_mib_same_row_canonical_b_merge_benchmark() {
@@ -3676,266 +3698,15 @@ async fn v3_json_reopen_uses_one_export_for_cold_successor() {
         )
         .await
         .unwrap();
-    assert_eq!(rows.rows()[0].get::<String>("scalar_json").unwrap(), "3");
+    assert_eq!(
+        rows.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!(3).into())
+    );
     reopened.close().await.unwrap();
 }
 
-#[async_trait::async_trait]
-trait CurrentPluginCheckpointCorruptionBackend:
-    Storage + Clone + Send + Sync + Sized + 'static
-{
-    fn open_checkpoint_fixture(path: &Path) -> Self;
-    async fn flush_checkpoint_fixture(&self);
-}
-
-#[async_trait::async_trait]
-impl CurrentPluginCheckpointCorruptionBackend for RocksDB {
-    fn open_checkpoint_fixture(path: &Path) -> Self {
-        Self::open(path).expect("open RocksDB plugin-checkpoint corruption fixture")
-    }
-
-    async fn flush_checkpoint_fixture(&self) {
-        self.flush()
-            .expect("flush RocksDB plugin-checkpoint corruption fixture");
-    }
-}
-
-#[async_trait::async_trait]
-impl CurrentPluginCheckpointCorruptionBackend for SlateDB {
-    fn open_checkpoint_fixture(path: &Path) -> Self {
-        Self::open(path).expect("open SlateDB plugin-checkpoint corruption fixture")
-    }
-
-    async fn flush_checkpoint_fixture(&self) {
-        self.flush_memtable_for_diagnostics()
-            .await
-            .expect("flush SlateDB plugin-checkpoint corruption fixture");
-    }
-}
-
 #[tokio::test]
-async fn rocksdb_corrupt_current_plugin_checkpoint_fails_public_actor_path() {
-    qualify_corrupt_current_plugin_checkpoint::<RocksDB>().await;
-}
-
-#[tokio::test]
-async fn slatedb_corrupt_current_plugin_checkpoint_fails_public_actor_path() {
-    qualify_corrupt_current_plugin_checkpoint::<SlateDB>().await;
-}
-
-async fn qualify_corrupt_current_plugin_checkpoint<B: CurrentPluginCheckpointCorruptionBackend>() {
-    const FILE_ID: &str = "01920000-0000-7000-8000-0000000000c1";
-    const PATH: &str = "/authenticated-checkpoint.json";
-    const CHECKPOINT_SPACE: &str = "plugin.current_checkpoint.v2";
-
-    let directory = tempfile::tempdir().expect("create plugin-checkpoint corruption fixture");
-    let storage_path = directory.path().join(".lix");
-    let database = B::open_checkpoint_fixture(&storage_path);
-    let lix = open_lix()
-        .with_storage(database.clone())
-        .await
-        .expect("open plugin-checkpoint corruption fixture");
-    install_reference_plugin_in_blank_registry(
-        &lix,
-        "plugin_json",
-        &build_json_plugin_archive(),
-        &["json_root", "json_object_member", "json_array_item"],
-    )
-    .await;
-    lix.execute(
-        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-        &[
-            Value::Text(FILE_ID.to_owned()),
-            Value::Text(PATH.to_owned()),
-            Value::Blob(br#"{"before":1}"#.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("materialize plugin file and its durable checkpoint");
-    let branch_id = lix
-        .active_branch_id()
-        .await
-        .expect("load plugin-checkpoint branch owner");
-    database.flush_checkpoint_fixture().await;
-    lix.close()
-        .await
-        .expect("close healthy plugin-checkpoint fixture");
-    drop(database);
-
-    let database = B::open_checkpoint_fixture(&storage_path);
-    let storage = StorageAdapter::new(database.clone());
-    let read = storage
-        .begin_read(StorageReadOptions::default())
-        .await
-        .expect("open plugin-checkpoint corruption read");
-    let branch_id_bytes =
-        uuid::Uuid::parse_str(&branch_id).expect("plugin-checkpoint branch owner is a UUID");
-    let file_id_bytes =
-        uuid::Uuid::parse_str(FILE_ID).expect("plugin-checkpoint file owner is a UUID");
-    let mut expected_key = Vec::with_capacity(32);
-    expected_key.extend_from_slice(branch_id_bytes.as_bytes());
-    expected_key.extend_from_slice(file_id_bytes.as_bytes());
-    let entries = space_inventory(&read, CHECKPOINT_SPACE).await;
-    drop(read);
-    let (_, mut value) = entries
-        .into_iter()
-        .find(|(key, _)| key == &expected_key)
-        .expect("real plugin operation must persist its current checkpoint");
-    assert!(
-        value.len() > 92,
-        "checkpoint payload must include authenticated bytes"
-    );
-    value[92] ^= 1;
-    let (space_id, _) = layout_space_catalog()
-        .into_iter()
-        .find(|(_, name)| *name == CHECKPOINT_SPACE)
-        .expect("plugin current-checkpoint space must be catalogued");
-    let mut writes = storage.new_write_set();
-    writes.put(
-        // A space id has exactly one value semantics; read it from Lix
-        // registry rather than restating it here.
-        lix::storage_bench::storage_space_by_id(space_id),
-        StorageKey(Bytes::from(expected_key)),
-        StorageValue {
-            bytes: Bytes::from(value),
-        },
-    );
-    storage
-        .commit_write_set(writes, StorageWriteOptions::default())
-        .await
-        .expect("commit physical plugin-checkpoint corruption fixture");
-    database.flush_checkpoint_fixture().await;
-    drop(storage);
-    drop(database);
-
-    let database = B::open_checkpoint_fixture(&storage_path);
-    let lix = open_lix()
-        .with_storage(database.clone())
-        .await
-        .expect("cold reopen plugin-checkpoint corruption fixture");
-    let error = write_file(&lix, PATH, br#"{"before":2}"#.to_vec())
-        .await
-        .expect_err("public plugin actor path must reject corrupt current checkpoint");
-    assert!(
-        error
-            .to_string()
-            .contains("plugin current checkpoint authentication digest mismatch"),
-        "unexpected public plugin-checkpoint corruption error: {error}"
-    );
-    lix.close()
-        .await
-        .expect("close rejected plugin-checkpoint fixture");
-    drop(database);
-}
-
-/// Lane parity for the durable actor checkpoint.
-///
-/// #1353 made plugin reconciliation lane-neutral, but the checkpoint was still
-/// withheld from untracked files, so every session re-parsed them from scratch.
-/// `plugin.current_checkpoint.v2` is a dedicated mutable side space keyed by
-/// `branch_id ++ file_id` — no lane column, no commit link, no changelog — and
-/// its validity is content-addressed, so publishing one for an untracked file
-/// creates no cross-lane state and can never serve stale rows: it either
-/// matches the current generation, blob hash and semantic root, or the load
-/// degrades into the cold rebuild it was accelerating.
-///
-/// The second half is the correctness crux. A restored actor that served stale
-/// rows would be silent corruption, so the edit after cold reopen has to
-/// re-render exactly the bytes a cold rebuild would have produced.
-#[tokio::test]
-async fn untracked_plugin_file_publishes_and_restores_its_durable_checkpoint() {
-    const FILE_ID: &str = "01920000-0000-7000-8000-0000000000c3";
-    const PATH: &str = "/untracked-durable-checkpoint.json";
-    const CHECKPOINT_SPACE: &str = "plugin.current_checkpoint.v2";
-
-    let root = tempfile::tempdir().expect("create untracked checkpoint fixture");
-    let lix = open_rocksdb_lix(root.path()).await;
-    install_reference_plugin_in_blank_registry(
-        &lix,
-        "plugin_json",
-        &build_json_plugin_archive(),
-        &["json_root", "json_object_member", "json_array_item"],
-    )
-    .await;
-    lix.execute(
-        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
-        &[
-            Value::Text(FILE_ID.to_owned()),
-            Value::Text(PATH.to_owned()),
-            Value::Blob(br#"{"alpha":"before"}"#.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("untracked plugin file should write");
-    let branch_id = lix
-        .active_branch_id()
-        .await
-        .expect("load untracked checkpoint branch owner");
-    lix.close()
-        .await
-        .expect("close untracked checkpoint fixture");
-
-    let mut expected_key = Vec::with_capacity(32);
-    expected_key.extend_from_slice(
-        uuid::Uuid::parse_str(&branch_id)
-            .expect("untracked checkpoint branch owner is a UUID")
-            .as_bytes(),
-    );
-    expected_key.extend_from_slice(
-        uuid::Uuid::parse_str(FILE_ID)
-            .expect("untracked checkpoint file owner is a UUID")
-            .as_bytes(),
-    );
-    let database =
-        RocksDB::open(root.path().join(".lix")).expect("reopen untracked checkpoint inventory");
-    let storage = StorageAdapter::new(database.clone());
-    let read = storage
-        .begin_read(StorageReadOptions::default())
-        .await
-        .expect("open untracked checkpoint inventory read");
-    let entries = space_inventory(&read, CHECKPOINT_SPACE).await;
-    drop(read);
-    drop(storage);
-    drop(database);
-    assert!(
-        entries.iter().any(|(key, _)| key == &expected_key),
-        "an untracked plugin file must publish its durable checkpoint like a tracked one"
-    );
-
-    let lix = open_rocksdb_lix(root.path()).await;
-    lix.execute(
-        "UPDATE json_object_member SET scalar_json = '\"after\"' \
-         WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
-        &[Value::Text(FILE_ID.to_owned())],
-    )
-    .await
-    .expect("a restored untracked actor should accept a row edit");
-    assert_eq!(
-        read_file(&lix, PATH).await.unwrap(),
-        Some(br#"{"alpha":"after"}"#.to_vec()),
-        "a restored checkpoint must re-render current bytes, never stale ones"
-    );
-    let still_untracked = lix
-        .execute(
-            "SELECT lixcol_untracked FROM lix_file WHERE id = $1",
-            &[Value::Text(FILE_ID.to_owned())],
-        )
-        .await
-        .expect("the untracked file should still be visible")
-        .rows()[0]
-        .get::<bool>("lixcol_untracked")
-        .expect("lane column should project");
-    assert!(
-        still_untracked,
-        "a durable checkpoint must not promote the file out of the untracked lane"
-    );
-    lix.close()
-        .await
-        .expect("close restored untracked checkpoint fixture");
-}
-
-#[tokio::test]
-async fn universal_row_page_streams_oversized_output_snapshot() {
+async fn universal_row_page_streams_oversized_jsonb_value() {
     const PATH: &str = "/universal-oversized-output.json";
     let value = "x".repeat(3 * 1024 * 1024);
     let bytes = serde_json::to_vec(&serde_json::json!({ "large": value })).unwrap();
@@ -3958,382 +3729,15 @@ async fn universal_row_page_streams_oversized_output_snapshot() {
         )
         .await
         .unwrap();
-    let scalar = rows.rows()[0].get::<String>("scalar_json").unwrap();
-    assert_eq!(
-        serde_json::from_str::<String>(&scalar).unwrap().len(),
-        3 * 1024 * 1024
-    );
+    let Value::Jsonb(scalar) = rows.rows()[0].get::<Value>("scalar_json").unwrap() else {
+        panic!("oversized scalar_json must project as native JSONB");
+    };
+    assert_eq!(scalar.to_value().as_str().unwrap().len(), 3 * 1024 * 1024);
     lix.close().await.unwrap();
 
     let reopened = open_rocksdb_lix(root.path()).await;
     assert_eq!(read_file(&reopened, PATH).await.unwrap(), Some(bytes));
     reopened.close().await.unwrap();
-}
-
-#[derive(Debug)]
-struct BenchmarkByteSource(Vec<u8>);
-
-impl WasmByteSource for BenchmarkByteSource {
-    fn len(&self) -> u64 {
-        self.0.len() as u64
-    }
-
-    fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, LixError> {
-        let start = usize::try_from(offset)
-            .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "benchmark source offset"))?;
-        let end = start
-            .checked_add(length as usize)
-            .ok_or_else(|| LixError::new(LixError::CODE_INVALID_PARAM, "benchmark source range"))?;
-        self.0
-            .get(start..end)
-            .map(<[u8]>::to_vec)
-            .ok_or_else(|| LixError::new(LixError::CODE_INVALID_PARAM, "benchmark source range"))
-    }
-}
-
-struct BenchmarkRowSource {
-    rows: Vec<WasmHostRow>,
-    next: usize,
-}
-
-impl WasmRowSource for BenchmarkRowSource {
-    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmRowPage>, LixError> {
-        if self.next == self.rows.len() {
-            return Ok(None);
-        }
-        let start = self.next;
-        let mut bytes = 0usize;
-        while self.next < self.rows.len() {
-            let row = &self.rows[self.next];
-            let size = row.key.schema_key.len()
-                + row.key.row_pk.iter().map(|part| part.len()).sum::<usize>()
-                + row.snapshot_content.len() as usize
-                + 64;
-            if self.next > start && bytes.saturating_add(size) > max_bytes as usize {
-                break;
-            }
-            bytes = bytes.saturating_add(size);
-            self.next += 1;
-        }
-        Ok(Some(WasmRowPage {
-            rows: self.rows[start..self.next].to_vec(),
-        }))
-    }
-}
-
-#[tokio::test]
-async fn v3_json_direct_cold_successor_preserves_durable_identity() {
-    let wasm = std::fs::read(Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json")))
-        .expect("read JSON component");
-    let runtime = lix::default_wasm_runtime().expect("default Wasm runtime");
-    let factory = runtime
-        .compile_component(
-            wasm,
-            WasmLimits::default(),
-            PluginCapabilities {
-                column_merger: false,
-                file_projection: true,
-            },
-        )
-        .await
-        .expect("compile JSON component");
-    let descriptor = WasmFileDescriptor {
-        file_id: "direct-cold-json".to_owned(),
-        path: Some("/direct-cold.json".to_owned()),
-        plugin: WasmPluginSelection {
-            plugin_key: "plugin_json".to_owned(),
-            generation: "direct".to_owned(),
-        },
-    };
-    let large_value = "x".repeat(96 * 1024);
-    let before = format!(r#"{{"a":"one","b":"{large_value}"}}"#).into_bytes();
-    let after = format!(r#"{{"a":"ONE","b":"{large_value}"}}"#).into_bytes();
-    let oversized_snapshot = serde_json::to_vec(&serde_json::json!({
-        "parent_id": "root",
-        "key": "b",
-        "order_key": "80",
-        "kind": "string",
-        "scalar_json": serde_json::to_string(&large_value).unwrap(),
-    }))
-    .unwrap();
-    let oversized_snapshot_len = oversized_snapshot.len() as u64;
-    let rows = vec![
-        WasmRow {
-            key: WasmRowKey::from_owned_parts("json_root", vec!["root".to_owned()]),
-            snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
-                br#"{"id":"root","kind":"object"}"#,
-            )),
-        },
-        WasmRow {
-            key: WasmRowKey::from_owned_parts(
-                "json_object_member",
-                vec!["root".to_owned(), "a".to_owned()],
-            ),
-            snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
-                br#"{"parent_id":"root","key":"a","order_key":"40","kind":"string","scalar_json":"\"one\""}"#,
-            )),
-        },
-        WasmRow {
-            key: WasmRowKey::from_owned_parts(
-                "json_object_member",
-                vec!["root".to_owned(), "b".to_owned()],
-            ),
-            snapshot_content: WasmHostBytes::Source(WasmSourceSlice {
-                source: Arc::new(BenchmarkByteSource(oversized_snapshot)),
-                range: WasmSourceRange {
-                    offset: 0,
-                    length: oversized_snapshot_len,
-                },
-            }),
-        },
-    ];
-    let original_keys = rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
-
-    let limits = WasmTransitionLimits {
-        max_page_bytes: 32 * 1024,
-        max_record_bytes: 32 * 1024,
-        max_total_bytes: 1024 * 1024,
-        max_inline_input_bytes: 32 * 1024,
-        ..WasmTransitionLimits::default()
-    };
-    let mut actor = factory.instantiate_actor().await.unwrap();
-    let cold = actor
-        .cold_file_changed(
-            limits,
-            WasmColdFileUpdate {
-                before_descriptor: descriptor.clone(),
-                after_descriptor: descriptor,
-                before: Some(Arc::new(BenchmarkByteSource(before))),
-                edits: vec![WasmInputSplice {
-                    offset: 6,
-                    delete_len: 3,
-                    insert: WasmInputBytes::Inline(b"ONE".to_vec()),
-                }],
-                after: Arc::new(BenchmarkByteSource(after)),
-                creates: WasmCreateContext { high: 13, low: 17 },
-                rows: Box::new(BenchmarkRowSource { rows, next: 0 }),
-            },
-        )
-        .await
-        .unwrap();
-    let mut changed_keys = Vec::new();
-    while let Some(page) = actor
-        .next_change_page(cold.transition, cold.changes, 2 * 1024 * 1024)
-        .await
-        .unwrap()
-    {
-        changed_keys.extend(
-            page.changes
-                .changes
-                .iter()
-                .filter_map(WasmRowChange::row_key)
-                .cloned(),
-        );
-    }
-    actor.finish_transition(cold.transition).await.unwrap();
-    assert_eq!(changed_keys.len(), 1);
-    assert!(original_keys.contains(&changed_keys[0]));
-    actor.retire().await.unwrap();
-}
-
-fn json_ten_mib_durable_rows() -> Vec<WasmHostRow> {
-    let mut rows = Vec::with_capacity(JSON_TEN_MIB_PROPERTY_COUNT + 1);
-    rows.push(WasmRow {
-        key: WasmRowKey::from_owned_parts("json_root", vec!["root".to_owned()]),
-        snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
-            br#"{"id":"root","kind":"object"}"#,
-        )),
-    });
-    let mut state = 0x6a73_6f6e_2d31_306du64;
-    let base_bytes = 2 + JSON_TEN_MIB_PROPERTY_COUNT * 44 + JSON_TEN_MIB_PROPERTY_COUNT - 1;
-    let padding = JSON_TEN_MIB_BYTES - base_bytes;
-    let padding_per_property = padding / JSON_TEN_MIB_PROPERTY_COUNT;
-    let extra_padding_properties = padding % JSON_TEN_MIB_PROPERTY_COUNT;
-    for index in 0..JSON_TEN_MIB_PROPERTY_COUNT {
-        state = splitmix64(state);
-        let first = state;
-        state = splitmix64(state);
-        let second = state as u32;
-        let padding = padding_per_property + usize::from(index < extra_padding_properties);
-        let key = format!("property_{index:06}");
-        let value = format!("{first:016x}{second:08x}{}", "f".repeat(padding));
-        let order_key = format!("{:016x}", (index as u64).saturating_mul(2) + 1);
-        let snapshot = serde_json::to_vec(&serde_json::json!({
-            "parent_id": "root",
-            "key": key,
-            "order_key": order_key,
-            "kind": "string",
-            "scalar_json": serde_json::to_string(&value).unwrap(),
-        }))
-        .unwrap();
-        rows.push(WasmRow {
-            key: WasmRowKey::from_owned_parts("json_object_member", vec!["root".to_owned(), key]),
-            snapshot_content: WasmHostBytes::Inline(Bytes::from(snapshot)),
-        });
-    }
-    rows
-}
-
-async fn drain_direct_file_transition(
-    actor: &mut dyn WasmComponentActor,
-    transition: WasmFileTransition,
-) -> WasmTransitionCounters {
-    while actor
-        .next_change_page(transition.transition, transition.changes, 2 * 1024 * 1024)
-        .await
-        .unwrap()
-        .is_some()
-    {}
-    let _ = actor.take_certified_row_batches(transition.transition);
-    actor
-        .finish_transition(transition.transition)
-        .await
-        .unwrap()
-}
-
-#[tokio::test]
-#[ignore = "10 MiB direct Wasm hydrate+update versus cold-successor A/B"]
-async fn v3_json_direct_cold_successor_benchmark() {
-    let samples = std::env::var("LIX_BENCH_SAMPLES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(3);
-    let wasm = std::fs::read(Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json")))
-        .expect("read JSON component");
-    let factory = lix::default_wasm_runtime()
-        .unwrap()
-        .compile_component(
-            wasm,
-            WasmLimits {
-                max_memory_bytes: 128 * 1024 * 1024,
-                ..WasmLimits::default()
-            },
-            PluginCapabilities {
-                column_merger: false,
-                file_projection: true,
-            },
-        )
-        .await
-        .unwrap();
-    let descriptor = WasmFileDescriptor {
-        file_id: "direct-cold-large-json".to_owned(),
-        path: Some("/direct-cold-large.json".to_owned()),
-        plugin: WasmPluginSelection {
-            plugin_key: "plugin_json".to_owned(),
-            generation: "direct".to_owned(),
-        },
-    };
-    let creates = WasmCreateContext { high: 13, low: 17 };
-    let (before, edit_offset, _) = json_ten_mib_flat_fixture();
-    let mut after = before.clone();
-    after[edit_offset] = alternate_ascii_hex(after[edit_offset]);
-    let rows = json_ten_mib_durable_rows();
-    for lane in ["hydrate_then_update", "cold_successor"] {
-        if std::env::var("LIX_BENCH_LANE").is_ok_and(|selected| selected != lane) {
-            continue;
-        }
-        let mut elapsed = Vec::new();
-        for sample in 0..samples {
-            let source_rows = rows.clone();
-            let before_source = Arc::new(BenchmarkByteSource(before.clone()));
-            let after_source = Arc::new(BenchmarkByteSource(after.clone()));
-            let mut actor = factory.instantiate_actor().await.unwrap();
-            let allocation_scope = AllocationScope::start();
-            let started = Instant::now();
-            let counters = if lane == "hydrate_then_update" {
-                let hydrated = actor
-                    .open_rows(
-                        WasmTransitionLimits::default(),
-                        WasmOpenRowsInput {
-                            descriptor: descriptor.clone(),
-                            rows: Box::new(BenchmarkRowSource {
-                                rows: source_rows,
-                                next: 0,
-                            }),
-                            accepted: Some(before_source.clone()),
-                        },
-                    )
-                    .await
-                    .unwrap();
-                assert!(
-                    actor
-                        .next_edit_page(hydrated.transition, hydrated.edits, 1024, 2 * 1024 * 1024,)
-                        .await
-                        .unwrap()
-                        .is_none()
-                );
-                let mut counters = actor.finish_transition(hydrated.transition).await.unwrap();
-                let transition = actor
-                    .file_changed(
-                        hydrated.document,
-                        WasmTransitionLimits::default(),
-                        WasmFileUpdate {
-                            before_descriptor: descriptor.clone(),
-                            after_descriptor: descriptor.clone(),
-                            before: before_source,
-                            edits: vec![WasmInputSplice {
-                                offset: edit_offset as u64,
-                                delete_len: 1,
-                                insert: WasmInputBytes::Inline(vec![after[edit_offset]]),
-                            }],
-                            after: after_source,
-                            creates,
-                            rows: None,
-                            prior_row_keys: None,
-                        },
-                    )
-                    .await
-                    .unwrap();
-                counters.accumulate(drain_direct_file_transition(actor.as_mut(), transition).await);
-                counters
-            } else {
-                let transition = actor
-                    .cold_file_changed(
-                        WasmTransitionLimits::default(),
-                        WasmColdFileUpdate {
-                            before_descriptor: descriptor.clone(),
-                            after_descriptor: descriptor.clone(),
-                            before: Some(before_source),
-                            edits: vec![WasmInputSplice {
-                                offset: edit_offset as u64,
-                                delete_len: 1,
-                                insert: WasmInputBytes::Inline(vec![after[edit_offset]]),
-                            }],
-                            after: after_source,
-                            creates,
-                            rows: Box::new(BenchmarkRowSource {
-                                rows: source_rows,
-                                next: 0,
-                            }),
-                        },
-                    )
-                    .await
-                    .unwrap();
-                drain_direct_file_transition(actor.as_mut(), transition).await
-            };
-            let measurement =
-                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
-            eprintln!(
-                "json_direct_cold lane={lane} sample={sample} elapsed_ms={:.3} peak_live_mb={:.3} \
-                 allocated_mb={:.3} exports={} imports={} boundary_mb={:.3} guest_hwm_mb={:.3}",
-                measurement.elapsed_ms,
-                measurement.allocations.peak_live_bytes_delta as f64 / 1_000_000.0,
-                measurement.allocations.allocated_bytes as f64 / 1_000_000.0,
-                counters.guest_export_calls,
-                counters.component_import_calls,
-                counters.component_boundary_bytes as f64 / 1_000_000.0,
-                counters.guest_linear_memory_high_water_bytes as f64 / 1_000_000.0,
-            );
-            elapsed.push(measurement.elapsed_ms);
-            actor.retire().await.unwrap();
-        }
-        elapsed.sort_by(f64::total_cmp);
-        eprintln!(
-            "json_direct_cold lane={lane} raw_ms={elapsed:?} p50_ms={:.3} p95_ms={:.3}",
-            p50_ms(&elapsed),
-            p95_ms(&elapsed),
-        );
-    }
 }
 
 #[tokio::test]
@@ -4373,8 +3777,8 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
     assert_eq!(current.rows().len(), 2);
     assert_eq!(current.rows()[0].get::<String>("key").unwrap(), "a");
     assert_eq!(
-        current.rows()[0].get::<String>("scalar_json").unwrap(),
-        r#""ONE""#
+        current.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!("ONE").into())
     );
     assert_eq!(current.rows()[1].get::<String>("key").unwrap(), "b");
 
@@ -4388,8 +3792,8 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
         .unwrap();
     assert_eq!(historical.rows().len(), 2);
     assert_eq!(
-        historical.rows()[0].get::<String>("scalar_json").unwrap(),
-        r#""one""#
+        historical.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!("one").into())
     );
     lix.close().await.unwrap();
 }
@@ -4433,9 +3837,9 @@ async fn v3_json_cold_hydration_after_actor_eviction_preserves_sparse_successor(
         .await
         .unwrap()
         .rows()[0]
-            .get::<String>("scalar_json")
+            .get::<Value>("scalar_json")
             .unwrap(),
-        r#""ONE""#
+        Value::Jsonb(serde_json::json!("ONE").into())
     );
     lix.close().await.unwrap();
 
@@ -4459,9 +3863,9 @@ async fn v3_json_cold_hydration_after_actor_eviction_preserves_sparse_successor(
             .await
             .unwrap()
             .rows()[0]
-            .get::<String>("scalar_json")
+            .get::<Value>("scalar_json")
             .unwrap(),
-        r#""TWO""#
+        Value::Jsonb(serde_json::json!("TWO").into())
     );
 
     reopened.close().await.unwrap();
@@ -4753,7 +4157,7 @@ fn report_cold_materialized_open(
         );
         assert_eq!(
             counters.full_state_semantic_rows_materialized, 0,
-            "{label} durable checkpoint must avoid semantic-row hydration"
+            "{label} typed cold-open path must avoid semantic-row hydration"
         );
         assert_eq!(counters.private_document_cache_hits, 1);
         assert_eq!(counters.full_document_reparses, 0);
@@ -4827,7 +4231,7 @@ async fn v2_json_cold_row_write_is_scoped_by_file_despite_shared_root_keys() {
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
         &[
-            Value::Text(r#""FIRST""#.to_string()),
+            Value::Jsonb(serde_json::json!("FIRST").into()),
             Value::Text(first_id.clone()),
         ],
     )
@@ -4848,8 +4252,8 @@ async fn v2_json_cold_row_write_is_scoped_by_file_despite_shared_root_keys() {
         .await
         .unwrap();
     assert_eq!(
-        untouched.rows()[0].get::<String>("scalar_json").unwrap(),
-        r#""second""#
+        untouched.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!("second").into())
     );
     lix.close().await.unwrap();
 }
@@ -4877,7 +4281,7 @@ async fn v2_json_row_write_rollback_keeps_original_bytes_and_actor() {
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
             &[
-                Value::Text(r#""rolled-back""#.to_string()),
+                Value::Jsonb(serde_json::json!("rolled-back").into()),
                 Value::Text(file_id.clone()),
             ],
         )
@@ -4901,7 +4305,10 @@ async fn v2_json_row_write_rollback_keeps_original_bytes_and_actor() {
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
-        &[Value::Text(r#""after""#.to_string()), Value::Text(file_id)],
+        &[
+            Value::Jsonb(serde_json::json!("after").into()),
+            Value::Text(file_id),
+        ],
     )
     .await
     .unwrap();
@@ -4929,14 +4336,14 @@ async fn same_base_json_transactions_resolve_overlap_and_converge() {
     let mut first_transaction = first.begin_transaction().await.unwrap();
     let mut second_transaction = second.begin_transaction().await.unwrap();
     for (transaction, value) in [
-        (&mut first_transaction, r#""first""#),
-        (&mut second_transaction, r#""second""#),
+        (&mut first_transaction, serde_json::json!("first")),
+        (&mut second_transaction, serde_json::json!("second")),
     ] {
         transaction
             .execute(
                 "UPDATE json_object_member SET scalar_json = $1 \
                  WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
-                &[Value::Text(value.to_owned()), Value::Text(file_id.clone())],
+                &[Value::Jsonb(value.into()), Value::Text(file_id.clone())],
             )
             .await
             .unwrap();
@@ -5244,7 +4651,10 @@ async fn v2_json_rejects_mixed_byte_and_row_transitions_in_one_transaction() {
         .execute(
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
-            &[Value::Text(r#""row""#.to_string()), Value::Text(file_id)],
+            &[
+                Value::Jsonb(serde_json::json!("row").into()),
+                Value::Text(file_id),
+            ],
         )
         .await
         .expect_err("one transaction must choose byte or semantic authority per file");
@@ -5316,15 +4726,15 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
         )
         .await
         .unwrap();
-    let element_json = element.rows()[0]
-        .get::<String>("element_json")
-        .unwrap()
-        .replacen(r#""isDeleted":false"#, r#""isDeleted":true"#, 1);
+    let mut element_json = element.rows()[0]
+        .get::<serde_json::Value>("element_json")
+        .unwrap();
+    element_json["isDeleted"] = serde_json::Value::Bool(true);
     lix.execute(
         "UPDATE excalidraw_element \
          SET element_json = $1, is_deleted = $2 \
          WHERE id = 'b'",
-        &[Value::Text(element_json), Value::Boolean(true)],
+        &[Value::Jsonb(element_json.into()), Value::Boolean(true)],
     )
     .await
     .unwrap();
@@ -5337,7 +4747,7 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
         serde_json::Value::Bool(true)
     );
 
-    let first_element = lix
+    let mut first_element = lix
         .execute(
             "SELECT element_json FROM excalidraw_element WHERE id = 'a'",
             &[],
@@ -5345,12 +4755,12 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
         .await
         .unwrap()
         .rows()[0]
-        .get::<String>("element_json")
-        .unwrap()
-        .replacen(r#""x":123.5"#, r#""x":123456.75"#, 1);
+        .get::<serde_json::Value>("element_json")
+        .unwrap();
+    first_element["x"] = serde_json::json!(123456.75);
     lix.execute(
         "UPDATE excalidraw_element SET element_json = $1 WHERE id = 'a'",
-        &[Value::Text(first_element)],
+        &[Value::Jsonb(first_element.into())],
     )
     .await
     .expect("semantic element growth should render");
@@ -5375,14 +4785,16 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
         .unwrap();
     assert!(
         elements.rows()[0]
-            .get::<String>("element_json")
+            .get::<serde_json::Value>("element_json")
             .unwrap()
+            .to_string()
             .contains("123456.75")
     );
     assert!(
         elements.rows()[1]
-            .get::<String>("element_json")
+            .get::<serde_json::Value>("element_json")
             .unwrap()
+            .to_string()
             .contains(r#""x":21"#)
     );
 
@@ -5538,8 +4950,9 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
         .await
         .unwrap()
         .rows()[0]
-            .get::<String>("element_json")
+            .get::<serde_json::Value>("element_json")
             .unwrap()
+            .to_string()
             .contains("123.5")
     );
     assert!(
@@ -5551,8 +4964,9 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
         .await
         .unwrap()
         .rows()[0]
-            .get::<String>("element_json")
+            .get::<serde_json::Value>("element_json")
             .unwrap()
+            .to_string()
             .contains("1.25")
     );
     lix.close().await.unwrap();
@@ -5750,6 +5164,7 @@ where
 }
 
 #[tokio::test]
+#[ignore = "CEB2 was retired by the protocol-v69 typed snapshot hard cut"]
 async fn v3_ceb2_roundtrip_corruption_and_reopen_memory() {
     let storage = lix::Memory::new();
     write_and_verify_ceb2_fixture(&storage).await;
@@ -5759,6 +5174,7 @@ async fn v3_ceb2_roundtrip_corruption_and_reopen_memory() {
 }
 
 #[tokio::test]
+#[ignore = "CEB2 was retired by the protocol-v69 typed snapshot hard cut"]
 async fn v3_ceb2_roundtrip_corruption_and_reopen_rocksdb() {
     let root = tempfile::tempdir().expect("create CEB2 RocksDB directory");
     let path = root.path().join("ceb2.rocksdb");
@@ -5778,6 +5194,7 @@ async fn v3_ceb2_roundtrip_corruption_and_reopen_rocksdb() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "CEB2 was retired by the protocol-v69 typed snapshot hard cut"]
 async fn v3_ceb2_roundtrip_corruption_and_reopen_slatedb() {
     let root = tempfile::tempdir().expect("create CEB2 SlateDB directory");
     let path = root.path().join("ceb2.slatedb");
@@ -5833,7 +5250,11 @@ async fn v3_ceb2_certified_row_read_benchmark() {
                 )
                 .await
                 .expect("read one certified CEB2 row");
-            black_box(result.rows()[0].get::<String>("element_json").unwrap());
+            black_box(
+                result.rows()[0]
+                    .get::<serde_json::Value>("element_json")
+                    .unwrap(),
+            );
         }
         let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
         eprintln!(
@@ -5905,7 +5326,7 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
         .await
         .unwrap()
         .rows()[0]
-        .get::<String>("element_json")
+        .get::<serde_json::Value>("element_json")
         .unwrap();
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
@@ -5917,11 +5338,15 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
         .await
         .unwrap();
 
-    let target_json = original.replacen(r#""x":1"#, r#""x":111"#, 1);
+    let mut target_json = original.clone();
+    target_json["x"] = serde_json::json!(111);
     lix.execute(
         "UPDATE excalidraw_element SET element_json = $1 \
          WHERE id = 'shape' AND lixcol_file_id = $2",
-        &[Value::Text(target_json), Value::Text(file_id.clone())],
+        &[
+            Value::Jsonb(target_json.into()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .expect("target element edit should commit");
@@ -5932,11 +5357,15 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
     })
     .await
     .unwrap();
-    let source_json = original.replacen(r#""x":1"#, r#""x":222"#, 1);
+    let mut source_json = original;
+    source_json["x"] = serde_json::json!(222);
     lix.execute(
         "UPDATE excalidraw_element SET element_json = $1 \
          WHERE id = 'shape' AND lixcol_file_id = $2",
-        &[Value::Text(source_json), Value::Text(file_id.clone())],
+        &[
+            Value::Jsonb(source_json.into()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .expect("source element edit should commit");
@@ -6001,7 +5430,7 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
         .await
         .unwrap()
         .rows()[0]
-        .get::<String>("element_json")
+        .get::<serde_json::Value>("element_json")
         .unwrap();
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
@@ -6013,11 +5442,15 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
         .await
         .unwrap();
 
-    let target_json = original.replacen(r#""x":1"#, r#""x":111"#, 1);
+    let mut target_json = original.clone();
+    target_json["x"] = serde_json::json!(111);
     lix.execute(
         "UPDATE excalidraw_element SET element_json = $1 \
          WHERE id = 'shape' AND lixcol_file_id = $2",
-        &[Value::Text(target_json), Value::Text(file_id.clone())],
+        &[
+            Value::Jsonb(target_json.into()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .expect("target element edit should commit");
@@ -6028,11 +5461,15 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
     })
     .await
     .unwrap();
-    let source_json = original.replacen(r#""x":1"#, r#""x":222"#, 1);
+    let mut source_json = original;
+    source_json["x"] = serde_json::json!(222);
     lix.execute(
         "UPDATE excalidraw_element SET element_json = $1 \
          WHERE id = 'shape' AND lixcol_file_id = $2",
-        &[Value::Text(source_json), Value::Text(file_id.clone())],
+        &[
+            Value::Jsonb(source_json.into()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .expect("source element edit should commit");
@@ -6233,9 +5670,18 @@ async fn v2_csv_file_incarnation_fences_old_observations_after_delete_and_recrea
     .await
     .unwrap();
     let new_bytes = b"new,incarnation\n".to_vec();
-    write_file(&lix, path, new_bytes.clone()).await.unwrap();
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+        &[
+            Value::Text(old_file_id.clone()),
+            Value::Text(path.to_string()),
+            Value::Blob(new_bytes.clone().into()),
+        ],
+    )
+    .await
+    .expect("recreation should deliberately reuse the durable file identity");
     let new_file_id = file_id_at_path(&lix, path).await;
-    assert_ne!(old_file_id, new_file_id);
+    assert_eq!(old_file_id, new_file_id);
 
     let stale_error = write_file(&stale, path, b"stale,overwrite\n".to_vec())
         .await
@@ -6247,6 +5693,63 @@ async fn v2_csv_file_incarnation_fences_old_observations_after_delete_and_recrea
 
     stale.close().await.unwrap();
     lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn csv_sql_insert_materializes_nullable_typed_null_and_reopens() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = "/nullable-layout.csv";
+    let lix = open_filesystem_lix(tempdir.path()).await;
+    install_plugin(&lix, "plugin_csv", &build_csv_plugin_archive())
+        .await
+        .unwrap();
+    write_file(&lix, path, b"base,one\n".to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+
+    lix.execute(
+        "INSERT INTO csv_row (id, order_key, cells, lixcol_file_id) VALUES ($1, $2, $3, $4)",
+        &[
+            Value::Text("019c6b89-bb18-77a8-9164-000000000001".to_string()),
+            Value::Text("fffffffffffffff0".to_string()),
+            Value::Jsonb(serde_json::json!(["created", "without-layout"]).into()),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .expect("omitted nullable layout should materialize as native SQL NULL");
+    assert_query_count(
+        &lix,
+        "SELECT COUNT(*) AS count FROM csv_row WHERE id = $1 AND layout IS NULL",
+        &[Value::Text(
+            "019c6b89-bb18-77a8-9164-000000000001".to_string(),
+        )],
+        1,
+    )
+    .await;
+    assert!(
+        read_file(&lix, path)
+            .await
+            .unwrap()
+            .unwrap()
+            .windows(b"created,without-layout".len())
+            .any(|window| window == b"created,without-layout")
+    );
+    lix.close().await.unwrap();
+
+    let reopened = open_filesystem_lix(tempdir.path()).await;
+    assert_query_count(
+        &reopened,
+        "SELECT COUNT(*) AS count FROM csv_row WHERE id = $1 AND layout IS NULL AND lixcol_file_id = $2",
+        &[
+            Value::Text("019c6b89-bb18-77a8-9164-000000000001".to_string()),
+            Value::Text(file_id),
+        ],
+        1,
+    )
+    .await;
+    reopened.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -6763,7 +6266,7 @@ where
             assert_eq!(
                 row_pk,
                 vec![serde_json::Value::String(id.clone())],
-                "csv_row snapshot identity must equal its durable primary key"
+                "csv_row typed identity must equal its durable primary key"
             );
             CsvV2Row {
                 id,
@@ -6772,7 +6275,7 @@ where
                     .get::<serde_json::Value>("cells")
                     .unwrap()
                     .as_array()
-                    .expect("csv_row snapshot must have cells")
+                    .expect("csv_row typed row must have cells")
                     .iter()
                     .map(|cell| {
                         cell.as_str()
@@ -7297,6 +6800,26 @@ where
         .transpose()
 }
 
+async fn assert_query_count<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    sql: &str,
+    params: &[Value],
+    expected: i64,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let result = lix
+        .execute(sql, params)
+        .await
+        .expect("count query should execute");
+    assert_eq!(
+        result.rows()[0]
+            .get::<i64>("count")
+            .expect("count query should return an integer"),
+        expected
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstalledPluginInfo {
     key: String,
@@ -7509,7 +7032,7 @@ const JSON_V2_GUEST_MEMORY_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
 struct NativeJsonControlMember {
     key: String,
     order_key: String,
-    scalar_json: String,
+    scalar_json: serde_json::Value,
 }
 
 /// A prebuilt public-SQL statement. SQL text and bound values are assembled
@@ -7669,8 +7192,7 @@ fn native_json_control_members(source: &[u8]) -> Vec<NativeJsonControlMember> {
                 .get(&key)
                 .and_then(serde_json::Value::as_str)
                 .expect("flat JSON fixture values must be strings");
-            let scalar_json =
-                serde_json::to_string(scalar).expect("flat JSON fixture scalar must serialize");
+            let scalar_json = serde_json::json!(scalar);
             let numerator =
                 u128::try_from(index + 1).expect("property index fits u128") * u128::from(u64::MAX);
             let order_rank =
@@ -7733,7 +7255,7 @@ fn native_json_control_member_insert_chunks(
                     let first = index * params_per_member + 1;
                     params.push(Value::Text(member.key.clone()));
                     params.push(Value::Text(member.order_key.clone()));
-                    params.push(Value::Text(member.scalar_json.clone()));
+                    params.push(Value::Jsonb(member.scalar_json.clone().into()));
                     match file_id {
                         None => {
                             format!("('root', ${first}, ${}, 'string', ${})", first + 1, first + 2)

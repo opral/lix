@@ -1562,7 +1562,6 @@ async fn execute_logical_plan_collected_batches(
 fn retain_columnar_result(fields: &[Field], batches: &[RecordBatch]) -> bool {
     const COLUMNAR_CELL_THRESHOLD: usize = 4_096;
     if fields.is_empty()
-        || fields.iter().any(|field| field_is_json(field))
         || fields.iter().any(|field| {
             !matches!(
                 field.data_type(),
@@ -3095,6 +3094,72 @@ pub(crate) fn query_result_from_batches(
     })
 }
 
+/// Materializes Arrow batches into one row-major value arena.
+///
+/// The public result backing can retain this arena directly, avoiding one
+/// allocation for every result row and the cache-unfriendly column-by-column
+/// writes into thousands of independently allocated `Vec`s.
+pub(crate) fn query_values_from_batches(
+    result_fields: &[Field],
+    batches: &[RecordBatch],
+) -> Result<(Vec<Value>, usize), LixError> {
+    let column_count = result_fields.len();
+    let mut row_count = 0_usize;
+    let mut cell_count = 0_usize;
+    for batch in batches {
+        if batch.num_columns() != column_count {
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!(
+                    "SQL result batch has {} columns but the result schema has {column_count}",
+                    batch.num_columns()
+                ),
+            ));
+        }
+        row_count = row_count.checked_add(batch.num_rows()).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "SQL result row count exceeds addressable memory",
+            )
+        })?;
+        let batch_cells = batch.num_rows().checked_mul(column_count).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "SQL result cell count exceeds addressable memory",
+            )
+        })?;
+        cell_count = cell_count.checked_add(batch_cells).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "SQL result cell count exceeds addressable memory",
+            )
+        })?;
+    }
+    let mut values = Vec::with_capacity(cell_count);
+    for batch in batches {
+        let cursors = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(column_index, array)| {
+                column_cursor(result_fields.get(column_index), array.as_ref())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for row_index in 0..batch.num_rows() {
+            for cursor in &cursors {
+                values.push(cursor.value(row_index)?);
+            }
+        }
+    }
+    if values.len() != cell_count {
+        return Err(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "SQL result values do not match the checked result shape",
+        ));
+    }
+    Ok((values, row_count))
+}
+
 /// Appends one batch to `rows`, filling it column by column.
 ///
 /// Rows are grown to their final width first, then each column is downcast once
@@ -3232,6 +3297,81 @@ fn downcast_column<'a, ArrayType: 'static>(
 }
 
 impl ColumnCursor<'_> {
+    fn value(&self, row_index: usize) -> Result<Value, LixError> {
+        let value = match self {
+            Self::Null => Value::Null,
+            Self::Boolean(values) => {
+                if values.is_null(row_index) {
+                    Value::Null
+                } else {
+                    Value::Boolean(values.value(row_index))
+                }
+            }
+            Self::Int8(values) => integer_value(*values, row_index),
+            Self::Int16(values) => integer_value(*values, row_index),
+            Self::Int32(values) => integer_value(*values, row_index),
+            Self::Int64(values) => integer_value(*values, row_index),
+            Self::UInt8(values) => integer_value(*values, row_index),
+            Self::UInt16(values) => integer_value(*values, row_index),
+            Self::UInt32(values) => integer_value(*values, row_index),
+            Self::UInt64(values) => {
+                if values.is_null(row_index) {
+                    Value::Null
+                } else {
+                    let value = values.value(row_index);
+                    i64::try_from(value)
+                        .map(Value::Integer)
+                        .unwrap_or_else(|_| Value::Text(value.to_string()))
+                }
+            }
+            Self::Float32(values) => real_value(*values, row_index)?,
+            Self::Float64(values) => real_value(*values, row_index)?,
+            Self::Utf8(values, kind) => {
+                if values.is_null(row_index) {
+                    Value::Null
+                } else {
+                    text_value(values.value(row_index), *kind)
+                }
+            }
+            Self::LargeUtf8(values, kind) => {
+                if values.is_null(row_index) {
+                    Value::Null
+                } else {
+                    text_value(values.value(row_index), *kind)
+                }
+            }
+            Self::Utf8View(values, kind) => {
+                if values.is_null(row_index) {
+                    Value::Null
+                } else {
+                    text_value(values.value(row_index), *kind)
+                }
+            }
+            Self::Binary(values) => {
+                if values.is_null(row_index) {
+                    Value::Null
+                } else {
+                    Value::Blob(values.value(row_index).into())
+                }
+            }
+            Self::LargeBinary(values) => {
+                if values.is_null(row_index) {
+                    Value::Null
+                } else {
+                    Value::Blob(values.value(row_index).into())
+                }
+            }
+            Self::TimestampMicrosecond(values) => {
+                if values.is_null(row_index) {
+                    Value::Null
+                } else {
+                    Value::Timestamptz(values.value(row_index))
+                }
+            }
+        };
+        Ok(value)
+    }
+
     /// Pushes this column's value onto every row of the batch.
     ///
     /// `rows` is exactly the batch's row window, so row `n` of the slice is row
@@ -3336,6 +3476,33 @@ impl ColumnCursor<'_> {
     }
 }
 
+fn integer_value<NativeType>(values: &PrimitiveArray<NativeType>, row_index: usize) -> Value
+where
+    NativeType: ArrowPrimitiveType,
+    NativeType::Native: Into<i64>,
+{
+    if values.is_null(row_index) {
+        Value::Null
+    } else {
+        Value::Integer(values.value(row_index).into())
+    }
+}
+
+fn real_value<NativeType>(
+    values: &PrimitiveArray<NativeType>,
+    row_index: usize,
+) -> Result<Value, LixError>
+where
+    NativeType: ArrowPrimitiveType,
+    NativeType::Native: Into<f64>,
+{
+    if values.is_null(row_index) {
+        Ok(Value::Null)
+    } else {
+        finite_query_float(values.value(row_index).into())
+    }
+}
+
 fn append_integers<NativeType>(values: &PrimitiveArray<NativeType>, rows: &mut [Vec<Value>])
 where
     NativeType: ArrowPrimitiveType,
@@ -3407,8 +3574,8 @@ mod tests {
 
     use super::{
         SqlExecutionContext, SqlWriteExecutionContext, build_write_session_with_options,
-        execute_sql, query_result_from_batches, row_values_from_batch, write_provider_selection,
-        write_session_options, write_target_table_name,
+        execute_sql, query_result_from_batches, query_values_from_batches, row_values_from_batch,
+        write_provider_selection, write_session_options, write_target_table_name,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
@@ -3420,7 +3587,6 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::functions::FunctionProviderHandle;
     use crate::hot_state::{HotStateReader, HotStateScanRequest, MaterializedHotStateRow};
-    use crate::json_store::JsonStoreContext;
     use crate::sql2::{
         ChangelogQuerySource, HistoryQuerySource, RowSnapshotReader, SqlChangelogQuerySource,
         SqlHistoryQuerySource,
@@ -3441,7 +3607,6 @@ mod tests {
         session::SessionContext,
     };
     use crate::{LixError, NullableKeyFilter, Value};
-    use bytes::Bytes;
     use datafusion::arrow::array::{
         ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
         Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, NullArray, StringArray,
@@ -3537,6 +3702,13 @@ mod tests {
             .map(|row_index| row_values_from_batch(&fields, &batch, row_index))
             .collect::<Result<Vec<_>, _>>()
             .expect("generic scalar conversion");
+        let (flat_values, flat_row_count) =
+            query_values_from_batches(&fields, std::slice::from_ref(&batch))
+                .expect("flat typed conversion");
+        let flat_rows = flat_values
+            .chunks_exact(fields.len())
+            .map(<[Value]>::to_vec)
+            .collect::<Vec<_>>();
         let direct = query_result_from_batches(&fields, &[batch]).expect("direct typed conversion");
 
         assert_eq!(
@@ -3544,6 +3716,28 @@ mod tests {
             fields.iter().map(Field::name).cloned().collect::<Vec<_>>()
         );
         assert_eq!(direct.rows, generic_rows);
+        assert_eq!(flat_row_count, ROWS);
+        assert_eq!(flat_rows, generic_rows);
+    }
+
+    #[test]
+    fn flat_query_values_reject_batch_schema_width_mismatch() {
+        let result_fields = vec![
+            Field::new("first", DataType::Int64, false),
+            Field::new("second", DataType::Int64, false),
+        ];
+        let batch_fields = vec![Field::new("first", DataType::Int64, false)];
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(batch_fields)),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("test batch should match its own schema");
+
+        let error = query_values_from_batches(&result_fields, &[batch])
+            .expect_err("flat results require the batch and result schema widths to match");
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(error.message.contains("1 columns"));
+        assert!(error.message.contains("2"));
     }
 
     struct DummyBlobReader;
@@ -3658,7 +3852,7 @@ mod tests {
         assert_eq!(cursor.next_values().await.unwrap(), None);
     }
     struct RecordingRowSnapshotReader {
-        snapshots: Vec<Option<Bytes>>,
+        snapshots: Vec<(crate::row_pk::RowPk, bytes::Bytes)>,
         requests: Arc<Mutex<Vec<HotStateScanRequest>>>,
     }
     struct DummyCommitGraphReader;
@@ -3865,9 +4059,7 @@ mod tests {
             let storage = StorageAdapter::new(Memory::new());
             let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
             HistoryQuerySource {
-                store: read_scope.clone(),
-                json_reader: JsonStoreContext::new().reader(read_scope),
-                certified_history_reader: None,
+                store: read_scope,
                 default_as_of_commit_id,
             }
         }
@@ -3876,8 +4068,7 @@ mod tests {
             let storage = StorageAdapter::new(Memory::new());
             let read_scope = SharedStorageAdapterRead::new(test_read_scope(&storage));
             ChangelogQuerySource {
-                store: read_scope.clone(),
-                json_reader: JsonStoreContext::new().reader(read_scope),
+                store: read_scope,
             }
         }
 
@@ -4483,12 +4674,14 @@ mod tests {
         async fn scan_row_snapshots(
             &self,
             request: HotStateScanRequest,
-        ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        ) -> Result<Option<crate::tracked_state::ExclusiveRowSnapshotBatch>, LixError> {
             self.requests
                 .lock()
                 .expect("captured snapshot requests lock")
                 .push(request);
-            Ok(Some(self.snapshots.clone()))
+            Ok(Some(crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(
+                self.snapshots.clone(),
+            )))
         }
     }
 
@@ -4876,12 +5069,42 @@ mod tests {
     async fn datafusion_row_primary_key_read_uses_registered_provider() {
         let sql = "SELECT id, value FROM test_state_schema \
                    WHERE id IN ('row-b', 'row-a', 'row-b') ORDER BY id";
+        let schema_definition = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "test_state_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        });
+        let schema_spec = crate::sql2::catalog::derive_schema_surface_spec_from_schema(
+            &schema_definition,
+        )
+        .expect("test schema should compile");
+        let native_row = |id: &str, value: &str| {
+            let typed = crate::plugin::runtime::WasmTypedRow {
+                schema_fingerprint: schema_spec.schema_fingerprint,
+                row_pk: vec![lix_schema::Value::Text(id.to_owned())].into(),
+                row: lix_schema::Row::from([
+                    ("id".to_owned(), lix_schema::Value::Text(id.to_owned())),
+                    (
+                        "value".to_owned(),
+                        lix_schema::Value::Text(value.to_owned()),
+                    ),
+                ]),
+                native_payload: std::sync::OnceLock::new(),
+                boundary_create_validation: std::sync::OnceLock::new(),
+            };
+            let payload = typed.durable_payload().expect("test row should encode");
+            (
+                crate::row_pk::RowPk::single(id),
+                bytes::Bytes::copy_from_slice(&payload),
+            )
+        };
         let requests = Arc::new(Mutex::new(Vec::new()));
         let snapshot_reader = Arc::new(RecordingRowSnapshotReader {
-            snapshots: vec![
-                Some(Bytes::from_static(br#"{"id":"row-a","value":"A"}"#)),
-                Some(Bytes::from_static(br#"{"id":"row-b","value":"B"}"#)),
-            ],
+            snapshots: vec![native_row("row-a", "A"), native_row("row-b", "B")],
             requests: Arc::clone(&requests),
         });
         let scans = Arc::new(AtomicUsize::new(0));
@@ -4906,15 +5129,7 @@ mod tests {
                 scans: Arc::clone(&scans),
             }),
             row_snapshot_reader: Some(snapshot_reader),
-            schema_definitions: vec![json!({
-                "$schema": "https://lix.dev/schema-v1.json",
-                "key": "test_state_schema",
-                "columns": [
-                    { "name": "id", "type": "text", "nullable": false },
-                    { "name": "value", "type": "text", "nullable": false },
-                ],
-                "primary_key": ["id"],
-            })],
+            schema_definitions: vec![schema_definition],
         };
         let result = execute_sql(&ctx, sql, &[])
             .await

@@ -98,12 +98,17 @@ async fn native_schema_point_survives_cold_reopen<S: ReopenStorage>() {
         .await
         .expect("cold reopen native point fixture");
     assert_point(&lix, expected).await;
-    lix.close().await.expect("close reopened native point fixture");
+    lix.close()
+        .await
+        .expect("close reopened native point fixture");
     drop(lix);
     storage.flush().await;
 }
 
-async fn assert_point<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::Lix<S>, expected: &str) {
+async fn assert_point<S: Storage + Clone + Send + Sync + 'static>(
+    lix: &lix::Lix<S>,
+    expected: &str,
+) {
     let result = lix
         .execute(
             &format!("SELECT payload AS body FROM {SCHEMA_KEY} WHERE id = $1 LIMIT 1"),

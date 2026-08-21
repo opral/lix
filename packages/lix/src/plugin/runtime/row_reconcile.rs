@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::{LixError, catalog::SchemaPlan};
+use crate::{LixError, catalog::SchemaPlan, common::SharedStr, plugin::runtime::WasmTypedRow};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowVersionRef<'a> {
@@ -26,7 +26,6 @@ pub(crate) struct ReconciledRow {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ColumnMerge<'a> {
     pub(crate) column: &'a str,
-    pub(crate) base: Option<&'a JsonValue>,
     pub(crate) a: Option<&'a JsonValue>,
     pub(crate) b: Option<&'a JsonValue>,
 }
@@ -38,6 +37,31 @@ pub(crate) enum ColumnMergeResult {
     /// Replace the column. `None` removes an optional column; it is distinct
     /// from `Some(JsonValue::Null)`.
     Replace(Option<JsonValue>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TypedRowVersionRef<'a> {
+    pub(crate) snapshot: &'a WasmTypedRow,
+    pub(crate) metadata: Option<&'a SharedStr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReconciledTypedRow {
+    pub(crate) snapshot: WasmTypedRow,
+    pub(crate) metadata: Option<SharedStr>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TypedColumnMerge<'a> {
+    pub(crate) column: &'a str,
+    pub(crate) a: Option<&'a lix_schema::Value>,
+    pub(crate) b: Option<&'a lix_schema::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TypedColumnMergeResult {
+    UseLww,
+    Replace(Option<lix_schema::Value>),
 }
 
 pub(crate) fn primary_key_columns(schema: &SchemaPlan) -> Result<BTreeSet<String>, LixError> {
@@ -122,7 +146,6 @@ where
         } else {
             match merge_column(ColumnMerge {
                 column: &column,
-                base: base_value,
                 a: a_value,
                 b: b_value,
             })? {
@@ -138,6 +161,180 @@ where
         // Metadata is not a schema column. Keep the same canonical LWW rule.
         metadata: b.metadata.cloned(),
     }))
+}
+
+/// Reconciles plugin-owned rows without converting Schema v1 values through
+/// an outer JSON row representation.
+pub(crate) fn reconcile_typed_row<F>(
+    base: Option<TypedRowVersionRef<'_>>,
+    a: Option<TypedRowVersionRef<'_>>,
+    b: Option<TypedRowVersionRef<'_>>,
+    primary_key_columns: &BTreeSet<String>,
+    mut merge_column: F,
+) -> Result<Option<ReconciledTypedRow>, LixError>
+where
+    F: FnMut(TypedColumnMerge<'_>) -> Result<Option<TypedColumnMergeResult>, LixError>,
+{
+    if typed_row_version_eq(a, b) {
+        return Ok(clone_typed_row(b));
+    }
+    if typed_row_version_eq(a, base) {
+        return Ok(clone_typed_row(b));
+    }
+    if typed_row_version_eq(b, base) {
+        return Ok(clone_typed_row(a));
+    }
+
+    let (Some(base), Some(a), Some(b)) = (base, a, b) else {
+        return Ok(clone_typed_row(b));
+    };
+    require_compatible_typed_rows(base.snapshot, a.snapshot, b.snapshot)?;
+
+    let mut columns = BTreeSet::new();
+    columns.extend(base.snapshot.row.keys().map(str::to_owned));
+    columns.extend(a.snapshot.row.keys().map(str::to_owned));
+    columns.extend(b.snapshot.row.keys().map(str::to_owned));
+
+    let mut merged = lix_schema::Row::new();
+    for column in columns {
+        let base_value = base.snapshot.row.get(&column);
+        let a_value = a.snapshot.row.get(&column);
+        let b_value = b.snapshot.row.get(&column);
+
+        if primary_key_columns.contains(&column) {
+            if a_value != base_value || b_value != base_value {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("row merge attempted to change primary-key column '{column}'"),
+                ));
+            }
+            insert_typed_optional(&mut merged, column, b_value.cloned());
+            continue;
+        }
+
+        let selected = if a_value == b_value {
+            a_value.cloned()
+        } else if a_value == base_value {
+            b_value.cloned()
+        } else if b_value == base_value {
+            a_value.cloned()
+        } else {
+            match merge_column(TypedColumnMerge {
+                column: &column,
+                a: a_value,
+                b: b_value,
+            })? {
+                Some(TypedColumnMergeResult::Replace(value)) => value,
+                Some(TypedColumnMergeResult::UseLww) | None => b_value.cloned(),
+            }
+        };
+        insert_typed_optional(&mut merged, column, selected);
+    }
+
+    Ok(Some(ReconciledTypedRow {
+        snapshot: WasmTypedRow {
+            schema_fingerprint: b.snapshot.schema_fingerprint,
+            row_pk: b.snapshot.row_pk.clone(),
+            row: merged,
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        },
+        metadata: b.metadata.cloned(),
+    }))
+}
+
+/// Visits only columns that require plugin arbitration, without constructing
+/// the reconciled row. This is the discovery pass used to batch component
+/// calls; the row is built once after those calls return.
+pub(crate) fn visit_typed_row_overlaps<F>(
+    base: Option<TypedRowVersionRef<'_>>,
+    a: Option<TypedRowVersionRef<'_>>,
+    b: Option<TypedRowVersionRef<'_>>,
+    primary_key_columns: &BTreeSet<String>,
+    mut visit: F,
+) -> Result<(), LixError>
+where
+    F: FnMut(TypedColumnMerge<'_>) -> Result<(), LixError>,
+{
+    if typed_row_version_eq(a, b) || typed_row_version_eq(a, base) || typed_row_version_eq(b, base)
+    {
+        return Ok(());
+    }
+    let (Some(base), Some(a), Some(b)) = (base, a, b) else {
+        return Ok(());
+    };
+    require_compatible_typed_rows(base.snapshot, a.snapshot, b.snapshot)?;
+
+    let mut columns = BTreeSet::new();
+    columns.extend(base.snapshot.row.keys());
+    columns.extend(a.snapshot.row.keys());
+    columns.extend(b.snapshot.row.keys());
+    for column in columns {
+        let base_value = base.snapshot.row.get(column);
+        let a_value = a.snapshot.row.get(column);
+        let b_value = b.snapshot.row.get(column);
+        if primary_key_columns.contains(column) {
+            if a_value != base_value || b_value != base_value {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("row merge attempted to change primary-key column '{column}'"),
+                ));
+            }
+        } else if a_value != b_value && a_value != base_value && b_value != base_value {
+            visit(TypedColumnMerge {
+                column,
+                a: a_value,
+                b: b_value,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn require_compatible_typed_rows(
+    base: &WasmTypedRow,
+    a: &WasmTypedRow,
+    b: &WasmTypedRow,
+) -> Result<(), LixError> {
+    if base.schema_fingerprint != a.schema_fingerprint
+        || base.schema_fingerprint != b.schema_fingerprint
+    {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            "typed row merge requires one schema fingerprint",
+        ));
+    }
+    if base.row_pk != a.row_pk || base.row_pk != b.row_pk {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            "typed row merge attempted to change the row identity",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_typed_optional(row: &mut lix_schema::Row, key: String, value: Option<lix_schema::Value>) {
+    if let Some(value) = value {
+        row.insert(key, value);
+    }
+}
+
+fn typed_row_version_eq(
+    a: Option<TypedRowVersionRef<'_>>,
+    b: Option<TypedRowVersionRef<'_>>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.snapshot == b.snapshot && a.metadata == b.metadata,
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+fn clone_typed_row(row: Option<TypedRowVersionRef<'_>>) -> Option<ReconciledTypedRow> {
+    row.map(|row| ReconciledTypedRow {
+        snapshot: row.snapshot.clone(),
+        metadata: row.metadata.cloned(),
+    })
 }
 
 fn require_object<'a>(
@@ -307,5 +504,57 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+    }
+
+    #[test]
+    fn typed_merge_keeps_json_columns_as_jsonb_values() {
+        fn typed_row(document: JsonValue) -> WasmTypedRow {
+            WasmTypedRow {
+                schema_fingerprint: [7; 32],
+                row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
+                row: lix_schema::Row::from([
+                    ("id".to_owned(), lix_schema::Value::Text("row-1".to_owned())),
+                    (
+                        "document".to_owned(),
+                        lix_schema::Value::Jsonb(document.into()),
+                    ),
+                ]),
+                native_payload: std::sync::OnceLock::new(),
+                boundary_create_validation: std::sync::OnceLock::new(),
+            }
+        }
+
+        let base = typed_row(json!({"base": true}));
+        let a = typed_row(json!({"author": "a"}));
+        let b = typed_row(json!({"author": "b"}));
+        let merged = reconcile_typed_row(
+            Some(TypedRowVersionRef {
+                snapshot: &base,
+                metadata: None,
+            }),
+            Some(TypedRowVersionRef {
+                snapshot: &a,
+                metadata: None,
+            }),
+            Some(TypedRowVersionRef {
+                snapshot: &b,
+                metadata: None,
+            }),
+            &BTreeSet::from(["id".to_owned()]),
+            |input| {
+                assert!(matches!(input.a, Some(lix_schema::Value::Jsonb(_))));
+                assert!(matches!(input.b, Some(lix_schema::Value::Jsonb(_))));
+                Ok(Some(TypedColumnMergeResult::Replace(Some(
+                    lix_schema::Value::Jsonb(json!({"merged": true}).into()),
+                ))))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            merged.snapshot.row.get("document"),
+            Some(&lix_schema::Value::Jsonb(json!({"merged": true}).into()))
+        );
     }
 }

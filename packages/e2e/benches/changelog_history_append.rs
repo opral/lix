@@ -419,6 +419,14 @@ where
         self.inner.put_many(space, entries).await
     }
 
+    async fn replace_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        self.inner.replace_many(space, entries).await
+    }
+
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         self.inner.delete_many(space, keys).await
     }

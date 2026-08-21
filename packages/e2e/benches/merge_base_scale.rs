@@ -238,6 +238,14 @@ where
         self.inner.put_many(space, entries).await
     }
 
+    async fn replace_many(
+        &mut self,
+        space: lix::storage::StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        self.inner.replace_many(space, entries).await
+    }
+
     async fn delete_many(
         &mut self,
         space: lix::storage::StorageSpace,

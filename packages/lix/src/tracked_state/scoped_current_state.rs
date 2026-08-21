@@ -442,6 +442,11 @@ pub(crate) fn current_state_mutation_authority_digest(
     }
     digest.update(&(inventory.part_count() as u64).to_be_bytes());
     digest.update(&(inventory.direct_part_row_counts.len() as u64).to_be_bytes());
+    digest.update(&(inventory.direct_part_ownership.len() as u64).to_be_bytes());
+    for ownership in &inventory.direct_part_ownership {
+        digest.update(&(ownership.len() as u64).to_be_bytes());
+        digest.update(ownership);
+    }
     let generic_part_count = if inventory.replacement_generation.is_some() {
         0
     } else {
@@ -923,7 +928,6 @@ mod tests {
 
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
-    use crate::json_store::JsonSlotRef;
     use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::codec::encode_key_ref;
@@ -1021,8 +1025,8 @@ mod tests {
                     commit_id,
                     created_at,
                     updated_at: created_at,
-                    snapshot: JsonSlotRef::Inline("{\"version\":1}"),
-                    metadata: JsonSlotRef::None,
+                    metadata: None,
+                    snapshot: b"typed-payload",
                 })
             }),
             &generation,
@@ -1098,8 +1102,8 @@ mod tests {
                     commit_id: parent_id,
                     created_at,
                     updated_at,
-                    snapshot: JsonSlotRef::Inline("{\"version\":1}"),
-                    metadata: JsonSlotRef::None,
+                    metadata: None,
+                    snapshot: b"typed-v1",
                 })
             }),
             &generation,
@@ -1181,8 +1185,8 @@ mod tests {
                     created_at,
                     updated_at,
                 },
-                snapshot: JsonSlotRef::None,
-                metadata: JsonSlotRef::None,
+                metadata: None,
+                snapshot: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -1198,8 +1202,8 @@ mod tests {
                     created_at,
                     updated_at,
                 },
-                snapshot: JsonSlotRef::Inline("{\"version\":2}"),
-                metadata: JsonSlotRef::None,
+                metadata: None,
+                snapshot: Some(b"typed-v2"),
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
@@ -1336,8 +1340,8 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{\"version\":1}"),
-            metadata: JsonSlotRef::None,
+            metadata: None,
+            snapshot: Some(b"typed-v1"),
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1441,8 +1445,8 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{\"version\":2}"),
-            metadata: JsonSlotRef::None,
+            metadata: None,
+            snapshot: Some(b"typed-v2"),
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1537,8 +1541,8 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{\"version\":2}"),
-            metadata: JsonSlotRef::None,
+            metadata: None,
+            snapshot: Some(b"typed-v2"),
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1554,8 +1558,8 @@ mod tests {
                 created_at,
                 updated_at,
             },
-            snapshot: JsonSlotRef::Inline("{\"version\":3}"),
-            metadata: JsonSlotRef::None,
+            metadata: None,
+            snapshot: Some(b"typed-v3"),
             origin_key: None,
             base_coordinate: None,
             authored: true,
@@ -1833,6 +1837,7 @@ mod tests {
         broad.parts.push(CommitStateMutationPart {
             first_key: encoded_key("alpha", &left).to_vec(),
             last_key: encoded_key("omega", &right).to_vec(),
+            content_digest: [1; 32],
             replacement_part: None,
         });
         let mut writes = storage.new_write_set();

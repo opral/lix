@@ -401,6 +401,14 @@ where
         self.inner.put_many(space, entries).await
     }
 
+    async fn replace_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        self.inner.replace_many(space, entries).await
+    }
+
     async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");

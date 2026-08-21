@@ -91,7 +91,6 @@ where
                 Arc::clone(&schema),
                 (self.query_source.clone(), schema),
                 move |(query_source, schema)| async move {
-                    let mut json_reader = query_source.json_reader;
                     let canonical_changes =
                         scan_changelog_changes(query_source.store, pushed_limit, route)
                             .await
@@ -101,21 +100,14 @@ where
                         match change {
                             LixChangeRow::Direct(change) => changes.push(
                                 materialize_changelog_change_record(
-                                    &mut json_reader,
                                     change,
                                     payload_projection,
                                 )
-                                .await
                                 .map_err(lix_error_to_datafusion_error)?,
                             ),
                             LixChangeRow::DerivedCommit(change) => changes.push(
-                                materialize_commit_graph_change(
-                                    &mut json_reader,
-                                    change,
-                                    payload_projection,
-                                )
-                                .await
-                                .map_err(lix_error_to_datafusion_error)?,
+                                materialize_commit_graph_change(change, payload_projection)
+                                    .map_err(lix_error_to_datafusion_error)?,
                             ),
                         }
                     }

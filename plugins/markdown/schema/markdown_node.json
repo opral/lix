@@ -5,9 +5,9 @@
   "columns": [
     {
       "name": "format_json",
-      "type": "text",
+      "type": "jsonb",
       "nullable": false,
-      "description": "Canonical JSON text for render-effective Markdown spelling choices. A document node may also carry a validated base64 lexical fallback for accepted noncanonical source bytes."
+      "description": "Native JSONB for render-effective Markdown spelling choices. Only the document root may temporarily carry a validated base64 copy of accepted noncanonical source bytes; projected rows omit that cache."
     },
     {
       "name": "id",
@@ -34,9 +34,9 @@
     },
     {
       "name": "payload_json",
-      "type": "text",
+      "type": "jsonb",
       "nullable": false,
-      "description": "Canonical JSON text for kind-specific semantic content. It is string-wrapped because the durable row profile does not admit JSON number nodes."
+      "description": "Native JSONB for kind-specific semantic content."
     }
   ],
   "primary_key": [

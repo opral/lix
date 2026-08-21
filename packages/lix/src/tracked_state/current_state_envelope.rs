@@ -111,9 +111,7 @@ fn validate_current_state_descriptor(
     };
     let source_identifiers_present = match &descriptor.source {
         CurrentStatePartSource::Replacement(source) => source.owner_commit_id != [0; 16],
-        CurrentStatePartSource::NativeDataPart {
-            payload_refs_digest,
-        } => *payload_refs_digest != [0; 32],
+        CurrentStatePartSource::NativeDataPart => true,
         CurrentStatePartSource::ColumnarPage(source) => {
             source.source_id != [0; 16] && source.owner_commit_id != [0; 16]
         }
@@ -229,9 +227,7 @@ mod tests {
     }
 
     fn native() -> CurrentStatePartSource {
-        CurrentStatePartSource::NativeDataPart {
-            payload_refs_digest: [9; 32],
-        }
+        CurrentStatePartSource::NativeDataPart
     }
 
     fn columnar() -> CurrentStatePartSource {
@@ -302,7 +298,7 @@ mod tests {
                 (v3_len(1), payload_len(native())),
                 (v3_len(2), payload_len(columnar())),
             ],
-            [(121, 72), (107, 71), (121, 90)]
+            [(121, 72), (107, 37), (121, 90)]
         );
     }
 

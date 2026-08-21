@@ -726,8 +726,8 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
         row_pk: change.row_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
-        snapshot: change.snapshot,
         metadata: change.metadata,
+        snapshot: change.snapshot,
         created_at: change.created_at,
         origin_key: change.origin_key,
     }
@@ -978,15 +978,28 @@ fn history_change_identity(
 pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChange {
     let snapshot_content = crate::changelog::commit_row_snapshot_json(&node.commit_id.to_string())
         .expect("lix_commit snapshot serialization should not fail");
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot_content)
+        .expect("canonical lix_commit snapshot is valid JSON");
+    let row_pk = RowPk::uuid_from_canonical(&node.commit_id.to_string())
+        .expect("commit IDs are canonical UUIDs");
+    let typed = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+        COMMIT_SCHEMA_KEY,
+        &row_pk,
+        &snapshot,
+    )
+    .expect("derived lix_commit row satisfies its embedded schema");
+    let snapshot = typed
+        .durable_payload()
+        .expect("derived lix_commit row has a native payload")
+        .to_vec();
     CommitGraphChange {
         id: node.change_id,
         account_id: node.account_id.clone(),
-        row_pk: RowPk::uuid_from_canonical(&node.commit_id.to_string())
-            .expect("commit IDs are canonical UUIDs"),
+        row_pk,
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
-        metadata: crate::json_store::JsonSlot::None,
+        metadata: None,
+        snapshot: Some(snapshot),
         created_at: node.created_at,
         origin_key: None,
     }
@@ -1623,8 +1636,8 @@ mod tests {
                     created_at,
                     updated_at: created_at,
                 },
-                snapshot: crate::json_store::JsonSlotRef::None,
-                metadata: crate::json_store::JsonSlotRef::None,
+                metadata: None,
+                snapshot: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -1640,8 +1653,8 @@ mod tests {
                     created_at,
                     updated_at: created_at,
                 },
-                snapshot: crate::json_store::JsonSlotRef::None,
-                metadata: crate::json_store::JsonSlotRef::None,
+                metadata: None,
+                snapshot: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -1657,8 +1670,8 @@ mod tests {
                     created_at,
                     updated_at: created_at,
                 },
-                snapshot: crate::json_store::JsonSlotRef::None,
-                metadata: crate::json_store::JsonSlotRef::None,
+                metadata: None,
+                snapshot: None,
                 origin_key: None,
                 base_coordinate: None,
                 authored: false,
@@ -1996,8 +2009,8 @@ mod tests {
                     row_pk: crate::row_pk::RowPk::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    snapshot: crate::json_store::JsonSlot::None,
-                    metadata: crate::json_store::JsonSlot::None,
+                    metadata: None,
+                    snapshot: None,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     origin_key: None,
                 },
@@ -2020,18 +2033,27 @@ mod tests {
             snapshot_content: Option<&str>,
             created_at: &str,
         ) -> Self {
+            let row_pk = crate::row_pk::RowPk::single(row_pk);
+            let snapshot = snapshot_content.map(|content| {
+                let snapshot = serde_json::from_str(content)
+                    .expect("commit-graph fixture snapshot should be valid JSON");
+                let row = crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+                    &row_pk, &snapshot,
+                )
+                .expect("commit-graph fixture should construct a typed row");
+                row.durable_payload()
+                    .map(|payload| payload.to_vec())
+                    .expect("commit-graph fixture should encode a durable typed payload")
+            });
             Self {
                 change: CommitGraphChange {
                     id: ChangeId::for_test_label(change_id),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                    row_pk: crate::row_pk::RowPk::single(row_pk),
+                    row_pk,
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
-                    snapshot: snapshot_content
-                        .map_or(crate::json_store::JsonSlot::None, |content| {
-                            crate::json_store::JsonSlot::from_json(content)
-                        }),
-                    metadata: crate::json_store::JsonSlot::None,
+                    metadata: None,
+                    snapshot,
                     created_at: ts(created_at),
                     origin_key: None,
                 },
@@ -2172,8 +2194,8 @@ mod tests {
                         created_at: change.created_at,
                         updated_at: change.created_at,
                     },
-                    snapshot: change.snapshot.as_ref_slot(),
-                    metadata: change.metadata.as_ref_slot(),
+                    metadata: change.metadata.as_ref(),
+                    snapshot: change.snapshot.as_deref(),
                     origin_key: change.origin_key.as_deref(),
                     base_coordinate: None,
                     authored: true,
@@ -2243,8 +2265,8 @@ mod tests {
             row_pk: change.change.row_pk.clone(),
             schema_key: change.change.schema_key.clone(),
             file_id: change.change.file_id.clone(),
-            snapshot: change.change.snapshot.clone(),
             metadata: change.change.metadata.clone(),
+            snapshot: change.change.snapshot.clone(),
             created_at: change.change.created_at,
             origin_key: change.change.origin_key.clone(),
         }

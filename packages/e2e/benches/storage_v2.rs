@@ -1616,6 +1616,15 @@ impl StorageWrite for CountingWrite {
         Ok(())
     }
 
+    async fn replace_many(
+        &mut self,
+        _space: StorageSpace,
+        _entries: PutBatch,
+    ) -> Result<(), StorageError> {
+        self.state.put_many_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     async fn delete_many(
         &mut self,
         _space: StorageSpace,

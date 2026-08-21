@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value as JsonValue;
 
@@ -17,7 +17,6 @@ use crate::hot_state::{
     HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateRowRef,
 };
-use crate::schema::schema_from_registered_snapshot;
 use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -37,7 +36,6 @@ const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
 /// the atomic storage revision captured when a transaction opens.
 pub(crate) struct CatalogContext {
     compiled_catalogs: Mutex<HashMap<CatalogFingerprint, Arc<CatalogSnapshot>>>,
-    compiled_catalogs_by_rows: Mutex<HashMap<CatalogRowsFingerprint, Arc<CatalogSnapshot>>>,
     transaction_opening_catalogs:
         Mutex<HashMap<TransactionOpeningCatalogKey, Arc<CatalogSnapshot>>>,
     #[cfg(test)]
@@ -62,7 +60,6 @@ impl CatalogContext {
     pub(crate) fn new() -> Self {
         Self {
             compiled_catalogs: Mutex::new(HashMap::new()),
-            compiled_catalogs_by_rows: Mutex::new(HashMap::new()),
             transaction_opening_catalogs: Mutex::new(HashMap::new()),
             #[cfg(test)]
             sql_read_schema_loads: AtomicUsize::new(0),
@@ -118,8 +115,8 @@ impl CatalogContext {
     /// Returns the compiled snapshot for the catalog rows visible to `domain`.
     ///
     /// This is the transaction-opening cache-miss path and the authoritative
-    /// path for validation overlays. Identical raw rows avoid JSON decoding and
-    /// canonicalization, but still require the live-state scans.
+    /// path for validation overlays. Identical native rows avoid JSON decoding
+    /// and canonicalization, but still require the live-state scans.
     pub(crate) async fn compiled_catalog_for_domain<R>(
         &self,
         hot_state: &R,
@@ -132,16 +129,15 @@ impl CatalogContext {
         let mut hasher = blake3::Hasher::new();
         for (schema_domain, row) in catalog_rows.iter() {
             hash_fingerprint_part(&mut hasher, &schema_domain.fingerprint_component());
-            let snapshot_content = row
-                .snapshot_content()
-                .map(|content| content.as_str())
-                .expect("catalog rows are filtered to rows with snapshot_content");
-            hash_fingerprint_part(&mut hasher, snapshot_content);
+            let payload = row
+                .raw_snapshot()
+                .expect("catalog rows are filtered to raw native payloads");
+            hasher.update(&(payload.len() as u64).to_le_bytes());
+            hasher.update(payload);
         }
         let fingerprint = CatalogRowsFingerprint(hasher.finalize().to_hex().to_string());
 
-        if let Some(snapshot) = self
-            .compiled_catalogs_by_rows
+        if let Some(snapshot) = compiled_catalogs_by_rows()
             .lock()
             .expect("compiled catalog rows cache lock should not be poisoned")
             .get(&fingerprint)
@@ -151,8 +147,7 @@ impl CatalogContext {
 
         let facts = facts_from_catalog_rows(&catalog_rows)?;
         let snapshot = self.compiled_catalog_for_facts(&facts)?;
-        let mut cache = self
-            .compiled_catalogs_by_rows
+        let mut cache = compiled_catalogs_by_rows()
             .lock()
             .expect("compiled catalog rows cache lock should not be poisoned");
         if cache.len() >= COMPILED_CATALOG_CACHE_LIMIT {
@@ -260,6 +255,13 @@ impl CatalogContext {
     }
 }
 
+fn compiled_catalogs_by_rows()
+-> &'static Mutex<HashMap<CatalogRowsFingerprint, Arc<CatalogSnapshot>>> {
+    static CACHE: OnceLock<Mutex<HashMap<CatalogRowsFingerprint, Arc<CatalogSnapshot>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Scans the raw registered-schema rows reachable from `domain`, without
 /// decoding their snapshots.
 struct CatalogRows {
@@ -297,6 +299,9 @@ where
                 untracked: Some(schema_domain.untracked()),
                 include_tombstones: false,
                 ..HotStateFilter::default()
+            },
+            projection: crate::hot_state::HotStateProjection {
+                columns: vec!["raw_snapshot".to_owned()],
             },
             ..HotStateScanRequest::default()
         };
@@ -337,7 +342,7 @@ fn row_belongs_to_schema_catalog_domain(
 ) -> bool {
     row.schema_key() == REGISTERED_SCHEMA_KEY
         && row.file_id().is_none()
-        && row.snapshot_content().is_some()
+        && row.raw_snapshot().is_some()
         && row.branch_id() == domain.branch_id()
         && row.untracked() == domain.untracked()
         && committed_row_ref_is_exact_branch_scoped(row, domain.branch_id())
@@ -356,17 +361,65 @@ fn decode_registered_schema_row(
         ));
     }
 
-    let Some(snapshot_content) = row.snapshot_content().map(|content| content.as_str()) else {
-        return Ok(None);
+    let decoded;
+    let typed = match row.decoded_snapshot() {
+        Some(typed) => typed.as_ref(),
+        None => {
+            let Some(payload) = row.raw_snapshot() else {
+                return Ok(None);
+            };
+            decoded = crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+                Arc::from(payload.as_ref()),
+                REGISTERED_SCHEMA_KEY,
+                row.row_pk(),
+            )?;
+            &decoded
+        }
     };
-
-    let snapshot: JsonValue = serde_json::from_str(snapshot_content).map_err(|err| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("invalid registered schema snapshot JSON: {err}"),
-        )
-    })?;
-    let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
+    let (_, plan) = CatalogSnapshot::builtin()
+        .plan_for_key(REGISTERED_SCHEMA_KEY)
+        .expect("embedded catalog contains lix_registered_schema");
+    typed.validate_resolved_schema_binding(
+        REGISTERED_SCHEMA_KEY,
+        REGISTERED_SCHEMA_KEY,
+        &plan.fingerprint().bytes(),
+    )?;
+    plan.compiled_schema
+        .validate_complete_row(&typed.row)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("invalid typed registered schema row: {error}"),
+            )
+        })?;
+    let stored_schema_key = match typed.row.get("schema_key") {
+        Some(lix_schema::Value::Text(value)) => value,
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                "typed registered schema row is missing schema_key",
+            ));
+        }
+    };
+    let schema = match typed.row.get("value") {
+        // Cloning binary JSONB retains its shared byte owner. Consume that
+        // cheap view directly into the catalog DOM; calling `as_value` first
+        // would populate the row's lazy DOM and then deep-clone the schema.
+        Some(lix_schema::Value::Jsonb(value)) => value.clone().into_value(),
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                "typed registered schema row is missing schema value",
+            ));
+        }
+    };
+    let key = crate::schema::schema_key_from_definition(&schema)?;
+    if key.schema_key != *stored_schema_key {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            "typed registered schema row key does not match its schema definition",
+        ));
+    }
     Ok(Some((key, schema)))
 }
 
@@ -772,30 +825,54 @@ mod tests {
             request: &HotStateScanRequest,
         ) -> Result<MaterializedHotStateBatch, LixError> {
             self.scan_count.fetch_add(1, Ordering::Relaxed);
-            Ok(MaterializedHotStateBatch::from_rows(
-                self.rows
-                    .iter()
-                    .filter(|row| {
-                        request.filter.schema_keys.is_empty()
-                            || request.filter.schema_keys.contains(&row.schema_key)
-                    })
-                    .filter(|row| {
-                        request.filter.branch_ids.is_empty()
-                            || request
-                                .filter
-                                .branch_ids
-                                .iter()
-                                .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref())
-                    })
-                    .filter(|row| {
-                        request
+            let rows = self
+                .rows
+                .iter()
+                .filter(|row| {
+                    request.filter.schema_keys.is_empty()
+                        || request.filter.schema_keys.contains(&row.schema_key)
+                })
+                .filter(|row| {
+                    request.filter.branch_ids.is_empty()
+                        || request
                             .filter
-                            .untracked
-                            .is_none_or(|untracked| row.untracked == untracked)
-                    })
-                    .cloned()
-                    .collect(),
-            ))
+                            .branch_ids
+                            .iter()
+                            .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref())
+                })
+                .filter(|row| {
+                    request
+                        .filter
+                        .untracked
+                        .is_none_or(|untracked| row.untracked == untracked)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut builder =
+                crate::hot_state::MaterializedHotStateBatchBuilder::with_capacity(rows.len());
+            for row in rows {
+                let typed = row.snapshot_content.as_deref().and_then(|snapshot| {
+                    let value = serde_json::from_str(snapshot).ok()?;
+                    crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+                        &row.schema_key,
+                        &row.row_pk,
+                        &value,
+                    )
+                    .ok()
+                    .map(Arc::new)
+                });
+                let ordinal = builder.len();
+                builder.push_owned(row);
+                let raw = typed.as_ref().and_then(|typed| {
+                    typed
+                        .durable_payload()
+                        .ok()
+                        .map(|payload| bytes::Bytes::copy_from_slice(&payload))
+                });
+                builder.set_decoded_snapshot(ordinal, typed);
+                builder.set_raw_snapshot(ordinal, raw);
+            }
+            Ok(builder.finish())
         }
     }
 

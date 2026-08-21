@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     io::{self, Write as _},
     ops::Deref,
@@ -16,12 +16,11 @@ use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance,
 use crate::functions::FunctionProviderHandle;
 use crate::hot_state::{CertifiedCurrentStatePredecessor, MaterializedHotStateRow};
 use crate::json_store::JsonRef;
-use crate::plugin::runtime::{
-    WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedRowBatch,
-};
+use crate::plugin::runtime::{WasmCertifiedRowBatch, WasmTypedRow};
 use crate::row_pk::RowPk;
 use crate::tracked_state::OrderedAddressableCommitDeltaStage;
 use bytes::Bytes;
+use lix_schema::Jsonb;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
@@ -44,7 +43,6 @@ enum TransactionJsonStorage {
         value: OnceLock<Arc<JsonValue>>,
         normalized: SharedStr,
     },
-    CanonicalBatch(WasmCanonicalJson),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,17 +83,6 @@ impl TransactionJson {
     #[cfg(test)]
     pub(crate) fn from_value_for_test(value: JsonValue) -> Self {
         Self::from_value(value, "test transaction JSON").expect("test JSON should normalize")
-    }
-
-    /// Reuses one row of a bounded canonical JSON cursor-page batch.
-    ///
-    /// The parsed value column and normalized byte arena remain owned once by
-    /// the batch. Moving this handle through transaction preparation and
-    /// staging clones neither representation.
-    pub(crate) fn from_canonical_batch(value: WasmCanonicalJson) -> Self {
-        Self {
-            storage: TransactionJsonStorage::CanonicalBatch(value),
-        }
     }
 
     /// Retains plan-bound certified canonical JSON in a shared buffer.
@@ -245,26 +232,6 @@ impl TransactionJson {
         }
     }
 
-    pub(crate) fn canonical_batch_certificate(
-        &self,
-    ) -> Option<WasmCanonicalJsonCertificateRef<'_>> {
-        match &self.storage {
-            TransactionJsonStorage::CanonicalBatch(value) => value.certificate(),
-            TransactionJsonStorage::Decoded { .. }
-            | TransactionJsonStorage::CertifiedShared { .. }
-            | TransactionJsonStorage::CanonicalShared { .. } => None,
-        }
-    }
-
-    pub(crate) fn canonical_batch_normalized_shared(&self) -> Option<SharedStr> {
-        match &self.storage {
-            TransactionJsonStorage::CanonicalBatch(value) => Some(value.normalized_shared()),
-            TransactionJsonStorage::Decoded { .. }
-            | TransactionJsonStorage::CertifiedShared { .. }
-            | TransactionJsonStorage::CanonicalShared { .. } => None,
-        }
-    }
-
     pub(crate) fn requires_batch_canonicalization(&self) -> bool {
         matches!(self.storage, TransactionJsonStorage::Decoded { .. })
     }
@@ -272,7 +239,6 @@ impl TransactionJson {
     pub(crate) fn value(&self) -> &JsonValue {
         match &self.storage {
             TransactionJsonStorage::Decoded { value, .. } => value.as_ref(),
-            TransactionJsonStorage::CanonicalBatch(value) => value.value(),
             TransactionJsonStorage::CanonicalShared { value, normalized } => value
                 .get_or_init(|| {
                     Arc::new(
@@ -298,29 +264,16 @@ impl TransactionJson {
                 .as_ref(),
             TransactionJsonStorage::CertifiedShared { normalized, .. } => normalized.as_str(),
             TransactionJsonStorage::CanonicalShared { normalized, .. } => normalized.as_str(),
-            TransactionJsonStorage::CanonicalBatch(value) => value.normalized(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn canonical_batch_row(&self) -> Option<&WasmCanonicalJson> {
-        match &self.storage {
-            TransactionJsonStorage::CanonicalBatch(value) => Some(value),
-            TransactionJsonStorage::Decoded { .. }
-            | TransactionJsonStorage::CertifiedShared { .. }
-            | TransactionJsonStorage::CanonicalShared { .. } => None,
         }
     }
 
     /// Materializes a mutable value only for a semantic rewrite such as
-    /// applying a missing schema default. The batch-backed happy path never
-    /// calls this method.
+    /// applying a missing schema default.
     pub(crate) fn into_value_for_mutation(self) -> JsonValue {
         match self.storage {
             TransactionJsonStorage::Decoded { value, .. } => {
                 Arc::try_unwrap(value).unwrap_or_else(|value| value.as_ref().clone())
             }
-            TransactionJsonStorage::CanonicalBatch(value) => value.value().clone(),
             TransactionJsonStorage::CanonicalShared { value, normalized } => {
                 let value = value.into_inner().unwrap_or_else(|| {
                     Arc::new(
@@ -344,10 +297,6 @@ impl PartialEq for TransactionJson {
                 TransactionJsonStorage::Decoded { value: left, .. },
                 TransactionJsonStorage::Decoded { value: right, .. },
             ) => left == right,
-            (
-                TransactionJsonStorage::CanonicalBatch(left),
-                TransactionJsonStorage::CanonicalBatch(right),
-            ) => left.normalized() == right.normalized(),
             _ => self.normalized() == other.normalized(),
         }
     }
@@ -434,6 +383,7 @@ const RAW_WRITE_NONE: u32 = u32::MAX;
 const RAW_WRITE_GLOBAL: u8 = 1;
 const RAW_WRITE_UNTRACKED: u8 = 1 << 1;
 const RAW_WRITE_CONSTRAINTS_UNCHANGED: u8 = 1 << 2;
+const RAW_WRITE_PLUGIN_OWNED: u8 = 1 << 3;
 
 /// Compact row topology for an incoming transaction write batch.
 ///
@@ -464,7 +414,7 @@ struct RawWriteSlot {
 pub(crate) struct RawWriteBatch {
     slots: Vec<RawWriteSlot>,
     row_pks: Vec<Option<RowPk>>,
-    snapshots: Vec<Option<TransactionJson>>,
+    snapshots: Vec<Option<RawSnapshot>>,
     metadata: Vec<Option<TransactionJson>>,
     durable_predecessors: Vec<Option<CertifiedCurrentStatePredecessor>>,
     strings: Vec<SharedStr>,
@@ -481,12 +431,28 @@ pub(crate) struct RawWriteBatch {
     origin_promotions: usize,
 }
 
+/// The sole pre-schema-bound snapshot owner.
+///
+/// JSON ingress is replaced in place with its decoded Schema v1 row during
+/// normalization, so a raw row cannot carry competing snapshot forms.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RawSnapshot {
+    Json(TransactionJson),
+    Row(Arc<WasmTypedRow>),
+}
+
+impl Eq for RawSnapshot {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CertifiedRawWriteBatchPreparation {
     pub(crate) schema_plan_id: SchemaPlanId,
     pub(crate) facts: PreparedRowFacts,
     pub(crate) tracked_keys_strictly_ordered: bool,
     pub(crate) complete_collection_replacement: Option<CompleteCollectionReplacementProof>,
+    /// The SQL lowerer produced one homogeneous native row collection with no
+    /// file scope or lifecycle/control rows. Plugin reconciliation can only
+    /// classify ownership for this shape; it cannot change its semantics.
+    pub(crate) fileless_typed_sql_rows: bool,
 }
 
 /// Ephemeral proof used to construct an authoritative immutable replacement
@@ -534,6 +500,22 @@ impl TypedMutationJournalBatch {
                 "typed mutation journal columns are empty or misaligned",
             ));
         }
+        let mut previous_end = 0usize;
+        for &(start, end) in &snapshot_offsets {
+            if start != previous_end || end <= start || end > snapshot_arena.len() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "typed mutation journal payload offsets are invalid",
+                ));
+            }
+            previous_end = end;
+        }
+        if previous_end != snapshot_arena.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "typed mutation journal payload offsets do not cover the arena",
+            ));
+        }
         Ok(Self {
             schema_plan_id,
             schema_key,
@@ -561,12 +543,18 @@ impl TypedMutationJournalBatch {
 pub(crate) struct CertifiedParameterBatch {
     row_pks: Vec<RowPk>,
     snapshots: Vec<TransactionJson>,
+    certified_snapshots: Option<CertifiedSnapshots>,
     durable_predecessors: Vec<Option<CertifiedCurrentStatePredecessor>>,
     schema_key: SharedStr,
     branch_id: SharedStr,
     untracked: bool,
     certificate: CertifiedRawWriteBatchPreparation,
     row_columnar: Option<crate::sql2::EncodedRowGroups>,
+}
+
+struct CertifiedSnapshots {
+    arena: Bytes,
+    offsets: Vec<(u32, u32)>,
 }
 
 impl CertifiedParameterBatch {
@@ -613,9 +601,81 @@ impl CertifiedParameterBatch {
                 .collect(),
             row_pks,
             snapshots,
+            certified_snapshots: None,
             schema_key,
             branch_id,
             untracked,
+            certificate,
+            row_columnar: None,
+        })
+    }
+
+    pub(crate) fn new_typed(
+        row_pks: Vec<RowPk>,
+        snapshot_arena: Vec<u8>,
+        snapshot_offsets: Vec<(usize, usize)>,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        mut certificate: CertifiedRawWriteBatchPreparation,
+    ) -> Result<Self, LixError> {
+        if row_pks.is_empty() || row_pks.len() != snapshot_offsets.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified typed replacement columns are not aligned",
+            ));
+        }
+        if row_pks.len() >= RAW_WRITE_NONE as usize {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "certified typed replacement row count exceeds u32",
+            ));
+        }
+        let arena_len = snapshot_arena.len();
+        let mut previous_end = 0usize;
+        let mut offsets = Vec::with_capacity(snapshot_offsets.len());
+        for (start, end) in snapshot_offsets {
+            if start != previous_end || end <= start || end > arena_len {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified typed replacement offsets are invalid",
+                ));
+            }
+            offsets.push((
+                u32::try_from(start).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "certified typed replacement arena exceeds u32",
+                    )
+                })?,
+                u32::try_from(end).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "certified typed replacement arena exceeds u32",
+                    )
+                })?,
+            ));
+            previous_end = end;
+        }
+        if previous_end != arena_len {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified typed replacement offsets do not cover their arena",
+            ));
+        }
+        certificate.fileless_typed_sql_rows = true;
+        Ok(Self {
+            durable_predecessors: std::iter::repeat_with(|| None)
+                .take(row_pks.len())
+                .collect(),
+            row_pks,
+            snapshots: Vec::new(),
+            certified_snapshots: Some(CertifiedSnapshots {
+                arena: Bytes::from(snapshot_arena),
+                offsets,
+            }),
+            schema_key,
+            branch_id,
+            untracked: false,
             certificate,
             row_columnar: None,
         })
@@ -642,6 +702,10 @@ impl CertifiedParameterBatch {
         self.untracked
     }
 
+    pub(crate) fn is_fileless_typed_sql_rows(&self) -> bool {
+        self.certificate.fileless_typed_sql_rows
+    }
+
     pub(crate) fn set_durable_predecessor(
         &mut self,
         index: usize,
@@ -650,7 +714,86 @@ impl CertifiedParameterBatch {
         self.durable_predecessors[index] = value;
     }
 
+    pub(crate) fn convert_to_typed(
+        &mut self,
+        schema_plan: &crate::catalog::SchemaPlan,
+    ) -> Result<(), LixError> {
+        if self.certified_snapshots.is_some() {
+            return Ok(());
+        }
+        let snapshots = std::mem::take(&mut self.snapshots);
+        let mut arena = Vec::new();
+        let mut offsets = Vec::with_capacity(self.row_pks.len());
+        for (row_pk, snapshot) in self.row_pks.iter().zip(snapshots) {
+            let value = serde_json::from_str(snapshot.normalized()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("certified typed row is not canonical JSON: {error}"),
+                )
+            })?;
+            let typed = WasmTypedRow::from_normalized_json(schema_plan, row_pk, &value)?;
+            let payload = typed.durable_payload().map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("cannot encode certified parameter typed payload: {error:?}"),
+                )
+            })?;
+            let start = u32::try_from(arena.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified typed payload arena exceeds u32",
+                )
+            })?;
+            arena.extend_from_slice(payload.as_ref());
+            let end = u32::try_from(arena.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified typed payload arena exceeds u32",
+                )
+            })?;
+            offsets.push((start, end));
+        }
+        self.certified_snapshots = Some(CertifiedSnapshots {
+            arena: Bytes::from(arena),
+            offsets,
+        });
+        self.certificate.fileless_typed_sql_rows = true;
+        Ok(())
+    }
+
     pub(crate) fn into_raw(self) -> Result<RawWriteBatch, LixError> {
+        if let Some(certified_snapshots) = self.certified_snapshots {
+            let mut rows = RawWriteBatch::with_capacity(self.row_pks.len());
+            for (row_pk, (start, end)) in self.row_pks.into_iter().zip(certified_snapshots.offsets)
+            {
+                let decoded_snapshot = WasmTypedRow::decode_durable_payload(
+                    Arc::from(&certified_snapshots.arena[start as usize..end as usize]),
+                    self.schema_key.as_str(),
+                    &row_pk,
+                )
+                .map(Arc::new)?;
+                rows.push_typed_parts(
+                    Some(row_pk),
+                    self.schema_key.clone(),
+                    None,
+                    Some(decoded_snapshot),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    self.untracked,
+                    self.branch_id.clone(),
+                );
+            }
+            rows.certified_preparation = Some(self.certificate);
+            for (index, predecessor) in self.durable_predecessors.into_iter().enumerate() {
+                rows.set_durable_predecessor(index, predecessor);
+            }
+            return Ok(rows);
+        }
         let mut rows = RawWriteBatch::from_certified_parameter_rows(
             self.row_pks,
             self.snapshots,
@@ -663,6 +806,18 @@ impl CertifiedParameterBatch {
             rows.set_durable_predecessor(index, predecessor);
         }
         Ok(rows)
+    }
+
+    pub(crate) fn into_prepared(
+        self,
+        origin_key: Option<&SharedStr>,
+        timestamp: LixTimestamp,
+        functions: &FunctionProviderHandle,
+    ) -> Result<PreparedStateBatch, LixError> {
+        if self.untracked {
+            return self.into_snapshot_prepared(origin_key, timestamp, functions);
+        }
+        self.into_dense_prepared(origin_key, timestamp)
     }
 
     pub(crate) fn into_dense_prepared(
@@ -701,6 +856,7 @@ impl CertifiedParameterBatch {
         let Self {
             row_pks,
             snapshots,
+            certified_snapshots,
             durable_predecessors,
             schema_key,
             branch_id,
@@ -708,6 +864,13 @@ impl CertifiedParameterBatch {
             certificate,
             row_columnar,
         } = self;
+        debug_assert!(snapshots.is_empty());
+        let certified_snapshots = certified_snapshots.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified parameter rows are missing typed snapshots",
+            )
+        })?;
         let row_count = row_pks.len();
         let predecessor_count = durable_predecessors
             .iter()
@@ -740,10 +903,7 @@ impl CertifiedParameterBatch {
             strings.push(value.clone());
             ordinal
         });
-        let mut json = Vec::with_capacity(row_count);
-        for snapshot in snapshots {
-            json.push(stage_json_from_value(snapshot));
-        }
+        let prepared_metadata = Vec::new();
         let string_index = strings
             .iter()
             .cloned()
@@ -775,7 +935,9 @@ impl CertifiedParameterBatch {
             row_pks,
             strings,
             string_index,
-            json,
+            metadata: prepared_metadata,
+            snapshot_arenas: Vec::new(),
+            snapshot_refs: std::iter::repeat_with(|| None).take(row_count).collect(),
             durable_predecessors: Vec::new(),
             origins: Vec::new(),
             origin_index: HashMap::new(),
@@ -785,11 +947,68 @@ impl CertifiedParameterBatch {
             complete_collection_replacement: certificate.complete_collection_replacement,
             staged_index_values: StagedIndexValues::default(),
         };
+        prepared.set_snapshot_arena(certified_snapshots.arena, certified_snapshots.offsets)?;
         if predecessor_count != 0 && predecessor_count != row_count {
             for (index, predecessor) in durable_predecessors.into_iter().enumerate() {
                 prepared.set_durable_predecessor(index, predecessor);
             }
         }
+        Ok(prepared)
+    }
+
+    fn into_snapshot_prepared(
+        self,
+        origin_key: Option<&SharedStr>,
+        timestamp: LixTimestamp,
+        functions: &FunctionProviderHandle,
+    ) -> Result<PreparedStateBatch, LixError> {
+        let Self {
+            row_pks,
+            snapshots,
+            certified_snapshots,
+            durable_predecessors,
+            schema_key,
+            branch_id,
+            untracked,
+            certificate,
+            row_columnar: _,
+        } = self;
+        debug_assert!(snapshots.is_empty());
+        let certified_snapshots = certified_snapshots.expect("snapshot conversion was checked");
+        let mut prepared = PreparedStateBatch::with_capacity(row_pks.len());
+        for row_pk in row_pks {
+            let change_id = if untracked {
+                ChangeId::from(functions.call_uuid_v7())
+            } else {
+                ChangeId::default()
+            };
+            prepared.push_parts_with_change_addressability(
+                certificate.schema_plan_id,
+                certificate.facts,
+                row_pk,
+                schema_key.clone(),
+                None,
+                None,
+                None,
+                None,
+                origin_key,
+                timestamp,
+                timestamp,
+                false,
+                Some(change_id),
+                true,
+                None,
+                untracked,
+                branch_id.clone(),
+            );
+        }
+        prepared.set_snapshot_arena(certified_snapshots.arena, certified_snapshots.offsets)?;
+        for (index, predecessor) in durable_predecessors.into_iter().enumerate() {
+            prepared.set_durable_predecessor(index, predecessor);
+        }
+        prepared.certified_tracked_keys_strictly_ordered =
+            certificate.tracked_keys_strictly_ordered;
+        prepared.complete_collection_replacement = certificate.complete_collection_replacement;
         Ok(prepared)
     }
 }
@@ -802,7 +1021,7 @@ pub(crate) struct RawWriteRowRef<'a> {
     pub(crate) row_pk: Option<&'a RowPk>,
     pub(crate) schema_key: &'a SharedStr,
     pub(crate) file_id: Option<&'a SharedStr>,
-    pub(crate) snapshot: Option<&'a TransactionJson>,
+    pub(crate) snapshot: Option<&'a RawSnapshot>,
     pub(crate) metadata: Option<&'a TransactionJson>,
     pub(crate) origin: Option<&'a TransactionWriteOrigin>,
     pub(crate) created_at: Option<&'a str>,
@@ -812,10 +1031,25 @@ pub(crate) struct RawWriteRowRef<'a> {
     pub(crate) commit_id: Option<&'a str>,
     pub(crate) untracked: bool,
     pub(crate) constraints_unchanged: bool,
+    pub(crate) plugin_owned: bool,
     pub(crate) branch_id: &'a SharedStr,
 }
 
-impl RawWriteRowRef<'_> {
+impl<'a> RawWriteRowRef<'a> {
+    pub(crate) fn snapshot_json(&self) -> Option<&'a TransactionJson> {
+        match self.snapshot? {
+            RawSnapshot::Json(snapshot) => Some(snapshot),
+            RawSnapshot::Row(_) => None,
+        }
+    }
+
+    pub(crate) fn decoded_snapshot(&self) -> Option<&'a Arc<WasmTypedRow>> {
+        match self.snapshot? {
+            RawSnapshot::Json(_) => None,
+            RawSnapshot::Row(snapshot) => Some(snapshot),
+        }
+    }
+
     pub(crate) fn schema_scope_branch_id(&self) -> &str {
         if self.global {
             crate::GLOBAL_BRANCH_ID
@@ -869,8 +1103,8 @@ fn record_prepared_row_ownership(
     row_pk: &RowPk,
     schema_key: &SharedStr,
     file_id: Option<&SharedStr>,
-    snapshot: Option<&StageJson>,
-    metadata: Option<&StageJson>,
+    snapshot: Option<&[u8]>,
+    metadata: Option<&Jsonb>,
     origin_key: Option<&SharedStr>,
     branch_id: &SharedStr,
     stage: usize,
@@ -880,8 +1114,8 @@ fn record_prepared_row_ownership(
         + file_id.map_or(0, |value| value.len())
         + origin_key.map_or(0, |value| value.len())
         + branch_id.len();
-    let value_bytes = snapshot.map_or(0, |value| value.normalized().len())
-        + metadata.map_or(0, |value| value.normalized().len());
+    let value_bytes = snapshot.map_or(0, <[u8]>::len)
+        + metadata.map_or(0, |value| value.binary_len().unwrap_or(0));
     crate::storage_bench::record_crud_ownership(
         stage,
         1,
@@ -985,7 +1219,10 @@ impl RawWriteBatch {
         Ok(Self {
             slots: vec![slot; row_count],
             row_pks: row_pks.into_iter().map(Some).collect(),
-            snapshots: snapshots.into_iter().map(Some).collect(),
+            snapshots: snapshots
+                .into_iter()
+                .map(|snapshot| Some(RawSnapshot::Json(snapshot)))
+                .collect(),
             metadata: std::iter::repeat_with(|| None).take(row_count).collect(),
             durable_predecessors: std::iter::repeat_with(|| None).take(row_count).collect(),
             strings,
@@ -1018,11 +1255,13 @@ impl RawWriteBatch {
         self.slots.is_empty()
     }
 
+    #[inline(always)]
     pub(crate) fn row(&self, index: usize) -> RawWriteRowRef<'_> {
         self.get(index)
             .expect("raw write row index must be inside the batch")
     }
 
+    #[inline(always)]
     pub(crate) fn get(&self, index: usize) -> Option<RawWriteRowRef<'_>> {
         let slot = self.slots.get(index)?;
         Some(RawWriteRowRef {
@@ -1039,6 +1278,7 @@ impl RawWriteBatch {
             commit_id: self.optional_string(slot.commit_id).map(SharedStr::as_str),
             untracked: slot.flags & RAW_WRITE_UNTRACKED != 0,
             constraints_unchanged: slot.flags & RAW_WRITE_CONSTRAINTS_UNCHANGED != 0,
+            plugin_owned: slot.flags & RAW_WRITE_PLUGIN_OWNED != 0,
             branch_id: &self.strings[slot.branch_id as usize],
         })
     }
@@ -1077,6 +1317,14 @@ impl RawWriteBatch {
             .last_mut()
             .expect("constraint certificate requires an appended row");
         slot.flags |= RAW_WRITE_CONSTRAINTS_UNCHANGED;
+    }
+
+    /// Marks a row whose schema is owned by the active plugin registry.
+    /// Normalization uses this proof to reject removed JSON ingress and require
+    /// the native typed payload lane used by component-authored rows.
+    pub(crate) fn mark_plugin_owned(&mut self, index: usize) {
+        self.certified_preparation = None;
+        self.slots[index].flags |= RAW_WRITE_PLUGIN_OWNED;
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1136,10 +1384,41 @@ impl RawWriteBatch {
             flags,
         });
         self.row_pks.push(row_pk);
-        self.snapshots.push(snapshot);
+        self.snapshots.push(snapshot.map(RawSnapshot::Json));
         self.metadata.push(metadata);
         self.durable_predecessors.push(None);
         self.debug_assert_aligned();
+    }
+
+    /// Appends a plugin row whose Schema v1 values have already been
+    /// validated at the component boundary. The typed owner remains aligned
+    /// with the ordinary raw-row columns and is never lowered to an outer JSON
+    /// object.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn push_typed_parts(
+        &mut self,
+        row_pk: Option<RowPk>,
+        schema_key: SharedStr,
+        file_id: Option<SharedStr>,
+        decoded_snapshot: Option<Arc<WasmTypedRow>>,
+        metadata: Option<TransactionJson>,
+        origin: Option<TransactionWriteOrigin>,
+        created_at: Option<SharedStr>,
+        updated_at: Option<SharedStr>,
+        global: bool,
+        change_id: Option<SharedStr>,
+        commit_id: Option<SharedStr>,
+        untracked: bool,
+        branch_id: SharedStr,
+    ) {
+        self.push_parts(
+            row_pk, schema_key, file_id, None, metadata, origin, created_at, updated_at, global,
+            change_id, commit_id, untracked, branch_id,
+        );
+        *self
+            .snapshots
+            .last_mut()
+            .expect("typed row was just appended") = decoded_snapshot.map(RawSnapshot::Row);
     }
 
     pub(crate) fn append(&mut self, mut other: Self) {
@@ -1171,6 +1450,79 @@ impl RawWriteBatch {
 
     pub(crate) fn certified_preparation(&self) -> Option<CertifiedRawWriteBatchPreparation> {
         self.certified_preparation
+    }
+
+    /// Replaces transient canonical JSON row sources with their sole durable
+    /// Schema v1 representation before certified preparation. This keeps the
+    /// fast SQL batch builders allocation-friendly without allowing their
+    /// temporary JSON arena to become a second physical payload lane.
+    pub(crate) fn convert_json_snapshots_to_typed(
+        &mut self,
+        schema_plan: &crate::catalog::SchemaPlan,
+    ) -> Result<(), LixError> {
+        for index in 0..self.len() {
+            let Some(RawSnapshot::Json(snapshot)) = self.snapshots[index].as_ref() else {
+                continue;
+            };
+            let value = serde_json::from_str(snapshot.normalized()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("certified typed row is not canonical JSON: {error}"),
+                )
+            })?;
+            let row_pk = self.row_pks[index].as_ref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified typed row is missing its primary key",
+                )
+            })?;
+            let typed = WasmTypedRow::from_normalized_json(schema_plan, row_pk, &value)?;
+            self.snapshots[index] = Some(RawSnapshot::Row(Arc::new(typed)));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn certify_fileless_typed_sql_rows(
+        &mut self,
+        schema_plan_id: SchemaPlanId,
+        facts: PreparedRowFacts,
+    ) -> Result<(), LixError> {
+        let Some(first) = self.get(0) else {
+            return Ok(());
+        };
+        let schema_key = first.schema_key;
+        let branch_id = first.branch_id;
+        let untracked = first.untracked;
+        let mut previous_row_pk = None;
+        let mut strictly_ordered = true;
+        for row in self.iter() {
+            if row.schema_key != schema_key
+                || row.branch_id != branch_id
+                || row.untracked != untracked
+                || row.global
+                || row.file_id.is_some()
+                || row.snapshot_json().is_some()
+                || row.metadata.is_some()
+                || (row.decoded_snapshot().is_none() && row.row_pk.is_none())
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "fileless typed SQL certificate received an ineligible row",
+                ));
+            }
+            if let (Some(previous), Some(current)) = (previous_row_pk, row.row_pk) {
+                strictly_ordered &= previous < current;
+            }
+            previous_row_pk = row.row_pk;
+        }
+        self.certified_preparation = Some(CertifiedRawWriteBatchPreparation {
+            schema_plan_id,
+            facts,
+            tracked_keys_strictly_ordered: strictly_ordered,
+            complete_collection_replacement: None,
+            fileless_typed_sql_rows: true,
+        });
+        Ok(())
     }
 
     /// Consumes a homogeneous certified ingress batch into its commit-ready
@@ -1229,13 +1581,6 @@ impl RawWriteBatch {
                 "certified transaction batch unexpectedly contains logical origins",
             ));
         }
-        if durable_predecessors.iter().any(Option::is_some) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "certified INSERT batch unexpectedly contains durable predecessors",
-            ));
-        }
-
         let mut string_index = HashMap::with_capacity(strings.len().saturating_add(1));
         for (ordinal, value) in strings.iter().cloned().enumerate() {
             string_index.insert(
@@ -1257,12 +1602,16 @@ impl RawWriteBatch {
 
         let mut prepared_slots = Vec::with_capacity(row_count);
         let mut prepared_row_pks = Vec::with_capacity(row_count);
-        let mut json = Vec::with_capacity(row_count);
-        for (row_index, (((slot, row_pk), snapshot), metadata)) in slots
+        let prepared_metadata = Vec::new();
+        let mut snapshot_arenas = Vec::with_capacity(row_count);
+        let mut snapshot_refs = Vec::with_capacity(row_count);
+        let mut prepared_durable_predecessors = Vec::new();
+        for (row_index, ((((slot, row_pk), snapshot), metadata), predecessor)) in slots
             .into_iter()
             .zip(row_pks)
             .zip(snapshots)
             .zip(metadata)
+            .zip(durable_predecessors)
             .enumerate()
         {
             if slot.file_id != RAW_WRITE_NONE
@@ -1271,7 +1620,7 @@ impl RawWriteBatch {
                 || slot.updated_at != RAW_WRITE_NONE
                 || slot.change_id != RAW_WRITE_NONE
                 || slot.commit_id != RAW_WRITE_NONE
-                || slot.flags & !RAW_WRITE_UNTRACKED != 0
+                || slot.flags & !(RAW_WRITE_UNTRACKED | RAW_WRITE_CONSTRAINTS_UNCHANGED) != 0
                 || metadata.is_some()
             {
                 return Err(LixError::new(
@@ -1285,15 +1634,41 @@ impl RawWriteBatch {
                     "certified transaction row is missing row_pk",
                 )
             })?;
-            let snapshot = snapshot.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "certified transaction row is missing snapshot_content",
-                )
-            })?;
-            let snapshot = stage_json_from_value(snapshot);
+            match snapshot {
+                Some(RawSnapshot::Row(decoded_snapshot)) => {
+                    let payload = decoded_snapshot.durable_payload().map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("cannot encode certified prepared snapshot: {error:?}"),
+                        )
+                    })?;
+                    if payload.is_empty() {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "certified transaction row has an empty native typed snapshot",
+                        ));
+                    }
+                    let arena = u32::try_from(snapshot_arenas.len())
+                        .expect("prepared snapshot arena count must fit u32");
+                    let end = u32::try_from(payload.len())
+                        .expect("prepared snapshot payload must fit u32");
+                    snapshot_arenas.push(Bytes::from_owner(payload));
+                    snapshot_refs.push(Some(PreparedSnapshotRef {
+                        arena,
+                        start: 0,
+                        end,
+                    }));
+                }
+                Some(RawSnapshot::Json(_)) => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "certified preparation requires a normalized snapshot row",
+                    ));
+                }
+                // Protocol v69 encodes deletes as the absence of a snapshot.
+                None => snapshot_refs.push(None),
+            }
             prepared_row_pks.push(row_pk);
-            json.push(snapshot);
             let untracked = slot.flags & RAW_WRITE_UNTRACKED != 0;
             // Tracked rows keep the nil placeholder: `addressable_change_id`
             // means commit planning replaces it with the row's commit-delta
@@ -1306,6 +1681,12 @@ impl RawWriteBatch {
             } else {
                 ChangeId::default()
             };
+            let durable_predecessor = predecessor.map(|predecessor| {
+                let ordinal = u32::try_from(prepared_durable_predecessors.len())
+                    .expect("certified predecessor column must fit u32");
+                prepared_durable_predecessors.push(predecessor);
+                ordinal
+            });
             prepared_slots.push(PreparedStateSlot {
                 schema_plan_id: certificate.schema_plan_id,
                 facts: certificate.facts,
@@ -1313,10 +1694,6 @@ impl RawWriteBatch {
                     .expect("certified transaction row ordinal must fit u32"),
                 schema_key: slot.schema_key,
                 file_id: None,
-                snapshot: Some(
-                    u32::try_from(row_index)
-                        .expect("certified transaction JSON ordinal must fit u32"),
-                ),
                 metadata: None,
                 origin: None,
                 origin_key,
@@ -1328,7 +1705,7 @@ impl RawWriteBatch {
                 commit_id: None,
                 untracked,
                 branch_id: slot.branch_id,
-                durable_predecessor: None,
+                durable_predecessor,
             });
         }
         Ok(PreparedStateBatch {
@@ -1337,8 +1714,10 @@ impl RawWriteBatch {
             row_pks: prepared_row_pks,
             strings,
             string_index,
-            json,
-            durable_predecessors: Vec::new(),
+            metadata: prepared_metadata,
+            snapshot_arenas,
+            snapshot_refs,
+            durable_predecessors: prepared_durable_predecessors,
             origins: Vec::new(),
             origin_index: HashMap::new(),
             origin_column_sets: Vec::new(),
@@ -1355,7 +1734,12 @@ impl RawWriteBatch {
         self.certified_preparation = None;
         for snapshot in &mut self.snapshots {
             if let Some(value) = snapshot.take() {
-                *snapshot = Some(value.revoke_row_content_certificate());
+                *snapshot = Some(match value {
+                    RawSnapshot::Json(value) => {
+                        RawSnapshot::Json(value.revoke_row_content_certificate())
+                    }
+                    RawSnapshot::Row(value) => RawSnapshot::Row(value),
+                });
             }
         }
     }
@@ -1397,12 +1781,33 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn take_snapshot(&mut self, index: usize) -> Option<TransactionJson> {
-        self.snapshots[index].take()
+        match self.snapshots[index].take() {
+            Some(RawSnapshot::Json(snapshot)) => Some(snapshot),
+            value => {
+                self.snapshots[index] = value;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn take_decoded_snapshot(&mut self, index: usize) -> Option<Arc<WasmTypedRow>> {
+        match self.snapshots[index].take() {
+            Some(RawSnapshot::Row(snapshot)) => Some(snapshot),
+            value => {
+                self.snapshots[index] = value;
+                None
+            }
+        }
     }
 
     pub(crate) fn set_snapshot(&mut self, index: usize, value: Option<TransactionJson>) {
         self.certified_preparation = None;
-        self.snapshots[index] = value;
+        self.snapshots[index] = value.map(RawSnapshot::Json);
+    }
+
+    pub(crate) fn set_decoded_snapshot(&mut self, index: usize, value: Option<Arc<WasmTypedRow>>) {
+        self.certified_preparation = None;
+        self.snapshots[index] = value.map(RawSnapshot::Row);
     }
 
     pub(crate) fn take_metadata(&mut self, index: usize) -> Option<TransactionJson> {
@@ -1422,12 +1827,6 @@ impl RawWriteBatch {
         value: Option<CertifiedCurrentStatePredecessor>,
     ) {
         self.durable_predecessors[index] = value;
-    }
-
-    pub(crate) fn snapshot_slots_mut(
-        &mut self,
-    ) -> impl Iterator<Item = &mut Option<TransactionJson>> {
-        self.snapshots.iter_mut()
     }
 
     pub(crate) fn metadata_slots_mut(
@@ -1507,11 +1906,19 @@ impl RawWriteBatch {
     #[cfg(test)]
     fn take_owned_row(&mut self, index: usize) -> TransactionWriteRow {
         let slot = self.slots[index];
+        let snapshot = self.snapshots[index].take().map(|snapshot| match snapshot {
+            RawSnapshot::Json(snapshot) => snapshot,
+            RawSnapshot::Row(snapshot) => TransactionJson::from_value_for_test(
+                snapshot
+                    .to_json_value()
+                    .expect("typed test row should project to JSON"),
+            ),
+        });
         TransactionWriteRow {
             row_pk: self.row_pks[index].take(),
             schema_key: self.strings[slot.schema_key as usize].clone(),
             file_id: self.optional_string(slot.file_id).cloned(),
-            snapshot: self.snapshots[index].take(),
+            snapshot,
             metadata: self.metadata[index].take(),
             origin: (slot.origin != RAW_WRITE_NONE)
                 .then(|| self.origins[slot.origin as usize].clone()),
@@ -1536,23 +1943,59 @@ impl RawWriteBatch {
     fn move_row_into(&mut self, index: usize, destination: &mut Self) {
         let slot = self.slots[index];
         let durable_predecessor = self.durable_predecessors[index].take();
-        destination.push_parts(
-            self.row_pks[index].take(),
-            self.strings[slot.schema_key as usize].clone(),
-            self.optional_string(slot.file_id).cloned(),
-            self.snapshots[index].take(),
-            self.metadata[index].take(),
-            (slot.origin != RAW_WRITE_NONE).then(|| self.origins[slot.origin as usize].clone()),
-            self.optional_string(slot.created_at).cloned(),
-            self.optional_string(slot.updated_at).cloned(),
-            slot.flags & RAW_WRITE_GLOBAL != 0,
-            self.optional_string(slot.change_id).cloned(),
-            self.optional_string(slot.commit_id).cloned(),
-            slot.flags & RAW_WRITE_UNTRACKED != 0,
-            self.strings[slot.branch_id as usize].clone(),
-        );
+        let row_pk = self.row_pks[index].take();
+        let schema_key = self.strings[slot.schema_key as usize].clone();
+        let file_id = self.optional_string(slot.file_id).cloned();
+        let snapshot = self.snapshots[index].take();
+        let metadata = self.metadata[index].take();
+        let origin =
+            (slot.origin != RAW_WRITE_NONE).then(|| self.origins[slot.origin as usize].clone());
+        let created_at = self.optional_string(slot.created_at).cloned();
+        let updated_at = self.optional_string(slot.updated_at).cloned();
+        let global = slot.flags & RAW_WRITE_GLOBAL != 0;
+        let change_id = self.optional_string(slot.change_id).cloned();
+        let commit_id = self.optional_string(slot.commit_id).cloned();
+        let untracked = slot.flags & RAW_WRITE_UNTRACKED != 0;
+        let branch_id = self.strings[slot.branch_id as usize].clone();
+        match snapshot {
+            Some(RawSnapshot::Row(snapshot)) => destination.push_typed_parts(
+                row_pk,
+                schema_key,
+                file_id,
+                Some(snapshot),
+                metadata,
+                origin,
+                created_at,
+                updated_at,
+                global,
+                change_id,
+                commit_id,
+                untracked,
+                branch_id,
+            ),
+            snapshot => destination.push_parts(
+                row_pk,
+                schema_key,
+                file_id,
+                snapshot.map(|snapshot| match snapshot {
+                    RawSnapshot::Json(snapshot) => snapshot,
+                    RawSnapshot::Row(_) => unreachable!("decoded snapshot matched above"),
+                }),
+                metadata,
+                origin,
+                created_at,
+                updated_at,
+                global,
+                change_id,
+                commit_id,
+                untracked,
+                branch_id,
+            ),
+        }
         let destination_index = destination.len() - 1;
         destination.set_durable_predecessor(destination_index, durable_predecessor);
+        destination.slots[destination_index].flags |=
+            slot.flags & (RAW_WRITE_CONSTRAINTS_UNCHANGED | RAW_WRITE_PLUGIN_OWNED);
     }
 
     fn intern_optional_string(&mut self, value: Option<SharedStr>) -> u32 {
@@ -1703,16 +2146,6 @@ impl RawWriteBatch {
     }
 
     #[cfg(test)]
-    pub(crate) fn string_dictionary_is_promoted(&self) -> bool {
-        self.string_index.is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn origin_dictionary_is_promoted(&self) -> bool {
-        self.origin_index.is_some()
-    }
-
-    #[cfg(test)]
     pub(crate) fn dictionary_capacities(&self) -> [usize; 4] {
         [
             self.strings.capacity(),
@@ -1737,6 +2170,7 @@ impl Default for RawWriteBatch {
 impl<'a> Iterator for RawWriteRows<'a> {
     type Item = RawWriteRowRef<'a>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         self.range.next().and_then(|index| self.batch.get(index))
     }
@@ -1974,11 +2408,7 @@ pub(crate) struct TransactionFileContent {
     /// steady-state reads can load it directly without reopening the archive.
     auxiliary_payloads: Vec<BlobPayload>,
     plugin_checkpoint: Option<PluginCheckpointWrite>,
-    /// Reconciliation may retain this record only as the owner of certified
-    /// semantic batches after its file payload has already been materialized
-    /// through the ordinary plugin path.
     stage_payload_at_commit: bool,
-    /// Certified v3 semantic owners which remain encoded through commit.
     certified_row_batches: Vec<WasmCertifiedRowBatch>,
 }
 
@@ -2047,35 +2477,12 @@ impl TransactionFileContent {
         self.auxiliary_payloads.push(BlobPayload::from_bytes(data));
     }
 
-    pub(crate) fn set_plugin_checkpoint(
-        &mut self,
-        generation: String,
-        semantic_root: String,
-        runtime: impl Into<crate::Blob>,
-        authority: impl Into<crate::Blob>,
-    ) {
-        self.plugin_checkpoint = Some(PluginCheckpointWrite {
-            generation,
-            semantic_root,
-            runtime: runtime.into(),
-            authority: authority.into(),
-        });
-    }
-
     pub(crate) fn plugin_checkpoint(&self) -> Option<&PluginCheckpointWrite> {
         self.plugin_checkpoint.as_ref()
     }
 
-    pub(crate) fn set_certified_row_batches(&mut self, batches: Vec<WasmCertifiedRowBatch>) {
-        self.certified_row_batches = batches;
-    }
-
     pub(crate) fn certified_row_batches(&self) -> &[WasmCertifiedRowBatch] {
         &self.certified_row_batches
-    }
-
-    pub(crate) fn retain_certified_batches_only(&mut self) {
-        self.stage_payload_at_commit = false;
     }
 
     pub(crate) fn stage_payload_at_commit(&self) -> bool {
@@ -2259,21 +2666,37 @@ enum StageJsonStorage {
     /// The parsed batch column is deliberately gone at this boundary. Commit
     /// materialization and storage lowering consume only the certified bytes,
     /// so making decoded access impossible prevents an accidental second parse.
-    ValidatedShared {
-        normalized: SharedStr,
-    },
+    ValidatedShared { normalized: SharedStr },
     /// Row-owned certified bytes retained after transaction validation.
     ///
     /// Direct row writes already arrive in an `Arc<str>`. Keeping that
     /// owner avoids allocating and copying the full JSON payload merely to
     /// discard an empty (or no-longer-needed) decoded-value cache.
-    ValidatedOwned {
-        normalized: Arc<str>,
-    },
-    CanonicalBatch(WasmCanonicalJson),
+    ValidatedOwned { normalized: Arc<str> },
 }
 
 impl StageJson {
+    /// Crosses the preparation boundary into the protocol's native metadata
+    /// representation. Prepared rows never retain a JSON text slot.
+    pub(crate) fn into_jsonb(self) -> Jsonb {
+        let parse = |normalized: &str| {
+            serde_json::from_str(normalized)
+                .expect("prepared normalized metadata must remain valid JSON")
+        };
+        let value = match self.storage {
+            StageJsonStorage::Owned { value, normalized } => value
+                .into_inner()
+                .map(|value| Arc::try_unwrap(value).unwrap_or_else(|value| (*value).clone()))
+                .unwrap_or_else(|| parse(&normalized)),
+            StageJsonStorage::CertifiedShared { value, normalized } => value
+                .into_inner()
+                .map(|value| Arc::try_unwrap(value).unwrap_or_else(|value| (*value).clone()))
+                .unwrap_or_else(|| parse(normalized.as_str())),
+            StageJsonStorage::ValidatedShared { normalized } => parse(normalized.as_str()),
+            StageJsonStorage::ValidatedOwned { normalized } => parse(&normalized),
+        };
+        Jsonb::from_value(value)
+    }
     pub(crate) fn value(&self) -> &serde_json::Value {
         match &self.storage {
             StageJsonStorage::Owned { value, normalized } => value
@@ -2295,7 +2718,6 @@ impl StageJson {
             StageJsonStorage::ValidatedShared { .. } | StageJsonStorage::ValidatedOwned { .. } => {
                 panic!("validated staged JSON must not be decoded after transaction validation")
             }
-            StageJsonStorage::CanonicalBatch(value) => value.value(),
         }
     }
 
@@ -2305,18 +2727,6 @@ impl StageJson {
             StageJsonStorage::CertifiedShared { normalized, .. } => normalized.as_str(),
             StageJsonStorage::ValidatedShared { normalized } => normalized.as_str(),
             StageJsonStorage::ValidatedOwned { normalized } => normalized.as_ref(),
-            StageJsonStorage::CanonicalBatch(value) => value.normalized(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn canonical_batch_row(&self) -> Option<&WasmCanonicalJson> {
-        match &self.storage {
-            StageJsonStorage::CanonicalBatch(value) => Some(value),
-            StageJsonStorage::Owned { .. }
-            | StageJsonStorage::CertifiedShared { .. }
-            | StageJsonStorage::ValidatedShared { .. }
-            | StageJsonStorage::ValidatedOwned { .. } => None,
         }
     }
 
@@ -2327,9 +2737,6 @@ impl StageJson {
     /// materialization allocates its storage buffers.
     pub(crate) fn release_validated_canonical_value_column(&mut self) -> bool {
         let storage = match &self.storage {
-            StageJsonStorage::CanonicalBatch(value) => StageJsonStorage::ValidatedShared {
-                normalized: value.normalized_shared(),
-            },
             StageJsonStorage::CertifiedShared { normalized, .. } => {
                 StageJsonStorage::ValidatedShared {
                     normalized: normalized.clone(),
@@ -2351,39 +2758,15 @@ impl StageJson {
         match &self.storage {
             StageJsonStorage::Owned { value, .. }
             | StageJsonStorage::CertifiedShared { value, .. } => value.get().is_some(),
-            StageJsonStorage::CanonicalBatch(_) => true,
             StageJsonStorage::ValidatedShared { .. } | StageJsonStorage::ValidatedOwned { .. } => {
                 false
             }
         }
     }
 
-    /// Retains canonical or already-shared normalized JSON without copying.
-    ///
-    /// Row-owned `Arc<str>` payloads still require one conversion into the
-    /// shared byte-backed representation. Batch-backed and certified-shared
-    /// payloads only clone an owner and range.
-    pub(crate) fn materialize_shared(&self) -> SharedStr {
-        match &self.storage {
-            StageJsonStorage::Owned { normalized, .. } => SharedStr::from(normalized.as_ref()),
-            StageJsonStorage::CertifiedShared { normalized, .. } => normalized.clone(),
-            StageJsonStorage::ValidatedShared { normalized } => normalized.clone(),
-            StageJsonStorage::ValidatedOwned { normalized } => SharedStr::from(normalized.as_ref()),
-            StageJsonStorage::CanonicalBatch(value) => value.normalized_shared(),
-        }
-    }
-
     /// Whether this payload inlines into values instead of the json store.
     pub(crate) fn is_inline(&self) -> bool {
         self.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES
-    }
-
-    pub(crate) fn slot_ref(&self) -> crate::json_store::JsonSlotRef<'_> {
-        if self.is_inline() {
-            crate::json_store::JsonSlotRef::Inline(self.normalized())
-        } else {
-            crate::json_store::JsonSlotRef::Ref(&self.json_ref)
-        }
     }
 }
 
@@ -2399,7 +2782,7 @@ impl Eq for StageJson {}
 pub(crate) fn stage_json_from_value(value: TransactionJson) -> StageJson {
     // Inline values carry their bytes as the authoritative durable payload.
     // Computing and retaining a content hash for every small row only to
-    // discard it at `JsonSlotRef::Inline` doubled the canonical-byte walk on
+    // discard it at the inline-storage boundary doubled the canonical-byte walk on
     // bulk inserts. Out-of-band values still require the exact content ref.
     let json_ref = if value.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
         JsonRef::default()
@@ -2424,21 +2807,11 @@ pub(crate) fn stage_json_from_value(value: TransactionJson) -> StageJson {
         TransactionJsonStorage::CanonicalShared { value, normalized } => {
             StageJsonStorage::CertifiedShared { value, normalized }
         }
-        TransactionJsonStorage::CanonicalBatch(value) => StageJsonStorage::CanonicalBatch(value),
     };
     StageJson { storage, json_ref }
 }
 
-/// Coalesces decoded JSON values into one Arrow-style values column plus one
-/// offset-addressed canonical UTF-8 arena.
-///
-/// Plugin-produced rows already carry a bounded canonical page handle and are
-/// left untouched. SQL-produced values reach this boundary without a
-/// per-row serialized `String`; the batch appends every row into one amortized
-/// arena, serializes each row once, and replaces the row-owned values with
-/// cheap batch handles. Avoiding an exact-size structural prepass matters for
-/// bulk writes: walking every JSON tree twice costs more than the bounded
-/// geometric growth of one shared arena.
+/// Coalesces decoded engine JSON values into one canonical UTF-8 arena.
 pub(crate) fn canonicalize_transaction_json_batch<'a>(
     slots: impl IntoIterator<Item = &'a mut Option<TransactionJson>>,
     context: &str,
@@ -2474,7 +2847,6 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         })
         .count();
     let mut values = Vec::with_capacity(decoded_count);
-    let mut all_values_uniquely_owned = true;
     let mut cached_normalized = Vec::with_capacity(decoded_count);
     let mut positions = Vec::with_capacity(decoded_count);
     for (position, slot) in slots.iter_mut().enumerate() {
@@ -2485,10 +2857,7 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
             TransactionJsonStorage::Decoded { value, normalized } => {
                 let value = match Arc::try_unwrap(value) {
                     Ok(value) => DecodedCanonicalValue::Owned(value),
-                    Err(value) => {
-                        all_values_uniquely_owned = false;
-                        DecodedCanonicalValue::Shared(value)
-                    }
+                    Err(value) => DecodedCanonicalValue::Shared(value),
                 };
                 positions.push(position);
                 values.push(value);
@@ -2509,9 +2878,6 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
                 **slot = Some(TransactionJson {
                     storage: TransactionJsonStorage::CanonicalShared { value, normalized },
                 });
-            }
-            TransactionJsonStorage::CanonicalBatch(value) => {
-                **slot = Some(TransactionJson::from_canonical_batch(value));
             }
         }
     }
@@ -2548,7 +2914,6 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
 
     let mut offsets = Vec::with_capacity(values.len());
     let mut normalized = CanonicalJsonArena::new(decoded_capacity_hint, context)?;
-    let mut serialize_count = 0usize;
     for (value, cached) in values.iter().zip(&cached_normalized) {
         let start = u32::try_from(normalized.len()).map_err(|_| {
             LixError::new(
@@ -2572,7 +2937,6 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
                     |failure| canonical_json_arena_error(context, failure),
                 )
             })?;
-            serialize_count += 1;
         }
         let end = u32::try_from(normalized.len()).map_err(|_| {
             LixError::new(
@@ -2582,48 +2946,25 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         })?;
         offsets.push((start, end));
     }
-    if all_values_uniquely_owned {
-        let values = values
-            .into_iter()
-            .map(|value| {
-                let DecodedCanonicalValue::Owned(value) = value else {
-                    unreachable!("unique canonicalization retained a shared decoded JSON owner")
-                };
-                value
-            })
-            .collect();
-        let rows = WasmCanonicalJson::from_batch_parts(
-            values,
-            normalized.into_bytes(),
-            offsets,
-            positions.len(),
-            serialize_count,
-        )?;
-        for ((position, row), expected_row) in positions.into_iter().zip(rows).zip(0..) {
-            debug_assert_eq!(row.row_index(), expected_row);
-            *slots[position] = Some(TransactionJson::from_canonical_batch(row));
-        }
-    } else {
-        // SAFETY: every uncached row was written by serde_json and every
-        // cached row came from a previously validated TransactionJson.
-        let normalized =
-            unsafe { SharedStr::from_utf8_unchecked(Bytes::from(normalized.into_bytes())) };
-        for ((position, value), (start, end)) in positions.into_iter().zip(values).zip(offsets) {
-            let normalized = normalized
-                .slice(start as usize..end as usize)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_UNKNOWN,
-                        format!("{context} canonical JSON batch offsets are invalid"),
-                    )
-                })?;
-            *slots[position] = Some(TransactionJson {
-                storage: TransactionJsonStorage::CanonicalShared {
-                    value: OnceLock::from(value.into_shared()),
-                    normalized,
-                },
-            });
-        }
+    // SAFETY: every uncached row was written by serde_json and every cached
+    // row came from a previously validated TransactionJson.
+    let normalized =
+        unsafe { SharedStr::from_utf8_unchecked(Bytes::from(normalized.into_bytes())) };
+    for ((position, value), (start, end)) in positions.into_iter().zip(values).zip(offsets) {
+        let normalized = normalized
+            .slice(start as usize..end as usize)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_UNKNOWN,
+                    format!("{context} canonical JSON batch offsets are invalid"),
+                )
+            })?;
+        *slots[position] = Some(TransactionJson {
+            storage: TransactionJsonStorage::CanonicalShared {
+                value: OnceLock::from(value.into_shared()),
+                normalized,
+            },
+        });
     }
     Ok(())
 }
@@ -2753,8 +3094,8 @@ pub(crate) struct TestPreparedStateRow {
     pub(crate) row_pk: RowPk,
     pub(crate) schema_key: SharedStr,
     pub(crate) file_id: Option<SharedStr>,
-    pub(crate) snapshot: Option<StageJson>,
-    pub(crate) metadata: Option<StageJson>,
+    pub(crate) snapshot: Option<Bytes>,
+    pub(crate) metadata: Option<Jsonb>,
     pub(crate) origin: Option<TransactionWriteOrigin>,
     /// Execution-scoped provenance shared by all rows in the prepared batch.
     pub(crate) origin_key: Option<SharedStr>,
@@ -2778,7 +3119,7 @@ impl TestPreparedStateRow {
             row_pk: &self.row_pk,
             schema_key: &self.schema_key,
             file_id: self.file_id.as_ref(),
-            snapshot: self.snapshot.as_ref(),
+            snapshot: self.snapshot.as_deref(),
             metadata: self.metadata.as_ref(),
             origin: self.origin.as_ref(),
             origin_key: self.origin_key.as_ref(),
@@ -2860,7 +3201,11 @@ pub(crate) struct PreparedStateBatch {
     row_pks: Vec<RowPk>,
     strings: Vec<SharedStr>,
     string_index: HashMap<SharedStr, u32>,
-    json: Vec<StageJson>,
+    metadata: Vec<Jsonb>,
+    /// Canonical typed snapshot owners. Row-aligned refs borrow ranges from
+    /// these arenas; `None` is the sole tombstone representation.
+    snapshot_arenas: Vec<Bytes>,
+    snapshot_refs: Vec<Option<PreparedSnapshotRef>>,
     durable_predecessors: Vec<CertifiedCurrentStatePredecessor>,
     origins: Vec<TransactionWriteOrigin>,
     origin_index: HashMap<TransactionWriteOrigin, u32>,
@@ -2879,13 +3224,19 @@ pub(crate) struct PreparedStateBatch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedSnapshotRef {
+    arena: u32,
+    start: u32,
+    end: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PreparedStateSlot {
     schema_plan_id: SchemaPlanId,
     facts: PreparedRowFacts,
     row_pk: u32,
     schema_key: u32,
     file_id: Option<u32>,
-    snapshot: Option<u32>,
     metadata: Option<u32>,
     origin: Option<u32>,
     origin_key: Option<u32>,
@@ -2974,8 +3325,8 @@ pub(crate) struct PreparedStateRowRef<'a> {
     pub(crate) row_pk: &'a RowPk,
     pub(crate) schema_key: &'a SharedStr,
     pub(crate) file_id: Option<&'a SharedStr>,
-    pub(crate) snapshot: Option<&'a StageJson>,
-    pub(crate) metadata: Option<&'a StageJson>,
+    pub(crate) snapshot: Option<&'a [u8]>,
+    pub(crate) metadata: Option<&'a Jsonb>,
     pub(crate) origin: Option<&'a TransactionWriteOrigin>,
     pub(crate) origin_key: Option<&'a SharedStr>,
     pub(crate) created_at: LixTimestamp,
@@ -2992,6 +3343,33 @@ pub(crate) struct PreparedStateRowRef<'a> {
 pub(crate) struct PreparedStateRows<'a> {
     batch: &'a PreparedStateBatch,
     range: std::ops::Range<usize>,
+}
+
+impl PreparedStateRowRef<'_> {
+    #[inline]
+    pub(crate) fn is_deleted(self) -> bool {
+        self.snapshot.is_none()
+    }
+
+    #[inline]
+    pub(crate) fn has_payload(self) -> bool {
+        !self.is_deleted()
+    }
+
+    pub(crate) fn materialize_decoded_snapshot(
+        self,
+    ) -> Result<Option<Arc<WasmTypedRow>>, LixError> {
+        self.snapshot
+            .map(|payload| {
+                WasmTypedRow::decode_durable_payload(
+                    Arc::from(payload),
+                    self.schema_key.as_str(),
+                    self.row_pk,
+                )
+                .map(Arc::new)
+            })
+            .transpose()
+    }
 }
 
 impl PreparedStateBatch {
@@ -3031,7 +3409,9 @@ impl PreparedStateBatch {
             // grow this bounded hint a fixed handful of times.
             strings: Vec::with_capacity(string_capacity),
             string_index: HashMap::with_capacity(string_capacity),
-            json: Vec::with_capacity(json_capacity),
+            metadata: Vec::with_capacity(json_capacity),
+            snapshot_arenas: Vec::new(),
+            snapshot_refs: Vec::with_capacity(row_capacity),
             durable_predecessors: Vec::new(),
             // Origin dictionaries are absent for ordinary SQL/direct writes
             // and typically contain only a few shared descriptors. Allocate
@@ -3075,8 +3455,11 @@ impl PreparedStateBatch {
                 .saturating_add(row.origin_key.map_or(0, |value| value.len()))
                 .saturating_add(row.branch_id.len());
             value_bytes = value_bytes
-                .saturating_add(row.snapshot.map_or(0, |value| value.normalized().len()))
-                .saturating_add(row.metadata.map_or(0, |value| value.normalized().len()));
+                .saturating_add(row.snapshot.map_or(0, <[u8]>::len))
+                .saturating_add(
+                    row.metadata
+                        .map_or(0, |value| value.binary_len().unwrap_or(0)),
+                );
             string_entries = string_entries
                 .saturating_add(2)
                 .saturating_add(usize::from(row.file_id.is_some()))
@@ -3099,6 +3482,40 @@ impl PreparedStateBatch {
 
     pub(crate) fn certified_tracked_keys_strictly_ordered(&self) -> bool {
         self.certified_tracked_keys_strictly_ordered
+    }
+
+    /// Rebinds addressable rows in a fully certified fresh-file import to the
+    /// owning commit's direct mutation address space.
+    ///
+    /// The fresh-file certificate has already proved that this is one live,
+    /// tracked, exact-file batch with no selected history. Preparation marks
+    /// engine-generated placeholder identities as addressable, so they can be
+    /// replaced here without touching authored IDs used by durable row
+    /// references, materialization roots, or actor observations.
+    pub(crate) fn certify_fresh_file_direct_addresses(
+        &mut self,
+        expected_file_id: &str,
+    ) -> Result<(), LixError> {
+        self.expand_dense_certified_parameter();
+        if self.slots.iter().enumerate().any(|(index, slot)| {
+            slot.untracked
+                || slot
+                    .file_id
+                    .map(|index| self.strings[index as usize].as_str())
+                    != Some(expected_file_id)
+                || self.snapshot_refs[index].is_none()
+        }) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "fresh-file direct-address certificate no longer matches prepared rows",
+            ));
+        }
+        for slot in &mut self.slots {
+            if slot.addressable_change_id {
+                slot.change_id = Some(ChangeId::default());
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn complete_collection_replacement_proof(
@@ -3139,12 +3556,13 @@ impl PreparedStateBatch {
             {
                 return None;
             }
+            let payload_bytes = row.snapshot.map(<[u8]>::len)?;
             let row_bytes = row
                 .schema_key
                 .len()
                 .checked_add(row.row_pk.estimated_heap_bytes())?
                 .checked_add(128)?
-                .checked_add(row.snapshot?.normalized().len())?;
+                .checked_add(payload_bytes)?;
             bytes.checked_add(u64::try_from(row_bytes).ok()?)
         }) else {
             return false;
@@ -3176,11 +3594,13 @@ impl PreparedStateBatch {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn row(&self, index: usize) -> PreparedStateRowRef<'_> {
         self.get(index)
             .expect("prepared state batch row ordinal is in bounds")
     }
 
+    #[inline(always)]
     pub(crate) fn get(&self, index: usize) -> Option<PreparedStateRowRef<'_>> {
         if let Some(dense) = &self.dense_certified_parameter {
             if index >= dense.len {
@@ -3192,7 +3612,7 @@ impl PreparedStateBatch {
                 row_pk: &self.row_pks[index],
                 schema_key: &self.strings[dense.schema_key as usize],
                 file_id: None,
-                snapshot: Some(&self.json[index]),
+                snapshot: self.snapshot_at(index),
                 metadata: None,
                 origin: None,
                 origin_key: dense.origin_key.map(|index| &self.strings[index as usize]),
@@ -3224,8 +3644,8 @@ impl PreparedStateBatch {
             row_pk: &self.row_pks[slot.row_pk as usize],
             schema_key: &self.strings[slot.schema_key as usize],
             file_id: slot.file_id.map(|index| &self.strings[index as usize]),
-            snapshot: slot.snapshot.map(|index| &self.json[index as usize]),
-            metadata: slot.metadata.map(|index| &self.json[index as usize]),
+            snapshot: self.snapshot_at(index),
+            metadata: slot.metadata.map(|index| &self.metadata[index as usize]),
             origin: slot.origin.map(|index| &self.origins[index as usize]),
             origin_key: slot.origin_key.map(|index| &self.strings[index as usize]),
             created_at: slot.created_at,
@@ -3252,7 +3672,7 @@ impl PreparedStateBatch {
 
     #[cfg(test)]
     pub(crate) fn push_test_row(&mut self, row: TestPreparedStateRow) {
-        self.push_parts(
+        self.push_parts_with_change_addressability_native(
             row.schema_plan_id,
             row.facts,
             row.row_pk,
@@ -3266,6 +3686,7 @@ impl PreparedStateBatch {
             row.updated_at,
             row.global,
             row.change_id,
+            false,
             row.commit_id,
             row.untracked,
             row.branch_id,
@@ -3282,45 +3703,12 @@ impl PreparedStateBatch {
     }
 
     #[cfg(test)]
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn push_parts(
-        &mut self,
-        schema_plan_id: SchemaPlanId,
-        facts: PreparedRowFacts,
-        row_pk: RowPk,
-        schema_key: SharedStr,
-        file_id: Option<SharedStr>,
-        snapshot: Option<StageJson>,
-        metadata: Option<StageJson>,
-        origin: Option<TransactionWriteOrigin>,
-        origin_key: Option<&SharedStr>,
-        created_at: LixTimestamp,
-        updated_at: LixTimestamp,
-        global: bool,
-        change_id: Option<ChangeId>,
-        commit_id: Option<CommitId>,
-        untracked: bool,
-        branch_id: SharedStr,
-    ) {
-        self.push_parts_with_change_addressability(
-            schema_plan_id,
-            facts,
-            row_pk,
-            schema_key,
-            file_id,
-            snapshot,
-            metadata,
-            origin,
-            origin_key,
-            created_at,
-            updated_at,
-            global,
-            change_id,
-            false,
-            commit_id,
-            untracked,
-            branch_id,
+    pub(crate) fn hard_cut_test_payloads_to_typed(&mut self) -> Result<(), LixError> {
+        debug_assert!(
+            self.iter()
+                .all(|row| row.snapshot.is_some() || row.is_deleted())
         );
+        Ok(())
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -3331,8 +3719,50 @@ impl PreparedStateBatch {
         row_pk: RowPk,
         schema_key: SharedStr,
         file_id: Option<SharedStr>,
-        snapshot: Option<StageJson>,
+        snapshot: Option<Bytes>,
         metadata: Option<StageJson>,
+        origin: Option<TransactionWriteOrigin>,
+        origin_key: Option<&SharedStr>,
+        created_at: LixTimestamp,
+        updated_at: LixTimestamp,
+        global: bool,
+        change_id: Option<ChangeId>,
+        addressable_change_id: bool,
+        commit_id: Option<CommitId>,
+        untracked: bool,
+        branch_id: SharedStr,
+    ) {
+        self.push_parts_with_change_addressability_native(
+            schema_plan_id,
+            facts,
+            row_pk,
+            schema_key,
+            file_id,
+            snapshot,
+            metadata.map(StageJson::into_jsonb),
+            origin,
+            origin_key,
+            created_at,
+            updated_at,
+            global,
+            change_id,
+            addressable_change_id,
+            commit_id,
+            untracked,
+            branch_id,
+        );
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn push_parts_with_change_addressability_native(
+        &mut self,
+        schema_plan_id: SchemaPlanId,
+        facts: PreparedRowFacts,
+        row_pk: RowPk,
+        schema_key: SharedStr,
+        file_id: Option<SharedStr>,
+        snapshot: Option<Bytes>,
+        metadata: Option<Jsonb>,
         origin: Option<TransactionWriteOrigin>,
         origin_key: Option<&SharedStr>,
         created_at: LixTimestamp,
@@ -3349,7 +3779,7 @@ impl PreparedStateBatch {
             &row_pk,
             &schema_key,
             file_id.as_ref(),
-            snapshot.as_ref(),
+            snapshot.as_deref(),
             metadata.as_ref(),
             origin_key,
             &branch_id,
@@ -3359,8 +3789,7 @@ impl PreparedStateBatch {
         let row_pk = self.push_row_pk(row_pk);
         let schema_key = self.intern_string(schema_key);
         let file_id = file_id.map(|value| self.intern_string(value));
-        let snapshot = snapshot.map(|value| self.push_json(value));
-        let metadata = metadata.map(|value| self.push_json(value));
+        let metadata = metadata.map(|value| self.push_metadata(value));
         let origin = origin.map(|value| self.intern_origin(value));
         let origin_key = origin_key.map(|value| self.intern_string_ref(value));
         let branch_id = self.intern_string(branch_id);
@@ -3370,7 +3799,6 @@ impl PreparedStateBatch {
             row_pk,
             schema_key,
             file_id,
-            snapshot,
             metadata,
             origin,
             origin_key,
@@ -3384,6 +3812,11 @@ impl PreparedStateBatch {
             branch_id,
             durable_predecessor: None,
         });
+        self.snapshot_refs.push(None);
+        if let Some(snapshot) = snapshot {
+            let index = self.slots.len() - 1;
+            self.set_snapshot_bytes(index, snapshot);
+        }
     }
 
     fn expand_dense_certified_parameter(&mut self) {
@@ -3392,7 +3825,6 @@ impl PreparedStateBatch {
         };
         debug_assert!(self.slots.is_empty());
         debug_assert_eq!(self.row_pks.len(), dense.len);
-        debug_assert_eq!(self.json.len(), dense.len);
         self.slots.reserve(dense.len);
         for row_index in 0..dense.len {
             let ordinal = u32::try_from(row_index)
@@ -3409,7 +3841,6 @@ impl PreparedStateBatch {
                 row_pk: ordinal,
                 schema_key: dense.schema_key,
                 file_id: None,
-                snapshot: Some(ordinal),
                 metadata: None,
                 origin: None,
                 origin_key: dense.origin_key,
@@ -3490,6 +3921,8 @@ impl PreparedStateBatch {
                     && right.durable_predecessors.is_none()
                     && self.durable_predecessors.is_empty()
                     && other.durable_predecessors.is_empty()
+                    && self.snapshot_arenas.is_empty()
+                    && other.snapshot_arenas.is_empty()
                     && self.origins.is_empty()
                     && other.origins.is_empty()
                     && self.origin_column_sets.is_empty()
@@ -3523,7 +3956,20 @@ impl PreparedStateBatch {
             .checked_add(right.len)
             .expect("prepared dense parameter row count overflowed");
         self.row_pks.append(&mut other.row_pks);
-        self.json.append(&mut other.json);
+        self.metadata.append(&mut other.metadata);
+        let arena_base = u32::try_from(self.snapshot_arenas.len())
+            .expect("prepared snapshot arena count must fit u32");
+        self.snapshot_arenas.append(&mut other.snapshot_arenas);
+        self.snapshot_refs
+            .extend(other.snapshot_refs.drain(..).map(|snapshot| {
+                snapshot.map(|snapshot| PreparedSnapshotRef {
+                    arena: snapshot
+                        .arena
+                        .checked_add(arena_base)
+                        .expect("prepared snapshot arena ordinal overflowed"),
+                    ..snapshot
+                })
+            }));
         self.complete_collection_replacement = None;
         true
     }
@@ -3555,12 +4001,14 @@ impl PreparedStateBatch {
         self.certified_tracked_keys_strictly_ordered = false;
         self.complete_collection_replacement = None;
         let row_base = u32::try_from(self.row_pks.len()).expect("prepared row column must fit u32");
-        let json_base = u32::try_from(self.json.len()).expect("prepared JSON column must fit u32");
+        let metadata_base =
+            u32::try_from(self.metadata.len()).expect("prepared metadata column must fit u32");
         let predecessor_base = u32::try_from(self.durable_predecessors.len())
             .expect("prepared predecessor column must fit u32");
         self.slots.reserve(other.slots.len());
         self.row_pks.reserve(other.row_pks.len());
-        self.json.reserve(other.json.len());
+        self.metadata.reserve(other.metadata.len());
+        self.snapshot_refs.reserve(other.snapshot_refs.len());
         self.durable_predecessors
             .reserve(other.durable_predecessors.len());
         self.strings.reserve(other.strings.len());
@@ -3582,7 +4030,20 @@ impl PreparedStateBatch {
             .map(|value| self.intern_origin(value))
             .collect::<Vec<_>>();
         self.row_pks.append(&mut other.row_pks);
-        self.json.append(&mut other.json);
+        self.metadata.append(&mut other.metadata);
+        let payload_arena_base = u32::try_from(self.snapshot_arenas.len())
+            .expect("prepared snapshot arena count must fit u32");
+        self.snapshot_arenas.append(&mut other.snapshot_arenas);
+        self.snapshot_refs
+            .extend(other.snapshot_refs.into_iter().map(|snapshot| {
+                snapshot.map(|snapshot| PreparedSnapshotRef {
+                    arena: snapshot
+                        .arena
+                        .checked_add(payload_arena_base)
+                        .expect("prepared snapshot arena ordinal overflowed"),
+                    ..snapshot
+                })
+            }));
         self.durable_predecessors
             .append(&mut other.durable_predecessors);
         self.slots.extend(other.slots.into_iter().map(|slot| {
@@ -3594,15 +4055,10 @@ impl PreparedStateBatch {
                     .expect("prepared row ordinal overflowed"),
                 schema_key: remap_string(slot.schema_key),
                 file_id: slot.file_id.map(remap_string),
-                snapshot: slot.snapshot.map(|index| {
-                    index
-                        .checked_add(json_base)
-                        .expect("prepared JSON ordinal overflowed")
-                }),
                 metadata: slot.metadata.map(|index| {
                     index
-                        .checked_add(json_base)
-                        .expect("prepared JSON ordinal overflowed")
+                        .checked_add(metadata_base)
+                        .expect("prepared metadata ordinal overflowed")
                 }),
                 durable_predecessor: slot.durable_predecessor.map(|index| {
                     index
@@ -3622,6 +4078,7 @@ impl PreparedStateBatch {
         self.certified_tracked_keys_strictly_ordered = false;
         self.complete_collection_replacement = None;
         self.slots.swap(left, right);
+        self.snapshot_refs.swap(left, right);
     }
 
     /// Selects unique source ordinals into the requested destination order.
@@ -3670,11 +4127,13 @@ impl PreparedStateBatch {
             }
             let displaced_original = original_at_position[destination];
             self.slots.swap(destination, source_position);
+            self.snapshot_refs.swap(destination, source_position);
             original_at_position.swap(destination, source_position);
             position_of_original[source] = destination;
             position_of_original[displaced_original] = source_position;
         }
         self.slots.truncate(source_by_destination.len());
+        self.snapshot_refs.truncate(source_by_destination.len());
     }
 
     /// Truncates a slot prefix after callers have placed final rows directly.
@@ -3691,6 +4150,7 @@ impl PreparedStateBatch {
             self.complete_collection_replacement = None;
         }
         self.slots.truncate(retained_len);
+        self.snapshot_refs.truncate(retained_len);
         if !self.should_compact_owner_columns(retained_len) {
             return;
         }
@@ -3749,106 +4209,8 @@ impl PreparedStateBatch {
     }
 
     pub(crate) fn release_validated_canonical_value_columns(&mut self) {
-        if let Some(dense) = &self.dense_certified_parameter {
-            debug_assert_eq!(dense.len, self.json.len());
-        } else {
-            let live_json_count = self
-                .slots
-                .iter()
-                .map(|slot| {
-                    usize::from(slot.snapshot.is_some()) + usize::from(slot.metadata.is_some())
-                })
-                .sum::<usize>();
-            #[cfg(debug_assertions)]
-            if live_json_count == self.json.len() {
-                let mut referenced = vec![false; self.json.len()];
-                for ordinal in self
-                    .slots
-                    .iter()
-                    .flat_map(|slot| [slot.snapshot, slot.metadata].into_iter().flatten())
-                {
-                    assert!(
-                        !std::mem::replace(&mut referenced[ordinal as usize], true),
-                        "prepared JSON ordinals must remain unique"
-                    );
-                }
-            }
-            if live_json_count != self.json.len() {
-                let old_json = std::mem::take(&mut self.json);
-                let mut ordinal_remap = vec![u32::MAX; old_json.len()];
-                let mut live_json = Vec::with_capacity(live_json_count);
-                for slot in &mut self.slots {
-                    for ordinal in [&mut slot.snapshot, &mut slot.metadata] {
-                        let Some(old_ordinal) = *ordinal else {
-                            continue;
-                        };
-                        let remapped = &mut ordinal_remap[old_ordinal as usize];
-                        if *remapped == u32::MAX {
-                            *remapped = u32::try_from(live_json.len())
-                                .expect("prepared live JSON ordinal must fit u32");
-                            live_json.push(old_json[old_ordinal as usize].clone());
-                        }
-                        *ordinal = Some(*remapped);
-                    }
-                }
-                self.json = live_json;
-            }
-        }
-        if self.json.is_empty() {
-            return;
-        }
-        for value in &mut self.json {
-            value.release_validated_canonical_value_column();
-        }
-        let mut normalized = self
-            .json
-            .iter()
-            .enumerate()
-            .filter_map(|(ordinal, value)| match &value.storage {
-                StageJsonStorage::ValidatedShared { normalized } => {
-                    Some((ordinal, normalized.clone()))
-                }
-                StageJsonStorage::ValidatedOwned { .. } => None,
-                StageJsonStorage::Owned { .. }
-                | StageJsonStorage::CertifiedShared { .. }
-                | StageJsonStorage::CanonicalBatch(_) => {
-                    unreachable!("all live staged JSON must be released before arena accounting")
-                }
-            })
-            .collect::<Vec<_>>();
-        let live_bytes = normalized
-            .iter()
-            .map(|(_, value)| value.len())
-            .sum::<usize>();
-        let mut source_buffers = HashSet::with_capacity(normalized.len());
-        let retained_bytes = normalized
-            .iter()
-            .filter_map(|(_, value)| {
-                source_buffers
-                    .insert(value.retained_buffer_identity())
-                    .then_some(value.retained_buffer_len())
-            })
-            .sum::<usize>();
-        if retained_bytes > live_bytes.saturating_mul(2) {
-            let mut arena = Vec::with_capacity(live_bytes);
-            for (_, value) in &normalized {
-                arena.extend_from_slice(value.as_bytes());
-            }
-            // SAFETY: this arena is the concatenation of validated SharedStr
-            // values and therefore remains UTF-8.
-            let arena = unsafe { SharedStr::from_utf8_unchecked(Bytes::from(arena)) };
-            let mut offset = 0usize;
-            for (_, value) in &mut normalized {
-                let end = offset + value.len();
-                *value = arena
-                    .slice(offset..end)
-                    .expect("validated canonical JSON row boundary remains UTF-8");
-                offset = end;
-            }
-        }
-        for (ordinal, normalized) in normalized {
-            self.json[ordinal].storage = StageJsonStorage::ValidatedShared { normalized };
-        }
+        // Metadata crossed into native JSONB during preparation; there is no
+        // decoded/text column left to release after semantic validation.
     }
 
     #[cfg(test)]
@@ -3864,20 +4226,6 @@ impl PreparedStateBatch {
             dense.facts,
             self.strings[dense.schema_key as usize].as_str(),
             self.strings[dense.branch_id as usize].as_str(),
-        ))
-    }
-
-    /// Returns the contiguous snapshot column for a single certified row
-    /// generation. Commit-time derived indexes can consume this column
-    /// directly instead of first allocating row ordinals and projecting the
-    /// same fixed metadata through `PreparedStateRowRef` for every row.
-    pub(crate) fn dense_row_columnar_input(&self) -> Option<(CommitId, &str, &[StageJson])> {
-        let dense = self.dense_certified_parameter.as_ref()?;
-        let commit_id = dense.commit_id?;
-        Some((
-            commit_id,
-            self.strings[dense.schema_key as usize].as_str(),
-            &self.json[..dense.len],
         ))
     }
 
@@ -3900,13 +4248,14 @@ impl PreparedStateBatch {
     }
 
     #[cfg(test)]
-    pub(crate) fn shared_string_count(&self) -> usize {
-        self.strings.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shared_origin_count(&self) -> usize {
-        self.origins.len()
+    pub(crate) fn set_origin_for_test(
+        &mut self,
+        index: usize,
+        origin: Option<TransactionWriteOrigin>,
+    ) {
+        self.expand_dense_certified_parameter();
+        let origin = origin.map(|origin| self.intern_origin(origin));
+        self.slots[index].origin = origin;
     }
 
     pub(crate) fn set_requires_transaction_validation(
@@ -3918,15 +4267,86 @@ impl PreparedStateBatch {
         self.slots[index].facts.requires_transaction_validation = requires_transaction_validation;
     }
 
+    pub(crate) fn set_decoded_snapshot(&mut self, index: usize, value: Option<Arc<WasmTypedRow>>) {
+        self.expand_dense_certified_parameter();
+        self.snapshot_refs[index] = None;
+        let Some(value) = value else {
+            return;
+        };
+        let payload = value
+            .durable_payload()
+            .expect("validated prepared typed row must encode");
+        self.set_snapshot_bytes(index, Bytes::from_owner(payload));
+    }
+
+    fn snapshot_at(&self, index: usize) -> Option<&[u8]> {
+        let snapshot = self.snapshot_refs.get(index).copied().flatten()?;
+        self.snapshot_arenas
+            .get(snapshot.arena as usize)?
+            .get(snapshot.start as usize..snapshot.end as usize)
+    }
+
+    fn set_snapshot_bytes(&mut self, index: usize, snapshot: Bytes) {
+        let arena = u32::try_from(self.snapshot_arenas.len())
+            .expect("prepared snapshot arena count must fit u32");
+        let end = u32::try_from(snapshot.len()).expect("prepared snapshot payload must fit u32");
+        self.snapshot_arenas.push(snapshot);
+        self.snapshot_refs[index] = Some(PreparedSnapshotRef {
+            arena,
+            start: 0,
+            end,
+        });
+    }
+
+    /// Attaches one certified payload arena to the current row topology.
+    /// Every range is validated before ownership is published, so subsequent
+    /// row operations only need to keep the compact refs aligned.
+    pub(crate) fn set_snapshot_arena(
+        &mut self,
+        arena: Bytes,
+        offsets: Vec<(u32, u32)>,
+    ) -> Result<(), LixError> {
+        if offsets.len() != self.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified typed payload ranges are not row-aligned",
+            ));
+        }
+        if offsets.iter().enumerate().any(|(index, &(start, end))| {
+            start >= end || end as usize > arena.len() || self.snapshot_refs[index].is_some()
+        }) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified typed payload range or row payload invariant is invalid",
+            ));
+        }
+        let arena_index = u32::try_from(self.snapshot_arenas.len()).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "prepared typed payload arena count exceeds u32",
+            )
+        })?;
+        self.snapshot_arenas.push(arena);
+        for (slot, (start, end)) in self.snapshot_refs.iter_mut().zip(offsets) {
+            *slot = Some(PreparedSnapshotRef {
+                arena: arena_index,
+                start,
+                end,
+            });
+        }
+        Ok(())
+    }
+
     fn push_row_pk(&mut self, value: RowPk) -> u32 {
         let index = u32::try_from(self.row_pks.len()).expect("prepared row column must fit u32");
         self.row_pks.push(value);
         index
     }
 
-    fn push_json(&mut self, value: StageJson) -> u32 {
-        let index = u32::try_from(self.json.len()).expect("prepared JSON column must fit u32");
-        self.json.push(value);
+    fn push_metadata(&mut self, value: Jsonb) -> u32 {
+        let index =
+            u32::try_from(self.metadata.len()).expect("prepared metadata column must fit u32");
+        self.metadata.push(value);
         index
     }
 
@@ -4008,13 +4428,13 @@ impl PreparedStateBatch {
             row.branch_id,
             crate::storage_bench::CRUD_OWNERSHIP_PREPARED_CLONE,
         );
-        self.push_parts_with_change_addressability(
+        self.push_parts_with_change_addressability_native(
             row.schema_plan_id,
             row.facts,
             row.row_pk.clone(),
             row.schema_key.clone(),
             row.file_id.cloned(),
-            row.snapshot.cloned(),
+            row.snapshot.map(Bytes::copy_from_slice),
             row.metadata.cloned(),
             row.origin.cloned(),
             row.origin_key,
@@ -4041,6 +4461,7 @@ impl Default for PreparedStateBatch {
 impl<'a> Iterator for PreparedStateRows<'a> {
     type Item = PreparedStateRowRef<'a>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         self.range.next().map(|index| self.batch.row(index))
     }
@@ -4102,14 +4523,21 @@ impl PartialEq for PreparedStateRowRef<'_> {
 
 impl Eq for PreparedStateRowRef<'_> {}
 
+pub(crate) fn materialize_jsonb_shared(value: &Jsonb) -> SharedStr {
+    SharedStr::from(
+        serde_json::to_string(value.as_value())
+            .expect("validated prepared metadata must serialize"),
+    )
+}
+
 impl From<PreparedStateRowRef<'_>> for MaterializedHotStateRow {
     fn from(row: PreparedStateRowRef<'_>) -> Self {
         Self {
             row_pk: row.row_pk.clone(),
             schema_key: row.schema_key.to_string(),
             file_id: row.file_id.map(ToString::to_string),
-            snapshot_content: row.snapshot.map(StageJson::materialize_shared),
-            metadata: row.metadata.map(StageJson::materialize_shared),
+            snapshot_content: None,
+            metadata: row.metadata.map(materialize_jsonb_shared),
             deleted: row.snapshot.is_none(),
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -4122,16 +4550,49 @@ impl From<PreparedStateRowRef<'_>> for MaterializedHotStateRow {
     }
 }
 
+/// Builds the legacy owned DTO at an explicit JSON projection boundary.
+/// Durable and batch-native paths keep the typed sidecar instead; persistent
+/// filesystem indexes currently own this DTO and therefore request the
+/// transient projection deliberately.
+pub(crate) fn materialized_hot_state_row_with_snapshot_projection(
+    row: PreparedStateRowRef<'_>,
+) -> Result<MaterializedHotStateRow, LixError> {
+    let mut materialized = MaterializedHotStateRow::from(row);
+    materialized.snapshot_content = row
+        .snapshot
+        .map(|payload| {
+            WasmTypedRow::decode_durable_payload(
+                Arc::from(payload),
+                row.schema_key.as_str(),
+                row.row_pk,
+            )?
+            .to_json_shared()
+        })
+        .transpose()?;
+    Ok(materialized)
+}
+
 #[cfg(test)]
 impl From<TestPreparedStateRow> for MaterializedHotStateRow {
     fn from(row: TestPreparedStateRow) -> Self {
         let deleted = row.snapshot.is_none();
+        let snapshot_content = row.snapshot.as_deref().map(|snapshot| {
+            WasmTypedRow::decode_durable_payload(
+                Arc::from(snapshot),
+                row.schema_key.as_str(),
+                &row.row_pk,
+            )
+            .and_then(|typed| typed.to_json_shared())
+            .expect("test prepared snapshot should decode")
+        });
         Self {
             row_pk: row.row_pk,
             schema_key: row.schema_key.into(),
             file_id: row.file_id.map(Into::into),
-            snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize_shared()),
-            metadata: row.metadata.map(|metadata| metadata.materialize_shared()),
+            snapshot_content,
+            metadata: row
+                .metadata
+                .map(|metadata| materialize_jsonb_shared(&metadata)),
             deleted,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -4151,8 +4612,16 @@ impl From<&TestPreparedStateRow> for MaterializedHotStateRow {
             row_pk: row.row_pk.clone(),
             schema_key: row.schema_key.to_string(),
             file_id: row.file_id.as_ref().map(ToString::to_string),
-            snapshot_content: row.snapshot.as_ref().map(StageJson::materialize_shared),
-            metadata: row.metadata.as_ref().map(StageJson::materialize_shared),
+            snapshot_content: row.snapshot.as_deref().map(|snapshot| {
+                WasmTypedRow::decode_durable_payload(
+                    Arc::from(snapshot),
+                    row.schema_key.as_str(),
+                    &row.row_pk,
+                )
+                .and_then(|typed| typed.to_json_shared())
+                .expect("test prepared snapshot should decode")
+            }),
+            metadata: row.metadata.as_ref().map(materialize_jsonb_shared),
             deleted: row.snapshot.is_none(),
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -4169,6 +4638,91 @@ impl From<&TestPreparedStateRow> for MaterializedHotStateRow {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fileless_typed_sql_certificate_rejects_metadata_rows() {
+        let mut rows = RawWriteBatch::new();
+        rows.push_typed_parts(
+            Some(RowPk::single("row")),
+            "typed_sql_probe".into(),
+            None,
+            None,
+            Some(TransactionJson::from_value_for_test(serde_json::json!({
+                "source": "test"
+            }))),
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            "main".into(),
+        );
+
+        let error = rows
+            .certify_fileless_typed_sql_rows(
+                SchemaPlanId::for_test(1),
+                PreparedRowFacts {
+                    row_content_validated: true,
+                    requires_transaction_validation: false,
+                },
+            )
+            .expect_err("metadata rows must remain on generic preparation");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(rows.certified_preparation().is_none());
+    }
+
+    #[test]
+    fn fresh_file_direct_addressing_preserves_authored_authorities() {
+        let timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z");
+        let file_id = SharedStr::from_static("01920000-0000-7000-8000-0000000000a2");
+        let authored = ChangeId::for_test_label("materialization-root");
+        let mut rows = PreparedStateBatch::with_capacity(2);
+        for (key, change_id, addressable) in [
+            (
+                "ordinary",
+                Some(ChangeId::for_test_label("placeholder")),
+                true,
+            ),
+            ("authority", Some(authored), false),
+        ] {
+            let row_pk = RowPk::single(key);
+            let snapshot =
+                WasmTypedRow::from_test_json_unchecked(&row_pk, &serde_json::json!({"id": key}))
+                    .expect("test snapshot should become typed")
+                    .durable_payload()
+                    .map(Bytes::from_owner)
+                    .expect("typed test snapshot should encode");
+            rows.push_parts_with_change_addressability(
+                SchemaPlanId::for_test(1),
+                PreparedRowFacts::default(),
+                row_pk,
+                "plugin_state".into(),
+                Some(file_id.clone()),
+                Some(snapshot),
+                None,
+                None,
+                None,
+                timestamp,
+                timestamp,
+                false,
+                change_id,
+                addressable,
+                None,
+                false,
+                "main".into(),
+            );
+        }
+
+        rows.certify_fresh_file_direct_addresses(file_id.as_str())
+            .expect("fresh file should certify");
+
+        assert_eq!(rows.row(0).change_id, Some(ChangeId::default()));
+        assert!(rows.row(0).addressable_change_id);
+        assert_eq!(rows.row(1).change_id, Some(authored));
+        assert!(!rows.row(1).addressable_change_id);
+    }
+
     fn expdl_probe_certificate(plan: u32) -> CertifiedRawWriteBatchPreparation {
         CertifiedRawWriteBatchPreparation {
             schema_plan_id: SchemaPlanId::for_test(plan),
@@ -4178,70 +4732,80 @@ mod tests {
             },
             tracked_keys_strictly_ordered: true,
             complete_collection_replacement: None,
+            fileless_typed_sql_rows: false,
         }
     }
 
-    fn expdl_probe_batch(keys: &[&str], untracked: bool) -> PreparedStateBatch {
-        let row_pks = keys.iter().map(|key| RowPk::single(*key)).collect();
-        let snapshots = keys
+    fn typed_certified_probe_batch(
+        keys: &[&str],
+        schema_key: &str,
+        untracked: bool,
+        certificate: CertifiedRawWriteBatchPreparation,
+        timestamp: LixTimestamp,
+    ) -> PreparedStateBatch {
+        let row_pks = keys
             .iter()
-            .map(|key| {
-                TransactionJson::from_certified_shared_normalized_row_content(
-                    format!(r#"{{"id":"{key}"}}"#).into(),
-                )
-            })
+            .map(|key| RowPk::single(*key))
             .collect::<Vec<_>>();
-        CertifiedParameterInsertBatch::new_with_lane(
+        let mut arena = Vec::new();
+        let mut offsets = Vec::with_capacity(keys.len());
+        for (row_pk, key) in row_pks.iter().zip(keys) {
+            let typed =
+                WasmTypedRow::from_test_json_unchecked(row_pk, &serde_json::json!({ "id": key }))
+                    .expect("test row should become typed");
+            let payload = typed
+                .durable_payload()
+                .expect("test typed row should encode");
+            let start = arena.len();
+            arena.extend_from_slice(payload.as_ref());
+            offsets.push((start, arena.len()));
+        }
+        let mut rows = CertifiedParameterInsertBatch::new_typed(
             row_pks,
-            snapshots,
-            "expdl_probe".into(),
+            arena,
+            offsets,
+            schema_key.into(),
             "main".into(),
-            untracked,
-            expdl_probe_certificate(7),
+            certificate,
         )
-        .expect("certified rows should construct")
-        // Deliberately the inner constructor. `into_dense_prepared` asserts
-        // that no untracked batch reaches the dense lane, which is the
-        // invariant these probes are the backstop for: they prove that if the
-        // routing guard ever goes, the projections still agree on the lane
-        // instead of silently flipping it.
-        .into_dense_prepared_timestamps(
-            None,
-            DenseParameterTimestamps::Scalar(LixTimestamp::expect_parse(
-                "timestamp",
-                "2026-08-02T00:00:00.000Z",
-            )),
-        )
-        .expect("certified rows should prepare")
+        .expect("certified typed rows should construct");
+        rows.untracked = untracked;
+        rows.into_prepared(None, timestamp, &FunctionProviderHandle::system())
+            .expect("certified typed rows should prepare")
     }
 
-    /// A dense certified batch must report the same durability lane through
-    /// both of its projections. The borrowed accessor reads
-    /// `dense.untracked`; expansion into row slots must not invent one.
+    fn expdl_probe_batch(keys: &[&str], untracked: bool) -> PreparedStateBatch {
+        typed_certified_probe_batch(
+            keys,
+            "expdl_probe",
+            untracked,
+            expdl_probe_certificate(7),
+            LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z"),
+        )
+    }
+
+    /// Certified typed rows must retain their durability lane after preparation
+    /// and after later row-local mutations.
     #[test]
-    fn expdl_dense_certified_expansion_preserves_untracked_lane() {
+    fn typed_certified_expansion_preserves_untracked_lane() {
         let mut prepared = expdl_probe_batch(&["a", "b"], true);
 
-        assert!(prepared.is_dense_certified_parameter());
+        assert!(!prepared.is_dense_certified_parameter());
         assert!(
             prepared.iter().all(|row| row.untracked),
-            "dense projection must report the untracked lane"
+            "prepared rows must report the untracked lane"
         );
 
         prepared.set_durable_predecessor(0, None);
-
-        assert!(!prepared.is_dense_certified_parameter());
         assert!(
             prepared.iter().all(|row| row.untracked),
             "expansion must not move untracked rows into the tracked lane"
         );
     }
 
-    /// Two dense cohorts only merge when every batch-common fact matches.
-    /// The durability lane is batch-common, so a tracked cohort must never
-    /// absorb an untracked one.
+    /// Appending certified typed rows must preserve each row's durability lane.
     #[test]
-    fn expdl_dense_certified_cohort_merge_keeps_lanes_apart() {
+    fn typed_certified_cohort_merge_keeps_lanes_apart() {
         let mut tracked = expdl_probe_batch(&["a", "b"], false);
         let untracked = expdl_probe_batch(&["c", "d"], true);
 
@@ -4256,14 +4820,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_parameter_rows_keep_batch_common_prepared_facts_dense() {
-        let row_pks = vec![RowPk::single("a"), RowPk::single("b")];
-        let snapshots = [r#"{"id":"a"}"#, r#"{"id":"b"}"#]
-            .into_iter()
-            .map(|value| {
-                TransactionJson::from_certified_shared_normalized_row_content(value.into())
-            })
-            .collect::<Vec<_>>();
+    fn certified_parameter_rows_keep_batch_common_prepared_facts_with_native_snapshots() {
         let certificate = CertifiedRawWriteBatchPreparation {
             schema_plan_id: SchemaPlanId::for_test(7),
             facts: PreparedRowFacts {
@@ -4272,27 +4829,24 @@ mod tests {
             },
             tracked_keys_strictly_ordered: true,
             complete_collection_replacement: None,
+            fileless_typed_sql_rows: false,
         };
         let timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z");
-        let mut prepared = CertifiedParameterInsertBatch::new(
-            row_pks,
-            snapshots,
-            "dense_probe".into(),
-            "main".into(),
-            certificate,
-        )
-        .expect("certified rows should construct")
-        .into_dense_prepared(None, timestamp)
-        .expect("certified rows should prepare");
+        let mut prepared =
+            typed_certified_probe_batch(&["a", "b"], "dense_probe", false, certificate, timestamp);
 
         assert!(prepared.is_dense_certified_parameter());
-        assert!(prepared.slots.is_empty());
+        assert_eq!(prepared.slots.len(), 0);
         assert_eq!(prepared.len(), 2);
         assert_eq!(prepared.first().unwrap().row_pk, &RowPk::single("a"));
-        assert_eq!(
-            prepared.last().unwrap().snapshot.unwrap().normalized(),
-            r#"{"id":"b"}"#
-        );
+        let last = prepared.last().unwrap();
+        let decoded = WasmTypedRow::decode_durable_payload(
+            Arc::from(last.snapshot.unwrap()),
+            last.schema_key.as_str(),
+            last.row_pk,
+        )
+        .expect("prepared snapshot should decode");
+        assert_eq!(decoded.to_json_shared().unwrap().as_str(), r#"{"id":"b"}"#);
         assert!(prepared.iter().all(|row| {
             row.schema_key.as_str() == "dense_probe"
                 && row.branch_id.as_str() == "main"
@@ -4321,7 +4875,6 @@ mod tests {
         );
 
         prepared.set_requires_transaction_validation(0, true);
-        assert!(!prepared.is_dense_certified_parameter());
         assert_eq!(prepared.slots.len(), 2);
         assert!(prepared.row(0).facts.requires_transaction_validation);
         assert!(!prepared.row(1).facts.requires_transaction_validation);
@@ -4331,18 +4884,11 @@ mod tests {
     }
 
     #[test]
-    fn certified_replacement_keeps_dense_complete_collection_proof() {
-        let snapshots = [r#"{"id":"a"}"#, r#"{"id":"b"}"#]
-            .into_iter()
-            .map(|value| {
-                TransactionJson::from_certified_shared_normalized_row_content(value.into())
-            })
-            .collect::<Vec<_>>();
-        let mut prepared = CertifiedParameterReplacementBatch::new(
-            vec![RowPk::single("a"), RowPk::single("b")],
-            snapshots,
-            "dense_replacement".into(),
-            "main".into(),
+    fn certified_typed_replacement_keeps_complete_collection_proof() {
+        let mut prepared = typed_certified_probe_batch(
+            &["a", "b"],
+            "dense_replacement",
+            false,
             CertifiedRawWriteBatchPreparation {
                 schema_plan_id: SchemaPlanId::for_test(8),
                 facts: PreparedRowFacts {
@@ -4354,14 +4900,10 @@ mod tests {
                     ordered_identity_digest: [7; 32],
                     replay_bytes: 321,
                 }),
+                fileless_typed_sql_rows: false,
             },
-        )
-        .expect("certified replacement should construct")
-        .into_dense_prepared(
-            None,
             LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z"),
-        )
-        .expect("certified replacement should prepare");
+        );
 
         assert!(prepared.is_dense_certified_parameter());
         assert_eq!(
@@ -4384,18 +4926,12 @@ mod tests {
     }
 
     #[test]
-    fn certified_replacement_keeps_authenticated_predecessors_dense_and_through_expansion() {
-        let snapshots = [r#"{"id":"a"}"#, r#"{"id":"b"}"#]
-            .into_iter()
-            .map(|value| {
-                TransactionJson::from_certified_shared_normalized_row_content(value.into())
-            })
-            .collect::<Vec<_>>();
-        let mut rows = CertifiedParameterReplacementBatch::new(
-            vec![RowPk::single("a"), RowPk::single("b")],
-            snapshots,
-            "dense_replacement".into(),
-            "main".into(),
+    fn certified_typed_replacement_keeps_authenticated_predecessors_through_mutation() {
+        let timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z");
+        let mut prepared = typed_certified_probe_batch(
+            &["a", "b"],
+            "dense_replacement",
+            false,
             CertifiedRawWriteBatchPreparation {
                 schema_plan_id: SchemaPlanId::for_test(10),
                 facts: PreparedRowFacts {
@@ -4404,29 +4940,24 @@ mod tests {
                 },
                 tracked_keys_strictly_ordered: true,
                 complete_collection_replacement: None,
+                fileless_typed_sql_rows: false,
             },
-        )
-        .expect("certified replacement should construct");
-        rows.set_durable_predecessor(
+            timestamp,
+        );
+        prepared.set_durable_predecessor(
             0,
             Some(CertifiedCurrentStatePredecessor::Encoded(
                 Bytes::from_static(b"predecessor-a"),
             )),
         );
-        rows.set_durable_predecessor(
+        prepared.set_durable_predecessor(
             1,
             Some(CertifiedCurrentStatePredecessor::Encoded(
                 Bytes::from_static(b"predecessor-b"),
             )),
         );
 
-        let mut prepared = rows
-            .into_dense_prepared(
-                None,
-                LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z"),
-            )
-            .expect("certified replacement should prepare");
-        assert!(prepared.is_dense_certified_parameter());
+        assert!(!prepared.is_dense_certified_parameter());
         assert!(matches!(
             prepared.row(1).durable_predecessor,
             Some(CertifiedCurrentStatePredecessor::Encoded(bytes))
@@ -4448,7 +4979,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_dense_replacements_coalesce_with_per_row_timestamps() {
+    fn typed_replacements_require_explicit_recertification_after_append() {
         let certificate = CertifiedRawWriteBatchPreparation {
             schema_plan_id: SchemaPlanId::for_test(9),
             facts: PreparedRowFacts {
@@ -4457,22 +4988,10 @@ mod tests {
             },
             tracked_keys_strictly_ordered: true,
             complete_collection_replacement: None,
+            fileless_typed_sql_rows: false,
         };
         let prepare = |key: &str, timestamp| {
-            CertifiedParameterReplacementBatch::new(
-                vec![RowPk::single(key)],
-                vec![
-                    TransactionJson::from_certified_shared_normalized_row_content(
-                        format!(r#"{{"id":"{key}"}}"#).into(),
-                    ),
-                ],
-                "dense_replacement".into(),
-                "main".into(),
-                certificate,
-            )
-            .expect("certified replacement should construct")
-            .into_dense_prepared(None, timestamp)
-            .expect("certified replacement should prepare")
+            typed_certified_probe_batch(&[key], "dense_replacement", false, certificate, timestamp)
         };
         let first_timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z");
         let second_timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:01.000Z");
@@ -4484,13 +5003,16 @@ mod tests {
 
         prepared.append(second);
 
-        assert!(prepared.is_dense_certified_parameter());
+        assert!(!prepared.is_dense_certified_parameter());
         assert_eq!(prepared.len(), 2);
         assert_eq!(prepared.row(0).created_at, first_timestamp);
         assert_eq!(prepared.row(1).created_at, second_timestamp);
         assert_eq!(prepared.row(0).commit_id, Some(commit_id));
         assert_eq!(prepared.row(1).commit_id, Some(commit_id));
-        assert!(prepared.certified_tracked_keys_strictly_ordered());
+        assert!(
+            !prepared.certified_tracked_keys_strictly_ordered(),
+            "append must invalidate the ordered-set proof until the combined rows are certified"
+        );
         let ordered_identity_digest =
             crate::collection_generation::ordered_single_string_identity_digest(
                 prepared.iter().map(|row| row.row_pk),
@@ -4502,14 +5024,10 @@ mod tests {
             2,
             ordered_identity_digest,
         ));
+        assert!(prepared.certified_tracked_keys_strictly_ordered());
         assert_eq!(prepared.row(0).updated_at, first_timestamp);
         assert_eq!(prepared.row(1).updated_at, first_timestamp);
-        let (columnar_commit_id, schema_key, snapshots) = prepared
-            .dense_row_columnar_input()
-            .expect("coalesced replacement retains contiguous columnar input");
-        assert_eq!(columnar_commit_id, commit_id);
-        assert_eq!(schema_key, "dense_replacement");
-        assert_eq!(snapshots.len(), 2);
+        assert!(prepared.iter().all(|row| row.snapshot.is_some()));
 
         prepared.append(prepare("a", second_timestamp));
         assert!(!prepared.is_dense_certified_parameter());
@@ -4527,22 +5045,10 @@ mod tests {
             },
             tracked_keys_strictly_ordered: true,
             complete_collection_replacement: None,
+            fileless_typed_sql_rows: false,
         };
         let prepare = |schema_key: &str, key: &str, timestamp| {
-            CertifiedParameterReplacementBatch::new(
-                vec![RowPk::single(key)],
-                vec![
-                    TransactionJson::from_certified_shared_normalized_row_content(
-                        format!(r#"{{"id":"{key}"}}"#).into(),
-                    ),
-                ],
-                schema_key.into(),
-                "main".into(),
-                certificate,
-            )
-            .expect("certified replacement should construct")
-            .into_dense_prepared(None, timestamp)
-            .expect("certified replacement should prepare")
+            typed_certified_probe_batch(&[key], schema_key, false, certificate, timestamp)
         };
         let first_timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z");
         let second_timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:01.000Z");
@@ -4567,15 +5073,27 @@ mod tests {
 
     fn prepared_fixture_row(
         row: &str,
-        snapshot: Option<StageJson>,
+        snapshot: Option<TransactionJson>,
         operation: TransactionWriteOperation,
         origin_key: &SharedStr,
     ) -> TestPreparedStateRow {
         let timestamp = LixTimestamp::expect_parse("timestamp", "2026-07-28T00:00:00.000Z");
+        let row_pk = RowPk::single(row);
+        let snapshot = snapshot.map(|snapshot| {
+            let value = serde_json::from_str(snapshot.normalized())
+                .expect("test JSON ingress should remain valid");
+            let typed = WasmTypedRow::from_test_json_unchecked(&row_pk, &value)
+                .expect("test snapshot should become typed");
+            Bytes::from_owner(
+                typed
+                    .durable_payload()
+                    .expect("test native snapshot should encode"),
+            )
+        });
         TestPreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
-            row_pk: RowPk::single(row),
+            row_pk,
             schema_key: "shared_schema".into(),
             file_id: Some("shared_file".into()),
             snapshot,
@@ -4594,109 +5112,6 @@ mod tests {
             untracked: false,
             branch_id: "shared_branch".into(),
         }
-    }
-
-    #[test]
-    fn ten_thousand_raw_rows_share_dictionaries_arenas_and_retain_in_place() {
-        const ROW_COUNT: usize = 10_000;
-        let mut values = Vec::with_capacity(ROW_COUNT);
-        let mut normalized = Vec::new();
-        let mut offsets = Vec::with_capacity(ROW_COUNT);
-        for index in 0..ROW_COUNT {
-            let value = serde_json::json!({"id": index});
-            let encoded = serde_json::to_vec(&value).expect("fixture should serialize");
-            let start = u32::try_from(normalized.len()).expect("fixture offset");
-            normalized.extend_from_slice(&encoded);
-            let end = u32::try_from(normalized.len()).expect("fixture offset");
-            values.push(value);
-            offsets.push((start, end));
-        }
-        let canonical =
-            WasmCanonicalJson::from_batch_parts(values, normalized, offsets, ROW_COUNT, ROW_COUNT)
-                .expect("canonical raw fixture");
-        let mut rows = RawWriteBatch::with_capacity(ROW_COUNT);
-        let owner_pointers = rows.aligned_owner_allocation_ptrs();
-        let owner_capacities = rows.aligned_owner_capacities();
-        let schema_key = SharedStr::from("bulk_schema");
-        let file_id = SharedStr::from("bulk_file");
-        let timestamp = SharedStr::from("2026-07-28T00:00:00.000Z");
-        let branch_id = SharedStr::from("bulk_branch");
-        let origin = TransactionWriteOrigin {
-            surface: SharedStr::from("bulk_surface"),
-            operation: TransactionWriteOperation::Update,
-            primary_key: None,
-        };
-        for (index, snapshot) in canonical.into_iter().enumerate() {
-            rows.push_parts(
-                Some(RowPk::single(index.to_string())),
-                schema_key.clone(),
-                Some(file_id.clone()),
-                Some(TransactionJson::from_canonical_batch(snapshot)),
-                None,
-                Some(origin.clone()),
-                Some(timestamp.clone()),
-                Some(timestamp.clone()),
-                false,
-                None,
-                None,
-                false,
-                branch_id.clone(),
-            );
-        }
-
-        assert_eq!(rows.aligned_owner_allocation_ptrs(), owner_pointers);
-        assert_eq!(rows.aligned_owner_capacities(), owner_capacities);
-        assert_eq!(rows.shared_string_count(), 4);
-        assert_eq!(rows.shared_origin_count(), 1);
-        assert!(
-            !rows.string_dictionary_is_promoted(),
-            "four shared values must stay in the inline dictionary"
-        );
-        assert!(
-            !rows.origin_dictionary_is_promoted(),
-            "one shared origin must stay in the inline dictionary"
-        );
-        let first = rows
-            .row(0)
-            .snapshot
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("first canonical raw row");
-        let last = rows
-            .row(ROW_COUNT - 1)
-            .snapshot
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("last canonical raw row");
-        assert!(first.shares_batch_with(last));
-
-        let mut source_index = 0usize;
-        rows.retain(|_| {
-            let keep = source_index % 2 == 0;
-            source_index += 1;
-            keep
-        });
-        assert_eq!(rows.len(), ROW_COUNT / 2);
-        assert_eq!(rows.aligned_owner_allocation_ptrs(), owner_pointers);
-        assert_eq!(rows.aligned_owner_capacities(), owner_capacities);
-        for (destination, row) in rows.iter().enumerate() {
-            assert_eq!(
-                row.row_pk
-                    .expect("retained raw identity")
-                    .as_single_string()
-                    .expect("single raw identity"),
-                (destination * 2).to_string()
-            );
-        }
-        let first = rows
-            .row(0)
-            .snapshot
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("retained first canonical row");
-        let last = rows
-            .row(rows.len() - 1)
-            .snapshot
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("retained last canonical row");
-        assert!(first.shares_batch_with(last));
     }
 
     #[test]
@@ -4766,84 +5181,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prepared_batch_interns_metadata_and_exposes_borrowed_crud_views() {
-        let normalized = br#"{"id":"a"}{"id":"b"}"#.to_vec();
-        let first_end = u32::try_from(br#"{"id":"a"}"#.len()).expect("fixture length");
-        let end = u32::try_from(normalized.len()).expect("fixture length");
-        let mut canonical = WasmCanonicalJson::from_batch_parts(
-            vec![
-                serde_json::json!({"id": "a"}),
-                serde_json::json!({"id": "b"}),
-            ],
-            normalized,
-            vec![(0, first_end), (first_end, end)],
-            2,
-            2,
-        )
-        .expect("canonical batch");
-        let second = canonical.pop().expect("second canonical row");
-        let first = canonical.pop().expect("first canonical row");
-        let origin_key: SharedStr = "one-execution".into();
-        let batch = PreparedStateBatch::from_test_rows(vec![
-            prepared_fixture_row(
-                "a",
-                Some(stage_json_from_value(
-                    TransactionJson::from_canonical_batch(first),
-                )),
-                TransactionWriteOperation::Insert,
-                &origin_key,
-            ),
-            prepared_fixture_row(
-                "b",
-                Some(stage_json_from_value(
-                    TransactionJson::from_canonical_batch(second),
-                )),
-                TransactionWriteOperation::Update,
-                &origin_key,
-            ),
-            prepared_fixture_row("c", None, TransactionWriteOperation::Delete, &origin_key),
-        ]);
-
-        assert_eq!(batch.shared_string_count(), 5);
-        assert_eq!(batch.shared_origin_count(), 3);
-        let rows = batch.iter().collect::<Vec<_>>();
-        assert_eq!(
-            rows.iter()
-                .map(|row| row.origin.expect("origin").operation)
-                .collect::<Vec<_>>(),
-            [
-                TransactionWriteOperation::Insert,
-                TransactionWriteOperation::Update,
-                TransactionWriteOperation::Delete,
-            ]
-        );
-        assert!(rows[0].snapshot.is_some());
-        assert!(rows[1].snapshot.is_some());
-        assert!(rows[2].snapshot.is_none());
-        assert!(std::ptr::eq(rows[0].schema_key, rows[2].schema_key));
-        assert!(std::ptr::eq(
-            rows[0].origin_key.expect("origin key"),
-            rows[2].origin_key.expect("origin key")
-        ));
-        let first_canonical = rows[0]
-            .snapshot
-            .and_then(StageJson::canonical_batch_row)
-            .expect("first canonical view");
-        let second_canonical = rows[1]
-            .snapshot
-            .and_then(StageJson::canonical_batch_row)
-            .expect("second canonical view");
-        assert!(first_canonical.shares_batch_with(second_canonical));
-    }
 
     #[test]
     fn prepared_batch_compacts_superseded_owner_columns() {
         let origin_key: SharedStr = "one-execution".into();
         let staged_snapshot = |value: String| {
-            stage_json_from_value(
-                TransactionJson::from_certified_shared_normalized_row_content(value.into()),
-            )
+            TransactionJson::from_certified_shared_normalized_row_content(value.into())
         };
         let mut batch = PreparedStateBatch::from_test_rows(vec![
             prepared_fixture_row(
@@ -4874,17 +5217,20 @@ mod tests {
             batch.select_rows(&[2, 1]);
             assert_eq!(batch.len(), 2);
             assert!(batch.row_pks.len() <= 4);
-            assert!(batch.json.len() <= 4);
+            assert!(batch.metadata.len() <= 4);
             assert!(batch.strings.len() <= 8);
             assert!(batch.origins.len() <= 2);
         }
 
+        let row = batch.row(0);
+        let decoded = WasmTypedRow::decode_durable_payload(
+            Arc::from(row.snapshot.expect("replacement snapshot")),
+            row.schema_key.as_str(),
+            row.row_pk,
+        )
+        .expect("replacement snapshot should decode");
         assert_eq!(
-            batch
-                .row(0)
-                .snapshot
-                .expect("replacement snapshot")
-                .normalized(),
+            decoded.to_json_shared().unwrap().as_str(),
             r#"{"id":"a","version":64}"#
         );
         assert_eq!(
@@ -4930,82 +5276,6 @@ mod tests {
         assert_eq!(second_key.values, ["file-b"]);
     }
 
-    #[test]
-    fn prepared_batch_reserves_dense_columns_without_overreserving_sparse_dictionaries() {
-        let row_count = 64;
-        let mut batch = PreparedStateBatch::with_capacity(row_count);
-        let initial_dense_capacities = (
-            batch.slots.capacity(),
-            batch.row_pks.capacity(),
-            batch.json.capacity(),
-        );
-        let initial_dense_pointers = (
-            batch.slots.as_ptr(),
-            batch.row_pks.as_ptr(),
-            batch.json.as_ptr(),
-        );
-        assert!(batch.strings.capacity() >= row_count);
-        assert!(batch.strings.capacity() < row_count * 5);
-        assert!(batch.string_index.capacity() >= row_count);
-        assert!(batch.string_index.capacity() < row_count * 5);
-        assert_eq!(batch.origins.capacity(), 0);
-        assert_eq!(batch.origin_index.capacity(), 0);
-        assert_eq!(batch.origin_column_sets.capacity(), 0);
-        assert_eq!(batch.origin_column_index.capacity(), 0);
-        for index in 0..row_count {
-            let timestamp = LixTimestamp::expect_parse("timestamp", "2026-07-28T00:00:00.000Z");
-            let snapshot = stage_json_from_value(
-                TransactionJson::from_certified_shared_normalized_row_content(
-                    format!(r#"{{"id":"row-{index}"}}"#).into(),
-                ),
-            );
-            let metadata = stage_json_from_value(
-                TransactionJson::from_certified_shared_normalized_row_content(
-                    format!(r#"{{"row":{index}}}"#).into(),
-                ),
-            );
-            batch.push_test_row(TestPreparedStateRow {
-                schema_plan_id: SchemaPlanId::for_test(0),
-                facts: PreparedRowFacts::default(),
-                row_pk: RowPk::single(format!("row-{index}")),
-                schema_key: format!("schema-{index}").into(),
-                file_id: Some(format!("file-{index}").into()),
-                snapshot: Some(snapshot),
-                metadata: Some(metadata),
-                origin: Some(TransactionWriteOrigin {
-                    surface: format!("surface-{index}").into(),
-                    operation: TransactionWriteOperation::Update,
-                    primary_key: None,
-                }),
-                origin_key: Some(format!("origin-key-{index}").into()),
-                created_at: timestamp,
-                updated_at: timestamp,
-                global: false,
-                change_id: Some(ChangeId::for_test_label(&format!("change-{index}"))),
-                commit_id: None,
-                untracked: false,
-                branch_id: format!("branch-{index}").into(),
-            });
-        }
-        assert_eq!(
-            (
-                batch.slots.capacity(),
-                batch.row_pks.capacity(),
-                batch.json.capacity(),
-            ),
-            initial_dense_capacities
-        );
-        assert_eq!(
-            (
-                batch.slots.as_ptr(),
-                batch.row_pks.as_ptr(),
-                batch.json.as_ptr(),
-            ),
-            initial_dense_pointers
-        );
-        assert_eq!(batch.strings.len(), row_count * 5);
-        assert_eq!(batch.origins.len(), row_count);
-    }
 
     #[test]
     fn ten_thousand_write_row_clones_retain_identifier_buffers() {
@@ -5099,145 +5369,12 @@ mod tests {
         assert_eq!(staged.json_ref, expected);
     }
 
-    #[test]
-    fn canonical_batch_row_stays_shared_at_the_prepared_boundary() {
-        let normalized = br#"{"id":"row-1","value":"hello"}"#.to_vec();
-        let end = u32::try_from(normalized.len()).expect("fixture length");
-        let mut batch = WasmCanonicalJson::from_batch_parts(
-            vec![serde_json::json!({"id": "row-1", "value": "hello"})],
-            normalized,
-            vec![(0, end)],
-            1,
-            1,
-        )
-        .expect("canonical batch");
-        let batch_row = batch.pop().expect("canonical row");
-        let transaction_json = TransactionJson::from_canonical_batch(batch_row.clone());
 
-        let staged = stage_json_from_value(transaction_json);
-        let staged_batch_row = staged
-            .canonical_batch_row()
-            .expect("staging must retain canonical batch ownership");
-        assert!(batch_row.shares_batch_with(staged_batch_row));
-        assert_eq!(staged.normalized(), r#"{"id":"row-1","value":"hello"}"#);
-        assert_eq!(staged.value(), batch_row.value());
-        assert_eq!(staged_batch_row.validation_counts(), (1, 1));
-        let source = batch_row.normalized_shared();
-        let materialized = staged.materialize_shared();
-        assert!(source.shares_buffer_with(&materialized));
-        assert_eq!(
-            source.retained_buffer_len(),
-            materialized.retained_buffer_len()
-        );
-    }
+
+
 
     #[test]
-    fn validated_stage_releases_the_parsed_column_and_keeps_the_canonical_arena() {
-        let normalized = br#"{"id":"row-1","value":"hello"}"#.to_vec();
-        let end = u32::try_from(normalized.len()).expect("fixture length");
-        let mut batch = WasmCanonicalJson::from_batch_parts(
-            vec![serde_json::json!({"id": "row-1", "value": "hello"})],
-            normalized,
-            vec![(0, end)],
-            1,
-            1,
-        )
-        .expect("canonical batch");
-        let batch_row = batch.pop().expect("canonical row");
-        let source = batch_row.normalized_shared();
-        let mut staged = stage_json_from_value(TransactionJson::from_canonical_batch(batch_row));
-
-        assert!(staged.release_validated_canonical_value_column());
-        assert!(!staged.release_validated_canonical_value_column());
-        assert!(staged.canonical_batch_row().is_none());
-        assert_eq!(staged.normalized(), r#"{"id":"row-1","value":"hello"}"#);
-        let materialized = staged.materialize_shared();
-        assert!(source.shares_buffer_with(&materialized));
-    }
-
-    #[test]
-    fn validated_stage_releases_a_parsed_shared_canonical_value() {
-        let source: SharedStr = r#"{"id":"row-1","value":"hello"}"#.into();
-        let transaction_json =
-            TransactionJson::from_unvalidated_shared_normalized_content(source.clone());
-        assert_eq!(
-            transaction_json.value(),
-            &serde_json::json!({"id": "row-1", "value": "hello"})
-        );
-        let mut staged = stage_json_from_value(transaction_json);
-        assert!(staged.retains_decoded_value_for_tests());
-
-        assert!(staged.release_validated_canonical_value_column());
-        assert!(!staged.retains_decoded_value_for_tests());
-        assert_eq!(staged.normalized(), source.as_str());
-        assert!(source.shares_buffer_with(&staged.materialize_shared()));
-        assert!(
-            std::panic::catch_unwind(|| staged.value()).is_err(),
-            "validated shared JSON must not retain or reparse a decoded value"
-        );
-    }
-
-    #[test]
-    fn validated_batch_keeps_certified_owned_json_zero_copy() {
-        const ROW_COUNT: usize = 32;
-        let sources = (0..ROW_COUNT)
-            .map(|index| {
-                Arc::<str>::from(format!(
-                    r#"{{"id":"row-{index}","padding":"{}"}}"#,
-                    "x".repeat(128)
-                ))
-            })
-            .collect::<Vec<_>>();
-        let origin_key: SharedStr = "direct-owned".into();
-        let mut batch = PreparedStateBatch::from_test_rows(
-            sources
-                .iter()
-                .enumerate()
-                .map(|(index, source)| {
-                    prepared_fixture_row(
-                        &format!("row-{index}"),
-                        Some(stage_json_from_value(TransactionJson {
-                            storage: TransactionJsonStorage::Decoded {
-                                value: Arc::new(
-                                    serde_json::from_str(source)
-                                        .expect("certified direct replacement JSON"),
-                                ),
-                                normalized: OnceLock::from(Arc::clone(source)),
-                            },
-                        })),
-                        TransactionWriteOperation::Update,
-                        &origin_key,
-                    )
-                })
-                .collect(),
-        );
-
-        batch.release_validated_canonical_value_columns();
-
-        for (row, source) in batch.iter().zip(&sources) {
-            let snapshot = row.snapshot.expect("direct replacement snapshot");
-            assert_eq!(
-                snapshot.normalized().as_ptr(),
-                source.as_ptr(),
-                "validation release must retain the incoming Arc<str> allocation"
-            );
-            assert!(!snapshot.retains_decoded_value_for_tests());
-        }
-        assert!(
-            std::panic::catch_unwind(|| {
-                batch
-                    .row(0)
-                    .snapshot
-                    .expect("direct replacement snapshot")
-                    .value()
-            })
-            .is_err(),
-            "validated owned JSON must not retain or reparse a decoded value"
-        );
-    }
-
-    #[test]
-    fn dense_certified_transaction_arena_releases_in_place() {
+    fn certified_transaction_rows_release_without_moving_native_columns() {
         const ROW_COUNT: usize = 32;
         let mut normalized = Vec::new();
         let mut offsets = Vec::with_capacity(ROW_COUNT);
@@ -5261,35 +5398,25 @@ mod tests {
                 .map(|(index, snapshot)| {
                     prepared_fixture_row(
                         &format!("row-{index}"),
-                        Some(stage_json_from_value(snapshot)),
+                        Some(snapshot),
                         TransactionWriteOperation::Insert,
                         &origin_key,
                     )
                 })
                 .collect(),
         );
-        let json_allocation = batch.json.as_ptr();
-        let first = batch
-            .row(0)
-            .snapshot
-            .expect("first snapshot")
-            .materialize_shared();
-        assert!(batch.iter().skip(1).all(|row| {
-            first.shares_buffer_with(&row.snapshot.expect("snapshot").materialize_shared())
-        }));
+        let metadata_allocation = batch.metadata.as_ptr();
+        let snapshot_arenas = batch.snapshot_arenas.as_ptr();
 
         batch.release_validated_canonical_value_columns();
 
         assert_eq!(
-            batch.json.as_ptr(),
-            json_allocation,
-            "a dense JSON owner column must not be cloned during validation release"
+            batch.metadata.as_ptr(),
+            metadata_allocation,
+            "native metadata owners must not move during validation release"
         );
-        assert!(batch.iter().all(|row| {
-            !row.snapshot
-                .expect("snapshot")
-                .retains_decoded_value_for_tests()
-        }));
+        assert_eq!(batch.snapshot_arenas.as_ptr(), snapshot_arenas);
+        assert!(batch.iter().all(|row| row.snapshot.is_some()));
     }
 
     #[test]
@@ -5344,146 +5471,7 @@ mod tests {
         assert_eq!(staged.normalized(), r#"{"id":"row-1"}"#);
     }
 
-    #[test]
-    fn validated_batch_repacks_a_sparse_canonical_source_arena() {
-        const ROW_COUNT: usize = 32;
-        let mut values = Vec::with_capacity(ROW_COUNT);
-        let mut normalized = Vec::new();
-        let mut offsets = Vec::with_capacity(ROW_COUNT);
-        for index in 0..ROW_COUNT {
-            let value = serde_json::json!({
-                "id": format!("row-{index}"),
-                "padding": "x".repeat(256),
-            });
-            let encoded = serde_json::to_vec(&value).expect("fixture should serialize");
-            let start = u32::try_from(normalized.len()).expect("fixture offset");
-            normalized.extend_from_slice(&encoded);
-            let end = u32::try_from(normalized.len()).expect("fixture offset");
-            offsets.push((start, end));
-            values.push(value);
-        }
-        let source_arena_len = normalized.len();
-        let canonical =
-            WasmCanonicalJson::from_batch_parts(values, normalized, offsets, ROW_COUNT, ROW_COUNT)
-                .expect("canonical fixture");
-        let origin_key: SharedStr = "sparse-arena".into();
-        let mut batch = PreparedStateBatch::from_test_rows(
-            canonical
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    prepared_fixture_row(
-                        &format!("row-{index}"),
-                        Some(stage_json_from_value(
-                            TransactionJson::from_canonical_batch(value),
-                        )),
-                        TransactionWriteOperation::Update,
-                        &origin_key,
-                    )
-                })
-                .collect(),
-        );
-        batch.select_rows(&[0]);
-        let live_len = batch
-            .row(0)
-            .snapshot
-            .expect("selected snapshot")
-            .normalized()
-            .len();
-        assert_eq!(
-            batch
-                .row(0)
-                .snapshot
-                .expect("selected snapshot")
-                .materialize_shared()
-                .retained_buffer_len(),
-            source_arena_len,
-            "slot compaction alone still retains the source page"
-        );
 
-        batch.release_validated_canonical_value_columns();
-        let retained = batch
-            .row(0)
-            .snapshot
-            .expect("selected snapshot")
-            .materialize_shared();
-        assert_eq!(retained.len(), live_len);
-        assert_eq!(
-            retained.retained_buffer_len(),
-            live_len,
-            "post-validation compaction must not retain dead canonical page bytes"
-        );
-    }
-
-    #[test]
-    fn validated_batch_prunes_skewed_dead_json_before_arena_accounting() {
-        const ROW_COUNT: usize = 100;
-        const LIVE_COUNT: usize = 51;
-        let mut values = Vec::with_capacity(ROW_COUNT);
-        let mut normalized = Vec::new();
-        let mut offsets = Vec::with_capacity(ROW_COUNT);
-        for index in 0..ROW_COUNT {
-            let value = if index < LIVE_COUNT {
-                serde_json::json!({"id": format!("live-{index}")})
-            } else {
-                serde_json::json!({
-                    "id": format!("dead-{index}"),
-                    "padding": "x".repeat(2048),
-                })
-            };
-            let encoded = serde_json::to_vec(&value).expect("fixture should serialize");
-            let start = u32::try_from(normalized.len()).expect("fixture offset");
-            normalized.extend_from_slice(&encoded);
-            let end = u32::try_from(normalized.len()).expect("fixture offset");
-            offsets.push((start, end));
-            values.push(value);
-        }
-        let source_arena_len = normalized.len();
-        let canonical =
-            WasmCanonicalJson::from_batch_parts(values, normalized, offsets, ROW_COUNT, ROW_COUNT)
-                .expect("canonical fixture");
-        let origin_key: SharedStr = "skewed-arena".into();
-        let mut batch = PreparedStateBatch::from_test_rows(
-            canonical
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    prepared_fixture_row(
-                        &format!("row-{index}"),
-                        Some(stage_json_from_value(
-                            TransactionJson::from_canonical_batch(value),
-                        )),
-                        TransactionWriteOperation::Update,
-                        &origin_key,
-                    )
-                })
-                .collect(),
-        );
-        let selected = (0..LIVE_COUNT).collect::<Vec<_>>();
-        batch.select_rows(&selected);
-        assert_eq!(batch.len(), LIVE_COUNT);
-        assert_eq!(
-            batch.json.len(),
-            ROW_COUNT,
-            "the lazy owner threshold intentionally defers a near-half compaction"
-        );
-
-        batch.release_validated_canonical_value_columns();
-        assert_eq!(batch.json.len(), LIVE_COUNT);
-        let retained = batch
-            .iter()
-            .map(|row| row.snapshot.expect("live snapshot").materialize_shared())
-            .collect::<Vec<_>>();
-        let live_bytes = retained.iter().map(|value| value.len()).sum::<usize>();
-        assert!(source_arena_len > live_bytes.saturating_mul(2));
-        assert_eq!(retained[0].retained_buffer_len(), live_bytes);
-        assert!(
-            retained[1..]
-                .iter()
-                .all(|value| retained[0].shares_buffer_with(value)),
-            "all live JSON slices must report one common compact arena owner"
-        );
-    }
 
     #[test]
     fn decoded_sql_rows_canonicalize_into_one_exact_batch_arena() {
@@ -5498,22 +5486,16 @@ mod tests {
 
         canonicalize_transaction_json_batch(rows.iter_mut(), "SQL fixture")
             .expect("canonicalize SQL batch");
-        let first = rows[0]
-            .as_ref()
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("first batch row");
-        let second = rows[1]
-            .as_ref()
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("second batch row");
-
-        assert!(first.shares_batch_with(second));
-        assert_eq!(first.batch_row_count(), 2);
-        assert_eq!(
-            first.batch_arena_len(),
-            first.normalized().len() + second.normalized().len()
-        );
-        assert_eq!(first.validation_counts(), (2, 2));
+        let first = match &rows[0].as_ref().expect("first row").storage {
+            TransactionJsonStorage::CanonicalShared { normalized, .. } => normalized,
+            _ => panic!("first row must retain canonical shared bytes"),
+        };
+        let second = match &rows[1].as_ref().expect("second row").storage {
+            TransactionJsonStorage::CanonicalShared { normalized, .. } => normalized,
+            _ => panic!("second row must retain canonical shared bytes"),
+        };
+        assert!(first.shares_buffer_with(second));
+        assert_eq!(first.retained_buffer_len(), first.len() + second.len());
     }
 
     #[test]
@@ -5579,21 +5561,16 @@ mod tests {
 
         canonicalize_transaction_json_batch(rows.iter_mut(), "cached SQL fixture")
             .expect("canonicalize cached SQL batch");
-        let first = rows[0]
-            .as_ref()
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("first batch row");
-        let second = rows[1]
-            .as_ref()
-            .and_then(TransactionJson::canonical_batch_row)
-            .expect("second batch row");
-        assert_eq!(first.normalized(), cached);
-        assert!(first.shares_batch_with(second));
-        assert_eq!(
-            first.validation_counts(),
-            (2, 1),
-            "only the uncached row should invoke canonical serialization"
-        );
+        let first = match &rows[0].as_ref().expect("first row").storage {
+            TransactionJsonStorage::CanonicalShared { normalized, .. } => normalized,
+            _ => panic!("first row must retain canonical shared bytes"),
+        };
+        let second = match &rows[1].as_ref().expect("second row").storage {
+            TransactionJsonStorage::CanonicalShared { normalized, .. } => normalized,
+            _ => panic!("second row must retain canonical shared bytes"),
+        };
+        assert_eq!(first.as_str(), cached);
+        assert!(first.shares_buffer_with(second));
     }
 
     #[test]

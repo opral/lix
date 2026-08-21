@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+};
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use smallvec::SmallVec;
@@ -6,9 +10,8 @@ use smallvec::SmallVec;
 use crate::LixError;
 use crate::common::format_json_pointer;
 use crate::domain::{Domain, DomainSchemaIdentity};
-use crate::row_pk::{RowPk, canonical_json_text};
 use crate::functions::FunctionProviderHandle;
-use crate::plugin::runtime::WasmRowKey;
+use crate::row_pk::{RowPk, canonical_json_text};
 use crate::schema::{SchemaKey, compile_lix_schema, validate_schema_amendment};
 
 #[derive(Default)]
@@ -42,7 +45,6 @@ impl std::fmt::Debug for CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
-    #[cfg(test)]
     pub(crate) fn from_visible_schemas(visible_schemas: &[JsonValue]) -> Result<Self, LixError> {
         let mut catalog = Self::default();
         for schema in visible_schemas {
@@ -59,6 +61,24 @@ impl CatalogSnapshot {
         Ok(catalog)
     }
 
+    /// Compiled catalog for schemas shipped with the engine.
+    ///
+    /// Repository bootstrap must encode its first rows before a persisted
+    /// catalog exists. Keeping this immutable catalog in the binary gives
+    /// those rows the same schema fingerprint and native value layout used
+    /// after catalog hydration.
+    pub(crate) fn builtin() -> &'static Self {
+        static BUILTIN: OnceLock<CatalogSnapshot> = OnceLock::new();
+        BUILTIN.get_or_init(|| {
+            let schemas = crate::schema::seed_schema_definitions()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            Self::from_visible_schemas(&schemas)
+                .expect("embedded Schema v1 definitions must compile as one catalog")
+        })
+    }
+
     pub(crate) fn from_schema_facts(facts: &[SchemaCatalogFact]) -> Result<Self, LixError> {
         let entries = facts
             .iter()
@@ -69,16 +89,6 @@ impl CatalogSnapshot {
             })
             .collect::<Vec<_>>();
         Self::from_entries(entries)
-    }
-
-    /// Rebuilds an owned snapshot with the same entries.
-    ///
-    /// Compiled plans are not clonable, so a transaction that needs a private
-    /// mutable catalog recompiles from the recorded entries. Entry order is
-    /// preserved, so `SchemaPlanId`s issued by the source snapshot remain
-    /// valid against the rebuilt one.
-    pub(crate) fn rebuild_owned(&self) -> Result<Self, LixError> {
-        Self::from_entries(self.entries.clone())
     }
 
     pub(crate) fn fingerprint(&self) -> &CatalogFingerprint {
@@ -98,13 +108,42 @@ impl CatalogSnapshot {
     ) -> Result<SchemaPlanId, LixError> {
         let key = SchemaCatalogKey::from_schema_key(key);
         let identity = DomainSchemaIdentity::new(domain, key.schema_key.clone());
-        let mut entries = self.entries.clone();
-        let mut candidate = Self::from_entries(entries.clone())?;
-        let plan_id = candidate.remember_schema_identity(identity.clone(), key, schema)?;
-        entries.clone_from(&candidate.entries);
-        let candidate = Self::from_entries(entries)?;
+        // Registration rows are deliberately made visible before the rest of
+        // their transaction is normalized, then encountered again in normal
+        // row order. Avoid rebuilding and recompiling the entire catalog for
+        // that exact replay. Amendments still take the atomic candidate path
+        // below.
+        if let Some(existing) = self.by_identity.get(&identity).copied() {
+            let existing_entry = &self.entries[existing.index()];
+            if existing_entry.key == key && existing_entry.schema == schema {
+                return Ok(existing);
+            }
+        }
+        let (candidate, plan_id) = self.with_inserted_schema(identity, key, schema)?;
         *self = candidate;
-        Ok(self.by_identity.get(&identity).copied().unwrap_or(plan_id))
+        Ok(plan_id)
+    }
+
+    /// Builds one atomic candidate without recompiling the already-valid
+    /// source catalog. Entry ordinals and both lookup maps are stable across
+    /// the clone; only the final candidate needs fresh compiled plans.
+    fn with_inserted_schema(
+        &self,
+        identity: DomainSchemaIdentity,
+        key: SchemaCatalogKey,
+        schema: JsonValue,
+    ) -> Result<(Self, SchemaPlanId), LixError> {
+        let mut candidate = Self {
+            entries: self.entries.clone(),
+            plans: Vec::new(),
+            by_key: self.by_key.clone(),
+            by_identity: self.by_identity.clone(),
+            delete_references_by_target: BTreeMap::new(),
+            fingerprint: CatalogFingerprint::default(),
+        };
+        let plan_id = candidate.remember_schema_identity(identity, key, schema)?;
+        candidate.rebuild_plans()?;
+        Ok((candidate, plan_id))
     }
 
     fn from_entries(entries: Vec<CatalogEntry>) -> Result<Self, LixError> {
@@ -347,13 +386,17 @@ impl TransactionCatalog {
         key: SchemaKey,
         schema: JsonValue,
     ) -> Result<SchemaPlanId, LixError> {
-        if let Self::Shared(snapshot) = self {
-            *self = Self::Owned(snapshot.rebuild_owned()?);
+        match self {
+            Self::Shared(snapshot) => {
+                let catalog_key = SchemaCatalogKey::from_schema_key(key);
+                let identity = DomainSchemaIdentity::new(domain, catalog_key.schema_key.clone());
+                let (candidate, plan_id) =
+                    snapshot.with_inserted_schema(identity, catalog_key, schema)?;
+                *self = Self::Owned(candidate);
+                Ok(plan_id)
+            }
+            Self::Owned(snapshot) => snapshot.insert_schema_for_domain(domain, key, schema),
         }
-        let Self::Owned(snapshot) = self else {
-            unreachable!("transaction catalog is owned after copy-on-write");
-        };
-        snapshot.insert_schema_for_domain(domain, key, schema)
     }
 }
 
@@ -374,6 +417,16 @@ impl SchemaPlanId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SchemaPlanFingerprint([u8; 32]);
 
+impl SchemaPlanFingerprint {
+    pub(crate) fn matches_bytes(&self, bytes: &[u8; 32]) -> bool {
+        &self.0 == bytes
+    }
+
+    pub(crate) fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
 pub(crate) type PointerGroup = Vec<Vec<String>>;
 
 pub(crate) struct SchemaPlan {
@@ -387,15 +440,6 @@ pub(crate) struct SchemaPlan {
     pub(crate) primary_key_component_types: Option<Vec<crate::row_pk::RowPkComponentType>>,
     pub(crate) uniques: Vec<PointerGroup>,
     pub(crate) foreign_keys: Vec<ForeignKeyPlan>,
-}
-
-#[derive(Debug)]
-pub(crate) struct CertifiedPluginRow {
-    pub(crate) row_pk: RowPk,
-    /// `None` retains the guest buffer because its spelling is already
-    /// canonical. `Some` is the canonical spelling produced by the same
-    /// structural parser pass that validated the row.
-    pub(crate) normalized: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -464,27 +508,21 @@ impl TypedJsonObjectLayoutCertificate<'_> {
                 ));
             }
         }
-        RowPk::validate_external_parts(row_pk, self.primary_key_component_types).map_err(
-            |error| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    format!(
-                        "typed row_pk is invalid for schema '{}': {error}",
-                        self.schema_key
-                    ),
-                )
-            },
-        )
+        RowPk::validate_external_parts(row_pk, self.primary_key_component_types).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "typed row_pk is invalid for schema '{}': {error}",
+                    self.schema_key
+                ),
+            )
+        })
     }
 }
 
 impl SchemaPlan {
     pub(crate) fn fingerprint(&self) -> &SchemaPlanFingerprint {
         self.fingerprint.as_ref()
-    }
-
-    pub(crate) fn shared_fingerprint(&self) -> Arc<SchemaPlanFingerprint> {
-        Arc::clone(&self.fingerprint)
     }
 
     pub(crate) fn accepts_row_content_fast(&self, value: &JsonValue) -> bool {
@@ -575,51 +613,10 @@ impl SchemaPlan {
         })
     }
 
-    /// Parses, validates, and, only when necessary, canonicalizes one v2
-    /// plugin row in one structural pass.
-    ///
-    /// Eligible canonical rows retain the guest buffer without building a
-    /// DOM. Eligible compatibility spellings return one canonical byte
-    /// buffer from that same pass. `Ok(None)` is reserved for plans that need
-    /// the general DOM validation path.
-    pub(crate) fn certify_or_normalize_plugin_row(
-        &self,
-        bytes: &[u8],
-        key: &WasmRowKey,
-    ) -> Result<Option<CertifiedPluginRow>, LixError> {
-        let emitted = key
-            .row_pk
-            .iter()
-            .map(|component| component.as_str())
-            .collect::<SmallVec<[_; 2]>>();
-        let Some(normalized) =
-            self.certify_or_normalize_plugin_row_parts(bytes, &key.schema_key, &emitted)?
-        else {
-            return Ok(None);
-        };
-        let component_types = self
-            .primary_key_component_types
-            .as_deref()
-            .expect("certificate eligibility requires typed primary-key components");
-        RowPk::from_shared_external_parts(key.row_pk.iter().cloned(), component_types)
-            .map(|row_pk| {
-                Some(CertifiedPluginRow {
-                    row_pk,
-                    normalized,
-                })
-            })
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    format!(
-                        "plugin row_pk is invalid for schema '{}': {error}",
-                        self.key.schema_key
-                    ),
-                )
-            })
-    }
-
-    pub(crate) fn certify_or_normalize_plugin_row_parts(
+    /// Parses, validates, and, only when necessary, canonicalizes an internal
+    /// engine JSON row in one structural pass. Plugin-owned schemas never use
+    /// this path; their rows cross the host boundary as typed values.
+    pub(crate) fn certify_or_normalize_json_row_parts(
         &self,
         bytes: &[u8],
         schema_key: &str,
@@ -647,7 +644,7 @@ impl SchemaPlan {
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "plugin snapshot schema '{}' does not match schema plan '{}'",
+                    "row schema '{}' does not match schema plan '{}'",
                     schema_key, self.key.schema_key
                 ),
             ));
@@ -664,7 +661,7 @@ impl SchemaPlan {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "snapshot_content validation failed for schema '{}': {message}",
+                        "row content validation failed for schema '{}': {message}",
                         self.key.schema_key
                     ),
                 ));
@@ -677,7 +674,7 @@ impl SchemaPlan {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "plugin row_pk is invalid for schema '{}': {error}",
+                        "row primary key is invalid for schema '{}': {error}",
                         self.key.schema_key
                     ),
                 )
@@ -715,14 +712,17 @@ impl SchemaPlan {
         key_index: &BTreeMap<SchemaCatalogKey, SchemaPlanId>,
         schema_index: &BTreeMap<SchemaCatalogKey, &JsonValue>,
     ) -> Result<Self, LixError> {
-        let canonical_schema = canonical_json_text(&schema).map_err(|error| {
-            LixError::new(
-                LixError::CODE_SCHEMA_DEFINITION,
-                format!("failed to fingerprint compiled schema plan: {error}"),
-            )
-        })?;
+        let parsed_schema = crate::schema::parse_lix_schema(&schema)?;
         let fingerprint = Arc::new(SchemaPlanFingerprint(
-            *blake3::hash(canonical_schema.as_bytes()).as_bytes(),
+            *parsed_schema
+                .wire_fingerprint()
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        format!("failed to fingerprint compiled schema plan: {error}"),
+                    )
+                })?
+                .as_bytes(),
         ));
         let compiled_schema = compile_lix_schema(&schema)?;
         let fast_object_validation = FastObjectValidationPlan::compile_v1(&schema);
@@ -2326,32 +2326,6 @@ mod tests {
 
     use super::*;
 
-    const UUID_A: &str = "019a0000-0000-7000-8000-000000000001";
-
-    fn compile_actual_fast_schema(schema_json: &str) -> SchemaPlan {
-        let schema: JsonValue =
-            serde_json::from_str(schema_json).expect("built-in schema JSON should parse");
-        let schema_key = schema
-            .get("key")
-            .and_then(JsonValue::as_str)
-            .expect("built-in schema should declare key")
-            .to_owned();
-        let plan = SchemaPlan::compile(
-            SchemaCatalogKey {
-                schema_key: schema_key.clone(),
-            },
-            schema,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .expect("built-in schema should compile");
-        assert!(
-            plan.fast_object_validation.is_some(),
-            "built-in schema '{schema_key}' should have a fast validation plan"
-        );
-        plan
-    }
-
     #[test]
     fn schema_rejects_removed_columnar_storage_policy() {
         let mut schema = crate::schema::seed_schema_definition("lix_key_value")
@@ -2393,264 +2367,6 @@ mod tests {
             assert!(!plan.accepts_row_content_fast(&value));
             assert!(!plan.compiled_schema.is_valid(&value));
         }
-    }
-
-    #[test]
-    fn canonical_plugin_row_certificate_proves_csv_schema_and_typed_identity() {
-        let plan =
-            compile_actual_fast_schema(include_str!("../../../../plugins/csv/schema/csv_row.json"));
-        assert!(plan.accepts_canonical_certificate());
-        let key = WasmRowKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]);
-        let certified = plan
-            .certify_or_normalize_plugin_row(
-                br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
-                &key,
-            )
-            .expect("canonical CSV row should validate")
-            .expect("canonical CSV row should receive a certificate");
-        assert_eq!(
-            certified.row_pk,
-            RowPk::uuid_from_canonical(UUID_A).expect("canonical UUID")
-        );
-        assert!(
-            certified.normalized.is_none(),
-            "canonical CSV row retains the guest buffer"
-        );
-
-        let validation = plan
-            .fast_object_validation
-            .as_ref()
-            .expect("CSV schema has streaming validation");
-        let primary_key_paths = plan.primary_key.as_deref().expect("CSV primary key");
-        let mut parser = CanonicalPluginRowParser::new(
-            br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
-        )
-        .expect("canonical parser");
-        let emitted = key
-            .row_pk
-            .iter()
-            .map(|component| component.as_str())
-            .collect::<SmallVec<[_; 2]>>();
-        let mut primary_key = CanonicalPrimaryKeyMatcher::new(primary_key_paths, &emitted);
-        assert!(
-            parser
-                .parse_root_object(validation, &mut primary_key)
-                .expect("canonical CSV row")
-                .is_none()
-        );
-        assert!(!parser.nodes.spilled(), "canonical node arena stays inline");
-        assert!(
-            !parser.properties.spilled(),
-            "canonical property arena stays inline"
-        );
-        assert!(
-            !parser.elements.spilled(),
-            "canonical array-element arena stays inline"
-        );
-
-        let normalized = plan
-            .certify_or_normalize_plugin_row(
-                br#"{"id":"019a0000-0000-7000-8000-000000000001","order_key":"01","cells":["a","b"]}"#,
-                &key,
-            )
-            .expect("valid noncanonical CSV row")
-            .expect("eligible compatibility row")
-            .normalized
-            .expect("legacy guest key order must be normalized");
-        assert_eq!(
-            normalized,
-            br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
-        );
-        let normalized = plan
-            .certify_or_normalize_plugin_row(
-                br#"{"cells":["line\u000Abreak"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
-                &key,
-            )
-            .expect("valid alternative escape")
-            .expect("eligible compatibility row")
-            .normalized
-            .expect("alternative JSON escape must be normalized");
-        assert_eq!(
-            normalized,
-            br#"{"cells":["line\nbreak"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
-        );
-        assert!(
-            plan.certify_or_normalize_plugin_row(
-                br#"{"cells":["line\nbreak"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
-                &key,
-            )
-            .expect("serde canonical short escape should validate")
-            .expect("eligible canonical row")
-            .normalized
-            .is_none(),
-            "exact serde control escapes must remain on the certificate path"
-        );
-        assert!(
-            plan.certify_or_normalize_plugin_row(
-                br#"{"cells":["\b\t\n\f\r\u0001\u001f"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
-                &key,
-            )
-            .expect("all exact serde control escapes should validate")
-            .expect("eligible canonical row")
-            .normalized
-            .is_none()
-        );
-        let normalized = plan
-            .certify_or_normalize_plugin_row(
-                br#"{"cells":["\u001F"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
-                &key,
-            )
-            .expect("uppercase hexadecimal escape should validate")
-            .expect("eligible compatibility row")
-            .normalized
-            .expect("uppercase hexadecimal escape must be normalized");
-        assert_eq!(
-            normalized,
-            br#"{"cells":["\u001f"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
-        );
-    }
-
-    #[test]
-    fn canonical_plugin_row_certificate_validates_non_primary_uuid_formats() {
-        let plan = SchemaPlan::compile(
-            SchemaCatalogKey {
-                schema_key: "uuid_format_row".to_owned(),
-            },
-            json!({
-                "$schema": "https://lix.dev/schema-v1.json",
-                "key": "uuid_format_row",
-                "columns": [
-                    {"name": "external_id", "type": "uuid", "nullable": false},
-                    {"name": "id", "type": "text", "nullable": false}
-                ],
-                "primary_key": ["id"]
-            }),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .expect("UUID schema should compile");
-        assert!(plan.accepts_canonical_certificate());
-        let key = WasmRowKey::from_owned_parts("uuid_format_row", vec!["row-1".to_owned()]);
-
-        let certified = plan
-            .certify_or_normalize_plugin_row(
-                br#"{"external_id":"019a0000-0000-7000-8000-000000000001","id":"row-1"}"#,
-                &key,
-            )
-            .expect("valid UUID should pass streaming validation")
-            .expect("eligible canonical row should receive a certificate");
-        assert!(certified.normalized.is_none());
-
-        let error = plan
-            .certify_or_normalize_plugin_row(br#"{"external_id":"not-a-uuid","id":"row-1"}"#, &key)
-            .expect_err("invalid non-primary UUID must not receive a certificate");
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-    }
-
-    #[test]
-    fn canonical_certificate_covers_csv_table_and_json_v2_schemas() {
-        let table = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv/schema/csv_table.json"
-        ));
-        assert!(table.accepts_canonical_certificate());
-        assert!(
-            table
-                .certify_or_normalize_plugin_row(
-                    br#"{"dialect":{"delimiter":",","quote":"\"","terminator":"\n"},"id":"root"}"#,
-                    &WasmRowKey::from_owned_parts("csv_table", vec!["root".to_owned()],),
-                )
-                .expect("canonical CSV table")
-                .expect("eligible canonical row")
-                .normalized
-                .is_none()
-        );
-
-        let json_root = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json/schema/json_root.json"
-        ));
-        assert!(json_root.accepts_canonical_certificate());
-        assert!(
-            json_root
-                .certify_or_normalize_plugin_row(
-                    br#"{"id":"root","kind":"object"}"#,
-                    &WasmRowKey::from_owned_parts("json_root", vec!["root".to_owned()]),
-                )
-                .expect("canonical JSON root")
-                .expect("eligible canonical row")
-                .normalized
-                .is_none()
-        );
-
-        let object_member = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json/schema/json_object_member.json"
-        ));
-        assert!(object_member.accepts_canonical_certificate());
-        assert!(
-            object_member
-                .certify_or_normalize_plugin_row(
-                    br#"{"key":"name","kind":"string","order_key":"01","parent_id":"root","scalar_json":"\"Lix\""}"#,
-                    &WasmRowKey::from_owned_parts(
-                        "json_object_member",
-                        vec!["root".to_owned(), "name".to_owned()],
-                    ),
-                )
-                .expect("canonical JSON object member")
-                .expect("eligible canonical row")
-                .normalized
-                .is_none()
-        );
-
-        let array_item = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json/schema/json_array_item.json"
-        ));
-        assert!(array_item.accepts_canonical_certificate());
-        assert!(
-            array_item
-                .certify_or_normalize_plugin_row(
-                    br#"{"id":"019a0000-0000-7000-8000-000000000001","kind":"null","order_key":"01","parent_id":"root","scalar_json":"null"}"#,
-                    &WasmRowKey::from_owned_parts(
-                        "json_array_item",
-                        vec![UUID_A.to_owned()],
-                    ),
-                )
-                .expect("canonical JSON array item")
-                .expect("eligible canonical row")
-                .normalized
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn canonical_plugin_row_certificate_rejects_hostile_rows() {
-        let plan =
-            compile_actual_fast_schema(include_str!("../../../../plugins/csv/schema/csv_row.json"));
-        let key = WasmRowKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]);
-
-        for bytes in [
-            br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
-            br#"{"cells":[1],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
-            br#"[]"#.as_slice(),
-            br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01""#.as_slice(),
-        ] {
-            let error = plan
-                .certify_or_normalize_plugin_row(bytes, &key)
-                .expect_err("hostile plugin snapshot must be rejected");
-            assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN, "{bytes:?}");
-        }
-
-        let wrong_identity = plan
-            .certify_or_normalize_plugin_row(
-                br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"01"}"#,
-                &key,
-            )
-            .expect_err("snapshot identity must match emitted row key");
-        assert_eq!(wrong_identity.code, LixError::CODE_SCHEMA_VALIDATION);
-
-        plan.certify_or_normalize_plugin_row(
-            br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"00"}"#,
-            &key,
-        )
-        .expect("removed order-key regex is intentionally no longer validated");
     }
 
     #[test]

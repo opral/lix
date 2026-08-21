@@ -400,5 +400,9 @@ artifact/*
 packages/engine/artifact/*
 target
 
+# Python benchmark-runner caches
+__pycache__/
+*.py[cod]
+
 # Built plugin archive artifacts
 packages/*/*.lixplugin

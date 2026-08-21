@@ -25,6 +25,29 @@ pub(crate) struct RowPk {
 }
 
 impl RowPk {
+    /// Compares a durable engine identity with native Schema v1 key values
+    /// without rebuilding an intermediate `RowPk`.
+    #[inline(always)]
+    pub(crate) fn matches_schema_values(&self, values: &[lix_schema::Value]) -> bool {
+        self.components.len() == values.len()
+            && self
+                .components
+                .iter()
+                .zip(values)
+                .all(|(component, value)| match (component, value) {
+                    (RowPkComponent::Uuid(left), lix_schema::Value::Uuid(right)) => {
+                        left == right.as_bytes()
+                    }
+                    (RowPkComponent::Integer(left), lix_schema::Value::Int8(right)) => {
+                        left == right
+                    }
+                    (RowPkComponent::String(left), lix_schema::Value::Text(right)) => {
+                        left.as_str() == right
+                    }
+                    _ => false,
+                })
+    }
+
     /// How many refcounted buffer handles one `clone` of this key duplicates.
     ///
     /// A composite key shares one `Arc` over its component slice, so it costs
@@ -294,6 +317,24 @@ impl RowPk {
         Ok(Self {
             components: RowPkComponents::from_smallvec(components),
         })
+    }
+
+    /// Builds an engine identity directly from native Schema v1 primary-key
+    /// values. Schema v1 permits only UUID, INT8, and TEXT primary-key
+    /// columns, so accepting any other value here would erase type information
+    /// at the typed plugin boundary.
+    pub(crate) fn from_schema_values(values: &[lix_schema::Value]) -> Result<Self, RowPkError> {
+        let components = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| match value {
+                lix_schema::Value::Uuid(value) => Ok(RowPkComponent::Uuid(*value.as_bytes())),
+                lix_schema::Value::Int8(value) => Ok(RowPkComponent::Integer(*value)),
+                lix_schema::Value::Text(value) => Ok(RowPkComponent::String(value.clone().into())),
+                _ => Err(RowPkError::UnsupportedPrimaryKeyValue { index }),
+            })
+            .collect::<Result<RowPkComponentBuffer, _>>()?;
+        Self::from_components(components)
     }
 
     pub(crate) fn uuid_from_canonical(value: &str) -> Result<Self, RowPkError> {

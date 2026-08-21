@@ -46,13 +46,22 @@ where
         })?;
     for (_, rows) in current {
         for row in rows.iter() {
-            let snapshot = row.snapshot_content().ok_or_else(|| {
-                LixError::new(
+            if row.deleted() {
+                continue;
+            }
+            if let Some(lix_schema::Value::Text(blob_hash)) = row
+                .decoded_snapshot()
+                .and_then(|typed| typed.row.get("blob_hash"))
+            {
+                roots.insert(crate::binary_cas::BlobId::from_hex(blob_hash)?);
+            } else if let Some(snapshot) = row.snapshot_content() {
+                roots.insert(blob_id_from_snapshot(snapshot.as_str())?);
+            } else {
+                return Err(LixError::new(
                     LixError::CODE_STORAGE_ERROR,
-                    "current binary blob reference has no snapshot",
-                )
-            })?;
-            roots.insert(blob_id_from_snapshot(snapshot.as_str())?);
+                    "current binary blob reference has no payload",
+                ));
+            }
         }
     }
 
@@ -68,13 +77,22 @@ where
             if row.deleted {
                 continue;
             }
-            let snapshot = row.snapshot.ok_or_else(|| {
+            let typed = row.decoded_snapshot.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_STORAGE_ERROR,
-                    format!("live binary blob reference in commit '{commit_id}' has no snapshot"),
+                    format!("live binary blob reference in commit '{commit_id}' has no native payload"),
                 )
             })?;
-            roots.insert(blob_id_from_snapshot(&snapshot)?);
+            let blob_hash = match typed.row.get("blob_hash") {
+                Some(lix_schema::Value::Text(value)) => value,
+                _ => {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("live binary blob reference in commit '{commit_id}' has no blob_hash"),
+                    ));
+                }
+            };
+            roots.insert(crate::binary_cas::BlobId::from_hex(blob_hash)?);
         }
     }
     Ok(roots)
@@ -110,12 +128,18 @@ impl FilesystemIndex {
                 untracked: row.untracked(),
                 file_id: row.file_id().map(str::to_owned),
             };
-            let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
+            if row.deleted() {
                 continue;
-            };
+            }
+            let snapshot = row.snapshot_json_value()?.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    format!("live filesystem row '{}' has no payload", row.schema_key()),
+                )
+            })?;
             match row.schema_key() {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                    let snapshot: DirectorySnapshot = serde_json::from_str(snapshot_content)
+                    let snapshot: DirectorySnapshot = serde_json::from_value(snapshot)
                         .map_err(|error| {
                             LixError::unknown(format!(
                                 "invalid lix_directory_descriptor snapshot JSON: {error}"
@@ -128,7 +152,7 @@ impl FilesystemIndex {
                 }
                 FILE_DESCRIPTOR_SCHEMA_KEY => {
                     let snapshot: FileSnapshot =
-                        serde_json::from_str(snapshot_content).map_err(|error| {
+                        serde_json::from_value(snapshot).map_err(|error| {
                             LixError::unknown(format!(
                                 "invalid lix_file_descriptor snapshot JSON: {error}"
                             ))
@@ -142,7 +166,7 @@ impl FilesystemIndex {
                     ));
                 }
                 BLOB_REF_SCHEMA_KEY => {
-                    let snapshot: BlobRefSnapshot = serde_json::from_str(snapshot_content)
+                    let snapshot: BlobRefSnapshot = serde_json::from_value(snapshot)
                         .map_err(|error| {
                             LixError::unknown(format!(
                                 "invalid lix_binary_blob_ref snapshot JSON: {error}"

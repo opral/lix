@@ -27,25 +27,25 @@ use crate::functions::FunctionProviderHandle;
 use crate::gc::CheckpointPublication;
 #[cfg(test)]
 use crate::hot_state::HotStateRowRequest;
-#[cfg(test)]
-use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::{
     CertifiedCurrentStatePredecessor, HotStateExactBatchRequest, HotStateExactRowRequest,
     HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateBatchBuilder,
     MaterializedHotStateExactBatch,
 };
+#[cfg(test)]
+use crate::hot_state::{MaterializedHotStateRow, MaterializedHotStateRowRef};
+use crate::plugin::runtime::WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::transaction::staged_commit_changes::StagedCommitChangeBatch;
 use crate::transaction::staged_commit_changes::StagedCommitChangeRefs;
-use crate::transaction_types::{
-    CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation,
-    CompleteCollectionReplacementProof, LogicalPrimaryKey, PreparedRowFacts, PreparedStateBatch,
-    PreparedStateRowRef, PreparedTransactionWrite, StageJson, TransactionFileContent,
-    TransactionJson, TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
-    TransactionWriteOutcome,
-};
 #[cfg(test)]
-use crate::transaction_types::{TestPreparedStateRow, stage_json_from_value};
+use crate::transaction_types::TestPreparedStateRow;
+use crate::transaction_types::{
+    CompleteCollectionReplacementProof, LogicalPrimaryKey, PreparedRowFacts, PreparedStateBatch,
+    PreparedStateRowRef, PreparedTransactionWrite, TransactionFileContent, TransactionWriteMode,
+    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteOutcome,
+    materialize_jsonb_shared,
+};
 use crate::{LixError, NullableKeyFilter};
 
 /// Transaction-local write buffer after transaction-boundary preparation.
@@ -84,7 +84,7 @@ pub(crate) struct TransactionWriteBufferCheckpoint {
 }
 
 /// One immutable, fixed-shape journal chunk produced by typed SQL mutation
-/// ingress. Identity and canonical JSON remain columnar owners; commit can
+/// ingress. Identity and native typed payloads remain columnar owners; commit can
 /// borrow them directly while encoding immutable mutation parts.
 #[derive(Clone, Debug)]
 pub(crate) struct ImmutableMutationJournalChunk {
@@ -94,9 +94,8 @@ pub(crate) struct ImmutableMutationJournalChunk {
     origin_key: Option<SharedStr>,
     identity_arena: SharedStr,
     identity_offsets: Arc<[(u32, u32)]>,
-    snapshot_arena: SharedStr,
+    snapshot_arena: Bytes,
     snapshot_offsets: Arc<[(u32, u32)]>,
-    large_snapshot_refs: Arc<[(u32, crate::json_store::JsonRef)]>,
     sealed_replacement_parts: Option<Arc<[crate::tracked_state::EncodedReplacementPart]>>,
     durable_predecessors: Option<Arc<[CertifiedCurrentStatePredecessor]>>,
     timestamp: LixTimestamp,
@@ -112,7 +111,6 @@ impl PartialEq for ImmutableMutationJournalChunk {
             && self.identity_offsets == other.identity_offsets
             && self.snapshot_arena == other.snapshot_arena
             && self.snapshot_offsets == other.snapshot_offsets
-            && self.large_snapshot_refs == other.large_snapshot_refs
             && self.sealed_replacement_parts == other.sealed_replacement_parts
             && self.timestamp == other.timestamp
             && self.durable_predecessors.as_ref().map(|values| {
@@ -136,6 +134,102 @@ impl Eq for ImmutableMutationJournalChunk {}
 impl ImmutableMutationJournalChunk {
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn try_new_single_string_identities(
+        schema_plan_id: SchemaPlanId,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        origin_key: Option<SharedStr>,
+        identity_arena: Vec<u8>,
+        identity_offsets: Vec<(usize, usize)>,
+        snapshot_arena: Vec<u8>,
+        snapshot_offsets: Vec<(usize, usize)>,
+        schema_plan: &crate::catalog::SchemaPlan,
+        durable_predecessors: Option<Vec<CertifiedCurrentStatePredecessor>>,
+        timestamp: LixTimestamp,
+    ) -> Result<Self, LixError> {
+        if identity_offsets.len() != snapshot_offsets.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation JSON columns are misaligned",
+            ));
+        }
+        let mut previous_end = 0usize;
+        let mut encoded_snapshot_arena = Vec::new();
+        let mut encoded_snapshot_offsets = Vec::with_capacity(snapshot_offsets.len());
+        for (index, &(start, end)) in snapshot_offsets.iter().enumerate() {
+            if start != previous_end || end <= start || end > snapshot_arena.len() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation JSON offsets are invalid",
+                ));
+            }
+            let value: serde_json::Value = serde_json::from_slice(&snapshot_arena[start..end])
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("immutable mutation row is not canonical JSON: {error}"),
+                    )
+                })?;
+            let (identity_start, identity_end) = identity_offsets[index];
+            let identity = std::str::from_utf8(
+                identity_arena
+                    .get(identity_start..identity_end)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "immutable mutation identity offsets are invalid",
+                        )
+                    })?,
+            )
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation identity is not UTF-8",
+                )
+            })?;
+            let row_pk = RowPk::single(identity.to_owned());
+            let typed = WasmTypedRow::from_normalized_json(schema_plan, &row_pk, &value).or_else(
+                |_error| {
+                    #[cfg(test)]
+                    {
+                        return WasmTypedRow::from_test_json_unchecked(&row_pk, &value);
+                    }
+                    #[cfg(not(test))]
+                    Err(_error)
+                },
+            )?;
+            let payload = typed.durable_payload().map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("cannot encode immutable mutation typed payload: {error:?}"),
+                )
+            })?;
+            let payload_start = encoded_snapshot_arena.len();
+            encoded_snapshot_arena.extend_from_slice(payload.as_ref());
+            encoded_snapshot_offsets.push((payload_start, encoded_snapshot_arena.len()));
+            previous_end = end;
+        }
+        if previous_end != snapshot_arena.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation JSON offsets do not cover the arena",
+            ));
+        }
+        Self::try_new_typed_single_string_identities(
+            schema_plan_id,
+            schema_key,
+            branch_id,
+            origin_key,
+            identity_arena,
+            identity_offsets,
+            encoded_snapshot_arena,
+            encoded_snapshot_offsets,
+            durable_predecessors,
+            timestamp,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_new_typed_single_string_identities(
         schema_plan_id: SchemaPlanId,
         schema_key: SharedStr,
         branch_id: SharedStr,
@@ -247,12 +341,6 @@ impl ImmutableMutationJournalChunk {
                 "immutable mutation predecessor column is misaligned",
             ));
         }
-        let snapshot_arena = SharedStr::from_utf8(Bytes::from(snapshot_arena)).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "immutable mutation journal arena is not UTF-8",
-            )
-        })?;
         let arena_len = snapshot_arena.len();
         let mut previous_end = 0usize;
         let mut offsets = Vec::with_capacity(snapshot_offsets.len());
@@ -260,26 +348,20 @@ impl ImmutableMutationJournalChunk {
             if start != previous_end || end <= start || end > arena_len {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "immutable mutation journal offsets are invalid",
+                    "immutable mutation journal typed payload offsets are invalid",
                 ));
             }
-            snapshot_arena.as_str().get(start..end).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "immutable mutation journal offset splits UTF-8",
-                )
-            })?;
             offsets.push((
                 u32::try_from(start).map_err(|_| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "immutable mutation journal arena exceeds u32",
+                        "immutable mutation journal typed payload arena exceeds u32",
                     )
                 })?,
                 u32::try_from(end).map_err(|_| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "immutable mutation journal arena exceeds u32",
+                        "immutable mutation journal typed payload arena exceeds u32",
                     )
                 })?,
             ));
@@ -288,23 +370,9 @@ impl ImmutableMutationJournalChunk {
         if previous_end != arena_len {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "immutable mutation journal offsets do not cover the arena",
+                "immutable mutation journal typed payload offsets do not cover the arena",
             ));
         }
-        let large_snapshot_refs = offsets
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &(start, end))| {
-                let bytes = &snapshot_arena.as_bytes()[start as usize..end as usize];
-                (bytes.len() > crate::json_store::JSON_INLINE_MAX_BYTES).then(|| {
-                    (
-                        u32::try_from(index)
-                            .expect("immutable mutation chunk row ordinal fits u32"),
-                        crate::json_store::JsonRef::for_content(bytes),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
         Ok(Self {
             schema_plan_id,
             schema_key,
@@ -312,9 +380,8 @@ impl ImmutableMutationJournalChunk {
             origin_key,
             identity_arena,
             identity_offsets,
-            snapshot_arena,
+            snapshot_arena: Bytes::from(snapshot_arena),
             snapshot_offsets: offsets.into(),
-            large_snapshot_refs: large_snapshot_refs.into(),
             sealed_replacement_parts: None,
             durable_predecessors: durable_predecessors.map(Into::into),
             timestamp,
@@ -361,25 +428,14 @@ impl ImmutableMutationJournalChunk {
             .expect("validated immutable mutation identity UTF-8")
     }
 
-    pub(crate) fn snapshot(&self, index: usize) -> &str {
+    pub(crate) fn snapshot(&self, index: usize) -> &[u8] {
         let (start, end) = self.snapshot_offsets[index];
-        self.snapshot_arena
-            .as_str()
-            .get(start as usize..end as usize)
-            .expect("validated immutable mutation journal UTF-8")
+        &self.snapshot_arena[start as usize..end as usize]
     }
 
-    pub(crate) fn snapshot_slot(&self, index: usize) -> crate::json_store::JsonSlotRef<'_> {
-        let snapshot = self.snapshot(index);
-        if snapshot.len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
-            return crate::json_store::JsonSlotRef::Inline(snapshot);
-        }
-        let index = u32::try_from(index).expect("immutable mutation chunk row ordinal fits u32");
-        let position = self
-            .large_snapshot_refs
-            .binary_search_by_key(&index, |(ordinal, _)| *ordinal)
-            .expect("large immutable mutation snapshot has a content ref");
-        crate::json_store::JsonSlotRef::Ref(&self.large_snapshot_refs[position].1)
+    fn snapshot_owned(&self, index: usize) -> Bytes {
+        let (start, end) = self.snapshot_offsets[index];
+        self.snapshot_arena.slice(start as usize..end as usize)
     }
 
     pub(crate) fn seal_replacement_parts(
@@ -404,9 +460,9 @@ impl ImmutableMutationJournalChunk {
         #[cfg(feature = "storage-benches")]
         let mut generated_key_bytes = 0usize;
         let mut first = 0usize;
+        let mut part_row_target = crate::tracked_state::REPLACEMENT_PART_MAX_ROWS;
         while first < self.len() {
-            let max_candidate_len =
-                (self.len() - first).min(crate::tracked_state::REPLACEMENT_PART_MAX_ROWS);
+            let max_candidate_len = (self.len() - first).min(part_row_target);
             let mut key_arena = Vec::new();
             let mut key_offsets = Vec::with_capacity(max_candidate_len);
             for index in first..first + max_candidate_len {
@@ -432,8 +488,8 @@ impl ImmutableMutationJournalChunk {
                     .map(
                         |(offset, &(start, end))| crate::tracked_state::ReplacementPartRowRef {
                             encoded_key: &key_arena[start..end],
-                            snapshot: self.snapshot_slot(first + offset),
-                            metadata: crate::json_store::JsonSlotRef::None,
+                            metadata: None,
+                            snapshot: self.snapshot(first + offset),
                         },
                     )
                     .collect::<Vec<_>>();
@@ -462,6 +518,7 @@ impl ImmutableMutationJournalChunk {
                     Ok(_) => unreachable!("single-row replacement part satisfies the size guard"),
                 }
             };
+            part_row_target = candidate_len;
             first += candidate_len;
             parts.push(encoded);
         }
@@ -514,32 +571,39 @@ impl ImmutableMutationJournalChunk {
     pub(crate) fn into_prepared(
         self,
         allow_missing_predecessors: bool,
+        _functions: &FunctionProviderHandle,
     ) -> Result<PreparedStateBatch, LixError> {
         let row_pks = self.materialized_row_pks();
-        let offsets = self
-            .snapshot_offsets
-            .iter()
-            .map(|&(start, end)| (start as usize, end as usize))
-            .collect();
-        let mut rows = CertifiedParameterReplacementBatch::new(
-            row_pks.iter().cloned().collect(),
-            TransactionJson::from_certified_row_content_arena(
-                self.snapshot_arena.as_bytes().to_vec(),
-                offsets,
-            )?,
-            self.schema_key,
-            self.branch_id,
-            CertifiedRawWriteBatchPreparation {
-                schema_plan_id: self.schema_plan_id,
-                facts: PreparedRowFacts {
-                    row_content_validated: true,
-                    requires_transaction_validation: false,
-                },
-                tracked_keys_strictly_ordered: true,
-                complete_collection_replacement: None,
-            },
-        )?
-        .into_dense_prepared(self.origin_key.as_ref(), self.timestamp)?;
+        let mut rows = PreparedStateBatch::with_capacity(row_pks.len());
+        let facts = PreparedRowFacts {
+            row_content_validated: true,
+            requires_transaction_validation: false,
+        };
+        for row_pk in row_pks.iter().cloned() {
+            rows.push_parts_with_change_addressability(
+                self.schema_plan_id,
+                facts,
+                row_pk,
+                self.schema_key.clone(),
+                None,
+                None,
+                None,
+                None,
+                self.origin_key.as_ref(),
+                self.timestamp,
+                self.timestamp,
+                false,
+                Some(ChangeId::default()),
+                true,
+                None,
+                false,
+                self.branch_id.clone(),
+            );
+        }
+        rows.set_snapshot_arena(
+            self.snapshot_arena,
+            self.snapshot_offsets.iter().copied().collect(),
+        )?;
         let Some(predecessors) = self.durable_predecessors else {
             if allow_missing_predecessors {
                 return Ok(rows);
@@ -566,7 +630,7 @@ pub(crate) struct OrderedMutationJournal {
     row_count: usize,
     commit_id: CommitId,
     replacement_proof: Option<CompleteCollectionReplacementProof>,
-    overlay_uniform_created_at: Option<LixTimestamp>,
+    overlay_lifecycle_certificate: Option<(CommitId, LixTimestamp)>,
 }
 
 #[derive(Clone, Copy)]
@@ -580,12 +644,8 @@ impl<'a> OrderedMutationJournalRowRef<'a> {
         self.chunk.identity(self.row_index)
     }
 
-    pub(crate) fn snapshot(&self) -> &'a str {
+    pub(crate) fn snapshot(&self) -> &'a [u8] {
         self.chunk.snapshot(self.row_index)
-    }
-
-    pub(crate) fn snapshot_slot(&self) -> crate::json_store::JsonSlotRef<'a> {
-        self.chunk.snapshot_slot(self.row_index)
     }
 }
 
@@ -708,7 +768,14 @@ impl OrderedMutationJournal {
             .expect("drained ordered mutation journal is replacement-certified")
     }
 
-    fn into_prepared(self) -> Result<PreparedStateBatch, LixError> {
+    pub(crate) fn overlay_lifecycle_certificate(&self) -> Option<(CommitId, LixTimestamp)> {
+        self.overlay_lifecycle_certificate
+    }
+
+    fn into_prepared(
+        self,
+        functions: &FunctionProviderHandle,
+    ) -> Result<PreparedStateBatch, LixError> {
         let proof = self.replacement_proof;
         let schema_key = self.schema_key().to_owned();
         let branch_id = self.branch_id().to_owned();
@@ -718,9 +785,9 @@ impl OrderedMutationJournal {
         let Some(first) = chunks.next() else {
             return Ok(PreparedStateBatch::new());
         };
-        let mut rows = first.into_prepared(proof.is_some())?;
+        let mut rows = first.into_prepared(proof.is_some(), functions)?;
         for chunk in chunks {
-            rows.append(chunk.into_prepared(proof.is_some())?);
+            rows.append(chunk.into_prepared(proof.is_some(), functions)?);
         }
         rows.set_commit_id_all(self.commit_id);
         if let Some(proof) = proof {
@@ -1286,21 +1353,39 @@ impl<'a> PreparedValidationRow<'a> {
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshot_content(&self) -> Option<&str> {
+    pub(crate) fn snapshot_content(&self) -> Option<String> {
         match self {
-            Self::State(row) => row.snapshot.map(StageJson::normalized),
+            Self::State(row) => row.snapshot.map(|snapshot| {
+                WasmTypedRow::decode_durable_payload(
+                    Arc::from(snapshot),
+                    row.schema_key.as_str(),
+                    row.row_pk,
+                )
+                .and_then(|typed| typed.to_json_shared())
+                .expect("prepared validation snapshot should decode")
+                .to_string()
+            }),
         }
     }
 
-    pub(crate) fn snapshot_json(self) -> Option<&'a serde_json::Value> {
+    pub(crate) fn decoded_snapshot(self) -> Result<Option<WasmTypedRow>, LixError> {
         match self {
-            Self::State(row) => row.snapshot.map(StageJson::value),
+            Self::State(row) => row
+                .snapshot
+                .map(|snapshot| {
+                    WasmTypedRow::decode_durable_payload(
+                        Arc::from(snapshot),
+                        row.schema_key.as_str(),
+                        row.row_pk,
+                    )
+                })
+                .transpose(),
         }
     }
 
     pub(crate) fn metadata_json(self) -> Option<&'a serde_json::Value> {
         match self {
-            Self::State(row) => row.metadata.map(StageJson::value),
+            Self::State(row) => row.metadata.map(lix_schema::Jsonb::as_value),
         }
     }
 
@@ -1324,7 +1409,7 @@ impl<'a> PreparedValidationRow<'a> {
 
     pub(crate) fn is_tombstone(&self) -> bool {
         match self {
-            Self::State(row) => row.snapshot.is_none(),
+            Self::State(row) => row.is_deleted(),
         }
     }
 
@@ -1442,6 +1527,7 @@ impl PreparedWriteSet {
     pub(crate) fn hydrate_and_lower_ordered_mutation_journals(
         &mut self,
         mut predecessors_by_commit: BTreeMap<CommitId, Vec<CertifiedCurrentStatePredecessor>>,
+        functions: &FunctionProviderHandle,
     ) -> Result<(), LixError> {
         let journals = self
             .commit_change_refs_by_branch
@@ -1472,7 +1558,7 @@ impl PreparedWriteSet {
                     "stale immutable journal has excess predecessor evidence",
                 ));
             }
-            let rows = journal.into_prepared()?;
+            let rows = journal.into_prepared(functions)?;
             let previous_len = self.state_rows.len();
             let row_count = rows.len();
             self.state_rows.append(rows);
@@ -1846,7 +1932,7 @@ impl TransactionWriteBuffer {
                     row_count: count,
                     commit_id: refs.commit_id,
                     replacement_proof: None,
-                    overlay_uniform_created_at: None,
+                    overlay_lifecycle_certificate: None,
                 });
             }
         }
@@ -1891,6 +1977,7 @@ impl TransactionWriteBuffer {
 
     pub(crate) fn set_ordered_mutation_overlay_created_at(
         &self,
+        source_parent_commit_id: CommitId,
         created_at: LixTimestamp,
     ) -> Result<(), LixError> {
         let mut ordered = self.ordered_mutations.lock().map_err(|_| {
@@ -1905,7 +1992,7 @@ impl TransactionWriteBuffer {
                 "transaction has no provisional immutable mutation journal",
             )
         })?;
-        journal.overlay_uniform_created_at = Some(created_at);
+        journal.overlay_lifecycle_certificate = Some((source_parent_commit_id, created_at));
         Ok(())
     }
 
@@ -1963,7 +2050,7 @@ impl TransactionWriteBuffer {
         let Some(journal) = journal else {
             return Ok(());
         };
-        let rows = journal.into_prepared()?;
+        let rows = journal.into_prepared(&self.functions)?;
         let last_key = rows.last().map(TrackedStateKey::from_row);
         let mut insert_selection = PreparedInsertSelection::new();
         insert_selection.resize_rows(rows.len());
@@ -2380,7 +2467,7 @@ impl TransactionWriteBuffer {
             && inserts
             && !rows
                 .iter()
-                .all(|row| row_is_insert(mode, row) && row.snapshot.is_some()))
+                .all(|row| row_is_insert(mode, row) && row_has_payload(row)))
         {
             return Ok(AppendOnlyStage::Fallback(rows));
         }
@@ -2401,7 +2488,7 @@ impl TransactionWriteBuffer {
         let append_shape_matches = if certified_tracked_keys_strictly_ordered {
             rows.first().is_none_or(|first| {
                 is_normal_tracked_append_row(first)
-                    && first.snapshot.is_some()
+                    && row_has_payload(first)
                     && last_key.as_ref().is_none_or(|previous| {
                         compare_tracked_key_to_row(previous, first) == std::cmp::Ordering::Less
                     })
@@ -2492,7 +2579,7 @@ impl TransactionWriteBuffer {
                 !is_normal_tracked_append_row(row)
                     || row.branch_id != first.branch_id
                     || row.facts.requires_transaction_validation
-                    || (row_is_insert(mode, row) && row.snapshot.is_none())
+                    || (row_is_insert(mode, row) && !row_has_payload(row))
             })
         {
             return Ok(AppendOnlyStage::Fallback(rows));
@@ -3311,6 +3398,10 @@ fn row_is_insert(mode: Option<TransactionWriteMode>, row: PreparedStateRowRef<'_
             .is_some_and(|origin| origin.operation == TransactionWriteOperation::Update)
 }
 
+fn row_has_payload(row: PreparedStateRowRef<'_>) -> bool {
+    row.has_payload()
+}
+
 fn rows_are_append_only_tracked(
     rows: &PreparedStateBatch,
     previous_last: Option<&TrackedStateKey>,
@@ -3559,21 +3650,18 @@ impl PreparedStateRowOverlay {
     #[cfg(test)]
     pub(crate) fn load_exact(&self, request: &HotStateRowRequest) -> Option<StagedExactRow> {
         let identity = PreparedStateRowIdentity::from_row_request(request)?;
-        if let Some(row) = self.load_state_slot(&identity) {
-            return Some(if row.deleted {
+        if let Some(deleted) = self.load_state_slot_deleted(&identity) {
+            return Some(if deleted {
                 StagedExactRow::Tombstone
             } else {
-                StagedExactRow::Row(row)
+                StagedExactRow::Row
             });
         }
         None
     }
 
     #[cfg(test)]
-    fn load_state_slot(
-        &self,
-        identity: &PreparedStateRowIdentity,
-    ) -> Option<MaterializedHotStateRow> {
+    fn load_state_slot_deleted(&self, identity: &PreparedStateRowIdentity) -> Option<bool> {
         self.staged_writes.ensure_identity_index(false).ok()?;
         let rows_guard = self.staged_writes.rows.lock().ok()?;
         let StagedPreparedRows::Indexed {
@@ -3585,7 +3673,7 @@ impl PreparedStateRowOverlay {
         let Some(RowSlot::State(index)) = by_identity.get(identity).copied() else {
             return None;
         };
-        rows.get(index).map(MaterializedHotStateRow::from)
+        rows.get(index).map(|row| row.is_deleted())
     }
 }
 
@@ -3646,7 +3734,7 @@ impl crate::hot_state::StagedHotStateRows for PreparedStateRowOverlay {
             {
                 continue;
             }
-            if row.snapshot.is_none() && !request.include_tombstones {
+            if row.is_deleted() && !request.include_tombstones {
                 continue;
             } else {
                 slots[request_index] = Some(
@@ -3691,7 +3779,7 @@ impl crate::hot_state::StagedHotStateRows for PreparedStateRowOverlay {
             let Some(row) = rows.get(index) else {
                 continue;
             };
-            if row.branch_id.as_str() != branch_id || row.snapshot.is_none() {
+            if row.branch_id.as_str() != branch_id || row.is_deleted() {
                 continue;
             }
             let (target_schema_key, target_file_id) =
@@ -3741,17 +3829,7 @@ fn push_ordered_mutation_materialized(
     chunk: &ImmutableMutationJournalChunk,
     row_index: usize,
 ) -> Result<usize, LixError> {
-    let (snapshot_start, snapshot_end) = chunk.snapshot_offsets[row_index];
-    let snapshot = chunk
-        .snapshot_arena
-        .slice(snapshot_start as usize..snapshot_end as usize)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "immutable mutation snapshot escaped its shared arena",
-            )
-        })?;
-    let created_at = if let Some(created_at) = journal.overlay_uniform_created_at {
+    let created_at = if let Some((_, created_at)) = journal.overlay_lifecycle_certificate {
         created_at
     } else {
         chunk
@@ -3777,7 +3855,7 @@ fn push_ordered_mutation_materialized(
         &row_pk,
         chunk.schema_key(),
         None,
-        Some(snapshot),
+        None,
         None,
         false,
         created_at,
@@ -3788,6 +3866,10 @@ fn push_ordered_mutation_materialized(
         false,
         chunk.branch_id(),
     );
+    // Keep the journal's certified native payload as a shared range. Overlay
+    // consumers can project it directly, while commit can borrow the exact
+    // durable bytes instead of decoding a Row and encoding it again.
+    output.set_raw_snapshot(ordinal, Some(chunk.snapshot_owned(row_index)));
     if let Some(predecessor) = chunk
         .durable_predecessors
         .as_ref()
@@ -3948,7 +4030,7 @@ fn append_only_collection_replaced(
     let marker_schema = crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY;
     for row_index in ordered_schema_row_range(rows, marker_schema) {
         let row = rows.row(row_index);
-        if row.branch_id.as_str() != branch_id || row.snapshot.is_none() {
+        if row.branch_id.as_str() != branch_id || row.is_deleted() {
             continue;
         }
         let (target_schema_key, target_file_id) =
@@ -3990,7 +4072,7 @@ fn ordered_schema_row_range(rows: &PreparedStateBatch, schema_key: &str) -> std:
 
 #[cfg(test)]
 pub(crate) enum StagedExactRow {
-    Row(MaterializedHotStateRow),
+    Row,
     Tombstone,
 }
 
@@ -4120,7 +4202,7 @@ fn validate_rows_in_identity_order<'a>(
         if previous_identity != Some(identity) {
             previous_identity = Some(identity);
             group_untracked = row.untracked;
-            pending_present = row.snapshot.map(|_| row);
+            pending_present = row_has_payload(row).then_some(row);
             unique_count += 1;
             continue;
         }
@@ -4132,7 +4214,7 @@ fn validate_rows_in_identity_order<'a>(
                 BatchIdentityViolation::MixedDurability(row),
             );
         }
-        if row.snapshot.is_none() {
+        if !row_has_payload(row) {
             pending_present = None;
         } else if let Some(previous) = pending_present.replace(row) {
             retain_earliest_batch_identity_violation(
@@ -4333,13 +4415,13 @@ fn push_prepared_materialized(
     output: &mut MaterializedHotStateBatchBuilder,
     row: PreparedStateRowRef<'_>,
 ) -> usize {
-    output.push_materialized_ref(
+    let ordinal = output.push_materialized_ref(
         row.row_pk,
         row.schema_key.as_str(),
         row.file_id.map(SharedStr::as_str),
-        row.snapshot.map(StageJson::materialize_shared),
-        row.metadata.map(StageJson::materialize_shared),
-        row.snapshot.is_none(),
+        None,
+        row.metadata.map(materialize_jsonb_shared),
+        row.is_deleted(),
         row.created_at,
         row.updated_at,
         row.global,
@@ -4349,7 +4431,9 @@ fn push_prepared_materialized(
         row.commit_id,
         row.untracked,
         row.branch_id.as_str(),
-    )
+    );
+    output.set_raw_snapshot(ordinal, row.snapshot.map(Bytes::copy_from_slice));
+    ordinal
 }
 
 fn staged_row_identity_matches_scan(
@@ -4424,10 +4508,35 @@ mod tests {
         StagedHotStateRows,
     };
 
+    fn journal_schema_plan() -> &'static crate::catalog::SchemaPlan {
+        let (_, plan) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_key_value")
+            .expect("embedded key-value schema");
+        plan
+    }
+
     macro_rules! prepared_rows {
         ($($row:expr),* $(,)?) => {
             PreparedStateBatch::from_test_rows(vec![$($row),*])
         };
+    }
+
+    fn decoded_test_snapshot(row: PreparedStateRowRef<'_>) -> SharedStr {
+        WasmTypedRow::decode_durable_payload(
+            Arc::from(row.snapshot.expect("test row should have a snapshot")),
+            row.schema_key.as_str(),
+            row.row_pk,
+        )
+        .and_then(|snapshot| snapshot.to_json_shared())
+        .expect("test snapshot should decode")
+    }
+
+    fn assert_native_snapshot(row: MaterializedHotStateRowRef<'_>, expected: serde_json::Value) {
+        assert_eq!(
+            row.snapshot_json_value()
+                .expect("native staged snapshot should decode"),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -4450,6 +4559,7 @@ mod tests {
                     first_snapshot.len() + second_snapshot.len(),
                 ),
             ],
+            journal_schema_plan(),
             None,
             LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
         )
@@ -4486,6 +4596,7 @@ mod tests {
             vec![(0, 1), (1, 2), (2, 3), (3, 4)],
             snapshot_arena.into_bytes(),
             snapshot_offsets,
+            journal_schema_plan(),
             None,
             LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
         )
@@ -4563,6 +4674,7 @@ mod tests {
                 vec![(0, 1)],
                 b"{}".to_vec(),
                 vec![(0, 2)],
+                journal_schema_plan(),
                 None,
                 LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
             )
@@ -4581,6 +4693,7 @@ mod tests {
                 vec![(0, 1), (1, 2)],
                 snapshots,
                 vec![(0, 1), (1, 2)],
+                journal_schema_plan(),
                 None,
                 LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
             )
@@ -4603,10 +4716,12 @@ mod tests {
 
             let start = snapshots.len();
             if row + 1 == ROW_COUNT {
+                snapshots.extend_from_slice(b"{\"value\":\"");
                 snapshots.extend(std::iter::repeat_n(
                     b'x',
                     crate::json_store::JSON_INLINE_MAX_BYTES + 1,
                 ));
+                snapshots.extend_from_slice(b"\"}");
             } else {
                 snapshots.extend_from_slice(b"{}");
             }
@@ -4622,15 +4737,13 @@ mod tests {
             identity_offsets,
             snapshots,
             snapshot_offsets,
+            journal_schema_plan(),
             None,
             LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
         )
         .expect("journal chunk above the u16 row boundary");
 
-        assert!(matches!(
-            chunk.snapshot_slot(ROW_COUNT - 1),
-            crate::json_store::JsonSlotRef::Ref(_)
-        ));
+        assert!(chunk.snapshot(ROW_COUNT - 1).len() > crate::json_store::JSON_INLINE_MAX_BYTES);
     }
 
     #[test]
@@ -4639,8 +4752,8 @@ mod tests {
         let mut identity_values = Vec::with_capacity(ROW_COUNT);
         let mut random = 0x9e37_79b9_7f4a_7c15_u64;
         for _ in 0..ROW_COUNT {
-            let mut identity = String::with_capacity(640);
-            for _ in 0..40 {
+            let mut identity = String::with_capacity(2_560);
+            for _ in 0..160 {
                 random ^= random << 13;
                 random ^= random >> 7;
                 random ^= random << 17;
@@ -4651,7 +4764,7 @@ mod tests {
         }
         identity_values.sort_unstable();
 
-        let mut identities = Vec::with_capacity(ROW_COUNT * 640);
+        let mut identities = Vec::with_capacity(ROW_COUNT * 2_560);
         let mut identity_offsets = Vec::with_capacity(ROW_COUNT);
         let mut snapshots = Vec::with_capacity(ROW_COUNT * 2);
         let mut snapshot_offsets = Vec::with_capacity(ROW_COUNT);
@@ -4674,6 +4787,7 @@ mod tests {
             identity_offsets,
             snapshots,
             snapshot_offsets,
+            journal_schema_plan(),
             None,
             LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
         )
@@ -5057,7 +5171,7 @@ mod tests {
                 "row-b",
             ))
             .expect("staged row should answer the exact read");
-        assert!(matches!(row, StagedExactRow::Row(_)));
+        assert!(matches!(row, StagedExactRow::Row));
         assert!(staged_writes.uses_identity_index_for_tests());
 
         assert!(
@@ -5199,7 +5313,12 @@ mod tests {
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
             row.row_pk == &RowPk::single("row-b")
-                && row.snapshot.as_ref().map(|snapshot| snapshot.normalized())
+                && crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
+                    row,
+                )
+                .ok()
+                .and_then(|row| row.snapshot_content)
+                .as_deref()
                     == Some("{\"key\":\"row-b\",\"value\":\"after\"}")
         }));
         assert_eq!(
@@ -5259,12 +5378,7 @@ mod tests {
         assert!(drained.insert_selection.is_empty());
         assert_eq!(drained.state_rows.len(), 1);
         assert_eq!(
-            drained
-                .state_rows
-                .row(0)
-                .snapshot
-                .expect("replacement snapshot")
-                .normalized(),
+            decoded_test_snapshot(drained.state_rows.row(0)).as_str(),
             "{\"key\":\"engine-owned-key\",\"value\":\"second\"}"
         );
 
@@ -5304,21 +5418,14 @@ mod tests {
         let overlay = staged_writes
             .staging_overlay()
             .expect("overlay should build from staged rows");
-        let row = overlay
-            .load_exact(&HotStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
-                row_pk: RowPk::single("sql2-duplicate-key"),
-                file_id: NullableKeyFilter::Null,
-            })
-            .expect("staged row should be visible");
-
-        let StagedExactRow::Row(row) = row else {
-            panic!("latest staged row should not be a tombstone");
-        };
-        assert_eq!(
-            row.snapshot_content.as_deref(),
-            Some("{\"key\":\"sql2-duplicate-key\",\"value\":\"second\"}")
+        let exact = StagedHotStateRows::load_exact_batch(
+            &overlay,
+            &exact_batch_request_for_key("sql2-duplicate-key"),
+        )
+        .expect("staged row should be visible");
+        assert_native_snapshot(
+            exact.row(0).expect("latest staged row"),
+            serde_json::json!({"key": "sql2-duplicate-key", "value": "second"}),
         );
     }
 
@@ -5415,13 +5522,13 @@ mod tests {
             .staging_overlay()
             .expect("overlay should build from staged rows");
         let rows = overlay
-            .scan(&scan_request_for_key("sql2-duplicate-key", false))
+            .scan_batch(&scan_request_for_key("sql2-duplicate-key", false))
             .expect("overlay scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].snapshot_content.as_deref(),
-            Some("{\"key\":\"sql2-duplicate-key\",\"value\":\"second\"}")
+        assert_native_snapshot(
+            rows.row(0),
+            serde_json::json!({"key": "sql2-duplicate-key", "value": "second"}),
         );
     }
 
@@ -5477,16 +5584,14 @@ mod tests {
         let overlay = staged_writes
             .staging_overlay()
             .expect("overlay should build from staged rows");
-        let exact = overlay
-            .load_exact(&exact_request_for_key("sql2-resurrect-key"))
-            .expect("staged row should answer exact load");
-
-        let StagedExactRow::Row(row) = exact else {
-            panic!("latest staged row should be visible");
-        };
-        assert_eq!(
-            row.snapshot_content.as_deref(),
-            Some("{\"key\":\"sql2-resurrect-key\",\"value\":\"visible-again\"}")
+        let exact = StagedHotStateRows::load_exact_batch(
+            &overlay,
+            &exact_batch_request_for_key("sql2-resurrect-key"),
+        )
+        .expect("staged row should answer exact load");
+        assert_native_snapshot(
+            exact.row(0).expect("latest staged row should be visible"),
+            serde_json::json!({"key": "sql2-resurrect-key", "value": "visible-again"}),
         );
         assert_eq!(
             overlay
@@ -5522,12 +5627,22 @@ mod tests {
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
             row.row_pk == &RowPk::single("sql2-key-a")
-                && row.snapshot.as_ref().map(|snapshot| snapshot.normalized())
+                && crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
+                    row,
+                )
+                .ok()
+                .and_then(|row| row.snapshot_content)
+                .as_deref()
                     == Some("{\"key\":\"sql2-key-a\",\"value\":\"second\"}")
         }));
         assert!(drained.state_rows.iter().any(|row| {
             row.row_pk == &RowPk::single("sql2-key-b")
-                && row.snapshot.as_ref().map(|snapshot| snapshot.normalized())
+                && crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
+                    row,
+                )
+                .ok()
+                .and_then(|row| row.snapshot_content)
+                .as_deref()
                     == Some("{\"key\":\"sql2-key-b\",\"value\":\"only\"}")
         }));
     }
@@ -5744,15 +5859,16 @@ mod tests {
         let overlay = staged_writes
             .staging_overlay()
             .expect("overlay should build");
-        let StagedExactRow::Row(visible) = overlay
-            .load_exact(&exact_request_for_key("resurrected-file"))
-            .expect("latest replacement should be visible")
-        else {
-            panic!("latest replacement must supersede its tombstone");
-        };
-        assert_eq!(
-            visible.snapshot_content.as_deref(),
-            Some("{\"key\":\"resurrected-file\",\"value\":\"latest\"}")
+        let exact = StagedHotStateRows::load_exact_batch(
+            &overlay,
+            &exact_batch_request_for_key("resurrected-file"),
+        )
+        .expect("latest replacement should be visible");
+        assert_native_snapshot(
+            exact
+                .row(0)
+                .expect("latest replacement must supersede its tombstone"),
+            serde_json::json!({"key": "resurrected-file", "value": "latest"}),
         );
 
         let drained = staged_writes.drain().expect("write should drain");
@@ -5762,12 +5878,8 @@ mod tests {
             "same-identity rows must coalesce before durable lowering"
         );
         assert_eq!(
-            drained
-                .state_rows
-                .row(0)
-                .snapshot
-                .map(StageJson::normalized),
-            Some("{\"key\":\"resurrected-file\",\"value\":\"latest\"}")
+            decoded_test_snapshot(drained.state_rows.row(0)).as_str(),
+            "{\"key\":\"resurrected-file\",\"value\":\"latest\"}"
         );
         assert_eq!(drained.file_content_writes.len(), 1);
         assert_eq!(drained.file_content_writes[0].content(), b"payload");
@@ -6045,7 +6157,15 @@ mod tests {
                 .state_rows
                 .row(0)
                 .snapshot
-                .map(StageJson::materialize_shared)
+                .map(|snapshot| {
+                    WasmTypedRow::decode_durable_payload(
+                        Arc::from(snapshot),
+                        drained.state_rows.row(0).schema_key.as_str(),
+                        drained.state_rows.row(0).row_pk,
+                    )
+                    .and_then(|typed| typed.to_json_shared())
+                    .expect("drained snapshot should decode")
+                })
                 .as_deref(),
             Some("{\"key\":\"alternating-key\",\"value\":\"tracked-final\"}")
         );
@@ -6538,13 +6658,19 @@ mod tests {
     }
 
     fn state_row(key: &str, value: &str) -> TestPreparedStateRow {
-        let snapshot = stage_json_from_value(
-            TransactionJson::from_value_for_test(serde_json::json!({ "key": key, "value": value })),
-        );
+        let row_pk = RowPk::single(key);
+        let snapshot = WasmTypedRow::from_test_json_unchecked(
+            &row_pk,
+            &serde_json::json!({ "key": key, "value": value }),
+        )
+        .expect("test snapshot should become typed")
+        .durable_payload()
+        .map(Bytes::from_owner)
+        .expect("typed test snapshot should encode");
         TestPreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
-            row_pk: RowPk::single(key),
+            row_pk,
             schema_key: "lix_key_value".into(),
             file_id: None,
             snapshot: Some(snapshot),
@@ -6573,6 +6699,18 @@ mod tests {
             branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             row_pk: RowPk::single(key),
             file_id: NullableKeyFilter::Null,
+        }
+    }
+
+    fn exact_batch_request_for_key(key: &str) -> HotStateExactBatchRequest {
+        HotStateExactBatchRequest {
+            rows: vec![HotStateExactRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
+                row_pk: RowPk::single(key),
+                file_id: None,
+            }],
+            ..HotStateExactBatchRequest::default()
         }
     }
 

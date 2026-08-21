@@ -109,6 +109,19 @@ pub trait StorageWrite: Send {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
+    /// Atomically replaces values in an immutable, non-content-addressed
+    /// space while preserving their stable physical keys.
+    ///
+    /// This is deliberately separate from `put_many`: ordinary immutable
+    /// writes must continue rejecting same-key/different-value assignments.
+    /// Backends may reclaim superseded physical versions through normal
+    /// compaction or garbage collection after publication.
+    fn replace_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
     /// Deletes the given keys of one space. Batches hold at most one
     /// mutation per key; engine write-set lowering produces sorted keys.
     fn delete_many(

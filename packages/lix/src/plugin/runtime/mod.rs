@@ -44,9 +44,8 @@ pub(crate) use incremental::{
     ArcByteSource, FileBytesSha256, LiveBatchRowSource, SchemaAllowlist,
     ValidatedColumnMergeTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
     VecColumnMergeSource, VecRowChangeSource, VecRowSource, build_file_update_splices,
-    canonicalize_snapshot, certify_dense_fresh_file, drain_column_merge_transition_results,
-    drain_file_transition_changes, drain_row_transition_edits, host_row_change_with_lazy_snapshot,
-    host_row_with_lazy_snapshot, transport_splice_preserves_prefix_exclusion,
+    drain_column_merge_transition_results, drain_file_transition_changes,
+    drain_row_transition_edits, transport_splice_preserves_prefix_exclusion,
     transport_splice_preserves_utf8,
 };
 pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_archive_path};
@@ -60,7 +59,8 @@ pub(crate) use registry::{
     collect_gc_wasm_blob_roots, load_plugin_registry_at_commit,
 };
 pub(crate) use row_reconcile::{
-    ColumnMergeResult, ReconciledRow, RowVersionRef, primary_key_columns, reconcile_row,
+    ReconciledRow, ReconciledTypedRow, RowVersionRef, TypedColumnMergeResult, TypedRowVersionRef,
+    primary_key_columns, reconcile_row, reconcile_typed_row, visit_typed_row_overlaps,
 };
 #[cfg(test)]
 pub(crate) use storage::plugin_storage_archive_path;

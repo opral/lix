@@ -118,6 +118,7 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ),
     ("lib", "crate root"),
     ("module_layers", "this guard"),
+    ("migration", "offline repository format migration"),
     ("observe_coordinator", "not yet analysed"),
     ("observe_invalidation", "not yet analysed"),
     ("prepared_dml", "leaf utility, no layer semantics"),

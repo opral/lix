@@ -54,20 +54,19 @@ pub(crate) use tracked_head::{
     COMPACTED_TOMBSTONE_COMPACTED, COMPACTED_TOMBSTONE_OFFERED, COMPACTED_TOMBSTONE_ROUTES,
     HOT_SCAN_DECODED_ENTRIES, HOT_SCAN_MATCHED_ENTRIES, HOT_SCAN_TOMBSTONE_ENTRIES,
     INTERVAL_LOCAL_TOMBSTONE_CANDIDATES, INTERVAL_LOCAL_TOMBSTONE_ELIDED,
-    INTERVAL_LOCAL_TOMBSTONE_OFFERED, INTERVAL_LOCAL_TOMBSTONE_ROUTES,
+    INTERVAL_LOCAL_TOMBSTONE_OFFERED, INTERVAL_LOCAL_TOMBSTONE_ROUTES, encode_snapshot,
 };
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
     CERTIFIED_ROW_BATCH_MANIFEST_SPACE, CERTIFIED_ROW_BATCH_PAGE_SPACE, CERTIFIED_ROW_BATCH_SPACE,
     COLLECTION_CONTROL_SPACE, CertifiedCurrentStatePredecessor,
     CertifiedCurrentStatePredecessorRef, CertifiedRowBatchFileRef, ColumnarBaseCoordinate,
-    CompleteWorkingDiffMode, CurrentStateDeltaRef, DIFF_SPACE, DeferredFreshHotPlan,
-    DeferredFreshHotRowRef, DeferredFreshHotRows, FILE_SPACE, HotIndexEntry, HotIndexValue,
-    HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
-    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
-    ROW_SPACE, RowColumnarOverlayRow, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext,
-    TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
-    load_certified_rows_at_commit, materialize_certified_root_rows, scan_certified_history_rows,
+    CompleteWorkingDiffMode, CurrentStateDeltaRef, DIFF_SPACE, FILE_SPACE, HotIndexEntry,
+    HotIndexValue, HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE,
+    PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, ROW_SPACE, RowColumnarOverlayRow,
+    TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
+    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, decode_hot_row_key_for_migration,
     stage_certified_row_batches, stage_hot_index_entries, stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]

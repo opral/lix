@@ -54,13 +54,16 @@ impl VisibleFilesystem {
         let mut visible = Self::default();
 
         for row in rows.iter() {
-            let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
+            if row.deleted() {
+                continue;
+            }
+            let Some(snapshot) = row.snapshot_json_value()? else {
                 continue;
             };
             match row.schema_key() {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
                     let snapshot: DirectoryDescriptorSnapshot =
-                        serde_json::from_str(snapshot_content).map_err(|error| {
+                        serde_json::from_value(snapshot).map_err(|error| {
                             LixError::new(
                                 "LIX_ERROR_UNKNOWN",
                                 format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
@@ -74,7 +77,7 @@ impl VisibleFilesystem {
                         .insert(snapshot.id);
                 }
                 FILE_DESCRIPTOR_SCHEMA_KEY => {
-                    let snapshot: FileDescriptorSnapshot = serde_json::from_str(snapshot_content)
+                    let snapshot: FileDescriptorSnapshot = serde_json::from_value(snapshot)
                         .map_err(|error| {
                         LixError::new(
                             "LIX_ERROR_UNKNOWN",
@@ -92,7 +95,7 @@ impl VisibleFilesystem {
                         .insert(snapshot.id);
                 }
                 BLOB_REF_SCHEMA_KEY => {
-                    let snapshot: BlobRefSnapshot = serde_json::from_str(snapshot_content)
+                    let snapshot: BlobRefSnapshot = serde_json::from_value(snapshot)
                         .map_err(|error| {
                             LixError::new(
                                 "LIX_ERROR_UNKNOWN",
@@ -366,11 +369,11 @@ mod tests {
         )])
         .expect_err("invalid directory JSON should be rejected");
 
-        assert_eq!(error.code, LixError::CODE_UNKNOWN);
+        assert_eq!(error.code, LixError::CODE_STORAGE_ERROR);
         assert!(
             error
                 .message
-                .contains("invalid lix_directory_descriptor snapshot JSON")
+                .contains("live row 'lix_directory_descriptor' has invalid snapshot JSON")
         );
     }
 

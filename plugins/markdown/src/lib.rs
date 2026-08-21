@@ -1,4 +1,4 @@
-//! Markdown support for the row-first Component API v1.
+//! Markdown support for the row-first Component API v2.
 #![allow(dead_code)]
 
 extern crate alloc;
@@ -30,6 +30,7 @@ use core::{
 };
 use lix::plugin as sdk;
 use serde_json::Value;
+use std::sync::OnceLock;
 
 struct MarkdownPlugin;
 
@@ -51,14 +52,14 @@ fn cold_parse_changes(
     let accepted = update.before.read_all()?;
     let mut records = Vec::new();
     let rows = update
-        .rows
+        .typed_rows
         .as_mut()
-        .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable rows"))?;
+        .ok_or_else(|| sdk::Error::internal("cold parse_changes requires durable typed rows"))?;
     while let Some(row) = rows.next()? {
         records.push(RowRecord {
             schema_key: row.schema_key,
-            row_pk: row.row_pk,
-            snapshot: row.snapshot,
+            row_pk: markdown_row_pk(row.primary_key)?,
+            row: row.row,
         });
     }
     let (document, _) = Document::open_rows(records, Some(accepted)).map_err(core_error)?;
@@ -94,11 +95,11 @@ impl sdk::FileProjection for MarkdownPlugin {
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
-        while let Some(change) = update.row_changes.next()? {
+        while let Some(change) = update.typed_row_changes.next()? {
             changes.push(RowChange {
                 schema_key: change.schema_key,
-                row_pk: change.row_pk,
-                snapshot: change.snapshot,
+                row_pk: markdown_row_pk(change.primary_key)?,
+                row: change.row,
                 effect: match change.effect {
                     sdk::ChangeEffect::Content => ChangeEffect::Content,
                     sdk::ChangeEffect::FormatOnly => ChangeEffect::FormatOnly,
@@ -119,11 +120,11 @@ impl sdk::FileProjection for MarkdownPlugin {
         sink: &mut sdk::FileOutput<'_, '_>,
     ) -> sdk::Result<()> {
         let mut records = Vec::new();
-        while let Some(row) = input.rows.next()? {
+        while let Some(row) = input.typed_rows.next()? {
             records.push(RowRecord {
                 schema_key: row.schema_key,
-                row_pk: row.row_pk,
-                snapshot: row.snapshot,
+                row_pk: markdown_row_pk(row.primary_key)?,
+                row: row.row,
             });
         }
         let accepted = input
@@ -228,27 +229,20 @@ impl sdk::ColumnMerger for MarkdownPlugin {
         {
             return Ok(sdk::ColumnMergeResult::UseLww);
         }
-        let base = input.rows.base.read()?;
-        let a = input.rows.a.read()?;
-        let b = input.rows.b.read()?;
-        let Some(resolved) = Document::resolve_row_conflict(Some(base), Some(a), Some(b.clone()))
-        else {
+        let base = input.row_payloads.base.typed()?;
+        let a = input.row_payloads.a.typed()?;
+        let b = input.row_payloads.b.typed()?;
+        let Some(resolved) = Document::resolve_typed_row_payload(&base, &a, &b) else {
             return Ok(sdk::ColumnMergeResult::UseLww);
         };
-        if resolved == b {
+        let Some(sdk::TypedValue::Jsonb(b_payload)) = b.get("payload_json") else {
+            return Ok(sdk::ColumnMergeResult::UseLww);
+        };
+        if resolved == *b_payload {
             return Ok(sdk::ColumnMergeResult::UseLww);
         }
-        let row: Value = serde_json::from_slice(&resolved).map_err(|error| {
-            sdk::Error::invalid_input(format!("invalid merged Markdown row: {error}"))
-        })?;
-        let value = row.get("payload_json").ok_or_else(|| {
-            sdk::Error::invalid_input("merged Markdown row has no payload_json column")
-        })?;
-        let encoded = serde_json::to_vec(value).map_err(|error| {
-            sdk::Error::internal(format!("encode merged Markdown payload_json: {error}"))
-        })?;
         Ok(sdk::ColumnMergeResult::Replace(
-            sdk::OwnedColumnValue::json(encoded),
+            sdk::OwnedColumnValue::typed(&sdk::TypedValue::Jsonb(resolved.into()))?,
         ))
     }
 }
@@ -730,28 +724,12 @@ fn core_error(error: PluginError) -> sdk::Error {
 
 fn strip_duplicated_lexical_fallback(changes: &mut [RowChange]) -> sdk::Result<()> {
     for change in changes {
-        let Some(snapshot) = &mut change.snapshot else {
+        let Some(row) = &mut change.row else {
             continue;
         };
-        if !snapshot
-            .windows(LEXICAL_FALLBACK_FIELD.len())
-            .any(|window| window == LEXICAL_FALLBACK_FIELD.as_bytes())
-        {
-            continue;
-        }
-        let mut value: Value = serde_json::from_slice(snapshot).map_err(|error| {
-            sdk::Error::invalid_input(format!("invalid Markdown root snapshot: {error}"))
-        })?;
-        let Some(format_json) = value
-            .as_object_mut()
-            .and_then(|object| object.get_mut("format_json"))
-            .and_then(|value| value.as_str())
-        else {
+        let Some(sdk::TypedValue::Jsonb(format)) = row.get_mut("format_json") else {
             continue;
         };
-        let mut format: Value = serde_json::from_str(format_json).map_err(|error| {
-            sdk::Error::invalid_input(format!("invalid Markdown root format_json: {error}"))
-        })?;
         if format
             .as_object_mut()
             .and_then(|format| format.remove(LEXICAL_FALLBACK_FIELD))
@@ -763,18 +741,6 @@ fn strip_duplicated_lexical_fallback(changes: &mut [RowChange]) -> sdk::Result<(
             .as_object_mut()
             .expect("validated Markdown root format is an object")
             .insert(LEXICAL_SOURCE_REQUIRED_FIELD.to_owned(), Value::Bool(true));
-        value
-            .as_object_mut()
-            .expect("validated Markdown wire snapshot is an object")
-            .insert(
-                "format_json".to_owned(),
-                Value::String(serde_json::to_string(&format).map_err(|error| {
-                    sdk::Error::internal(format!("encode compact Markdown root format: {error}"))
-                })?),
-            );
-        *snapshot = serde_json::to_vec(&value).map_err(|error| {
-            sdk::Error::internal(format!("encode compact Markdown root snapshot: {error}"))
-        })?;
     }
     Ok(())
 }
@@ -786,23 +752,27 @@ fn emit_changes(
     sink: &mut impl MutationOutput,
 ) -> sdk::Result<()> {
     for change in changes {
-        match change.snapshot {
-            Some(snapshot) => {
+        match change.row {
+            Some(row) => {
                 let local_ref = change
                     .row_pk
                     .first()
                     .filter(|_| change.row_pk.len() == 1)
-                    .and_then(|id| local_ref(creates, id))
+                    .and_then(|id| local_ref(creates, *id))
                     .filter(|ordinal| {
                         create_from_ordinal.is_none_or(|minimum| *ordinal >= minimum)
                     });
                 if let Some(local_ref) = local_ref {
-                    sink.create(&change.schema_key, local_ref, &snapshot)?;
+                    sink.create(&change.schema_key, local_ref, &row)?;
                 } else {
                     sink.upsert(
                         &change.schema_key,
-                        &change.row_pk,
-                        &snapshot,
+                        change
+                            .row_pk
+                            .into_iter()
+                            .map(sdk::TypedValue::Uuid)
+                            .collect(),
+                        &row,
                         match change.effect {
                             ChangeEffect::Content => sdk::ChangeEffect::Content,
                             ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
@@ -810,7 +780,14 @@ fn emit_changes(
                     )?;
                 }
             }
-            None => sink.delete(&change.schema_key, &change.row_pk)?,
+            None => sink.delete(
+                &change.schema_key,
+                change
+                    .row_pk
+                    .into_iter()
+                    .map(sdk::TypedValue::Uuid)
+                    .collect(),
+            )?,
         }
     }
     Ok(())
@@ -838,43 +815,87 @@ impl_state_output!(sdk::FileOutput<'_, '_>);
 impl_state_output!(sdk::FileEditOutput<'_, '_>);
 
 trait MutationOutput {
-    fn create(&mut self, schema_key: &str, local_ref: u32, snapshot: &[u8]) -> sdk::Result<()>;
+    fn create(&mut self, schema_key: &str, local_ref: u32, row: &sdk::TypedRow) -> sdk::Result<()>;
     fn upsert(
         &mut self,
         schema_key: &str,
-        row_pk: &[String],
-        snapshot: &[u8],
+        row_pk: Vec<sdk::TypedValue>,
+        row: &sdk::TypedRow,
         effect: sdk::ChangeEffect,
     ) -> sdk::Result<()>;
-    fn delete(&mut self, schema_key: &str, row_pk: &[String]) -> sdk::Result<()>;
+    fn delete(&mut self, schema_key: &str, row_pk: Vec<sdk::TypedValue>) -> sdk::Result<()>;
 }
 impl MutationOutput for sdk::RowOutput<'_, '_> {
-    fn create(&mut self, s: &str, l: u32, v: &[u8]) -> sdk::Result<()> {
-        self.create(s, l, v)
+    fn create(&mut self, s: &str, l: u32, row: &sdk::TypedRow) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(s)?;
+        self.create(schema_key, fingerprint, l, row)
     }
-    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], _: sdk::ChangeEffect) -> sdk::Result<()> {
-        self.upsert(s, k, v)
+    fn upsert(
+        &mut self,
+        s: &str,
+        k: Vec<sdk::TypedValue>,
+        row: &sdk::TypedRow,
+        _: sdk::ChangeEffect,
+    ) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(s)?;
+        self.upsert(schema_key, fingerprint, k, row)
     }
-    fn delete(&mut self, _: &str, _: &[String]) -> sdk::Result<()> {
+    fn delete(&mut self, _: &str, _: Vec<sdk::TypedValue>) -> sdk::Result<()> {
         Err(sdk::Error::invalid_input(
             "initial Markdown parse produced a deletion",
         ))
     }
 }
 impl MutationOutput for sdk::RowChangeOutput<'_, '_> {
-    fn create(&mut self, s: &str, l: u32, v: &[u8]) -> sdk::Result<()> {
-        self.create(s, l, v)
+    fn create(&mut self, s: &str, l: u32, row: &sdk::TypedRow) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(s)?;
+        self.create(schema_key, fingerprint, l, row)
     }
-    fn upsert(&mut self, s: &str, k: &[String], v: &[u8], e: sdk::ChangeEffect) -> sdk::Result<()> {
-        self.upsert(s, k, v, e)
+    fn upsert(
+        &mut self,
+        s: &str,
+        k: Vec<sdk::TypedValue>,
+        row: &sdk::TypedRow,
+        e: sdk::ChangeEffect,
+    ) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(s)?;
+        self.upsert(schema_key, fingerprint, k, row, e)
     }
-    fn delete(&mut self, s: &str, k: &[String]) -> sdk::Result<()> {
-        self.delete(s, k)
+    fn delete(&mut self, s: &str, k: Vec<sdk::TypedValue>) -> sdk::Result<()> {
+        let (schema_key, fingerprint) = typed_schema(s)?;
+        self.delete(schema_key, fingerprint, k)
     }
 }
 
-fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
-    let id = uuid::Uuid::parse_str(id).ok()?;
+fn typed_schema(schema_key: &str) -> sdk::Result<(&'static str, [u8; 32])> {
+    static FINGERPRINT: OnceLock<[u8; 32]> = OnceLock::new();
+    if schema_key != NODE_SCHEMA_KEY {
+        return Err(sdk::Error::invalid_input(format!(
+            "Markdown plugin does not support schema '{schema_key}'"
+        )));
+    }
+    let schema_json = schemas::node_schema_json();
+    Ok((
+        NODE_SCHEMA_KEY,
+        *FINGERPRINT.get_or_init(|| {
+            sdk::schema_fingerprint(schema_json).expect("embedded Markdown schema must be valid")
+        }),
+    ))
+}
+
+fn markdown_row_pk(row_pk: Vec<sdk::TypedValue>) -> sdk::Result<Vec<uuid::Uuid>> {
+    row_pk
+        .into_iter()
+        .map(|value| match value {
+            sdk::TypedValue::Uuid(id) => Ok(id),
+            _ => Err(sdk::Error::invalid_input(
+                "Markdown row primary-key components must be UUID",
+            )),
+        })
+        .collect()
+}
+
+fn local_ref(creates: sdk::CreateContext, id: uuid::Uuid) -> Option<u32> {
     let bytes = id.as_bytes();
     if bytes[..12] != creates.namespace_bytes() {
         return None;
@@ -891,6 +912,16 @@ lix::plugin::export_capabilities! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_row_keys_remain_native_uuids() {
+        let id = uuid::Uuid::from_u128(42);
+        assert_eq!(
+            markdown_row_pk(vec![sdk::TypedValue::Uuid(id)]).expect("native Markdown key"),
+            vec![id]
+        );
+        assert!(markdown_row_pk(vec![sdk::TypedValue::Text(id.to_string())]).is_err());
+    }
 
     #[test]
     fn large_block_index_is_split_into_bounded_pages() {

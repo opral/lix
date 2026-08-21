@@ -1,9 +1,9 @@
 # Plugin API v1 scorecard
 
 > Historical design record, superseded by
-> [Universal plugin API v1 experiment](universal-plugin-api.md). The gates,
+> [Universal plugin API v2 contract](universal-plugin-api.md). The gates,
 > pending lanes, and decision figures below describe an earlier prototype and
-> are not acceptance evidence for the selected `lix:plugin@1.0.0` API.
+> are not acceptance evidence for the selected `lix:plugin@2.0.0` API.
 
 Measured on 2026-07-29 from `origin/main` at `57d619aad`. Release results are
 from a local Linux x86-64 build and are intended for relative design guidance,

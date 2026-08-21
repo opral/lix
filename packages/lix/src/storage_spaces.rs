@@ -37,14 +37,10 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::hot_state::FILE_SPACE,
     crate::hot_state::DIFF_SPACE,
     crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE,
-    crate::hot_state::CERTIFIED_ROW_BATCH_SPACE,
     crate::branch::BRANCH_HEAD_CONTROL_SPACE,
-    crate::hot_state::CERTIFIED_ROW_BATCH_MANIFEST_SPACE,
-    crate::hot_state::CERTIFIED_ROW_BATCH_PAGE_SPACE,
     crate::hot_state::COLLECTION_CONTROL_SPACE,
     crate::hot_state::PACKED_CURRENT_BASE_SPACE,
     crate::hot_state::PACKED_CURRENT_BASE_CONTROL_SPACE,
-    crate::transaction::PLUGIN_CHECKPOINT_SPACE,
     crate::hot_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
     crate::hot_state::ROOT_CURRENT_BASE_SPACE,
     crate::columnar_row_group::ROW_GROUP_MANIFEST_SPACE,
@@ -54,7 +50,6 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
     crate::tracked_state::TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
     crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-    crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
     crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
     crate::hot_state::INDEX_SPACE,
     crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
@@ -158,6 +153,14 @@ pub(crate) const RETIRED_STORAGE_SPACE_IDS: &[StorageSpaceId] = &[
     StorageSpaceId(0x0002_0002),
     // live_state.index.branch_root.v1
     StorageSpaceId(0x0004_0005),
+    // hot_state.certified_row_batch.v1
+    StorageSpaceId(0x0004_001f),
+    // hot_state.certified_row_batch_manifest.v2
+    StorageSpaceId(0x0004_0021),
+    // hot_state.certified_row_batch_page.v1
+    StorageSpaceId(0x0004_0022),
+    // plugin.current_checkpoint.v2
+    StorageSpaceId(0x0004_0026),
     // gc.reachability_delta.v1
     StorageSpaceId(0x0008_0003),
     // gc.reachability_queue.v1
