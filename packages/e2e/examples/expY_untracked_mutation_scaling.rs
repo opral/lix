@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Does one untracked mutation cost O(1) or O(total untracked rows)?
 //!
 //! `HotWriter::stage_untracked_generation` (`hot_state/tracked_head/hot.rs`)

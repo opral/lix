@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 // This parity test includes the benchmark-only fixture modules directly.
 // Most of their CRUD helpers are intentionally unused by this one focused
 // assertion.

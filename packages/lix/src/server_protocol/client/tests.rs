@@ -13,8 +13,8 @@ use crate::Value;
 use super::http::{
     ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse, ProtocolHttpStream, StreamCancel,
 };
-use super::wire::{SERVER_CLOSED_CODE, SESSION_GONE_CODE};
-use super::{open_protocol_client, ProtocolExecuteOptions};
+use super::wire::{SERVER_CLOSED_CODE, SERVER_PROTOCOL_VERSION, SESSION_GONE_CODE};
+use super::{ProtocolExecuteOptions, open_protocol_client};
 
 #[derive(Clone, Default)]
 struct ScriptHttp {
@@ -77,12 +77,7 @@ impl ProtocolHttp for ScriptHttp {
             .lock()
             .expect("script requests")
             .push(request.clone());
-        match self
-            .outcomes
-            .lock()
-            .expect("script outcomes")
-            .pop_front()
-        {
+        match self.outcomes.lock().expect("script outcomes").pop_front() {
             Some(ScriptOutcome::Json { status, body }) => Ok(ProtocolHttpResponse {
                 status,
                 headers: vec![("content-type".to_owned(), "application/json".to_owned())],
@@ -112,12 +107,7 @@ impl ProtocolHttp for ScriptHttp {
             .lock()
             .expect("script requests")
             .push(request.clone());
-        match self
-            .outcomes
-            .lock()
-            .expect("script outcomes")
-            .pop_front()
-        {
+        match self.outcomes.lock().expect("script outcomes").pop_front() {
             Some(ScriptOutcome::Stream {
                 status,
                 headers,
@@ -172,7 +162,7 @@ impl ProtocolHttp for ScriptHttp {
 
 fn handshake(session_id: &str, branch_id: &str) -> serde_json::Value {
     serde_json::json!({
-        "protocolVersion": 2,
+        "protocolVersion": SERVER_PROTOCOL_VERSION,
         "activeBranchId": branch_id,
         "activeAccountId": "00000000-0000-7000-8000-000000000002",
         "sessionId": session_id,
@@ -330,7 +320,9 @@ async fn open_handshake_can_pin_an_initial_branch() {
     client.close().await.expect("close");
     let handshake_url = &http.requests()[0].url;
     assert!(handshake_url.contains("/@acme/repository/lix/v1/"));
-    assert!(handshake_url.contains("activeBranchId=draft+%2F+one") || handshake_url.contains("draft"));
+    assert!(
+        handshake_url.contains("activeBranchId=draft+%2F+one") || handshake_url.contains("draft")
+    );
     assert!(http.requests()[0].header("Lix-Session-Id").is_none());
 }
 

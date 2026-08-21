@@ -187,7 +187,7 @@ fn multi_key_delete_uses_exact_contiguous_key_ranges() {
 }
 
 #[test]
-fn same_process_writes_are_serialized_across_reopened_handles() {
+fn same_process_write_staging_is_concurrent_across_reopened_handles() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
     let storage_a = RocksDB::open(&path).expect("open first storage");
@@ -195,30 +195,18 @@ fn same_process_writes_are_serialized_across_reopened_handles() {
     let write_a =
         block_on(storage_a.begin_write(WriteOptions::default())).expect("begin first write");
 
-    let (attempt_tx, attempt_rx) = mpsc::channel();
     let (acquired_tx, acquired_rx) = mpsc::channel();
     let waiter = std::thread::spawn(move || {
-        attempt_tx.send(()).expect("signal write attempt");
         let write_b =
             block_on(storage_b.begin_write(WriteOptions::default())).expect("begin second write");
         acquired_tx.send(()).expect("signal write acquired");
         block_on(write_b.rollback()).expect("rollback second write");
     });
 
-    attempt_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("second write should be attempted");
-    assert!(
-        acquired_rx
-            .recv_timeout(Duration::from_millis(100))
-            .is_err(),
-        "second write should wait while the first write is active"
-    );
-
-    block_on(write_a.rollback()).expect("rollback first write");
     acquired_rx
         .recv_timeout(Duration::from_secs(1))
-        .expect("second write should acquire after first write closes");
+        .expect("write staging should not hold the serialized commit lane");
+    block_on(write_a.rollback()).expect("rollback first write");
     waiter.join().expect("writer thread should finish");
 }
 

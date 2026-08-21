@@ -2,16 +2,13 @@ use std::ops::Bound;
 
 use bytes::Bytes;
 
-use crate::init::{
-    REPOSITORY_PROTOCOL_KEY, REPOSITORY_PROTOCOL_SPACE, REPOSITORY_PROTOCOL_VALUE,
-};
-use crate::storage_adapter::{
-    PutBatch, PutEntry, Storage, StorageKey as Key,
-    StorageError, StorageKeyRange as KeyRange, StoragePrecondition as Precondition, StorageSpace,
-    StorageValue as StoredValue, StorageWrite, StorageWriteOptions as WriteOptions, ValueIntegrity,
-    ValueSemantics,
-};
 use crate::LixError;
+use crate::init::{REPOSITORY_PROTOCOL_KEY, REPOSITORY_PROTOCOL_SPACE, REPOSITORY_PROTOCOL_VALUE};
+use crate::storage_adapter::{
+    PutBatch, PutEntry, Storage, StorageError, StorageKey as Key, StorageKeyRange as KeyRange,
+    StoragePrecondition as Precondition, StorageSpace, StorageValue as StoredValue, StorageWrite,
+    StorageWriteOptions as WriteOptions, ValueIntegrity, ValueSemantics,
+};
 
 /// Fully preflighted physical mutations. Construction stays private so the
 /// executor cannot publish a partially validated migration.
@@ -75,7 +72,9 @@ impl PublicationPlan {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), LixError> {
         if space.value_semantics != ValueSemantics::Mutable {
-            return Err(plan_error("mutable migration put targeted an immutable space"));
+            return Err(plan_error(
+                "mutable migration put targeted an immutable space",
+            ));
         }
         let batch = put_batch(entries)?;
         self.account(&batch)?;
@@ -127,12 +126,14 @@ impl Default for PublicationPlan {
     }
 }
 
-/// Publishes one already-complete v68→v69 plan in a single durable backend
+/// Publishes one already-complete migration plan in a single durable backend
 /// transaction. The marker precondition fences concurrent writers and the
 /// marker update shares the same atomic commit as every authority rewrite.
 pub(super) async fn publish<S>(
     storage: &S,
     expected_mutation_revision: Option<Bytes>,
+    expected_protocol_value: &'static [u8],
+    target_protocol_value: &'static [u8],
     plan: PublicationPlan,
 ) -> Result<(), LixError>
 where
@@ -140,7 +141,7 @@ where
 {
     let marker_batch = put_batch(vec![(
         REPOSITORY_PROTOCOL_KEY.to_vec(),
-        REPOSITORY_PROTOCOL_VALUE.to_vec(),
+        target_protocol_value.to_vec(),
     )])?;
     let mut write = storage
         .begin_write(WriteOptions {
@@ -149,7 +150,7 @@ where
                 Precondition::KeyValueEquals {
                     space: REPOSITORY_PROTOCOL_SPACE,
                     key: Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY)),
-                    expected: Bytes::from_static(b"tracked-default-branch.v68"),
+                    expected: Bytes::from_static(expected_protocol_value),
                 },
                 crate::storage_adapter::StorageAdapter::<S>::mutation_revision_precondition(
                     expected_mutation_revision,
@@ -162,14 +163,15 @@ where
 
     let stage_result: Result<(), StorageError> = async {
         for space in plan.cleared_spaces {
-            write.delete_range(
-                space,
-                KeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-            )
-            .await?;
+            write
+                .delete_range(
+                    space,
+                    KeyRange {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+                )
+                .await?;
         }
         for (space, entries) in plan.replacements {
             write.replace_many(space, entries).await?;
@@ -196,7 +198,9 @@ where
 fn put_batch(mut entries: Vec<(Vec<u8>, Vec<u8>)>) -> Result<PutBatch, LixError> {
     entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(plan_error("migration plan contains a duplicate physical key"));
+        return Err(plan_error(
+            "migration plan contains a duplicate physical key",
+        ));
     }
     Ok(PutBatch {
         entries: entries
@@ -217,12 +221,10 @@ fn plan_error(message: impl Into<String>) -> LixError {
 
 fn storage_error(error: StorageError) -> LixError {
     let code = match &error {
-        StorageError::CommitOutcomeUnknown(_) => {
-            "LIX_ERROR_MIGRATION_COMMIT_OUTCOME_UNKNOWN"
-        }
-        StorageError::PreconditionFailed(_) | StorageError::WriteConflict | StorageError::Fenced => {
-            "LIX_ERROR_MIGRATION_CONCURRENT_MUTATION"
-        }
+        StorageError::CommitOutcomeUnknown(_) => "LIX_ERROR_MIGRATION_COMMIT_OUTCOME_UNKNOWN",
+        StorageError::PreconditionFailed(_)
+        | StorageError::WriteConflict
+        | StorageError::Fenced => "LIX_ERROR_MIGRATION_CONCURRENT_MUTATION",
         _ => LixError::CODE_INTERNAL_ERROR,
     };
     LixError::new(code, format!("repository migration storage error: {error}"))
@@ -231,13 +233,13 @@ fn storage_error(error: StorageError) -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::init::CURRENT_FORMAT_VERSION;
     use crate::storage::{
         CoreProjection, GetManyRequest, GetOptions, Memory, ProjectedValue, ReadOptions,
         StorageRead,
     };
 
-    const IMMUTABLE: StorageSpace =
-        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE;
+    const IMMUTABLE: StorageSpace = crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE;
 
     #[tokio::test]
     async fn replaces_immutable_bytes_and_marker_atomically() {
@@ -262,14 +264,19 @@ mod tests {
         seed.commit().await.unwrap();
 
         let mut plan = PublicationPlan::default();
-        plan.replace_immutable(
-            IMMUTABLE,
-            vec![(b"same-key".to_vec(), b"v69".to_vec())],
-        )
-        .unwrap();
+        plan.replace_immutable(IMMUTABLE, vec![(b"same-key".to_vec(), b"v69".to_vec())])
+            .unwrap();
         let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
         let revision = adapter.load_mutation_revision().await.unwrap();
-        publish(&storage, revision, plan).await.unwrap();
+        publish(
+            &storage,
+            revision,
+            b"tracked-default-branch.v68",
+            REPOSITORY_PROTOCOL_VALUE,
+            plan,
+        )
+        .await
+        .unwrap();
 
         let read = storage.begin_read(ReadOptions::default()).await.unwrap();
         let immutable_keys = [Key(Bytes::from_static(b"same-key"))];
@@ -323,25 +330,29 @@ mod tests {
         let stale_revision = adapter.load_mutation_revision().await.unwrap();
 
         let mut concurrent = adapter.new_write_set();
-        concurrent.put(
-            REPOSITORY_PROTOCOL_SPACE,
-            &b"unrelated"[..],
-            &b"write"[..],
-        );
+        concurrent.put(REPOSITORY_PROTOCOL_SPACE, &b"unrelated"[..], &b"write"[..]);
         adapter
             .commit_write_set(concurrent, WriteOptions::default())
             .await
             .unwrap();
 
-        let error = publish(&storage, stale_revision, PublicationPlan::default())
-            .await
-            .expect_err("stale migration must be fenced");
+        let error = publish(
+            &storage,
+            stale_revision,
+            b"tracked-default-branch.v68",
+            REPOSITORY_PROTOCOL_VALUE,
+            PublicationPlan::default(),
+        )
+        .await
+        .expect_err("stale migration must be fenced");
         assert!(error.to_string().contains("precondition failed"));
         assert_eq!(
-            crate::migration::inspect_repository(&storage).await.unwrap(),
+            crate::migration::inspect_repository(&storage)
+                .await
+                .unwrap(),
             crate::migration::MigrationStatus::Required {
                 from_version: 68,
-                to_version: 69,
+                to_version: CURRENT_FORMAT_VERSION,
             }
         );
     }

@@ -47,9 +47,8 @@ pub(crate) use catalog::{
 pub(crate) use context::WriteContextLiveness;
 pub(crate) use context::{
     ChangelogQuerySource, DiffCommand, DiffCommandOutcome, HistoryQuerySource,
-    SqlChangelogQuerySource, SqlExecutionContext,
-    SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
-    WriteContextBranchRefReader, WriteContextHotStateReader,
+    SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource, SqlWriteContext,
+    SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader, WriteContextHotStateReader,
 };
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 #[cfg(feature = "storage-benches")]
@@ -69,8 +68,7 @@ pub(crate) use exec::{
     execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
     prepare_path_value_replacement_program, prepare_path_value_replacement_row,
     prepare_read_session, prepare_read_session_at_head, query_result_from_batches,
-    query_values_from_batches,
-    write_plan_requires_post_stage_returning_checkpoint,
+    query_values_from_batches, write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]
 pub(crate) use exec::{

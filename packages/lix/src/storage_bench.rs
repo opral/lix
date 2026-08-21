@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
@@ -9,6 +11,93 @@ use crate::storage_adapter::{
     StoragePrefix, StorageProjectedValue, StorageWriteOptions, StorageWriteSet,
     StorageWriteSetError,
 };
+
+/// Storage work performed by the task that publishes one checkpoint.
+///
+/// This is task-local so maintenance spawned by checkpoint publication is not
+/// charged to the foreground census. Adapter calls made before the spawned
+/// task boundary remain visible, including waits on adapter-owned resources.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointForegroundAccounting {
+    pub read_views: u64,
+    pub point_batches: u64,
+    pub point_keys: u64,
+    pub scan_starts: u64,
+    pub scan_pages: u64,
+    pub scan_rows: u64,
+    pub write_transactions: u64,
+    pub write_calls: u64,
+    pub written_records: u64,
+    pub written_bytes: u64,
+}
+
+tokio::task_local! {
+    static CHECKPOINT_FOREGROUND_ACCOUNTING: RefCell<CheckpointForegroundAccounting>;
+}
+
+/// Measures only storage work polled by `future`'s task.
+pub async fn measure_checkpoint_foreground<F>(
+    future: F,
+) -> (F::Output, CheckpointForegroundAccounting)
+where
+    F: Future,
+{
+    CHECKPOINT_FOREGROUND_ACCOUNTING
+        .scope(
+            RefCell::new(CheckpointForegroundAccounting::default()),
+            async {
+                let output = future.await;
+                let accounting = CHECKPOINT_FOREGROUND_ACCOUNTING.with(|cell| *cell.borrow());
+                (output, accounting)
+            },
+        )
+        .await
+}
+
+/// True only while the currently polled task is inside a foreground census.
+/// Global allocator probes use this to avoid charging unrelated maintenance
+/// tasks that happen to run on the same executor thread.
+pub fn checkpoint_foreground_is_active() -> bool {
+    CHECKPOINT_FOREGROUND_ACCOUNTING.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn record_checkpoint_read_view() {
+    let _ = CHECKPOINT_FOREGROUND_ACCOUNTING.try_with(|cell| {
+        cell.borrow_mut().read_views += 1;
+    });
+}
+
+pub(crate) fn record_checkpoint_point_read(batches: usize, keys: usize) {
+    let _ = CHECKPOINT_FOREGROUND_ACCOUNTING.try_with(|cell| {
+        let mut accounting = cell.borrow_mut();
+        accounting.point_batches += batches as u64;
+        accounting.point_keys += keys as u64;
+    });
+}
+
+pub(crate) fn record_checkpoint_scan_start() {
+    let _ = CHECKPOINT_FOREGROUND_ACCOUNTING.try_with(|cell| {
+        cell.borrow_mut().scan_starts += 1;
+    });
+}
+
+pub(crate) fn record_checkpoint_scan_page(rows: usize) {
+    let _ = CHECKPOINT_FOREGROUND_ACCOUNTING.try_with(|cell| {
+        let mut accounting = cell.borrow_mut();
+        accounting.scan_pages += 1;
+        accounting.scan_rows += rows as u64;
+    });
+}
+
+pub(crate) fn record_checkpoint_write(stats: crate::storage_adapter::StorageWriteSetStats) {
+    let _ = CHECKPOINT_FOREGROUND_ACCOUNTING.try_with(|cell| {
+        let mut accounting = cell.borrow_mut();
+        accounting.write_transactions += 1;
+        accounting.write_calls += stats.storage_calls;
+        accounting.written_records += stats.staged_puts + stats.staged_deletes;
+        accounting.written_bytes += stats.written_bytes;
+    });
+}
 
 fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
@@ -4019,6 +4108,10 @@ mod tests {
                 ), // mutation inventory authority
                 (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
                 (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
+                (
+                    crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE.id.0,
+                    10,
+                ), // unconditional canonical sync-state alias cleanup descriptors
             ]
         );
         assert_eq!(
@@ -4038,7 +4131,10 @@ mod tests {
         // constant rather than restating it.
         const FENCE_KEY_BYTES: usize =
             crate::storage_adapter::REVISION_KEY_BINARY_CAS_RECLAMATION.len();
-        assert_eq!(first.key_shared_buffers, first.staged_deletes as usize + 1);
+        // Batched checkpoint retirement keys share two packed backing buffers
+        // (working-diff rows and their marker) instead of retaining one buffer
+        // per delete. The remaining UUID deletes and reclamation fence each
+        // retain one fixed-size buffer.
         // Canonical-record deletes are UUID keyed. Checkpoint rotation also
         // retires the fixture's fixed-width working-diff identities and the
         // branch-ref marker through their authenticated physical encodings.
@@ -4048,6 +4144,7 @@ mod tests {
         let working_diff_deletes = 100;
         let marker_deletes = 1;
         let uuid_deletes = first.staged_deletes as usize - working_diff_deletes - marker_deletes;
+        assert_eq!(first.key_shared_buffers, uuid_deletes + 3);
         assert_eq!(
             first.key_shared_bytes,
             uuid_deletes * UUID_KEY_BYTES

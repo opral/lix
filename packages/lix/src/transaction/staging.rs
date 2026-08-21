@@ -772,7 +772,7 @@ impl OrderedMutationJournal {
         self.overlay_lifecycle_certificate
     }
 
-    fn into_prepared(
+    pub(crate) fn into_prepared(
         self,
         functions: &FunctionProviderHandle,
     ) -> Result<PreparedStateBatch, LixError> {

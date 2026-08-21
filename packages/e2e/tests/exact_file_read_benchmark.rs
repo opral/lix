@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Manual benchmark for warmed exact `lix_file` reads through the public session API.
 //!
 //! Run with:

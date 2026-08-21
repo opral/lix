@@ -1,4 +1,5 @@
 #![allow(clippy::large_futures)]
+#![recursion_limit = "256"]
 
 //! Two-phase populated tracked-working-diff benchmark for storage adapters.
 //!

@@ -1,4 +1,5 @@
 #![allow(clippy::large_futures)]
+#![recursion_limit = "256"]
 
 use std::fmt::{self, Display, Formatter};
 use std::hint::black_box;

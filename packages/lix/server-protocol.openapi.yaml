@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Lix Server Protocol
-  version: "2"
+  version: "3"
   description: Canonical HTTP surface implemented by lix::server_protocol.
 servers:
   - url: https://host.example/{repositoryPrefix}
@@ -474,7 +474,7 @@ components:
       type: object
       required: [protocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
-        protocolVersion: { type: integer, const: 2 }
+        protocolVersion: { type: integer, const: 3 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -574,8 +574,20 @@ components:
         createdAt: { type: string, minLength: 1 }
         selectedSourceCommitId:
           type: [string, "null"]
-          description: Exactly parentCommitIds[1] for a merge with selected members; null otherwise, including self-contained non-merge checkpoints. Physical storage aliases are not exposed.
+          description: Exactly parentCommitIds[1] for a merge with selected members; null otherwise.
+        stateAlias:
+          oneOf:
+            - { $ref: "#/components/schemas/SyncCommitStateAlias" }
+            - { type: "null" }
+          description: Authenticated complete-state source for a metadata-only checkpoint commit; omitted or null for ordinary and merge commits.
         members: { type: array, items: { $ref: "#/components/schemas/SyncCommitMember" } }
+    SyncCommitStateAlias:
+      type: object
+      additionalProperties: false
+      required: [sourceCommitId, stateRootId]
+      properties:
+        sourceCommitId: { type: string, minLength: 1 }
+        stateRootId: { type: string, pattern: "^[0-9a-f]{64}$" }
     SyncRefUpdate:
       type: object
       required: [branchId, expectedHeadCommitId, expectedCheckpointCommitId, headCommitId, checkpointCommitId]

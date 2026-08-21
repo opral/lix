@@ -112,3 +112,7 @@ is not implicit, so request it explicitly.
 These surfaces are read-only. Create a checkpoint for every working diff
 through `lix.createCheckpoint()`, or checkpoint a SQL-selected subset
 through `lix_create_checkpoint`. See [Diff commands](./diff-commands.md).
+
+The foreground publication path has fixed storage, allocation, payload, and
+latency regression gates. See the reproducible
+[checkpoint performance qualification](./checkpoint-performance.md).

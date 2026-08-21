@@ -24,9 +24,11 @@ use std::time::Duration;
 
 use crate::LixError;
 
-pub(crate) use commit::{SyncCommit, SyncCommitMemberRef, encode_sync_commit_member};
 #[cfg(feature = "server-protocol")]
 pub(crate) use blob::validate_sync_blob_manifest;
+pub(crate) use commit::{
+    SyncCommit, SyncCommitMemberRef, SyncCommitStateAlias, encode_sync_commit_member,
+};
 pub(crate) use contract::SyncTransport;
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]
@@ -42,10 +44,14 @@ pub(crate) use protocol::{
     SyncEvent, SyncHistoryBoundary, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
     SyncRepositoryPullResponse, SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
 };
+pub(crate) use commit::{
+    SYNC_MATERIALIZED_STATE_ALIAS_SPACE, stage_delete_materialized_sync_state_alias,
+};
 pub(crate) use repository::{
     SYNC_REPLICA_STATE_SPACE, SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE,
-    has_any_sync_replica_state, load_replayable_repository_event_commit_ids,
-    load_sync_replica_account, stage_repository_transaction_event,
+    has_any_sync_replica_state, load_pending_sync_export_commit_ids,
+    load_replayable_repository_event_commit_ids, load_sync_replica_account,
+    stage_repository_transaction_event,
     validate_repository_transaction_event_transfer,
 };
 pub(crate) use runtime::{

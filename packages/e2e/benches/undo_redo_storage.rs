@@ -1,4 +1,5 @@
 #![allow(clippy::large_futures)]
+#![recursion_limit = "256"]
 
 //! Destructive, real-backend undo/redo phase profiler.
 //!

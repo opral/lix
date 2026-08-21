@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Per-space physical growth across a real multi-commit history.
 //!
 //! `storage_layout` reports one snapshot of a fixture that some other tool

@@ -10,10 +10,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use crate::branch::{
-    BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability,
-    branch_head_control_precondition,
-};
+use crate::branch::{BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability};
 use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRoot, GcSweepSet};
 #[cfg(test)]
 use crate::changelog::{ChangeRecord, CommitScanRequest};
@@ -21,7 +18,9 @@ use crate::changelog::{ChangeRecord, CommitScanRequest};
 use crate::changelog::{ChangeScanRequest, ChangelogContext, ChangelogReader};
 use crate::commit_graph::CommitGraphContext;
 use crate::hot_state::TrackedHeadContext;
-use crate::hot_state::stage_collect_stale_working_diff_indexes;
+use crate::hot_state::{
+    stage_collect_stale_working_diff_indexes, stage_compact_checkpoint_tombstones,
+};
 use crate::json_store::{JsonRef, JsonStoreContext};
 #[cfg(test)]
 use crate::storage_adapter::StorageCoreProjection;
@@ -41,6 +40,10 @@ pub(crate) const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = StorageSpace::mut
 pub(crate) const CHECKPOINT_GC_STATE_NAMESPACE: &str = "checkpoint.gc_state.v1";
 pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_0002), CHECKPOINT_GC_STATE_NAMESPACE);
+pub(crate) const COMMIT_RETIREMENT_INTENT_SPACE: StorageSpace = StorageSpace::mutable(
+    StorageSpaceId(0x0008_0008),
+    "gc.commit_retirement_intent.v1",
+);
 const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
 const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 2;
 const CHECKPOINT_GC_STATE_KEY: &[u8] = b"repository";
@@ -573,15 +576,30 @@ pub(crate) async fn resolve_checkpoint_branch_parent(
 pub(crate) async fn load_checkpoint_gc_state(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<CheckpointGcState, LixError> {
-    let result = PointReadPlan::new(
-        CHECKPOINT_GC_STATE_SPACE,
-        &[StorageKey(Bytes::from_static(CHECKPOINT_GC_STATE_KEY))],
-    )
-    .materialize(store, StorageGetOptions::default())
-    .await?;
+    load_checkpoint_gc_state_with_precondition(store)
+        .await
+        .map(|(state, _)| state)
+}
+
+/// Loads the GC singleton together with an exact storage precondition for the
+/// observed value. Background maintenance uses this for read-modify-write so
+/// it cannot overwrite checkpoint debt published after its snapshot opened.
+pub(crate) async fn load_checkpoint_gc_state_with_precondition(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<(CheckpointGcState, StoragePrecondition), LixError> {
+    let key = StorageKey(Bytes::from_static(CHECKPOINT_GC_STATE_KEY));
+    let result = PointReadPlan::new(CHECKPOINT_GC_STATE_SPACE, std::slice::from_ref(&key))
+        .materialize(store, StorageGetOptions::default())
+        .await?;
     let Some(StorageProjectedValue::FullValue(bytes)) = result.value.into_iter().next().flatten()
     else {
-        return Ok(CheckpointGcState::default());
+        return Ok((
+            CheckpointGcState::default(),
+            StoragePrecondition::KeyAbsent {
+                space: CHECKPOINT_GC_STATE_SPACE,
+                key,
+            },
+        ));
     };
     let stored: StoredCheckpointGcState = storage_codec::decode("checkpoint GC state", &bytes)?;
     if stored.format_version != CHECKPOINT_GC_STATE_FORMAT_VERSION {
@@ -602,7 +620,14 @@ pub(crate) async fn load_checkpoint_gc_state(
         consecutive_reclaim_failures: stored.consecutive_reclaim_failures,
     };
     validate_checkpoint_gc_state(state)?;
-    Ok(state)
+    Ok((
+        state,
+        StoragePrecondition::KeyValueEquals {
+            space: CHECKPOINT_GC_STATE_SPACE,
+            key,
+            expected: bytes,
+        },
+    ))
 }
 
 fn validate_checkpoint_gc_state(state: CheckpointGcState) -> Result<(), LixError> {
@@ -665,6 +690,10 @@ pub(crate) struct RepositoryGcSweep {
     /// branch control selects any more.
     pub(crate) reclaimed_generation_rows: u64,
     pub(crate) binary_cas: crate::binary_cas::BinaryCasGcSweep,
+    /// More unreachable authority remained after this bounded maintenance
+    /// publication. The checkpoint debt must stay due until a later slice
+    /// observes and retires the remainder.
+    pub(crate) has_more: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -978,6 +1007,16 @@ where
             physical_authorities.insert(source);
             pending.push(source);
         }
+        if manifest
+            .snapshot_root
+            .as_ref()
+            .is_some_and(|root| root.complete_state_fence)
+            && let Some(owners) =
+                crate::tracked_state::complete_state_fence_change_owner_commit_ids(store, commit_id)
+                    .await?
+        {
+            physical_authorities.extend(owners);
+        }
         if let Some(root) = manifest.current_state_scoped_ranges.as_ref() {
             if let Some(base) = root.serving_base_commit_id {
                 physical_dependencies.insert(base);
@@ -1066,33 +1105,60 @@ where
     .await?;
     semantic_dependencies.extend(cas_logical_dependencies.iter().copied());
 
-    let selected_owner_sources = physical_authorities
-        .union(&physical_dependencies)
-        .copied()
-        .collect::<Vec<_>>();
-    let selected_owner_source_manifests =
-        crate::tracked_state::load_commit_state_manifests(store, &selected_owner_sources).await?;
-    for (commit_id, manifest) in selected_owner_sources
-        .iter()
-        .copied()
-        .zip(selected_owner_source_manifests)
-    {
-        let manifest = manifest.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "active GC dependency '{commit_id}' has no authenticated physical manifest"
-                ),
-            )
-        })?;
-        let may_contain_finite_selected_members =
-            manifest.mutations.may_contain_finite_selected_members();
-        manifests.insert(commit_id, manifest);
-        if may_contain_finite_selected_members {
-            physical_authorities.extend(
-                crate::tracked_state::load_local_selected_change_owner_commit_ids(store, commit_id)
+    // Complete-state fences and finite selected members can reveal another
+    // physical owner, whose own authority can reveal another owner in turn.
+    // Discover that closure to a fixed point. A one-shot snapshot of the set
+    // can retire payload owners reached through nested checkpoints.
+    let mut inspected_owner_sources = BTreeSet::new();
+    loop {
+        let selected_owner_sources = physical_authorities
+            .union(&physical_dependencies)
+            .filter(|commit_id| !inspected_owner_sources.contains(*commit_id))
+            .copied()
+            .collect::<Vec<_>>();
+        if selected_owner_sources.is_empty() {
+            break;
+        }
+        let selected_owner_source_manifests =
+            crate::tracked_state::load_commit_state_manifests(store, &selected_owner_sources)
+                .await?;
+        for (commit_id, manifest) in selected_owner_sources
+            .into_iter()
+            .zip(selected_owner_source_manifests)
+        {
+            let manifest = manifest.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "active GC dependency '{commit_id}' has no authenticated physical manifest"
+                    ),
+                )
+            })?;
+            let may_contain_finite_selected_members =
+                manifest.mutations.may_contain_finite_selected_members();
+            let complete_state_fence = manifest
+                .snapshot_root
+                .as_ref()
+                .is_some_and(|root| root.complete_state_fence);
+            manifests.insert(commit_id, manifest);
+            inspected_owner_sources.insert(commit_id);
+            if complete_state_fence
+                && let Some(owners) =
+                    crate::tracked_state::complete_state_fence_change_owner_commit_ids(
+                        store, commit_id,
+                    )
+                    .await?
+            {
+                physical_authorities.extend(owners);
+            }
+            if may_contain_finite_selected_members {
+                physical_authorities.extend(
+                    crate::tracked_state::load_local_selected_change_owner_commit_ids(
+                        store, commit_id,
+                    )
                     .await?,
-            );
+                );
+            }
         }
     }
 
@@ -1155,6 +1221,9 @@ where
     control_reachability
         .history_dependencies
         .extend(crate::sync::load_replayable_repository_event_commit_ids(store).await?);
+    control_reachability.history_dependencies.extend(
+        crate::sync::load_pending_sync_export_commit_ids(store, controls).await?,
+    );
     let mut chronology_roots = control_reachability.chronology_roots;
     chronology_roots.extend(
         load_recovery_refs(store)
@@ -1278,32 +1347,20 @@ pub(crate) async fn stage_repository_gc_with_preconditions<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
+    const MAX_SLICE_MUTATIONS: u64 = 4_000;
+    const MAX_SLICE_WRITTEN_BYTES: u64 = 3 * 1024 * 1024;
     let started = Instant::now();
-    let mut staged_preconditions = Vec::new();
+    let expected_mutation_revision =
+        crate::storage_adapter::load_repository_mutation_revision(&store).await?;
+    let mut staged_preconditions = vec![
+        crate::storage_adapter::repository_mutation_revision_precondition(
+            expected_mutation_revision,
+        ),
+    ];
     let controls = BranchHeadControlContext::new()
         .reader(store.clone())
         .scan()
         .await?;
-    let branch_ids = controls
-        .iter()
-        .map(|(branch_id, _)| branch_id.clone())
-        .collect::<Vec<_>>();
-    let observed_controls = BranchHeadControlContext::new()
-        .reader(store.clone())
-        .load_observed(&branch_ids)
-        .await?;
-    for ((branch_id, control), observed) in controls.iter().zip(observed_controls) {
-        if observed.control != Some(*control) {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                format!("branch '{branch_id}' changed while GC roots were being observed"),
-            ));
-        }
-        staged_preconditions.push(branch_head_control_precondition(
-            branch_id,
-            observed.raw_token,
-        )?);
-    }
     let AuthenticatedServingDependencyClosure {
         chronology_roots: active_roots,
         physical_authorities: active_authority_ids,
@@ -1361,50 +1418,87 @@ where
         crate::filesystem::collect_gc_binary_blob_roots(&store, &controls, &retained_cas_root_ids)
             .await?;
     blob_roots.extend(
-        crate::plugin::runtime::collect_gc_wasm_blob_roots(
-            &store,
-            &controls,
-            &active_roots,
-        )
-        .await?,
+        crate::plugin::runtime::collect_gc_wasm_blob_roots(&store, &controls, &active_roots)
+            .await?,
     );
-    let upload_chunks =
-        crate::session::stage_reclaimable_upload_receipts(&store, writes, &blob_roots).await?;
-    let binary_cas =
-        crate::binary_cas::stage_gc_reclamation(&store, writes, &blob_roots, &upload_chunks)
-            .await?;
-    crate::binary_cas::stage_cas_reclamation_fence(&store, writes, &mut staged_preconditions)
-        .await?;
-
-    // Retire the derived candidates. Nothing here is ordered and nothing is
-    // capped: a candidate that is still pinned holds back only itself, and the
-    // two planes prove retirement independently. The ledger could do neither —
+    // Retire the derived candidates in backend-admissible slices. A candidate
+    // that is still pinned holds back only itself, and a wide commit drains its
+    // owned locator rows before the compact authority deletion. The two planes
+    // prove retirement independently. The ledger could do neither —
     // it consumed a queue in publication order and stopped at the first blocked
     // row, so one permanently live root at the head froze every younger
     // candidate behind it forever.
     let mut reclaimed_commits = BTreeSet::new();
     let mut reclaimed_semantic_commits = BTreeSet::new();
+    let mut has_more = false;
     for commit_id in candidates {
+        let mut candidate_writes = StorageWriteSet::new();
         if retirement_is_proven(commit_id, &active_roots, &active_semantic_dependency_ids)
             && reclaimed_semantic_commits.insert(commit_id)
         {
-            crate::changelog::stage_delete_commit_projection(&store, writes, commit_id).await?;
-        }
-        if blocked_physical_dependency_ids.contains(&commit_id) {
-            continue;
-        }
-        if reclaimed_commits.insert(commit_id) {
-            crate::tracked_state::stage_retire_commit_physical_state(
+            crate::changelog::stage_delete_commit_projection(
                 &store,
-                writes,
+                &mut candidate_writes,
+                commit_id,
+            )
+            .await?;
+            crate::sync::stage_delete_materialized_sync_state_alias(
+                &mut candidate_writes,
+                commit_id,
+            );
+        }
+        let reclaims_physical = !blocked_physical_dependency_ids.contains(&commit_id);
+        let current = writes.stats();
+        let candidate_so_far = candidate_writes.stats();
+        let remaining_mutations = MAX_SLICE_MUTATIONS.saturating_sub(
+            current
+                .staged_puts
+                .saturating_add(current.staged_deletes)
+                .saturating_add(candidate_so_far.staged_puts)
+                .saturating_add(candidate_so_far.staged_deletes),
+        );
+        let mut physical_complete = true;
+        if reclaims_physical {
+            physical_complete = crate::tracked_state::stage_retire_commit_physical_state_bounded(
+                &store,
+                &mut candidate_writes,
                 commit_id,
                 RetainedPhysicalState {
                     mutation_nodes: &active_mutation_nodes,
                     scoped_nodes: &active_scoped_nodes,
                     native_parts: &active_current_parts,
                 },
+                Some(usize::try_from(remaining_mutations).unwrap_or(usize::MAX)),
             )
             .await?;
+        }
+        let current = writes.stats();
+        let candidate = candidate_writes.stats();
+        if current
+            .staged_puts
+            .saturating_add(current.staged_deletes)
+            .saturating_add(candidate.staged_puts)
+            .saturating_add(candidate.staged_deletes)
+            > MAX_SLICE_MUTATIONS
+            || current
+                .written_bytes
+                .saturating_add(candidate.written_bytes)
+                > MAX_SLICE_WRITTEN_BYTES
+        {
+            has_more = true;
+            reclaimed_semantic_commits.remove(&commit_id);
+            break;
+        }
+        writes.extend(candidate_writes);
+        if reclaims_physical && physical_complete {
+            reclaimed_commits.insert(commit_id);
+        }
+        if !physical_complete {
+            // Existing locator rows are a durable cursor for a wide commit:
+            // each pass removes a bounded prefix while retaining the immutable
+            // manifest and segments needed to enumerate the next prefix.
+            has_more = true;
+            break;
         }
     }
     if !reclaimed_semantic_commits.is_empty() {
@@ -1414,7 +1508,53 @@ where
     // Checkpoint publication rotates the authenticated sparse dirty-index
     // marker in O(1). Retire every now-unreachable epoch here, under the same
     // observed branch-control preconditions as the rest of repository GC.
-    stage_collect_stale_working_diff_indexes(&store, writes).await?;
+    let binary_cas = if has_more {
+        Default::default()
+    } else {
+        let mut auxiliary_writes = StorageWriteSet::new();
+        let mut auxiliary_preconditions = Vec::new();
+        let upload_chunks = crate::session::stage_reclaimable_upload_receipts(
+            &store,
+            &mut auxiliary_writes,
+            &blob_roots,
+        )
+        .await?;
+        let binary_cas = crate::binary_cas::stage_gc_reclamation(
+            &store,
+            &mut auxiliary_writes,
+            &blob_roots,
+            &upload_chunks,
+        )
+        .await?;
+        crate::binary_cas::stage_cas_reclamation_fence(
+            &store,
+            &mut auxiliary_writes,
+            &mut auxiliary_preconditions,
+        )
+        .await?;
+        let tombstones_have_more =
+            stage_compact_checkpoint_tombstones(&store, &mut auxiliary_writes, &controls).await?;
+        stage_collect_stale_working_diff_indexes(&store, &mut auxiliary_writes).await?;
+        let current = writes.stats();
+        let remaining_mutations = MAX_SLICE_MUTATIONS
+            .saturating_sub(current.staged_puts.saturating_add(current.staged_deletes));
+        let remaining_bytes = MAX_SLICE_WRITTEN_BYTES.saturating_sub(current.written_bytes);
+        let (auxiliary_slice, auxiliary_has_more) =
+            auxiliary_writes.into_bounded_maintenance_slice(remaining_mutations, remaining_bytes);
+        if auxiliary_slice.is_empty() && !auxiliary_preconditions.is_empty() {
+            has_more = true;
+            Default::default()
+        } else {
+            writes.extend(auxiliary_slice);
+            staged_preconditions.extend(auxiliary_preconditions);
+            has_more |= auxiliary_has_more || tombstones_have_more;
+            if auxiliary_has_more || tombstones_have_more {
+                Default::default()
+            } else {
+                binary_cas
+            }
+        }
+    };
 
     preconditions.extend(staged_preconditions);
     Ok(RepositoryGcPlan {
@@ -1445,6 +1585,7 @@ where
             standalone_changes: Vec::new(),
             reclaimed_generation_rows: 0,
             binary_cas,
+            has_more,
         },
         profile: RepositoryGcProfile {
             history_manifests_missing,
@@ -1524,6 +1665,7 @@ where
             standalone_changes: Vec::new(),
             reclaimed_generation_rows: 0,
             binary_cas: Default::default(),
+            has_more: false,
         },
         profile: RepositoryGcProfile {
             // The recovery-only rebuild path rediscovers liveness by scanning;
@@ -4007,6 +4149,88 @@ mod tests {
             .await
             .expect_err("a recovery ref no live control still serves is not a branchable root");
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn repository_gc_makes_bounded_progress_across_an_oversized_retirement_set() {
+        let backend = Memory::new();
+        let storage = StorageAdapter::new(backend.clone());
+        Engine::initialize(backend.clone()).await.unwrap();
+        let timestamp = LixTimestamp::expect_parse("bounded GC timestamp", "2026-01-01T00:00:00Z");
+        // Seed unreachable authority directly so checkpoint-triggered
+        // background GC cannot race this deterministic slicer test. Each
+        // candidate contributes semantic and split-manifest point deletes;
+        // 2,500 candidates therefore exceed the real 4,000-mutation cap.
+        for batch in 0..5 {
+            let records = (0..500)
+                .map(|index| {
+                    replay_commit_record(&format!("bounded-gc-{batch}-{index}"), 0, None, timestamp)
+                })
+                .collect::<Vec<_>>();
+            let manifests = records
+                .iter()
+                .map(|record| {
+                    test_commit_state_manifest(record, CommitStateMutationInventory::default())
+                })
+                .collect::<Vec<_>>();
+            persist_replay_closure_fixture(&storage, storage.new_write_set(), &records, &manifests)
+                .await;
+        }
+
+        let mut reclaimed = 0usize;
+        let mut observed_partial = false;
+        let mut completed = false;
+        for _ in 0..32 {
+            let read = SharedStorageAdapterRead::new(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .unwrap(),
+            );
+            let mut writes = storage.new_write_set();
+            let mut preconditions = Vec::new();
+            let plan = super::stage_repository_gc_with_preconditions(
+                read,
+                &mut writes,
+                &mut preconditions,
+            )
+            .await
+            .unwrap();
+            let stats = writes.stats();
+            assert!(
+                stats.staged_puts.saturating_add(stats.staged_deletes) <= 4_000,
+                "every maintenance slice must remain below adapter admission"
+            );
+            reclaimed = reclaimed.saturating_add(plan.sweep.tracked_commit_roots.len());
+            storage
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        background_maintenance: true,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            observed_partial |= plan.sweep.has_more;
+            if !plan.sweep.has_more {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            observed_partial,
+            "fixture must cross the maintenance hard cut"
+        );
+        assert!(
+            completed,
+            "bounded slices must eventually drain all GC debt"
+        );
+        assert!(
+            reclaimed >= 2_400,
+            "the fixture must reclaim real commit debt"
+        );
     }
 
     /// Undo-to-last-checkpoint must survive reclaim at any cadence.

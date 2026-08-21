@@ -2183,11 +2183,15 @@ fn packed_exact_keys_for_filter(filter: &TrackedStateFilter) -> Option<Vec<Track
 /// interval, so its rows were absent when that checkpoint was taken.
 fn packed_current_base_working_diff_baseline(
     active_checkpoint_commit_id: Option<CommitId>,
+    base_checkpoint_commit_id: Option<CommitId>,
 ) -> PackedWorkingDiffBaseline {
     match active_checkpoint_commit_id {
-        Some(checkpoint_commit_id) => PackedWorkingDiffBaseline::AbsentAtCheckpoint {
-            checkpoint_commit_id,
-        },
+        Some(checkpoint_commit_id) if base_checkpoint_commit_id == Some(checkpoint_commit_id) => {
+            PackedWorkingDiffBaseline::AbsentAtCheckpoint {
+                checkpoint_commit_id,
+            }
+        }
+        Some(_) => PackedWorkingDiffBaseline::CleanAtCheckpoint,
         None => PackedWorkingDiffBaseline::Disabled,
     }
 }
@@ -3131,7 +3135,8 @@ async fn load_packed_current_base_exact(
     let mut slots = Vec::with_capacity(keys.len());
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
     for (key, entry) in keys.iter().zip(winners) {
-        let Some((value, mut change_record, base_coordinate)) = entry else {
+        let Some((value, mut change_record, base_coordinate, base_checkpoint_commit_id)) = entry
+        else {
             slots.push(None);
             continue;
         };
@@ -3170,6 +3175,7 @@ async fn load_packed_current_base_exact(
             updated_at: value.updated_at,
             working_diff_baseline: packed_current_base_working_diff_baseline(
                 active_checkpoint_commit_id,
+                base_checkpoint_commit_id,
             ),
             columnar_base_coordinate,
         });
@@ -3244,6 +3250,7 @@ async fn load_packed_current_base_exact_entries(
             crate::tracked_state::TrackedStateIndexValue,
             crate::changelog::ChangeRecord,
             Option<crate::tracked_state::TrackedStateBaseCoordinate>,
+            Option<CommitId>,
         )>,
     >,
     LixError,
@@ -3339,6 +3346,7 @@ async fn load_packed_current_base_exact_entries_from_refs(
             crate::tracked_state::TrackedStateIndexValue,
             crate::changelog::ChangeRecord,
             Option<crate::tracked_state::TrackedStateBaseCoordinate>,
+            Option<CommitId>,
         )>,
     >,
     LixError,
@@ -3354,7 +3362,14 @@ async fn load_packed_current_base_exact_entries_from_refs(
             .await?
             .into_iter()
             .map(|entry| {
-                entry.map(|entry| (entry.value, entry.change_record, entry.base_coordinate))
+                entry.map(|entry| {
+                    (
+                        entry.value,
+                        entry.change_record,
+                        entry.base_coordinate,
+                        base_ref.checkpoint_commit_id,
+                    )
+                })
             })
             .collect(),
         );
@@ -3382,21 +3397,23 @@ async fn load_packed_current_base_exact_entries_from_refs(
             crate::tracked_state::TrackedStateIndexValue,
             crate::changelog::ChangeRecord,
             Option<crate::tracked_state::TrackedStateBaseCoordinate>,
+            Option<CommitId>,
         )>,
     >>();
-    for entries in loaded.chunks(keys.len()) {
+    for (base_ref, entries) in base_refs.iter().zip(loaded.chunks(keys.len())) {
         for (slot, entry) in winners.iter_mut().zip(entries) {
             let Some(entry) = entry else {
                 continue;
             };
             if slot
                 .as_ref()
-                .is_none_or(|(previous, _, _)| previous.commit_id < entry.value.commit_id)
+                .is_none_or(|(previous, _, _, _)| previous.commit_id < entry.value.commit_id)
             {
                 *slot = Some((
                     entry.value.clone(),
                     entry.change_record.clone(),
                     entry.base_coordinate,
+                    base_ref.checkpoint_commit_id,
                 ));
             }
         }
@@ -4637,6 +4654,45 @@ where
         Ok(Some((base_ref.commit_id, collection.live_count)))
     }
 
+    pub(crate) async fn scan_tracked_tombstones_for_control(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
+        let filter = TrackedStateFilter {
+            include_tombstones: true,
+            ..TrackedStateFilter::default()
+        };
+        let HotScanEntries::Decoded(entries) = hot_scan_entries(
+            &self.store,
+            branch_id,
+            control.tracked_generation,
+            &filter,
+            None,
+            None,
+        )
+        .await?
+        .expect("unbounded HOT scan cannot exhaust a byte budget") else {
+            unreachable!("an unconstrained HOT scan cannot select the finite point-read route");
+        };
+        let mut tombstones = Vec::new();
+        for (identity, bytes) in entries {
+            let value = decode_head_value(&bytes)?;
+            if value.deleted && !value.untracked {
+                tombstones.push((identity, bytes));
+            }
+        }
+        Ok(materialize_live_entries(
+            &self.store,
+            tombstones,
+            ChangeRecordProjection::identity_only(),
+            branch_id,
+            control.working_diff_checkpoint_commit_id,
+        )
+        .await?
+        .into_rows())
+    }
+
     #[cfg(test)]
     pub(crate) async fn scan_live_rows_if_current(
         &self,
@@ -5362,6 +5418,30 @@ impl<S> HotStateWriter<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    /// Returns the checkpoint tombstones that can actually be removed under
+    /// the current serving-base and cross-branch safety gates.
+    ///
+    /// Background GC uses this before pagination so permanently blocked rows
+    /// do not occupy the first page forever.
+    pub(crate) async fn checkpoint_tombstone_compaction_mask(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+    ) -> Result<Vec<bool>, LixError> {
+        let refs = deltas.iter().collect::<Vec<_>>();
+        hot_compaction_mask(
+            self.store,
+            branch_id,
+            generation,
+            &refs,
+            None,
+            HotTombstoneMaskKind::Checkpoint,
+            self.transaction_global_schema_keys,
+        )
+        .await
+    }
+
     /// Publishes an immutable tracked root as the baseline of a new sparse
     /// branch generation. The root is already authoritative for every tracked
     /// identity at `head_commit_id`; later branch-local HOT rows shadow it.
@@ -5638,12 +5718,18 @@ where
                         "exclusive-schema index references an inactive packed current base",
                     )
                 })?;
-                if full_value_bytes(value)?.as_ref() != expected_checkpoint {
+                let base_checkpoint = full_value_bytes(value)?;
+                let base_is_dirty_in_active_epoch = base_checkpoint.as_ref() == expected_checkpoint;
+                if working_diff_capture_checkpoint_commit_id.is_none()
+                    && !base_is_dirty_in_active_epoch
+                {
                     return Err(head_value_error(
                         "packed collection replacement has a different working-diff owner",
                     ));
                 }
-                if working_diff_capture_checkpoint_commit_id.is_some() {
+                if working_diff_capture_checkpoint_commit_id.is_some()
+                    && base_is_dirty_in_active_epoch
+                {
                     coverage
                         .remove_encoded_group_key(&base_key.0)
                         .ok_or_else(|| {
@@ -6503,21 +6589,15 @@ where
     /// Whether a checkpoint can rotate its working-diff epoch without
     /// materializing current-state base rows first.
     ///
-    /// Immutable packed bases encode interval-relative absent-at-checkpoint
-    /// facts and must take the existing materializing route once. Root bases
-    /// are already the branch's checkpoint state and remain clean under a new
-    /// epoch, so they do not prevent lazy rotation.
+    /// Packed-base refs retain the checkpoint epoch in which they were
+    /// published. Readers reinterpret a base as clean when the active epoch
+    /// advances, so rotating the epoch neither scans nor retires those refs.
+    /// Root bases are already checkpoint state and need no rewrite either.
     pub(crate) async fn can_rotate_checkpoint_epoch(
         &self,
-        branch_id: &str,
-        generation: CommitId,
+        _branch_id: &str,
+        _generation: CommitId,
     ) -> Result<bool, LixError> {
-        if !packed_current_base_refs(self.store, branch_id, generation)
-            .await?
-            .is_empty()
-        {
-            return Ok(false);
-        }
         Ok(true)
     }
 
@@ -6778,7 +6858,9 @@ where
         for (index, packed_previous) in packed_previous_indices.iter().copied().zip(packed_previous)
         {
             let previous = &mut previous_values[index];
-            let Some((packed_value, _, base_coordinate)) = &packed_previous else {
+            let Some((packed_value, _, base_coordinate, base_checkpoint_commit_id)) =
+                &packed_previous
+            else {
                 continue;
             };
             let packed_is_newer = match (
@@ -6806,6 +6888,7 @@ where
                 updated_at: packed_value.updated_at,
                 working_diff_baseline: packed_current_base_working_diff_baseline(
                     working_diff_capture_checkpoint_commit_id,
+                    *base_checkpoint_commit_id,
                 ),
                 columnar_base_coordinate: base_coordinate.map(|coordinate| {
                     ColumnarBaseCoordinate {
@@ -7111,6 +7194,7 @@ where
             {
                 let identical_immutable_change = !previous_from_packed
                     && !delta.untracked
+                    && !delta.deleted
                     && delta.schema_key
                         != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
                     && previous
@@ -13668,7 +13752,7 @@ mod tests {
             admitted_read_counts,
             "a transaction snapshot must reuse an admitted packed segment by immutable address"
         );
-        let (_, change, _) = entries[0].as_ref().expect("packed predecessor exists");
+        let (_, change, _, _) = entries[0].as_ref().expect("packed predecessor exists");
         assert!(
             change.snapshot.is_some(),
             "mutation lookup must retain the native typed payload"

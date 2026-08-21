@@ -479,12 +479,8 @@ where
                                         .await
                                     }
                                     SyncDemandRequest::Chunks(ids) => {
-                                        hydrate_chunk_ids(
-                                            &lix,
-                                            current,
-                                            ids.into_iter().collect(),
-                                        )
-                                        .await
+                                        hydrate_chunk_ids(&lix, current, ids.into_iter().collect())
+                                            .await
                                     }
                                 }
                             }
@@ -1165,15 +1161,12 @@ where
         if inline_blob_ids.contains(blob_id.as_str()) {
             continue;
         }
-        let manifest = lix
-            .get_sync_blob_manifest(&blob_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("local push references missing sync blob '{blob_id}'"),
-                )
-            })?;
+        let manifest = lix.get_sync_blob_manifest(&blob_id).await?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("local push references missing sync blob '{blob_id}'"),
+            )
+        })?;
         let mut registration = transport.register_blob(&manifest).await?;
         for chunk_id in registration
             .missing_chunk_ids
@@ -1242,7 +1235,12 @@ where
     let mut inline_blob_ids = BTreeSet::new();
     for event in events {
         blob_ids.extend(super::repository::sync_commit_blob_ids(&event.commits)?);
-        inline_blob_ids.extend(event.inline_blobs.iter().map(|manifest| manifest.blob_id.clone()));
+        inline_blob_ids.extend(
+            event
+                .inline_blobs
+                .iter()
+                .map(|manifest| manifest.blob_id.clone()),
+        );
     }
     blob_ids.retain(|blob_id| !inline_blob_ids.contains(blob_id));
     ensure_blob_manifests(lix, transport, blob_ids).await?;
@@ -1698,6 +1696,7 @@ mod tests {
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             selected_source_commit_id: None,
+            state_alias: None,
             members: vec![super::super::commit::SyncCommitMember {
                 change_id: crate::changelog::ChangeId::for_test_label("runtime-inline-change")
                     .to_string(),
@@ -1730,9 +1729,8 @@ mod tests {
                     size_bytes: chunk.size_bytes,
                 })
                 .collect(),
-            inline_bytes_base64: inline.then(|| {
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            }),
+            inline_bytes_base64: inline
+                .then(|| base64::engine::general_purpose::STANDARD.encode(bytes)),
         }
     }
 
@@ -1832,7 +1830,10 @@ mod tests {
         )
         .await
         .expect("large blob retains manifest fetch lane");
-        assert_eq!(large_get_calls.lock().expect("large get calls lock").len(), 1);
+        assert_eq!(
+            large_get_calls.lock().expect("large get calls lock").len(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Crash-consistency qualification: kill a real writer process with SIGKILL at
 //! every point of the publication window, then reopen the store in a fresh
 //! process and prove the invariants still hold.

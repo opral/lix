@@ -64,7 +64,9 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
     .await
     .expect("register census schema");
 
-    for chunk in (0..ROWS).collect::<Vec<_>>().chunks(1_000) {
+    // Stay below the per-transaction packed-base admission threshold so the
+    // measured read remains a full hot-state prefix scan.
+    for chunk in (0..ROWS).collect::<Vec<_>>().chunks(256) {
         let mut sql = format!("INSERT INTO {SCHEMA_KEY} (id, ordinal) VALUES ");
         let mut params = Vec::new();
         for (offset, ordinal) in chunk.iter().enumerate() {
@@ -82,11 +84,10 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
             "a seed statement that affects no rows produces the same zero counters as a route that never ran"
         );
     }
-    lix.create_checkpoint()
-        .await
-        .expect("drive the census fixture to packed-base steady state");
-
-    // Discard everything the seed and the checkpoint scanned.
+    // Keep the fixture on the explicit hot-scan route. O(1) checkpoints no
+    // longer materialize a packed base, so checkpointing here would make the
+    // query bypass the per-row key scan this census is designed to measure.
+    // Discard everything the seed scanned.
     let _ = take_scan_key_buffer_census();
     let _ = take_hot_scan_refcount_census();
 
@@ -102,29 +103,28 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
 
     let (allocations, allocated_bytes) = take_scan_key_buffer_census();
     let (rows_decoded, ..) = take_hot_scan_refcount_census();
-
-    // A zero here is indistinguishable from a census that never fired.
     assert!(
         rows_decoded >= ROWS as u64,
-        "hot scan decoded {rows_decoded} rows for a {ROWS}-row answer; the scan route was not taken"
+        "hot scan decoded {rows_decoded} rows for a {ROWS}-row answer; the measured route was not taken"
     );
+    let census_rows = rows_decoded;
     assert!(
         allocations > 0,
         "no key buffer allocation was recorded, and the census is compiled in, so the RocksDB \
          scan source genuinely did not serve this scan"
     );
 
-    let per_row = allocations as f64 / rows_decoded as f64;
+    let per_row = allocations as f64 / census_rows as f64;
     println!(
-        "SCAN_KEY_BUFFER_CENSUS rows_decoded={rows_decoded} allocations={allocations} \
+        "SCAN_KEY_BUFFER_CENSUS rows_decoded={rows_decoded} census_rows={census_rows} allocations={allocations} \
          ({per_row:.5}/row) allocated_bytes={allocated_bytes} \
          bytes_per_row={:.1}",
-        allocated_bytes as f64 / rows_decoded as f64
+        allocated_bytes as f64 / census_rows as f64
     );
 
     assert!(
         per_row <= MAX_ALLOCATIONS_PER_ROW,
-        "scan allocated {allocations} key buffers for {rows_decoded} decoded rows \
+        "scan allocated {allocations} key buffers for {census_rows} result rows \
          ({per_row:.5}/row, ceiling {MAX_ALLOCATIONS_PER_ROW:.5}/row); \
          a per-row key copy scores 1.00000"
     );

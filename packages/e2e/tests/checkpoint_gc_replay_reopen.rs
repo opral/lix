@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::future::Future;
 use std::path::Path;
 use std::time::Duration;

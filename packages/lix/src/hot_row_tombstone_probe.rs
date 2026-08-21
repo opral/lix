@@ -215,7 +215,7 @@ async fn working_diff_rows(session: &SessionContext<Memory>, schema_key: &str) -
 
 /// Plans and commits a repository GC sweep against the same physical store the
 /// session writes through.
-async fn run_repository_gc(storage: &Memory) {
+async fn run_repository_gc(storage: &Memory) -> bool {
     let adapter = StorageAdapter::new(storage.clone());
     let read = SharedStorageAdapterRead::new(
         adapter
@@ -224,13 +224,23 @@ async fn run_repository_gc(storage: &Memory) {
             .expect("gc read"),
     );
     let mut gc_writes = adapter.new_write_set();
-    crate::gc::stage_repository_gc(read, &mut gc_writes)
+    let plan = crate::gc::stage_repository_gc(read, &mut gc_writes)
         .await
         .expect("repository gc should plan");
     adapter
         .commit_write_set(gc_writes, StorageWriteOptions::default())
         .await
         .expect("gc write set should commit");
+    plan.sweep.has_more
+}
+
+async fn drain_repository_gc(storage: &Memory) {
+    for _ in 0..32 {
+        if !run_repository_gc(storage).await {
+            return;
+        }
+    }
+    panic!("bounded repository maintenance did not drain within 32 slices");
 }
 
 fn probe_schema(key: &str) -> serde_json::Value {
@@ -435,7 +445,7 @@ async fn hot_row_tombstone_reclamation_events() {
     report("after_checkpoint", census, scan);
 
     // (c) repository GC.
-    run_repository_gc(&storage).await;
+    drain_repository_gc(&storage).await;
     let census = row_census(&storage).await;
     let scan = timed_scan(&session, &scan_sql("evtrow"), 1, reps).await;
     report("after_gc", census, scan);
@@ -1512,7 +1522,7 @@ async fn broad_canonical_created_at_recovery_misses_for_new_identities() {
 ///
 /// Process-global by construction, so only *deltas* and only *thresholds*
 /// scaled to a fixture no concurrent test can reach are meaningful here.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct CompactionCounters {
     /// Publications that reached the mask at all.
     routes: u64,
@@ -1556,18 +1566,17 @@ impl std::fmt::Display for CompactionCounters {
     }
 }
 
-/// PHASE 10 — the landed engine change: a checkpoint reclaims the tombstones
-/// it has just discharged.
+/// PHASE 10 — checkpoint publication discharges tombstones in O(1), and
+/// repository maintenance reclaims them afterward.
 ///
 /// Numbered 10 because phases 1–7 are shared, 8 is #1427's allocation census
 /// and 9 is the canonical `created_at` recovery that #1432 landed.
 ///
 /// Phase 4 proved the *premise* by removing tombstones behind the engine's
-/// back. This phase asserts the engine now does it itself, at the checkpoint,
-/// through `hot_compaction_mask`. Both the hit and the refusal are asserted in
-/// non-`#[ignore]`d tests, because a design whose every gate is conservative
-/// fails silently inert, and a row-count instrument one layer up cannot tell
-/// "reclaimed nothing here" from "never ran".
+/// back. This phase asserts that the foreground checkpoint does not enter the
+/// scale-dependent route, then that repository GC does. Both halves are
+/// explicit because a flat row count cannot distinguish deferred work from an
+/// inert compactor.
 #[tokio::test]
 async fn checkpoint_compacts_discharged_branch_tombstones() {
     const N: usize = 300;
@@ -1600,11 +1609,26 @@ async fn checkpoint_compacts_discharged_branch_tombstones() {
         .create_checkpoint()
         .await
         .expect("checkpoint should publish");
-    let counters = compaction_counters().since(counters_before);
+    let foreground_counters = compaction_counters().since(counters_before);
+    let after_checkpoint = row_census(&storage).await;
+
+    assert_eq!(
+        foreground_counters,
+        CompactionCounters::default(),
+        "foreground checkpoint publication must not enter tombstone compaction"
+    );
+    assert_eq!(
+        after_checkpoint.tombstones, before.tombstones,
+        "foreground checkpoint publication must leave physical retirement to maintenance"
+    );
+
+    let gc_counters_before = compaction_counters();
+    drain_repository_gc(&storage).await;
+    let counters = compaction_counters().since(gc_counters_before);
     let after = row_census(&storage).await;
 
     println!(
-        "phase10 | compaction entries {}->{} tombstones {}->{} {counters}",
+        "phase10 | background compaction entries {}->{} tombstones {}->{} {counters}",
         before.entries, after.entries, before.tombstones, after.tombstones
     );
 
@@ -1701,7 +1725,16 @@ async fn recreated_identity_inherits_created_at_after_engine_compaction() {
         .create_checkpoint()
         .await
         .expect("checkpoint should publish");
-    let counters = compaction_counters().since(counters_before);
+    let foreground_counters = compaction_counters().since(counters_before);
+    assert_eq!(
+        foreground_counters,
+        CompactionCounters::default(),
+        "foreground checkpoint publication must not enter tombstone compaction"
+    );
+
+    let gc_counters_before = compaction_counters();
+    run_repository_gc(&storage).await;
+    let counters = compaction_counters().since(gc_counters_before);
     assert!(
         counters.compacted > 0,
         "this test is about a compacted identity; nothing was compacted"

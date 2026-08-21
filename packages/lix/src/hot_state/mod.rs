@@ -38,8 +38,10 @@ pub(crate) use tracked_head::WORKING_DIFF_PATH_HITS;
 pub(crate) use tracked_head::encode_hot_row_key_for_test;
 #[cfg(test)]
 pub(crate) use tracked_head::hot_generation_scope_prefix;
-pub(crate) use tracked_head::stage_collect_stale_working_diff_indexes;
 pub(crate) use tracked_head::stage_retire_hot_generation;
+pub(crate) use tracked_head::{
+    stage_collect_stale_working_diff_indexes, stage_compact_checkpoint_tombstones,
+};
 // Read only by `#[cfg(test)]` probes, so a features-on *library* build compiles
 // the counters and re-exports them without any in-crate reader. `cargo test`
 // cannot see that — under `--profile test` the probe module exists and the

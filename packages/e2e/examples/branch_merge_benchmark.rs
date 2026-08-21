@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Isolated-process branching and merge qualification benchmark.
 //!
 //! Run the default qualification matrix and capture JSONL:

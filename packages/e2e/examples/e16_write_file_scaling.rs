@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Why does a single write cost 30x more in a 10,000-file repository than in a
 //! 100-file one, while writing the same handful of rows?
 //!

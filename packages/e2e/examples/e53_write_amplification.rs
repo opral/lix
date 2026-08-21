@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Does a commit's physical write cost grow with repository size?
 //!
 //! A probe replay of `stage_retire_hot_generation` against a branch's live

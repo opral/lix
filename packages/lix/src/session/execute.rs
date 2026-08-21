@@ -6616,7 +6616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_certified_insert_publishes_rootless_history_and_reads_packed_head() {
+    async fn large_certified_insert_publishes_rooted_history_and_reads_packed_head() {
         const ROW_COUNT: usize = 32 * 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
@@ -6708,9 +6708,7 @@ mod tests {
                 .await
                 .expect("head physical state should load")
                 .expect("head physical state should exist");
-        assert!(commit_state.replay_debt.depth >= 1);
-        assert!(commit_state.replay_debt.rows >= ROW_COUNT as u64);
-        assert!(commit_state.replay_debt.bytes > commit_state.replay_debt.rows);
+        assert_eq!(commit_state.replay_debt, Default::default());
         assert!(
             crate::tracked_state::load_snapshot_commit_root(
                 &history_read,
@@ -6718,8 +6716,8 @@ mod tests {
             )
             .await
             .expect("root lookup should succeed")
-            .is_none(),
-            "rootless production commit must skip the duplicate immutable tree"
+            .is_some(),
+            "production commits must publish persistent root authority"
         );
 
         let diff = session
@@ -6785,19 +6783,7 @@ mod tests {
         .await
         .expect("descendant physical state should load")
         .expect("descendant physical state should exist");
-        assert!(
-            descendant_state.replay_debt.depth > 0,
-            "a sparse descendant must extend the rootless first-parent interval"
-        );
-        assert_eq!(
-            descendant_state.replay_debt.depth,
-            commit_state.replay_debt.depth + 1
-        );
-        assert_eq!(
-            descendant_state.replay_debt.rows,
-            commit_state.replay_debt.rows + 1
-        );
-        assert!(descendant_state.replay_debt.bytes > commit_state.replay_debt.bytes);
+        assert_eq!(descendant_state.replay_debt, Default::default());
         assert!(
             crate::tracked_state::load_snapshot_commit_root(
                 &descendant_history_read,
@@ -6805,7 +6791,8 @@ mod tests {
             )
             .await
             .expect("descendant root lookup should succeed")
-            .is_none()
+            .is_some(),
+            "sparse descendants must retain persistent root authority"
         );
         let updated = session
             .execute(
@@ -6921,7 +6908,7 @@ mod tests {
                 .await
                 .expect("reseed physical state should load")
                 .expect("reseed physical state should exist");
-        assert!(reseed_state.replay_debt.depth >= 1);
+        assert_eq!(reseed_state.replay_debt, Default::default());
 
         let mut rooted_fence = None;
         for generation_offset in 1..=32 {
@@ -6967,7 +6954,7 @@ mod tests {
         }
         assert!(
             rooted_fence.is_some(),
-            "rootless replay intervals must close within one generation fence"
+            "every generation must retain a persistent root"
         );
         let rooted_fence = rooted_fence.unwrap();
         let rebuilt_rows = main_session
@@ -9222,8 +9209,8 @@ mod tests {
         );
         assert_eq!(
             crate::transaction::take_rootless_replacement_generation_publications(),
-            1,
-            "the certified replacement must publish a rootless partition generation"
+            0,
+            "the certified replacement must publish persistent root authority"
         );
 
         let update_commit_id = session
@@ -9356,8 +9343,8 @@ mod tests {
         session.execute_batch(&second_updates).await.unwrap();
         assert_eq!(
             crate::transaction::take_rootless_replacement_generation_publications(),
-            1,
-            "a repeated replacement must collapse to one generation over the same durable fallback"
+            0,
+            "a repeated replacement must retain persistent root authority"
         );
         let second_commit_id = session
             .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
@@ -11567,7 +11554,6 @@ mod tests {
             1,
             "the complete scalar generation must seal without PreparedStateBatch"
         );
-
         // Replacement-part bytes are content-addressed without their commit
         // owner. Publishing the same post-image again must bind a fresh
         // physical commit instead of reusing the decoded leaf from above.
@@ -11597,6 +11583,10 @@ mod tests {
             ),
             1
         );
+        session
+            .create_checkpoint()
+            .await
+            .expect("a direct replacement must leave checkpointable root authority");
     }
 
     #[tokio::test]
@@ -11865,6 +11855,21 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(committed_created_at, original_created_at);
+        session
+            .create_checkpoint()
+            .await
+            .expect("a replacement immediately before checkpoint must retain a root alias");
+        let checkpointed_created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM rooted_journal_parent_probe WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .unwrap();
+        assert_eq!(checkpointed_created_at, original_created_at);
     }
 
     #[tokio::test]

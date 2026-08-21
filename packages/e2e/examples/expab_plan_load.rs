@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Commit-root rebuild plan-load attribution (experiment AB).
 //!
 //! Experiment AA measured that 83% of commit-root replay time is spent inside

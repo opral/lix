@@ -90,6 +90,8 @@ impl<'a> ScanCursor<'a> {
         let page_size = limit_rows.min(crate::storage::MAX_SCAN_PAGE_ROWS);
         self.poisoned = true;
         let (entries, has_more) = self.source.next_page(page_size).await?.into_parts();
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_checkpoint_scan_page(entries.len());
         if entries.len() > page_size
             || (has_more && entries.is_empty())
             || !self.valid_entries(&entries)

@@ -1,12 +1,14 @@
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
-use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_stage_row};
+use crate::checkpoint::checkpoint_stage_row;
 use crate::gc::CheckpointGcState;
 use crate::storage_adapter::Storage;
 use crate::telemetry::{
     ActiveTelemetrySpan, TelemetryAttribute, TelemetrySpanClass, TelemetrySpanStatus,
 };
-use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow};
+#[cfg(test)]
+use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRow};
+#[cfg(test)]
 use crate::transaction::StagedCommitChangeBatchBuilder;
 use crate::transaction_types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 
@@ -39,6 +41,7 @@ struct CreateCheckpointOutcome {
     receipt: CreateCheckpointReceipt,
     parent_commit_id: String,
     gc_due: bool,
+    checkpoint_sequence: u64,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -47,12 +50,10 @@ where
 {
     /// Creates a checkpoint for the active branch.
     ///
-    /// The new commit contains the net tracked changes since the previous
-    /// checkpoint and parents that checkpoint directly. The old branch head is
-    /// retained as a local recovery root for the GC grace window. Publication
-    /// returns as soon as that durable root is committed; due garbage
-    /// collection runs asynchronously so a history-sized sweep cannot extend
-    /// the foreground checkpoint latency.
+    /// The new metadata-only commit structurally aliases the captured branch
+    /// state while parenting the prior checkpoint. Publication never reads or
+    /// copies interval members. Scale-dependent physical reclamation is
+    /// maintenance work and cannot extend foreground checkpoint latency.
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
         let span = self.telemetry.as_ref().and_then(|sink| {
             ActiveTelemetrySpan::start_if_enabled(
@@ -64,6 +65,12 @@ where
         });
         let operation = self.with_write_transaction_lending(async move |transaction| {
             let branch_id = transaction.active_branch_id().to_string();
+            if branch_id == crate::GLOBAL_BRANCH_ID {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "the repository-global branch cannot be checkpointed",
+                ));
+            }
             let (previous_recovery, mut gc_state) =
                 transaction.checkpoint_publication_state(&branch_id).await?;
             let head_commit_id = {
@@ -76,62 +83,14 @@ where
                     )
                     .await?
             };
-            let direct_working_diff = transaction
-                .working_diff_at_head(
-                    &branch_id,
-                    head_commit_id,
-                    &TrackedStateDiffRequest::default(),
-                )
+            let previous_checkpoint_commit_id = transaction
+                .checkpoint_commit_id_at_head(&branch_id, head_commit_id)
                 .await?;
-            let previous_checkpoint_commit_id = if let Some(direct) = &direct_working_diff {
-                direct.checkpoint_commit_id
-            } else {
-                transaction
-                    .checkpoint_commit_id_at_head(&branch_id, head_commit_id)
-                    .await?
-            };
             let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
-            let selected_changes = {
-                let entries = if let Some(direct) = direct_working_diff {
-                    direct.diff.entries
-                } else {
-                    let mut reader = transaction.tracked_state_reader().await;
-                    reader
-                        .diff_commits(
-                            &previous_checkpoint_commit_id.to_string(),
-                            &head_commit_id.to_string(),
-                            &TrackedStateDiffRequest::default(),
-                        )
-                        .await?
-                        .entries
-                };
-                let mut selected_changes =
-                    StagedCommitChangeBatchBuilder::with_capacity(entries.len());
-                let mut source_membership_exact = true;
-                for entry in entries.into_iter().filter(|entry| {
-                    entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
-                        && entry.identity.schema_key()
-                            != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
-                }) {
-                    let row = entry.after.ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "working diff for schema '{}' row {:?} has no target row",
-                                entry.identity.schema_key(),
-                                entry.identity.row_pk()
-                            ),
-                        )
-                    })?;
-                    source_membership_exact &=
-                        push_selected_change(&mut selected_changes, row, entry.kind);
-                }
-                if source_membership_exact {
-                    selected_changes.finish_source_certified()
-                } else {
-                    selected_changes.finish()
-                }
-            };
+            // The checkpoint commit severs the ordinary first-parent interval.
+            // Commit materialization publishes a complete-state fence that
+            // structurally shares the captured head root, so publication does
+            // not enumerate or copy interval members.
             gc_state.checkpoint_sequence =
                 gc_state.checkpoint_sequence.checked_add(1).ok_or_else(|| {
                     LixError::new(
@@ -144,13 +103,12 @@ where
             }
             let gc_due = checkpoint_gc_due(gc_state)?;
 
-            let commit_id = transaction.stage_checkpoint_commit(
+            let commit_id = transaction.stage_checkpoint_boundary_commit(
                 branch_id,
                 previous_checkpoint_commit_id,
                 head_commit_id,
                 interval_has_commits,
                 gc_state,
-                selected_changes,
             )?;
             let checkpoint_commit_id =
                 crate::changelog::CommitId::parse_lix(&commit_id, "checkpoint commit id")?;
@@ -173,6 +131,7 @@ where
                 },
                 parent_commit_id: previous_checkpoint_commit_id.to_string(),
                 gc_due,
+                checkpoint_sequence: gc_state.checkpoint_sequence,
             })
         });
         let result = match span.as_ref() {
@@ -203,20 +162,34 @@ where
                 ],
             );
         }
-        if outcome.gc_due {
+        if outcome.gc_due
+            && self
+                .commit_coordinator
+                .try_begin_checkpoint_gc(outcome.checkpoint_sequence)
+        {
             // GC debt is durable in the checkpoint transaction. The sweep is
             // therefore safely retryable and does not need to delay the user
             // checkpoint. A clone shares the same storage and collaboration
-            // write gate; concurrent schedules serialize, and only the first
-            // one that still sees debt performs work.
+            // coordinator. Concurrent schedules coalesce, and only the first
+            // one that still sees debt performs work. Repository-scale GC
+            // planning runs without the foreground session gate; its prepared
+            // commit relies on storage conflict detection.
             let gc_session = self.clone();
+            let gc_coordinator = self.commit_coordinator.clone();
             #[cfg(not(target_family = "wasm"))]
-            crate::background_task::spawn("lix-checkpoint-gc", move || async move {
-                gc_session.collect_checkpoint_garbage_best_effort().await;
-            })?;
+            if let Err(error) =
+                crate::background_task::spawn("lix-checkpoint-gc", move || async move {
+                    gc_session.collect_checkpoint_garbage_best_effort().await;
+                    gc_coordinator.finish_checkpoint_gc();
+                })
+            {
+                self.commit_coordinator.finish_checkpoint_gc();
+                return Err(error);
+            }
             #[cfg(target_family = "wasm")]
             tokio::spawn(async move {
                 gc_session.collect_checkpoint_garbage_best_effort().await;
+                gc_coordinator.finish_checkpoint_gc();
             });
         }
         Ok(outcome.receipt)
@@ -286,6 +259,7 @@ pub(crate) fn checkpoint_gc_due(state: CheckpointGcState) -> Result<bool, LixErr
     Ok(yield_due || stale_due)
 }
 
+#[cfg(test)]
 fn push_selected_change(
     selected_changes: &mut StagedCommitChangeBatchBuilder,
     row: TrackedStateDiffRow,
@@ -320,14 +294,38 @@ mod tests {
     use super::{
         RECLAIM_MIN_INVENTORY, RECLAIM_YIELD_DENOMINATOR, checkpoint_gc_due, push_selected_change,
     };
+    use crate::LixError;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::gc::CheckpointGcState;
     use crate::row_pk::RowPk;
+    use crate::storage::Memory;
     use crate::tracked_state::{
         TrackedStateDiffIdentity, TrackedStateDiffKind, TrackedStateDiffRow, TrackedStateKey,
     };
     use crate::transaction::StagedCommitChangeBatchBuilder;
+
+    #[tokio::test]
+    async fn repository_global_branch_cannot_be_checkpointed() {
+        let storage = Memory::new();
+        let _receipt = crate::engine::Engine::initialize(storage.clone())
+            .await
+            .expect("repository initializes");
+        let engine = crate::engine::Engine::new(storage)
+            .await
+            .expect("repository opens");
+        let session = engine
+            .open_session_at(crate::GLOBAL_BRANCH_ID)
+            .await
+            .expect("global session opens");
+
+        let error = session
+            .create_checkpoint()
+            .await
+            .expect_err("global branch checkpoint must be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.to_string().contains("global branch"));
+    }
 
     #[test]
     fn canonicalized_added_timestamp_declines_source_membership_certificate() {

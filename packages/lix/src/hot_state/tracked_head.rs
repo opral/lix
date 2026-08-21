@@ -832,6 +832,85 @@ where
     hot::stage_collect_stale_hot_diff_records(store, writes, &active).await
 }
 
+/// Reclaims current-generation tracked tombstones as repository maintenance.
+/// The scan is deliberately background scale work; checkpoint publication
+/// only rotates its constant-size epoch marker.
+pub(crate) async fn stage_compact_checkpoint_tombstones<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    controls: &[(String, BranchHeadControl)],
+) -> Result<bool, LixError>
+where
+    S: StorageAdapterRead + Clone,
+{
+    let context = TrackedHeadContext::new();
+    let reader = context.reader(store.clone());
+    let no_staged_global_schemas = BTreeSet::new();
+    const MAX_TOMBSTONE_ROWS_PER_SLICE: usize = 32;
+    let mut staged_rows = 0usize;
+    let mut has_more = false;
+    for (branch_id, control) in controls {
+        let Some(checkpoint_commit_id) = control.working_diff_checkpoint_commit_id else {
+            continue;
+        };
+        let rows = reader
+            .scan_tracked_tombstones_for_control(branch_id, *control)
+            .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        let deltas = rows
+            .iter()
+            .map(|row| CurrentStateDeltaRef {
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                row_pk: &row.row_pk,
+                change_id: row.change_id,
+                commit_id: Some(checkpoint_commit_id),
+                untracked: false,
+                deleted: true,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                snapshot: None,
+                metadata: None,
+                columnar_base_coordinate: None,
+            })
+            .collect::<Vec<_>>();
+        let mut coverage = WorkingDiffIndexCoverage::default();
+        let mut writer = context.writer(store, writes);
+        writer = writer.with_transaction_global_schema_keys(&no_staged_global_schemas);
+        let mask = writer
+            .checkpoint_tombstone_compaction_mask(branch_id, control.tracked_generation, &deltas)
+            .await?;
+        let mut candidates = deltas
+            .into_iter()
+            .zip(mask)
+            .filter_map(|(delta, compactable)| compactable.then_some(delta))
+            .collect::<Vec<_>>();
+        let remaining = MAX_TOMBSTONE_ROWS_PER_SLICE.saturating_sub(staged_rows);
+        if candidates.len() > remaining {
+            has_more = true;
+            candidates.truncate(remaining);
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+        staged_rows = staged_rows.saturating_add(candidates.len());
+        writer
+            .stage_checkpoint_current_state(
+                branch_id,
+                control.tracked_generation,
+                control.head_commit_id,
+                &candidates,
+                &BTreeSet::new(),
+                checkpoint_commit_id,
+                &mut coverage,
+            )
+            .await?;
+    }
+    Ok(has_more)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveWorkingDiffScope {
     checkpoint_commit_id: CommitId,

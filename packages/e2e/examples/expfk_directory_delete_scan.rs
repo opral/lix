@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Cost of the foreign-key delete restriction on a directory delete, as a
 //! function of how many files the branch holds.
 //!

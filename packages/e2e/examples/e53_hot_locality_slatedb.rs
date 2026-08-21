@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! `e53_hot_locality`, on SlateDB, where a block fetch is an object-store GET.
 //!
 //! The RocksDB run of this experiment found the eight-space layout costs eight

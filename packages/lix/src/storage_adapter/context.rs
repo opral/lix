@@ -43,6 +43,8 @@ where
         &self,
         opts: ReadOptions,
     ) -> Result<StorageAdapterReadScope<StorageImpl::Read<'_>>, StorageError> {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_checkpoint_read_view();
         self.storage
             .begin_read(opts)
             .await
@@ -249,6 +251,29 @@ where
         .await
 }
 
+pub(crate) async fn load_repository_mutation_revision<R>(
+    read: &R,
+) -> Result<Option<Bytes>, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    load_revision(read, REVISION_KEY_MUTATION).await
+}
+
+pub(crate) fn repository_mutation_revision_precondition(expected: Option<Bytes>) -> Precondition {
+    expected.map_or_else(
+        || Precondition::KeyAbsent {
+            space: REVISION_SPACE,
+            key: revision_key(REVISION_KEY_MUTATION),
+        },
+        |expected| Precondition::KeyValueEquals {
+            space: REVISION_SPACE,
+            key: revision_key(REVISION_KEY_MUTATION),
+            expected,
+        },
+    )
+}
+
 impl<'a, StorageImpl> PreparedStorageCommit<'a, StorageImpl>
 where
     StorageImpl: Storage + 'a,
@@ -262,6 +287,8 @@ where
                 "lix.perf.storage_commit_accepted_visible"
             ))
             .await?;
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_checkpoint_write(self.stats);
         Ok((result, self.stats))
     }
 

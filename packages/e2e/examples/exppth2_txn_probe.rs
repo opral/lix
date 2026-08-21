@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! EXPPTH2: does batching content updates into ONE explicit transaction
 //! collapse the per-statement O(repository size) term?
 //!

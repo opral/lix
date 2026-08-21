@@ -8,10 +8,16 @@ pub(crate) struct Migration {
     pub(crate) to_version: u32,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    from_version: 68,
-    to_version: 69,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        from_version: 68,
+        to_version: 69,
+    },
+    Migration {
+        from_version: 69,
+        to_version: 70,
+    },
+];
 
 pub(crate) fn registered_migrations() -> &'static [Migration] {
     MIGRATIONS
@@ -28,7 +34,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_describes_v68_to_current() {
+    fn registry_describes_format_edges() {
         assert_eq!(
             migration_from(68),
             Some(&Migration {
@@ -36,7 +42,14 @@ mod tests {
                 to_version: 69,
             })
         );
-        assert_eq!(registered_migrations().len(), 1);
+        assert_eq!(
+            migration_from(69),
+            Some(&Migration {
+                from_version: 69,
+                to_version: 70,
+            })
+        );
+        assert_eq!(registered_migrations().len(), 2);
         assert_eq!(migration_from(crate::init::CURRENT_FORMAT_VERSION), None);
     }
 }

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Client-observed real-time collaboration capacity workload.
 //!
 //! The ignored release-mode benchmark models 50-100 active collaborators on
