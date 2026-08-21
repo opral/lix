@@ -7302,18 +7302,13 @@ async fn route_direct_change_records_for_state(
                 let locator_index = unique_locator_indices[selector_index];
                 let locator = locators[locator_index];
                 let route = match state.mutations.direct_coordinate_owned(0, locator.ordinal) {
-                    Some(false) => {
-                        DirectChangeRecordRoute::NotOwned(DirectNotOwnedReason::AuthoredCoordinate)
-                    }
-                    Some(true) => DirectChangeRecordRoute::Owned(
-                        decode_change_at_locator_from_decoded(
-                            &leaf,
-                            &payloads,
-                            locator,
-                            &state.change_account_id,
-                        )?
-                        .change_record,
-                    ),
+                    Some(direct) => route_change_at_locator_from_decoded(
+                        &leaf,
+                        &payloads,
+                        locator,
+                        &state.change_account_id,
+                        direct,
+                    )?,
                     None => {
                         return Err(replacement_payload_error(
                             "inline direct coordinate omitted authenticated ownership",
@@ -7538,18 +7533,13 @@ async fn load_physical_direct_change_records(
                 .mutations
                 .direct_coordinate_owned(entry_index as usize, locator.ordinal)
             {
-                Some(false) => {
-                    DirectChangeRecordRoute::NotOwned(DirectNotOwnedReason::AuthoredCoordinate)
-                }
-                Some(true) => DirectChangeRecordRoute::Owned(
-                    decode_change_at_locator_from_decoded(
-                        &leaf,
-                        &payloads,
-                        locator,
-                        &state.change_account_id,
-                    )?
-                    .change_record,
-                ),
+                Some(direct) => route_change_at_locator_from_decoded(
+                    &leaf,
+                    &payloads,
+                    locator,
+                    &state.change_account_id,
+                    direct,
+                )?,
                 None => {
                     return Err(replacement_payload_error(
                         "direct coordinate omitted authenticated ownership",
@@ -8150,6 +8140,36 @@ where
         base_coordinate,
         selected_ref: false,
     })
+}
+
+fn route_change_at_locator_from_decoded<S>(
+    leaf: &DecodedLeafNodeRef,
+    payloads: &CommitDeltaPayloadIndex<S>,
+    locator: CommitDeltaChangeLocator,
+    account_id: &str,
+    direct: bool,
+) -> Result<DirectChangeRecordRoute, LixError>
+where
+    S: AsRef<[u8]>,
+{
+    if !direct {
+        let ordinal = usize::from(locator.ordinal);
+        let Some(entry) = leaf.entry(ordinal) else {
+            return Err(replacement_payload_error(
+                "authored change locator references an absent ordinal",
+            ));
+        };
+        let value = decode_value(entry.value)?;
+        let authored = matches!(payloads.decode(ordinal)?, CommitDeltaPayload::Authored(_));
+        if !authored || value.change_id != locator.change_id {
+            return Ok(DirectChangeRecordRoute::NotOwned(
+                DirectNotOwnedReason::AuthoredCoordinate,
+            ));
+        }
+    }
+    Ok(DirectChangeRecordRoute::Owned(
+        decode_change_at_locator_from_decoded(leaf, payloads, locator, account_id)?.change_record,
+    ))
 }
 
 pub(crate) fn validate_columnar_mutation_manifest(
@@ -17959,7 +17979,11 @@ mod tests {
         let mixed =
             stage_addressable_commit_deltas(&mut writes, &mixed_deltas, &[true, false, true])
                 .expect("mixed addressable deltas should stage");
-        assert_eq!(mixed.mutation_inventory().direct_part_row_counts, vec![3],);
+        assert_eq!(
+            mixed.mutation_inventory().direct_part_row_counts,
+            vec![2, 1],
+            "direct-address inventory follows the alpha and beta schema-bounded segments"
+        );
         assert_eq!(mixed.locators.len(), 1);
         assert_eq!(mixed.locators[0].change_id, fixtures[1].change_id);
         assert_ne!(mixed.assigned_change_ids[0], ChangeId::default());
@@ -21523,7 +21547,11 @@ mod tests {
         let inline_deltas = commit_delta_refs(inline_commit_id, &fixtures[..128]);
         stage_commit_deltas(&mut inline_writes, &inline_deltas)
             .expect("128 generic deltas should fit the history read boundary");
-        assert_eq!(inline_writes.stats().staged_puts, 3);
+        assert_eq!(
+            inline_writes.stats().staged_puts,
+            6,
+            "two schema-bounded segments require an atomic header, catalog, directory root, and semantic owner"
+        );
         storage
             .commit_write_set(inline_writes, StorageWriteOptions::default())
             .await
@@ -21533,7 +21561,11 @@ mod tests {
         let indexed_deltas = commit_delta_refs(indexed_commit_id, &fixtures);
         stage_commit_deltas(&mut indexed_writes, &indexed_deltas)
             .expect("129 generic deltas should use indexed segments");
-        assert_eq!(indexed_writes.stats().staged_puts, 6);
+        assert_eq!(
+            indexed_writes.stats().staged_puts,
+            7,
+            "three schema-bounded segments require an atomic header, catalog, directory root, and semantic owner"
+        );
         storage
             .commit_write_set(indexed_writes, StorageWriteOptions::default())
             .await
