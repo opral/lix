@@ -2044,6 +2044,23 @@ where
                         let local = local_coordinates
                             .get(&update.branch_id)
                             .expect("delta branch was loaded once");
+                        let first_update_for_branch =
+                            !branch_chains.contains_key(&update.branch_id);
+                        if first_update_for_branch
+                            && local.0.as_deref() != authoritative
+                            && let Some(authoritative) = authoritative
+                        {
+                            // A divergent local chain can still terminate at
+                            // the authority head that was current when its
+                            // first offline commit was authored. Once this ref
+                            // advances, authoritative_branches no longer names
+                            // that dependency frontier. Retain exactly that
+                            // old tip until the reconciled push acknowledges a
+                            // child whose parent-pruning removes it.
+                            state
+                                .authority_known_commit_ids
+                                .insert(authoritative.to_owned());
+                        }
                         let chain = branch_chains
                             .entry(update.branch_id.clone())
                             .or_insert_with(|| {

@@ -98,6 +98,12 @@ impl Simulation {
         &self.receipt.main_branch_id
     }
 
+    /// Returns the backing in-memory repository for subsystem simulations
+    /// which need to open their own public `Lix` handle.
+    pub(crate) fn storage(&self) -> Memory {
+        self.storage.clone()
+    }
+
     pub(crate) fn finish(&self) {
         self.assertions.finish_mode(self.mode);
     }

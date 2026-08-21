@@ -15,6 +15,8 @@ mod platform;
 mod protocol;
 mod repository;
 mod runtime;
+#[cfg(test)]
+mod simulation_tests;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
