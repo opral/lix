@@ -567,41 +567,99 @@ impl ActiveTelemetrySpan {
     }
 }
 
-pub(crate) async fn instrument_lix_result<T, F>(
+/// Instruments `future` without growing the caller's async state machine.
+///
+/// An `async fn` wrapper would store `F` in every caller. Combined with
+/// `tokio`/`futures_lite` `block_on` pinning that future on a 2 MiB worker
+/// or coordinator thread, engine-open and commit phases overflowed
+/// `deterministic_replica_scenarios`. Boxing here keeps the wrapper
+/// pointer-sized whether or not a span is active.
+pub(crate) fn instrument_lix_result<T, F>(
     span: Option<ActiveTelemetrySpan>,
     future: F,
-) -> Result<T, crate::LixError>
+) -> InstrumentLixResult<F>
 where
     F: Future<Output = Result<T, crate::LixError>>,
 {
-    let result = match span.as_ref() {
-        Some(span) => span.instrument(future).await,
-        None => future.await,
-    };
-    if let Some(span) = span {
-        match &result {
-            Ok(_) => span.finish(TelemetrySpanStatus::Ok, Vec::new()),
-            Err(error) => span.finish(
-                TelemetrySpanStatus::Error,
-                vec![TelemetryAttribute::string("error.type", error.code.clone())],
-            ),
-        }
+    InstrumentLixResult {
+        future: Box::pin(future),
+        span,
     }
-    result
 }
 
-pub(crate) async fn instrument_value<T, F>(span: Option<ActiveTelemetrySpan>, future: F) -> T
+pub(crate) fn instrument_value<T, F>(
+    span: Option<ActiveTelemetrySpan>,
+    future: F,
+) -> InstrumentValue<F>
 where
     F: Future<Output = T>,
 {
-    let value = match span.as_ref() {
-        Some(span) => span.instrument(future).await,
-        None => future.await,
-    };
-    if let Some(span) = span {
-        span.finish(TelemetrySpanStatus::Ok, Vec::new());
+    InstrumentValue {
+        future: Box::pin(future),
+        span,
     }
-    value
+}
+
+pub(crate) struct InstrumentLixResult<F> {
+    future: Pin<Box<F>>,
+    span: Option<ActiveTelemetrySpan>,
+}
+
+impl<T, F> Future for InstrumentLixResult<F>
+where
+    F: Future<Output = Result<T, crate::LixError>>,
+{
+    type Output = Result<T, crate::LixError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let entered = this.span.as_ref().map(ActiveTelemetrySpan::enter);
+        let result = this.future.as_mut().poll(context);
+        drop(entered);
+        match result {
+            Poll::Ready(result) => {
+                if let Some(span) = this.span.take() {
+                    match &result {
+                        Ok(_) => span.finish(TelemetrySpanStatus::Ok, Vec::new()),
+                        Err(error) => span.finish(
+                            TelemetrySpanStatus::Error,
+                            vec![TelemetryAttribute::string("error.type", error.code.clone())],
+                        ),
+                    }
+                }
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub(crate) struct InstrumentValue<F> {
+    future: Pin<Box<F>>,
+    span: Option<ActiveTelemetrySpan>,
+}
+
+impl<T, F> Future for InstrumentValue<F>
+where
+    F: Future<Output = T>,
+{
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let entered = this.span.as_ref().map(ActiveTelemetrySpan::enter);
+        let result = this.future.as_mut().poll(context);
+        drop(entered);
+        match result {
+            Poll::Ready(value) => {
+                if let Some(span) = this.span.take() {
+                    span.finish(TelemetrySpanStatus::Ok, Vec::new());
+                }
+                Poll::Ready(value)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 impl Drop for ActiveTelemetrySpan {
