@@ -21,6 +21,8 @@ pub(crate) use diff::{diff_schema, register_diff_function};
 mod diff_command;
 mod file;
 mod file_history;
+#[cfg(test)]
+pub(crate) use file_history::{file_history_anchor_probe_census, reset_file_history_anchor_probe_census};
 mod filesystem_history_path;
 mod history_table_function;
 mod history_util;

@@ -17,6 +17,10 @@ mod plan;
 mod planning_cache;
 mod predicate_typecheck;
 mod providers;
+#[cfg(test)]
+pub(crate) use providers::{
+    file_history_anchor_probe_census, reset_file_history_anchor_probe_census,
+};
 mod read_only;
 mod result_metadata;
 mod row_batch;
