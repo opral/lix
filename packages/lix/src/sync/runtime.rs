@@ -139,8 +139,9 @@ where
                 .map(|head| (branch.branch_id.as_str(), head))
         })
         .collect::<Vec<_>>();
+    let precise_history_heads = BTreeSet::new();
     let (history, mut rows) = futures_util::try_join!(
-        fetch_history_objects(transport, head_ids, 1, None),
+        fetch_history_objects(transport, head_ids, 1, None, &precise_history_heads),
         fetch_snapshot_rows(transport, &branch_targets),
     )?;
     let mut checkpoint_targets = Vec::new();
@@ -956,11 +957,18 @@ where
     if pending.is_empty() {
         return Ok(());
     }
+    // The hot global checkpoint catalog is part of bootstrap, even when the
+    // checkpoint bodies remain deferred. A point read of one of those known
+    // checkpoints needs exactly that authenticated boundary; fetching nearby
+    // checkpoint snapshots only adds latency. Non-checkpoint history demands
+    // keep wide pages so full file-history walks remain bounded in round trips.
+    let precise_heads = lix.sync_checkpoint_history_demand_ids(&pending).await?;
     let fetched = fetch_history_objects(
         transport,
         pending,
         super::MAX_SYNC_HISTORY_PAGE_SIZE,
         Some(SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE),
+        &precise_heads,
     )
     .await?;
     let boundary_targets = fetched
@@ -988,6 +996,7 @@ async fn fetch_history_objects<Transport>(
     pending: BTreeSet<String>,
     requested_page_limit: usize,
     max_boundaries_per_page: Option<usize>,
+    precise_heads: &BTreeSet<String>,
 ) -> Result<FetchedHistory, LixError>
 where
     Transport: SyncTransport,
@@ -995,8 +1004,12 @@ where
     let mut commits = BTreeMap::new();
     let mut commit_headers = BTreeMap::new();
     let mut boundaries = BTreeMap::new();
-    let mut history_page_limit = requested_page_limit;
     for head in pending {
+        let mut history_page_limit = if precise_heads.contains(&head) {
+            1
+        } else {
+            requested_page_limit
+        };
         let response = loop {
             let response =
                 fetch_history_page_adaptive(transport, &head, &mut history_page_limit).await?;
@@ -2500,6 +2513,7 @@ mod tests {
             BTreeSet::from([head.clone()]),
             super::super::MAX_SYNC_HISTORY_PAGE_SIZE,
             None,
+            &BTreeSet::new(),
         )
         .await
         .expect("deep head fetch succeeds");
@@ -3205,6 +3219,63 @@ mod tests {
             smaller_history_demand_page_limit(1, 1, 5, 4),
             None,
             "one indivisible merge commit retains all required boundaries",
+        );
+    }
+
+    #[tokio::test]
+    async fn hot_checkpoint_catalog_classifies_precise_history_demands() {
+        let lix = open_lix().await.expect("lix opens");
+        let checkpoint = lix
+            .create_checkpoint()
+            .await
+            .expect("checkpoint is created")
+            .commit_id;
+        let ordinary = uuid::Uuid::now_v7().to_string();
+        let requested = BTreeSet::from([checkpoint.clone(), ordinary]);
+
+        assert_eq!(
+            lix.sync_checkpoint_history_demand_ids(&requested)
+                .await
+                .expect("hot checkpoint catalog is readable"),
+            BTreeSet::from([checkpoint]),
+        );
+    }
+
+    #[tokio::test]
+    async fn precise_checkpoint_history_demand_skips_wide_page_probes() {
+        let (_replica, parent, _head, commits, commit_headers, history_boundaries, boundary_rows) =
+            history_fixture().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = HistoryTransport {
+            commits,
+            missing: BTreeSet::new(),
+            calls: Arc::clone(&calls),
+            max_history_items: Some(1),
+            fail_first_history: false,
+            commit_headers,
+            history_boundaries,
+            boundary_rows,
+            blobs: BTreeMap::new(),
+            blob_calls: Arc::new(Mutex::new(Vec::new())),
+            chunks: BTreeMap::new(),
+            chunk_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let precise_heads = BTreeSet::from([parent.clone()]);
+        let fetched = fetch_history_objects(
+            &transport,
+            BTreeSet::from([parent.clone()]),
+            super::super::MAX_SYNC_HISTORY_PAGE_SIZE,
+            Some(SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE),
+            &precise_heads,
+        )
+        .await
+        .expect("precise history fetch succeeds");
+        assert_eq!(fetched.commits.len(), 1);
+        assert_eq!(
+            *calls.lock().expect("history calls lock"),
+            vec![vec![parent]],
+            "known checkpoint demand starts at one commit without probing a wide page",
         );
     }
 

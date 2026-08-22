@@ -4814,6 +4814,60 @@ where
         Ok(pending)
     }
 
+    pub(crate) async fn sync_checkpoint_history_demand_ids(
+        &self,
+        commit_ids: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, LixError> {
+        if commit_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let requested = commit_ids
+            .iter()
+            .map(|commit_id| {
+                let parsed =
+                    CommitId::parse_lix(commit_id, "sync checkpoint history demand commit id")?;
+                Ok((
+                    RowPk::uuid_from_canonical(&parsed.to_string())
+                        .expect("a canonical commit UUID is a canonical checkpoint row key"),
+                    commit_id.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        let Some(global) = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(crate::GLOBAL_BRANCH_ID)
+            .await?
+        else {
+            return Ok(BTreeSet::new());
+        };
+        let mut tracked = TrackedStateContext::new().reader(&read);
+        let rows = tracked
+            .scan_batch_at_commit(
+                &global.head_commit_id.to_string(),
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![crate::checkpoint::CHECKPOINT_SCHEMA_KEY.to_owned()],
+                        row_pks: requested.iter().map(|(row_pk, _)| row_pk.clone()).collect(),
+                        ..TrackedStateFilter::default()
+                    },
+                    limit: Some(requested.len()),
+                    ..TrackedStateScanRequest::default()
+                },
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                requested
+                    .iter()
+                    .find(|(row_pk, _)| row_pk == row.row_pk())
+                    .map(|(_, commit_id)| commit_id.clone())
+            })
+            .collect())
+    }
+
     async fn complete_live_root_at_commit(
         &self,
         read: &(impl StorageAdapterRead + ?Sized),
