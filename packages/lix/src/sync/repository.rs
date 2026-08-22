@@ -10162,6 +10162,8 @@ mod tests {
         assert_eq!(checkpoint, snapshot_head);
         let replica = replica_from_snapshot(&authority, &snapshot).await;
 
+        crate::sql2::reset_file_history_anchor_probe_census();
+
         let history = loop {
             match replica
                 .execute(
@@ -10219,6 +10221,13 @@ mod tests {
                 Err(error) => panic!("checkpoint history should load: {error:?}"),
             }
         };
+        let (anchor_probes, anchor_probe_hits) =
+            crate::sql2::file_history_anchor_probe_census();
+        assert!(anchor_probes >= 1, "top-k history should probe its anchor");
+        assert_eq!(
+            anchor_probe_hits, 1,
+            "the selected checkpoint change should resolve at the anchor"
+        );
         assert_eq!(history.rows().len(), 1);
         assert_eq!(
             history.rows()[0]

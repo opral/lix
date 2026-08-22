@@ -373,6 +373,76 @@ async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_p
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
+    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let inserted = authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/bounded.md', CAST('version-00' AS BYTEA)) RETURNING id",
+            &[],
+        )
+        .await
+        .expect("create checkpointed file");
+    let file_id = inserted.rows()[0]
+        .get::<String>("id")
+        .expect("file id decodes");
+    let mut target_checkpoint = None;
+    for index in 0..12 {
+        authority
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
+                &[
+                    Value::Text(format!("version-{index:02}")),
+                    Value::Text(file_id.clone()),
+                ],
+            )
+            .await
+            .expect("update checkpointed file");
+        let checkpoint = authority
+            .create_checkpoint()
+            .await
+            .expect("create file checkpoint")
+            .commit_id;
+        if index == 4 {
+            target_checkpoint = Some(checkpoint);
+        }
+    }
+    let target_checkpoint = target_checkpoint.expect("target checkpoint captured");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+    let history_before = probe.history_gets.load(Ordering::Acquire);
+
+    let history = replica
+        .execute(
+            "SELECT id, path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+            &[
+                Value::Text(target_checkpoint),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .expect("exact checkpoint file history hydrates");
+    assert_eq!(history.rows().len(), 1);
+    assert_eq!(
+        history.rows()[0]
+            .get::<String>("path")
+            .expect("history path decodes"),
+        "/bounded.md",
+    );
+    assert_eq!(
+        probe.history_gets.load(Ordering::Acquire) - history_before,
+        1,
+        "a depth-ordered point lookup should hydrate only the selected checkpoint",
+    );
+
+    replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+    authority.close().await.expect("close authority");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_bootstrap_pages_more_than_one_window_of_hot_rows() {
     let authority = Arc::new(open_lix().await.expect("open authority"));
     let statements = (0..OFFLINE_COMMIT_COUNT)

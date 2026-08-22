@@ -67,12 +67,15 @@ pub(super) type RowSource = Arc<dyn Fn() -> BoxFuture<'static, Result<RecordBatc
 pub(super) type BatchStreamSource =
     Arc<dyn Fn(usize, Arc<TaskContext>) -> Result<SendableRecordBatchStream> + Send + Sync>;
 
+type ScanFetchRebind = Arc<dyn Fn(Option<usize>) -> ScanSource + Send + Sync>;
+
 #[derive(Clone)]
 pub(super) struct ScanSource {
     partition_count: usize,
     statistics: Arc<Vec<Statistics>>,
     source_statistics: Option<Statistics>,
     open: BatchStreamSource,
+    fetch_rebind: Option<ScanFetchRebind>,
 }
 
 impl ScanSource {
@@ -100,7 +103,12 @@ impl ScanSource {
             statistics: Arc::new(statistics),
             source_statistics,
             open: Arc::new(open),
+            fetch_rebind: None,
         }
+    }
+
+    fn with_fetch(&self, fetch: Option<usize>) -> Option<Self> {
+        self.fetch_rebind.as_ref().map(|rebind| rebind(fetch))
     }
 
     fn open(
@@ -170,6 +178,61 @@ where
             stream,
         )))
     })
+}
+
+/// Adapt a materializing loader that can use an execution-time fetch bound.
+///
+/// `ORDER BY ... LIMIT` is lowered to a physical top-k after table planning,
+/// so its bound is not present in [`TableSpec::plan_scan`]. DataFusion offers
+/// it later through [`ExecutionPlan::with_fetch`]; this source can be rebuilt
+/// with that bound without making an unbounded scan pretend it already knew
+/// the query's final cardinality.
+pub(super) fn fetchable_scan_row_source<S, F, Fut>(
+    schema: SchemaRef,
+    state: S,
+    initial_fetch: Option<usize>,
+    f: F,
+) -> ScanSource
+where
+    S: Clone + Send + Sync + 'static,
+    F: Fn(S, Option<usize>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RecordBatch>> + Send + 'static,
+{
+    fetchable_scan_row_source_inner(schema, state, initial_fetch, Arc::new(f))
+}
+
+fn fetchable_scan_row_source_inner<S, F, Fut>(
+    schema: SchemaRef,
+    state: S,
+    fetch: Option<usize>,
+    f: Arc<F>,
+) -> ScanSource
+where
+    S: Clone + Send + Sync + 'static,
+    F: Fn(S, Option<usize>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<RecordBatch>> + Send + 'static,
+{
+    let load = row_source((state.clone(), Arc::clone(&f)), move |(state, f)| {
+        f(state, fetch)
+    });
+    let stream_schema = Arc::clone(&schema);
+    let mut source = batch_stream_source(Arc::clone(&schema), 1, move |_partition, _context| {
+        let load = Arc::clone(&load);
+        let stream = stream::once(async move { load().await });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&stream_schema),
+            stream,
+        )))
+    });
+    source.fetch_rebind = Some(Arc::new(move |fetch| {
+        fetchable_scan_row_source_inner(
+            Arc::clone(&schema),
+            state.clone(),
+            fetch,
+            Arc::clone(&f),
+        )
+    }));
+    source
 }
 
 /// Build a storage-originating streaming scan source.
@@ -1401,6 +1464,30 @@ impl ExecutionPlan for SpecScanExec {
             )));
         }
         Ok(self)
+    }
+
+    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let source = self.source.with_fetch(fetch)?;
+        if source.partition_count != self.source.partition_count {
+            return None;
+        }
+        let mut physical_cache_key = self.physical_cache_key.clone();
+        physical_cache_key.limit = fetch;
+        Some(Arc::new(Self {
+            table: Arc::clone(&self.table),
+            schema: Arc::clone(&self.schema),
+            source,
+            fragment_ranges: Arc::clone(&self.fragment_ranges),
+            properties: Arc::clone(&self.properties),
+            statement_cache_key: None,
+            physical_cache_key,
+            target_partitions: self.target_partitions,
+            probe_binding: self.probe_binding.clone(),
+        }))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.physical_cache_key.limit
     }
 
     fn execute(
