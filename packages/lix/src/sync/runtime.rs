@@ -22,6 +22,10 @@ const SYNC_ITEM_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_ITEM_TOO_LARGE";
 const SYNC_SNAPSHOT_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_SNAPSHOT_TOO_LARGE";
 const SYNC_DEMAND_STALLED_CODE: &str = "LIX_ERROR_SYNC_DEMAND_STALLED";
 const SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE: usize = 4;
+/// Independent sparse heads are safe to fetch concurrently. Keeping the cap
+/// below the HTTP/1 connection fan-out used by browser transports avoids both
+/// serial round-trip latency and unbounded authority pressure.
+const SYNC_DEMAND_FETCH_CONCURRENCY: usize = 6;
 
 #[derive(Debug)]
 pub(crate) struct SyncRuntime {
@@ -754,51 +758,68 @@ where
     Transport: SyncTransport,
 {
     let mut rows = Vec::new();
+    for target_batch in targets.chunks(SYNC_DEMAND_FETCH_CONCURRENCY) {
+        let batches = futures_util::future::try_join_all(
+            target_batch.iter().copied().map(|(branch_id, head_commit_id)| {
+                fetch_snapshot_target_rows(transport, branch_id, head_commit_id)
+            }),
+        )
+        .await?;
+        rows.extend(batches.into_iter().flatten());
+    }
+    Ok(rows)
+}
+
+async fn fetch_snapshot_target_rows<Transport>(
+    transport: &Transport,
+    branch_id: &str,
+    head_commit_id: &str,
+) -> Result<Vec<super::SyncSnapshotRow>, LixError>
+where
+    Transport: SyncTransport,
+{
+    let mut rows = Vec::new();
     let mut page_limit = super::MAX_SYNC_REQUEST_ITEMS;
-    for &(branch_id, head_commit_id) in targets {
-        let mut continuation = None;
-        let mut seen_continuations = BTreeSet::new();
-        loop {
-            let page = fetch_adaptive(&mut page_limit, "snapshot row", |limit| {
-                transport.snapshot_rows(branch_id, head_commit_id, continuation.as_deref(), limit)
-            })
-            .await?;
-            if page.branch_id != branch_id || page.head_commit_id != head_commit_id {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync snapshot row page changed its pinned branch or head",
-                ));
-            }
-            if page.rows.len() > page_limit
-                || page.rows.iter().any(|row| row.branch_id != branch_id)
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync snapshot row page exceeded its limit or contained another branch",
-                ));
-            }
-            let next = page.continuation;
-            if next.is_some() && page.rows.is_empty() {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync snapshot row page returned a continuation without rows",
-                ));
-            }
-            if next
-                .as_ref()
-                .is_some_and(|next| next.len() > 4096 || !seen_continuations.insert(next.clone()))
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync snapshot row continuation is invalid or did not advance",
-                ));
-            }
-            rows.extend(page.rows);
-            let Some(next) = next else {
-                break;
-            };
-            continuation = Some(next);
+    let mut continuation = None;
+    let mut seen_continuations = BTreeSet::new();
+    loop {
+        let page = fetch_adaptive(&mut page_limit, "snapshot row", |limit| {
+            transport.snapshot_rows(branch_id, head_commit_id, continuation.as_deref(), limit)
+        })
+        .await?;
+        if page.branch_id != branch_id || page.head_commit_id != head_commit_id {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync snapshot row page changed its pinned branch or head",
+            ));
         }
+        if page.rows.len() > page_limit || page.rows.iter().any(|row| row.branch_id != branch_id) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync snapshot row page exceeded its limit or contained another branch",
+            ));
+        }
+        let next = page.continuation;
+        if next.is_some() && page.rows.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync snapshot row page returned a continuation without rows",
+            ));
+        }
+        if next
+            .as_ref()
+            .is_some_and(|next| next.len() > 4096 || !seen_continuations.insert(next.clone()))
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync snapshot row continuation is invalid or did not advance",
+            ));
+        }
+        rows.extend(page.rows);
+        let Some(next) = next else {
+            break;
+        };
+        continuation = Some(next);
     }
     Ok(rows)
 }
@@ -1004,79 +1025,76 @@ where
     let mut commits = BTreeMap::new();
     let mut commit_headers = BTreeMap::new();
     let mut boundaries = BTreeMap::new();
-    for head in pending {
-        let mut history_page_limit = if precise_heads.contains(&head) {
-            1
-        } else {
-            requested_page_limit
-        };
-        let response = loop {
-            let response =
-                fetch_history_page_adaptive(transport, &head, &mut history_page_limit).await?;
-            let Some(max_boundaries) = max_boundaries_per_page else {
-                break response;
-            };
-            let Some(next_limit) = smaller_history_demand_page_limit(
-                history_page_limit,
-                response.commits.len(),
-                response.boundaries.len(),
-                max_boundaries,
-            ) else {
-                break response;
-            };
-            history_page_limit = next_limit;
-        };
-        for header in response.commit_headers {
-            if let Some(existing) = commit_headers.insert(header.commit_id.clone(), header.clone())
-                && existing != header
-            {
+    let pending = pending.into_iter().collect::<Vec<_>>();
+    for pending_batch in pending.chunks(SYNC_DEMAND_FETCH_CONCURRENCY) {
+        let responses = futures_util::future::try_join_all(pending_batch.iter().map(|head| {
+            fetch_history_head(
+                transport,
+                head,
+                if precise_heads.contains(head) {
+                    1
+                } else {
+                    requested_page_limit
+                },
+                max_boundaries_per_page,
+            )
+        }))
+        .await?;
+        for (head, response) in pending_batch.iter().zip(responses) {
+            for header in response.commit_headers {
+                if let Some(existing) =
+                    commit_headers.insert(header.commit_id.clone(), header.clone())
+                    && existing != header
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync history returned conflicting commit headers",
+                    ));
+                }
+            }
+            let mut response_commits = response.commits;
+            for commit in &response_commits {
+                commit.validate()?;
+            }
+            let returned = response_commits
+                .iter()
+                .map(|commit| commit.commit_id.clone())
+                .collect::<BTreeSet<_>>();
+            if !returned.contains(head) {
                 return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync history returned conflicting commit headers",
+                    LixError::CODE_COMMIT_NOT_FOUND,
+                    format!("sync history response omitted requested head '{head}'"),
                 ));
             }
-        }
-        let mut response_commits = response.commits;
-        for commit in &response_commits {
-            commit.validate()?;
-        }
-        let returned = response_commits
-            .iter()
-            .map(|commit| commit.commit_id.clone())
-            .collect::<BTreeSet<_>>();
-        if !returned.contains(&head) {
-            return Err(LixError::new(
-                LixError::CODE_COMMIT_NOT_FOUND,
-                format!("sync history response omitted requested head '{head}'"),
-            ));
-        }
-        for boundary in response.boundaries {
-            if !returned.contains(&boundary.commit_id) {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!(
-                        "sync history returned boundary '{}' outside its page",
-                        boundary.commit_id
-                    ),
-                ));
+            for boundary in response.boundaries {
+                if !returned.contains(&boundary.commit_id) {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "sync history returned boundary '{}' outside its page",
+                            boundary.commit_id
+                        ),
+                    ));
+                }
+                if let Some(existing) =
+                    boundaries.insert(boundary.commit_id.clone(), boundary.clone())
+                    && existing != boundary
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync history returned conflicting boundary roots",
+                    ));
+                }
             }
-            if let Some(existing) = boundaries.insert(boundary.commit_id.clone(), boundary.clone())
-                && existing != boundary
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync history returned conflicting boundary roots",
-                ));
-            }
-        }
-        for commit in response_commits.drain(..) {
-            if let Some(existing) = commits.insert(commit.commit_id.clone(), commit.clone())
-                && existing != commit
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync history returned conflicting duplicate commits",
-                ));
+            for commit in response_commits.drain(..) {
+                if let Some(existing) = commits.insert(commit.commit_id.clone(), commit.clone())
+                    && existing != commit
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync history returned conflicting duplicate commits",
+                    ));
+                }
             }
         }
     }
@@ -1089,6 +1107,33 @@ where
         commit_headers: commit_headers.into_values().collect(),
         boundaries: boundaries.into_values().collect(),
     })
+}
+
+async fn fetch_history_head<Transport>(
+    transport: &Transport,
+    head: &str,
+    mut history_page_limit: usize,
+    max_boundaries_per_page: Option<usize>,
+) -> Result<super::SyncHistoryResponse, LixError>
+where
+    Transport: SyncTransport,
+{
+    loop {
+        let response =
+            fetch_history_page_adaptive(transport, head, &mut history_page_limit).await?;
+        let Some(max_boundaries) = max_boundaries_per_page else {
+            return Ok(response);
+        };
+        let Some(next_limit) = smaller_history_demand_page_limit(
+            history_page_limit,
+            response.commits.len(),
+            response.boundaries.len(),
+            max_boundaries,
+        ) else {
+            return Ok(response);
+        };
+        history_page_limit = next_limit;
+    }
 }
 
 fn smaller_history_demand_page_limit(

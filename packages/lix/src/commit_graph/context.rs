@@ -32,6 +32,10 @@ use crate::storage_codec;
 use bytes::Bytes;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
+/// Maximum number of known sparse bodies one history attempt asks sync to
+/// hydrate. The retry loop can request another batch, so memory and network
+/// work stay bounded independently of repository age.
+const DEFERRED_HISTORY_DEMAND_CENSUS_BATCH_SIZE: usize = 64;
 /// Read model for resolving changelog commit facts at a head.
 ///
 /// The commit graph owns semantic commit metadata. Physical tracked-state
@@ -491,6 +495,33 @@ where
             let nodes = self
                 .reachable_nodes_within_depth(start_commit_id, request.max_depth)
                 .await?;
+            if shaping.may_include_members
+                && crate::tracked_state::has_deferred_commit_history(&self.store).await?
+            {
+                let candidates = nodes
+                    .iter()
+                    .filter(|reachable| depth_matches(reachable.depth, request))
+                    .filter(|reachable| {
+                        scope_digest_outcome(&reachable.commit, request, &shaping)
+                            != ScopeDigestOutcome::Pruned
+                    })
+                    .map(|reachable| reachable.commit.commit_id)
+                    .collect::<Vec<_>>();
+                for candidate_batch in
+                    candidates.chunks(DEFERRED_HISTORY_DEMAND_CENSUS_BATCH_SIZE)
+                {
+                    let deferred = crate::tracked_state::deferred_commit_history_ids(
+                        &self.store,
+                        candidate_batch,
+                    )
+                    .await?;
+                    if !deferred.is_empty() {
+                        return Err(crate::tracked_state::sync_history_required_for_commits(
+                            &deferred,
+                        ));
+                    }
+                }
+            }
             for reachable in nodes.iter() {
                 self.extend_history_entries(
                     start_commit_id,

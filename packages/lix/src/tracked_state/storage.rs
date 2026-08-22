@@ -24,9 +24,9 @@ use crate::row_pk::RowPk;
 use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, StorageAdapterRead,
     StorageBeginScanOptions, StorageCoreProjection, StorageError, StorageGetManyRequest,
-    StorageGetManyResult, StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue,
-    StorageScanCursor, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet, ValueSemantics,
-    exact_get_many,
+    StorageGetManyResult, StorageGetOptions, StorageKey, StorageKeyRange, StoragePrefix,
+    StorageProjectedValue, StorageScanCursor, StorageSpace, StorageSpaceId, StorageValue,
+    StorageWriteSet, ValueSemantics, exact_get_many,
 };
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
@@ -9189,14 +9189,78 @@ pub(crate) async fn commit_history_is_deferred(
     Ok(result.value.into_iter().next().flatten().is_some())
 }
 
-fn sync_history_required(commit_id: CommitId) -> LixError {
+pub(crate) async fn has_deferred_commit_history(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<bool, LixError> {
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
+    let mut cursor = store
+        .begin_scan(
+            TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    Ok(!cursor.next_page(1).await?.is_empty())
+}
+
+pub(crate) fn sync_history_required_for_commits(commit_ids: &[CommitId]) -> LixError {
+    let commit_ids = commit_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     LixError::new(
         "LIX_SYNC_HISTORY_REQUIRED",
-        format!("commit '{commit_id}' requires deferred history payloads"),
+        format!(
+            "{} commit{} require deferred history payloads",
+            commit_ids.len(),
+            if commit_ids.len() == 1 { "" } else { "s" },
+        ),
     )
     .with_details(serde_json::json!({
-        "commitIds": [commit_id.to_string()],
+        "commitIds": commit_ids,
     }))
+}
+
+fn sync_history_required(commit_id: CommitId) -> LixError {
+    sync_history_required_for_commits(&[commit_id])
+}
+
+/// Returns the subset of known commit headers whose history bodies are deferred.
+///
+/// One point-read plan preserves the caller's nearest-first order while letting
+/// a sparse history walk report a batch of absences instead of failing at the
+/// first checkpoint body it encounters.
+pub(crate) async fn deferred_commit_history_ids(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_ids: &[CommitId],
+) -> Result<Vec<CommitId>, LixError> {
+    if commit_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = commit_ids
+        .iter()
+        .map(|commit_id| StorageKey(Bytes::from(commit_key(*commit_id))))
+        .collect::<Vec<_>>();
+    let result = PointReadPlan::new(TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE, &keys)
+        .materialize(
+            store,
+            StorageGetOptions {
+                projection: StorageCoreProjection::KeyOnly,
+            },
+        )
+        .await?;
+    Ok(commit_ids
+        .iter()
+        .copied()
+        .zip(result.value)
+        .filter_map(|(commit_id, marker)| marker.map(|_| commit_id))
+        .collect())
 }
 
 /// Classifies a missing point-replay commit without turning a known deferred
