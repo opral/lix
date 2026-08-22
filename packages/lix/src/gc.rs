@@ -967,12 +967,14 @@ where
     let graph_reachable_manifests =
         crate::tracked_state::load_commit_state_manifests(store, &graph_reachable_ids).await?;
     let mut history_manifests_missing = 0u64;
+    let mut graph_reachable_with_manifests = BTreeSet::new();
     for (commit_id, manifest) in graph_reachable_ids
         .into_iter()
         .zip(graph_reachable_manifests)
     {
         if manifest.is_some() {
             physical_dependencies.insert(commit_id);
+            graph_reachable_with_manifests.insert(commit_id);
         } else {
             history_manifests_missing += 1;
         }
@@ -985,8 +987,15 @@ where
              permanently truncated and cannot be recovered"
         );
     }
-    semantic_dependencies.extend(graph_reachable);
     let mut cas_logical_dependencies = history_dependencies;
+    // File history materializes binary payloads from the state selected at
+    // each graph-reachable commit. Keeping the commit delta but sweeping its
+    // blob turns a valid historical row into `content = NULL` and prevents a
+    // sparse replica from hydrating that checkpoint. The checkpoint chain is
+    // already the compacted, observable history boundary, so its CAS roots
+    // must have the same reachability lifetime as its row-history deltas.
+    cas_logical_dependencies.extend(graph_reachable_with_manifests);
+    semantic_dependencies.extend(graph_reachable);
     let mut manifests = BTreeMap::new();
     let mut pending = chronology_roots.iter().copied().collect::<Vec<_>>();
     while let Some(commit_id) = pending.pop() {
@@ -2537,6 +2546,10 @@ mod tests {
     /// `last_gc_sequence`, which only a *successful* sweep advances, so the
     /// due-predicate would latch: every later checkpoint would pay for a
     /// doomed full-repository sweep, forever.
+    ///
+    /// The CAS closure must preserve the same tolerance. Adding the missing
+    /// graph commit as a binary-root authority would make blob-root discovery
+    /// demand the already-reclaimed manifest and reintroduce this latch.
     #[tokio::test]
     async fn ordinary_gc_tolerates_and_counts_history_reclaimed_before_the_fix() {
         let plan = history_retention_fixture(false).await;

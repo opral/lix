@@ -43,6 +43,56 @@ async fn repository_gc_keeps_plugin_wasm_for_cold_runtime_execution() {
 }
 
 #[tokio::test]
+async fn repository_gc_keeps_graph_reachable_file_history_content() {
+    let memory = Memory::new();
+    let lix = open_lix().with_storage(memory.clone()).await.unwrap();
+    write_file(&lix, "/history.txt", b"before gc").await;
+    let file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = '/history.txt'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .unwrap();
+    let historical_checkpoint = lix.create_checkpoint().await.unwrap().commit_id;
+    write_file(&lix, "/history.txt", b"after gc").await;
+    lix.create_checkpoint().await.unwrap();
+
+    let storage = StorageAdapter::new(memory);
+    let orphan_hash = write_binary_cas_for_bench(&storage, b"history-gc-orphan")
+        .await
+        .unwrap();
+    collect_repository_gc_for_bench(&storage).await.unwrap();
+    assert!(
+        read_binary_cas_for_bench(&storage, &orphan_hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "the test must run a reclaiming CAS sweep"
+    );
+
+    let history = lix
+        .execute(
+            "SELECT content FROM lix_history('lix_file', $1) \
+             WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+            &[
+                Value::Text(historical_checkpoint),
+                Value::Text(file_id),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        history.rows()[0].get::<Vec<u8>>("content").unwrap(),
+        b"before gc",
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn repository_gc_reclaims_plugin_wasm_after_final_registry_root_releases() {
     let memory = Memory::new();
     let lix = open_lix().with_storage(memory.clone()).await.unwrap();
