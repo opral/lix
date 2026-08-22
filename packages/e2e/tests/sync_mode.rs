@@ -388,7 +388,8 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
         .get::<String>("id")
         .expect("file id decodes");
     let mut target_checkpoint = None;
-    for index in 0..12 {
+    let mut gc_candidate = None;
+    for index in 0..64 {
         authority
             .execute(
                 "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
@@ -399,16 +400,54 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
             )
             .await
             .expect("update checkpointed file");
+        if index == 0 {
+            gc_candidate = Some(active_head(&authority).await);
+        }
         let checkpoint = authority
             .create_checkpoint()
             .await
             .expect("create file checkpoint")
             .commit_id;
-        if index == 4 {
+        if index == 31 {
             target_checkpoint = Some(checkpoint);
         }
     }
     let target_checkpoint = target_checkpoint.expect("target checkpoint captured");
+    let gc_candidate = gc_candidate.expect("GC candidate captured");
+    let gc_deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        let present = authority
+            .execute(
+                "SELECT id FROM lix_commit WHERE id = $1",
+                &[Value::Text(gc_candidate.clone())],
+            )
+            .await
+            .expect("GC candidate presence should load");
+        if present.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < gc_deadline,
+            "checkpoint GC must reclaim an interval commit before retention is asserted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let authority_history = authority
+        .execute(
+            "SELECT content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+            &[
+                Value::Text(target_checkpoint.clone()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .expect("authority retains exact checkpoint content");
+    assert_eq!(
+        authority_history.rows()[0]
+            .get::<Vec<u8>>("content")
+            .expect("authority history content decodes"),
+        b"version-31",
+    );
 
     let probe = Arc::new(HttpProbe::default());
     let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
@@ -418,7 +457,7 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
 
     let history = replica
         .execute(
-            "SELECT id, path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+            "SELECT id, path, content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
             &[
                 Value::Text(target_checkpoint),
                 Value::Text(file_id.clone()),
@@ -432,6 +471,12 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
             .get::<String>("path")
             .expect("history path decodes"),
         "/bounded.md",
+    );
+    assert_eq!(
+        history.rows()[0]
+            .get::<Vec<u8>>("content")
+            .expect("history content decodes"),
+        b"version-31",
     );
     assert_eq!(
         probe.history_gets.load(Ordering::Acquire) - history_before,
