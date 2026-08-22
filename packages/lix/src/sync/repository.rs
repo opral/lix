@@ -10175,6 +10175,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warm_replica_history_reads_files_added_by_a_later_checkpoint() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/baseline.md".to_owned()),
+                    Value::Text("baseline".to_owned()),
+                ],
+            )
+            .await
+            .expect("baseline file should commit");
+        let previous_checkpoint = authority
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should commit")
+            .commit_id;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("baseline snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+
+        let added_file = authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA)) RETURNING id",
+                &[
+                    Value::Text("/added-later.md".to_owned()),
+                    Value::Text("added later".to_owned()),
+                ],
+            )
+            .await
+            .expect("later file should commit");
+        let added_file_id = added_file.rows()[0]
+            .get::<String>("id")
+            .expect("later file id should decode");
+        let latest_checkpoint = authority
+            .create_checkpoint()
+            .await
+            .expect("later checkpoint should commit")
+            .commit_id;
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("later checkpoint delta should load");
+        hydrate_delta_blobs(&authority, &replica, &delta).await;
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("warm replica should apply the checkpoint delta");
+
+        let diff = loop {
+            match replica
+                .execute(
+                    "SELECT DISTINCT file_id FROM lix_diff($1, $2) WHERE file_id IS NOT NULL",
+                    &[
+                        Value::Text(previous_checkpoint.clone()),
+                        Value::Text(latest_checkpoint.clone()),
+                    ],
+                )
+                .await
+            {
+                Ok(diff) => break diff,
+                Err(error)
+                    if error.code == "LIX_SYNC_HISTORY_REQUIRED"
+                        || error.code == LixError::CODE_COMMIT_NOT_FOUND =>
+                {
+                    let details = error.details.as_ref().expect("history demand details");
+                    let commit_ids = if error.code == "LIX_SYNC_HISTORY_REQUIRED" {
+                        details["commitIds"]
+                            .as_array()
+                            .expect("history demand ids")
+                            .iter()
+                            .map(|id| id.as_str().expect("history demand id").to_owned())
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![details["commit_id"]
+                            .as_str()
+                            .expect("missing graph commit id")
+                            .to_owned()]
+                    };
+                    for commit_id in commit_ids {
+                        let page = authority
+                            .sync_history(&commit_id, 100)
+                            .await
+                            .expect("deferred diff history should load from authority");
+                        let mut boundary_rows = Vec::new();
+                        for boundary in &page.boundaries {
+                            let rows = authority
+                                .pull_sync_snapshot_rows(
+                                    &boundary.commit_id,
+                                    &boundary.commit_id,
+                                    None,
+                                    super::super::MAX_SYNC_REQUEST_ITEMS,
+                                )
+                                .await
+                                .expect("history boundary rows should load");
+                            assert_eq!(rows.continuation, None);
+                            boundary_rows.extend(rows.rows);
+                        }
+                        replica
+                            .import_sync_history_headers(&page.commit_headers)
+                            .await
+                            .expect("history headers should import");
+                        replica
+                            .import_sync_history_boundaries(
+                                &page.commits,
+                                &page.boundaries,
+                                &boundary_rows,
+                            )
+                            .await
+                            .expect("history bodies should import");
+                    }
+                }
+                Err(error) => panic!("checkpoint diff should load: {error:?}"),
+            }
+        };
+        assert!(
+            diff.rows().iter().any(|row| {
+                row.get::<String>("file_id")
+                    .is_ok_and(|file_id| file_id == added_file_id)
+            }),
+            "checkpoint diff should expose the later file id",
+        );
+
+        let history = replica
+            .execute(
+                "SELECT id, path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+                &[
+                    Value::Text(latest_checkpoint),
+                    Value::Text(added_file_id),
+                ],
+            )
+            .await
+            .expect("hydrated warm checkpoint history should be queryable");
+        assert_eq!(history.rows().len(), 1);
+        assert_eq!(
+            history.rows()[0]
+                .get::<String>("path")
+                .expect("history path should decode"),
+            "/added-later.md",
+        );
+    }
+
+    #[tokio::test]
     async fn authority_rejects_a_stale_expected_checkpoint_coordinate() {
         let authority = open_lix().await.expect("authority should open");
         write_key_value(&authority, "checkpoint-cas", "baseline").await;

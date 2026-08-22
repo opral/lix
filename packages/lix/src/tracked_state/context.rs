@@ -3850,12 +3850,14 @@ where
         }
         let (record, manifest) =
             storage::load_commit_record_and_point_replay_state(&self.store, commit_id).await?;
-        let record = record.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("cannot point-replay tracked_state for unknown commit '{commit_id}'"),
-            )
-        })?;
+        let record = match record {
+            Some(record) => record,
+            None => {
+                return Err(
+                    storage::missing_point_replay_commit_error(&self.store, commit_id).await,
+                );
+            }
+        };
         let manifest = match manifest {
             Some(manifest) => manifest,
             None => {
