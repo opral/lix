@@ -6,9 +6,9 @@
 //! the same storage write set that publishes the compacted checkpoint.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
 
 use bytes::Bytes;
+use web_time::Instant;
 
 use crate::branch::{BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability};
 use crate::changelog::{ChangeId, CommitId, GcLiveSet, GcPlan, GcRoot, GcSweepSet};
