@@ -10066,6 +10066,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sparse_snapshot_history_reads_files_added_at_checkpoint_state() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
+                &[
+                    Value::Text("/baseline.md".to_owned()),
+                    Value::Text("baseline".to_owned()),
+                ],
+            )
+            .await
+            .expect("baseline file should commit");
+        authority
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should commit");
+        let added_file = authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA)) RETURNING id",
+                &[
+                    Value::Text("/added.md".to_owned()),
+                    Value::Text("added".to_owned()),
+                ],
+            )
+            .await
+            .expect("added file should commit");
+        let added_file_id = added_file.rows()[0]
+            .get::<String>("id")
+            .expect("added file id should decode");
+        let checkpoint = authority
+            .create_checkpoint()
+            .await
+            .expect("latest checkpoint should commit")
+            .commit_id;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (_, snapshot_head) = default_head(&snapshot);
+        assert_eq!(checkpoint, snapshot_head);
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+
+        let history = loop {
+            match replica
+                .execute(
+                    "SELECT id, path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+                    &[
+                        Value::Text(checkpoint.clone()),
+                        Value::Text(added_file_id.clone()),
+                    ],
+                )
+                .await
+            {
+                Ok(history) => break history,
+                Err(error) if error.code == "LIX_SYNC_HISTORY_REQUIRED" => {
+                    let commit_ids = error
+                        .details
+                        .as_ref()
+                        .and_then(|details| details["commitIds"].as_array())
+                        .expect("history demand ids")
+                        .iter()
+                        .map(|id| id.as_str().expect("history demand id").to_owned())
+                        .collect::<Vec<_>>();
+                    for commit_id in commit_ids {
+                        let page = authority
+                            .sync_history(&commit_id, 1)
+                            .await
+                            .expect("deferred history should load from authority");
+                        let mut boundary_rows = Vec::new();
+                        for boundary in &page.boundaries {
+                            let rows = authority
+                                .pull_sync_snapshot_rows(
+                                    &boundary.commit_id,
+                                    &boundary.commit_id,
+                                    None,
+                                    super::super::MAX_SYNC_REQUEST_ITEMS,
+                                )
+                                .await
+                                .expect("history boundary rows should load");
+                            assert_eq!(rows.continuation, None);
+                            boundary_rows.extend(rows.rows);
+                        }
+                        replica
+                            .import_sync_history_headers(&page.commit_headers)
+                            .await
+                            .expect("history headers should import");
+                        replica
+                            .import_sync_history_boundaries(
+                                &page.commits,
+                                &page.boundaries,
+                                &boundary_rows,
+                            )
+                            .await
+                            .expect("history bodies should import");
+                    }
+                }
+                Err(error) => panic!("checkpoint history should load: {error:?}"),
+            }
+        };
+        assert_eq!(history.rows().len(), 1);
+        assert_eq!(
+            history.rows()[0]
+                .get::<String>("path")
+                .expect("history path should decode"),
+            "/added.md",
+        );
+    }
+
+    #[tokio::test]
     async fn authority_rejects_a_stale_expected_checkpoint_coordinate() {
         let authority = open_lix().await.expect("authority should open");
         write_key_value(&authority, "checkpoint-cas", "baseline").await;
