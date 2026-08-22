@@ -32,6 +32,8 @@ struct HttpProbe {
     delta_pulls: AtomicU64,
     snapshot_row_pulls: AtomicU64,
     history_gets: AtomicU64,
+    active_history_gets: AtomicU64,
+    max_concurrent_history_gets: AtomicU64,
     blob_gets: AtomicU64,
     chunk_gets: AtomicU64,
     chunk_puts: AtomicU64,
@@ -435,6 +437,73 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
         probe.history_gets.load(Ordering::Acquire) - history_before,
         1,
         "a depth-ordered point lookup should hydrate only the selected checkpoint",
+    );
+
+    replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+    authority.close().await.expect("close authority");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sparse_checkpoint_history_hydrates_missing_bodies_concurrently() {
+    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let inserted = authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/checkpoint.md', CAST('version-00' AS BYTEA)) RETURNING id",
+            &[],
+        )
+        .await
+        .expect("create checkpointed file");
+    let file_id = inserted.rows()[0]
+        .get::<String>("id")
+        .expect("file id decodes");
+    let mut latest_checkpoint = None;
+    for index in 0..12 {
+        authority
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
+                &[
+                    Value::Text(format!("version-{index:02}")),
+                    Value::Text(file_id.clone()),
+                ],
+            )
+            .await
+            .expect("update checkpointed file");
+        latest_checkpoint = Some(
+            authority
+                .create_checkpoint()
+                .await
+                .expect("create file checkpoint")
+                .commit_id,
+        );
+    }
+    let latest_checkpoint = latest_checkpoint.expect("latest checkpoint captured");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+    probe.set_round_trip_delay(Duration::from_millis(500));
+    let history_before = probe.history_gets.load(Ordering::Acquire);
+
+    let history = tokio::time::timeout(
+        WAIT_TIMEOUT,
+        replica.execute(
+            "SELECT content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth",
+            &[Value::Text(latest_checkpoint), Value::Text(file_id)],
+        ),
+    )
+    .await
+    .expect("sparse checkpoint history must complete promptly")
+    .expect("sparse checkpoint history succeeds");
+    assert!(history.rows().len() >= 12);
+    assert!(
+        probe.history_gets.load(Ordering::Acquire) - history_before >= 8,
+        "fixture must retain enough cold checkpoint bodies to exercise batching",
+    );
+    assert!(
+        probe.max_concurrent_history_gets.load(Ordering::Acquire) > 1,
+        "one history attempt must hydrate its censused sparse bodies concurrently",
     );
 
     replica.close().await.expect("close replica");
@@ -1139,6 +1208,7 @@ where
                 .split('&')
                 .any(|part| part.starts_with("snapshotBranchId="))
         });
+    let is_history_get = parts.method == Method::GET && path == "/lix/v1/sync/history";
     if is_push {
         probe.pushes.fetch_add(1, Ordering::Release);
     }
@@ -1151,8 +1221,12 @@ where
     if parts.method == Method::GET && path == "/lix/v1/sync/blob" {
         probe.blob_gets.fetch_add(1, Ordering::Release);
     }
-    if parts.method == Method::GET && path == "/lix/v1/sync/history" {
+    if is_history_get {
         probe.history_gets.fetch_add(1, Ordering::Release);
+        let active = probe.active_history_gets.fetch_add(1, Ordering::AcqRel) + 1;
+        probe
+            .max_concurrent_history_gets
+            .fetch_max(active, Ordering::AcqRel);
     }
     if parts.method == Method::GET && path == "/lix/v1/sync/chunk" {
         probe.chunk_gets.fetch_add(1, Ordering::Release);
@@ -1177,6 +1251,9 @@ where
             },
         )
         .await;
+    if is_history_get {
+        probe.active_history_gets.fetch_sub(1, Ordering::AcqRel);
+    }
     if is_push && response.status() == StatusCode::CONFLICT {
         probe.push_conflicts.fetch_add(1, Ordering::Release);
     }
