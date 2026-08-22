@@ -8,6 +8,7 @@ import {
 	bumpVersion,
 	changelogEntry,
 	loadChanges,
+	manualReleaseVersion,
 	updateCargoToml,
 	updateCargoLockfiles,
 	updateChangelog,
@@ -49,6 +50,18 @@ test("bumpVersion applies semver changes", () => {
 	assert.equal(bumpVersion("0.6.0", "patch"), "0.6.1");
 	assert.equal(bumpVersion("0.6.0", "minor"), "0.7.0");
 	assert.equal(bumpVersion("0.6.0", "major"), "1.0.0");
+});
+
+test("manualReleaseVersion accepts an explicit newer stable version", () => {
+	assert.equal(manualReleaseVersion("0.12.3", "0.14.0"), "0.14.0");
+	assert.equal(manualReleaseVersion("0.12.3", "1.0.0"), "1.0.0");
+});
+
+test("manualReleaseVersion rejects malformed or non-incrementing versions", () => {
+	assert.throws(() => manualReleaseVersion("0.12.3", "v0.14.0"), /Unsupported manual release/);
+	assert.throws(() => manualReleaseVersion("0.12.3", "0.14"), /Unsupported manual release/);
+	assert.throws(() => manualReleaseVersion("0.12.3", "0.12.3"), /must be greater/);
+	assert.throws(() => manualReleaseVersion("0.12.3", "0.11.9"), /must be greater/);
 });
 
 test("loadChanges validates and parses fragments", () => {
