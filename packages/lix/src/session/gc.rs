@@ -700,17 +700,27 @@ mod tests {
                 .expect("padding checkpoint succeeds");
         }
 
-        // `create_checkpoint` spawns the sweep, so drive one here rather than
-        // racing it; an explicit call is a no-op once the debt is clear, so
-        // whichever runs first, the assertions below read the same committed
-        // outcome. Without the tolerance this call is what fails, loudly:
-        // the sweep hard-errors on the missing manifest.
+        // `create_checkpoint` spawns the sweep, so this explicit call can
+        // overlap it. Retry only that optimistic commit conflict; once either
+        // sweep clears the debt, the explicit call is a no-op and the
+        // assertions below read the same committed outcome. Without the
+        // missing-manifest tolerance this call still fails loudly.
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            session
-                .collect_checkpoint_garbage()
-                .await
-                .expect("a sweep must not fail on a repository swept before the fix");
+            match session.collect_checkpoint_garbage().await {
+                Ok(_) => {}
+                Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "checkpoint GC remained in conflict with its spawned sweep: {error:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                Err(error) => {
+                    panic!("a sweep must not fail on a repository swept before the fix: {error:?}")
+                }
+            }
             let remaining = present(&session, &interior_commits).await;
             if remaining.is_empty() {
                 break;
