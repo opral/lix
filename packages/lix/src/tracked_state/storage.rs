@@ -9199,6 +9199,23 @@ fn sync_history_required(commit_id: CommitId) -> LixError {
     }))
 }
 
+/// Classifies a missing point-replay commit without turning a known deferred
+/// header into local corruption.
+pub(crate) async fn missing_point_replay_commit_error(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> LixError {
+    match commit_history_is_deferred(store, commit_id).await {
+        Ok(true) => sync_history_required(commit_id),
+        Ok(false) => LixError::commit_not_found(
+            commit_id.to_string(),
+            "walk_commit_graph",
+            "graph_node",
+        ),
+        Err(error) => error,
+    }
+}
+
 /// Classifies a missing commit-state manifest without confusing intentionally
 /// deferred history with local corruption.
 pub(crate) async fn missing_commit_state_manifest_error(
