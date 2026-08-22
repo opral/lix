@@ -252,8 +252,7 @@ mod tests {
     use crate::changelog::{
         ChangeId, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId, CommitRecord,
     };
-    use crate::commit_graph::CommitGraphChange;
-    use crate::commit_graph::CommitGraphContext;
+    use crate::commit_graph::{CommitGraphChange, CommitGraphContext, CommitGraphReader};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageKey, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::{
@@ -621,6 +620,51 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(bounded, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn reachable_nodes_through_depth_completes_merge_layer_and_excludes_next_depth() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
+                commit_change("commit-right-change", "commit-right", &[], &["commit-root"]),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &[],
+                    &["commit-left", "commit-right"],
+                ),
+            ],
+        )
+        .await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let bounded = CommitGraphReader::reachable_nodes_through_depth(
+            &mut reader,
+            &commit_id("commit-head"),
+            1,
+        )
+        .await
+        .expect("depth-bounded trait read should load");
+        let mut expected = vec![(commit_id("commit-head"), 0)];
+        expected.extend(sorted_commit_ids_at_depth(
+            ["commit-left", "commit-right"],
+            1,
+        ));
+        assert_eq!(
+            bounded
+                .iter()
+                .map(|reachable| (reachable.commit.commit_id, reachable.depth))
+                .collect::<Vec<_>>(),
+            expected,
+            "the complete sibling layer belongs to the boundary and the root below it does not"
+        );
     }
 
     #[tokio::test]

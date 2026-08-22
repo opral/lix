@@ -182,9 +182,11 @@ where
                     let mut rows = if runtime_limit == Some(0) {
                         Vec::new()
                     } else {
-                        match load_anchor_file_history_row(
+                        match load_bounded_file_history_rows(
                             Arc::clone(&commit_graph),
                             query_source.clone(),
+                            &blob_reader,
+                            &plugin_host,
                             &route,
                             &public_predicate,
                             lookup_ids.as_ref(),
@@ -196,7 +198,7 @@ where
                         .await
                         .map_err(lix_error_to_datafusion_error)?
                         {
-                            Some(row) => vec![row],
+                            Some(rows) => rows,
                             None => load_file_history_rows(
                                 commit_graph,
                                 query_source,
@@ -207,6 +209,7 @@ where
                                 lookup_ids.as_ref(),
                                 needs_data,
                                 metadata_projection,
+                                None,
                             )
                             .await
                             .map_err(lix_error_to_datafusion_error)?,
@@ -647,12 +650,19 @@ struct FileHistoryPluginDiscovery {
 thread_local! {
     static ANCHOR_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ANCHOR_PROBE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BOUNDED_FRONTIERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
 pub(crate) fn reset_file_history_anchor_probe_census() {
     ANCHOR_PROBES.with(|count| count.set(0));
     ANCHOR_PROBE_HITS.with(|count| count.set(0));
+    BOUNDED_FRONTIERS.with(|depths| depths.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn file_history_bounded_frontier_census() -> Vec<u32> {
+    BOUNDED_FRONTIERS.with(|depths| depths.borrow().clone())
 }
 
 #[cfg(test)]
@@ -663,18 +673,20 @@ pub(crate) fn file_history_anchor_probe_census() -> (usize, usize) {
     )
 }
 
-/// Returns the nearest selected file row directly from the anchor checkpoint
-/// when the physical top-k asks for exactly one depth-ordered row.
+/// Returns the nearest selected file rows through a bounded depth frontier
+/// when the physical top-k asks for an ascending depth-ordered fetch.
 ///
-/// This is deliberately a narrow proof. A descriptor/blob change for the
-/// selected file at depth zero means no older event can precede the answer.
-/// The authenticated anchor state supplies the composed path and deletion
-/// state, while the depth-zero entry supplies real history provenance. Queries
-/// that project data/provenance, apply history-row constraints, or do not hit
-/// the anchor fall back to the complete shaped traversal below.
-async fn load_anchor_file_history_row<S>(
+/// Direct descriptor/blob revisions prove an upper depth boundary for the
+/// requested number of shaped rows. The complete directory/plugin shaper then
+/// runs through that boundary, including the whole merge layer, and blob bytes
+/// load only after the shaped rows are truncated to the fetch. Queries that
+/// project provenance, apply history-row constraints, or cannot prove one
+/// exact file and anchor fall back to the complete traversal below.
+async fn load_bounded_file_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    plugin_host: &PluginRuntimeHost,
     route: &HistoryRoute,
     public_predicate: &FileHistoryPublicPredicate,
     lookup_ids: Option<&FileHistoryLookupIds>,
@@ -682,16 +694,17 @@ async fn load_anchor_file_history_row<S>(
     needs_data: bool,
     metadata_projection: HistoryMetadataProjection,
     limit: Option<usize>,
-) -> Result<Option<FileHistoryOutputRow>, LixError>
+) -> Result<Option<Vec<FileHistoryOutputRow>>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let Some(lookup_ids) = lookup_ids else {
         return Ok(None);
     };
-    if limit != Some(1)
-        || needs_data
-        || lookup_ids.0.len() != 1
+    let Some(limit) = limit.filter(|limit| *limit > 0) else {
+        return Ok(None);
+    };
+    if lookup_ids.0.len() != 1
         || route.as_of_commit_ids.len() != 1
         || route.invalid_as_of_commit_filter
         || route.contradictory
@@ -704,7 +717,7 @@ where
         || schema.fields().iter().any(|field| {
             !matches!(
                 field.name().as_str(),
-                "id" | "path" | HISTORY_COL_DEPTH
+                "id" | "path" | "content" | HISTORY_COL_DEPTH
             )
         })
     {
@@ -714,71 +727,77 @@ where
     #[cfg(test)]
     ANCHOR_PROBES.with(|count| count.set(count.get() + 1));
 
-    let event_route = file_history_descriptor_blob_route(&route.traversal_only(), lookup_ids)?;
-    let mut entries = load_history_entries(
-        HistoryViewDescriptor {
-            view_name: "lix_history('lix_file')",
-            as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
-        },
-        commit_graph,
-        query_source.clone(),
-        &event_route,
-        vec![
-            FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-            BLOB_REF_SCHEMA_KEY.to_string(),
-        ],
-        metadata_projection,
-        Some(1),
-    )
-    .await?;
-    let Some(entry) = entries.pop() else {
-        return Ok(None);
-    };
-    if entry.depth != 0 {
-        return Ok(None);
-    }
-
-    let file_id = lookup_ids
-        .0
-        .first()
-        .expect("single file-history lookup id");
-    let state = Arc::new(
-        load_file_history_observed_state(
-            &mut TrackedStateContext::new().reader(query_source.store),
-            &entry.observed_commit_id,
-            Some(lookup_ids),
+    // Direct descriptor/blob revisions form a complete set of boundaries for
+    // one file. The Nth distinct direct revision is therefore an upper depth
+    // bound for the Nth shaped revision: directory and plugin events can only
+    // add rows before that boundary. Completing the whole depth layer below
+    // preserves merge semantics while avoiding traversal beneath it.
+    let direct_route = file_history_descriptor_blob_route(&route.traversal_only(), lookup_ids)?;
+    let mut raw_limit = limit.saturating_mul(2).max(2);
+    loop {
+        let entries = load_history_entries(
+            HistoryViewDescriptor {
+                view_name: "lix_history('lix_file')",
+                as_of_commit_column: HISTORY_COL_AS_OF_COMMIT_ID,
+            },
+            Arc::clone(&commit_graph),
+            query_source.clone(),
+            &direct_route,
+            vec![
+                FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                BLOB_REF_SCHEMA_KEY.to_string(),
+            ],
+            metadata_projection,
+            Some(raw_limit),
         )
-        .await?,
-    );
-    let Some((descriptor_ordinal, descriptor)) = state
-        .descriptors
-        .iter()
-        .enumerate()
-        .find(|(_, descriptor)| descriptor.id == *file_id)
-    else {
-        return Ok(None);
-    };
-    let path = resolve_observed_file_history_path(descriptor, &state.directories);
-    if !public_predicate.matches(file_id, path.as_deref()) {
-        return Ok(None);
+        .await?;
+        if entries.is_empty() {
+            #[cfg(test)]
+            ANCHOR_PROBE_HITS.with(|count| count.set(count.get() + 1));
+            return Ok(Some(Vec::new()));
+        }
+        let exhausted = entries.len() < raw_limit;
+        let mut seen_commits = BTreeSet::new();
+        let distinct = entries
+            .iter()
+            .filter_map(|entry| {
+                seen_commits
+                    .insert(entry.observed_commit_id.as_str())
+                    .then_some((entry.observed_commit_id.as_str(), entry.depth))
+            })
+            .collect::<Vec<_>>();
+        let frontier = distinct
+            .get(limit.saturating_sub(1))
+            .or_else(|| exhausted.then(|| distinct.last()).flatten())
+            .map(|(_, depth)| *depth);
+        let Some(frontier) = frontier else {
+            raw_limit = raw_limit.saturating_mul(2);
+            continue;
+        };
+        let mut bounded_route = route.clone();
+        bounded_route.max_depth = Some(i64::from(frontier));
+        #[cfg(test)]
+        BOUNDED_FRONTIERS.with(|depths| depths.borrow_mut().push(frontier));
+        let rows = load_file_history_rows(
+            Arc::clone(&commit_graph),
+            query_source.clone(),
+            blob_reader,
+            plugin_host,
+            &bounded_route,
+            public_predicate,
+            Some(lookup_ids),
+            needs_data,
+            metadata_projection,
+            Some(limit),
+        )
+        .await?;
+        if rows.len() >= limit || exhausted {
+            #[cfg(test)]
+            ANCHOR_PROBE_HITS.with(|count| count.set(count.get() + 1));
+            return Ok(Some(rows));
+        }
+        raw_limit = raw_limit.saturating_mul(2);
     }
-
-    #[cfg(test)]
-    ANCHOR_PROBE_HITS.with(|count| count.set(count.get() + 1));
-
-    Ok(Some(FileHistoryOutputRow {
-        observed_state: state,
-        descriptor_ordinal: u32::try_from(descriptor_ordinal).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "lix_file_history descriptor ordinal exceeds u32",
-            )
-        })?,
-        id: file_id.clone(),
-        path,
-        data: None,
-        event: file_history_event_from_entry(file_id.clone(), &entry),
-    }))
 }
 
 async fn load_file_history_rows<S>(
@@ -791,6 +810,7 @@ async fn load_file_history_rows<S>(
     lookup_ids: Option<&FileHistoryLookupIds>,
     needs_data: bool,
     metadata_projection: HistoryMetadataProjection,
+    output_limit: Option<usize>,
 ) -> Result<Vec<FileHistoryOutputRow>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -805,7 +825,11 @@ where
     }
 
     let event_route = route.traversal_only();
-    let context_route = route.anchors_only();
+    let context_route = if lookup_ids.is_some() && route.max_depth.is_some() {
+        route.traversal_only()
+    } else {
+        route.anchors_only()
+    };
     // A `path` predicate prunes exactly like an `id` predicate once it is
     // resolved to the file IDs that could render that path.
     let resolved_lookup_ids = match lookup_ids {
@@ -837,8 +861,12 @@ where
         metadata_projection,
     )
     .await?;
-    let parent_commit_ids_by_commit =
-        load_history_commit_parents(&commit_graph, &context_route.as_of_commit_ids).await?;
+    let parent_commit_ids_by_commit = load_history_commit_parents(
+        &commit_graph,
+        &context_route.as_of_commit_ids,
+        context_route.max_depth.and_then(|depth| u32::try_from(depth).ok()),
+    )
+    .await?;
     let plugin_discovery = discover_file_history_plugins(
         Arc::clone(&commit_graph),
         query_source.clone(),
@@ -937,6 +965,7 @@ where
         &filesystem_context.descriptors,
         &observed_states,
         &parent_commit_ids_by_commit,
+        event_route.max_depth.is_some() && event_route == context_route,
     );
     let plugin_state_events = file_history_plugin_events(
         &event_plugin_state,
@@ -960,7 +989,10 @@ where
             .chain(plugin_owner_events)
             .chain(plugin_registry_events),
     );
-    let prepared = prepare_file_history_rows(&observed_states, events, route, public_predicate)?;
+    let mut prepared = prepare_file_history_rows(&observed_states, events, route, public_predicate)?;
+    if let Some(output_limit) = output_limit {
+        prepared.truncate(output_limit);
+    }
     let blob_bytes = if needs_data {
         load_file_history_blob_bytes(blob_reader, &prepared).await?
     } else {
@@ -1968,16 +2000,17 @@ fn file_history_events(
     context_descriptors: &[FileHistoryDescriptorRecord],
     observed_states: &BTreeMap<String, Arc<FileHistoryObservedState>>,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
+    allow_observed_descriptor_evidence: bool,
 ) -> Vec<FileHistoryEvent> {
-    let mut descriptor_ids_by_as_of = BTreeSet::<(String, String)>::new();
-
-    for descriptor in context_descriptors {
-        let key = (
-            descriptor.id.clone(),
-            descriptor.entry.as_of_commit_id.clone(),
-        );
-        descriptor_ids_by_as_of.insert(key);
-    }
+    let descriptor_ids_by_as_of = context_descriptors
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.id.clone(),
+                descriptor.entry.as_of_commit_id.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
 
     let mut candidates = Vec::new();
     let directory_indexes = observed_states
@@ -2016,6 +2049,15 @@ fn file_history_events(
     for blob in event_blobs {
         if descriptor_ids_by_as_of
             .contains(&(blob.file_id.clone(), blob.entry.as_of_commit_id.clone()))
+            || (allow_observed_descriptor_evidence
+                && observed_states
+                    .get(&blob.entry.observed_commit_id)
+                    .is_some_and(|state| {
+                        state
+                            .descriptors
+                            .iter()
+                            .any(|descriptor| descriptor.id == blob.file_id)
+                    }))
         {
             candidates.push(file_history_event_from_entry(
                 blob.file_id.clone(),
@@ -2148,6 +2190,7 @@ where
     // A registry is only ever compared at a commit whose registry changed and
     // at that commit's direct parents, so reconstruct exactly those.
     let mut registry_commit_ids = BTreeSet::new();
+    registry_commit_ids.extend(context_route.as_of_commit_ids.iter().cloned());
     for entry in &registry_events {
         registry_commit_ids.insert(entry.observed_commit_id.clone());
         registry_commit_ids.extend(
@@ -2165,6 +2208,14 @@ where
         let registry =
             load_plugin_registry_at_observed_commit(&mut reader, &shared_observed_commit).await?;
         registries_by_commit.insert(observed_commit_id, registry);
+    }
+    for registry in registries_by_commit.values() {
+        schema_keys.extend(
+            registry
+                .plugins()
+                .iter()
+                .flat_map(|plugin| plugin.schema_keys().iter().cloned()),
+        );
     }
 
     Ok(FileHistoryPluginDiscovery {
@@ -3293,6 +3344,7 @@ mod tests {
             &descriptors,
             &observed_states,
             &BTreeMap::new(),
+            false,
         );
 
         assert_eq!(events.len(), SIBLING_COUNT);

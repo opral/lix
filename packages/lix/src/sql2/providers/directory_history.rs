@@ -256,7 +256,7 @@ where
     .await?;
     let event_descriptors = parse_directory_history_records(&event_entries)?;
     let parent_commit_ids_by_commit =
-        load_history_commit_parents(&commit_graph, &event_route.as_of_commit_ids).await?;
+        load_history_commit_parents(&commit_graph, &event_route.as_of_commit_ids, None).await?;
     let mut observed_commit_ids = event_descriptors
         .iter()
         .map(|record| record.entry.observed_commit_id.clone())
