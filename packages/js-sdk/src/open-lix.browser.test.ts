@@ -116,6 +116,32 @@ test("createCheckpoint returns the new active head through browser WASM", async 
 	}
 });
 
+test("checkpoint GC starts without requiring a browser Tokio runtime", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const lix = await openLix();
+	try {
+		// The first checkpoint establishes the recovery boundary. Sixteen more
+		// non-empty intervals reach the fresh-repository GC threshold
+		// (16 intervals * yield 1 * denominator 4 = inventory floor 64).
+		for (let sequence = 0; sequence < 17; sequence += 1) {
+			await lix.execute(
+				`INSERT INTO lix_key_value (key, value)
+				 VALUES ($1, $2)
+				 ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+				["checkpoint-gc-browser-test", sequence],
+			);
+			const checkpoint = await lix.createCheckpoint();
+			expect(checkpoint.commitId).toEqual(expect.any(String));
+		}
+
+		expect((await lix.execute("SELECT 1 AS value")).rows[0]?.get("value")).toBe(
+			1,
+		);
+	} finally {
+		await lix.close();
+	}
+});
+
 test("lix_restore moves the active branch to an ancestor through browser WASM", async () => {
 	const { openLix } = await import("@lix-js/sdk");
 	const lix = await openLix();

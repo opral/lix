@@ -171,7 +171,6 @@ where
             // commit relies on storage conflict detection.
             let gc_session = self.clone();
             let gc_coordinator = self.commit_coordinator.clone();
-            #[cfg(not(target_family = "wasm"))]
             if let Err(error) =
                 crate::background_task::spawn("lix-checkpoint-gc", move || async move {
                     gc_session.collect_checkpoint_garbage_best_effort().await;
@@ -181,11 +180,6 @@ where
                 self.commit_coordinator.finish_checkpoint_gc();
                 return Err(error);
             }
-            #[cfg(target_family = "wasm")]
-            tokio::spawn(async move {
-                gc_session.collect_checkpoint_garbage_best_effort().await;
-                gc_coordinator.finish_checkpoint_gc();
-            });
         }
         Ok(outcome.receipt)
     }
