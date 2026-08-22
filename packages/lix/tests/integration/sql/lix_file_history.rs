@@ -1917,7 +1917,7 @@ simulation_test!(
             .expect("history anchor should exist");
 
         crate::sql2::reset_file_history_anchor_probe_census();
-        let digest_before = crate::commit_graph::scope_digest_census();
+        crate::commit_graph::reset_thread_scope_digest_census();
         let result = session
             .execute(
                 &format!(
@@ -1933,11 +1933,14 @@ simulation_test!(
         assert_eq!(result.len(), 0);
         assert_eq!(crate::sql2::file_history_anchor_probe_census(), (1, 1));
         assert!(crate::sql2::file_history_bounded_frontier_census().is_empty());
-        let digest = crate::commit_graph::scope_digest_census().since(&digest_before);
+        let digest = crate::commit_graph::thread_scope_digest_census();
         assert!(
             digest.pruned >= 70,
             "every unrelated preview commit should be rejected by its authenticated scope digest: {digest:?}"
         );
+        assert_eq!(digest.loaded_present, 0);
+        assert_eq!(digest.loaded_opaque, 0);
+        assert_eq!(digest.loaded_absent, 0);
     }
 );
 
