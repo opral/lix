@@ -21,6 +21,7 @@ const SYNC_REQUEST_TOO_LARGE_CODE: &str = "LIX_ERROR_REQUEST_BODY_TOO_LARGE";
 const SYNC_ITEM_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_ITEM_TOO_LARGE";
 const SYNC_SNAPSHOT_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_SNAPSHOT_TOO_LARGE";
 const SYNC_DEMAND_STALLED_CODE: &str = "LIX_ERROR_SYNC_DEMAND_STALLED";
+const SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE: usize = 4;
 
 #[derive(Debug)]
 pub(crate) struct SyncRuntime {
@@ -139,7 +140,7 @@ where
         })
         .collect::<Vec<_>>();
     let (history, mut rows) = futures_util::try_join!(
-        fetch_history_objects(transport, head_ids, 1),
+        fetch_history_objects(transport, head_ids, 1, None),
         fetch_snapshot_rows(transport, &branch_targets),
     )?;
     let mut checkpoint_targets = Vec::new();
@@ -955,8 +956,13 @@ where
     if pending.is_empty() {
         return Ok(());
     }
-    let fetched =
-        fetch_history_objects(transport, pending, super::MAX_SYNC_HISTORY_PAGE_SIZE).await?;
+    let fetched = fetch_history_objects(
+        transport,
+        pending,
+        super::MAX_SYNC_HISTORY_PAGE_SIZE,
+        Some(SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE),
+    )
+    .await?;
     let boundary_targets = fetched
         .boundaries
         .iter()
@@ -981,6 +987,7 @@ async fn fetch_history_objects<Transport>(
     transport: &Transport,
     pending: BTreeSet<String>,
     requested_page_limit: usize,
+    max_boundaries_per_page: Option<usize>,
 ) -> Result<FetchedHistory, LixError>
 where
     Transport: SyncTransport,
@@ -990,8 +997,22 @@ where
     let mut boundaries = BTreeMap::new();
     let mut history_page_limit = requested_page_limit;
     for head in pending {
-        let response =
-            fetch_history_page_adaptive(transport, &head, &mut history_page_limit).await?;
+        let response = loop {
+            let response =
+                fetch_history_page_adaptive(transport, &head, &mut history_page_limit).await?;
+            let Some(max_boundaries) = max_boundaries_per_page else {
+                break response;
+            };
+            let Some(next_limit) = smaller_history_demand_page_limit(
+                history_page_limit,
+                response.commits.len(),
+                response.boundaries.len(),
+                max_boundaries,
+            ) else {
+                break response;
+            };
+            history_page_limit = next_limit;
+        };
         for header in response.commit_headers {
             if let Some(existing) = commit_headers.insert(header.commit_id.clone(), header.clone())
                 && existing != header
@@ -1055,6 +1076,21 @@ where
         commit_headers: commit_headers.into_values().collect(),
         boundaries: boundaries.into_values().collect(),
     })
+}
+
+fn smaller_history_demand_page_limit(
+    current_limit: usize,
+    returned_commits: usize,
+    returned_boundaries: usize,
+    max_boundaries: usize,
+) -> Option<usize> {
+    if returned_boundaries <= max_boundaries || current_limit <= 1 || returned_commits <= 1 {
+        return None;
+    }
+    // A checkpoint-dense page can contain fewer commits than requested. Base
+    // the next probe on what the authority actually returned so a 40-commit
+    // tail does not redundantly retry at 50 before it starts shrinking.
+    Some(smaller_page_limit(current_limit.min(returned_commits)))
 }
 
 async fn fetch_history_page_adaptive<Transport>(
@@ -2463,6 +2499,7 @@ mod tests {
             &transport,
             BTreeSet::from([head.clone()]),
             super::super::MAX_SYNC_HISTORY_PAGE_SIZE,
+            None,
         )
         .await
         .expect("deep head fetch succeeds");
@@ -3141,6 +3178,34 @@ mod tests {
             )
             .await
             .expect("same SQL succeeds after history hydration");
+    }
+
+    #[test]
+    fn history_demand_page_limit_tracks_checkpoint_density() {
+        assert_eq!(
+            smaller_history_demand_page_limit(100, 40, 39, 4),
+            Some(20),
+            "a short checkpoint-dense tail shrinks from its returned size",
+        );
+        assert_eq!(
+            smaller_history_demand_page_limit(20, 20, 19, 4),
+            Some(10),
+        );
+        assert_eq!(
+            smaller_history_demand_page_limit(5, 5, 4, 4),
+            None,
+            "a page at the boundary budget is admitted",
+        );
+        assert_eq!(
+            smaller_history_demand_page_limit(100, 100, 1, 4),
+            None,
+            "deep sparse history keeps its full commit batch",
+        );
+        assert_eq!(
+            smaller_history_demand_page_limit(1, 1, 5, 4),
+            None,
+            "one indivisible merge commit retains all required boundaries",
+        );
     }
 
     #[tokio::test]
