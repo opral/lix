@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version to release and publish, without a leading v
+        description: Version to prepare, release, and publish, without a leading v
         required: true
         type: string
   push:
@@ -28,6 +28,10 @@ jobs:
       release_sha: ${{ steps.version.outputs.release_sha }}
       has_release: ${{ steps.version.outputs.has_release }}
 
+    permissions:
+      contents: write
+      pull-requests: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,27 +42,64 @@ jobs:
       - name: Validate release version
         id: version
         env:
+          GH_TOKEN: ${{ github.token }}
           MANUAL_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           release_sha="$GITHUB_SHA"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release source $GITHUB_SHA is not reachable from origin/main." >&2
+            exit 1
+          fi
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             if [[ "$MANUAL_VERSION" == v* ]]; then
               echo "Manual release version must not include a leading v." >&2
               exit 1
             fi
-            tag="$(node scripts/release-tag.mjs "$MANUAL_VERSION" | tail -n 1)"
+            tag="v${MANUAL_VERSION}"
+            if git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" >/dev/null; then
+              echo "$tag already exists; choose a newer manual release version." >&2
+              exit 1
+            fi
+
+            node scripts/prepare-manual-release.mjs "$MANUAL_VERSION"
+            git diff --check
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- \
+              .changenotes \
+              CHANGELOG.md \
+              Cargo.lock \
+              Cargo.toml \
+              packages \
+              plugins \
+              tooling/Cargo.lock \
+              tooling/Cargo.toml
+            git commit -m "Release $tag"
+            release_sha="$(git rev-parse HEAD)"
+            manual_branch="manual-release/${tag}"
+            git push --force origin "HEAD:refs/heads/${manual_branch}"
+            existing_manual_pr="$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state open \
+              --head "$manual_branch" \
+              --json number \
+              --jq 'length')"
+            if [ "$existing_manual_pr" = 0 ]; then
+              gh pr create \
+                --repo "$GITHUB_REPOSITORY" \
+                --base main \
+                --head "$manual_branch" \
+                --title "Release $tag" \
+                --body "Manually generated release commit for $tag. Merging this PR keeps main's Cargo, npm, lockfile, changelog, and changenote state aligned with the published release."
+            fi
           else
             tag="$(node scripts/release-tag.mjs | tail -n 1)"
           fi
           if [ -z "$tag" ] || [ "$tag" = "No release tag needed for this commit." ]; then
             echo "has_release=false" >> "$GITHUB_OUTPUT"
             exit 0
-          fi
-
-          if ! git merge-base --is-ancestor "$release_sha" origin/main; then
-            echo "Release source $release_sha is not reachable from origin/main." >&2
-            exit 1
           fi
 
           existing_tag_sha="$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" || true)"

@@ -63,6 +63,27 @@ export function bumpVersion(version, type) {
 	throw new Error(`Unsupported change type: ${type}`);
 }
 
+export function manualReleaseVersion(current, requested) {
+	const pattern = /^(\d+)\.(\d+)\.(\d+)$/;
+	const currentMatch = current.match(pattern);
+	const requestedMatch = requested.match(pattern);
+	if (!requestedMatch) {
+		throw new Error(`Unsupported manual release version: ${requested}`);
+	}
+	if (!currentMatch) {
+		throw new Error(`Unsupported current version: ${current}`);
+	}
+	const currentParts = currentMatch.slice(1).map(Number);
+	const requestedParts = requestedMatch.slice(1).map(Number);
+	const firstDifference = requestedParts.findIndex(
+		(part, index) => part !== currentParts[index],
+	);
+	if (firstDifference === -1 || requestedParts[firstDifference] < currentParts[firstDifference]) {
+		throw new Error(`Manual release version ${requested} must be greater than ${current}`);
+	}
+	return requested;
+}
+
 export function changeFiles(root) {
 	const dir = join(root, ".changenotes");
 	if (!existsSync(dir)) return [];
@@ -519,6 +540,26 @@ export function prepareRelease(root, { date = new Date().toISOString().slice(0, 
 	}
 	updateCargoLockfiles(root);
 	return { version, type, changes };
+}
+
+export function prepareManualRelease(
+	root,
+	requestedVersion,
+	{ date = new Date().toISOString().slice(0, 10), runCargo = execFileSync } = {},
+) {
+	const version = manualReleaseVersion(currentVersion(root), requestedVersion);
+	const changes = loadChanges(root);
+	updateCargoToml(root, version);
+	validateCargoLockstepVersions(root, version);
+	updatePackageVersion(root, version);
+	if (changes.length > 0) {
+		updateChangelog(root, version, date, changes);
+		for (const change of changes) {
+			rmSync(join(root, change.path));
+		}
+	}
+	updateCargoLockfiles(root, { runCargo });
+	return { version, changes };
 }
 
 export function releaseTagForHead(root) {
