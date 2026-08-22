@@ -1,27 +1,38 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "lix_account",
+  "description": "An actor that can author changes in a Lix repository. Repository accounts carry durable attribution; optional public profile data is resolved separately through profile_uri.",
   "columns": [
     {
       "name": "id",
       "type": "uuid",
       "nullable": false,
-      "default_expression": "uuidv7()"
+      "default_expression": "uuidv7()",
+      "description": "Stable repository account identifier used for attribution. This is not an authentication credential or a public profile identifier."
     },
     {
       "name": "kind",
       "type": "text",
-      "nullable": false
+      "nullable": false,
+      "description": "Application-defined account category, such as a human, agent, application, or system actor."
     },
     {
       "name": "name",
       "type": "text",
-      "nullable": false
+      "nullable": false,
+      "description": "Repository-local fallback display name used when profile_uri is absent or cannot be resolved. It is not authoritative and is not automatically synchronized with the public profile."
     },
     {
       "name": "status",
       "type": "text",
-      "nullable": false
+      "nullable": false,
+      "description": "Application-defined lifecycle status of the account within this repository."
+    },
+    {
+      "name": "profile_uri",
+      "type": "text",
+      "nullable": true,
+      "description": "Optional absolute URI of a public machine-readable profile document. Profile data is presentation metadata and must not be used for authentication or authorization."
     }
   ],
   "primary_key": [
