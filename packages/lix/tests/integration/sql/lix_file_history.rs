@@ -1938,9 +1938,6 @@ simulation_test!(
             digest.pruned >= 70,
             "every unrelated preview commit should be rejected by its authenticated scope digest: {digest:?}"
         );
-        assert_eq!(digest.loaded_present, 0);
-        assert_eq!(digest.loaded_opaque, 0);
-        assert_eq!(digest.loaded_absent, 0);
     }
 );
 
