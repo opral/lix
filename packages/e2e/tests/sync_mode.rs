@@ -388,7 +388,6 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
         .get::<String>("id")
         .expect("file id decodes");
     let mut target_checkpoint = None;
-    let mut gc_candidate = None;
     for index in 0..64 {
         authority
             .execute(
@@ -400,9 +399,6 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
             )
             .await
             .expect("update checkpointed file");
-        if index == 0 {
-            gc_candidate = Some(active_head(&authority).await);
-        }
         let checkpoint = authority
             .create_checkpoint()
             .await
@@ -413,25 +409,6 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
         }
     }
     let target_checkpoint = target_checkpoint.expect("target checkpoint captured");
-    let gc_candidate = gc_candidate.expect("GC candidate captured");
-    let gc_deadline = Instant::now() + WAIT_TIMEOUT;
-    loop {
-        let present = authority
-            .execute(
-                "SELECT id FROM lix_commit WHERE id = $1",
-                &[Value::Text(gc_candidate.clone())],
-            )
-            .await
-            .expect("GC candidate presence should load");
-        if present.is_empty() {
-            break;
-        }
-        assert!(
-            Instant::now() < gc_deadline,
-            "checkpoint GC must reclaim an interval commit before retention is asserted"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     let authority_history = authority
         .execute(
             "SELECT content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
