@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::storage::{
@@ -11,7 +11,7 @@ use crate::{ExecuteBatchStatement, Value};
 #[derive(Clone)]
 struct ExpiringReadStorage {
     inner: Memory,
-    expire_next_read_call: Arc<AtomicBool>,
+    remaining_expired_read_calls: Arc<AtomicUsize>,
     expired_calls: Arc<AtomicUsize>,
 }
 
@@ -19,13 +19,23 @@ impl ExpiringReadStorage {
     fn new() -> Self {
         Self {
             inner: Memory::new(),
-            expire_next_read_call: Arc::new(AtomicBool::new(false)),
+            remaining_expired_read_calls: Arc::new(AtomicUsize::new(0)),
             expired_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     fn expire_next_read_call(&self) {
-        self.expire_next_read_call.store(true, Ordering::Release);
+        self.expire_read_calls(1);
+    }
+
+    fn expire_read_calls(&self, count: usize) {
+        self.remaining_expired_read_calls
+            .store(count, Ordering::Release);
+    }
+
+    fn allow_reads(&self) {
+        self.remaining_expired_read_calls
+            .store(0, Ordering::Release);
     }
 
     fn expired_calls(&self) -> usize {
@@ -35,13 +45,19 @@ impl ExpiringReadStorage {
 
 struct ExpiringRead {
     inner: MemoryRead,
-    expire_next_read_call: Arc<AtomicBool>,
+    remaining_expired_read_calls: Arc<AtomicUsize>,
     expired_calls: Arc<AtomicUsize>,
 }
 
 impl ExpiringRead {
     fn expire_if_armed(&self) -> Result<(), StorageError> {
-        if self.expire_next_read_call.swap(false, Ordering::AcqRel) {
+        if self
+            .remaining_expired_read_calls
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
             self.expired_calls.fetch_add(1, Ordering::AcqRel);
             return Err(StorageError::ReadExpired);
         }
@@ -62,7 +78,7 @@ impl Storage for ExpiringReadStorage {
     async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         Ok(ExpiringRead {
             inner: self.inner.begin_read(options).await?,
-            expire_next_read_call: Arc::clone(&self.expire_next_read_call),
+            remaining_expired_read_calls: Arc::clone(&self.remaining_expired_read_calls),
             expired_calls: Arc::clone(&self.expired_calls),
         })
     }
@@ -184,6 +200,77 @@ async fn expired_read_waits_for_one_write_quiescent_retry() {
         serde_json::json!(42)
     );
     assert_eq!(storage.expired_calls(), 1);
+}
+
+#[tokio::test]
+async fn expired_read_backs_off_until_cross_context_writer_settles() {
+    let storage = ExpiringReadStorage::new();
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+        &[
+            Value::Text("read-external-quiescence".into()),
+            Value::Integer(42),
+        ],
+    )
+    .await
+    .expect("seed value");
+
+    // A writer in another browser context does not share this engine's write
+    // gate. Keep expiring fresh snapshots until that external churn settles.
+    storage.expire_read_calls(64);
+    let settling_storage = storage.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        settling_storage.allow_reads();
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        lix.execute(
+            "SELECT value FROM lix_key_value WHERE key = $1",
+            &[Value::Text("read-external-quiescence".into())],
+        ),
+    )
+    .await
+    .expect("bounded retry should wait for external writes to settle")
+    .expect("expired read should stay behind the SQL API boundary");
+
+    assert_eq!(
+        result.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!(42)
+    );
+    assert!(
+        storage.expired_calls() > 1,
+        "the regression must exercise repeated cross-context invalidation",
+    );
+}
+
+#[tokio::test]
+async fn perpetually_expired_read_remains_bounded() {
+    let storage = ExpiringReadStorage::new();
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+
+    storage.expire_read_calls(usize::MAX);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        lix.execute("SELECT key FROM lix_key_value", &[]),
+    )
+    .await
+    .expect("retry policy must remain bounded")
+    .expect_err("perpetual invalidation must eventually surface");
+
+    assert_eq!(error.code, "LIX_STORAGE_READ_EXPIRED");
+    assert!(
+        storage.expired_calls() > 1,
+        "the bounded path must cover repeated invalidation",
+    );
 }
 
 #[tokio::test]

@@ -15,11 +15,15 @@ mod wasm;
 mod wasm_http;
 
 #[cfg(not(target_family = "wasm"))]
-pub(super) use native::{SyncTask, sleep, spawn_sync_task};
+pub(super) use native::{SyncTask, spawn_sync_task};
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use native::sleep;
 #[cfg(not(target_family = "wasm"))]
 pub(super) type HttpSyncTransport = super::http::HttpSyncTransport<reqwest::Client>;
 #[cfg(target_family = "wasm")]
-pub(super) use wasm::{SyncTask, sleep, spawn_sync_task};
+pub(super) use wasm::{SyncTask, spawn_sync_task};
+#[cfg(target_family = "wasm")]
+pub(crate) use wasm::sleep;
 #[cfg(target_family = "wasm")]
 pub(super) type HttpSyncTransport = super::http::HttpSyncTransport<wasm_http::BrowserHttpClient>;
 #[cfg(target_family = "wasm")]
