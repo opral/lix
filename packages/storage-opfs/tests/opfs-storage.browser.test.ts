@@ -1,6 +1,16 @@
-import { openLix } from "@lix-js/sdk";
+import {
+	openLix,
+	type LixStorageProvider,
+	type LixStorageProviderRegistration,
+	type LixStorageSpace,
+} from "@lix-js/sdk";
 import { OpfsStorage } from "@lix-js/storage-opfs";
 import { expect, test } from "vitest";
+import {
+	OPFS_RPC_CHANNEL,
+	type OpfsRpcRequest,
+	type OpfsRpcResponse,
+} from "../js/rpc.js";
 import { restoreSynchronousModeBestEffort } from "../js/sqlite-cleanup.js";
 
 test("does not replace a committed result with a synchronous cleanup error", () => {
@@ -130,6 +140,136 @@ test("opens distinct repositories in parallel workers", async () => {
 		expect(await keyValue(reopenedRight, "repository-isolation")).toBe("right");
 	} finally {
 		await Promise.all([reopenedLeft.close(), reopenedRight.close()]);
+	}
+});
+
+test("preserves mixed projection order across batched point reads", async () => {
+	const storage = new OpfsStorage({
+		name: `lix-opfs-batched-read:${crypto.randomUUID()}`,
+	});
+	const provider = await openProvider(storage.lixStorage);
+	const space: LixStorageSpace = {
+		id: 41,
+		name: "batched-read",
+		valueSemantics: "mutable",
+		valueIntegrity: "backendVerified",
+	};
+	const otherSpace: LixStorageSpace = {
+		...space,
+		id: 42,
+		name: "batched-read-other-space",
+	};
+	const entries = Array.from({ length: 650 }, (_, index) => ({
+		key: keyBytes(index),
+		value: new Uint8Array([index & 0xff, index >>> 8]),
+	}));
+	const emptyValueEntry = { key: keyBytes(700), value: new Uint8Array() };
+	const otherSpaceEntry = {
+		key: entries[12]!.key,
+		value: new Uint8Array([42]),
+	};
+	try {
+		const write = await provider.beginWrite({
+			awaitDurable: false,
+			preconditions: [],
+			batchCapacityHintBytes: entries.length * 6,
+		});
+		await write.putMany(space, [...entries, emptyValueEntry]);
+		await write.putMany(otherSpace, [otherSpaceEntry]);
+		await write.commit();
+
+		const read = await provider.beginRead({
+			consistency: "snapshot",
+			durability: "visible",
+		});
+		const requests = [
+			{
+				space,
+				keys: entries.slice(0, 299).map((entry) => entry.key),
+				options: { projection: "fullValue" },
+			},
+			{
+				space,
+				keys: [entries[12]!.key, keyBytes(999)],
+				options: { projection: "keyOnly" },
+			},
+			{
+				space: otherSpace,
+				keys: [entries[12]!.key, keyBytes(999)],
+				options: { projection: "fullValue" },
+			},
+			{
+				space,
+				keys: entries.slice(299).map((entry) => entry.key),
+				options: { projection: "keyOnly" },
+			},
+			{
+				space,
+				keys: [entries[12]!.key, emptyValueEntry.key],
+				options: { projection: "fullValue" },
+			},
+		] satisfies Parameters<typeof read.getMany>[0];
+		const values = await read.getMany(requests);
+
+		const expected = [
+			...entries.slice(0, 299).map((entry) => ({
+				kind: "fullValue",
+				value: entry.value,
+			})),
+			{ kind: "keyOnly" },
+			null,
+			{ kind: "fullValue", value: otherSpaceEntry.value },
+			null,
+			...entries.slice(299).map(() => ({ kind: "keyOnly" } as const)),
+			{ kind: "fullValue", value: entries[12]!.value },
+			{ kind: "fullValue", value: emptyValueEntry.value },
+		];
+		expect(values).toEqual(expected);
+	} finally {
+		await provider.close();
+	}
+});
+
+test("does not replay a request after its owner response completes", async () => {
+	const storageName = `lix-opfs-completed-request:${crypto.randomUUID()}`;
+	const lix = await openLix({
+		storage: new OpfsStorage({ name: storageName }),
+	});
+	const channel = new BroadcastChannel(OPFS_RPC_CHANNEL);
+	const request: OpfsRpcRequest = {
+		kind: "request",
+		requestId: crypto.randomUUID(),
+		clientId: crypto.randomUUID(),
+		storageName,
+		operation: "open",
+		payload: undefined,
+	};
+	const responses: OpfsRpcResponse[] = [];
+	channel.onmessage = (event: MessageEvent<OpfsRpcResponse>) => {
+		if (
+			event.data.kind === "response" &&
+			event.data.requestId === request.requestId
+		) {
+			responses.push(event.data);
+		}
+	};
+	try {
+		channel.postMessage(request);
+		await expect
+			.poll(() => responses.length, { timeout: 2_000 })
+			.toBe(1);
+		channel.postMessage(request);
+		// A unique request from the same sender is a deterministic FIFO barrier.
+		// The old owner re-executed the duplicate and emitted its second response
+		// before this barrier; the completed-ID cache drops it instead.
+		await postRpcAndWait(channel, {
+			...request,
+			requestId: crypto.randomUUID(),
+		});
+		expect(responses).toHaveLength(1);
+	} finally {
+		channel.close();
+		await lix.close();
 	}
 });
 
@@ -275,4 +415,42 @@ async function keyValues(
 		keys,
 	);
 	return result.rows.map((row) => [row.get("key"), row.get("value")]);
+}
+
+function keyBytes(index: number): Uint8Array {
+	const key = new Uint8Array(4);
+	new DataView(key.buffer).setUint32(0, index, false);
+	return key;
+}
+
+async function openProvider(
+	registration: LixStorageProviderRegistration,
+): Promise<LixStorageProvider> {
+	const module = (await import(/* @vite-ignore */ registration.moduleUrl)) as {
+		createLixStorageProvider(options: unknown): Promise<LixStorageProvider>;
+	};
+	return module.createLixStorageProvider(registration.options);
+}
+
+function postRpcAndWait(
+	channel: BroadcastChannel,
+	request: OpfsRpcRequest,
+): Promise<OpfsRpcResponse> {
+	return withTimeout(
+		new Promise((resolve) => {
+			const listener = (event: MessageEvent<OpfsRpcResponse>) => {
+				if (
+					event.data.kind !== "response" ||
+					event.data.requestId !== request.requestId
+				) {
+					return;
+				}
+				channel.removeEventListener("message", listener);
+				resolve(event.data);
+			};
+			channel.addEventListener("message", listener);
+			channel.postMessage(request);
+		}),
+		2_000,
+	);
 }

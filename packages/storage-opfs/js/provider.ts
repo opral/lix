@@ -59,6 +59,10 @@ type BrowserNavigator = {
 
 const SQLITE_VFS_NAME_PREFIX = "lix-opfs-sahpool-";
 const SQLITE_VFS_DIRECTORY = "/lix/sqlite-sahpool";
+// Keep point reads comfortably below SQLite's conservative 999-variable
+// ceiling while collapsing hundreds of JS/Wasm bind-step-reset crossings into
+// a handful of indexed joins.
+const READ_MANY_KEYS_PER_QUERY = 300;
 const SQLITE_SCHEMA = `
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -170,25 +174,56 @@ export class OpfsBackend implements LixStorageProvider {
 		generation: number,
 	): Array<LixStorageProjectedValue | null> {
 		this.#assertGeneration(generation);
+		const entries = requests.flatMap((request) =>
+			request.keys.map((key) => ({
+				spaceId: request.space.id,
+				key,
+				projection: request.options.projection,
+			})),
+		);
 		const values: Array<LixStorageProjectedValue | null> = [];
-		for (const request of requests) {
-			const statement = this.#database.prepare(
-				"SELECT value FROM lix_entries WHERE space = ? AND key = ?",
-			);
-			try {
-				for (const key of request.keys) {
-					statement.bind([request.space.id, key]);
-					if (!statement.step()) {
-						values.push(null);
-					} else if (request.options.projection === "keyOnly") {
-						values.push({ kind: "keyOnly" });
-					} else {
-						values.push({ kind: "fullValue", value: copyBlob(statement.get(0)) });
-					}
-					statement.reset(true);
+		for (
+			let offset = 0;
+			offset < entries.length;
+			offset += READ_MANY_KEYS_PER_QUERY
+		) {
+			const chunk = entries.slice(offset, offset + READ_MANY_KEYS_PER_QUERY);
+			const requestedRows = chunk
+				.map((_, index) => `(${index}, ?, ?, ?)`)
+				.join(", ");
+			const bindings: SqliteValue[] = [];
+			for (const entry of chunk) {
+				bindings.push(
+					entry.spaceId,
+					entry.key,
+					entry.projection === "fullValue" ? 1 : 0,
+				);
+			}
+			const rows: SqliteValue[][] = [];
+			this.#database.exec({
+				sql: `WITH requested(ordinal, space, key, wants_value) AS (
+					VALUES ${requestedRows}
+				)
+				SELECT entries.value IS NOT NULL,
+					CASE WHEN requested.wants_value = 1 THEN entries.value END
+				FROM requested
+				LEFT JOIN lix_entries AS entries
+					ON entries.space = requested.space AND entries.key = requested.key
+				ORDER BY requested.ordinal`,
+				bind: bindings,
+				rowMode: "array",
+				resultRows: rows,
+			});
+			for (let index = 0; index < rows.length; index += 1) {
+				const row = rows[index]!;
+				const entry = chunk[index]!;
+				if (row[0] !== 1) {
+					values.push(null);
+				} else if (entry.projection === "keyOnly") {
+					values.push({ kind: "keyOnly" });
+				} else {
+					values.push({ kind: "fullValue", value: copyBlob(row[1]) });
 				}
-			} finally {
-				statement.finalize();
 			}
 		}
 		this.#assertGeneration(generation);
