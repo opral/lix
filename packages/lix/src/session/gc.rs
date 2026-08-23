@@ -424,10 +424,24 @@ mod tests {
                 .expect("padding checkpoint succeeds");
         }
 
-        let plan = session
-            .collect_checkpoint_garbage()
-            .await
-            .expect("the sweep must succeed");
+        // `create_checkpoint` schedules this same sweep best-effort. The
+        // explicit call can therefore prepare from the same snapshot and lose
+        // the optimistic commit race. Retry that expected conflict until one
+        // sweep has committed; every other error still fails the test.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let plan = loop {
+            match session.collect_checkpoint_garbage().await {
+                Ok(plan) => break plan,
+                Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "checkpoint GC remained in conflict with its spawned sweep: {error:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("the sweep must succeed: {error:?}"),
+            }
+        };
 
         let after = committed_state(&session).await;
         let observed_live_manifest_count = if let Some(plan) = plan {
