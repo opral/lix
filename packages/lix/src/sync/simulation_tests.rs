@@ -686,6 +686,79 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
     );
 }
 
+async fn partial_checkpoint_batches_distinct_change_owners(_sim: Simulation) {
+    const OWNER_COUNT: usize = 50;
+    let authority = fresh_authority().await;
+    write_key_value(&authority, "baseline", "shared").await;
+    authority
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should commit");
+    let mut replica = Replica::bootstrap(AuthorityTransport::connected(authority.clone())).await;
+    for index in 0..OWNER_COUNT {
+        write_key_value(
+            &authority,
+            &format!("owner-{index:02}"),
+            &format!("value-{index:02}"),
+        )
+        .await;
+    }
+    replica
+        .pump()
+        .await
+        .expect("replica should import every distinct change owner");
+    let selected_diff_id = replica
+        .lix
+        .execute(
+            "SELECT diff_id FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value' \
+               AND row_pk = CAST('[\"owner-00\"]' AS JSONB)",
+            &[],
+        )
+        .await
+        .expect("selected working diff should load")
+        .rows()[0]
+        .get::<String>("diff_id")
+        .expect("selected diff id should decode");
+
+    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
+    let checkpoint = replica
+        .lix
+        .execute(
+            "INSERT INTO lix_create_checkpoint (diff_id) SELECT $1 RETURNING commit_id",
+            &[Value::Text(selected_diff_id)],
+        )
+        .await
+        .expect("partial checkpoint should batch selected-change owners");
+    let authority_batches =
+        crate::tracked_state::take_point_replay_authority_batch_probe_for_test();
+
+    assert_eq!(checkpoint.rows_affected(), 1);
+    assert!(
+        authority_batches
+            .iter()
+            .any(|owner_count| *owner_count >= OWNER_COUNT),
+        "the complete selected-change owner set must enter one authority batch: {authority_batches:?}",
+    );
+    assert!(
+        authority_batches.iter().filter(|count| **count == 1).count() <= 8,
+        "partial checkpoint must not fall back to one authority read per owner: {authority_batches:?}",
+    );
+    let remaining = replica
+        .lix
+        .execute(
+            "SELECT count(*) AS count FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value'",
+            &[],
+        )
+        .await
+        .expect("remaining working diff should load")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("remaining count should decode");
+    assert_eq!(remaining, (OWNER_COUNT - 1) as i64);
+}
+
 async fn deterministic_sync_command_traces(_sim: Simulation) {
     for seed in fuzz_seeds(&(0_u64..32).collect::<Vec<_>>()) {
         // Each seed starts from an independent repository, so an override can
@@ -741,6 +814,10 @@ sync_simulation_test!(
 sync_simulation_test!(
     sparse_partial_checkpoint_uses_hot_working_diff,
     sparse_partial_checkpoint_uses_hot_working_diff
+);
+sync_simulation_test!(
+    partial_checkpoint_batches_distinct_change_owners,
+    partial_checkpoint_batches_distinct_change_owners
 );
 
 struct XorShift64(u64);

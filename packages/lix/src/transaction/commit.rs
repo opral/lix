@@ -36,7 +36,7 @@ use crate::tracked_state::{
     TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
     TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
     TrackedStateScanRequest, TrackedStateSingleStringReplacementRef, encode_key_ref,
-    load_commit_delta_change_records, load_commit_delta_replay_metadata,
+    load_commit_delta_change_records_for_owners, load_commit_delta_replay_metadata,
     stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
@@ -1762,90 +1762,85 @@ async fn load_selected_change_records(
     read: &(impl StorageAdapterRead + ?Sized),
     commit_rows: &[FinalizedCommitRow],
 ) -> Result<HashMap<SelectedChangeKey, ChangeRecord>, LixError> {
-    let mut by_source_commit = BTreeMap::<CommitId, Vec<StagedCommitChangeRef<'_>>>::new();
-    for change_ref in commit_rows
+    let change_refs = commit_rows
         .iter()
         .flat_map(|commit| selected_changes(&commit.selected_change_batches))
-    {
         // Identity and timestamps fully describe a selected tombstone.
         // Historical rows may be absent or retain metadata, while checkpoint
         // HOT tombstones must carry no payload.
-        if change_ref.deleted {
-            continue;
-        }
-        by_source_commit
-            .entry(change_ref.source_commit_id)
-            .or_default()
-            .push(change_ref);
-    }
+        .filter(|change_ref| !change_ref.deleted)
+        .collect::<Vec<_>>();
+    let requests = change_refs
+        .iter()
+        .map(|change_ref| {
+            (
+                change_ref.source_commit_id,
+                TrackedStateKey {
+                    schema_key: change_ref.schema_key().to_owned(),
+                    file_id: change_ref.file_id().map(str::to_owned),
+                    row_pk: change_ref.row_pk().clone(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let loaded = load_commit_delta_change_records_for_owners(read, &requests).await?;
+    let missing_ids = change_refs
+        .iter()
+        .zip(&loaded)
+        .filter_map(|(change_ref, record)| record.is_none().then_some(change_ref.change_id))
+        .collect::<Vec<_>>();
+    let fallback = ChangelogContext::new()
+        .reader(read)
+        .load_changes(ChangeLoadRequest {
+            change_ids: &missing_ids,
+        })
+        .await?
+        .into_iter()
+        .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
+        .collect::<HashMap<_, _>>();
 
     let mut records = HashMap::new();
-    for (source_commit_id, change_refs) in by_source_commit {
-        let keys = change_refs
-            .iter()
-            .map(|change_ref| TrackedStateKey {
-                schema_key: change_ref.schema_key().to_owned(),
-                file_id: change_ref.file_id().map(str::to_owned),
-                row_pk: change_ref.row_pk().clone(),
-            })
-            .collect::<Vec<_>>();
-        let loaded = load_commit_delta_change_records(read, source_commit_id, &keys).await?;
-        let missing_ids = change_refs
-            .iter()
-            .zip(&loaded)
-            .filter_map(|(change_ref, record)| record.is_none().then_some(change_ref.change_id))
-            .collect::<Vec<_>>();
-        let fallback = ChangelogContext::new()
-            .reader(read)
-            .load_changes(ChangeLoadRequest {
-                change_ids: &missing_ids,
-            })
-            .await?
-            .into_iter()
-            .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
-            .collect::<HashMap<_, _>>();
-        for (change_ref, record) in change_refs.into_iter().zip(loaded) {
-            let record = record.or_else(|| fallback.get(&change_ref.change_id).cloned());
-            let Some(record) = record else {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "selected change '{}' for ({:?}, {:?}, {:?}) has no authoritative payload at source commit '{}'",
-                        change_ref.change_id,
-                        change_ref.schema_key(),
-                        change_ref.file_id(),
-                        change_ref.row_pk(),
-                        source_commit_id
-                    ),
-                ));
-            };
-            if record.change_id != change_ref.change_id
-                || record.schema_key != change_ref.schema_key()
-                || record.file_id.as_deref() != change_ref.file_id()
-                || record.row_pk != *change_ref.row_pk()
-                || record.snapshot.is_none() != change_ref.deleted
-                || record.created_at != change_ref.updated_at
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "selected change '{}' does not match its authoritative source payload",
-                        change_ref.change_id
-                    ),
-                ));
-            }
-            let key = selected_change_key(change_ref);
-            if let Some(existing) = records.insert(key, record.clone())
-                && existing != record
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "selected change '{}' resolves to conflicting source payloads",
-                        change_ref.change_id
-                    ),
-                ));
-            }
+    for (change_ref, record) in change_refs.into_iter().zip(loaded) {
+        let record = record.or_else(|| fallback.get(&change_ref.change_id).cloned());
+        let Some(record) = record else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "selected change '{}' for ({:?}, {:?}, {:?}) has no authoritative payload at source commit '{}'",
+                    change_ref.change_id,
+                    change_ref.schema_key(),
+                    change_ref.file_id(),
+                    change_ref.row_pk(),
+                    change_ref.source_commit_id
+                ),
+            ));
+        };
+        if record.change_id != change_ref.change_id
+            || record.schema_key != change_ref.schema_key()
+            || record.file_id.as_deref() != change_ref.file_id()
+            || record.row_pk != *change_ref.row_pk()
+            || record.snapshot.is_none() != change_ref.deleted
+            || record.created_at != change_ref.updated_at
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "selected change '{}' does not match its authoritative source payload",
+                    change_ref.change_id
+                ),
+            ));
+        }
+        let key = selected_change_key(change_ref);
+        if let Some(existing) = records.insert(key, record.clone())
+            && existing != record
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "selected change '{}' resolves to conflicting source payloads",
+                    change_ref.change_id
+                ),
+            ));
         }
     }
     Ok(records)
@@ -6996,7 +6991,7 @@ fn account_has_changes_error(account_id: &str) -> LixError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -7025,6 +7020,44 @@ mod tests {
         ($($row:expr),* $(,)?) => {
             PreparedStateBatch::from_test_rows(vec![$($row),*])
         };
+    }
+
+    struct ChangeBatchCountingRead<R> {
+        inner: R,
+        change_batches: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl<R> StorageAdapterRead for ChangeBatchCountingRead<R>
+    where
+        R: StorageAdapterRead,
+    {
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        fn get_many(
+            &self,
+            requests: &[crate::storage::GetManyRequest<'_>],
+        ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+            for request in requests {
+                if request.space == crate::changelog::CHANGE_SPACE {
+                    self.change_batches
+                        .lock()
+                        .expect("change batch counter lock")
+                        .push(request.keys.len());
+                }
+            }
+            self.inner.get_many(requests)
+        }
+
+        fn begin_scan(
+            &self,
+            space: StorageSpace,
+            range: KeyRange,
+            opts: BeginScanOptions,
+        ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+            self.inner.begin_scan(space, range, opts)
+        }
     }
 
     fn ts(value: &str) -> LixTimestamp {
@@ -10676,6 +10709,78 @@ mod tests {
             ts("2026-01-01T00:00:00Z"),
         );
         batch.finish()
+    }
+
+    #[tokio::test]
+    async fn selected_change_fallback_batches_standalone_changelog_reads() {
+        const CHANGE_COUNT: usize = 8;
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp = ts("2026-01-01T00:00:00Z");
+        let changes = (0..CHANGE_COUNT)
+            .map(|index| ChangeRecord {
+                format_version: 2,
+                change_id: change_id(&format!("fallback-change-{index}")),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                schema_key: "test_schema".to_owned(),
+                row_pk: RowPk::single(format!("fallback-row-{index}")),
+                file_id: None,
+                snapshot: Some(b"{}".to_vec()),
+                metadata: None,
+                created_at: timestamp,
+                origin_key: None,
+            })
+            .collect::<Vec<_>>();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fallback fixture read should open");
+        let mut writes = storage.new_write_set();
+        ChangelogContext::new()
+            .writer(&mut &read, &mut writes)
+            .stage_certified_sparse_append(crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: changes.clone(),
+            })
+            .await
+            .expect("standalone fallback changes should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("standalone fallback changes should publish");
+
+        let change_batches = Arc::new(Mutex::new(Vec::new()));
+        let read = ChangeBatchCountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("counted fallback read should open"),
+            change_batches: Arc::clone(&change_batches),
+        };
+        let commit_rows = [FinalizedCommitRow {
+            commit_id: commit_id("fallback-checkpoint"),
+            parent_commit_ids: Vec::new(),
+            created_at: timestamp,
+            selected_change_batches: (0..CHANGE_COUNT)
+                .map(|index| {
+                    selected_change_batch_from(
+                        &format!("fallback-change-{index}"),
+                        &format!("fallback-row-{index}"),
+                        &format!("missing-fallback-owner-{index}"),
+                    )
+                })
+                .collect(),
+        }];
+        let loaded = load_selected_change_records(&read, &commit_rows)
+            .await
+            .expect("standalone selected changes should resolve in one fallback batch");
+
+        assert_eq!(loaded.len(), CHANGE_COUNT);
+        assert_eq!(
+            *change_batches.lock().expect("change batch counter lock"),
+            vec![CHANGE_COUNT],
+            "all missing selected payloads must enter one physical changelog point batch",
+        );
     }
 
     fn tracked_global_row(change_id: &str) -> TestPreparedStateRow {
