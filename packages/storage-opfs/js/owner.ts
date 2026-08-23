@@ -23,32 +23,45 @@ type BackendEntry = {
 const backends = new Map<string, BackendEntry>();
 const channel = new BroadcastChannel(OPFS_RPC_CHANNEL);
 const inFlightRequests = new Map<string, Promise<void>>();
+const completedRequests = new Map<string, number>();
 const MAX_WARM_IDLE_BACKENDS = 2;
+const COMPLETED_REQUEST_TTL_MS = 30_000;
 
 setInterval(() => {
-	const cutoff = Date.now() - 15_000;
+	const now = Date.now();
+	const cutoff = now - 15_000;
 	for (const [name, entry] of backends) {
 		for (const [clientId, lastSeen] of entry.clients) {
 			if (lastSeen < cutoff) entry.clients.delete(clientId);
 		}
 		scheduleIdleClose(name, entry);
 	}
+	pruneCompletedRequests(now);
 }, 5_000);
 
 channel.onmessage = (event: MessageEvent<OpfsRpcRequest>) => {
 	const request = event.data;
 	if (!request || request.kind !== "request") return;
 	// BroadcastChannel retries can deliver the same request while a SQLite
-	// operation is still running. Do not enqueue duplicate reads/commits.
-	if (inFlightRequests.has(request.requestId)) return;
-	const pending = dispatch(request);
+	// operation is still running, and queued retry events can arrive after it
+	// completes. Retain completed IDs past the client's retry deadline so one
+	// logical read cannot be replayed into an ever-growing owner backlog.
+	if (
+		inFlightRequests.has(request.requestId) ||
+		completedRequests.has(request.requestId)
+	) {
+		return;
+	}
+	const pending = dispatch(request).then((responded) => {
+		if (responded) rememberCompletedRequest(request.requestId);
+	});
 	inFlightRequests.set(request.requestId, pending);
 	void pending
 		.finally(() => inFlightRequests.delete(request.requestId))
 		.catch(() => undefined);
 };
 
-async function dispatch(request: OpfsRpcRequest): Promise<void> {
+async function dispatch(request: OpfsRpcRequest): Promise<boolean> {
 	const entry = getEntry(request.storageName);
 	if (request.operation === "close") {
 		entry.clients.delete(request.clientId);
@@ -60,7 +73,7 @@ async function dispatch(request: OpfsRpcRequest): Promise<void> {
 			ok: true,
 			result: undefined,
 		});
-		return;
+		return true;
 	}
 	entry.clients.set(request.clientId, Date.now());
 	if (entry.idleTimer) {
@@ -80,8 +93,9 @@ async function dispatch(request: OpfsRpcRequest): Promise<void> {
 				ok: false,
 				error: serializeError(entry.fatalError),
 			});
+			return true;
 		}
-		return;
+		return false;
 	}
 	const operation = entry.queue.then(async () => {
 		switch (request.operation) {
@@ -139,6 +153,7 @@ async function dispatch(request: OpfsRpcRequest): Promise<void> {
 			ok: true,
 			result,
 		});
+		return true;
 	} catch (error) {
 		postResponse({
 			kind: "response",
@@ -147,6 +162,20 @@ async function dispatch(request: OpfsRpcRequest): Promise<void> {
 			ok: false,
 			error: serializeError(error),
 		});
+		return true;
+	}
+}
+
+function rememberCompletedRequest(requestId: string): void {
+	completedRequests.set(requestId, Date.now());
+	pruneCompletedRequests(Date.now());
+}
+
+function pruneCompletedRequests(now: number): void {
+	const cutoff = now - COMPLETED_REQUEST_TTL_MS;
+	for (const [requestId, completedAt] of completedRequests) {
+		if (completedAt >= cutoff) break;
+		completedRequests.delete(requestId);
 	}
 }
 
