@@ -650,6 +650,7 @@ struct FileHistoryPluginDiscovery {
 thread_local! {
     static ANCHOR_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ANCHOR_PROBE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RAW_PROBE_LIMITS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     static BOUNDED_FRONTIERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -657,7 +658,13 @@ thread_local! {
 pub(crate) fn reset_file_history_anchor_probe_census() {
     ANCHOR_PROBES.with(|count| count.set(0));
     ANCHOR_PROBE_HITS.with(|count| count.set(0));
+    RAW_PROBE_LIMITS.with(|limits| limits.borrow_mut().clear());
     BOUNDED_FRONTIERS.with(|depths| depths.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn file_history_raw_probe_limit_census() -> Vec<usize> {
+    RAW_PROBE_LIMITS.with(|limits| limits.borrow().clone())
 }
 
 #[cfg(test)]
@@ -733,8 +740,14 @@ where
     // add rows before that boundary. Completing the whole depth layer below
     // preserves merge semantics while avoiding traversal beneath it.
     let direct_route = file_history_descriptor_blob_route(&route.traversal_only(), lookup_ids)?;
-    let mut raw_limit = limit.saturating_mul(2).max(2);
+    // Ask for exactly the requested number first. Descriptor and blob entries
+    // can share a commit, so the distinct-revision check below doubles only
+    // when those duplicates leave us short. Starting at 2N makes sparse files
+    // traverse past a sufficient frontier merely to satisfy probe overfetch.
+    let mut raw_limit = limit;
     loop {
+        #[cfg(test)]
+        RAW_PROBE_LIMITS.with(|limits| limits.borrow_mut().push(raw_limit));
         let entries = load_history_entries(
             HistoryViewDescriptor {
                 view_name: "lix_history('lix_file')",
