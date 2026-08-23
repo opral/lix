@@ -3953,8 +3953,30 @@ async fn stage_tracked_head(
                 lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
             let mut coverage = WorkingDiffIndexCoverage::default();
             let owned_absence_guards = owned_absence_guards(&absence_guards);
+            let partial_checkpoint_epoch = checkpoint_commit_id
+                .filter(|checkpoint_commit_id| *checkpoint_commit_id != root.commit_id);
             let working_diff_mode = match (checkpoint_commit_id, working_diff_epoch.as_ref()) {
-                (Some(_), _) => CompleteWorkingDiffMode::ResetClean,
+                (Some(checkpoint_commit_id), _) if checkpoint_commit_id == root.commit_id => {
+                    CompleteWorkingDiffMode::ResetClean
+                }
+                (Some(checkpoint_commit_id), _) => {
+                    let checkpoint = tracked_snapshots
+                        .get(&checkpoint_commit_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "partial checkpoint child '{}' is missing checkpoint snapshot '{}'",
+                                    root.commit_id, checkpoint_commit_id
+                                ),
+                            )
+                        })?;
+                    CompleteWorkingDiffMode::Rebase {
+                        checkpoint_commit_id,
+                        checkpoint,
+                    }
+                }
                 (None, Some(epoch)) => {
                     let checkpoint = load_persisted_lifecycle_tracked_snapshot(
                         read,
@@ -3988,12 +4010,16 @@ async fn stage_tracked_head(
                     &mut coverage,
                 )
                 .await?;
-            if let Some(epoch) = &working_diff_epoch {
+            if let Some(checkpoint_commit_id) = partial_checkpoint_epoch.or(
+                working_diff_epoch
+                    .as_ref()
+                    .map(|epoch| epoch.checkpoint_commit_id),
+            ) {
                 stage_tracked_working_diff_epoch(
                     writes,
                     &root.branch_id,
                     TrackedWorkingDiffEpoch {
-                        checkpoint_commit_id: epoch.checkpoint_commit_id,
+                        checkpoint_commit_id,
                         generation,
                         coverage,
                     },
@@ -4955,10 +4981,10 @@ async fn stage_checkpoint_working_diff_epochs(
             ));
         }
         // A partial checkpoint publishes a child head whose unselected
-        // changes remain dirty relative to the intermediate checkpoint. The
-        // empty HOT epoch is valid only when the checkpoint itself is the
-        // published head; otherwise the historical diff path reconstructs
-        // the remaining working diff from the two durable roots.
+        // changes remain dirty relative to the intermediate checkpoint.
+        // `stage_tracked_head` rebases that child and stages its sparse epoch
+        // while both lifecycle snapshots are available in the transaction.
+        // The empty epoch here is valid only for a fully clean checkpoint.
         if control.head_commit_id != recovery.checkpoint_commit_id {
             continue;
         }

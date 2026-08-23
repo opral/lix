@@ -31,7 +31,7 @@ use crate::sql2::{
     SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
 };
 use crate::storage_adapter::Storage;
-use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteSetStats};
+use crate::storage_adapter::{Memory, StorageWriteSetStats};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::sync::SyncModeState;
 use crate::telemetry::{
@@ -179,51 +179,6 @@ impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub(crate) async fn open_default(
-        active_account_id: String,
-        storage: StorageAdapter<StorageImpl>,
-        hot_state: Arc<HotStateContext>,
-        tracked_state: Arc<TrackedStateContext>,
-        binary_cas: Arc<BinaryCasContext>,
-        branch_ctx: Arc<BranchContext>,
-        catalog_context: Arc<CatalogContext>,
-        sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
-        deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
-        collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
-        commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
-        observe_coordinator: Arc<ObserveCoordinator>,
-        observe_invalidation: Arc<ObserveInvalidation>,
-        sync_mode: SyncModeState,
-        plugin_host: PluginRuntimeHost,
-        telemetry: Option<Arc<dyn TelemetrySink>>,
-    ) -> Result<Self, LixError> {
-        let read =
-            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
-        let branch_id =
-            load_default_branch_id_from_index(hot_state.as_ref(), branch_ctx.as_ref(), &read)
-                .await?;
-        drop(read);
-        Ok(Self::new(
-            SessionBranch::new(branch_id),
-            active_account_id,
-            storage,
-            hot_state,
-            tracked_state,
-            binary_cas,
-            branch_ctx,
-            catalog_context,
-            sql_planning_cache,
-            deterministic_runtime_gate,
-            collaboration_write_gate,
-            commit_coordinator,
-            observe_coordinator,
-            observe_invalidation,
-            sync_mode,
-            plugin_host,
-            telemetry,
-        ))
-    }
-
     pub(crate) fn new(
         branch: SessionBranch,
         active_account_id: String,
