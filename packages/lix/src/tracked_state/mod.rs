@@ -76,6 +76,11 @@ pub(crate) use storage::load_commit_state_authority_ids;
 pub(crate) use storage::stage_commit_state_manifest;
 #[cfg(test)]
 pub(crate) use storage::stage_sweep_unreachable_content_nodes;
+#[cfg(test)]
+pub(crate) use storage::{
+    arm_point_replay_authority_batch_probe_for_test,
+    take_point_replay_authority_batch_probe_for_test,
+};
 pub(crate) use storage::{
     CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
     CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
@@ -86,7 +91,8 @@ pub(crate) use storage::{
     complete_state_fence_change_owner_commit_ids, direct_change_locator,
     deferred_commit_history_ids,
     encode_commit_state_manifest_replacement_for_migration, load_change_record_by_id,
-    load_commit_delta_change_records, load_commit_delta_members_with_payloads,
+    load_commit_delta_change_records, load_commit_delta_change_records_for_owners,
+    load_commit_delta_members_with_payloads,
     load_commit_delta_members_with_payloads_for_schemas, load_commit_delta_replay_metadata,
     load_commit_delta_selection_certificate, load_commit_history_members_with_payloads_for_schemas,
     has_deferred_commit_history, load_commit_mutation_directory_roots,

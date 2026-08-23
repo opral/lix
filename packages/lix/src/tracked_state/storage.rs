@@ -4776,6 +4776,8 @@ pub(crate) async fn load_point_replay_commit_state(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<Arc<AuthenticatedReplayCommitStateManifest>>, LixError> {
+    #[cfg(test)]
+    record_point_replay_authority_batch_for_test(1);
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_crud_replay_manifest_load();
     let header_keys = [StorageKey(Bytes::from(commit_state_manifest_key(
@@ -4802,6 +4804,95 @@ pub(crate) async fn load_point_replay_commit_state(
         values.next().flatten(),
         values.next().flatten(),
     )
+}
+
+/// Co-loads the shallow replay authority for an operation's complete owner set.
+///
+/// Selected-change materialization commonly addresses rows owned by many
+/// commits. Loading each split header/inventory pair separately turns one
+/// logical point batch into one backend round trip per owner. Keep the
+/// operation-owned authority set outside the small decoded-segment LRU and
+/// authenticate every pair from two aligned point-read groups.
+async fn load_point_replay_commit_states(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_ids: &[CommitId],
+) -> Result<Vec<Option<Arc<AuthenticatedReplayCommitStateManifest>>>, LixError> {
+    if commit_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[cfg(test)]
+    record_point_replay_authority_batch_for_test(commit_ids.len());
+    #[cfg(feature = "storage-benches")]
+    for _ in commit_ids {
+        crate::storage_bench::record_crud_replay_manifest_load();
+    }
+    let header_keys = commit_ids
+        .iter()
+        .map(|commit_id| StorageKey(Bytes::from(commit_state_manifest_key(*commit_id))))
+        .collect::<Vec<_>>();
+    let inventory_keys = commit_ids
+        .iter()
+        .map(|commit_id| StorageKey(Bytes::from(commit_mutation_inventory_key(*commit_id))))
+        .collect::<Vec<_>>();
+    let requests = [
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            keys: &header_keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+            keys: &inventory_keys,
+            opts: StorageGetOptions::default(),
+        },
+    ];
+    let mut values = exact_get_many(store, &requests).await?.values.into_iter();
+    let headers = values.by_ref().take(commit_ids.len()).collect::<Vec<_>>();
+    let inventories = values.collect::<Vec<_>>();
+    if headers.len() != commit_ids.len() || inventories.len() != commit_ids.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state replay authority batch returned the wrong cardinality",
+        ));
+    }
+    commit_ids
+        .iter()
+        .copied()
+        .zip(headers)
+        .zip(inventories)
+        .map(|((commit_id, header), inventory)| {
+            decode_point_replay_commit_state_values(commit_id, header, inventory)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static POINT_REPLAY_AUTHORITY_BATCH_PROBE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static POINT_REPLAY_AUTHORITY_BATCH_PROBE: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_point_replay_authority_batch_for_test(owner_count: usize) {
+    POINT_REPLAY_AUTHORITY_BATCH_PROBE_ACTIVE.with(|active| {
+        if active.get() {
+            POINT_REPLAY_AUTHORITY_BATCH_PROBE.with(|batches| {
+                batches.borrow_mut().push(owner_count);
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn arm_point_replay_authority_batch_probe_for_test() {
+    POINT_REPLAY_AUTHORITY_BATCH_PROBE.with(|batches| batches.borrow_mut().clear());
+    POINT_REPLAY_AUTHORITY_BATCH_PROBE_ACTIVE.with(|active| active.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn take_point_replay_authority_batch_probe_for_test() -> Vec<usize> {
+    POINT_REPLAY_AUTHORITY_BATCH_PROBE_ACTIVE.with(|active| active.set(false));
+    POINT_REPLAY_AUTHORITY_BATCH_PROBE.with(|batches| std::mem::take(&mut *batches.borrow_mut()))
 }
 
 /// Co-loads the semantic commit record and its physical replay authority.
@@ -9138,7 +9229,18 @@ pub(crate) async fn load_commit_delta_change_records(
         .cloned()
         .map(|key| (commit_id, key))
         .collect::<Vec<_>>();
-    Ok(load_owned_commit_delta_entries(store, &requests)
+    load_commit_delta_change_records_for_owners(store, &requests).await
+}
+
+/// Loads exact change records from their already-known physical owners in one
+/// operation-wide batch. Unlike the single-owner convenience wrapper, this
+/// preserves the complete owner set so replay authorities and fallbacks can be
+/// coalesced before any per-owner payload routing begins.
+pub(crate) async fn load_commit_delta_change_records_for_owners(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[(CommitId, TrackedStateKey)],
+) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
+    Ok(load_owned_commit_delta_entries(store, requests)
         .await?
         .into_iter()
         .map(|entry| entry.map(|entry| entry.change_record))
@@ -11122,8 +11224,24 @@ pub(crate) async fn load_owned_commit_delta_entries(
     requests: &[(CommitId, TrackedStateKey)],
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     let point_cache = CommitDeltaPointReadCache::default();
-    let mut output =
-        load_local_owned_commit_delta_entries(store, requests, Some(&point_cache)).await?;
+    let owner_commit_ids = requests
+        .iter()
+        .map(|(commit_id, _)| *commit_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut authorities = owner_commit_ids
+        .iter()
+        .copied()
+        .zip(load_point_replay_commit_states(store, &owner_commit_ids).await?)
+        .collect::<BTreeMap<_, _>>();
+    let mut output = load_local_owned_commit_delta_entries(
+        store,
+        requests,
+        Some(&point_cache),
+        Some(&authorities),
+    )
+    .await?;
     let mut source_requests = Vec::new();
     let mut source_outputs = Vec::new();
     let mut source_owner_commits = Vec::new();
@@ -11131,7 +11249,7 @@ pub(crate) async fn load_owned_commit_delta_entries(
         if output[request_index].is_some() {
             continue;
         }
-        let Some(state) = point_cache.authority(*commit_id)? else {
+        let Some(state) = authorities.get(commit_id).cloned().flatten() else {
             continue;
         };
         let Some(source_commit_id) = state.mutations.selected_source_commit_id() else {
@@ -11141,14 +11259,36 @@ pub(crate) async fn load_owned_commit_delta_entries(
         source_owner_commits.push(*commit_id);
         source_requests.push((source_commit_id, key.clone()));
     }
-    let selected =
-        load_local_owned_commit_delta_entries(store, &source_requests, Some(&point_cache)).await?;
+    let source_commit_ids = source_requests
+        .iter()
+        .map(|(commit_id, _)| *commit_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|commit_id| !authorities.contains_key(commit_id))
+        .collect::<Vec<_>>();
+    authorities.extend(
+        source_commit_ids
+            .iter()
+            .copied()
+            .zip(load_point_replay_commit_states(store, &source_commit_ids).await?),
+    );
+    let selected = load_local_owned_commit_delta_entries(
+        store,
+        &source_requests,
+        Some(&point_cache),
+        Some(&authorities),
+    )
+    .await?;
     for source_commit_id in source_requests
         .iter()
         .map(|(source_commit_id, _)| *source_commit_id)
         .collect::<BTreeSet<_>>()
     {
-        let source = point_cache.authority(source_commit_id)?.ok_or_else(|| {
+        let source = authorities
+            .get(&source_commit_id)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| {
             replacement_payload_error(
                 "selected-source mutation authority references a missing source",
             )
@@ -11199,6 +11339,7 @@ pub(crate) async fn load_owned_commit_delta_entries_one_ordered_ref(
             commit_id,
             keys,
             Some(point_cache),
+            None,
         )
         .await?;
         if output.iter().all(Option::is_some)
@@ -11231,6 +11372,9 @@ async fn load_local_owned_commit_delta_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     requests: &[(CommitId, TrackedStateKey)],
     point_cache: Option<&CommitDeltaPointReadCache>,
+    authorities: Option<
+        &BTreeMap<CommitId, Option<Arc<AuthenticatedReplayCommitStateManifest>>>,
+    >,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     if requests.is_empty() {
         return Ok(Vec::new());
@@ -11252,6 +11396,7 @@ async fn load_local_owned_commit_delta_entries(
             requests[0].0,
             &keys,
             point_cache,
+            authorities,
         ))
         .await;
     }
@@ -11298,6 +11443,7 @@ async fn load_local_owned_commit_delta_entries(
             commit_id,
             &keys,
             point_cache,
+            authorities,
         ))
         .await?;
         for (request_index, unique_index) in output_routes {
@@ -11399,15 +11545,26 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
     commit_id: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
     point_cache: Option<&CommitDeltaPointReadCache>,
+    authorities: Option<
+        &BTreeMap<CommitId, Option<Arc<AuthenticatedReplayCommitStateManifest>>>,
+    >,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_ordered_load(keys.len());
-    let cached_state = point_cache
-        .map(|cache| cache.authority(commit_id))
-        .transpose()?
-        .flatten();
-    let state = match cached_state {
+    let preloaded_state = authorities.and_then(|authorities| authorities.get(&commit_id));
+    let cached_state = if preloaded_state.is_some() {
+        None
+    } else {
+        point_cache
+            .map(|cache| cache.authority(commit_id))
+            .transpose()?
+            .flatten()
+    };
+    let state = match preloaded_state.cloned().flatten().or(cached_state) {
         Some(state) => state,
+        None if preloaded_state.is_some() => {
+            return Ok((0..keys.len()).map(|_| None).collect());
+        }
         None => {
             let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
                 return Ok((0..keys.len()).map(|_| None).collect());
@@ -19718,6 +19875,30 @@ mod tests {
                 .iter()
                 .flatten()
                 .all(|value| value.commit_id == alias_commit)
+        );
+        let owned_requests = keys
+            .iter()
+            .cloned()
+            .map(|key| (alias_commit, key))
+            .collect::<Vec<_>>();
+        let owned = load_owned_commit_delta_entries(&read, &owned_requests)
+            .await
+            .expect("operation-wide alias exact values should load");
+        assert!(owned.iter().all(Option::is_some));
+        assert_eq!(
+            owned
+                .iter()
+                .flatten()
+                .filter(|entry| entry.selected_ref)
+                .count(),
+            2,
+            "the operation authority map must preserve selected-source routing",
+        );
+        assert!(
+            owned
+                .iter()
+                .flatten()
+                .all(|entry| entry.value.commit_id == alias_commit)
         );
 
         let alias_state = super::load_point_replay_commit_state(&read, alias_commit)
