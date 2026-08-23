@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex;
 
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
@@ -15,6 +17,40 @@ use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef, TrackedStateTreeScanRequest,
 };
 use crate::tracked_state::{TrackedStateFilter, TrackedStateStoreReader};
+
+#[cfg(test)]
+static DIFF_COMMITS_TEST_PROBES: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn arm_diff_commits_test_probe(left: &str, right: &str) {
+    DIFF_COMMITS_TEST_PROBES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("diff-commits test probe lock should remain available")
+        .insert((left.to_owned(), right.to_owned()), 0);
+}
+
+#[cfg(test)]
+pub(crate) fn take_diff_commits_test_probe(left: &str, right: &str) -> u64 {
+    DIFF_COMMITS_TEST_PROBES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("diff-commits test probe lock should remain available")
+        .remove(&(left.to_owned(), right.to_owned()))
+        .expect("diff-commits test probe should be armed")
+}
+
+#[cfg(test)]
+fn record_diff_commits_test_probe(left: &str, right: &str) {
+    if let Some(probes) = DIFF_COMMITS_TEST_PROBES.get()
+        && let Some(count) = probes
+            .lock()
+            .expect("diff-commits test probe lock should remain available")
+            .get_mut(&(left.to_owned(), right.to_owned()))
+    {
+        *count += 1;
+    }
+}
 
 /// Filter for comparing two tracked-state commit roots.
 #[derive(Debug, Clone, PartialEq)]
@@ -355,6 +391,8 @@ pub(crate) async fn diff_commits<S>(
 where
     S: crate::storage_adapter::StorageAdapterRead,
 {
+    #[cfg(test)]
+    record_diff_commits_test_probe(left_commit_id, right_commit_id);
     let scan_request = scan_request_for_diff(request);
     let mut tree_diff = reader
         .diff_semantic_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)

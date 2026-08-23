@@ -520,6 +520,172 @@ async fn lazy_history_and_binary_cas_scenarios(sim: Simulation) {
     assert!(!checkpoints.rows().is_empty());
 }
 
+async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
+    let authority = fresh_authority().await;
+    write_key_value(&authority, "selected", "baseline").await;
+    write_key_value(&authority, "remaining", "baseline").await;
+    authority
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should commit");
+    let mut replica = Replica::bootstrap(AuthorityTransport::connected(authority.clone())).await;
+
+    // Advance the shared checkpoint only after this replica bootstrapped. The
+    // following interval therefore arrives through sparse delta
+    // reconciliation instead of the initial complete checkpoint snapshot.
+    write_key_value(&authority, "selected", "checkpointed").await;
+    write_key_value(&authority, "remaining", "checkpointed").await;
+    authority
+        .create_checkpoint()
+        .await
+        .expect("remote checkpoint should commit");
+    replica
+        .pump()
+        .await
+        .expect("replica should import the remote checkpoint");
+
+    for index in 0..24 {
+        write_key_value(&authority, "selected", &format!("selected-{index}")).await;
+        write_key_value(&authority, "remaining", &format!("remaining-{index}")).await;
+    }
+    replica
+        .pump()
+        .await
+        .expect("replica should import the sparse working interval");
+
+    let selected_diff_id = replica
+        .lix
+        .execute(
+            "SELECT diff_id FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value' \
+               AND row_pk = CAST('[\"selected\"]' AS JSONB)",
+            &[],
+        )
+        .await
+        .expect("selected working diff should be hot")
+        .rows()[0]
+        .get::<String>("diff_id")
+        .expect("selected diff id should decode");
+    let head_commit_id_text = replica
+        .lix
+        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .expect("working head coordinate should load")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("working head coordinate should decode");
+    let branch_id = replica
+        .lix
+        .active_branch_id()
+        .await
+        .expect("active branch id should load");
+    let adapter = replica.lix.storage_adapter();
+    let checkpoint_read = adapter
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+        .await
+        .expect("checkpoint cursor read should open");
+    let head_commit_id = crate::changelog::CommitId::parse_lix(
+        &head_commit_id_text,
+        "working head fixture",
+    )
+    .expect("working head id should be canonical");
+    let checkpoint_commit_id = crate::checkpoint::checkpoint_commit_id_at_head(
+        &checkpoint_read,
+        &branch_id,
+        head_commit_id,
+    )
+    .await
+    .expect("working checkpoint coordinate should load")
+    .to_string();
+    drop(checkpoint_read);
+
+    // The selected diff id is frozen before the checkpoint command. Probe the
+    // canonical endpoint diff directly: a selective checkpoint must consume
+    // the already-certified hot working diff and never reconstruct the same
+    // interval through diff_commits(checkpoint, head).
+    crate::tracked_state::arm_diff_commits_test_probe(
+        &checkpoint_commit_id,
+        &head_commit_id_text,
+    );
+
+    let checkpoint = replica
+        .lix
+        .execute(
+            "INSERT INTO lix_create_checkpoint (diff_id) SELECT $1 RETURNING commit_id",
+            &[Value::Text(selected_diff_id)],
+        )
+        .await
+        .expect("partial checkpoint should use the hot working-diff authority");
+    assert_eq!(
+        crate::tracked_state::take_diff_commits_test_probe(
+            &checkpoint_commit_id,
+            &head_commit_id_text,
+        ),
+        0,
+        "partial checkpoint must not reconstruct the certified working diff",
+    );
+    assert_eq!(checkpoint.rows_affected(), 1);
+    let checkpoint_commit_id = checkpoint.rows()[0]
+        .get::<String>("commit_id")
+        .expect("checkpoint commit id should decode");
+
+    let checkpoint_state = replica
+        .lix
+        .execute(
+            &format!(
+                "SELECT key, value FROM lix_history('lix_key_value', '{checkpoint_commit_id}') \
+                 WHERE lixcol_depth = 0 ORDER BY key"
+            ),
+            &[],
+        )
+        .await
+        .expect("partial checkpoint state should remain readable");
+    let checkpoint_values = checkpoint_state
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("key").expect("checkpoint state key"),
+                row.get::<serde_json::Value>("value")
+                    .expect("checkpoint state value"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checkpoint_values,
+        vec![("selected".to_owned(), serde_json::json!("selected-23"))]
+    );
+
+    let remaining = replica
+        .lix
+        .execute(
+            "SELECT row_pk FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
+            &[],
+        )
+        .await
+        .expect("unselected working diff should remain readable");
+    assert_eq!(remaining.rows().len(), 1);
+    assert_eq!(
+        remaining.rows()[0]
+            .get::<serde_json::Value>("row_pk")
+            .expect("remaining row key"),
+        serde_json::json!(["remaining"]),
+    );
+    let final_values = hot_digest(&replica.lix)
+        .await
+        .into_iter()
+        .filter(|(key, _)| key == "remaining" || key == "selected")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        final_values,
+        vec![
+            ("remaining".to_owned(), "\"remaining-23\"".to_owned()),
+            ("selected".to_owned(), "\"selected-23\"".to_owned()),
+        ]
+    );
+}
+
 async fn deterministic_sync_command_traces(_sim: Simulation) {
     for seed in fuzz_seeds(&(0_u64..32).collect::<Vec<_>>()) {
         // Each seed starts from an independent repository, so an override can
@@ -571,6 +737,10 @@ sync_simulation_test!(
 sync_simulation_test!(
     deterministic_sync_command_traces,
     deterministic_sync_command_traces
+);
+sync_simulation_test!(
+    sparse_partial_checkpoint_uses_hot_working_diff,
+    sparse_partial_checkpoint_uses_hot_working_diff
 );
 
 struct XorShift64(u64);
