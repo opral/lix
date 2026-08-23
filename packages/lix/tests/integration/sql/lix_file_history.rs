@@ -1811,6 +1811,11 @@ simulation_test!(
             )
             .await
             .expect("initial file revision should commit");
+        let initial_anchor = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("initial history anchor should load")
+            .expect("initial history anchor should exist");
         session
             .execute(
                 "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
@@ -1878,11 +1883,36 @@ simulation_test!(
 
         let (probes, hits) = crate::sql2::file_history_anchor_probe_census();
         assert_eq!((probes, hits), (3, 3));
+        assert_eq!(
+            crate::sql2::file_history_raw_probe_limit_census(),
+            vec![1, 2, 16],
+            "the direct probe must begin at LIMIT N and expand only when duplicate entries leave fewer than N revisions",
+        );
         let frontiers = crate::sql2::file_history_bounded_frontier_census();
         assert_eq!(frontiers, vec![5, 6, 6]);
         assert!(
             frontiers.iter().all(|depth| *depth < 24),
             "bounded point history must not traverse the unrelated prehistory"
+        );
+
+        crate::sql2::reset_file_history_anchor_probe_census();
+        let duplicate_direct_entries = session
+            .execute(
+                &format!(
+                    "SELECT content, lixcol_depth \
+                     FROM lix_history('lix_file', '{initial_anchor}') \
+                     WHERE id = '{file_id}' \
+                     ORDER BY lixcol_depth ASC LIMIT 2"
+                ),
+                &[],
+            )
+            .await
+            .expect("duplicate direct entries should expand the raw probe");
+        assert_eq!(duplicate_direct_entries.len(), 1);
+        assert_eq!(
+            crate::sql2::file_history_raw_probe_limit_census(),
+            vec![2, 4],
+            "descriptor and blob entries at one commit must trigger adaptive expansion",
         );
     }
 );
