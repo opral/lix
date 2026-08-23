@@ -69,6 +69,10 @@ if (cargoProfile === "release") {
 	// times reasonable and dramatically reduces download/compile overhead.
 	cargoEnv.CARGO_PROFILE_RELEASE_OPT_LEVEL ??= "s";
 	cargoEnv.CARGO_PROFILE_RELEASE_STRIP ??= "symbols";
+	// A single codegen unit lets LLVM optimize across each crate's full graph.
+	// For the DataFusion-heavy browser build this materially reduces both the
+	// raw module and its compressed transfer size.
+	cargoEnv.CARGO_PROFILE_RELEASE_CODEGEN_UNITS ??= "1";
 }
 const cargoArgs = [
 	"build",
