@@ -36,7 +36,7 @@ async fn current_format_inspection_recognizes_v68_golden_snapshot() {
             .expect("v68 format inspection should succeed"),
         MigrationStatus::Required {
             from_version: 68,
-            to_version: 70,
+            to_version: 71,
         }
     );
 }
@@ -49,7 +49,7 @@ async fn migrates_external_v68_authority_and_plugin_and_engine_tombstones() {
         inspect_repository(&storage).await.unwrap(),
         MigrationStatus::Required {
             from_version: 68,
-            to_version: 70,
+            to_version: 71,
         }
     );
     let report = migrate_repository(storage.clone(), MigrationOptions::default())
@@ -148,19 +148,19 @@ async fn migrates_v68_fixture_and_reopens_with_current_and_history_rows() {
         .await
         .expect("v68 fixture should migrate");
     assert_eq!(report.from_version, 68);
-    assert_eq!(report.to_version, 70);
+    assert_eq!(report.to_version, 71);
     assert!(report.changes_rewritten >= 2);
     assert!(report.commit_members_rewritten >= 2);
     assert!(report.hot_rows_rewritten >= 1);
     assert_eq!(
         inspect_repository(&storage).await.unwrap(),
-        MigrationStatus::Current { version: 70 }
+        MigrationStatus::Current { version: 71 }
     );
     let retry = migrate_repository(storage.clone(), MigrationOptions::default())
         .await
         .expect("migration retry should be idempotent");
-    assert_eq!(retry.from_version, 70);
-    assert_eq!(retry.to_version, 70);
+    assert_eq!(retry.from_version, 71);
+    assert_eq!(retry.to_version, 71);
     assert_eq!(retry.changes_rewritten, 0);
 
     let migrated_snapshot = storage
@@ -175,7 +175,7 @@ async fn migrates_v68_fixture_and_reopens_with_current_and_history_rows() {
         .expect("migrated repository should cold-open");
     lix.create_checkpoint()
         .await
-        .expect("migrated v68 branch head should support a v70 checkpoint alias");
+        .expect("migrated v68 branch head should support a checkpoint alias");
     let current = lix
         .execute("SELECT id, cells, order_key FROM csv_row", &[])
         .await

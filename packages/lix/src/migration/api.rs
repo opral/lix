@@ -22,8 +22,9 @@ use crate::tracked_state::{
 
 const REPOSITORY_PROTOCOL_V68: &[u8] = b"tracked-default-branch.v68";
 const REPOSITORY_PROTOCOL_V69: &[u8] = b"tracked-default-branch.v69";
+const REPOSITORY_PROTOCOL_V70: &[u8] = b"tracked-default-branch.v70";
 
-/// Bounds for the intentionally small-repository v68 migration.
+/// Bounds for explicit offline repository migrations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MigrationOptions {
     pub max_changes: usize,
@@ -122,8 +123,8 @@ where
 /// Callers must place the repository in maintenance mode and take their
 /// backend-level backup first. Each format edge publishes atomically. A v68
 /// migration may stop in a valid, retryable v69 state after its typed rewrite;
-/// v69 root chunks may likewise be persisted unreferenced before the final
-/// atomic manifest replacement and v70 marker publication.
+/// chronology-root chunks may likewise be persisted unreferenced before each
+/// edge's final atomic manifest replacement and marker publication.
 pub async fn migrate_repository<S>(
     storage: S,
     options: MigrationOptions,
@@ -138,7 +139,7 @@ where
         .map_err(storage_error)?;
     let from_version = match crate::init::repository_protocol_status(&read).await? {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (68 | 69),
+            found_version: found_version @ (68 | 69 | 70),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -165,13 +166,28 @@ where
             ));
         }
     };
-    let expected_revision =
-        crate::storage_adapter::StorageAdapter::<S>::load_mutation_revision_from_read(&read)
-            .await
-            .map_err(storage_error)?;
-    if from_version == 69 {
+    if from_version >= 69 {
         drop(read);
-        promote_v69_branch_head_roots(&adapter, &storage, options).await?;
+        if from_version == 69 {
+            promote_chronology_roots(
+                &adapter,
+                &storage,
+                options,
+                69,
+                REPOSITORY_PROTOCOL_V69,
+                REPOSITORY_PROTOCOL_V70,
+            )
+            .await?;
+        }
+        promote_chronology_roots(
+            &adapter,
+            &storage,
+            options,
+            70,
+            REPOSITORY_PROTOCOL_V70,
+            crate::init::REPOSITORY_PROTOCOL_VALUE,
+        )
+        .await?;
         return Ok(MigrationReport {
             from_version,
             to_version: CURRENT_FORMAT_VERSION,
@@ -180,6 +196,10 @@ where
             hot_rows_rewritten: 0,
         });
     }
+    let expected_revision =
+        crate::storage_adapter::StorageAdapter::<S>::load_mutation_revision_from_read(&read)
+            .await
+            .map_err(storage_error)?;
     let (v68_changes, standalone_retained_bytes) =
         crate::migration::v68::preflight_standalone_changelog(
             &read,
@@ -244,7 +264,24 @@ where
         publication,
     )
     .await?;
-    promote_v69_branch_head_roots(&adapter, &storage, options).await?;
+    promote_chronology_roots(
+        &adapter,
+        &storage,
+        options,
+        69,
+        REPOSITORY_PROTOCOL_V69,
+        REPOSITORY_PROTOCOL_V70,
+    )
+    .await?;
+    promote_chronology_roots(
+        &adapter,
+        &storage,
+        options,
+        70,
+        REPOSITORY_PROTOCOL_V70,
+        crate::init::REPOSITORY_PROTOCOL_VALUE,
+    )
+    .await?;
     Ok(MigrationReport {
         from_version: 68,
         to_version: CURRENT_FORMAT_VERSION,
@@ -254,17 +291,24 @@ where
     })
 }
 
-/// Promotes every v69 branch head to a durable root fence before v70 makes
-/// complete-state checkpoint aliases depend on that invariant.
+/// Promotes every distinct live branch chronology root to a durable root.
+///
+/// A branch's chronology roots are its head and its optional working-diff
+/// checkpoint cursor. The cursor may be distinct from an already-rooted head;
+/// omitting it leaves checkpoint aliases and chronology GC with a rootless live
+/// authority after the protocol marker claims the invariant.
 ///
 /// Chunk publication is deliberately separate from authority publication.
 /// Content-addressed chunks are safe to leave unreferenced after a crash; the
 /// immutable manifest replacements and protocol marker are not, so those land
 /// together in the final atomic publication.
-async fn promote_v69_branch_head_roots<S>(
+async fn promote_chronology_roots<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
     storage: &S,
     options: MigrationOptions,
+    from_version: u32,
+    from_protocol: &'static [u8],
+    to_protocol: &'static [u8],
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -276,29 +320,36 @@ where
             .map_err(storage_error)?,
     );
     match crate::init::repository_protocol_status(&read).await? {
-        RepositoryProtocolStatus::MigrationRequired { found_version: 69 } => {}
+        RepositoryProtocolStatus::MigrationRequired { found_version }
+            if found_version == from_version => {}
         status => {
             return Err(migration_error(format!(
-                "v69 root promotion observed unexpected repository status {status:?}"
+                "v{from_version} chronology-root promotion observed unexpected repository status {status:?}"
             )));
         }
     }
     let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
         .await
         .map_err(storage_error)?;
-    let head_commit_ids = BranchHeadControlContext::new()
+    let chronology_root_commit_ids = BranchHeadControlContext::new()
         .reader(read.clone())
         .scan()
         .await?
         .into_iter()
-        .map(|(_, control)| control.head_commit_id)
+        .flat_map(|(_, control)| {
+            [
+                Some(control.head_commit_id),
+                control.working_diff_checkpoint_commit_id,
+            ]
+        })
+        .flatten()
         .collect::<BTreeSet<_>>();
-    if head_commit_ids.len() > options.max_changes {
+    if chronology_root_commit_ids.len() > options.max_changes {
         return Err(LixError::new(
             "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
             format!(
-                "v69 root promotion exceeds configured head bound: {} heads",
-                head_commit_ids.len()
+                "v{from_version} chronology-root promotion exceeds configured root bound: {} roots",
+                chronology_root_commit_ids.len()
             ),
         ));
     }
@@ -310,12 +361,15 @@ where
     let mut remaining_members = options.max_changes;
     {
         let mut writer = tracked_state.writer(&read, &mut chunk_writes);
-        for head_commit_id in head_commit_ids {
-            let manifest = crate::tracked_state::load_commit_state_manifest(&read, head_commit_id)
+        for chronology_root_commit_id in chronology_root_commit_ids {
+            let manifest = crate::tracked_state::load_commit_state_manifest(
+                &read,
+                chronology_root_commit_id,
+            )
                 .await?
                 .ok_or_else(|| {
                     migration_error(format!(
-                        "v69 branch head '{head_commit_id}' has no commit-state manifest"
+                        "v{from_version} chronology root '{chronology_root_commit_id}' has no commit-state manifest"
                     ))
                 })?;
             if manifest.snapshot_root.is_some() {
@@ -323,7 +377,7 @@ where
             }
             let plans = load_rebuild_plans_to_nearest_available_root_bounded(
                 &read,
-                &head_commit_id.to_string(),
+                &chronology_root_commit_id.to_string(),
                 true,
                 remaining_members,
                 &staged_commit_ids,
@@ -342,7 +396,7 @@ where
                         return Err(LixError::new(
                             "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
                             format!(
-                                "v69 root promotion exceeds configured replay-commit bound: {} commits",
+                                "v{from_version} chronology-root promotion exceeds configured replay-commit bound: {} commits",
                                 staged_commit_ids.len()
                             ),
                         ));
@@ -353,7 +407,7 @@ where
                             .await?
                             .ok_or_else(|| {
                                 migration_error(format!(
-                                    "v69 replay commit '{}' has no commit-state manifest",
+                                    "v{from_version} replay commit '{}' has no commit-state manifest",
                                     plan.commit_id
                                 ))
                             })?;
@@ -364,7 +418,7 @@ where
                             .cloned()
                             .ok_or_else(|| {
                                 migration_error(format!(
-                                    "v69 root promotion did not stage replay commit '{}'",
+                                    "v{from_version} chronology-root promotion did not stage replay commit '{}'",
                                     plan.commit_id
                                 ))
                             })?;
@@ -374,9 +428,9 @@ where
                     }
                 }
             }
-            if !promotions.contains_key(&head_commit_id) {
+            if !promotions.contains_key(&chronology_root_commit_id) {
                 return Err(migration_error(format!(
-                    "v69 root promotion did not authorize branch head '{head_commit_id}'"
+                    "v{from_version} chronology-root promotion did not authorize root '{chronology_root_commit_id}'"
                 )));
             }
         }
@@ -387,7 +441,7 @@ where
         return Err(LixError::new(
             "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
             format!(
-                "v69 root promotion exceeds configured byte bound: {} bytes",
+                "v{from_version} chronology-root promotion exceeds configured byte bound: {} bytes",
                 chunk_stats.written_bytes
             ),
         ));
@@ -396,7 +450,7 @@ where
         // Chunk rows are content-addressed and not authority until the final
         // manifest publication. Persist them without rotating the repository
         // mutation token, so that exact original token still fences every
-        // concurrent domain write through the final v70 marker flip.
+        // concurrent domain write through the final marker flip for this edge.
         let mut write = storage
             .begin_write(WriteOptions {
                 await_durable: true,
@@ -404,7 +458,7 @@ where
                     Precondition::KeyValueEquals {
                         space: REPOSITORY_PROTOCOL_SPACE,
                         key: Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY)),
-                        expected: Bytes::from_static(REPOSITORY_PROTOCOL_V69),
+                        expected: Bytes::from_static(from_protocol),
                     },
                     crate::storage_adapter::repository_mutation_revision_precondition(
                         expected_revision.clone(),
@@ -436,8 +490,8 @@ where
     crate::migration::publish::publish(
         storage,
         expected_revision,
-        REPOSITORY_PROTOCOL_V69,
-        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        from_protocol,
+        to_protocol,
         publication,
     )
     .await
@@ -457,8 +511,10 @@ fn migration_error(message: impl Into<String>) -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::CommitId;
     use crate::storage::{Memory, StorageWrite, WriteOptions};
     use crate::storage_adapter::{PutBatch, PutEntry, StorageValue};
+    use crate::tracked_state::TrackedStateRootId;
 
     #[tokio::test]
     async fn migrates_v69_with_a_marker_only_publication() {
@@ -496,45 +552,77 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn migrates_rootless_v69_branch_heads_before_enabling_checkpoint_aliases() {
-        let storage = Memory::new();
+    async fn seed_rooted_head_with_rootless_checkpoint_cursor(
+        storage: &Memory,
+        protocol: &'static [u8],
+    ) -> (CommitId, CommitId, TrackedStateRootId) {
         let lix = crate::open_lix()
             .with_storage(storage.clone())
             .await
             .unwrap();
-        drop(lix);
+        lix.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('migration-chronology-head', 'rooted')",
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.close().await.unwrap();
 
         let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
         let read = SharedStorageAdapterRead::new(
             adapter.begin_read(ReadOptions::default()).await.unwrap(),
         );
-        let head_commit_ids = BranchHeadControlContext::new()
+        let controls = BranchHeadControlContext::new()
             .reader(read.clone())
             .scan()
             .await
-            .unwrap()
-            .into_iter()
-            .map(|(_, control)| control.head_commit_id)
-            .collect::<BTreeSet<_>>();
-        let mut replacements = Vec::new();
-        for commit_id in &head_commit_ids {
-            let mut manifest = crate::tracked_state::load_commit_state_manifest(&read, *commit_id)
+            .unwrap();
+        let mut candidates = controls.into_iter().filter_map(|(_, control)| {
+            control
+                .working_diff_checkpoint_commit_id
+                .filter(|checkpoint_commit_id| *checkpoint_commit_id != control.head_commit_id)
+                .map(|_| control)
+        });
+        let control = candidates
+            .next()
+            .expect("fixture should have one branch with a distinct checkpoint cursor");
+        assert!(
+            candidates.next().is_none(),
+            "fixture should have only one branch with a distinct checkpoint cursor"
+        );
+        let head_commit_id = control.head_commit_id;
+        let checkpoint_commit_id = control
+            .working_diff_checkpoint_commit_id
+            .expect("fixture branch should retain its initial checkpoint cursor");
+        assert_ne!(head_commit_id, checkpoint_commit_id);
+
+        let head_manifest =
+            crate::tracked_state::load_commit_state_manifest(&read, head_commit_id)
                 .await
                 .unwrap()
                 .unwrap();
-            manifest.snapshot_root = None;
-            manifest.replay_debt = CommitStateReplayDebt {
-                depth: 1,
-                rows: u64::from(manifest.mutations.member_count),
-                bytes: 1,
-            };
-            for replacement in
-                encode_commit_state_manifest_replacement_for_migration(&manifest).unwrap()
-            {
-                replacements.push(replacement);
-            }
-        }
+        let head_root_id = head_manifest
+            .snapshot_root
+            .as_ref()
+            .expect("fixture head should already be rooted")
+            .root_id
+            .clone();
+        let mut checkpoint_manifest =
+            crate::tracked_state::load_commit_state_manifest(&read, checkpoint_commit_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(checkpoint_manifest.snapshot_root.is_some());
+        checkpoint_manifest.snapshot_root = None;
+        checkpoint_manifest.replay_debt = CommitStateReplayDebt {
+            depth: 1,
+            rows: u64::from(checkpoint_manifest.mutations.member_count),
+            bytes: 1,
+        };
+        let replacements = encode_commit_state_manifest_replacement_for_migration(
+            &checkpoint_manifest,
+        )
+        .unwrap();
         read.finish().unwrap();
 
         let mut fixture = storage.begin_write(WriteOptions::default()).await.unwrap();
@@ -561,7 +649,7 @@ mod tests {
                     entries: vec![PutEntry {
                         key: Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY)),
                         value: StorageValue {
-                            bytes: Bytes::from_static(REPOSITORY_PROTOCOL_V69),
+                            bytes: Bytes::from_static(protocol),
                         },
                     }],
                 },
@@ -570,22 +658,122 @@ mod tests {
             .unwrap();
         fixture.commit().await.unwrap();
 
-        migrate_repository(storage.clone(), MigrationOptions::default())
-            .await
-            .unwrap();
+        (head_commit_id, checkpoint_commit_id, head_root_id)
+    }
+
+    async fn assert_chronology_roots_promoted(
+        storage: &Memory,
+        head_commit_id: CommitId,
+        checkpoint_commit_id: CommitId,
+        original_head_root_id: &TrackedStateRootId,
+    ) {
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
         let read = SharedStorageAdapterRead::new(
             adapter.begin_read(ReadOptions::default()).await.unwrap(),
         );
-        for commit_id in head_commit_ids {
-            let manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
+        let head_manifest =
+            crate::tracked_state::load_commit_state_manifest(&read, head_commit_id)
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(manifest.snapshot_root.is_some());
-        }
+        assert_eq!(
+            &head_manifest
+                .snapshot_root
+                .expect("rooted head must remain rooted")
+                .root_id,
+            original_head_root_id,
+        );
+        let checkpoint_manifest =
+            crate::tracked_state::load_commit_state_manifest(&read, checkpoint_commit_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            checkpoint_manifest.snapshot_root.is_some(),
+            "distinct working-diff checkpoint cursor must be promoted"
+        );
+        assert_eq!(checkpoint_manifest.replay_debt, CommitStateReplayDebt::default());
         read.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn v69_promotion_roots_head_and_distinct_checkpoint_cursor_before_v70() {
+        let storage = Memory::new();
+        let (head_commit_id, checkpoint_commit_id, head_root_id) =
+            seed_rooted_head_with_rootless_checkpoint_cursor(
+                &storage,
+                REPOSITORY_PROTOCOL_V69,
+            )
+            .await;
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        promote_chronology_roots(
+            &adapter,
+            &storage,
+            MigrationOptions::default(),
+            69,
+            REPOSITORY_PROTOCOL_V69,
+            REPOSITORY_PROTOCOL_V70,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            inspect_repository(&storage).await.unwrap(),
+            MigrationStatus::Required {
+                from_version: 70,
+                to_version: 71,
+            }
+        );
+        assert_chronology_roots_promoted(
+            &storage,
+            head_commit_id,
+            checkpoint_commit_id,
+            &head_root_id,
+        )
+        .await;
+
+        migrate_repository(storage.clone(), MigrationOptions::default())
+            .await
+            .unwrap();
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        lix.create_checkpoint().await.unwrap();
+        lix.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v70_repair_promotes_distinct_rootless_checkpoint_cursor() {
+        let storage = Memory::new();
+        let (head_commit_id, checkpoint_commit_id, head_root_id) =
+            seed_rooted_head_with_rootless_checkpoint_cursor(
+                &storage,
+                REPOSITORY_PROTOCOL_V70,
+            )
+            .await;
+
+        assert_eq!(
+            inspect_repository(&storage).await.unwrap(),
+            MigrationStatus::Required {
+                from_version: 70,
+                to_version: 71,
+            }
+        );
+        let report = migrate_repository(storage.clone(), MigrationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.from_version, 70);
+        assert_eq!(report.to_version, 71);
+        assert_chronology_roots_promoted(
+            &storage,
+            head_commit_id,
+            checkpoint_commit_id,
+            &head_root_id,
+        )
+        .await;
 
         let lix = crate::open_lix().with_storage(storage).await.unwrap();
         lix.create_checkpoint().await.unwrap();
+        lix.close().await.unwrap();
     }
 }
