@@ -368,6 +368,10 @@ jobs:
       - name: Build browser JS SDK
         if: matrix.runtime == 'browser'
         working-directory: packages/js-sdk
+        # Generic CI favors fast feedback. Production builds leave this unset
+        # and use the single codegen unit configured by build-wasm.js for size.
+        env:
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: npm run build:browser
 
       - name: Build and check OPFS storage package
