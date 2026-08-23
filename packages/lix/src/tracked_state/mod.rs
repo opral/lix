@@ -10,6 +10,8 @@ mod context;
 mod current_state_data_part;
 pub(crate) mod current_state_envelope;
 mod diff;
+#[cfg(test)]
+pub(crate) use diff::{arm_diff_commits_test_probe, take_diff_commits_test_probe};
 mod diff_id;
 mod merge;
 pub(crate) mod mutation_directory;

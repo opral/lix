@@ -8556,18 +8556,49 @@ where
             .load_branch_head(&branch_id)
             .await?
             .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
-        let previous_checkpoint_commit_id = self
-            .checkpoint_commit_id_at_head(&branch_id, head_commit_id)
-            .await?;
-        let diff = {
-            let mut tracked = self.tracked_state_reader().await;
-            tracked
-                .diff_commits(
-                    &previous_checkpoint_commit_id.to_string(),
-                    &head_commit_id.to_string(),
-                    &TrackedStateDiffRequest::default(),
+        let control = BranchHeadControlContext::new()
+            .reader(self.opening_read())
+            .load(&branch_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::branch_not_found(&branch_id, "create checkpoint", "target")
+            })?;
+        if control.head_commit_id != head_commit_id {
+            return Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                format!(
+                    "branch '{branch_id}' head changed while loading its checkpoint cursor"
+                ),
+            ));
+        }
+        let previous_checkpoint_commit_id = control
+            .working_diff_checkpoint_commit_id
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("branch '{branch_id}' has no checkpoint cursor"),
                 )
-                .await?
+            })?;
+        let direct_diff = TrackedHeadContext::new()
+            .reader(self.opening_read())
+            .working_diff_for_control(
+                &branch_id,
+                control,
+                &TrackedStateDiffRequest::default(),
+            )
+            .await?;
+        let diff = match direct_diff {
+            Some(direct) => direct.diff,
+            None => {
+                let mut tracked = self.tracked_state_reader().await;
+                tracked
+                    .diff_commits(
+                        &previous_checkpoint_commit_id.to_string(),
+                        &head_commit_id.to_string(),
+                        &TrackedStateDiffRequest::default(),
+                    )
+                    .await?
+            }
         };
         let requested = diff_ids.iter().cloned().collect::<BTreeSet<_>>();
         if requested.len() != diff_ids.len() {
