@@ -889,6 +889,14 @@ where
         Self::reachable_nodes_limited(self, head_commit_id, limit).await
     }
 
+    async fn reachable_nodes_through_depth(
+        &mut self,
+        head_commit_id: &CommitId,
+        max_depth: u32,
+    ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
+        Self::reachable_nodes_within_depth(self, head_commit_id, Some(max_depth)).await
+    }
+
     async fn change_history_from_commit(
         &mut self,
         start_commit_id: &CommitId,

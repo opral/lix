@@ -148,6 +148,20 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         Ok(nodes.iter().take(limit).cloned().collect())
     }
 
+    /// Returns complete breadth layers through `max_depth`.
+    async fn reachable_nodes_through_depth(
+        &mut self,
+        head_commit_id: &CommitId,
+        max_depth: u32,
+    ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
+        let nodes = self.reachable_nodes(head_commit_id).await?;
+        Ok(nodes
+            .iter()
+            .take_while(|reachable| reachable.depth <= max_depth)
+            .cloned()
+            .collect())
+    }
+
     async fn change_history_from_commit(
         &mut self,
         start_commit_id: &CommitId,

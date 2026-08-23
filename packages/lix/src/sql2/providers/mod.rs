@@ -22,7 +22,10 @@ mod diff_command;
 mod file;
 mod file_history;
 #[cfg(test)]
-pub(crate) use file_history::{file_history_anchor_probe_census, reset_file_history_anchor_probe_census};
+pub(crate) use file_history::{
+    file_history_anchor_probe_census, file_history_bounded_frontier_census,
+    reset_file_history_anchor_probe_census,
+};
 mod filesystem_history_path;
 mod history_table_function;
 mod history_util;

@@ -114,6 +114,12 @@ pub(crate) fn record_scope_digest_outcome(outcome: ScopeDigestOutcome) {
         ScopeDigestOutcome::Unconstrained => &UNCONSTRAINED,
     };
     counter.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_CENSUS.with(|slot| {
+        let mut census = slot.get();
+        census.record(outcome);
+        slot.set(census);
+    });
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +129,22 @@ pub(crate) struct ScopeDigestCensus {
     pub(crate) loaded_opaque: u64,
     pub(crate) loaded_absent: u64,
     pub(crate) unconstrained: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_CENSUS: std::cell::Cell<ScopeDigestCensus> =
+        const { std::cell::Cell::new(ScopeDigestCensus::empty()) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_thread_scope_digest_census() {
+    THREAD_CENSUS.with(|census| census.set(ScopeDigestCensus::empty()));
+}
+
+#[cfg(test)]
+pub(crate) fn thread_scope_digest_census() -> ScopeDigestCensus {
+    THREAD_CENSUS.with(std::cell::Cell::get)
 }
 
 /// Reads the process-wide census.
@@ -137,6 +159,28 @@ pub(crate) fn scope_digest_census() -> ScopeDigestCensus {
 }
 
 impl ScopeDigestCensus {
+    const fn empty() -> Self {
+        Self {
+            pruned: 0,
+            loaded_present: 0,
+            loaded_opaque: 0,
+            loaded_absent: 0,
+            unconstrained: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn record(&mut self, outcome: ScopeDigestOutcome) {
+        let counter = match outcome {
+            ScopeDigestOutcome::Pruned => &mut self.pruned,
+            ScopeDigestOutcome::LoadedPresent => &mut self.loaded_present,
+            ScopeDigestOutcome::LoadedOpaque => &mut self.loaded_opaque,
+            ScopeDigestOutcome::LoadedAbsent => &mut self.loaded_absent,
+            ScopeDigestOutcome::Unconstrained => &mut self.unconstrained,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
     /// Commits whose membership test consulted a digest, whatever the answer.
     pub(crate) fn probed(&self) -> u64 {
         self.pruned + self.loaded_present + self.loaded_opaque + self.loaded_absent

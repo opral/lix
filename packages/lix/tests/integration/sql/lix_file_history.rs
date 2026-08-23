@@ -714,6 +714,29 @@ simulation_test!(
             json!(["7813628c-6493-7241-80fe-c63337c5d3f9"])
         );
 
+        crate::sql2::reset_file_history_anchor_probe_census();
+        let bounded_renamed_file = session
+            .execute(
+                &format!(
+                    "SELECT path, content, lixcol_depth \
+                     FROM lix_history('lix_file', '{rename_commit_id}') \
+                     WHERE id = '70726f6a-6563-8469-8f6e-2d66696c6500' \
+                     ORDER BY lixcol_depth ASC LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("bounded renamed descendant history should load");
+        assert_rows_eq(
+            bounded_renamed_file,
+            vec![vec![
+                Value::Text("/archive/docs/guides/readme.md".to_string()),
+                Value::Blob(b"x".to_vec().into()),
+                Value::Integer(0),
+            ]],
+        );
+        assert_eq!(crate::sql2::file_history_anchor_probe_census(), (1, 1));
+
         let renamed_directory = session
             .execute(
                 &format!(
@@ -1471,6 +1494,52 @@ simulation_test!(
         let mut expected = vec![main_sibling, draft_sibling];
         expected.sort();
         assert_eq!(observed, expected);
+
+        crate::sql2::reset_file_history_anchor_probe_census();
+        let bounded_top_one = main
+            .execute(
+                &format!(
+                    "SELECT path, content, lixcol_depth \
+                     FROM lix_history('lix_file', '{merge_commit_id}') \
+                     WHERE id = '6469616d-6f6e-842d-8669-6c6500000000' \
+                     ORDER BY lixcol_depth ASC LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("top-one diamond history should load");
+        assert_eq!(bounded_top_one.len(), 1);
+        assert_eq!(
+            bounded_top_one.rows()[0]
+                .get::<i64>("lixcol_depth")
+                .unwrap(),
+            1,
+            "LIMIT 1 must complete the two-parent depth layer before truncating"
+        );
+
+        let bounded = main
+            .execute(
+                &format!(
+                    "SELECT path, content, lixcol_depth \
+                     FROM lix_history('lix_file', '{merge_commit_id}') \
+                     WHERE id = '6469616d-6f6e-842d-8669-6c6500000000' \
+                     ORDER BY lixcol_depth ASC LIMIT 2"
+                ),
+                &[],
+            )
+            .await
+            .expect("bounded diamond history should load");
+        assert_eq!(bounded.len(), 2, "the fetch must complete the merge depth layer");
+        for row in bounded.rows() {
+            assert_eq!(row.get::<String>("path").unwrap(), "/same.md");
+            assert_eq!(row.get::<Vec<u8>>("content").unwrap(), b"base");
+            assert_eq!(row.get::<i64>("lixcol_depth").unwrap(), 1);
+        }
+        assert_eq!(crate::sql2::file_history_anchor_probe_census(), (2, 2));
+        assert_eq!(
+            crate::sql2::file_history_bounded_frontier_census(),
+            vec![1, 1]
+        );
     }
 );
 
@@ -1702,6 +1771,269 @@ simulation_test!(
                 Value::Text("/target/three.txt".to_string()),
                 Value::Blob(b"three".to_vec().into()),
             ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_history_exact_id_fetch_bounds_history_and_hydrates_content,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for index in 0..24 {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+                    &[
+                        Value::Text(format!("bounded-history-before-{index}")),
+                        Value::Text(index.to_string()),
+                    ],
+                )
+                .await
+                .expect("prehistory noise should commit");
+        }
+        let file_id = "5dca5f64-4803-7855-94ce-9465ac1e2ca4";
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, CAST($3 AS BYTEA))",
+                &[
+                    Value::Text(file_id.to_owned()),
+                    Value::Text("/bounded-history.txt".to_owned()),
+                    Value::Text("before".to_owned()),
+                ],
+            )
+            .await
+            .expect("initial file revision should commit");
+        session
+            .execute(
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
+                &[
+                    Value::Text("after".to_owned()),
+                    Value::Text(file_id.to_owned()),
+                ],
+            )
+            .await
+            .expect("second file revision should commit");
+        for index in 0..5 {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+                    &[
+                        Value::Text(format!("bounded-history-after-{index}")),
+                        Value::Text(index.to_string()),
+                    ],
+                )
+                .await
+                .expect("posthistory noise should commit");
+        }
+        let anchor = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("history anchor should load")
+            .expect("history anchor should exist");
+        let query = |limit| {
+            format!(
+                "SELECT content, lixcol_depth \
+                 FROM lix_history('lix_file', '{anchor}') \
+                 WHERE id = '{file_id}' \
+                 ORDER BY lixcol_depth ASC LIMIT {limit}"
+            )
+        };
+
+        crate::sql2::reset_file_history_anchor_probe_census();
+        let top_one = session
+            .execute(&query(1), &[])
+            .await
+            .expect("top-one history should succeed");
+        assert_rows_eq(
+            top_one,
+            vec![vec![
+                Value::Blob(b"after".to_vec().into()),
+                Value::Integer(5),
+            ]],
+        );
+        let top_two = session
+            .execute(&query(2), &[])
+            .await
+            .expect("top-two history should succeed");
+        assert_rows_eq(
+            top_two,
+            vec![
+                vec![Value::Blob(b"after".to_vec().into()), Value::Integer(5)],
+                vec![Value::Blob(b"before".to_vec().into()), Value::Integer(6)],
+            ],
+        );
+        let oversized = session
+            .execute(&query(16), &[])
+            .await
+            .expect("oversized bounded history should succeed");
+        assert_eq!(oversized.len(), 2);
+
+        let (probes, hits) = crate::sql2::file_history_anchor_probe_census();
+        assert_eq!((probes, hits), (3, 3));
+        let frontiers = crate::sql2::file_history_bounded_frontier_census();
+        assert_eq!(frontiers, vec![5, 6, 6]);
+        assert!(
+            frontiers.iter().all(|depth| *depth < 24),
+            "bounded point history must not traverse the unrelated prehistory"
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_history_missing_exact_id_prunes_preview_sized_history,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        for index in 0..70 {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+                    &[
+                        Value::Text(format!("missing-history-{index}")),
+                        Value::Text(index.to_string()),
+                    ],
+                )
+                .await
+                .expect("preview-sized history should commit");
+        }
+        let anchor = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("history anchor should load")
+            .expect("history anchor should exist");
+
+        crate::sql2::reset_file_history_anchor_probe_census();
+        crate::commit_graph::reset_thread_scope_digest_census();
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT id, path, content, lixcol_depth \
+                     FROM lix_history('lix_file', '{anchor}') \
+                     WHERE id = 'deadbeef-dead-7bee-8bad-deadbeefdead' \
+                     ORDER BY lixcol_depth ASC LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("missing point history should succeed");
+        assert_eq!(result.len(), 0);
+        assert_eq!(crate::sql2::file_history_anchor_probe_census(), (1, 1));
+        assert!(crate::sql2::file_history_bounded_frontier_census().is_empty());
+        let digest = crate::commit_graph::thread_scope_digest_census();
+        assert!(
+            digest.pruned >= 70,
+            "every unrelated preview commit should be rejected by its authenticated scope digest: {digest:?}"
+        );
+        assert_eq!(digest.loaded_present, 0);
+        assert_eq!(digest.loaded_opaque, 0);
+        assert_eq!(digest.loaded_absent, 0);
+    }
+);
+
+simulation_test!(
+    lix_file_history_bounded_fetch_preserves_tombstones_and_fallbacks,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let file_id = "6e65f80b-92ea-70a7-b9bb-f6bc0882a852";
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, CAST($3 AS BYTEA))",
+                &[
+                    Value::Text(file_id.to_owned()),
+                    Value::Text("/bounded-delete.txt".to_owned()),
+                    Value::Text("deleted content".to_owned()),
+                ],
+            )
+            .await
+            .expect("file should insert");
+        session
+            .execute("DELETE FROM lix_file WHERE id = $1", &[Value::Text(file_id.to_owned())])
+            .await
+            .expect("file should delete");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('bounded-delete-noise', 'one')",
+                &[],
+            )
+            .await
+            .expect("noise should advance deletion depth");
+        let anchor = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("history anchor should load")
+            .expect("history anchor should exist");
+
+        crate::sql2::reset_file_history_anchor_probe_census();
+        let deleted = session
+            .execute(
+                &format!(
+                    "SELECT path, content, lixcol_depth \
+                     FROM lix_history('lix_file', '{anchor}') \
+                     WHERE id = '{file_id}' \
+                     ORDER BY lixcol_depth ASC LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("bounded tombstone history should load");
+        assert_rows_eq(
+            deleted,
+            vec![vec![Value::Null, Value::Null, Value::Integer(1)]],
+        );
+        assert_eq!(crate::sql2::file_history_anchor_probe_census(), (1, 1));
+
+        crate::sql2::reset_file_history_anchor_probe_census();
+        let descending = session
+            .execute(
+                &format!(
+                    "SELECT content, lixcol_depth \
+                     FROM lix_history('lix_file', '{anchor}') \
+                     WHERE id = '{file_id}' \
+                     ORDER BY lixcol_depth DESC LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("descending history fallback should load");
+        assert_eq!(descending.len(), 1);
+        let non_exact = session
+            .execute(
+                &format!(
+                    "SELECT content, lixcol_depth \
+                     FROM lix_history('lix_file', '{anchor}') \
+                     WHERE id LIKE '6e65f80b-%' \
+                     ORDER BY lixcol_depth ASC LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("non-exact history fallback should load");
+        assert_eq!(non_exact.len(), 1);
+        assert_eq!(
+            crate::sql2::file_history_anchor_probe_census(),
+            (0, 0),
+            "unsupported sort and predicate shapes must retain the complete traversal"
         );
     }
 );

@@ -126,13 +126,22 @@ pub(super) fn resolve_observed_directory_path<R: DirectoryPathRecord>(
 pub(super) async fn load_history_commit_parents(
     commit_graph: &Arc<Mutex<Box<dyn CommitGraphReader>>>,
     as_of_commit_ids: &[String],
+    max_depth: Option<u32>,
 ) -> Result<BTreeMap<String, Vec<String>>, LixError> {
     let mut parents_by_commit = BTreeMap::new();
     let mut commit_graph = commit_graph.lock().await;
     for as_of_commit_id in as_of_commit_ids {
         let as_of_commit_id =
             CommitId::parse_lix(as_of_commit_id, "history lixcol_as_of_commit_id")?;
-        for reachable in commit_graph.reachable_nodes(&as_of_commit_id).await?.iter() {
+        let reachable = match max_depth {
+            Some(max_depth) => {
+                commit_graph
+                    .reachable_nodes_through_depth(&as_of_commit_id, max_depth)
+                    .await?
+            }
+            None => commit_graph.reachable_nodes(&as_of_commit_id).await?,
+        };
+        for reachable in reachable.iter() {
             parents_by_commit.insert(
                 reachable.commit.commit_id.to_string(),
                 reachable

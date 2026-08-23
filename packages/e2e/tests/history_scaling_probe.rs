@@ -423,6 +423,10 @@ async fn history_commits_at_fixed_files() {
             "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE id = $2 \
              ORDER BY lixcol_depth LIMIT {depth}"
         );
+        let by_id_content = format!(
+            "SELECT content, lixcol_depth FROM lix_history('lix_file', $1) WHERE id = $2 \
+             ORDER BY lixcol_depth LIMIT {depth}"
+        );
         // A depth-bounded shape: the bounded-history-traversal work should make
         // this cheap regardless of how many commits exist.
         let by_path_depth0 = "SELECT lixcol_depth FROM lix_history('lix_file', $1) \
@@ -447,6 +451,11 @@ async fn history_commits_at_fixed_files() {
             (
                 "by_id",
                 &by_id,
+                vec![Value::Text(head.clone()), Value::Text(file_id.clone())],
+            ),
+            (
+                "by_id_content",
+                &by_id_content,
                 vec![Value::Text(head.clone()), Value::Text(file_id.clone())],
             ),
             (
