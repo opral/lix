@@ -686,7 +686,53 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
     );
 }
 
-async fn partial_checkpoint_batches_distinct_change_owners(_sim: Simulation) {
+async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulation) {
+	let authority = fresh_authority().await;
+	write_key_value(&authority, "checkpoint-base", "baseline").await;
+	authority
+		.create_checkpoint()
+		.await
+		.expect("baseline checkpoint should commit");
+	for index in 0..50 {
+		write_key_value(&authority, &format!("working-{index:02}"), "working").await;
+	}
+	let replica = Replica::bootstrap(AuthorityTransport::connected(authority)).await;
+
+	// Snapshot bootstrap deliberately keeps each live change payload locally
+	// while leaving its owning historical commit cold. Working-diff
+	// checkpoint materialization must use those local snapshot payloads instead
+	// of turning one checkpoint into a history-hydration demand per source
+	// commit.
+	let checkpoint = replica
+		.lix
+		.execute(
+			"INSERT INTO lix_create_checkpoint (diff_id) \
+			 SELECT diff_id FROM lix_working_diff() \
+			 WHERE schema_key = 'lix_key_value' \
+			   AND row_pk = CAST('[\"working-00\"]' AS JSONB) \
+			 RETURNING commit_id",
+			&[],
+		)
+		.await
+		.expect("partial checkpoint should use the snapshot-local selected payload");
+	assert_eq!(checkpoint.rows_affected(), 1);
+	let remaining = replica
+		.lix
+		.execute(
+			"SELECT row_pk FROM lix_working_diff() \
+			 WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
+			&[],
+		)
+		.await
+		.expect("unselected snapshot-local diff should remain readable");
+	assert_eq!(remaining.rows().len(), 49);
+	assert_eq!(
+		remaining.rows()[0].get::<serde_json::Value>("row_pk").unwrap(),
+		serde_json::json!(["working-01"]),
+	);
+}
+
+async fn partial_checkpoint_avoids_distinct_cold_change_owners(_sim: Simulation) {
     const OWNER_COUNT: usize = 50;
     let authority = fresh_authority().await;
     write_key_value(&authority, "baseline", "shared").await;
@@ -734,16 +780,10 @@ async fn partial_checkpoint_batches_distinct_change_owners(_sim: Simulation) {
         crate::tracked_state::take_point_replay_authority_batch_probe_for_test();
 
     assert_eq!(checkpoint.rows_affected(), 1);
-    assert!(
-        authority_batches
-            .iter()
-            .any(|owner_count| *owner_count >= OWNER_COUNT),
-        "the complete selected-change owner set must enter one authority batch: {authority_batches:?}",
-    );
-    assert!(
-        authority_batches.iter().filter(|count| **count == 1).count() <= 8,
-        "partial checkpoint must not fall back to one authority read per owner: {authority_batches:?}",
-    );
+	assert!(
+		authority_batches.iter().sum::<usize>() <= 8,
+		"snapshot-local checkpointing must not probe the cold selected-owner population: {authority_batches:?}",
+	);
     let remaining = replica
         .lix
         .execute(
@@ -1033,8 +1073,12 @@ sync_simulation_test!(
     sparse_partial_checkpoint_uses_hot_working_diff
 );
 sync_simulation_test!(
-    partial_checkpoint_batches_distinct_change_owners,
-    partial_checkpoint_batches_distinct_change_owners
+	snapshot_partial_checkpoint_uses_local_selected_payloads,
+	snapshot_partial_checkpoint_uses_local_selected_payloads
+);
+sync_simulation_test!(
+	partial_checkpoint_avoids_distinct_cold_change_owners,
+	partial_checkpoint_avoids_distinct_cold_change_owners
 );
 sync_simulation_test!(
 	partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot,
