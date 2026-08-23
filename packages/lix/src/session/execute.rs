@@ -4,6 +4,7 @@ use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 
 use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
@@ -5333,7 +5334,9 @@ fn consume_expired_read_retry(retries: &mut usize, error: &LixError) -> bool {
 /// A storage such as browser OPFS may preserve coherent reads by expiring a
 /// multi-call snapshot when a commit lands between calls. Retry once on the
 /// optimistic path, then hold the same collaboration gate used by every Lix
-/// writer so a busy sync bootstrap cannot invalidate all bounded retries.
+/// writer. Repeated expiry can come from another browser context, whose writer
+/// does not share that in-process gate, so bounded backoff gives that writer a
+/// chance to finish instead of exhausting every retry in one event-loop turn.
 async fn retry_expired_read_with_write_quiescence(
     retries: &mut usize,
     error: &LixError,
@@ -5351,6 +5354,10 @@ async fn retry_expired_read_with_write_quiescence(
     tokio::task::yield_now().await;
     if !already_quiesced && guard.is_none() {
         *guard = Some(Arc::clone(write_gate).lock_owned().await);
+    }
+    if *retries > 1 {
+        let exponent = (*retries - 2).min(4) as u32;
+        crate::sync::sleep(Duration::from_millis(1_u64 << exponent)).await;
     }
     true
 }

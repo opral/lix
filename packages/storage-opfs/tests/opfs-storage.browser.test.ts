@@ -8,6 +8,7 @@ import { OpfsStorage } from "@lix-js/storage-opfs";
 import { expect, test } from "vitest";
 import {
 	OPFS_RPC_CHANNEL,
+	type OpfsChannelMessage,
 	type OpfsRpcRequest,
 	type OpfsRpcResponse,
 } from "../js/rpc.js";
@@ -348,6 +349,83 @@ test("concurrent engines converge without losing divergent writes", async () => 
 		expect(secondWinner).toBe(firstWinner);
 	} finally {
 		await Promise.all([first.close(), second.close()]);
+	}
+});
+
+test("keeps a complete SQL read coherent during cross-client commit churn", async () => {
+	const name = `lix-opfs-read-churn:${crypto.randomUUID()}`;
+	const monitor = new BroadcastChannel(OPFS_RPC_CHANNEL);
+	const readRequests = new Set<string>();
+	let expiredReads = 0;
+	monitor.onmessage = (event: MessageEvent<OpfsChannelMessage>) => {
+		const message = event.data;
+		if (
+			message.kind === "request" &&
+			message.storageName === name &&
+			["beginRead", "readMany", "scanPage"].includes(message.operation)
+		) {
+			readRequests.add(message.requestId);
+		} else if (
+			message.kind === "response" &&
+			!message.ok &&
+			readRequests.has(message.requestId) &&
+			message.error.code === "LIX_STORAGE_READ_EXPIRED"
+		) {
+			expiredReads += 1;
+		}
+	};
+	const lix = await openLix({ storage: new OpfsStorage({ name }) });
+	const writer = await openProvider(new OpfsStorage({ name }).lixStorage);
+	const churnSpace: LixStorageSpace = {
+		id: 2_000_000_000,
+		name: "cross-client-read-churn",
+		valueSemantics: "mutable",
+		valueIntegrity: "backendVerified",
+	};
+	let releaseFirstCommit!: () => void;
+	const firstCommit = new Promise<void>((resolve) => {
+		releaseFirstCommit = resolve;
+	});
+	try {
+		const commits = (async () => {
+			for (let index = 0; index < 96; index += 1) {
+				const write = await writer.beginWrite({
+					awaitDurable: false,
+					preconditions: [],
+					batchCapacityHintBytes: 8,
+				});
+				await write.putMany(churnSpace, [
+					{ key: keyBytes(index), value: new Uint8Array([index & 0xff]) },
+				]);
+				try {
+					await write.commit();
+				} finally {
+					if (index === 0) releaseFirstCommit();
+				}
+			}
+		})();
+
+		const reads = (async () => {
+			await firstCommit;
+			for (let index = 0; index < 12; index += 1) {
+				const result = await lix.execute(
+					`SELECT 1 AS present FROM lix_directory WHERE lower(path) = lower($1)
+				 UNION ALL
+				 SELECT 1 AS present FROM lix_file WHERE lower(path) = lower($1)
+				 LIMIT 1`,
+					[`/absent-during-churn-${index}.md`],
+				);
+				expect(result.rows).toHaveLength(0);
+			}
+		})();
+		const outcomes = await Promise.allSettled([commits, reads]);
+		for (const outcome of outcomes) {
+			if (outcome.status === "rejected") throw outcome.reason;
+		}
+		expect(expiredReads).toBeGreaterThan(1);
+	} finally {
+		monitor.close();
+		await Promise.all([writer.close(), lix.close()]);
 	}
 });
 

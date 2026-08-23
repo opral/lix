@@ -1,13 +1,16 @@
 //! Browser mechanics for the shared synchronization state machine.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use js_sys::{Function, Promise, Reflect};
+use js_sys::{Function, Reflect};
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::spawn_local;
 
 use crate::LixError;
 
@@ -38,18 +41,62 @@ impl SyncTask {
     }
 }
 
-pub(in crate::sync) async fn sleep(duration: Duration) {
-    let promise = Promise::new(&mut |resolve, _reject| {
-        let global = js_sys::global();
-        if let Ok(timer) = Reflect::get(&global, &"setTimeout".into())
-            && let Ok(timer) = timer.dyn_into::<Function>()
+pub(crate) fn sleep(duration: Duration) -> impl Future<Output = ()> + Send {
+    let state = Arc::new(BrowserSleepState {
+        done: AtomicBool::new(false),
+        waker: Mutex::new(None),
+    });
+    let callback_state = Arc::clone(&state);
+    let callback = Closure::once_into_js(move || {
+        callback_state.done.store(true, Ordering::Release);
+        if let Ok(mut waker) = callback_state.waker.lock()
+            && let Some(waker) = waker.take()
         {
-            let _ = timer.call2(
-                &global,
-                &resolve,
-                &JsValue::from_f64(duration.as_millis() as f64),
-            );
+            waker.wake();
         }
     });
-    let _ = JsFuture::from(promise).await;
+    let global = js_sys::global();
+    let scheduled = Reflect::get(&global, &"setTimeout".into())
+        .ok()
+        .and_then(|timer| timer.dyn_into::<Function>().ok())
+        .is_some_and(|timer| {
+            timer
+                .call2(
+                    &global,
+                    &callback,
+                    &JsValue::from_f64(duration.as_millis() as f64),
+                )
+                .is_ok()
+        });
+    if !scheduled {
+        state.done.store(true, Ordering::Release);
+    }
+    BrowserSleep { state }
+}
+
+struct BrowserSleepState {
+    done: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+struct BrowserSleep {
+    state: Arc<BrowserSleepState>,
+}
+
+impl Future for BrowserSleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.state.done.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        let Ok(mut waker) = self.state.waker.lock() else {
+            return Poll::Ready(());
+        };
+        if self.state.done.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        *waker = Some(context.waker().clone());
+        Poll::Pending
+    }
 }
