@@ -1813,16 +1813,27 @@ pub(crate) async fn try_execute_bound_public_write(
         BoundWriteTarget::Restore { commit_id } => {
             let commit_id = eval_restore_commit_id(commit_id, params)?;
             ctx.restore_active_branch(commit_id.clone()).await?;
-            Ok(BoundPublicWriteExecution::Executed(
+            let result = if let Some(returning) = &plan.bound.returning {
                 SqlWriteResult::returning(
-                    0,
+                    1,
                     crate::SqlQueryResult {
-                        columns: vec!["lix_restore".to_string()],
-                        rows: vec![vec![Value::Text(commit_id)]],
+                        columns: returning
+                            .items
+                            .iter()
+                            .map(|item| item.output_name.clone())
+                            .collect(),
+                        rows: vec![returning
+                            .items
+                            .iter()
+                            .map(|_| Value::Text(commit_id.clone()))
+                            .collect()],
                         notices: Vec::new(),
                     },
-                ),
-            ))
+                )
+            } else {
+                SqlWriteResult::affected(1)
+            };
+            Ok(BoundPublicWriteExecution::Executed(result))
         }
         BoundWriteTarget::Row(surface) if bound_public_write_shape_supported(plan) => {
             execute_row_write(ctx, plan, surface, params)

@@ -315,7 +315,7 @@ simulation_test!(
 
         session
             .execute(
-                "SELECT lix_restore($1)",
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
                 &[Value::Text(first_checkpoint.commit_id.clone())],
             )
             .await

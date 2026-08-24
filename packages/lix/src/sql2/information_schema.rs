@@ -2,7 +2,7 @@ use std::any::Any;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, StringArray, UInt64Array};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::information_schema::{
@@ -15,11 +15,15 @@ use datafusion::prelude::SessionContext;
 
 use crate::LixError;
 
-use super::catalog::{PublicCatalog, PublicColumnInsertPolicy};
+use super::catalog::{
+    PublicCatalog, PublicColumnInsertPolicy, PublicRelationKind, PublicSurfaceClass,
+    PublicSurfaceKind,
+};
 use super::result_metadata::field_is_json;
 
 const LIX_VALUE_KIND_JSONB: &str = "JSONB";
 const TABLE_FUNCTIONS: &str = "table_functions";
+const LIX_SURFACES: &str = "lix_surfaces";
 
 /// Installs Lix's SQL-level column contract while retaining DataFusion's other
 /// standard information-schema views.
@@ -128,12 +132,14 @@ impl LixInformationSchemaProvider {
             for table_name in INFORMATION_SCHEMA_TABLES
                 .iter()
                 .copied()
-                .chain(std::iter::once(TABLE_FUNCTIONS))
+                .chain([TABLE_FUNCTIONS, LIX_SURFACES])
             {
                 let table_schema = if table_name == "columns" {
                     Arc::clone(&schema)
                 } else if table_name == TABLE_FUNCTIONS {
                     table_functions_schema()
+                } else if table_name == LIX_SURFACES {
+                    lix_surfaces_schema()
                 } else {
                     delegate
                         .table(table_name)
@@ -203,27 +209,35 @@ impl LixInformationSchemaProvider {
             }
         }
 
-        for (name, signature, provider_schema) in [
-            (
-                "lix_commit_ancestry",
-                "() | (commit_id TEXT)",
-                super::providers::commit_ancestry_schema(),
-            ),
-            (
-                "lix_working_diff",
-                "()",
-                super::providers::working_diff_schema(),
-            ),
-            (
-                "lix_diff",
-                "(from_commit_id TEXT, to_commit_id TEXT)",
-                super::providers::diff_schema(),
-            ),
-        ] {
+        for surface in self
+            .public_catalog
+            .surfaces()
+            .filter(|surface| surface.class == PublicSurfaceClass::TableFunction)
+        {
+            let (signature, provider_schema) = match surface.kind {
+                PublicSurfaceKind::HistoryFunction => continue,
+                PublicSurfaceKind::CommitAncestryFunction => (
+                    "() | (commit_id TEXT)",
+                    super::providers::commit_ancestry_schema(),
+                ),
+                PublicSurfaceKind::WorkingDiff => {
+                    ("()", super::providers::working_diff_schema())
+                }
+                PublicSurfaceKind::DiffFunction => (
+                    "(from_commit_id TEXT, to_commit_id TEXT)",
+                    super::providers::diff_schema(),
+                ),
+                _ => {
+                    return Err(DataFusionError::Execution(format!(
+                        "table function '{}' has a non-function semantic kind",
+                        surface.name
+                    )));
+                }
+            };
             for (position, field) in provider_schema.fields().iter().enumerate() {
                 function_catalog.push(self.public_catalog_name.clone());
                 function_schema.push(self.public_schema_name.clone());
-                function_name.push(name.to_string());
+                function_name.push(surface.name.clone());
                 source_relation.push(None);
                 argument_signature.push(signature.to_string());
                 result_column.push(field.name().clone());
@@ -251,6 +265,70 @@ impl LixInformationSchemaProvider {
         )?;
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
+
+    fn lix_surfaces_table(&self) -> Result<Arc<dyn TableProvider>> {
+        let schema = lix_surfaces_schema();
+        let mut surface_catalog = Vec::new();
+        let mut surface_schema = Vec::new();
+        let mut surface_name = Vec::new();
+        let mut surface_class = Vec::new();
+        let mut relation_kind = Vec::new();
+        let mut can_read = Vec::new();
+        let mut can_insert = Vec::new();
+        let mut can_update = Vec::new();
+        let mut can_delete = Vec::new();
+        let mut is_side_effecting = Vec::new();
+
+        for surface in self.public_catalog.surfaces() {
+            surface_catalog.push(self.public_catalog_name.clone());
+            surface_schema.push(self.public_schema_name.clone());
+            surface_name.push(surface.name.clone());
+            surface_class.push(surface.class.sql_name().to_string());
+            relation_kind.push(match surface.class {
+                PublicSurfaceClass::Relation(PublicRelationKind::Base) => {
+                    Some("BASE".to_string())
+                }
+                PublicSurfaceClass::Relation(PublicRelationKind::View) => {
+                    Some("VIEW".to_string())
+                }
+                _ => None,
+            });
+            can_read.push(!matches!(surface.class, PublicSurfaceClass::CommandSink));
+            can_insert.push(surface.capabilities.insert);
+            can_update.push(surface.capabilities.update);
+            can_delete.push(surface.capabilities.delete);
+            is_side_effecting.push(matches!(surface.class, PublicSurfaceClass::CommandSink));
+        }
+        for function in self.public_catalog.scalar_functions() {
+            surface_catalog.push(self.public_catalog_name.clone());
+            surface_schema.push(self.public_schema_name.clone());
+            surface_name.push(function.name.clone());
+            surface_class.push(function.class.sql_name().to_string());
+            relation_kind.push(None);
+            can_read.push(true);
+            can_insert.push(false);
+            can_update.push(false);
+            can_delete.push(false);
+            is_side_effecting.push(false);
+        }
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(surface_catalog)),
+                Arc::new(StringArray::from(surface_schema)),
+                Arc::new(StringArray::from(surface_name)),
+                Arc::new(StringArray::from(surface_class)),
+                Arc::new(StringArray::from(relation_kind)),
+                Arc::new(BooleanArray::from(can_read)),
+                Arc::new(BooleanArray::from(can_insert)),
+                Arc::new(BooleanArray::from(can_update)),
+                Arc::new(BooleanArray::from(can_delete)),
+                Arc::new(BooleanArray::from(is_side_effecting)),
+            ],
+        )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
 }
 
 #[async_trait]
@@ -263,7 +341,7 @@ impl SchemaProvider for LixInformationSchemaProvider {
         INFORMATION_SCHEMA_TABLES
             .iter()
             .map(|name| (*name).to_string())
-            .chain(std::iter::once(TABLE_FUNCTIONS.to_string()))
+            .chain([TABLE_FUNCTIONS.to_string(), LIX_SURFACES.to_string()])
             .collect()
     }
 
@@ -273,6 +351,9 @@ impl SchemaProvider for LixInformationSchemaProvider {
         }
         if name.eq_ignore_ascii_case(TABLE_FUNCTIONS) {
             return self.table_functions_table().map(Some);
+        }
+        if name.eq_ignore_ascii_case(LIX_SURFACES) {
+            return self.lix_surfaces_table().map(Some);
         }
         let catalog_list = self.catalog_list.upgrade().ok_or_else(|| {
             DataFusionError::Execution("SQL catalog closed while reading information_schema".into())
@@ -287,6 +368,7 @@ impl SchemaProvider for LixInformationSchemaProvider {
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(name))
             || name.eq_ignore_ascii_case(TABLE_FUNCTIONS)
+            || name.eq_ignore_ascii_case(LIX_SURFACES)
     }
 }
 
@@ -302,6 +384,21 @@ fn table_functions_schema() -> SchemaRef {
         Field::new("is_nullable", DataType::Utf8, false),
         Field::new("data_type", DataType::Utf8, false),
         Field::new("lix_value_kind", DataType::Utf8, true),
+    ]))
+}
+
+fn lix_surfaces_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("surface_catalog", DataType::Utf8, false),
+        Field::new("surface_schema", DataType::Utf8, false),
+        Field::new("surface_name", DataType::Utf8, false),
+        Field::new("surface_class", DataType::Utf8, false),
+        Field::new("relation_kind", DataType::Utf8, true),
+        Field::new("can_read", DataType::Boolean, false),
+        Field::new("can_insert", DataType::Boolean, false),
+        Field::new("can_update", DataType::Boolean, false),
+        Field::new("can_delete", DataType::Boolean, false),
+        Field::new("is_side_effecting", DataType::Boolean, false),
     ]))
 }
 

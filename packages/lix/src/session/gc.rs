@@ -504,7 +504,10 @@ mod tests {
             CommitId::parse_lix(&commit_d, "restore GC commit D").expect("D commit id parses");
 
         session
-            .execute("SELECT lix_restore($1)", &[Value::Text(commit_c.clone())])
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(commit_c.clone())],
+            )
             .await
             .expect("restore to C succeeds");
         assert_eq!(head(&engine, &branch_id).await, commit_c);

@@ -510,9 +510,11 @@ where
             }
             PublicSurfaceKind::SchemaBase { .. }
             | PublicSurfaceKind::HistoryFunction
+            | PublicSurfaceKind::DiffFunction
             | PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
-            | PublicSurfaceKind::CreateCheckpoint => {}
+            | PublicSurfaceKind::CreateCheckpoint
+            | PublicSurfaceKind::Restore => {}
         }
     }
     schema::register_row_providers(
@@ -706,7 +708,9 @@ async fn register_write_from_catalog(
             PublicSurfaceKind::Change
             | PublicSurfaceKind::WorkingDiff
             | PublicSurfaceKind::HistoryFunction
-            | PublicSurfaceKind::CommitAncestryFunction => {}
+            | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::CommitAncestryFunction
+            | PublicSurfaceKind::Restore => {}
             PublicSurfaceKind::SchemaBase { .. } => {}
         }
     }
@@ -950,6 +954,7 @@ mod tests {
             vec![
                 "lix_change",
                 "lix_commit_ancestry",
+                "lix_diff",
                 "lix_history",
                 "lix_working_diff",
             ]
@@ -962,13 +967,14 @@ mod tests {
                 "lix_create_checkpoint",
                 "lix_directory",
                 "lix_file",
+                "lix_restore",
                 "lix_revert",
                 "phase8_row",
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 18, "construction count");
-        assert_eq!(read_only.len() + writable.len(), 11, "surface count");
+        assert_eq!(all_read + writable.len(), 21, "construction count");
+        assert_eq!(read_only.len() + writable.len(), 13, "surface count");
     }
 
     #[test]
@@ -985,7 +991,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(all_writable, 6, "previous standalone write count");
+        assert_eq!(all_writable, 7, "standalone write count");
         assert_eq!(selected_writable, vec!["lix_file"]);
     }
 

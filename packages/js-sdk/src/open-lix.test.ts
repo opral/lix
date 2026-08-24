@@ -402,7 +402,10 @@ test("lix_restore moves the active branch to an ancestor through the local worke
 		["restore-test", "later"],
 	);
 
-	await lix.execute("SELECT lix_restore($1)", [initial]);
+	await lix.execute(
+		"INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
+		[initial],
+	);
 
 	expect(await activeHeadCommitId(lix)).toBe(initial);
 	expect(

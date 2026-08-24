@@ -6,6 +6,7 @@ use datafusion::arrow::array::{BooleanArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
@@ -102,6 +103,10 @@ impl TableSpec for BranchSpec {
 
     fn schema(&self) -> SchemaRef {
         lix_branch_schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
     }
 
     fn upsert_support(&self) -> Option<&dyn UpsertSupport> {

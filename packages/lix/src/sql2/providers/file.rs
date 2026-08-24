@@ -21,6 +21,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
+use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::{InList, Like};
@@ -860,6 +861,10 @@ impl TableSpec for LixFileSpec {
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {

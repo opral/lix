@@ -72,6 +72,43 @@ History functions are discoverable through
 and result columns. They do not appear in `information_schema.tables` or
 `information_schema.columns`.
 
+Query `information_schema.lix_surfaces` to distinguish the complete Lix-owned
+public SQL contract without relying on naming conventions. `surface_class` is
+one of `RELATION`, `TABLE_FUNCTION`, `COMMAND_SINK`, or `SCALAR_FUNCTION`;
+`relation_kind` distinguishes `BASE` from `VIEW`. Registered schema relations
+are bases, while the composed `lix_file`, `lix_directory`, `lix_branch`, and
+`lix_change` projections are views. The capability columns report which SQL
+operations each surface accepts:
+
+```sql
+SELECT surface_name, surface_class, relation_kind, can_read, can_insert
+FROM information_schema.lix_surfaces
+ORDER BY surface_name;
+```
+
+The fixed Lix surfaces are classified as follows. Every additional registered
+schema contributes another `RELATION` / `BASE` surface.
+
+| Class | Fixed surfaces |
+| --- | --- |
+| Relation / base | `lix_account`, `lix_checkpoint`, `lix_commit`, `lix_commit_edge`, `lix_key_value`, `lix_registered_schema` |
+| Relation / view | `lix_branch`, `lix_change`, `lix_directory`, `lix_file` |
+| Table function | `lix_commit_ancestry`, `lix_diff`, `lix_history`, `lix_working_diff` |
+| Command sink | `lix_apply`, `lix_create_checkpoint`, `lix_restore`, `lix_revert` |
+| Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `uuidv7` |
+
+Standard SQL value expressions such as `CURRENT_TIMESTAMP` are supported SQL
+syntax, not Lix-owned scalar-function surfaces, and are therefore omitted from
+`information_schema.lix_surfaces`.
+
+Classify by SQL shape, not merely by whether data is computed dynamically.
+Unparameterized, table-shaped projections are views. Row producers invoked in
+the `FROM` clause with function syntax are table functions, including the
+zero-argument, active-branch-scoped `lix_working_diff()`. Side-effecting
+operations are command sinks and use `INSERT`; they are not table functions.
+This keeps commands out of relation and function discovery even when a command
+supports `RETURNING`.
+
 JSON-backed columns are SQL `TEXT` and are marked with
 `lix_value_kind = 'JSONB'`. `is_nullable` describes values returned by reads;
 `column_default` and `lix_insert_policy` separately describe whether a write

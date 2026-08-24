@@ -229,11 +229,13 @@ mod tests {
             "lix_commit_ancestry",
             "lix_commit_edge",
             "lix_create_checkpoint",
+            "lix_diff",
             "lix_directory",
             "lix_file",
             "lix_history",
             "lix_key_value",
             "lix_registered_schema",
+            "lix_restore",
             "lix_revert",
             "lix_working_diff",
         ];

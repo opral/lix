@@ -3,10 +3,49 @@ use super::{PublicColumn, SurfaceCapabilities};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicSurfaceContract {
     pub(crate) name: String,
+    pub(crate) class: PublicSurfaceClass,
     pub(crate) kind: PublicSurfaceKind,
     pub(crate) columns: Vec<PublicColumn>,
     pub(crate) capabilities: SurfaceCapabilities,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicRelationKind {
+    Base,
+    View,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicSurfaceClass {
+    Relation(PublicRelationKind),
+    TableFunction,
+    CommandSink,
+    ScalarFunction,
+}
+
+impl PublicSurfaceClass {
+    pub(crate) fn sql_name(self) -> &'static str {
+        match self {
+            Self::Relation(_) => "RELATION",
+            Self::TableFunction => "TABLE_FUNCTION",
+            Self::CommandSink => "COMMAND_SINK",
+            Self::ScalarFunction => "SCALAR_FUNCTION",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicScalarFunctionContract {
+    pub(crate) name: String,
+    pub(crate) class: PublicSurfaceClass,
+}
+
+pub(crate) const PUBLIC_SCALAR_FUNCTION_NAMES: [&str; 4] = [
+    "lix_active_account_id",
+    "lix_active_branch_commit_id",
+    "lix_active_branch_id",
+    "uuidv7",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicHistoryContract {
@@ -43,10 +82,31 @@ pub(crate) enum PublicSurfaceKind {
     Directory,
     Branch,
     HistoryFunction,
+    DiffFunction,
     CommitAncestryFunction,
     WorkingDiff,
     Revert,
     Apply,
     CreateCheckpoint,
+    Restore,
     Change,
+}
+
+impl PublicSurfaceKind {
+    pub(crate) fn accepts_class(&self, class: PublicSurfaceClass) -> bool {
+        match self {
+            Self::SchemaBase { .. }
+            | Self::File
+            | Self::Directory
+            | Self::Branch
+            | Self::Change => matches!(class, PublicSurfaceClass::Relation(_)),
+            Self::HistoryFunction
+            | Self::DiffFunction
+            | Self::CommitAncestryFunction
+            | Self::WorkingDiff => class == PublicSurfaceClass::TableFunction,
+            Self::Revert | Self::Apply | Self::CreateCheckpoint | Self::Restore => {
+                class == PublicSurfaceClass::CommandSink
+            }
+        }
+    }
 }

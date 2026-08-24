@@ -3,6 +3,9 @@ use serde_json::json;
 
 use crate::support::simulation_test::engine::SimSession;
 
+const RESTORE_SQL: &str =
+    "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id";
+
 simulation_test!(
     restore_moves_only_the_active_branch_to_an_ancestor,
     |sim| async move {
@@ -285,41 +288,29 @@ simulation_test!(
             .expect("D commits");
         let commit_d = head(&session).await;
 
-        let wrong_arity = session
-            .execute("SELECT lix_restore()", &[])
-            .await
-            .expect_err("wrong restore arity must fail");
-        assert_eq!(wrong_arity.code, LixError::CODE_INVALID_PARAM);
-        assert_eq!(head(&session).await, commit_d);
-
-        for (sql, params) in [
-            (
-                "SELECT upper(lix_restore($1))",
-                vec![Value::Text(commit_c.clone())],
-            ),
-            (
-                "SELECT lix_restore($1), 1",
-                vec![Value::Text(commit_c.clone())],
-            ),
+        for sql in [
+            "SELECT lix_restore()",
+            "SELECT upper(lix_restore($1))",
+            "SELECT lix_restore($1)",
+            "SELECT lix_restore($1), 1",
         ] {
-            let error = session
-                .execute(sql, &params)
+            session
+                .execute(sql, &[Value::Text(commit_c.clone())])
                 .await
-                .expect_err("composed restore SQL must fail");
-            assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
+                .expect_err("removed scalar restore syntax must fail");
             assert_eq!(head(&session).await, commit_d, "{sql}");
         }
 
         for value in [Value::Null, Value::Integer(1)] {
             let error = session
-                .execute("SELECT lix_restore($1)", &[value])
+                .execute(RESTORE_SQL, &[value])
                 .await
                 .expect_err("non-text restore target must fail");
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
             assert_eq!(head(&session).await, commit_d);
         }
         let missing_param = session
-            .execute("SELECT lix_restore($1)", &[])
+            .execute(RESTORE_SQL, &[])
             .await
             .expect_err("missing restore parameter must fail");
         assert_eq!(missing_param.code, LixError::CODE_INVALID_PARAM);
@@ -330,7 +321,7 @@ simulation_test!(
             .await
             .expect("transaction should begin");
         rolled_back
-            .execute("SELECT lix_restore($1)", &[Value::Text(commit_c.clone())])
+            .execute(RESTORE_SQL, &[Value::Text(commit_c.clone())])
             .await
             .expect("transaction restore should stage");
         rolled_back
@@ -351,7 +342,7 @@ simulation_test!(
             .await
             .expect("earlier write should stage");
         let restore_after_write = write_first
-            .execute("SELECT lix_restore($1)", &[Value::Text(commit_c.clone())])
+            .execute(RESTORE_SQL, &[Value::Text(commit_c.clone())])
             .await
             .expect_err("restore cannot follow another write");
         assert_eq!(restore_after_write.code, "LIX_INVALID_TRANSACTION_STATE");
@@ -379,7 +370,7 @@ simulation_test!(
             .await
             .expect("transaction should begin");
         transaction
-            .execute("SELECT lix_restore($1)", &[Value::Text(commit_c.clone())])
+            .execute(RESTORE_SQL, &[Value::Text(commit_c.clone())])
             .await
             .expect("first restore should stage");
         let stale_read_error = transaction
@@ -388,7 +379,7 @@ simulation_test!(
             .expect_err("reads after restore must be rejected");
         assert_eq!(stale_read_error.code, "LIX_INVALID_TRANSACTION_STATE");
         let second_error = transaction
-            .execute("SELECT lix_restore($1)", &[Value::Text(commit_d.clone())])
+            .execute(RESTORE_SQL, &[Value::Text(commit_d.clone())])
             .await
             .expect_err("a second restore in one transaction should fail");
         assert_eq!(second_error.code, "LIX_INVALID_TRANSACTION_STATE");
@@ -472,14 +463,11 @@ async fn head(session: &SimSession) -> String {
 
 async fn restore(session: &SimSession, commit_id: &str) -> Result<(), LixError> {
     let result = session
-        .execute(
-            "SELECT lix_restore($1)",
-            &[Value::Text(commit_id.to_string())],
-        )
+        .execute(RESTORE_SQL, &[Value::Text(commit_id.to_string())])
         .await?;
-    assert_eq!(result.columns(), &["lix_restore"]);
+    assert_eq!(result.columns(), &["commit_id"]);
     assert_eq!(
-        result.rows()[0].get::<String>("lix_restore").unwrap(),
+        result.rows()[0].get::<String>("commit_id").unwrap(),
         commit_id
     );
     Ok(())

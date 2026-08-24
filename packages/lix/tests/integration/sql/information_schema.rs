@@ -2,6 +2,114 @@ use lix::{LixError, Value};
 
 use super::assert_rows_eq;
 
+simulation_test!(lix_surfaces_classifies_the_public_sql_contract, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    let surfaces = session
+        .execute(
+            "SELECT surface_name, surface_class, relation_kind, can_read, can_insert, is_side_effecting \
+             FROM information_schema.lix_surfaces \
+             WHERE surface_name IN (\
+               'lix_active_branch_id', 'lix_create_checkpoint', 'lix_diff',\
+               'lix_file', 'lix_restore', 'lix_working_diff'\
+             ) \
+             ORDER BY surface_name",
+            &[],
+        )
+        .await
+        .expect("the unified Lix surface catalog should be readable");
+
+    assert_rows_eq(
+        surfaces,
+        vec![
+            vec![
+                Value::Text("lix_active_branch_id".to_string()),
+                Value::Text("SCALAR_FUNCTION".to_string()),
+                Value::Null,
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::Boolean(false),
+            ],
+            vec![
+                Value::Text("lix_create_checkpoint".to_string()),
+                Value::Text("COMMAND_SINK".to_string()),
+                Value::Null,
+                Value::Boolean(false),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ],
+            vec![
+                Value::Text("lix_diff".to_string()),
+                Value::Text("TABLE_FUNCTION".to_string()),
+                Value::Null,
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::Boolean(false),
+            ],
+            vec![
+                Value::Text("lix_file".to_string()),
+                Value::Text("RELATION".to_string()),
+                Value::Text("VIEW".to_string()),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(false),
+            ],
+            vec![
+                Value::Text("lix_restore".to_string()),
+                Value::Text("COMMAND_SINK".to_string()),
+                Value::Null,
+                Value::Boolean(false),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ],
+            vec![
+                Value::Text("lix_working_diff".to_string()),
+                Value::Text("TABLE_FUNCTION".to_string()),
+                Value::Null,
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::Boolean(false),
+            ],
+        ],
+    );
+
+    let relations = session
+        .execute(
+            "SELECT table_name, table_type \
+             FROM information_schema.tables \
+             WHERE table_schema = 'public' \
+               AND table_name IN ('lix_change', 'lix_file', 'lix_key_value') \
+             ORDER BY table_name",
+            &[],
+        )
+        .await
+        .expect("standard relation classification should be readable");
+    assert_rows_eq(
+        relations,
+        vec![
+            vec![
+                Value::Text("lix_change".to_string()),
+                Value::Text("VIEW".to_string()),
+            ],
+            vec![
+                Value::Text("lix_file".to_string()),
+                Value::Text("VIEW".to_string()),
+            ],
+            vec![
+                Value::Text("lix_key_value".to_string()),
+                Value::Text("BASE TABLE".to_string()),
+            ],
+        ],
+    );
+});
+
 simulation_test!(public_catalog_hides_internal_branch_surfaces, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(

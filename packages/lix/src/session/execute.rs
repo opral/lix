@@ -5445,13 +5445,13 @@ mod tests {
 
         let restored = session
             .execute(
-                "SELECT lix_restore($1)",
+                "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
                 &[Value::Text(restore_target.clone())],
             )
             .await
             .expect("restore should repair the legacy branch atomically");
         assert_eq!(
-            restored.rows()[0].get::<String>("lix_restore").unwrap(),
+            restored.rows()[0].get::<String>("commit_id").unwrap(),
             restore_target
         );
         let working_diff = session

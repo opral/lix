@@ -5,6 +5,7 @@ use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
@@ -45,6 +46,13 @@ impl TableSpec for DiffCommandSpec {
 
     fn schema(&self) -> SchemaRef {
         command_schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        // A command sink is closest to an insertable view in the standard
+        // information schema. Lix's exact classification is exposed through
+        // information_schema.lix_surfaces.
+        TableType::View
     }
 
     async fn plan_scan(

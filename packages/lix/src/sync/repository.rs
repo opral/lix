@@ -7192,7 +7192,7 @@ mod tests {
             .expect("abandoned head should decode");
         authority
             .execute(
-                "SELECT lix_restore($1)",
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
                 &[Value::Text(target_head.clone())],
             )
             .await

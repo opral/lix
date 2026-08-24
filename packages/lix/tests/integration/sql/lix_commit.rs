@@ -241,7 +241,10 @@ simulation_test!(
         );
 
         session
-            .execute("SELECT lix_restore($1)", &[Value::Text(first_head.clone())])
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(first_head.clone())],
+            )
             .await
             .expect("restore should succeed");
         let restored = select_rows(
