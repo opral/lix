@@ -7630,7 +7630,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn packed_replacement_over_hot_before_declines_compact_working_diff() {
+    async fn packed_replacement_over_hot_before_resolves_compact_working_diff() {
         const ROW_COUNT: usize = 512;
         let session = open_session().await;
         let schema = serde_json::json!({
@@ -7689,6 +7689,28 @@ mod tests {
             ROW_COUNT as u64,
         )
         .await;
+		let branch_id = session.active_branch_id().await.unwrap();
+		let read = session
+			.storage
+			.begin_read(StorageReadOptions::default())
+			.await
+			.unwrap();
+		let control = crate::branch::BranchHeadControlContext::new()
+			.reader(&read)
+			.load(&branch_id)
+			.await
+			.unwrap()
+			.unwrap();
+		drop(read);
+		let checkpoint_commit_id = control
+			.working_diff_checkpoint_commit_id
+			.expect("working checkpoint should be active")
+			.to_string();
+		let head_commit_id = control.head_commit_id.to_string();
+		crate::tracked_state::arm_diff_commits_test_probe(
+			&checkpoint_commit_id,
+			&head_commit_id,
+		);
 
         let diff = session
             .execute(
@@ -7698,8 +7720,16 @@ mod tests {
                 &[],
             )
             .await
-            .expect("ambiguous packed payload comparison should fall back correctly");
+            .expect("ambiguous packed payload comparison should resolve locally");
         assert_eq!(diff.rows()[0].get::<i64>("count").unwrap(), ROW_COUNT as i64);
+		assert_eq!(
+			crate::tracked_state::take_diff_commits_test_probe(
+				&checkpoint_commit_id,
+				&head_commit_id,
+			),
+			0,
+			"packed replacements over clean HOT rows must remain local",
+		);
     }
 
     #[tokio::test]

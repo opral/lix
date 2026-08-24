@@ -5309,7 +5309,9 @@ pub(crate) enum CompleteWorkingDiffMode {
 enum WorkingDiffBaselineAction {
     Continue,
     Reset,
-    Rebase,
+    Rebase {
+        previous_checkpoint_commit_id: CommitId,
+    },
 }
 
 impl HotTrackedSnapshot {
@@ -6605,6 +6607,7 @@ where
         generation: CommitId,
         new_head: CommitId,
         deltas: &[CurrentStateDeltaRef<'_>],
+        previous_checkpoint_commit_id: CommitId,
         checkpoint_commit_id: CommitId,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
@@ -6621,7 +6624,9 @@ where
             false,
             None,
             None,
-            WorkingDiffBaselineAction::Rebase,
+            WorkingDiffBaselineAction::Rebase {
+                previous_checkpoint_commit_id,
+            },
             &BTreeMap::new(),
         )
         .await
@@ -6709,7 +6714,10 @@ where
         working_diff_baseline_action: WorkingDiffBaselineAction,
         certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
     ) -> Result<CommitId, LixError> {
-        if working_diff_baseline_action == WorkingDiffBaselineAction::Rebase
+        if matches!(
+            working_diff_baseline_action,
+            WorkingDiffBaselineAction::Rebase { .. }
+        )
             && working_diff_capture_checkpoint_commit_id.is_none()
         {
             return Err(head_value_error(
@@ -6718,8 +6726,18 @@ where
         }
         let reset_working_diff_baselines =
             working_diff_baseline_action == WorkingDiffBaselineAction::Reset;
-        let rebase_working_diff_baselines =
-            working_diff_baseline_action == WorkingDiffBaselineAction::Rebase;
+        let rebase_working_diff_baselines = matches!(
+            working_diff_baseline_action,
+            WorkingDiffBaselineAction::Rebase { .. }
+        );
+        let predecessor_checkpoint_commit_id = match working_diff_baseline_action {
+            WorkingDiffBaselineAction::Rebase {
+                previous_checkpoint_commit_id,
+            } => Some(previous_checkpoint_commit_id),
+            WorkingDiffBaselineAction::Continue | WorkingDiffBaselineAction::Reset => {
+                working_diff_capture_checkpoint_commit_id
+            }
+        };
         let generation = parent_generation.unwrap_or(new_head);
         let sorted = {
             let _span = tracing::debug_span!(
@@ -6924,7 +6942,7 @@ where
                 created_at: packed_value.created_at,
                 updated_at: packed_value.updated_at,
                 working_diff_baseline: packed_current_base_working_diff_baseline(
-                    working_diff_capture_checkpoint_commit_id,
+                    predecessor_checkpoint_commit_id,
                     *base_checkpoint_commit_id,
                 ),
                 columnar_base_coordinate: base_coordinate.map(|coordinate| {
@@ -6944,7 +6962,7 @@ where
                 self.store,
                 branch_id,
                 generation,
-                working_diff_capture_checkpoint_commit_id,
+                predecessor_checkpoint_commit_id,
                 &packed_previous_keys,
                 ChangeRecordProjection::identity_only(),
             ))
@@ -10065,10 +10083,10 @@ fn packed_working_diff_snapshot(payload: Option<&[u8]>) -> WorkingDiffSlotFinger
 /// Builds a packed-base after candidate from its compact authenticated index.
 ///
 /// The dominant fresh-row case has no before image and therefore needs only
-/// identity and provenance to emit `Added`. A later guard declines the
-/// accelerator when a live before image would require comparing payloads.
-/// Keeping payload slots unresolved avoids loading cold owners for every row
-/// merely to answer the common case.
+/// identity and provenance to emit `Added`. The comparison resolver hydrates
+/// only the rare live/live candidates whose payloads must be compared. Keeping
+/// every other slot unresolved avoids loading cold owners merely to answer the
+/// common case.
 fn packed_compact_working_diff_version(
     value: &crate::tracked_state::TrackedStateIndexValue,
 ) -> WorkingDiffVersion {
@@ -10439,25 +10457,37 @@ async fn hot_working_diff_entries(
             // * `reject_retention_change` forbids flipping retention while any
             //   physical member exists, so a dirty tracked row cannot be
             //   overwritten by an untracked one.
-            // * The scope prefix contains the checkpoint and the generation, so
-            //   a `Clean` baseline or a foreign checkpoint owner cannot appear
-            //   under the scope the epoch names.
+            // * The scope prefix contains the checkpoint and generation, so a
+            //   foreign checkpoint owner cannot appear. A matching packed base
+            //   can add identities beyond the sparse dirty index; its primary
+            //   HOT row may validly be `Clean`, in which case that row is the
+            //   checkpoint before-image for the newer packed value.
             //
             // The finite bypass instead reads *all* primary rows matching a
             // finite identity filter, where clean, untracked, and absent rows
             // are the normal case and skipping them is the classification. It
-            // never sees this population, so keep the strict guard here rather
-            // than relaxing it to match.
+            // never sees this population. Keep the strict guard here apart
+            // from the explicit clean-HOT/packed-overlay case below.
             if after.untracked {
                 return Ok(None);
             }
-            let Some(before) =
-                working_diff_baseline_before(after.working_diff_baseline, checkpoint_commit_id)
-            else {
-                return Ok(None);
-            };
+            let baseline = after.working_diff_baseline;
             let Some(after) = after.working_diff_version() else {
                 return Ok(None);
+            };
+            let before = if baseline == WorkingDiffBaseline::Clean
+                && base_after.is_some_and(|packed| after.commit_id < packed.commit_id)
+            {
+                // A clean HOT row is the checkpoint state itself. When a
+                // newer packed current base overlays it, that row is the exact
+                // before image for comparing the packed replacement.
+                Some(after)
+            } else {
+                let Some(before) = working_diff_baseline_before(baseline, checkpoint_commit_id)
+                else {
+                    return Ok(None);
+                };
+                before
             };
             Some((before, after))
         } else {
@@ -10466,20 +10496,6 @@ async fn hot_working_diff_entries(
         let Some((before, after)) = choose_hot_or_packed_working_diff(hot_after, base_after) else {
             return Ok(None);
         };
-        if before.is_some_and(|before| {
-            !before.deleted
-                && !after.deleted
-                && before.change_id != after.change_id
-                && after.payload_is_unresolved()
-        }) {
-            // A newer packed replacement can overlay a dirty HOT row that was
-            // already present at the checkpoint. Compact packed authority can
-            // prove identity and provenance, but not whether two distinct live
-            // changes have equal payloads. Decline this rare accelerator case
-            // so canonical diff owns the comparison instead of reintroducing
-            // broad historical payload hydration into the common Added path.
-            return Ok(None);
-        }
         let identity = identity.into_row_identity();
         candidates.push((
             TrackedStateKey {
@@ -10608,11 +10624,12 @@ async fn classify_hot_working_diff_entries(
         WorkingDiffVersion,
     )>,
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
-    resolve_working_diff_before_payloads(
+    resolve_working_diff_comparison_payloads(
         store,
         &mut candidates,
         |(key, _, _)| key.clone(),
         |(_, before, _)| before,
+        |(_, _, after)| after,
     )
     .await?;
     let row_count = candidates.len();
@@ -10640,7 +10657,7 @@ async fn classify_hot_working_diff_entry_refs(
         WorkingDiffVersion,
     )>,
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
-    resolve_working_diff_before_payloads(
+    resolve_working_diff_comparison_payloads(
         store,
         &mut candidates,
         |(key, _, _)| TrackedStateKey {
@@ -10649,6 +10666,7 @@ async fn classify_hot_working_diff_entry_refs(
             row_pk: key.row_pk.clone(),
         },
         |(_, before, _)| before,
+        |(_, _, after)| after,
     )
     .await?;
     let row_count = candidates.len();
@@ -10671,7 +10689,7 @@ async fn classify_hot_working_diff_scan_entries(
         WorkingDiffVersion,
     )>,
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
-    resolve_working_diff_before_payloads(
+    resolve_working_diff_comparison_payloads(
         store,
         &mut candidates,
         |(identity, _, _)| TrackedStateKey {
@@ -10680,6 +10698,7 @@ async fn classify_hot_working_diff_scan_entries(
             row_pk: identity.row_pk.clone(),
         },
         |(_, before, _)| before,
+        |(_, _, after)| after,
     )
     .await?;
     let row_count = candidates.len();
@@ -10700,109 +10719,101 @@ async fn classify_hot_working_diff_scan_entries(
     Ok(entries)
 }
 
-/// Hydrates the payload slots of before images that were captured by reference.
+#[derive(Debug, Clone, Copy)]
+enum WorkingDiffPayloadSide {
+    Before,
+    After,
+}
+
+struct PendingWorkingDiffPayload {
+    candidate_index: usize,
+    side: WorkingDiffPayloadSide,
+    key: TrackedStateKey,
+}
+
+/// Hydrates only the payload slots needed to compare two distinct live changes.
 ///
-/// A root-backed baseline stores only the reference to its before image — the
-/// change id plus the commit that owns it — so the write path pays no payload
-/// I/O to capture it. Classification needs the payload itself for exactly one
-/// question the change id cannot answer alone: whether two distinct change
-/// records carry the same payload. Change records are addressed by owning
-/// commit, so pending rows are grouped by commit and fetched one batch per
-/// commit. Identity keys are materialized only for rows that are actually
-/// unresolved, so a diff with no root-backed baselines pays nothing.
-async fn resolve_working_diff_before_payloads<T>(
+/// Root-backed before images and compact packed after images retain identity
+/// and provenance without materializing payloads. Added, removed, and
+/// same-change rows need no payload comparison. For the remaining ambiguous
+/// live/live pairs, resolve every missing side from the local changelog in one
+/// batch, then co-load all exact physical owners that were not locally present.
+/// This keeps one ambiguous packed replacement from degrading the entire
+/// working diff to canonical ancestry replay.
+async fn resolve_working_diff_comparison_payloads<T>(
     store: &(impl StorageAdapterRead + ?Sized),
     candidates: &mut [T],
     key_of: impl Fn(&T) -> TrackedStateKey,
     before_of: impl Fn(&mut T) -> &mut Option<WorkingDiffVersion>,
+    after_of: impl Fn(&mut T) -> &mut WorkingDiffVersion,
 ) -> Result<(), LixError> {
     let mut pending = Vec::new();
     for index in 0..candidates.len() {
-        let Some(version) = before_of(&mut candidates[index]).as_mut() else {
+        let before = *before_of(&mut candidates[index]);
+        let after = *after_of(&mut candidates[index]);
+        let Some(before) = before else {
             continue;
         };
-        if !version.payload_is_unresolved() {
+        if before.deleted || after.deleted || before.change_id == after.change_id {
             continue;
         }
-        if version.deleted {
-            // A tombstone before image has no payload to hydrate, and
-            // classification never consults one for a deleted row.
-            version.resolve_payload_slots(
-                WorkingDiffSlotFingerprint::none(),
-                WorkingDiffSlotFingerprint::none(),
-            );
-            continue;
+        let key = key_of(&candidates[index]);
+        if before.payload_is_unresolved() {
+            pending.push(PendingWorkingDiffPayload {
+                candidate_index: index,
+                side: WorkingDiffPayloadSide::Before,
+                key: key.clone(),
+            });
         }
-        pending.push((index, key_of(&candidates[index])));
+        if after.payload_is_unresolved() {
+            pending.push(PendingWorkingDiffPayload {
+                candidate_index: index,
+                side: WorkingDiffPayloadSide::After,
+                key,
+            });
+        }
     }
     if pending.is_empty() {
         return Ok(());
     }
-    // Snapshot/bootstrap publication keeps change payloads in the standalone
-    // changelog while their physical commit bodies may remain remote. Resolve
-    // that local authority in one batch before asking for any owner commit.
-    let change_ids = pending
+    let requests = pending
         .iter()
-        .map(|(index, _)| {
-            before_of(&mut candidates[*index])
+        .map(|pending| {
+            let version = match pending.side {
+                WorkingDiffPayloadSide::Before => before_of(
+                    &mut candidates[pending.candidate_index],
+                )
                 .as_ref()
-                .expect("pending before images are present")
-                .change_id
+                .expect("pending before image is present"),
+                WorkingDiffPayloadSide::After => {
+                    after_of(&mut candidates[pending.candidate_index])
+                }
+            };
+            crate::tracked_state::AuthoritativeLiveChangeRequest {
+                change_id: version.change_id,
+                source_commit_id: version.commit_id,
+                key: pending.key.clone(),
+                updated_at: version.updated_at,
+            }
         })
         .collect::<Vec<_>>();
-    let local = crate::changelog::ChangelogContext::new()
-        .reader(store)
-        .load_changes(crate::changelog::ChangeLoadRequest {
-            change_ids: &change_ids,
-        })
+    let records = crate::tracked_state::load_authoritative_live_change_records(store, &requests)
         .await?;
-    let mut by_commit = BTreeMap::<CommitId, Vec<(usize, TrackedStateKey)>>::new();
-    for ((index, key), (_, record)) in pending.into_iter().zip(local) {
-        let commit_id = before_of(&mut candidates[index])
-            .as_ref()
-            .expect("pending before images are present")
-            .commit_id;
-        let version = before_of(&mut candidates[index])
+    for (pending, record) in pending.into_iter().zip(records) {
+        let version = match pending.side {
+            WorkingDiffPayloadSide::Before => before_of(
+                &mut candidates[pending.candidate_index],
+            )
             .as_mut()
-            .expect("pending before images are present");
-        if let Some(record) = record.as_ref()
-            && record.schema_key == key.schema_key
-            && record.file_id == key.file_id
-            && record.row_pk == key.row_pk
-            && record.snapshot.is_some()
-            && record.created_at == version.updated_at
-        {
-            version.resolve_payload_slots(
-                packed_working_diff_snapshot(record.snapshot.as_deref()),
-                packed_working_diff_slot(&record.metadata),
-            );
-            continue;
-        }
-        by_commit.entry(commit_id).or_default().push((index, key));
-    }
-    for (commit_id, pending) in by_commit {
-        let (indexes, keys): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
-        let records =
-            crate::tracked_state::load_commit_delta_change_records(store, commit_id, &keys).await?;
-        for (index, record) in indexes.into_iter().zip(records) {
-            let record = record.ok_or_else(|| {
-                head_value_error(
-                    "working-diff baseline references a before image that is missing from its commit",
-                )
-            })?;
-            let version = before_of(&mut candidates[index])
-                .as_mut()
-                .expect("pending before images are present the second time");
-            if record.change_id != version.change_id {
-                return Err(head_value_error(
-                    "working-diff baseline before image does not match its referenced change record",
-                ));
+            .expect("pending before image is present"),
+            WorkingDiffPayloadSide::After => {
+                after_of(&mut candidates[pending.candidate_index])
             }
-            version.resolve_payload_slots(
-                packed_working_diff_snapshot(record.snapshot.as_deref()),
-                packed_working_diff_slot(&record.metadata),
-            );
-        }
+        };
+        version.resolve_payload_slots(
+            packed_working_diff_snapshot(record.snapshot.as_deref()),
+            packed_working_diff_slot(&record.metadata),
+        );
     }
     Ok(())
 }
