@@ -115,8 +115,9 @@ use crate::transaction::staged_commit_changes::{
     StagedCommitChangeBatch, StagedCommitChangeBatchBuilder,
 };
 use crate::transaction::staging::{
-    ImmutableMutationChunkStage, ImmutableMutationJournalChunk, PreparedStateRowOverlay,
-    PreparedWriteSet, TransactionWriteBuffer, TransactionWriteBufferCheckpoint,
+    ImmutableMutationChunkStage, ImmutableMutationJournalChunk, MUTATION_JOURNAL_CHUNK_MAX_ROWS,
+    PreparedStateRowOverlay, PreparedWriteSet, TransactionWriteBuffer,
+    TransactionWriteBufferCheckpoint,
 };
 use crate::transaction::stale_commit::{
     StaleCommitPlan, StaleRowReconciliationPlan, classify_stale_commit,
@@ -7304,7 +7305,7 @@ where
         let chunk_has_capacity = self
             .mutation_journal
             .as_ref()
-            .is_none_or(|journal| journal.len() < 4_096);
+            .is_none_or(|journal| journal.len() < MUTATION_JOURNAL_CHUNK_MAX_ROWS);
         if !same_origin || !ordered_append || !chunk_has_capacity {
             self.flush_mutation_journal().await?;
         }
@@ -7575,7 +7576,7 @@ where
         let chunk_has_capacity = self
             .mutation_journal
             .as_ref()
-            .is_none_or(|journal| journal.len() < 4_096);
+            .is_none_or(|journal| journal.len() < MUTATION_JOURNAL_CHUNK_MAX_ROWS);
         if !same_program || !same_origin || !ordered_append || !chunk_has_capacity {
             self.flush_mutation_journal().await?;
         }

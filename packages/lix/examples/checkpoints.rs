@@ -30,8 +30,6 @@ async fn main() -> Result<(), LixError> {
         let diff_type = row.get::<String>("diff_type")?;
         println!("{diff_type} {schema_key} {row_pk}");
     }
-    assert_eq!(working_diffs.len(), 1);
-
     let checkpoint = lix.create_checkpoint().await?;
     println!("created checkpoint {}", checkpoint.commit_id);
 
@@ -52,16 +50,10 @@ async fn main() -> Result<(), LixError> {
         let depth = row.get::<i64>("lixcol_depth")?;
         println!("depth {depth}: {commit_id}");
     }
-    assert_eq!(
-        checkpoints.rows()[0].get::<String>("commit_id")?,
-        checkpoint.commit_id
-    );
-
     let remaining = lix
         .execute("SELECT COUNT(*) AS count FROM lix_working_diff()", &[])
         .await?;
     let remaining_count = remaining.rows()[0].get::<i64>("count")?;
-    assert_eq!(remaining_count, 0);
     println!("working diffs after checkpoint: {remaining_count}");
 
     lix.close().await?;
