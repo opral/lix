@@ -913,27 +913,22 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
         .rows()[0]
         .get::<String>("id")
         .expect("selected file id should decode");
-    let selected_diff_id = replica
+    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
+    let checkpoint = replica
         .lix
         .execute(
-            "SELECT diff_id FROM lix_working_diff() WHERE file_id = $1 LIMIT 1",
+            "INSERT INTO lix_create_checkpoint (diff_id) \
+             SELECT diff_id FROM lix_working_diff() \
+             WHERE coalesce( \
+                 file_id, \
+                 CASE WHEN schema_key = 'lix_file_descriptor' THEN row_pk ->> 0 END \
+             ) IN ($1) \
+             RETURNING commit_id",
             &[Value::Text(selected_file_id)],
         )
         .await
-        .expect("selected file diff should load")
-        .rows()[0]
-        .get::<String>("diff_id")
-        .expect("selected file diff id should decode");
-
-    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
-    replica
-        .lix
-        .execute(
-            "INSERT INTO lix_create_checkpoint (diff_id) SELECT $1 RETURNING commit_id",
-            &[Value::Text(selected_diff_id)],
-        )
-        .await
         .expect("partial file checkpoint should stay snapshot-local");
+    assert_eq!(checkpoint.rows_affected(), 1);
     let authority_batches =
         crate::tracked_state::take_point_replay_authority_batch_probe_for_test();
     assert!(
@@ -1086,14 +1081,14 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
 	);
 }
 
-async fn partial_checkpoint_canonical_fallback_keeps_lifecycle_path(_sim: Simulation) {
+async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Simulation) {
     let authority = fresh_authority().await;
     write_key_value(&authority, "selected", "baseline").await;
     write_key_value(&authority, "remaining", "baseline").await;
     authority.create_checkpoint().await.unwrap();
+    write_key_value(&authority, "selected", "selected-update").await;
+    write_key_value(&authority, "remaining", "remaining-update").await;
     let replica = Replica::bootstrap(AuthorityTransport::connected(authority)).await;
-    replica.write("selected", "selected-update").await;
-    replica.write("remaining", "remaining-update").await;
 
     let branch_id = replica.lix.active_branch_id().await.unwrap();
     let adapter = replica.lix.storage_adapter();
@@ -1132,52 +1127,61 @@ async fn partial_checkpoint_canonical_fallback_keeps_lifecycle_path(_sim: Simula
         .begin_read(crate::storage_adapter::StorageReadOptions::default())
         .await
         .unwrap();
-    assert!(
-        crate::hot_state::TrackedHeadContext::new()
-            .reader(read)
-            .working_diff_for_control(
-                &branch_id,
-                control,
-                &crate::tracked_state::TrackedStateDiffRequest::default(),
-            )
-            .await
-            .unwrap()
-            .is_none(),
-        "corrupt coverage must force the canonical diff fallback",
-    );
-
-    let selected_diff_id = replica
-        .lix
-        .execute(
-            "SELECT diff_id FROM lix_working_diff() \
-             WHERE schema_key = 'lix_key_value' \
-               AND row_pk = CAST('[\"selected\"]' AS JSONB)",
-            &[],
+    let direct = crate::hot_state::TrackedHeadContext::new()
+        .reader(read)
+        .working_diff_for_control(
+            &branch_id,
+            control,
+            &crate::tracked_state::TrackedStateDiffRequest::default(),
         )
         .await
         .unwrap()
-        .rows()[0]
-        .get::<String>("diff_id")
-        .unwrap();
+        .expect("authoritative HOT rows must survive an uncertified sparse index");
+    assert_eq!(direct.diff.entries.len(), 2);
+
+    let head_commit_id = control.head_commit_id.to_string();
+    crate::tracked_state::arm_diff_commits_test_probe(
+        &checkpoint_commit_id.to_string(),
+        &head_commit_id,
+    );
+    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     replica
         .lix
         .execute(
-            "INSERT INTO lix_create_checkpoint (diff_id) SELECT $1 RETURNING commit_id",
-            &[Value::Text(selected_diff_id)],
+            // Keep the source intentionally non-pushdownable so the provider
+            // must answer a broad working-diff read before SQL filters it.
+            "INSERT INTO lix_create_checkpoint (diff_id) \
+             SELECT diff_id FROM lix_working_diff() \
+             WHERE coalesce(schema_key, '') = 'lix_key_value' \
+               AND row_pk ->> 0 = 'selected' \
+             RETURNING commit_id",
+            &[],
         )
         .await
-        .expect("canonical fallback must retain complete lifecycle publication");
+        .expect("HOT primary fallback must retain complete lifecycle publication");
     assert_eq!(
-        replica
-            .lix
-            .execute("SELECT COUNT(*) AS count FROM lix_working_diff()", &[])
-            .await
-            .unwrap()
-            .rows()[0]
-            .get::<i64>("count")
-            .unwrap(),
-        1,
+        crate::tracked_state::take_diff_commits_test_probe(
+            &checkpoint_commit_id.to_string(),
+            &head_commit_id,
+        ),
+        0,
+        "an uncertified derived index must not hydrate canonical history while HOT rows are authoritative",
     );
+    assert!(
+        crate::tracked_state::take_point_replay_authority_batch_probe_for_test().is_empty(),
+        "HOT primary fallback must not demand cold owner snapshots",
+    );
+    let remaining = replica
+        .lix
+        .execute(
+            "SELECT row_pk ->> 0 AS key FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(remaining.rows().len(), 1);
+    assert_eq!(remaining.rows()[0].get::<String>("key").unwrap(), "remaining");
 }
 
 async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
@@ -1428,8 +1432,8 @@ sync_simulation_test!(
 	partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot
 );
 sync_simulation_test!(
-    partial_checkpoint_canonical_fallback_keeps_lifecycle_path,
-    partial_checkpoint_canonical_fallback_keeps_lifecycle_path
+    partial_checkpoint_uncertified_index_uses_hot_primary_fallback,
+    partial_checkpoint_uncertified_index_uses_hot_primary_fallback
 );
 sync_simulation_test!(
     partial_checkpoint_rebases_unselected_tombstone,
