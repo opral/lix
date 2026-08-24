@@ -197,14 +197,13 @@ struct WorkingDiffSlotFingerprint {
 const WORKING_DIFF_SLOT_NONE: u8 = 0;
 const WORKING_DIFF_SLOT_REF: u8 = 1;
 const WORKING_DIFF_SLOT_INLINE: u8 = 2;
-/// The before image is identified by its change id, but its payload slot was
-/// not materialized where the baseline was captured.
+/// A working-diff version is identified by its change id, but its payload slots
+/// were not materialized at the compact authority that supplied it.
 ///
-/// Root current bases are read under `ChangeRecordProjection::identity_only()`
-/// so the write path pays no payload I/O to capture a baseline. The reader
-/// hydrates the referenced change record only for the one question the change
-/// id cannot answer on its own: whether two distinct changes carry the same
-/// payload.
+/// Root before images and compact packed after images both use this marker so
+/// their common identity-only paths pay no payload I/O. A reader either
+/// resolves the payload for comparing two distinct live changes or declines
+/// the accelerator in favor of canonical diff.
 const WORKING_DIFF_SLOT_UNRESOLVED: u8 = 3;
 const WORKING_DIFF_VERSION_BYTES: usize =
     16 + 16 + 1 + 8 + 8 + 1 + JSON_REF_BYTES + 1 + JSON_REF_BYTES;
@@ -1541,9 +1540,8 @@ fn effective_hot_created_at(
 ///
 /// `Unresolved` is deliberately a distinct answer rather than a default. An
 /// accelerator over the canonical diff may answer correctly or decline, but it
-/// must never answer confidently and wrongly, so a caller that has not
-/// hydrated an unresolved before image cannot accidentally read it as
-/// "different".
+/// must never answer confidently and wrongly, so an unresolved version cannot
+/// accidentally compare as "different".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkingDiffPayloadEquality {
     Equal,
@@ -1553,8 +1551,8 @@ pub(crate) enum WorkingDiffPayloadEquality {
 
 impl WorkingDiffVersion {
     /// True when this version's payload slots were never materialized, so only
-    /// its change id is known. Resolve with `resolve_payload_slots` before
-    /// classifying.
+    /// its change id is known. Resolve before comparing two distinct live
+    /// changes, or decline the accelerator.
     fn payload_is_unresolved(self) -> bool {
         self.snapshot.kind == WORKING_DIFF_SLOT_UNRESOLVED
             || self.metadata.kind == WORKING_DIFF_SLOT_UNRESOLVED
