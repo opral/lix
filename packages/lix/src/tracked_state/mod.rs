@@ -94,7 +94,6 @@ pub(crate) use storage::{
     deferred_commit_history_ids,
     encode_commit_state_manifest_replacement_for_migration, load_authoritative_live_change_records,
     load_change_record_by_id,
-    load_commit_delta_change_records, load_commit_delta_change_records_for_owners,
     load_commit_delta_members_with_payloads,
     load_commit_delta_members_with_payloads_for_schemas, load_commit_delta_replay_metadata,
     load_commit_delta_selection_certificate, load_commit_history_members_with_payloads_for_schemas,
