@@ -14,8 +14,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-const MAX_EXPIRED_READ_RETRIES: usize = 16;
-
 mod checkpoint;
 mod context;
 mod create_branch;

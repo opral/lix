@@ -37,11 +37,18 @@ use tracing::Instrument as _;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::{SessionTransaction, transaction_state_error};
-use super::{ExecuteIdempotency, MAX_EXPIRED_READ_RETRIES};
+use super::ExecuteIdempotency;
 use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AUTO_COMMIT_RETRIES: usize = 16;
+const MAX_EXPIRED_READ_RETRY_DURATION: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct ExpiredReadRetryState {
+    attempts: usize,
+    started_at: Option<web_time::Instant>,
+}
 
 enum LiteralParameterBuilder {
     Utf8(StringBuilder),
@@ -1259,7 +1266,7 @@ where
 
         let paths = BTreeSet::from([path]);
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let mut expired_read_retries = 0;
+        let mut expired_read_retries = ExpiredReadRetryState::default();
         let mut read_quiescence_guard = None;
         loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
@@ -1514,7 +1521,7 @@ where
         } else {
             None
         };
-        let mut expired_read_retries = 0;
+        let mut expired_read_retries = ExpiredReadRetryState::default();
         let mut read_quiescence_guard = None;
         let reads_already_quiesced = runtime_write_access.is_some();
         let (mut read_result, file_view_mutations, _provider_rows_examined) = loop {
@@ -2229,7 +2236,7 @@ where
                 || late_materialized_lix_file_content_read(parsed).is_some()
         });
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let mut expired_read_retries = 0;
+        let mut expired_read_retries = ExpiredReadRetryState::default();
         let mut read_quiescence_guard = None;
         loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
@@ -2411,7 +2418,7 @@ where
         });
 
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let mut expired_read_retries = 0;
+        let mut expired_read_retries = ExpiredReadRetryState::default();
         let mut read_quiescence_guard = None;
         loop {
             let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
@@ -5323,11 +5330,16 @@ fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
     error
 }
 
-fn consume_expired_read_retry(retries: &mut usize, error: &LixError) -> bool {
-    if error.code != LixError::CODE_STORAGE_READ_EXPIRED || *retries >= MAX_EXPIRED_READ_RETRIES {
+fn consume_expired_read_retry(state: &mut ExpiredReadRetryState, error: &LixError) -> bool {
+    if error.code != LixError::CODE_STORAGE_READ_EXPIRED {
         return false;
     }
-    *retries += 1;
+    let now = web_time::Instant::now();
+    let started_at = state.started_at.get_or_insert(now);
+    if now.duration_since(*started_at) >= MAX_EXPIRED_READ_RETRY_DURATION {
+        return false;
+    }
+    state.attempts += 1;
     true
 }
 
@@ -5335,16 +5347,17 @@ fn consume_expired_read_retry(retries: &mut usize, error: &LixError) -> bool {
 /// multi-call snapshot when a commit lands between calls. Retry once on the
 /// optimistic path, then hold the same collaboration gate used by every Lix
 /// writer. Repeated expiry can come from another browser context, whose writer
-/// does not share that in-process gate, so bounded backoff gives that writer a
-/// chance to finish instead of exhausting every retry in one event-loop turn.
+/// does not share that in-process gate, so an elapsed-time budget with bounded
+/// backoff gives an ownership handoff time to finish without allowing a broken
+/// storage implementation to retry forever.
 async fn retry_expired_read_with_write_quiescence(
-    retries: &mut usize,
+    state: &mut ExpiredReadRetryState,
     error: &LixError,
     write_gate: &Arc<tokio::sync::Mutex<()>>,
     guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
     already_quiesced: bool,
 ) -> bool {
-    if !consume_expired_read_retry(retries, error) {
+    if !consume_expired_read_retry(state, error) {
         return false;
     }
     // Cross-context stores such as OPFS can invalidate a read while another
@@ -5355,8 +5368,8 @@ async fn retry_expired_read_with_write_quiescence(
     if !already_quiesced && guard.is_none() {
         *guard = Some(Arc::clone(write_gate).lock_owned().await);
     }
-    if *retries > 1 {
-        let exponent = (*retries - 2).min(4) as u32;
+    if state.attempts > 1 {
+        let exponent = (state.attempts - 2).min(4) as u32;
         crate::sync::sleep(Duration::from_millis(1_u64 << exponent)).await;
     }
     true

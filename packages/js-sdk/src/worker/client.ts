@@ -193,7 +193,8 @@ function wrapTelemetryParentTransaction(
 	};
 }
 
-class BindingLease {
+/** @internal Exported only for worker lifecycle tests. */
+export class BindingLease {
 	private references = 1;
 	constructor(private readonly releaseLast: () => void | Promise<void>) {}
 	retain(): void {
@@ -238,7 +239,8 @@ function wrapDirectBinding(
 	});
 }
 
-function workerBinding(
+/** @internal Exported only for worker lifecycle tests. */
+export function workerBinding(
 	client: LixWorkerClient,
 	lease: BindingLease,
 	sessionId: number,
@@ -295,9 +297,18 @@ function workerBinding(
 		syncDiskToLix: () => request({ kind: "syncDiskToLix" }),
 		close: async () => {
 			if (closed) return;
-			await request({ kind: "close" });
-			closed = true;
-			await lease.release();
+			try {
+				await request({ kind: "close" });
+			} catch (error) {
+				// A failed semantic close may leave the worker host retaining its OPFS
+				// session. Terminating the worker is the ownership backstop before an
+				// outer caller can safely release its cross-tab lock.
+				await client.terminate().catch(() => undefined);
+				throw error;
+			} finally {
+				closed = true;
+				await lease.release();
+			}
 		},
 	};
 }
