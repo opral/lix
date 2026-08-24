@@ -71,7 +71,7 @@ pub enum MigrationStatus {
 ///
 /// This is read-only and intentionally understands only the format marker;
 /// migration preflight performs the deeper physical validation.
-pub async fn inspect_repository<S>(storage: &S) -> Result<MigrationStatus, LixError>
+pub async fn inspect_lix<S>(storage: &S) -> Result<MigrationStatus, LixError>
 where
     S: Storage + ?Sized,
 {
@@ -125,7 +125,7 @@ where
 /// migration may stop in a valid, retryable v69 state after its typed rewrite;
 /// chronology-root chunks may likewise be persisted unreferenced before each
 /// edge's final atomic manifest replacement and marker publication.
-pub async fn migrate_repository<S>(
+pub async fn migrate_lix<S>(
     storage: S,
     options: MigrationOptions,
 ) -> Result<MigrationReport, LixError>
@@ -531,7 +531,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = migrate_repository(storage.clone(), MigrationOptions::default())
+        let report = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
             .unwrap();
         assert_eq!(
@@ -545,7 +545,7 @@ mod tests {
             }
         );
         assert_eq!(
-            inspect_repository(&storage).await.unwrap(),
+            inspect_lix(&storage).await.unwrap(),
             MigrationStatus::Current {
                 version: CURRENT_FORMAT_VERSION,
             }
@@ -717,7 +717,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            inspect_repository(&storage).await.unwrap(),
+            inspect_lix(&storage).await.unwrap(),
             MigrationStatus::Required {
                 from_version: 70,
                 to_version: 71,
@@ -731,7 +731,7 @@ mod tests {
         )
         .await;
 
-        migrate_repository(storage.clone(), MigrationOptions::default())
+        migrate_lix(storage.clone(), MigrationOptions::default())
             .await
             .unwrap();
         let lix = crate::open_lix()
@@ -753,13 +753,13 @@ mod tests {
             .await;
 
         assert_eq!(
-            inspect_repository(&storage).await.unwrap(),
+            inspect_lix(&storage).await.unwrap(),
             MigrationStatus::Required {
                 from_version: 70,
                 to_version: 71,
             }
         );
-        let report = migrate_repository(storage.clone(), MigrationOptions::default())
+        let report = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
             .unwrap();
         assert_eq!(report.from_version, 70);

@@ -15,7 +15,7 @@
 //! The temporary helper and baseline patches are intentionally not retained.
 
 use lix::Memory;
-use lix::migration::{MigrationOptions, MigrationStatus, inspect_repository, migrate_repository};
+use lix::migration::{MigrationOptions, MigrationStatus, inspect_lix, migrate_lix};
 use lix::open_lix;
 
 const V68_SNAPSHOT: &[u8] = include_bytes!("fixtures/v68_bundled_csv_history.snapshot");
@@ -31,7 +31,7 @@ async fn current_format_inspection_recognizes_v68_golden_snapshot() {
     let storage = Memory::from_snapshot(V68_SNAPSHOT).expect("v68 golden snapshot should decode");
 
     assert_eq!(
-        inspect_repository(&storage)
+        inspect_lix(&storage)
             .await
             .expect("v68 format inspection should succeed"),
         MigrationStatus::Required {
@@ -46,13 +46,13 @@ async fn migrates_external_v68_authority_and_plugin_and_engine_tombstones() {
     let storage = Memory::from_snapshot(V68_EXTERNAL_TOMBSTONES)
         .expect("external v68 golden snapshot should decode");
     assert_eq!(
-        inspect_repository(&storage).await.unwrap(),
+        inspect_lix(&storage).await.unwrap(),
         MigrationStatus::Required {
             from_version: 68,
             to_version: 71,
         }
     );
-    let report = migrate_repository(storage.clone(), MigrationOptions::default())
+    let report = migrate_lix(storage.clone(), MigrationOptions::default())
         .await
         .expect("external v68 authority should migrate");
     assert!(report.commit_members_rewritten >= 704);
@@ -144,7 +144,7 @@ async fn migrates_v68_fixture_and_reopens_with_current_and_history_rows() {
         panic!("normal engine open must require migration");
     };
     assert_eq!(open_error.code, "LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED");
-    let report = migrate_repository(storage.clone(), MigrationOptions::default())
+    let report = migrate_lix(storage.clone(), MigrationOptions::default())
         .await
         .expect("v68 fixture should migrate");
     assert_eq!(report.from_version, 68);
@@ -153,10 +153,10 @@ async fn migrates_v68_fixture_and_reopens_with_current_and_history_rows() {
     assert!(report.commit_members_rewritten >= 2);
     assert!(report.hot_rows_rewritten >= 1);
     assert_eq!(
-        inspect_repository(&storage).await.unwrap(),
+        inspect_lix(&storage).await.unwrap(),
         MigrationStatus::Current { version: 71 }
     );
-    let retry = migrate_repository(storage.clone(), MigrationOptions::default())
+    let retry = migrate_lix(storage.clone(), MigrationOptions::default())
         .await
         .expect("migration retry should be idempotent");
     assert_eq!(retry.from_version, 71);

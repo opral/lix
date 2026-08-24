@@ -166,7 +166,7 @@ pub(crate) fn migration_required_error(found_version: u32) -> LixError {
     LixError::new(
         "LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED",
         format!(
-            "repository format v{found_version} must be migrated to v{CURRENT_FORMAT_VERSION} with lix::migration::migrate_repository before opening"
+            "repository format v{found_version} must be migrated to v{CURRENT_FORMAT_VERSION} with lix::migration::migrate_lix before opening"
         ),
     )
 }

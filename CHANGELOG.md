@@ -4,6 +4,9 @@
 
 ### Breaking
 
+- Renamed the Rust repository migration functions from `inspect_repository` and
+  `migrate_repository` to `inspect_lix` and `migrate_lix`. Migration remains an
+  explicit offline operation before `open_lix()`.
 - Removed the `@lix-js/sdk/workerd` entry point, its direct in-isolate WASM
   snapshot bindings, and the now-unused synchronous WASM initializer.
 - Removed the public SQL script-parsing API (`parse_sql_script` /
