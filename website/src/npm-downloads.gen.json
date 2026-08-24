@@ -1,12 +1,8 @@
 {
-  "generatedAt": "2026-08-17T06:36:59.815Z",
+  "generatedAt": "2026-08-24T06:37:13.629Z",
   "package": "@lix-js/sdk",
-  "latestWeeklyDownloads": 411000,
+  "latestWeeklyDownloads": 488000,
   "weeks": [
-    {
-      "weekEnding": "2025-08-17",
-      "downloads": 36000
-    },
     {
       "weekEnding": "2025-08-24",
       "downloads": 37000
@@ -214,6 +210,10 @@
     {
       "weekEnding": "2026-08-16",
       "downloads": 411000
+    },
+    {
+      "weekEnding": "2026-08-23",
+      "downloads": 488000
     }
   ]
 }
