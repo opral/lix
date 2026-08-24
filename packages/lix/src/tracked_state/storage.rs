@@ -9415,6 +9415,21 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
     )
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static COMMIT_DELTA_SCAN_PROBE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_commit_delta_scan_probe_for_test() {
+    COMMIT_DELTA_SCAN_PROBE.with(|probe| probe.set((0, 0)));
+}
+
+#[cfg(test)]
+pub(crate) fn take_commit_delta_scan_probe_for_test() -> (usize, usize) {
+    COMMIT_DELTA_SCAN_PROBE.with(|probe| probe.replace((0, 0)))
+}
+
 /// Loads only the mutations physically authored by one commit, without
 /// expanding a complete-state checkpoint fence into its logical net diff.
 /// Sync uses this together with an authenticated state alias so a checkpoint
@@ -9454,6 +9469,8 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
     file_ids: &[String],
     max_segment_count: usize,
 ) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
+    #[cfg(test)]
+    COMMIT_DELTA_SCAN_PROBE.with(|probe| probe.set((probe.get().0, probe.get().1 + 1)));
     load_commit_delta_members_with_payloads_for_schemas_impl(
         store,
         commit_id,
@@ -11163,6 +11180,8 @@ pub(crate) async fn scan_commit_delta_members(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+    #[cfg(test)]
+    COMMIT_DELTA_SCAN_PROBE.with(|probe| probe.set((probe.get().0 + 1, probe.get().1)));
     let batch = {
         #[cfg(feature = "storage-benches")]
         let _phase = crate::storage_bench::PlanLoadPhaseScope::enter(

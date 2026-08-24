@@ -7630,6 +7630,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packed_replacement_over_hot_before_declines_compact_working_diff() {
+        const ROW_COUNT: usize = 512;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "packed_replacement_working_diff_probe",
+            "columns": [
+                { "name": "path", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["path"],
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        let insert_statements = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                label: None,
+                sql: "INSERT INTO packed_replacement_working_diff_probe (path, value) VALUES ($1, $2)"
+                    .to_owned(),
+                params: vec![
+                    Value::Text(format!("{row_index:04}")),
+                    Value::Text(format!("base-{row_index:04}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session.execute_batch(&insert_statements).await.unwrap();
+        session.create_checkpoint().await.unwrap();
+        session
+            .execute(
+                "UPDATE packed_replacement_working_diff_probe SET value = 'hot' WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let replacement_statements = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                label: None,
+                sql: "UPDATE packed_replacement_working_diff_probe SET value = $1 WHERE path = $2"
+                    .to_owned(),
+                params: vec![
+                    Value::Text(format!("packed-{row_index:04}")),
+                    Value::Text(format!("{row_index:04}")),
+                ],
+        })
+        .collect::<Vec<_>>();
+        session.execute_batch(&replacement_statements).await.unwrap();
+        assert_current_head_uses_packed_delta_without_columnar_sidecar(
+            &session,
+            "packed_replacement_working_diff_probe",
+            ROW_COUNT as u64,
+        )
+        .await;
+
+        let diff = session
+            .execute(
+                "SELECT count(*) AS count FROM lix_working_diff() \
+                 WHERE schema_key = 'packed_replacement_working_diff_probe' \
+                   AND diff_type = 'modified'",
+                &[],
+            )
+            .await
+            .expect("ambiguous packed payload comparison should fall back correctly");
+        assert_eq!(diff.rows()[0].get::<i64>("count").unwrap(), ROW_COUNT as i64);
+    }
+
+    #[tokio::test]
     async fn ordered_batch_update_preserves_non_uniform_lifecycle_without_journal_admission() {
         let session = open_session().await;
         let schema = serde_json::json!({

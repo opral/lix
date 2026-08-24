@@ -13,7 +13,7 @@ use crate::engine::Engine;
 use crate::storage::Memory;
 use crate::support::fuzz_seeds;
 use crate::support::simulation_test::engine::{Simulation, SimulationMode, SimulationOptions};
-use crate::{Lix, LixError, Value, open_lix};
+use crate::{ExecuteBatchStatement, Lix, LixError, Value, open_lix};
 
 use super::runtime::{
     fetch_repository_snapshot, hydrate_error_for_test, register_blob_manifests, sync_iteration,
@@ -965,6 +965,166 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
     );
 }
 
+async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simulation) {
+    const HISTORICAL_CHECKPOINT_COUNT: usize = 50;
+    const FILE_COUNT: usize = 90;
+    const PACKED_ROW_COUNT: usize = 512;
+    let authority = fresh_authority().await;
+    for checkpoint_index in 0..HISTORICAL_CHECKPOINT_COUNT {
+        write_key_value(
+            &authority,
+            "history",
+            &format!("checkpoint-{checkpoint_index:02}"),
+        )
+        .await;
+        authority
+            .create_checkpoint()
+            .await
+            .expect("historical checkpoint should commit");
+    }
+    for index in 0..FILE_COUNT {
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text(format!("/packed-{index:02}.md")),
+                    Value::Blob(format!("packed-{index:02}").into_bytes().into()),
+                ],
+            )
+            .await
+            .expect("post-checkpoint file should commit");
+    }
+    let mut replica = Replica::bootstrap(AuthorityTransport::connected(authority)).await;
+    let packed_rows = (0..PACKED_ROW_COUNT)
+        .map(|index| ExecuteBatchStatement {
+            label: None,
+            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_owned(),
+            params: vec![
+                Value::Text(format!("packed-row-{index:03}")),
+                Value::Text(format!("value-{index:03}")),
+            ],
+        })
+        .collect::<Vec<_>>();
+    replica
+        .lix
+        .execute_batch(&packed_rows)
+        .await
+        .expect("large post-checkpoint batch should publish a packed current base");
+    replica
+        .lix
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = '/packed-02.md'",
+            &[Value::Blob(b"hot update".to_vec().into())],
+        )
+        .await
+        .expect("packed snapshot should accept a HOT file update");
+    replica
+        .lix
+        .execute("DELETE FROM lix_file WHERE path = '/packed-03.md'", &[])
+        .await
+        .expect("packed snapshot should accept a HOT file delete");
+
+    let mut compact_scan_counts = Vec::new();
+    for (selected_path, expected_remaining) in
+        [("/packed-00.md", FILE_COUNT - 2), ("/packed-01.md", FILE_COUNT - 3)]
+    {
+        let selected_file_id = replica
+            .lix
+            .execute("SELECT id FROM lix_file WHERE path = $1", &[Value::Text(selected_path.to_owned())])
+            .await
+            .expect("selected packed file should be locally readable")
+            .rows()[0]
+            .get::<String>("id")
+            .expect("selected packed file id should decode");
+        crate::tracked_state::reset_commit_delta_scan_probe_for_test();
+        let direct_file_diff = replica
+            .lix
+            .execute(
+                "SELECT count(*) AS count FROM lix_working_diff() WHERE file_id = $1",
+                &[Value::Text(selected_file_id.clone())],
+            )
+            .await
+            .expect("direct file-filtered packed diff should stay local");
+        assert!(
+            direct_file_diff.rows()[0].get::<i64>("count").unwrap() > 0,
+            "selected packed file should have a direct file-scoped diff",
+        );
+        let (direct_compact_scans, payload_scans) =
+            crate::tracked_state::take_commit_delta_scan_probe_for_test();
+        assert_eq!(payload_scans, 0, "direct file filter hydrated payload owners");
+
+        crate::tracked_state::reset_commit_delta_scan_probe_for_test();
+        let checkpoint = replica
+            .lix
+            .execute(
+                "INSERT INTO lix_create_checkpoint (diff_id) \
+                 SELECT diff_id FROM lix_working_diff() \
+                 WHERE coalesce( \
+                     file_id, \
+                     CASE WHEN schema_key = 'lix_file_descriptor' THEN row_pk ->> 0 END \
+                 ) IN ($1) \
+                 RETURNING commit_id",
+                &[Value::Text(selected_file_id.clone())],
+            )
+            .await
+            .expect("packed partial checkpoint should stay local");
+        assert!(checkpoint.rows_affected() > 0);
+        let checkpoint_ids = checkpoint
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("commit_id").unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(checkpoint_ids.len(), 1, "one partial checkpoint was created");
+        let (checkpoint_compact_scans, payload_scans) =
+            crate::tracked_state::take_commit_delta_scan_probe_for_test();
+        assert_eq!(
+            payload_scans, 0,
+            "partial checkpoint hydrated historical payload owners",
+        );
+        compact_scan_counts.push((direct_compact_scans, checkpoint_compact_scans));
+
+        let selected_remaining = replica
+            .lix
+            .execute(
+                "SELECT count(*) AS count FROM lix_working_diff() \
+                 WHERE coalesce( \
+                     file_id, \
+                     CASE WHEN schema_key = 'lix_file_descriptor' THEN row_pk ->> 0 END \
+                 ) = $1",
+                &[Value::Text(selected_file_id)],
+            )
+            .await
+            .expect("selected packed file diff should be cleared");
+        assert_eq!(
+            selected_remaining.rows()[0].get::<i64>("count").unwrap(),
+            0,
+            "partial checkpoint cleared the wrong file",
+        );
+
+        let remaining = replica
+            .lix
+            .execute(
+                "SELECT count(distinct coalesce( \
+                     file_id, \
+                     CASE WHEN schema_key = 'lix_file_descriptor' THEN row_pk ->> 0 END \
+                 )) AS count \
+                 FROM lix_working_diff()",
+                &[],
+            )
+            .await
+            .expect("remaining packed working diff should stay locally readable")
+            .rows()[0]
+            .get::<i64>("count")
+            .expect("remaining packed file count should decode");
+        assert_eq!(remaining, expected_remaining as i64);
+        replica.restart().await;
+    }
+    assert!(
+        compact_scan_counts[0].0 > 0 && compact_scan_counts[0].1 > 0,
+        "the first direct filter and checkpoint must both traverse compact packed authority",
+    );
+}
+
 async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Simulation) {
 	let authority = fresh_authority().await;
 	write_key_value(&authority, "selected", "baseline").await;
@@ -1426,6 +1586,10 @@ sync_simulation_test!(
 sync_simulation_test!(
     partial_file_checkpoint_rebases_hot_epoch,
     partial_file_checkpoint_rebases_hot_epoch
+);
+sync_simulation_test!(
+    packed_snapshot_partial_file_checkpoint_stays_payload_local,
+    packed_snapshot_partial_file_checkpoint_stays_payload_local
 );
 sync_simulation_test!(
 	partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot,

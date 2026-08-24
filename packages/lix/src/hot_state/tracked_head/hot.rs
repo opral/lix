@@ -10062,17 +10062,24 @@ fn packed_working_diff_snapshot(payload: Option<&[u8]>) -> WorkingDiffSlotFinger
     )
 }
 
-fn packed_working_diff_version(
-    member: &crate::tracked_state::CommitDeltaMember,
+/// Builds a packed-base after candidate from its compact authenticated index.
+///
+/// The dominant fresh-row case has no before image and therefore needs only
+/// identity and provenance to emit `Added`. A later guard declines the
+/// accelerator when a live before image would require comparing payloads.
+/// Keeping payload slots unresolved avoids loading cold owners for every row
+/// merely to answer the common case.
+fn packed_compact_working_diff_version(
+    value: &crate::tracked_state::TrackedStateIndexValue,
 ) -> WorkingDiffVersion {
     WorkingDiffVersion {
-        change_id: member.value.change_id,
-        commit_id: member.value.commit_id,
-        deleted: member.value.deleted,
-        created_at: member.value.created_at,
-        updated_at: member.value.updated_at,
-        snapshot: packed_working_diff_snapshot(member.change.snapshot.as_deref()),
-        metadata: packed_working_diff_slot(&member.change.metadata),
+        change_id: value.change_id,
+        commit_id: value.commit_id,
+        deleted: value.deleted,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+        snapshot: WorkingDiffSlotFingerprint::unresolved(),
+        metadata: WorkingDiffSlotFingerprint::unresolved(),
     }
 }
 
@@ -10243,7 +10250,10 @@ async fn hot_working_diff_entries(
         .into_iter()
         .filter(|base| base.checkpoint_commit_id == Some(checkpoint_commit_id))
         .collect::<Vec<_>>();
-    if packed_refs.is_empty() {
+    let has_matching_packed_ref = packed_refs
+        .iter()
+        .any(|base| packed_base_matches_file_filter(base, &filter.file_ids));
+    if !has_matching_packed_ref {
         if let Some(bypass) =
             hot_working_diff_bypass_filter(store, branch_id, generation, filter).await?
         {
@@ -10342,26 +10352,31 @@ async fn hot_working_diff_entries(
         {
             return Ok(None);
         }
-        let Ok(members) = crate::tracked_state::load_commit_delta_members_with_payloads(
-            store,
-            base_ref.commit_id,
-        )
-        .await
+        if !packed_base_matches_file_filter(base_ref, &filter.file_ids) {
+            continue;
+        }
+        let Ok(members) =
+            crate::tracked_state::scan_commit_delta_members(store, base_ref.commit_id).await
         else {
             return Ok(None);
         };
-        for member in members {
-            if !packed_member_matches_filter(&member, filter) {
+        for (key, value) in members {
+            if !packed_identity_matches_filter(
+                &key.schema_key,
+                &key.row_pk,
+                key.file_id.as_deref(),
+                filter,
+            ) {
                 continue;
             }
             let identity = HeadIdentity {
                 branch_id: branch_id.to_string(),
                 generation,
-                schema_key: member.key.schema_key.clone(),
-                row_pk: member.key.row_pk.clone(),
-                file_id: member.key.file_id.clone(),
+                schema_key: key.schema_key,
+                row_pk: key.row_pk,
+                file_id: key.file_id,
             };
-            let version = packed_working_diff_version(&member);
+            let version = packed_compact_working_diff_version(&value);
             match selected.entry(identity) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(Some(version));
@@ -10378,7 +10393,7 @@ async fn hot_working_diff_entries(
         }
     }
     if actual_coverage != expected_coverage {
-        if packed_refs.is_empty() {
+        if !has_matching_packed_ref {
             // The sparse dirty-key index is a derived accelerator. Complete
             // HOT primary rows carry the authoritative checkpoint baseline,
             // so an invalid index certificate must degrade to one local
@@ -10451,6 +10466,20 @@ async fn hot_working_diff_entries(
         let Some((before, after)) = choose_hot_or_packed_working_diff(hot_after, base_after) else {
             return Ok(None);
         };
+        if before.is_some_and(|before| {
+            !before.deleted
+                && !after.deleted
+                && before.change_id != after.change_id
+                && after.payload_is_unresolved()
+        }) {
+            // A newer packed replacement can overlay a dirty HOT row that was
+            // already present at the checkpoint. Compact packed authority can
+            // prove identity and provenance, but not whether two distinct live
+            // changes have equal payloads. Decline this rare accelerator case
+            // so canonical diff owns the comparison instead of reintroducing
+            // broad historical payload hydration into the common Added path.
+            return Ok(None);
+        }
         let identity = identity.into_row_identity();
         candidates.push((
             TrackedStateKey {
@@ -10812,11 +10841,10 @@ fn classify_hot_working_diff_entry(
                     before: before_row,
                     after: Some(after_row),
                 })),
-                // Never guess. Every caller hydrates unresolved before images
-                // before classifying, so reaching this arm means a new baseline
-                // source skipped that step.
+                // Never guess. Callers must resolve ambiguous payloads or
+                // decline the accelerator before classification.
                 WorkingDiffPayloadEquality::Unresolved => Err(head_value_error(
-                    "working-diff classification reached an unresolved before image",
+                    "working-diff classification reached an unresolved payload",
                 )),
             }
         }
@@ -11562,8 +11590,8 @@ fn encode_hot_diff_key_parts(
 ///   contributes exactly one group key naming a *commit*
 ///   (`hot_scope_prefix ++ new_head`, see the collection-replacement writer),
 ///   standing for a whole schema collection whose members span every file and
-///   are only recoverable through `load_commit_delta_members_with_payloads`
-///   at read time. Attributing it to file partitions means expanding it per
+///   are recovered from the compact commit-delta member index at read time.
+///   Attributing it to file partitions means expanding it per
 ///   member on the write path — reinstating the per-identity coverage cost
 ///   the manifest exists to remove.
 /// - **A partition-keyed segment is not a packed segment.** A segment batches
