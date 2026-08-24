@@ -48,6 +48,8 @@ use crate::transaction_types::{
 };
 use crate::{LixError, NullableKeyFilter};
 
+pub(crate) const MUTATION_JOURNAL_CHUNK_MAX_ROWS: usize = 4 * 1_024;
+
 /// Transaction-local write buffer after transaction-boundary preparation.
 ///
 /// This is the engine seam between SQL execution and transaction ownership:
@@ -4568,6 +4570,99 @@ mod tests {
         assert_eq!(chunk.identity(0), "a");
         assert_eq!(chunk.identity(1), "b");
         assert_eq!(chunk.identity_arena.len(), 2);
+    }
+
+    #[test]
+    fn immutable_journal_seals_and_routes_across_real_chunk_boundaries() {
+        const ROW_COUNT: usize = 2 * MUTATION_JOURNAL_CHUNK_MAX_ROWS + 1;
+        const BRANCH_ID: &str = "ffffffff-ffff-7fff-bfff-ffffffffffff";
+        const TIMESTAMP: &str = "2026-01-01T00:00:00Z";
+
+        fn chunk(
+            first: usize,
+            end: usize,
+            finalize_tail: bool,
+            compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
+        ) -> ImmutableMutationJournalChunk {
+            let mut identities = Vec::with_capacity((end - first) * 5);
+            let mut identity_offsets = Vec::with_capacity(end - first);
+            let mut snapshots = Vec::new();
+            let mut snapshot_offsets = Vec::with_capacity(end - first);
+            for row_index in first..end {
+                let identity = format!("{row_index:05}");
+                let start = identities.len();
+                identities.extend_from_slice(identity.as_bytes());
+                identity_offsets.push((start, identities.len()));
+
+                let snapshot = format!(r#"{{"key":"{identity}","value":"replacement"}}"#);
+                let start = snapshots.len();
+                snapshots.extend_from_slice(snapshot.as_bytes());
+                snapshot_offsets.push((start, snapshots.len()));
+            }
+
+            let mut chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+                SchemaPlanId::for_test(0),
+                "lix_key_value".into(),
+                BRANCH_ID.into(),
+                None,
+                identities,
+                identity_offsets,
+                snapshots,
+                snapshot_offsets,
+                journal_schema_plan(),
+                None,
+                LixTimestamp::expect_parse("timestamp", TIMESTAMP),
+            )
+            .expect("boundary chunk should build");
+            chunk
+                .seal_replacement_parts(finalize_tail, compressor)
+                .expect("boundary chunk should seal");
+            chunk
+        }
+
+        let staged_writes = test_staged_writes();
+        let mut compressor = None;
+        for (first, end, finalize_tail) in [
+            (0, MUTATION_JOURNAL_CHUNK_MAX_ROWS, false),
+            (
+                MUTATION_JOURNAL_CHUNK_MAX_ROWS,
+                2 * MUTATION_JOURNAL_CHUNK_MAX_ROWS,
+                false,
+            ),
+            (2 * MUTATION_JOURNAL_CHUNK_MAX_ROWS, ROW_COUNT, true),
+        ] {
+            assert!(matches!(
+                staged_writes
+                    .stage_immutable_mutation_chunk(chunk(
+                        first,
+                        end,
+                        finalize_tail,
+                        &mut compressor,
+                    ))
+                    .expect("boundary chunk should stage"),
+                ImmutableMutationChunkStage::Staged
+            ));
+        }
+
+        let journal = staged_writes
+            .ordered_mutations
+            .lock()
+            .expect("ordered journal lock should not be poisoned");
+        let journal = journal.as_ref().expect("ordered journal should exist");
+        assert_eq!(journal.row_count(), ROW_COUNT);
+        assert_eq!(journal.chunks.len(), 3);
+        assert_eq!(journal.sealed_replacement_prefix().0, ROW_COUNT);
+        for expected in ["00000", "04096", "08192"] {
+            let (chunk, row_index) = ordered_mutation_journal_row(
+                journal,
+                BRANCH_ID,
+                "lix_key_value",
+                None,
+                &RowPk::single(expected),
+            )
+            .expect("point lookup should route across journal chunks");
+            assert_eq!(chunk.identity(row_index), expected);
+        }
     }
 
     #[test]

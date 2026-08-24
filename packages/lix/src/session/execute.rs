@@ -11641,8 +11641,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequential_complete_update_seals_direct_journal() {
-        const ROW_COUNT: usize = 8_193;
+    async fn sequential_complete_update_publishes_direct_journal() {
+        // This is the smallest collection that enters the production packed-base lane.
+        const ROW_COUNT: usize = 512;
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://lix.dev/schema-v1.json",
@@ -11705,13 +11706,13 @@ mod tests {
         let visible = transaction
             .execute(
                 "SELECT path, value FROM direct_journal_seal_probe \
-                 WHERE path IN ('0000', '4096', '8192') ORDER BY path",
+                 WHERE path IN ('0000', '0256', '0511') ORDER BY path",
                 &[],
             )
             .await
-            .expect("point reads must route across immutable journal chunks");
+            .expect("point reads must observe the immutable journal");
         assert_eq!(visible.len(), 3);
-        for (row, expected_path) in visible.rows().iter().zip(["0000", "4096", "8192"]) {
+        for (row, expected_path) in visible.rows().iter().zip(["0000", "0256", "0511"]) {
             assert_eq!(row.get::<String>("path").unwrap(), expected_path);
             assert_eq!(
                 row.get::<serde_json::Value>("value").unwrap(),

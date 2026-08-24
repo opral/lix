@@ -100,6 +100,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-dev libclang-dev clang mold
 
+      - name: Install cargo-nextest
+        if: matrix.task == 'test'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # Pull requests restore dependency artifacts seeded by main but never
+      # publish branch-specific target caches. Workspace crates remain
+      # excluded so source changes always rebuild Lix itself.
+      - name: Restore Cargo dependency cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-${{ matrix.task }}
+          workspaces: |
+            . -> target
+          cache-targets: true
+          cache-workspace-crates: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Restore compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
 
@@ -118,12 +137,13 @@ jobs:
 
       # The one supported configuration nothing else here builds: `cfg(test)`
       # with `storage-benches` OFF, which is exactly what a plain
-      # `cargo test -p lix` — the dev loop `packages/lix/AGENTS.md` documents —
-      # compiles. Every other step has the feature on (`--all-features`), and a
-      # `--no-default-features` check has no test targets at all, so a
+      # `cargo nextest run -p lix` — the dev loop `packages/lix/AGENTS.md`
+      # documents — compiles. Every other step has the feature on
+      # (`--all-features`), and a `--no-default-features` check has no test
+      # targets at all, so a
       # `#[cfg(test)]` item that calls the feature-only `storage_bench` module
-      # breaks `cargo test -p lix` while clippy, the full test matrix and the
-      # `--all-features` build all stay green. Two such call sites had
+      # breaks `cargo nextest run -p lix` while clippy, the full test matrix and
+      # the `--all-features` build all stay green. Two such call sites had
       # accumulated in `gc.rs` before this step existed. `check` rather than
       # `test`: the matrix below already runs the tests, this only has to prove
       # the configuration compiles.
@@ -167,40 +187,48 @@ jobs:
       # instrumentation sources, so it is listed to keep them compiling —
       # dropping it would recreate exactly the `storage_bench.rs` blind spot
       # described above.
-      - name: Compile Rust workspace tests
-        if: matrix.task == 'test'
-        run: |
-          cargo test --profile test --workspace --all-features --no-run
-          cargo test --locked --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-run
-          cargo test --locked --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-run
-
-      - name: Run Rust workspace tests
+      - name: Run Rust workspace tests with nextest
         # Deliberately no stack-size override here. Production operations and
-        # their tests must fit libtest's default worker stack, so the command a
-        # developer runs by hand behaves like CI's.
+        # their tests must fit the default worker stack, so the command a
+        # developer runs by hand behaves like CI's. The checked-in CI profile
+        # runs every test after failures, reports slow tests, and terminates a
+        # test that exceeds five minutes.
         #
-        # `--no-fail-fast` is required, not cosmetic. Without it cargo stops at
-        # the first failing target and never runs the rest, so a single red
-        # crate hides every later one. #1329 broke two tests; the second sat
-        # invisible behind the first for hours because CI could only ever
-        # report one, and it appeared in the logs as a compiled executable that
-        # never ran.
+        # `fail-fast = false` is required, not cosmetic. #1329 broke two tests;
+        # the second sat invisible behind the first for hours because CI could
+        # only ever report one.
         if: matrix.task == 'test'
         run: |
-          cargo test --profile test --workspace --all-features --no-fail-fast
-          cargo test --locked --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
-          cargo test --locked --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --no-fail-fast
+          cargo nextest run --config-file .config/nextest.toml --profile ci --cargo-profile test --workspace --all-features --timings
+          cargo nextest run --config-file .config/nextest.toml --profile ci --locked --manifest-path tooling/Cargo.toml --cargo-profile test --workspace --exclude lix_e2e --all-features --timings
+          cargo nextest run --config-file .config/nextest.toml --profile ci-e2e --locked --manifest-path tooling/Cargo.toml --cargo-profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --timings
 
-      # Examples are compiled by `--all-targets` but never executed, so the SQL
-      # strings inside them are never checked. `checkpoints.rs` selected two
-      # columns that do not exist on `lix_checkpoint` and clippy stayed green,
-      # while the docs mirrored the same broken query. Running the example is
-      # what makes its SQL a tested claim rather than a compiled string.
-      # `--all-features` matches the compilation above so the artifacts are
-      # reused.
-      - name: Run Rust examples
+      - name: Upload Rust test timing reports
+        if: matrix.task == 'test' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-nextest-junit
+          path: |
+            target/nextest/ci/junit.xml
+            tooling/target/nextest/ci/junit.xml
+            tooling/target/nextest/ci-e2e/junit.xml
+          if-no-files-found: error
+
+      - name: Upload Cargo build timings
+        if: matrix.task == 'test' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-cargo-timings
+          path: target/cargo-timings/*.html
+          if-no-files-found: warn
+
+      # Nextest deliberately does not execute rustdoc tests. Keep their Cargo
+      # feature/package scopes aligned with the nextest runs above.
+      - name: Run Rust doctests
         if: matrix.task == 'test'
-        run: cargo run --profile test -p lix --all-features --example checkpoints
+        run: |
+          cargo test --doc --profile test --workspace --all-features --no-fail-fast
+          cargo test --doc --locked --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
 
       # The e2e test compilation above already builds the real workspace plugin
       # artifacts. This one external fixture covers the distinct risk: whether

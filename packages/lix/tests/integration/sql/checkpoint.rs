@@ -3,6 +3,89 @@ use serde_json::json;
 
 use super::select_rows;
 
+#[tokio::test(flavor = "current_thread")]
+async fn checkpoints_example_sql_contract() {
+    let lix = crate::open_lix().await.expect("example repository opens");
+
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+        &[
+            Value::Text("checkpoint-demo".to_string()),
+            Value::Text("draft".to_string()),
+        ],
+    )
+    .await
+    .expect("example tracked write succeeds");
+
+    let working_diffs = lix
+        .execute(
+            "SELECT row_pk, schema_key, diff_type
+             FROM lix_working_diff()
+             ORDER BY schema_key, row_pk",
+            &[],
+        )
+        .await
+        .expect("example working diff query succeeds");
+    assert_eq!(working_diffs.len(), 1);
+    assert_eq!(
+        working_diffs.rows()[0]
+            .get::<serde_json::Value>("row_pk")
+            .expect("row_pk is JSON"),
+        json!(["checkpoint-demo"])
+    );
+    assert_eq!(
+        working_diffs.rows()[0]
+            .get::<String>("schema_key")
+            .expect("schema_key is text"),
+        "lix_key_value"
+    );
+    assert_eq!(
+        working_diffs.rows()[0]
+            .get::<String>("diff_type")
+            .expect("diff_type is text"),
+        "added"
+    );
+
+    let checkpoint = lix
+        .create_checkpoint()
+        .await
+        .expect("example checkpoint succeeds");
+    let checkpoints = lix
+        .execute(
+            "SELECT commit_id, lixcol_depth
+             FROM lix_history('lix_checkpoint')
+             ORDER BY lixcol_depth",
+            &[],
+        )
+        .await
+        .expect("example checkpoint history query succeeds");
+    assert_eq!(
+        checkpoints.rows()[0]
+            .get::<String>("commit_id")
+            .expect("commit_id is text"),
+        checkpoint.commit_id
+    );
+    assert_eq!(
+        checkpoints.rows()[0]
+            .get::<i64>("lixcol_depth")
+            .expect("lixcol_depth is an integer"),
+        0
+    );
+
+    let remaining = lix
+        .execute("SELECT COUNT(*) AS count FROM lix_working_diff()", &[])
+        .await
+        .expect("example final working diff query succeeds");
+    assert_eq!(
+        remaining.rows()[0]
+            .get::<i64>("count")
+            .expect("count is an integer"),
+        0
+    );
+
+    lix.close().await.expect("example repository closes");
+}
+
 simulation_test!(
     checkpoint_marks_working_interval_and_projects_sql_surfaces,
     |sim| async move {
