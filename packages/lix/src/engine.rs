@@ -1684,7 +1684,7 @@ mod tests {
     /// never-existed) and asserts the finite answer equals the broad answer
     /// restricted to that identity.
     #[tokio::test]
-    async fn working_diff_finite_bypass_and_index_scan_agree_on_every_row_state() {
+    async fn working_diff_primary_scan_and_index_scan_agree_on_every_row_state() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -1850,7 +1850,7 @@ mod tests {
             "/never-existed",
         ] {
             let requested_row_pk = format!("[\"{path}\"]");
-            let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
+            let primary_before = hits.primary_scan.load(Ordering::Relaxed);
             let finite = session
                 .execute(
                     "SELECT row_pk, diff_type FROM lix_working_diff() \
@@ -1861,7 +1861,7 @@ mod tests {
                 .await
                 .expect("finite working-diff read should execute");
             assert!(
-                hits.finite_bypass.load(Ordering::Relaxed) > bypass_before,
+                hits.primary_scan.load(Ordering::Relaxed) > primary_before,
                 "the finite working-diff read for {path} must take the primary-row bypass"
             );
             let finite_rows = finite
@@ -2064,7 +2064,7 @@ mod tests {
         );
 
         for file in files {
-            let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
+            let primary_before = hits.primary_scan.load(Ordering::Relaxed);
             let scoped = collect(
                 &session
                     .execute(
@@ -2075,7 +2075,7 @@ mod tests {
                     .expect("file-scoped working-diff read should execute"),
             );
             assert!(
-                hits.finite_bypass.load(Ordering::Relaxed) > bypass_before,
+                hits.primary_scan.load(Ordering::Relaxed) > primary_before,
                 "the file-scoped working-diff read for {file} must take the primary-row bypass"
             );
             let want = broad
@@ -2088,7 +2088,7 @@ mod tests {
                 "the file-scoped working-diff bypass disagrees with the index scan for {file}"
             );
 
-            let bypass_before = hits.finite_bypass.load(Ordering::Relaxed);
+            let primary_before = hits.primary_scan.load(Ordering::Relaxed);
             let scoped_schema = collect(
                 &session
                     .execute(
@@ -2102,7 +2102,7 @@ mod tests {
                     .expect("file+schema working-diff read should execute"),
             );
             assert!(
-                hits.finite_bypass.load(Ordering::Relaxed) > bypass_before,
+                hits.primary_scan.load(Ordering::Relaxed) > primary_before,
                 "the file+schema working-diff read for {file} must take the primary-row bypass"
             );
             let want_schema = want

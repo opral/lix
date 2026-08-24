@@ -59,7 +59,7 @@ use crate::NullableKeyFilter;
 #[cfg(test)]
 use crate::branch::stage_branch_head_control;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext, BranchHeadTrackedReachability};
-use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
+use crate::changelog::{ChangeId, ChangeRecordProjection, ChangelogReader, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch,
@@ -3622,18 +3622,24 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open bad coverage read");
-        assert!(
-            TrackedHeadContext::new()
-                .reader(read)
-                .working_diff_for_control(
-                    branch_id,
-                    control(second_head, checkpoint, no_op_checkpoint),
-                    &TrackedStateDiffRequest::default(),
-                )
-                .await
-                .expect("bad coverage should not error")
-                .is_none(),
-            "bad index coverage must select canonical replay"
+        let recovered = TrackedHeadContext::new()
+            .reader(read)
+            .working_diff_for_control(
+                branch_id,
+                control(second_head, checkpoint, no_op_checkpoint),
+                &TrackedStateDiffRequest::default(),
+            )
+            .await
+            .expect("uncertified coverage should not error")
+            .expect("uncertified derived coverage should use authoritative primary rows");
+        assert_eq!(recovered.diff.entries.len(), 1);
+        assert_eq!(
+            recovered.diff.entries[0]
+                .before
+                .as_ref()
+                .expect("recovered modification has a before row")
+                .change_id,
+            ChangeId::for_test_label("first-change")
         );
     }
 

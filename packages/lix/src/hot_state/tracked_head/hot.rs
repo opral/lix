@@ -10082,13 +10082,13 @@ fn packed_working_diff_version(
 #[cfg(test)]
 pub(crate) static WORKING_DIFF_PATH_HITS: WorkingDiffPathHits = WorkingDiffPathHits {
     index_scan: std::sync::atomic::AtomicUsize::new(0),
-    finite_bypass: std::sync::atomic::AtomicUsize::new(0),
+    primary_scan: std::sync::atomic::AtomicUsize::new(0),
 };
 
 #[cfg(test)]
 pub(crate) struct WorkingDiffPathHits {
     pub(crate) index_scan: std::sync::atomic::AtomicUsize,
-    pub(crate) finite_bypass: std::sync::atomic::AtomicUsize,
+    pub(crate) primary_scan: std::sync::atomic::AtomicUsize,
 }
 
 /// Decides whether a working-diff read may skip the `HOT_DIFF` scope scan and
@@ -10228,8 +10228,8 @@ fn decode_hot_file_schema_key_in_scope(key: Bytes, scope: &[u8]) -> Result<Strin
 }
 
 /// Resolves a checkpoint diff from row-local first-before images. Broad diffs
-/// enumerate the sparse dirty-key index; finite PK queries read only the
-/// primary rows that can answer the request.
+/// normally enumerate the sparse dirty-key index; finite PK queries and broad
+/// reads with an uncertified derived index scan authoritative primary rows.
 async fn hot_working_diff_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -10247,7 +10247,7 @@ async fn hot_working_diff_entries(
         if let Some(bypass) =
             hot_working_diff_bypass_filter(store, branch_id, generation, filter).await?
         {
-            return hot_working_diff_entries_for_finite_filter(
+            return hot_working_diff_entries_from_primary(
                 store,
                 branch_id,
                 checkpoint_commit_id,
@@ -10335,7 +10335,7 @@ async fn hot_working_diff_entries(
             break;
         }
     }
-    for base_ref in packed_refs {
+    for base_ref in &packed_refs {
         if actual_coverage
             .add_encoded_group_key(&base_ref.coverage_key)
             .is_none()
@@ -10378,6 +10378,23 @@ async fn hot_working_diff_entries(
         }
     }
     if actual_coverage != expected_coverage {
+        if packed_refs.is_empty() {
+            // The sparse dirty-key index is a derived accelerator. Complete
+            // HOT primary rows carry the authoritative checkpoint baseline,
+            // so an invalid index certificate must degrade to one local
+            // current-state scan before canonical commit replay is considered.
+            // Snapshot replicas intentionally keep historical commit bodies
+            // cold; replaying them here turns one local read into a request per
+            // checkpoint even though the answer is already in HOT state.
+            return hot_working_diff_entries_from_primary(
+                store,
+                branch_id,
+                checkpoint_commit_id,
+                generation,
+                filter,
+            )
+            .await;
+        }
         return Ok(None);
     }
     let (selected, base_versions): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
@@ -10462,7 +10479,7 @@ fn choose_hot_or_packed_working_diff(
     }
 }
 
-async fn hot_working_diff_entries_for_finite_filter(
+async fn hot_working_diff_entries_from_primary(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     checkpoint_commit_id: CommitId,
@@ -10471,7 +10488,7 @@ async fn hot_working_diff_entries_for_finite_filter(
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
     #[cfg(test)]
     WORKING_DIFF_PATH_HITS
-        .finite_bypass
+        .primary_scan
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rows = hot_scan_entries(store, branch_id, generation, filter, None, None)
         .await?
@@ -10535,7 +10552,7 @@ async fn hot_working_diff_entries_for_finite_filter(
 /// are dirty, where those same states would be corruption. See the equivalence
 /// argument in `hot_working_diff_entries`; the reachable-state proof is
 /// exercised end to end by
-/// `working_diff_finite_bypass_and_index_scan_agree_on_every_row_state`.
+/// `working_diff_primary_scan_and_index_scan_agree_on_every_row_state`.
 fn finite_working_diff_versions(
     bytes: &Bytes,
     checkpoint_commit_id: CommitId,
@@ -10687,24 +10704,55 @@ async fn resolve_working_diff_before_payloads<T>(
             );
             continue;
         }
-        pending.push(index);
+        pending.push((index, key_of(&candidates[index])));
     }
     if pending.is_empty() {
         return Ok(());
     }
-    let mut by_commit = BTreeMap::<CommitId, Vec<usize>>::new();
-    for index in pending {
+    // Snapshot/bootstrap publication keeps change payloads in the standalone
+    // changelog while their physical commit bodies may remain remote. Resolve
+    // that local authority in one batch before asking for any owner commit.
+    let change_ids = pending
+        .iter()
+        .map(|(index, _)| {
+            before_of(&mut candidates[*index])
+                .as_ref()
+                .expect("pending before images are present")
+                .change_id
+        })
+        .collect::<Vec<_>>();
+    let local = crate::changelog::ChangelogContext::new()
+        .reader(store)
+        .load_changes(crate::changelog::ChangeLoadRequest {
+            change_ids: &change_ids,
+        })
+        .await?;
+    let mut by_commit = BTreeMap::<CommitId, Vec<(usize, TrackedStateKey)>>::new();
+    for ((index, key), (_, record)) in pending.into_iter().zip(local) {
         let commit_id = before_of(&mut candidates[index])
             .as_ref()
             .expect("pending before images are present")
             .commit_id;
-        by_commit.entry(commit_id).or_default().push(index);
+        let version = before_of(&mut candidates[index])
+            .as_mut()
+            .expect("pending before images are present");
+        if let Some(record) = record.as_ref()
+            && record.schema_key == key.schema_key
+            && record.file_id == key.file_id
+            && record.row_pk == key.row_pk
+            && record.snapshot.is_some()
+            && record.created_at == version.updated_at
+        {
+            version.resolve_payload_slots(
+                packed_working_diff_snapshot(record.snapshot.as_deref()),
+                packed_working_diff_slot(&record.metadata),
+            );
+            continue;
+        }
+        by_commit.entry(commit_id).or_default().push((index, key));
     }
-    for (commit_id, indexes) in by_commit {
-        let keys = indexes
-            .iter()
-            .map(|index| key_of(&candidates[*index]))
-            .collect::<Vec<_>>();
+    for (commit_id, pending) in by_commit {
+        let (indexes, keys): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
         let records =
             crate::tracked_state::load_commit_delta_change_records(store, commit_id, &keys).await?;
         for (index, record) in indexes.into_iter().zip(records) {
