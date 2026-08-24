@@ -12,6 +12,7 @@ use crate::{ExecuteBatchStatement, Value};
 struct ExpiringReadStorage {
     inner: Memory,
     remaining_expired_read_calls: Arc<AtomicUsize>,
+    remaining_expired_scan_calls: Arc<AtomicUsize>,
     expired_calls: Arc<AtomicUsize>,
 }
 
@@ -20,6 +21,7 @@ impl ExpiringReadStorage {
         Self {
             inner: Memory::new(),
             remaining_expired_read_calls: Arc::new(AtomicUsize::new(0)),
+            remaining_expired_scan_calls: Arc::new(AtomicUsize::new(0)),
             expired_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -31,6 +33,11 @@ impl ExpiringReadStorage {
     fn expire_read_calls(&self, count: usize) {
         self.remaining_expired_read_calls
             .store(count, Ordering::Release);
+    }
+
+    fn expire_next_scan_call(&self) {
+        self.remaining_expired_scan_calls
+            .store(1, Ordering::Release);
     }
 
     fn allow_reads(&self) {
@@ -46,6 +53,7 @@ impl ExpiringReadStorage {
 struct ExpiringRead {
     inner: MemoryRead,
     remaining_expired_read_calls: Arc<AtomicUsize>,
+    remaining_expired_scan_calls: Arc<AtomicUsize>,
     expired_calls: Arc<AtomicUsize>,
 }
 
@@ -53,6 +61,20 @@ impl ExpiringRead {
     fn expire_if_armed(&self) -> Result<(), StorageError> {
         if self
             .remaining_expired_read_calls
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.expired_calls.fetch_add(1, Ordering::AcqRel);
+            return Err(StorageError::ReadExpired);
+        }
+        Ok(())
+    }
+
+    fn expire_scan_if_armed(&self) -> Result<(), StorageError> {
+        if self
+            .remaining_expired_scan_calls
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
@@ -79,6 +101,7 @@ impl Storage for ExpiringReadStorage {
         Ok(ExpiringRead {
             inner: self.inner.begin_read(options).await?,
             remaining_expired_read_calls: Arc::clone(&self.remaining_expired_read_calls),
+            remaining_expired_scan_calls: Arc::clone(&self.remaining_expired_scan_calls),
             expired_calls: Arc::clone(&self.expired_calls),
         })
     }
@@ -108,6 +131,7 @@ impl StorageRead for ExpiringRead {
         options: BeginScanOptions,
     ) -> Result<ScanCursor<'_>, StorageError> {
         self.expire_if_armed()?;
+        self.expire_scan_if_armed()?;
         self.inner.begin_scan(space, range, options).await
     }
 }
@@ -160,6 +184,36 @@ async fn auto_commit_query_restarts_after_its_snapshot_expires() {
         serde_json::json!(42)
     );
     assert_eq!(storage.expired_calls(), 1);
+}
+
+#[tokio::test]
+async fn filesystem_provider_scan_preserves_expired_read_for_session_retry() {
+    let storage = ExpiringReadStorage::new();
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+    lix.execute("INSERT INTO lix_directory (path) VALUES ('/docs')", &[])
+        .await
+        .expect("seed directory");
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ('/docs/readme.md', $1)",
+        &[Value::Blob(b"hello".to_vec().into())],
+    )
+    .await
+    .expect("seed file");
+
+    for sql in [
+        "SELECT id FROM lix_directory",
+        "SELECT content FROM lix_file",
+    ] {
+        let expired_before = storage.expired_calls();
+        storage.expire_next_scan_call();
+        lix.execute(sql, &[])
+            .await
+            .expect("filesystem provider must preserve the typed retry signal");
+        assert_eq!(storage.expired_calls(), expired_before + 1);
+    }
 }
 
 #[tokio::test]

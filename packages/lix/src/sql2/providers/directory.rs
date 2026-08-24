@@ -539,9 +539,10 @@ impl TableSpec for LixDirectorySpec {
                         indexed_lix_directory_record_batch(&batch_schema, indexed_matches)
                     } else {
                         let rows = hot_state.scan_batch(&request).await.map_err(|error| {
-                            DataFusionError::Execution(format!(
-                                "sql2 lix_directory scan failed: {error}"
-                            ))
+                            DataFusionError::Context(
+                                "sql2 lix_directory scan failed".to_string(),
+                                Box::new(lix_error_to_datafusion_error(error)),
+                            )
                         })?;
                         lix_directory_record_batch(&batch_schema, &rows)
                     }
