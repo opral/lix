@@ -5506,6 +5506,96 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
 }
 
 #[tokio::test]
+async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
+    let lix = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv",
+        &build_csv_plugin_archive(),
+        &["csv_table", "csv_row"],
+    )
+    .await;
+    write_file(&lix, "/selected.csv", b"name,value\na,one\nb,two\n".to_vec())
+        .await
+        .unwrap();
+    write_file(
+        &lix,
+        "/remaining.csv",
+        b"name,value\nx,ten\ny,twenty\n".to_vec(),
+    )
+    .await
+    .unwrap();
+    lix.create_checkpoint().await.unwrap();
+    let selected_file_id = file_id_at_path(&lix, "/selected.csv").await;
+    let remaining_file_id = file_id_at_path(&lix, "/remaining.csv").await;
+
+    write_file(
+        &lix,
+        "/selected.csv",
+        b"name,value\na,ONE\nb,TWO\nc,THREE\n".to_vec(),
+    )
+    .await
+    .unwrap();
+    write_file(
+        &lix,
+        "/remaining.csv",
+        b"name,value\nx,TEN\ny,TWENTY\nz,THIRTY\n".to_vec(),
+    )
+    .await
+    .unwrap();
+    let selected_diff_count = lix
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_working_diff() WHERE file_id = $1",
+            &[Value::Text(selected_file_id.clone())],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<i64>("count")
+        .unwrap();
+    assert!(selected_diff_count > 1, "CSV must fan out beyond lix_file");
+    lix.execute(
+        "INSERT INTO lix_create_checkpoint (diff_id) \
+         SELECT diff_id FROM lix_working_diff() WHERE file_id = $1 \
+         RETURNING commit_id",
+        &[Value::Text(selected_file_id.clone())],
+    )
+    .await
+    .expect("checkpoint all selected plugin rows");
+
+    assert_eq!(
+        lix.execute(
+            "SELECT COUNT(*) AS count FROM lix_working_diff() WHERE file_id = $1",
+            &[Value::Text(selected_file_id.clone())],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<i64>("count")
+        .unwrap(),
+        0,
+    );
+    assert!(
+        lix.execute(
+            "SELECT COUNT(*) AS count FROM lix_working_diff() WHERE file_id = $1",
+            &[Value::Text(remaining_file_id)],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<i64>("count")
+        .unwrap()
+            > 0,
+    );
+    assert_eq!(active_csv_rows(&lix, &selected_file_id).await.len(), 4);
+    assert_eq!(
+        read_file(&lix, "/selected.csv").await.unwrap().unwrap(),
+        b"name,value\na,ONE\nb,TWO\nc,THREE\n",
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_csv_ids_survive_insert_edit_reorder_delete_eviction_and_cold_reopen() {
     let tempdir = tempfile::tempdir().unwrap();
     let archive = build_csv_plugin_archive();

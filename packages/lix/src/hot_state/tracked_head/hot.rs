@@ -5305,6 +5305,13 @@ pub(crate) enum CompleteWorkingDiffMode {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkingDiffBaselineAction {
+    Continue,
+    Reset,
+    Rebase,
+}
+
 impl HotTrackedSnapshot {
     pub(crate) fn from_materialized_rows(
         tracked_rows: Vec<MaterializedTrackedStateRow>,
@@ -6507,7 +6514,7 @@ where
             false,
             None,
             None,
-            false,
+            WorkingDiffBaselineAction::Continue,
             &BTreeMap::new(),
         )
         .await
@@ -6539,7 +6546,7 @@ where
             false,
             None,
             None,
-            false,
+            WorkingDiffBaselineAction::Continue,
             &BTreeMap::new(),
         )
         .await
@@ -6575,7 +6582,7 @@ where
                 false,
                 None,
                 None,
-                true,
+                WorkingDiffBaselineAction::Reset,
                 &BTreeMap::new(),
             )
             .await?;
@@ -6586,19 +6593,38 @@ where
         Ok(generation)
     }
 
-    /// Whether a checkpoint can rotate its working-diff epoch without
-    /// materializing current-state base rows first.
+    /// Carries the unselected part of a partial checkpoint into its new
+    /// working-diff epoch without reconstructing the branch snapshot.
     ///
-    /// Packed-base refs retain the checkpoint epoch in which they were
-    /// published. Readers reinterpret a base as clean when the active epoch
-    /// advances, so rotating the epoch neither scans nor retires those refs.
-    /// Root bases are already checkpoint state and need no rewrite either.
-    pub(crate) async fn can_rotate_checkpoint_epoch(
-        &self,
-        _branch_id: &str,
-        _generation: CommitId,
-    ) -> Result<bool, LixError> {
-        Ok(true)
+    /// Every delta is already dirty in the visible generation. Its immutable
+    /// before-image remains the checkpoint baseline; only the checkpoint id,
+    /// current commit ownership, and sparse dirty index advance.
+    pub(crate) async fn stage_partial_checkpoint_current_state(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        new_head: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        checkpoint_commit_id: CommitId,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<CommitId, LixError> {
+        self.stage_current_state_with_working_diff_inner(
+            branch_id,
+            Some(generation),
+            new_head,
+            deltas,
+            &[],
+            &BTreeSet::new(),
+            None,
+            Some(checkpoint_commit_id),
+            coverage,
+            false,
+            None,
+            None,
+            WorkingDiffBaselineAction::Rebase,
+            &BTreeMap::new(),
+        )
+        .await
     }
 
     /// Stages deltas whose absence was already validated against the coherent
@@ -6640,7 +6666,7 @@ where
                     true,
                     validated_absent_file_id,
                     None,
-                    false,
+                    WorkingDiffBaselineAction::Continue,
                     &BTreeMap::new(),
                 )
                 .await;
@@ -6659,7 +6685,7 @@ where
             true,
             validated_absent_file_id,
             Some(absence_guards),
-            false,
+            WorkingDiffBaselineAction::Continue,
             &BTreeMap::new(),
         )
         .await
@@ -6680,9 +6706,20 @@ where
         absence_guards_validated: bool,
         validated_absent_file_id: Option<&str>,
         borrowed_absence_guards: Option<&[TrackedStateKeyRef<'_>]>,
-        reset_working_diff_baselines: bool,
+        working_diff_baseline_action: WorkingDiffBaselineAction,
         certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
     ) -> Result<CommitId, LixError> {
+        if working_diff_baseline_action == WorkingDiffBaselineAction::Rebase
+            && working_diff_capture_checkpoint_commit_id.is_none()
+        {
+            return Err(head_value_error(
+                "partial-checkpoint rebase requires an active checkpoint",
+            ));
+        }
+        let reset_working_diff_baselines =
+            working_diff_baseline_action == WorkingDiffBaselineAction::Reset;
+        let rebase_working_diff_baselines =
+            working_diff_baseline_action == WorkingDiffBaselineAction::Rebase;
         let generation = parent_generation.unwrap_or(new_head);
         let sorted = {
             let _span = tracing::debug_span!(
@@ -7373,6 +7410,21 @@ where
                     && !delta.untracked
                 {
                     (WorkingDiffBaseline::Clean, false)
+                } else if rebase_working_diff_baselines && !delta.untracked {
+                    let previous = previous
+                        .as_ref()
+                        .map(CertifiedCurrentStatePredecessor::view)
+                        .transpose()?
+                        .ok_or_else(|| {
+                            head_value_error(
+                                "partial-checkpoint remainder has no HOT before-image",
+                            )
+                        })?;
+                    rebase_hot_working_diff_baseline(
+                        working_diff_capture_checkpoint_commit_id
+                            .expect("partial-checkpoint rebase requires a checkpoint"),
+                        previous,
+                    )?
                 } else if working_diff_capture_checkpoint_commit_id.is_some() && !delta.untracked {
                     let previous = previous
                         .as_ref()
@@ -8042,6 +8094,30 @@ fn next_hot_working_diff_baseline(
         }
         WorkingDiffBaseline::Disabled => Err(head_value_error(
             "active checkpoint generation contains a tracked row without a baseline",
+        )),
+    }
+}
+
+fn rebase_hot_working_diff_baseline(
+    checkpoint_commit_id: CommitId,
+    previous: HeadValueView<'_>,
+) -> Result<(WorkingDiffBaseline, bool), LixError> {
+    match previous.working_diff_baseline {
+        WorkingDiffBaseline::BeforeAbsent { .. } => Ok((
+            WorkingDiffBaseline::BeforeAbsent {
+                checkpoint_commit_id,
+            },
+            true,
+        )),
+        WorkingDiffBaseline::BeforePresent { version, .. } => Ok((
+            WorkingDiffBaseline::BeforePresent {
+                checkpoint_commit_id,
+                version,
+            },
+            true,
+        )),
+        WorkingDiffBaseline::Clean | WorkingDiffBaseline::Disabled => Err(head_value_error(
+            "partial-checkpoint remainder is not dirty in the previous epoch",
         )),
     }
 }

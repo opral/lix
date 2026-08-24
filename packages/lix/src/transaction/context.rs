@@ -8044,6 +8044,7 @@ where
                     interval_has_commits,
                 },
                 gc_state,
+                hot_working_diff_certified: false,
             })?;
         Ok(commit_id)
     }
@@ -8056,6 +8057,7 @@ where
         interval_has_commits: bool,
         gc_state: CheckpointGcState,
         selected_changes: StagedCommitChangeBatch,
+        hot_working_diff_certified: bool,
     ) -> Result<String, LixError> {
         let commit_id = self
             .staged_writes
@@ -8072,6 +8074,7 @@ where
                     interval_has_commits,
                 },
                 gc_state,
+                hot_working_diff_certified,
             })?;
         Ok(commit_id)
     }
@@ -8587,6 +8590,7 @@ where
                 &TrackedStateDiffRequest::default(),
             )
             .await?;
+        let hot_working_diff_certified = direct_diff.is_some();
         let diff = match direct_diff {
             Some(direct) => direct.diff,
             None => {
@@ -8665,6 +8669,7 @@ where
                 interval_has_commits,
                 gc_state,
                 selected,
+                hot_working_diff_certified,
             )?
         } else {
             let checkpoint_commit_id = self.staged_writes.stage_intermediate_commit(
@@ -8685,6 +8690,7 @@ where
                         interval_has_commits,
                     },
                     gc_state,
+                    hot_working_diff_certified,
                 })?;
             checkpoint_commit_id.to_string()
         };

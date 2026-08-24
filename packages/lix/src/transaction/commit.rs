@@ -3034,6 +3034,12 @@ struct StagedHotHeads {
     controls: BTreeMap<String, BranchHeadControl>,
 }
 
+#[derive(Clone, Copy)]
+struct CheckpointEpochBinding {
+    commit_id: CommitId,
+    hot_rebase_certified: bool,
+}
+
 /// Returns the commit snapshots that must be materialized before publication.
 /// Normal serial commits and row-only selected refs stay on the
 /// O(changed-rows) hot mutation path. A lifecycle discontinuity (checkpoint,
@@ -3045,7 +3051,7 @@ fn lifecycle_snapshot_commit_ids(
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
-    checkpoint_epochs: &BTreeMap<String, CommitId>,
+    checkpoint_epochs: &BTreeMap<String, CheckpointEpochBinding>,
 ) -> Result<BTreeSet<CommitId>, LixError> {
     let roots_by_id = tracked_roots
         .iter()
@@ -3070,13 +3076,23 @@ fn lifecycle_snapshot_commit_ids(
             (Some(parent_commit_id), Some(control))
                 if control.head_commit_id == parent_commit_id
         );
-        let checkpoint_can_reuse_generation = checkpoint_epochs.get(&root.branch_id)
-            == Some(&root.commit_id)
+        let checkpoint_can_reuse_generation = checkpoint_epochs
+            .get(&root.branch_id)
+            .is_some_and(|binding| binding.commit_id == root.commit_id)
             && observations
                 .get(&root.branch_id)
                 .and_then(|observation| observation.control)
                 .is_some();
+        let partial_checkpoint_can_reuse_generation = partial_checkpoint_rebase_commit_id(
+            root,
+            staged,
+            staged_commits,
+            observations,
+            checkpoint_epochs,
+        )
+        .is_some();
         if !checkpoint_can_reuse_generation
+            && !partial_checkpoint_can_reuse_generation
             && (!parent_is_published
                 || selected_refs_require_complete_snapshot(&staged.selected_change_batches))
         {
@@ -3128,6 +3144,32 @@ fn selected_refs_require_complete_snapshot(
             FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
         )
     })
+}
+
+fn partial_checkpoint_rebase_commit_id(
+    root: &PendingTrackedRoot,
+    staged: &StagedChangelogCommit,
+    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    observations: &BTreeMap<String, BranchHeadControlObservation>,
+    checkpoint_epochs: &BTreeMap<String, CheckpointEpochBinding>,
+) -> Option<CommitId> {
+    let checkpoint = checkpoint_epochs.get(&root.branch_id)?;
+    let checkpoint_commit_id = checkpoint.commit_id;
+    (root.publish_head
+        && root.commit_id != checkpoint_commit_id
+        && root.parent_commit_id == Some(checkpoint_commit_id)
+        && checkpoint.hot_rebase_certified
+        && observations
+            .get(&root.branch_id)
+            .and_then(|observation| observation.control)
+            .is_some()
+        && !selected_refs_require_complete_snapshot(&staged.selected_change_batches)
+        && staged_commits
+            .get(&checkpoint_commit_id)
+            .is_some_and(|checkpoint| {
+                !selected_refs_require_complete_snapshot(&checkpoint.selected_change_batches)
+            }))
+    .then_some(checkpoint_commit_id)
 }
 
 /// Resolves the full tracked view for only the rare lifecycle commits selected
@@ -3627,7 +3669,7 @@ async fn stage_tracked_head(
     certified_fresh_plugin_file_id: Option<&str>,
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
-    checkpoint_epochs: &BTreeMap<String, CommitId>,
+    checkpoint_epochs: &BTreeMap<String, CheckpointEpochBinding>,
     mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
     ordered_addressable_commits: &BTreeSet<CommitId>,
     replacement_generation_commits: &BTreeSet<CommitId>,
@@ -3699,7 +3741,9 @@ async fn stage_tracked_head(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let checkpoint_commit_id = checkpoint_epochs.get(&root.branch_id).copied();
+        let checkpoint_commit_id = checkpoint_epochs
+            .get(&root.branch_id)
+            .map(|binding| binding.commit_id);
         let is_checkpoint_publication = checkpoint_commit_id == Some(root.commit_id);
         let certified_columnar_parts = mutation_inventories
             .get(&root.commit_id)
@@ -3726,97 +3770,118 @@ async fn stage_tracked_head(
             if let Some(schema_keys) = transaction_global_schema_keys.as_ref() {
                 writer = writer.with_transaction_global_schema_keys(schema_keys);
             }
-            if writer
-                .can_rotate_checkpoint_epoch(&root.branch_id, parent_generation)
-                .await?
-            {
-                let selected_deleted_rows = staged
+            let selected_deleted_rows = staged
+                .selected_change_batches
+                .iter()
+                .flat_map(StagedCommitChangeBatch::deleted_iter)
+                .map(|change_ref| {
+                    let key = selected_change_key(change_ref);
+                    lifecycle_selected_tracked_row(
+                        change_ref,
+                        root.commit_id,
+                        None,
+                        selected_change_payloads.get(&key),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let selected_metadata = selected_deleted_rows
+                .iter()
+                .map(|row| {
+                    row.metadata
+                        .as_deref()
+                        .map(|metadata| {
+                            serde_json::from_str(metadata)
+                                .map(lix_schema::Jsonb::from_value)
+                                .map_err(|error| LixError::unknown(error.to_string()))
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, LixError>>()?;
+            let mut deleted_deltas = tracked_delete_indices_by_commit
+                .get(&root.commit_id)
+                .into_iter()
+                .flatten()
+                .map(|&row_index| current_state_delta_from_state_row(state_rows.row(row_index)))
+                .collect::<Result<Vec<_>, _>>()?;
+            deleted_deltas.extend(
+                staged
                     .selected_change_batches
                     .iter()
                     .flat_map(StagedCommitChangeBatch::deleted_iter)
-                    .map(|change_ref| {
-                        let key = selected_change_key(change_ref);
-                        lifecycle_selected_tracked_row(
-                            change_ref,
-                            root.commit_id,
-                            None,
-                            selected_change_payloads.get(&key),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let selected_metadata = selected_deleted_rows
-                    .iter()
-                    .map(|row| {
-                        row.metadata
-                            .as_deref()
-                            .map(|metadata| {
-                                serde_json::from_str(metadata)
-                                    .map(lix_schema::Jsonb::from_value)
-                                    .map_err(|error| LixError::unknown(error.to_string()))
-                            })
-                            .transpose()
-                    })
-                    .collect::<Result<Vec<_>, LixError>>()?;
-                let mut deleted_deltas = tracked_delete_indices_by_commit
-                    .get(&root.commit_id)
-                    .into_iter()
-                    .flatten()
-                    .map(|&row_index| current_state_delta_from_state_row(state_rows.row(row_index)))
-                    .collect::<Result<Vec<_>, _>>()?;
-                deleted_deltas.extend(
-                    staged
-                        .selected_change_batches
-                        .iter()
-                        .flat_map(StagedCommitChangeBatch::deleted_iter)
-                        .zip(selected_deleted_rows.iter())
-                        .zip(&selected_metadata)
-                        .map(|((change_ref, row), metadata)| {
-                            crate::hot_state::CurrentStateDeltaRef {
-                                schema_key: &row.schema_key,
-                                file_id: row.file_id.as_deref(),
-                                row_pk: &row.row_pk,
-                                change_id: Some(change_ref.change_id),
-                                commit_id: Some(root.commit_id),
-                                untracked: false,
-                                deleted: true,
-                                created_at: change_ref.created_at,
-                                updated_at: change_ref.updated_at,
-                                snapshot: None,
-                                metadata: metadata.as_ref(),
-                                columnar_base_coordinate: None,
-                            }
-                        }),
-                );
-                let mut coverage = WorkingDiffIndexCoverage::default();
-                let generation = if deleted_deltas.is_empty() {
-                    parent_generation
-                } else {
-                    writer
-                        .stage_checkpoint_current_state(
-                            &root.branch_id,
-                            parent_generation,
-                            root.commit_id,
-                            &deleted_deltas,
-                            &BTreeSet::new(),
-                            checkpoint_commit_id
-                                .expect("checkpoint publication has an epoch commit id"),
-                            &mut coverage,
-                        )
-                        .instrument(tracing::debug_span!(
-                            target: "lix_perf",
-                            "lix.perf.materialization.tracked_head.stage_checkpoint_tombstones"
-                        ))
-                        .await?
-                };
-                let control = normal_branch_head_control(
-                    root,
-                    parent_control,
-                    generation,
-                    checkpoint_commit_id,
-                )?;
-                insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
-                continue;
-            }
+                    .zip(selected_deleted_rows.iter())
+                    .zip(&selected_metadata)
+                    .map(|((change_ref, row), metadata)| {
+                        crate::hot_state::CurrentStateDeltaRef {
+                            schema_key: &row.schema_key,
+                            file_id: row.file_id.as_deref(),
+                            row_pk: &row.row_pk,
+                            change_id: Some(change_ref.change_id),
+                            commit_id: Some(root.commit_id),
+                            untracked: false,
+                            deleted: true,
+                            created_at: change_ref.created_at,
+                            updated_at: change_ref.updated_at,
+                            snapshot: None,
+                            metadata: metadata.as_ref(),
+                            columnar_base_coordinate: None,
+                        }
+                    }),
+            );
+            let mut coverage = WorkingDiffIndexCoverage::default();
+            let generation = if deleted_deltas.is_empty() {
+                parent_generation
+            } else {
+                writer
+                    .stage_checkpoint_current_state(
+                        &root.branch_id,
+                        parent_generation,
+                        root.commit_id,
+                        &deleted_deltas,
+                        &BTreeSet::new(),
+                        checkpoint_commit_id
+                            .expect("checkpoint publication has an epoch commit id"),
+                        &mut coverage,
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.materialization.tracked_head.stage_checkpoint_tombstones"
+                    ))
+                    .await?
+            };
+            let control = normal_branch_head_control(
+                root,
+                parent_control,
+                generation,
+                checkpoint_commit_id,
+            )?;
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+            continue;
+        }
+
+        // A partial checkpoint publishes an intermediate checkpoint commit
+        // followed by a child containing the still-dirty selected refs. The
+        // visible HOT generation already contains those exact current rows;
+        // rebind their existing before-images to the new checkpoint epoch
+        // instead of rebuilding the complete branch snapshot from history.
+        let partial_checkpoint_commit_id = partial_checkpoint_rebase_commit_id(
+            root,
+            staged,
+            staged_commits,
+            observations,
+            checkpoint_epochs,
+        )
+        .filter(|_| !tracked_snapshots.contains_key(&root.commit_id));
+        if partial_checkpoint_commit_id.is_some()
+            && (!state_row_indices.is_empty()
+                || engine_rows.iter().any(|row| row.branch_id == root.branch_id)
+                || state_rows.iter().any(|row| {
+                    row.untracked && row.branch_id.as_str() == root.branch_id
+                }))
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "partial checkpoint HOT rebase received unrelated current-state mutations",
+            ));
         }
         let selected_materialization = if !staged.selected_change_batches.is_empty()
             && !tracked_snapshots.contains_key(&root.commit_id)
@@ -3949,7 +4014,11 @@ async fn stage_tracked_head(
                 )
             };
         let parent_generation = match (root.parent_commit_id, parent_control) {
-            (_, Some(control)) if is_checkpoint_publication => Some(control.tracked_generation),
+            (_, Some(control))
+                if is_checkpoint_publication || partial_checkpoint_commit_id.is_some() =>
+            {
+                Some(control.tracked_generation)
+            }
             (Some(parent_commit_id), Some(control))
                 if control.head_commit_id == parent_commit_id =>
             {
@@ -4548,7 +4617,23 @@ async fn stage_tracked_head(
             durable_predecessor_count = durable_predecessors.len(),
             "packed current-base route decision"
         );
-        let generation = if is_checkpoint_publication {
+        let generation = if let Some(partial_checkpoint_commit_id) = partial_checkpoint_commit_id {
+            coverage = WorkingDiffIndexCoverage::default();
+            writer
+                .stage_partial_checkpoint_current_state(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    &deltas,
+                    partial_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_partial_checkpoint"
+                ))
+                .await?
+        } else if is_checkpoint_publication {
             // Reaching this point means an immutable packed base prevented
             // the O(deletes) epoch-rotation route above. Materialize it once;
             // retirement makes later checkpoints eligible for lazy rotation.
@@ -4619,7 +4704,17 @@ async fn stage_tracked_head(
             parent_control.as_ref(),
         )
         .await?;
-        if let Some(epoch) = working_diff_epoch {
+        if let Some(checkpoint_commit_id) = partial_checkpoint_commit_id {
+            stage_tracked_working_diff_epoch(
+                writes,
+                &root.branch_id,
+                TrackedWorkingDiffEpoch {
+                    checkpoint_commit_id,
+                    generation,
+                    coverage,
+                },
+            )?;
+        } else if let Some(epoch) = working_diff_epoch {
             let next_epoch = TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: epoch.checkpoint_commit_id,
                 generation,
@@ -5499,7 +5594,8 @@ async fn stage_branch_head_control_publications(
         return Ok(BTreeMap::new());
     }
     for (branch_id, desired) in &mut publications {
-        if let Some(checkpoint_commit_id) = checkpoint_epochs.get(branch_id) {
+        if let Some(checkpoint) = checkpoint_epochs.get(branch_id) {
+            let checkpoint_commit_id = checkpoint.commit_id;
             let control = desired.as_mut().ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -5508,7 +5604,7 @@ async fn stage_branch_head_control_publications(
                     ),
                 )
             })?;
-            control.working_diff_checkpoint_commit_id = Some(*checkpoint_commit_id);
+            control.working_diff_checkpoint_commit_id = Some(checkpoint_commit_id);
         }
         let observation = observations.get(branch_id).ok_or_else(|| {
             LixError::new(
@@ -5558,12 +5654,18 @@ async fn stage_branch_head_control_publications(
 
 fn checkpoint_epoch_bindings(
     publications: &[crate::gc::CheckpointPublication],
-) -> Result<BTreeMap<String, CommitId>, LixError> {
+) -> Result<BTreeMap<String, CheckpointEpochBinding>, LixError> {
     let mut bindings = BTreeMap::new();
     for publication in publications {
         let recovery = &publication.recovery_ref;
         if bindings
-            .insert(recovery.branch_id.clone(), recovery.checkpoint_commit_id)
+            .insert(
+                recovery.branch_id.clone(),
+                CheckpointEpochBinding {
+                    commit_id: recovery.checkpoint_commit_id,
+                    hot_rebase_certified: publication.hot_working_diff_certified,
+                },
+            )
             .is_some()
         {
             return Err(LixError::new(
@@ -7287,6 +7389,7 @@ mod tests {
                     interval_has_commits: true,
                 },
                 gc_state: crate::gc::CheckpointGcState::default(),
+                hot_working_diff_certified: false,
             }],
             &BTreeMap::new(),
         )
