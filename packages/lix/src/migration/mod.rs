@@ -1,7 +1,22 @@
 //! Repository-format migration API.
 //!
 //! This module describes migration edges independently from their physical
-//! implementation. Normal repository opening never runs migrations.
+//! implementation. Normal repository opening never runs migrations. Inspect
+//! and migrate closed repositories explicitly before opening an engine:
+//!
+//! ```no_run
+//! # async fn example(storage: lix::Memory) -> Result<(), lix::LixError> {
+//! use lix::migration::{MigrationOptions, MigrationStatus, inspect_lix, migrate_lix};
+//!
+//! if matches!(inspect_lix(&storage).await?, MigrationStatus::Required { .. }) {
+//!     migrate_lix(storage.clone(), MigrationOptions::default()).await?;
+//! }
+//!
+//! let lix = lix::open_lix().with_storage(storage).await?;
+//! # lix.close().await?;
+//! # Ok(())
+//! # }
+//! ```
 
 mod api;
 mod commit_plan;
@@ -16,5 +31,5 @@ pub(crate) mod v68;
 mod v68_to_v69_rows;
 
 pub use api::{
-    MigrationOptions, MigrationReport, MigrationStatus, inspect_repository, migrate_repository,
+    MigrationOptions, MigrationReport, MigrationStatus, inspect_lix, migrate_lix,
 };

@@ -347,7 +347,7 @@ mod tests {
         .expect_err("stale migration must be fenced");
         assert!(error.to_string().contains("precondition failed"));
         assert_eq!(
-            crate::migration::inspect_repository(&storage)
+            crate::migration::inspect_lix(&storage)
                 .await
                 .unwrap(),
             crate::migration::MigrationStatus::Required {
