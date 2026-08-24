@@ -83,7 +83,8 @@ pub(crate) use storage::{
     take_point_replay_authority_batch_probe_for_test,
 };
 pub(crate) use storage::{
-    CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
+    AuthoritativeLiveChangeRequest, CertifiedCommitStateTopologyParent,
+    CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
     CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
     CommitDeltaReplacementScope, EnvelopeCertifiedNativeProjectionBatch,
     EnvelopeCertifiedNativeProjectionSegment, ExclusiveRowSnapshotBatch,
@@ -91,8 +92,8 @@ pub(crate) use storage::{
     commit_delta_contains_schema, commit_delta_member_scopes, commit_history_is_deferred,
     complete_state_fence_change_owner_commit_ids, direct_change_locator,
     deferred_commit_history_ids,
-    encode_commit_state_manifest_replacement_for_migration, load_change_record_by_id,
-    load_commit_delta_change_records, load_commit_delta_change_records_for_owners,
+    encode_commit_state_manifest_replacement_for_migration, load_authoritative_live_change_records,
+    load_change_record_by_id,
     load_commit_delta_members_with_payloads,
     load_commit_delta_members_with_payloads_for_schemas, load_commit_delta_replay_metadata,
     load_commit_delta_selection_certificate, load_commit_history_members_with_payloads_for_schemas,

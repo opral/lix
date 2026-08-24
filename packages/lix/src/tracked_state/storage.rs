@@ -9247,6 +9247,107 @@ pub(crate) async fn load_commit_delta_change_records_for_owners(
         .collect())
 }
 
+/// The complete address of one live change payload.
+///
+/// The change id addresses the ordinary local changelog. The source commit and
+/// row identity address the immutable physical fallback used by compact or
+/// deferred history. The timestamp prevents a same-identity record from a
+/// different row lifetime from being accepted as the requested payload.
+pub(crate) struct AuthoritativeLiveChangeRequest {
+    pub(crate) change_id: crate::changelog::ChangeId,
+    pub(crate) source_commit_id: CommitId,
+    pub(crate) key: TrackedStateKey,
+    pub(crate) updated_at: crate::common::LixTimestamp,
+}
+
+/// Resolves live payloads from local changelog authority first, then co-loads
+/// only the exact physical owners that were absent or did not match.
+///
+/// Both paths apply the same identity and lifetime validation. Callers decide
+/// which changes need payloads; this function is the single authority policy
+/// for fetching them in request order.
+pub(crate) async fn load_authoritative_live_change_records(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[AuthoritativeLiveChangeRequest],
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let change_ids = requests
+        .iter()
+        .map(|request| request.change_id)
+        .collect::<Vec<_>>();
+    let standalone = ChangelogContext::new()
+        .reader(store)
+        .load_changes(ChangeLoadRequest {
+            change_ids: &change_ids,
+        })
+        .await?;
+    let mut records = vec![None; requests.len()];
+    let mut fallback_indices = Vec::new();
+    for (index, ((request, (change_id, record)), slot)) in requests
+        .iter()
+        .zip(standalone)
+        .zip(records.iter_mut())
+        .enumerate()
+    {
+        if *change_id != request.change_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "standalone change batch lost request order",
+            ));
+        }
+        if record
+            .as_ref()
+            .is_some_and(|record| authoritative_live_change_matches(request, record))
+        {
+            *slot = record;
+        } else {
+            fallback_indices.push(index);
+        }
+    }
+    let owner_requests = fallback_indices
+        .iter()
+        .map(|&index| {
+            let request = &requests[index];
+            (request.source_commit_id, request.key.clone())
+        })
+        .collect::<Vec<_>>();
+    let fallback = load_commit_delta_change_records_for_owners(store, &owner_requests).await?;
+    for (index, record) in fallback_indices.into_iter().zip(fallback) {
+        records[index] = record;
+    }
+    requests
+        .iter()
+        .zip(records)
+        .map(|(request, record)| {
+            record
+                .filter(|record| authoritative_live_change_matches(request, record))
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "change '{}' has no authoritative live payload at source commit '{}'",
+                            request.change_id, request.source_commit_id
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn authoritative_live_change_matches(
+    request: &AuthoritativeLiveChangeRequest,
+    record: &crate::changelog::ChangeRecord,
+) -> bool {
+    record.change_id == request.change_id
+        && record.schema_key == request.key.schema_key
+        && record.file_id == request.key.file_id
+        && record.row_pk == request.key.row_pk
+        && record.snapshot.is_some()
+        && record.created_at == request.updated_at
+}
+
 /// Marks one known commit's tracked history as intentionally deferred.
 ///
 /// The marker is staged atomically with the commit header. Its presence keeps

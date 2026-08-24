@@ -36,8 +36,8 @@ use crate::tracked_state::{
     TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
     TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
     TrackedStateScanRequest, TrackedStateSingleStringReplacementRef, encode_key_ref,
-    load_commit_delta_change_records_for_owners, load_commit_delta_replay_metadata,
-    stage_addressable_commit_deltas, stage_change_locators,
+    AuthoritativeLiveChangeRequest, load_authoritative_live_change_records,
+    load_commit_delta_replay_metadata, stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
 use crate::transaction::context::PendingRestoreIntent;
@@ -1770,92 +1770,23 @@ async fn load_selected_change_records(
         // HOT tombstones must carry no payload.
         .filter(|change_ref| !change_ref.deleted)
         .collect::<Vec<_>>();
-	// A sync snapshot persists every live payload in the standalone changelog
-	// plane while its owning commit body may intentionally remain cold. Resolve
-	// that local authority in one batch before touching physical commit owners;
-	// probing the owners first turns one checkpoint into a history hydration per
-	// source commit even though every selected payload is already present.
-	//
-	// A single source change can materialize more than one semantic identity.
-	// Only accept the standalone record when it exactly matches this selected
-	// identity; identity-specific rows continue through their physical owner.
-	let change_ids = change_refs
+	let requests = change_refs
 		.iter()
-		.map(|change_ref| change_ref.change_id)
-		.collect::<Vec<_>>();
-	let standalone = ChangelogContext::new()
-		.reader(read)
-		.load_changes(ChangeLoadRequest {
-			change_ids: &change_ids,
+		.map(|change_ref| AuthoritativeLiveChangeRequest {
+			change_id: change_ref.change_id,
+			source_commit_id: change_ref.source_commit_id,
+			key: TrackedStateKey {
+				schema_key: change_ref.schema_key().to_owned(),
+				file_id: change_ref.file_id().map(str::to_owned),
+				row_pk: change_ref.row_pk().clone(),
+			},
+			updated_at: change_ref.updated_at,
 		})
-		.await?;
-	let mut loaded = (0..change_refs.len())
-		.map(|_| None)
-		.collect::<Vec<Option<ChangeRecord>>>();
-	let mut cold_indices = Vec::new();
-	for (index, ((change_ref, (change_id, record)), slot)) in change_refs
-		.iter()
-		.zip(standalone)
-		.zip(loaded.iter_mut())
-		.enumerate()
-	{
-		if *change_id != change_ref.change_id {
-			return Err(LixError::new(
-				LixError::CODE_INTERNAL_ERROR,
-				"standalone selected change batch lost request order",
-			));
-		}
-		if record.as_ref().is_some_and(|record| {
-			selected_change_record_matches(*change_ref, record)
-		}) {
-			*slot = record;
-		} else {
-			cold_indices.push(index);
-		}
-	}
-	let requests = cold_indices
-        .iter()
-		.map(|&index| {
-			let change_ref = change_refs[index];
-            (
-                change_ref.source_commit_id,
-                TrackedStateKey {
-                    schema_key: change_ref.schema_key().to_owned(),
-                    file_id: change_ref.file_id().map(str::to_owned),
-                    row_pk: change_ref.row_pk().clone(),
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-	let cold = load_commit_delta_change_records_for_owners(read, &requests).await?;
-	for (index, record) in cold_indices.into_iter().zip(cold) {
-		loaded[index] = record;
-	}
+		.collect::<Vec<_>>();
+	let loaded = load_authoritative_live_change_records(read, &requests).await?;
 
     let mut records = HashMap::new();
     for (change_ref, record) in change_refs.into_iter().zip(loaded) {
-        let Some(record) = record else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "selected change '{}' for ({:?}, {:?}, {:?}) has no authoritative payload at source commit '{}'",
-                    change_ref.change_id,
-                    change_ref.schema_key(),
-                    change_ref.file_id(),
-                    change_ref.row_pk(),
-                    change_ref.source_commit_id
-                ),
-            ));
-        };
-		if !selected_change_record_matches(change_ref, &record) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "selected change '{}' does not match its authoritative source payload",
-                    change_ref.change_id
-                ),
-            ));
-        }
         let key = selected_change_key(change_ref);
         if let Some(existing) = records.insert(key, record.clone())
             && existing != record
@@ -1870,18 +1801,6 @@ async fn load_selected_change_records(
         }
     }
     Ok(records)
-}
-
-fn selected_change_record_matches(
-	change_ref: StagedCommitChangeRef<'_>,
-	record: &ChangeRecord,
-) -> bool {
-	record.change_id == change_ref.change_id
-		&& record.schema_key == change_ref.schema_key()
-		&& record.file_id.as_deref() == change_ref.file_id()
-		&& record.row_pk == *change_ref.row_pk()
-		&& record.snapshot.is_none() == change_ref.deleted
-		&& record.created_at == change_ref.updated_at
 }
 
 fn materialize_selected_change_payloads(
@@ -4625,6 +4544,9 @@ async fn stage_tracked_head(
                     parent_generation,
                     root.commit_id,
                     &deltas,
+                    parent_control
+                        .and_then(|control| control.working_diff_checkpoint_commit_id)
+                        .expect("partial checkpoint requires the previous working-diff epoch"),
                     partial_checkpoint_commit_id,
                     &mut coverage,
                 )

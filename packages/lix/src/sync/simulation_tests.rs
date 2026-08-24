@@ -965,6 +965,144 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
     );
 }
 
+async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
+    const PACKED_ROW_COUNT: usize = 512;
+    let authority = fresh_authority().await;
+    write_key_value(&authority, "selected-recreate", "baseline").await;
+    write_key_value(&authority, "remaining", "baseline").await;
+    authority
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should commit");
+    let mut replica = Replica::bootstrap(AuthorityTransport::connected(authority)).await;
+
+    replica
+        .lix
+        .execute(
+            "DELETE FROM lix_key_value WHERE key = 'selected-recreate'",
+            &[],
+        )
+        .await
+        .expect("selected row should leave a HOT checkpoint baseline");
+    replica.write("remaining", "working").await;
+    let mut packed_rows = vec![
+        ExecuteBatchStatement {
+            label: None,
+            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_owned(),
+            params: vec![
+                Value::Text("selected-recreate".to_owned()),
+                Value::Text("recreated".to_owned()),
+            ],
+        },
+    ];
+    packed_rows.extend((packed_rows.len()..PACKED_ROW_COUNT).map(|index| {
+        ExecuteBatchStatement {
+            label: None,
+            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_owned(),
+            params: vec![
+                Value::Text(format!("packed-filler-{index:03}")),
+                Value::Text("filler".to_owned()),
+            ],
+        }
+    }));
+    replica
+        .lix
+        .execute_batch(&packed_rows)
+        .await
+        .expect("recreate batch should publish a packed current base");
+    replica.restart().await;
+
+    let branch_id = replica.lix.active_branch_id().await.unwrap();
+    let adapter = replica.lix.storage_adapter();
+    let read = adapter
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+        .await
+        .unwrap();
+    let control = crate::branch::BranchHeadControlContext::new()
+        .reader(&read)
+        .load(&branch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(read);
+    let checkpoint_commit_id = control
+        .working_diff_checkpoint_commit_id
+        .expect("working checkpoint should remain active")
+        .to_string();
+    let head_commit_id = control.head_commit_id.to_string();
+    crate::tracked_state::arm_diff_commits_test_probe(&checkpoint_commit_id, &head_commit_id);
+    crate::tracked_state::reset_commit_delta_scan_probe_for_test();
+    let checkpoint = replica
+        .lix
+        .execute(
+            "INSERT INTO lix_create_checkpoint (diff_id) \
+             SELECT diff_id FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value' \
+               AND row_pk ->> 0 = 'selected-recreate' \
+             RETURNING commit_id",
+            &[],
+        )
+        .await
+        .expect("packed recreate partial checkpoint should stay HOT");
+    assert_eq!(checkpoint.rows_affected(), 1);
+    assert_eq!(
+        crate::tracked_state::take_diff_commits_test_probe(
+            &checkpoint_commit_id,
+            &head_commit_id,
+        ),
+        0,
+        "one ambiguous packed recreate must not fall back to canonical history",
+    );
+    let (compact_scans, payload_scans) =
+        crate::tracked_state::take_commit_delta_scan_probe_for_test();
+    assert!(compact_scans > 0, "the packed compact route was not exercised");
+    assert_eq!(
+        payload_scans, 0,
+        "partial checkpoint performed a broad commit-payload scan",
+    );
+    let selected_remaining = replica
+        .lix
+        .execute(
+            "SELECT count(*) AS count FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value' \
+               AND row_pk ->> 0 = 'selected-recreate'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<i64>("count")
+        .unwrap();
+    assert_eq!(selected_remaining, 0);
+    let remaining = replica
+        .lix
+        .execute(
+            "SELECT count(*) AS count FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value' \
+               AND row_pk ->> 0 = 'remaining'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining.rows()[0].get::<i64>("count").unwrap(),
+        1,
+        "the unselected change must remain dirty",
+    );
+    replica.restart().await;
+    let reopened_remaining = replica
+        .lix
+        .execute(
+            "SELECT count(*) AS count FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value' \
+               AND row_pk ->> 0 = 'remaining'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened_remaining.rows()[0].get::<i64>("count").unwrap(), 1);
+}
+
 async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simulation) {
     const HISTORICAL_CHECKPOINT_COUNT: usize = 50;
     const FILE_COUNT: usize = 90;
@@ -1586,6 +1724,10 @@ sync_simulation_test!(
 sync_simulation_test!(
     partial_file_checkpoint_rebases_hot_epoch,
     partial_file_checkpoint_rebases_hot_epoch
+);
+sync_simulation_test!(
+    packed_recreate_partial_checkpoint_stays_hot,
+    packed_recreate_partial_checkpoint_stays_hot
 );
 sync_simulation_test!(
     packed_snapshot_partial_file_checkpoint_stays_payload_local,
