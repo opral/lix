@@ -58,6 +58,8 @@ struct ErrorBody {
     message: String,
     #[serde(default)]
     hint: Option<String>,
+    #[serde(default)]
+    details: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -317,6 +319,21 @@ fn response_error(response: &RawHttpResponse, operation: &str) -> LixError {
     if let Ok(envelope) = serde_json::from_slice::<ErrorResponse>(&response.body)
         && !envelope.error.code.is_empty()
     {
+        let mut details = envelope
+            .error
+            .details
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(object) = details.as_object_mut() {
+            object.insert(
+                "httpStatus".to_owned(),
+                serde_json::json!(response.status),
+            );
+        } else {
+            details = serde_json::json!({
+                "httpStatus": response.status,
+                "body": details,
+            });
+        }
         let mut error = LixError::new(
             envelope.error.code,
             format!("{operation}: {}", envelope.error.message),
@@ -324,7 +341,7 @@ fn response_error(response: &RawHttpResponse, operation: &str) -> LixError {
         if let Some(hint) = envelope.error.hint {
             error = error.with_hint(hint);
         }
-        return error.with_details(serde_json::json!({ "httpStatus": response.status }));
+        return error.with_details(details);
     }
     if response.status == 413 {
         return LixError::new(
@@ -360,10 +377,49 @@ fn encode_query(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_query;
+    use super::{RawHttpResponse, encode_query, response_error};
 
     #[test]
     fn query_encoding_is_rfc3986_component_encoding() {
         assert_eq!(encode_query("a b/c?d=ü"), "a%20b%2Fc%3Fd%3D%C3%BC");
+    }
+
+    #[test]
+    fn structured_http_error_preserves_remote_details_and_adds_status() {
+        let error = response_error(
+            &RawHttpResponse {
+                status: 503,
+                status_text: "Service Unavailable".to_owned(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "error": {
+                        "code": "LIX_ERROR_LIX_MIGRATING",
+                        "message": "The lix repository is being migrated.",
+                        "hint": "Retry after the migration completes.",
+                        "details": {
+                            "fromVersion": 68,
+                            "toVersion": 71,
+                            "retryable": true,
+                        },
+                    },
+                }))
+                .expect("encode error response"),
+            },
+            "open sync session",
+        );
+
+        assert_eq!(error.code, "LIX_ERROR_LIX_MIGRATING");
+        assert_eq!(
+            error.hint.as_deref(),
+            Some("Retry after the migration completes.")
+        );
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({
+                "fromVersion": 68,
+                "toVersion": 71,
+                "retryable": true,
+                "httpStatus": 503,
+            }))
+        );
     }
 }
