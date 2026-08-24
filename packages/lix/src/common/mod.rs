@@ -26,6 +26,7 @@ pub(crate) use lix_path::{compose_directory_path, compose_file_path};
 pub(crate) use metadata::{
     parse_row_metadata_value, serialize_row_metadata, validate_row_metadata,
 };
+pub(crate) use read_retry::ExpiredReadRetryState;
 pub(crate) use string_dictionary::{
     FastHashBuilder, StringDictionary, StringDictionaryBuilder, fast_hash_builder,
 };

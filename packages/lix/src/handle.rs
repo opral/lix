@@ -22,7 +22,7 @@ use std::{
 };
 
 use crate::engine::{Engine, EngineOptions};
-use crate::common::read_retry::ExpiredReadRetryState;
+use crate::common::ExpiredReadRetryState;
 use crate::session::SessionContext;
 use crate::session::{CoherentReadBatch, ExecuteOptions};
 #[cfg(test)]

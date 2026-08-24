@@ -7,8 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
-use crate::common::ExecuteStatementMetadata;
-use crate::common::read_retry::ExpiredReadRetryState;
+use crate::common::{ExecuteStatementMetadata, ExpiredReadRetryState};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
 use crate::sql2;
