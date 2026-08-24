@@ -732,27 +732,39 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
 	);
 }
 
-async fn partial_checkpoint_avoids_distinct_cold_change_owners(_sim: Simulation) {
+async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulation) {
     const OWNER_COUNT: usize = 50;
     let authority = fresh_authority().await;
-    write_key_value(&authority, "baseline", "shared").await;
+    for index in 0..OWNER_COUNT {
+        write_key_value(
+            &authority,
+            &format!("owner-{index:02}"),
+            &format!("baseline-{index:02}"),
+        )
+        .await;
+    }
     authority
         .create_checkpoint()
         .await
         .expect("baseline checkpoint should commit");
     let mut replica = Replica::bootstrap(AuthorityTransport::connected(authority.clone())).await;
+
+    // Every updated payload is present in the replica's current HOT state,
+    // while the fifty physical commits that authored those rows remain cold.
     for index in 0..OWNER_COUNT {
         write_key_value(
             &authority,
             &format!("owner-{index:02}"),
-            &format!("value-{index:02}"),
+            &format!("updated-{index:02}"),
         )
         .await;
     }
     replica
         .pump()
         .await
-        .expect("replica should import every distinct change owner");
+        .expect("replica should import every sparse update");
+
+    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     let selected_diff_id = replica
         .lix
         .execute(
@@ -762,10 +774,14 @@ async fn partial_checkpoint_avoids_distinct_cold_change_owners(_sim: Simulation)
             &[],
         )
         .await
-        .expect("selected working diff should load")
+        .expect("working diff should already be HOT")
         .rows()[0]
         .get::<String>("diff_id")
         .expect("selected diff id should decode");
+    assert!(
+        crate::tracked_state::take_point_replay_authority_batch_probe_for_test().is_empty(),
+        "working-diff classification must not touch cold commit owners",
+    );
 
     crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     let checkpoint = replica
@@ -775,15 +791,19 @@ async fn partial_checkpoint_avoids_distinct_cold_change_owners(_sim: Simulation)
             &[Value::Text(selected_diff_id)],
         )
         .await
-        .expect("partial checkpoint should batch selected-change owners");
+        .expect("checkpoint should use the exact selected HOT payload");
     let authority_batches =
         crate::tracked_state::take_point_replay_authority_batch_probe_for_test();
 
     assert_eq!(checkpoint.rows_affected(), 1);
-	assert!(
-		authority_batches.iter().sum::<usize>() <= 8,
-		"snapshot-local checkpointing must not probe the cold selected-owner population: {authority_batches:?}",
-	);
+    let checkpoint_commit_id = checkpoint.rows()[0]
+        .get::<String>("commit_id")
+        .expect("checkpoint commit id should decode");
+    assert!(
+        authority_batches.is_empty(),
+        "checkpoint publication must not re-read cold selected owners: {authority_batches:?}",
+    );
+    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     let remaining = replica
         .lix
         .execute(
@@ -797,6 +817,157 @@ async fn partial_checkpoint_avoids_distinct_cold_change_owners(_sim: Simulation)
         .get::<i64>("count")
         .expect("remaining count should decode");
     assert_eq!(remaining, (OWNER_COUNT - 1) as i64);
+    assert!(
+        crate::tracked_state::take_point_replay_authority_batch_probe_for_test().is_empty(),
+        "the first reactive working-diff read must stay HOT",
+    );
+
+    let checkpoint_state = replica
+        .lix
+        .execute(
+            &format!(
+                "SELECT key, value FROM lix_history('lix_key_value', '{checkpoint_commit_id}') \
+                 WHERE lixcol_depth = 0"
+            ),
+            &[],
+        )
+        .await
+        .expect("partial checkpoint state should remain readable");
+    assert_eq!(checkpoint_state.rows().len(), 1);
+    assert_eq!(
+        checkpoint_state.rows()[0].get::<String>("key").unwrap(),
+        "owner-00",
+    );
+    assert_eq!(
+        checkpoint_state.rows()[0]
+            .get::<serde_json::Value>("value")
+            .unwrap(),
+        serde_json::json!("updated-00"),
+    );
+
+    replica.restart().await;
+    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
+    let reopened_remaining = replica
+        .lix
+        .execute("SELECT count(*) AS count FROM lix_working_diff()", &[])
+        .await
+        .expect("reopened working diff should remain HOT")
+        .rows()[0]
+        .get::<i64>("count")
+        .unwrap();
+    assert_eq!(reopened_remaining, (OWNER_COUNT - 1) as i64);
+    assert!(
+        crate::tracked_state::take_point_replay_authority_batch_probe_for_test().is_empty(),
+        "reopened working-diff read must not reconstruct cold owners",
+    );
+}
+
+async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
+    let authority = fresh_authority().await;
+    for path in ["/selected.md", "/remaining.md"] {
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text(path.to_owned()),
+                    Value::Blob(b"baseline".to_vec().into()),
+                ],
+            )
+            .await
+            .expect("baseline file should commit");
+    }
+    authority
+        .create_checkpoint()
+        .await
+        .expect("baseline checkpoint should commit");
+    let mut replica = Replica::bootstrap(AuthorityTransport::connected(authority.clone())).await;
+
+    for (path, content) in [
+        ("/selected.md", b"selected update".as_slice()),
+        ("/remaining.md", b"remaining update".as_slice()),
+    ] {
+        authority
+            .execute(
+                "UPDATE lix_file SET content = $1 WHERE path = $2",
+                &[
+                    Value::Blob(content.to_vec().into()),
+                    Value::Text(path.to_owned()),
+                ],
+            )
+            .await
+            .expect("file update should commit");
+    }
+    replica
+        .pump()
+        .await
+        .expect("replica should import both file updates");
+
+    let selected_file_id = replica
+        .lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = '/selected.md'",
+            &[],
+        )
+        .await
+        .expect("selected file should load")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("selected file id should decode");
+    let selected_diff_id = replica
+        .lix
+        .execute(
+            "SELECT diff_id FROM lix_working_diff() WHERE file_id = $1 LIMIT 1",
+            &[Value::Text(selected_file_id)],
+        )
+        .await
+        .expect("selected file diff should load")
+        .rows()[0]
+        .get::<String>("diff_id")
+        .expect("selected file diff id should decode");
+
+    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
+    replica
+        .lix
+        .execute(
+            "INSERT INTO lix_create_checkpoint (diff_id) SELECT $1 RETURNING commit_id",
+            &[Value::Text(selected_diff_id)],
+        )
+        .await
+        .expect("partial file checkpoint should stay snapshot-local");
+    let authority_batches =
+        crate::tracked_state::take_point_replay_authority_batch_probe_for_test();
+    assert!(
+        authority_batches.is_empty(),
+        "partial file checkpoint must not re-read cold owners: {authority_batches:?}",
+    );
+
+    let files = replica
+        .lix
+        .execute("SELECT path, content FROM lix_file ORDER BY path", &[])
+        .await
+        .expect("files should remain readable after checkpoint");
+    assert_eq!(
+        files.rows()[0].get::<Vec<u8>>("content").unwrap(),
+        b"remaining update",
+    );
+    assert_eq!(
+        files.rows()[1].get::<Vec<u8>>("content").unwrap(),
+        b"selected update",
+    );
+    let remaining_paths = replica
+        .lix
+        .execute(
+            "SELECT DISTINCT file.path AS path FROM lix_working_diff() AS diff \
+             JOIN lix_file AS file ON file.id = diff.file_id ORDER BY path",
+            &[],
+        )
+        .await
+        .expect("remaining file diff should load");
+    assert_eq!(remaining_paths.rows().len(), 1);
+    assert_eq!(
+        remaining_paths.rows()[0].get::<String>("path").unwrap(),
+        "/remaining.md",
+    );
 }
 
 async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Simulation) {
@@ -913,6 +1084,174 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
 		1,
 		"the second partial checkpoint must retain only the unselected change",
 	);
+}
+
+async fn partial_checkpoint_canonical_fallback_keeps_lifecycle_path(_sim: Simulation) {
+    let authority = fresh_authority().await;
+    write_key_value(&authority, "selected", "baseline").await;
+    write_key_value(&authority, "remaining", "baseline").await;
+    authority.create_checkpoint().await.unwrap();
+    let replica = Replica::bootstrap(AuthorityTransport::connected(authority)).await;
+    replica.write("selected", "selected-update").await;
+    replica.write("remaining", "remaining-update").await;
+
+    let branch_id = replica.lix.active_branch_id().await.unwrap();
+    let adapter = replica.lix.storage_adapter();
+    let read = adapter
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+        .await
+        .unwrap();
+    let control = crate::branch::BranchHeadControlContext::new()
+        .reader(&read)
+        .load(&branch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let checkpoint_commit_id = control.working_diff_checkpoint_commit_id.unwrap();
+    drop(read);
+    let mut writes = adapter.new_write_set();
+    crate::hot_state::stage_tracked_working_diff_epoch(
+        &mut writes,
+        &branch_id,
+        crate::hot_state::TrackedWorkingDiffEpoch {
+            checkpoint_commit_id,
+            generation: control.tracked_generation,
+            coverage: crate::hot_state::WorkingDiffIndexCoverage::default(),
+        },
+    )
+    .unwrap();
+    adapter
+        .commit_write_set(
+            writes,
+            crate::storage_adapter::StorageWriteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let read = adapter
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        crate::hot_state::TrackedHeadContext::new()
+            .reader(read)
+            .working_diff_for_control(
+                &branch_id,
+                control,
+                &crate::tracked_state::TrackedStateDiffRequest::default(),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "corrupt coverage must force the canonical diff fallback",
+    );
+
+    let selected_diff_id = replica
+        .lix
+        .execute(
+            "SELECT diff_id FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value' \
+               AND row_pk = CAST('[\"selected\"]' AS JSONB)",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("diff_id")
+        .unwrap();
+    replica
+        .lix
+        .execute(
+            "INSERT INTO lix_create_checkpoint (diff_id) SELECT $1 RETURNING commit_id",
+            &[Value::Text(selected_diff_id)],
+        )
+        .await
+        .expect("canonical fallback must retain complete lifecycle publication");
+    assert_eq!(
+        replica
+            .lix
+            .execute("SELECT COUNT(*) AS count FROM lix_working_diff()", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        1,
+    );
+}
+
+async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
+    let authority = fresh_authority().await;
+    write_key_value(&authority, "selected", "baseline").await;
+    write_key_value(&authority, "removed", "baseline").await;
+    authority.create_checkpoint().await.unwrap();
+    let mut replica = Replica::bootstrap(AuthorityTransport::connected(authority.clone())).await;
+    write_key_value(&authority, "selected", "selected-update").await;
+    authority
+        .execute("DELETE FROM lix_key_value WHERE key = 'removed'", &[])
+        .await
+        .unwrap();
+    replica.pump().await.unwrap();
+    let selected_diff_id = replica
+        .lix
+        .execute(
+            "SELECT diff_id FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value' \
+               AND row_pk = CAST('[\"selected\"]' AS JSONB)",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("diff_id")
+        .unwrap();
+
+    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
+    replica
+        .lix
+        .execute(
+            "INSERT INTO lix_create_checkpoint (diff_id) SELECT $1 RETURNING commit_id",
+            &[Value::Text(selected_diff_id)],
+        )
+        .await
+        .unwrap();
+    assert!(
+        crate::tracked_state::take_point_replay_authority_batch_probe_for_test().is_empty(),
+        "partial checkpoint tombstone rebase must stay HOT",
+    );
+    let remaining = replica
+        .lix
+        .execute(
+            "SELECT diff_type, row_pk FROM lix_working_diff() \
+             WHERE schema_key = 'lix_key_value'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(remaining.rows().len(), 1);
+    assert_eq!(remaining.rows()[0].get::<String>("diff_type").unwrap(), "removed");
+    assert_eq!(
+        remaining.rows()[0]
+            .get::<serde_json::Value>("row_pk")
+            .unwrap(),
+        serde_json::json!(["removed"]),
+    );
+    replica.restart().await;
+    assert_eq!(
+        replica
+            .lix
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_working_diff() \
+                 WHERE diff_type = 'removed'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        1,
+    );
 }
 
 async fn stale_partial_checkpoint_epoch_repairs_on_reopen(_sim: Simulation) {
@@ -1077,12 +1416,24 @@ sync_simulation_test!(
 	snapshot_partial_checkpoint_uses_local_selected_payloads
 );
 sync_simulation_test!(
-	partial_checkpoint_avoids_distinct_cold_change_owners,
-	partial_checkpoint_avoids_distinct_cold_change_owners
+	partial_checkpoint_rebases_hot_epoch_without_cold_history,
+	partial_checkpoint_rebases_hot_epoch_without_cold_history
+);
+sync_simulation_test!(
+    partial_file_checkpoint_rebases_hot_epoch,
+    partial_file_checkpoint_rebases_hot_epoch
 );
 sync_simulation_test!(
 	partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot,
 	partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot
+);
+sync_simulation_test!(
+    partial_checkpoint_canonical_fallback_keeps_lifecycle_path,
+    partial_checkpoint_canonical_fallback_keeps_lifecycle_path
+);
+sync_simulation_test!(
+    partial_checkpoint_rebases_unselected_tombstone,
+    partial_checkpoint_rebases_unselected_tombstone
 );
 sync_simulation_test!(
 	stale_partial_checkpoint_epoch_repairs_on_reopen,

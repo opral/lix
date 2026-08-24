@@ -39,9 +39,123 @@ struct HttpProbe {
     chunk_puts: AtomicU64,
     drop_next_push_ack: AtomicBool,
     reject_requests: AtomicBool,
+    reject_pushes: AtomicBool,
     one_way_delay_millis: AtomicU64,
     gated_pushes: AtomicU64,
     push_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synced_partial_file_checkpoint_stays_off_cold_history() {
+    let authority = Arc::new(open_lix().await.expect("open authority"));
+    for index in 0..50 {
+        put_value(
+            &authority,
+            &format!("cold-owner-{index:02}"),
+            &format!("baseline-{index:02}"),
+        )
+        .await;
+    }
+    authority
+        .create_checkpoint()
+        .await
+        .expect("checkpoint cold snapshot baseline");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+    probe.set_push_offline(true);
+    let history_after_bootstrap = probe.history_gets.load(Ordering::Acquire);
+
+    for (path, content) in [
+        ("/selected.md", b"selected content".as_slice()),
+        ("/remaining.md", b"remaining content".as_slice()),
+    ] {
+        replica
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text(path.to_owned()),
+                    Value::Blob(content.to_vec().into()),
+                ],
+            )
+            .await
+            .expect("create local file");
+    }
+
+    let selected_file_id = replica
+        .execute("SELECT id FROM lix_file WHERE path = '/selected.md'", &[])
+        .await
+        .expect("load selected file id")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("selected file id decodes");
+    assert_eq!(
+        probe.history_gets.load(Ordering::Acquire),
+        history_after_bootstrap,
+        "local file setup must not hydrate additional snapshot history",
+    );
+
+    let history_before_checkpoint = probe.history_gets.load(Ordering::Acquire);
+    let checkpoint = replica
+        .execute(
+            "INSERT INTO lix_create_checkpoint (diff_id) \
+             SELECT diff_id FROM lix_working_diff() WHERE file_id = $1 \
+             RETURNING commit_id",
+            &[Value::Text(selected_file_id.clone())],
+        )
+        .await
+        .expect("partial file checkpoint stays HOT");
+    assert!(
+        checkpoint.rows_affected() > 0,
+        "checkpoint must select the file diff",
+    );
+    assert_eq!(
+        probe.history_gets.load(Ordering::Acquire),
+        history_before_checkpoint,
+        "checkpoint must not reconstruct the snapshot's cold commit owners",
+    );
+    assert_eq!(
+        replica
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_working_diff() WHERE file_id = $1",
+                &[Value::Text(selected_file_id.clone())],
+            )
+            .await
+            .expect("first reactive working-diff read stays HOT")
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        0,
+    );
+    assert!(
+        replica
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_working_diff() AS diff \
+                 JOIN lix_file AS file ON file.id = diff.file_id \
+                 WHERE file.path = '/remaining.md'",
+                &[],
+            )
+            .await
+            .expect("unselected file remains dirty")
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap()
+            > 0,
+    );
+    assert_eq!(
+        read_file_content(&replica, "/selected.md").await.as_deref(),
+        Some(b"selected content".as_slice()),
+    );
+    assert_eq!(
+        probe.history_gets.load(Ordering::Acquire),
+        history_before_checkpoint,
+        "reactive refresh must not defer the same cold reconstruction",
+    );
+    replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -154,6 +268,10 @@ impl HttpProbe {
 
     fn set_offline(&self, offline: bool) {
         self.reject_requests.store(offline, Ordering::Release);
+    }
+
+    fn set_push_offline(&self, offline: bool) {
+        self.reject_pushes.store(offline, Ordering::Release);
     }
 }
 
@@ -1217,6 +1335,15 @@ where
     tokio::time::sleep(one_way_delay).await;
     let path = parts.uri.path();
     let is_push = parts.method == Method::POST && path == "/lix/v1/sync/push";
+    if is_push && probe.reject_pushes.load(Ordering::Acquire) {
+        return Ok(Response::builder()
+            .status(503)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from_static(
+                br#"{"error":{"code":"LIX_SYNC_TEST_PUSH_OFFLINE","message":"test push endpoint offline"}}"#,
+            )))
+            .expect("build push-offline response"));
+    }
     let is_delta_pull = parts.method == Method::GET
         && path == "/lix/v1/sync/pull"
         && parts

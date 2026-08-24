@@ -189,6 +189,9 @@ impl CheckpointGcState {
 pub(crate) struct CheckpointPublication {
     pub(crate) recovery_ref: CheckpointRecoveryRef,
     pub(crate) gc_state: CheckpointGcState,
+    /// The selected interval came from the certified HOT working-diff index,
+    /// so a partial checkpoint may rebind its remaining dirty rows in place.
+    pub(crate) hot_working_diff_certified: bool,
 }
 
 #[derive(musli::Encode)]
