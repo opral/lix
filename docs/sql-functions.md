@@ -12,7 +12,6 @@ operators; there are no public `lix_json_*` functions.
 | `lix_active_account_id()` | text | Active SQL-session account. |
 | `lix_active_branch_id()` | text | Active branch. |
 | `lix_active_branch_commit_id()` | text | Active branch head pinned for the statement. |
-| `lix_restore(commit_id)` | text | Move the active branch head to an ancestor commit. |
 | `uuidv7()` | uuid | Generate a UUIDv7 value. |
 | `CURRENT_TIMESTAMP` | timestamptz | Transaction-start instant at microsecond precision. |
 
@@ -66,15 +65,16 @@ FROM lix_commit_ancestry($1)
 ORDER BY depth, commit_id;
 ```
 
-`lix_restore` is a command-shaped mutation and must be the statement's only
-projection:
+`lix_restore` is an insert-only command sink:
 
 ```sql
-SELECT lix_restore($1);
+INSERT INTO lix_restore (commit_id)
+VALUES ($1)
+RETURNING commit_id;
 ```
 
 The commit must exist and be an ancestor of the active branch head. The
-function returns the restored commit ID. It creates no commit, leaves other
+command returns the restored commit ID. It creates no commit, leaves other
 branches untouched, preserves branch-local untracked rows, and starts a fresh
 undo interval. A restore cannot be combined with another write in the same
 transaction and must be the final statement before commit or rollback.

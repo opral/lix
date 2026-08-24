@@ -8,8 +8,9 @@ use serde_json::Value as JsonValue;
 use crate::LixError;
 
 use super::{
-    PublicColumn, PublicHistoryContract, PublicHistoryKind, PublicSurfaceContract,
-    PublicSurfaceKind, SurfaceCapabilities,
+    PublicColumn, PublicHistoryContract, PublicHistoryKind, PublicRelationKind,
+    PublicScalarFunctionContract, PublicSurfaceClass, PublicSurfaceContract, PublicSurfaceKind,
+    SurfaceCapabilities, PUBLIC_SCALAR_FUNCTION_NAMES,
 };
 use crate::sql2::catalog::schema_surface_schema;
 use crate::sql2::catalog::{
@@ -27,6 +28,7 @@ use crate::sql2::result_metadata::json_field;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PublicCatalog {
     surfaces: BTreeMap<String, PublicSurfaceContract>,
+    scalar_functions: BTreeMap<String, PublicScalarFunctionContract>,
     history: BTreeMap<String, PublicHistoryContract>,
     schema_specs: BTreeMap<String, SchemaSurfaceSpec>,
 }
@@ -68,13 +70,41 @@ impl PublicCatalog {
     }
 
     pub(crate) fn insert(&mut self, surface: PublicSurfaceContract) -> Result<(), LixError> {
-        if self.surfaces.contains_key(&surface.name) {
+        if !surface.kind.accepts_class(surface.class) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "public SQL surface '{}' has incompatible class {:?} and semantic kind {:?}",
+                    surface.name, surface.class, surface.kind
+                ),
+            ));
+        }
+        if self.surfaces.contains_key(&surface.name)
+            || self.scalar_functions.contains_key(&surface.name)
+        {
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!("duplicate public SQL surface '{}'", surface.name),
             ));
         }
         self.surfaces.insert(surface.name.clone(), surface);
+        Ok(())
+    }
+
+    fn insert_scalar_function(&mut self, name: &str) -> Result<(), LixError> {
+        if self.surfaces.contains_key(name) || self.scalar_functions.contains_key(name) {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!("duplicate public SQL surface '{name}'"),
+            ));
+        }
+        self.scalar_functions.insert(
+            name.to_string(),
+            PublicScalarFunctionContract {
+                name: name.to_string(),
+                class: PublicSurfaceClass::ScalarFunction,
+            },
+        );
         Ok(())
     }
 
@@ -92,6 +122,12 @@ impl PublicCatalog {
 
     pub(crate) fn surfaces(&self) -> impl Iterator<Item = &PublicSurfaceContract> {
         self.surfaces.values()
+    }
+
+    pub(crate) fn scalar_functions(
+        &self,
+    ) -> impl Iterator<Item = &PublicScalarFunctionContract> {
+        self.scalar_functions.values()
     }
 
     pub(crate) fn history_relations(&self) -> impl Iterator<Item = &PublicHistoryContract> {
@@ -118,13 +154,20 @@ impl PublicCatalog {
                 Field::new("commit_id", DataType::Utf8, false),
             ])),
             PublicSurfaceKind::WorkingDiff => working_diff_schema(),
-            PublicSurfaceKind::HistoryFunction | PublicSurfaceKind::CommitAncestryFunction => {
+            PublicSurfaceKind::HistoryFunction
+            | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::CommitAncestryFunction => {
                 return None;
             }
             PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![Field::new(
                 "diff_id",
+                DataType::Utf8,
+                false,
+            )])),
+            PublicSurfaceKind::Restore => Arc::new(Schema::new(vec![Field::new(
+                "commit_id",
                 DataType::Utf8,
                 false,
             )])),
@@ -192,18 +235,21 @@ impl PublicCatalog {
     fn insert_system_surfaces(&mut self) -> Result<(), LixError> {
         self.insert(surface(
             "lix_file",
+            PublicSurfaceClass::Relation(PublicRelationKind::View),
             PublicSurfaceKind::File,
             filesystem_columns(),
             SurfaceCapabilities::read_write(),
         ))?;
         self.insert(surface(
             "lix_directory",
+            PublicSurfaceClass::Relation(PublicRelationKind::View),
             PublicSurfaceKind::Directory,
             directory_columns(),
             SurfaceCapabilities::read_write(),
         ))?;
         self.insert(surface(
             "lix_branch",
+            PublicSurfaceClass::Relation(PublicRelationKind::View),
             PublicSurfaceKind::Branch,
             vec![
                 PublicColumn::public_insert_only("id", false),
@@ -216,6 +262,7 @@ impl PublicCatalog {
         ))?;
         self.insert(surface(
             "lix_change",
+            PublicSurfaceClass::Relation(PublicRelationKind::View),
             PublicSurfaceKind::Change,
             public_columns([
                 ("id", false),
@@ -232,6 +279,7 @@ impl PublicCatalog {
         ))?;
         self.insert(surface(
             "lix_working_diff",
+            PublicSurfaceClass::TableFunction,
             PublicSurfaceKind::WorkingDiff,
             public_columns([
                 ("diff_id", false),
@@ -246,12 +294,21 @@ impl PublicCatalog {
         ))?;
         self.insert(surface(
             "lix_history",
+            PublicSurfaceClass::TableFunction,
             PublicSurfaceKind::HistoryFunction,
             Vec::new(),
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
+            "lix_diff",
+            PublicSurfaceClass::TableFunction,
+            PublicSurfaceKind::DiffFunction,
+            Vec::new(),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
             "lix_commit_ancestry",
+            PublicSurfaceClass::TableFunction,
             PublicSurfaceKind::CommitAncestryFunction,
             Vec::new(),
             SurfaceCapabilities::read_only(),
@@ -263,6 +320,7 @@ impl PublicCatalog {
         ] {
             self.insert(surface(
                 name,
+                PublicSurfaceClass::CommandSink,
                 kind,
                 vec![
                     PublicColumn::public_insert_only("diff_id", false),
@@ -274,6 +332,20 @@ impl PublicCatalog {
                     delete: false,
                 },
             ))?;
+        }
+        self.insert(surface(
+            "lix_restore",
+            PublicSurfaceClass::CommandSink,
+            PublicSurfaceKind::Restore,
+            vec![PublicColumn::public_insert_only("commit_id", false)],
+            SurfaceCapabilities {
+                insert: true,
+                update: false,
+                delete: false,
+            },
+        ))?;
+        for name in PUBLIC_SCALAR_FUNCTION_NAMES {
+            self.insert_scalar_function(name)?;
         }
         self.insert_history(PublicHistoryContract {
             relation_name: "lix_file".to_string(),
@@ -322,6 +394,7 @@ impl PublicCatalog {
 
         self.insert(surface(
             &spec.schema_key,
+            PublicSurfaceClass::Relation(PublicRelationKind::Base),
             PublicSurfaceKind::SchemaBase {
                 schema_key: spec.schema_key.clone(),
             },
@@ -433,6 +506,7 @@ fn history_filesystem_schema(include_data: bool) -> SchemaRef {
 
 fn surface(
     name: impl Into<String>,
+    class: PublicSurfaceClass,
     kind: PublicSurfaceKind,
     columns: Vec<PublicColumn>,
     capabilities: SurfaceCapabilities,
@@ -444,6 +518,7 @@ fn surface(
         .collect();
     PublicSurfaceContract {
         name: name.into(),
+        class,
         kind,
         columns,
         capabilities,

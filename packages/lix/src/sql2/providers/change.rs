@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 
@@ -63,6 +64,10 @@ where
 
     fn schema(&self) -> SchemaRef {
         lix_change_schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {

@@ -14,6 +14,7 @@ use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatchOptions, Strin
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
+use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
@@ -430,6 +431,10 @@ impl TableSpec for LixDirectorySpec {
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
     }
 
     fn filter_pushdown(&self, _filter: &Expr) -> TableProviderFilterPushDown {
@@ -3480,7 +3485,7 @@ mod tests {
         )));
         assert_eq!(
             provider.table_type(),
-            datafusion::datasource::TableType::Base
+            datafusion::datasource::TableType::View
         );
     }
 }

@@ -4,9 +4,9 @@ use std::ops::ControlFlow;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, ConflictTarget, DataType as SqlDataType, Delete,
-    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Insert, ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Query, SelectFlavor,
-    SelectItem, SetExpr, Statement as SqlStatement, TableFactor, TableObject, TableWithJoins,
+    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectName,
+    ObjectNamePart, OnConflictAction, OnInsert, Query, SelectItem, SetExpr,
+    Statement as SqlStatement, TableFactor, TableObject, TableWithJoins,
     UnaryOperator, Update, Value, Visit, Visitor, WildcardAdditionalOptions,
 };
 #[cfg(test)]
@@ -69,7 +69,6 @@ fn bind_sql_statement(
         SqlStatement::Insert(insert) => bind_insert_bound(insert, catalog, active_branch_id),
         SqlStatement::Update(update) => bind_update_bound(update, catalog, active_branch_id),
         SqlStatement::Delete(delete) => bind_delete_bound(delete, catalog, active_branch_id),
-        SqlStatement::Query(query) => bind_restore_bound(query, active_branch_id),
         SqlStatement::Explain { .. } => Err(super::error::unsupported(
             "EXPLAIN statements are not supported by SQL write binding",
         )),
@@ -77,104 +76,6 @@ fn bind_sql_statement(
             "sql2 bound statement pipeline is not wired yet",
         )),
     }
-}
-
-fn bind_restore_bound(query: &Query, active_branch_id: &str) -> Result<BoundWrite, LixError> {
-    if query.with.is_some()
-        || query.order_by.is_some()
-        || query.limit_clause.is_some()
-        || query.fetch.is_some()
-        || !query.locks.is_empty()
-        || query.for_clause.is_some()
-        || query.settings.is_some()
-        || query.format_clause.is_some()
-        || !query.pipe_operators.is_empty()
-    {
-        return Err(restore_shape_error());
-    }
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Err(restore_shape_error());
-    };
-    if select.flavor != SelectFlavor::Standard
-        || select.optimizer_hint.is_some()
-        || select.distinct.is_some()
-        || select.select_modifiers.is_some()
-        || select.top.is_some()
-        || select.exclude.is_some()
-        || select.into.is_some()
-        || !select.from.is_empty()
-        || !select.lateral_views.is_empty()
-        || select.selection.is_some()
-        || select.prewhere.is_some()
-        || !select.connect_by.is_empty()
-        || !matches!(&select.group_by, GroupByExpr::Expressions(items, modifiers) if items.is_empty() && modifiers.is_empty())
-        || !select.cluster_by.is_empty()
-        || !select.distribute_by.is_empty()
-        || !select.sort_by.is_empty()
-        || select.having.is_some()
-        || !select.named_window.is_empty()
-        || select.qualify.is_some()
-        || select.value_table_mode.is_some()
-    {
-        return Err(restore_shape_error());
-    }
-    let [projection] = select.projection.as_slice() else {
-        return Err(restore_shape_error());
-    };
-    let SelectItem::UnnamedExpr(expression) = projection else {
-        return Err(restore_shape_error());
-    };
-    let Expr::Function(function) = expression else {
-        return Err(restore_shape_error());
-    };
-    reject_unsupported_function_modifiers(function)?;
-    if !is_unqualified_unquoted_function(function, "lix_restore") {
-        return Err(restore_shape_error());
-    }
-    let args = function_args(&function.args)?;
-    if args.len() != 1 {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "lix_restore requires exactly 1 argument",
-        ));
-    }
-    let mut params = ParamBinder::default();
-    let commit_id = match args[0] {
-        Expr::Value(value) => match &value.value {
-            Value::Placeholder(name) => BoundExpr::Param(params.bind(name)?),
-            Value::SingleQuotedString(value) => {
-                BoundExpr::Literal(BoundLiteral::Text(value.clone()))
-            }
-            _ => {
-                return Err(LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    "lix_restore commit id must be text",
-                ));
-            }
-        },
-        _ => return Err(restore_shape_error()),
-    };
-    Ok(BoundWrite {
-        target: BoundWriteTarget::Restore { commit_id },
-        op: BoundWriteOp::Update,
-        input: BoundWriteInput::None,
-        predicate: BoundPredicate::True,
-        assignments: Vec::new(),
-        conflict: None,
-        returning: None,
-        params: params.into_map(),
-        branch_scope: active_branch_scope(active_branch_id),
-    })
-}
-
-fn is_unqualified_unquoted_function(function: &Function, expected: &str) -> bool {
-    matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(ident)] if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case(expected))
-}
-
-fn restore_shape_error() -> LixError {
-    super::error::unsupported(
-        "lix_restore is a command and must be called as SELECT lix_restore(<commit_id>)",
-    )
 }
 
 pub(super) fn bind_insert_bound(
@@ -252,8 +153,9 @@ pub(super) fn bind_insert_bound(
         &BoundPredicate::True,
         active_branch_id,
     )?;
+    let target = bound_insert_target(&table.surface.kind, &input)?;
     Ok(BoundWrite {
-        target: bound_write_target(&table.surface.kind),
+        target,
         op: BoundWriteOp::Insert,
         input,
         predicate: BoundPredicate::True,
@@ -407,7 +309,10 @@ fn bind_insert_returning(
 
     if !matches!(
         table.surface.kind,
-        PublicSurfaceKind::Revert | PublicSurfaceKind::Apply | PublicSurfaceKind::CreateCheckpoint
+        PublicSurfaceKind::Revert
+            | PublicSurfaceKind::Apply
+            | PublicSurfaceKind::CreateCheckpoint
+            | PublicSurfaceKind::Restore
     ) {
         return bind_returning(table, Some(returning), params, "INSERT");
     }
@@ -419,14 +324,14 @@ fn bind_insert_returning(
             SelectItem::ExprWithAlias { expr, alias } => (expr, normalize_identifier(alias)),
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
                 return Err(super::error::unsupported(
-                    "diff command INSERT RETURNING only supports commit_id",
+                    "command sink INSERT RETURNING only supports commit_id",
                 ));
             }
         };
         let expr = bind_expr(table, sql_expr, params)?;
         if !matches!(&expr, BoundExpr::Column(column) if column.name == "commit_id") {
             return Err(super::error::unsupported(
-                "diff command INSERT RETURNING only supports commit_id",
+                "command sink INSERT RETURNING only supports commit_id",
             ));
         }
         items.push(BoundReturningItem { expr, output_name });
@@ -1453,10 +1358,44 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         PublicSurfaceKind::Change
         | PublicSurfaceKind::WorkingDiff
         | PublicSurfaceKind::HistoryFunction
+        | PublicSurfaceKind::DiffFunction
+        | PublicSurfaceKind::Restore
         | PublicSurfaceKind::CommitAncestryFunction => {
             unreachable!("write capability checked before target binding")
         }
     }
+}
+
+fn bound_insert_target(
+    kind: &PublicSurfaceKind,
+    input: &BoundWriteInput,
+) -> Result<BoundWriteTarget, LixError> {
+    if !matches!(kind, PublicSurfaceKind::Restore) {
+        return Ok(bound_write_target(kind));
+    }
+    let BoundWriteInput::Values(values) = input else {
+        return Err(super::error::unsupported(
+            "lix_restore requires exactly one INSERT ... VALUES row",
+        ));
+    };
+    let Some(commit_id_index) = values.column_index("commit_id") else {
+        return Err(super::error::unsupported(
+            "lix_restore requires the commit_id column",
+        ));
+    };
+    let [row] = values.rows.as_slice() else {
+        return Err(super::error::unsupported(
+            "lix_restore requires exactly one INSERT ... VALUES row",
+        ));
+    };
+    let Some(commit_id) = row.get(commit_id_index) else {
+        return Err(super::error::unsupported(
+            "lix_restore requires the commit_id column",
+        ));
+    };
+    Ok(BoundWriteTarget::Restore {
+        commit_id: commit_id.clone(),
+    })
 }
 
 fn bind_write_branch_scope(
@@ -1529,14 +1468,16 @@ mod tests {
     use datafusion::sql::parser::Statement as DataFusionStatement;
 
     #[test]
-    fn bind_statement_binds_exact_restore_command() {
-        let statement = parse_statement("SELECT lix_restore($1)");
+    fn bind_statement_binds_restore_command_sink() {
+        let statement = parse_statement(
+            "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
+        );
         let bound = bind_statement(&statement, &[], "branch1").expect("restore should bind");
 
         assert!(matches!(
             bound.target,
             BoundWriteTarget::Restore {
-                commit_id: BoundExpr::Param(BoundParamRef { index: 1 })
+                commit_id: BoundExpr::Param(BoundParamRef { index: 1 }),
             }
         ));
         assert_eq!(
@@ -1548,18 +1489,11 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_composed_restore_calls() {
-        for sql in [
-            "SELECT lix_restore($1), 1",
-            "SELECT upper(lix_restore($1))",
-            "SELECT lix_restore($1) AS restored",
-            "SELECT lix_restore($1) FROM lix_commit",
-            "SELECT lix_restore($1) WHERE true",
-        ] {
-            let error = bind_statement(&parse_statement(sql), &[], "branch1")
-                .expect_err("composed restore must fail");
-            assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
-        }
+    fn bind_statement_rejects_removed_restore_scalar_syntax() {
+        let sql = "SELECT lix_restore($1)";
+        let error = bind_statement(&parse_statement(sql), &[], "branch1")
+            .expect_err("the removed scalar-shaped restore command must fail");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
     }
 
     #[test]

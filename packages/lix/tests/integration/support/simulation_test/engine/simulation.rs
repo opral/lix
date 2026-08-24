@@ -448,16 +448,8 @@ fn classify_statement(sql: &str) -> StatementKind {
         return classify_statement(inner);
     }
 
-    let (keyword, rest) = first_keyword_and_rest(sql);
+    let (keyword, _rest) = first_keyword_and_rest(sql);
     match keyword.as_str() {
-        "SELECT"
-            if rest
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("lix_restore") =>
-        {
-            StatementKind::Write
-        }
         "SELECT" | "WITH" | "VALUES" | "FROM" | "TABLE" | "EXPLAIN" => StatementKind::Read,
         "INSERT" | "UPDATE" | "DELETE" => StatementKind::Write,
         _ => StatementKind::Utility,
@@ -542,7 +534,7 @@ mod tests {
     fn classify_statement_splits_reads_writes_and_utility() {
         assert_eq!(classify_statement("SELECT 1"), StatementKind::Read);
         assert_eq!(
-            classify_statement("SELECT lix_restore($1)"),
+            classify_statement("INSERT INTO lix_restore (commit_id) VALUES ($1)"),
             StatementKind::Write
         );
         assert_eq!(

@@ -8,6 +8,7 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::sql::sqlparser::parser::Parser;
 
 use crate::LixError;
+use crate::sql2::catalog::PUBLIC_SCALAR_FUNCTION_NAMES;
 
 #[cfg(test)]
 pub(crate) fn validate_public_udf_calls(sql: &str) -> Result<(), LixError> {
@@ -54,49 +55,9 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
     let arity = function_arity(&function.args);
 
     match name {
-        "current_timestamp" | "uuidv7" | "lix_active_branch_id" | "lix_active_branch_commit_id" => {
-            expect_exact_arity(name, arity, 0)
-        }
-        "lix_restore" => expect_exact_arity(name, arity, 1),
+        "current_timestamp" => expect_exact_arity(name, arity, 0),
+        name if PUBLIC_SCALAR_FUNCTION_NAMES.contains(&name) => expect_exact_arity(name, arity, 0),
         _ => Ok(()),
-    }
-}
-
-pub(crate) fn statement_has_restore_function(statement: &DataFusionStatement) -> bool {
-    let mut visitor = RestoreFunctionVisitor { found: false };
-    visit_datafusion_statement_for_restore_function(statement, &mut visitor);
-    visitor.found
-}
-
-struct RestoreFunctionVisitor {
-    found: bool,
-}
-
-impl Visitor for RestoreFunctionVisitor {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-        if matches!(expr, Expr::Function(function) if public_lix_function_name(function) == Some("lix_restore"))
-        {
-            self.found = true;
-            return ControlFlow::Break(());
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-fn visit_datafusion_statement_for_restore_function(
-    statement: &DataFusionStatement,
-    visitor: &mut RestoreFunctionVisitor,
-) {
-    match statement {
-        DataFusionStatement::Statement(statement) => {
-            let _ = statement.visit(visitor);
-        }
-        DataFusionStatement::Explain(explain) => {
-            visit_datafusion_statement_for_restore_function(explain.statement.as_ref(), visitor);
-        }
-        _ => {}
     }
 }
 
@@ -189,14 +150,17 @@ fn public_lix_function_name(function: &Function) -> Option<&'static str> {
         ObjectNamePart::Identifier(ident) => ident.value.as_str(),
         ObjectNamePart::Function(_) => return None,
     };
-    match ident.to_ascii_lowercase().as_str() {
-        "current_timestamp" | "__lix_current_timestamp" => Some("current_timestamp"),
-        "uuidv7" => Some("uuidv7"),
-        "lix_active_branch_id" => Some("lix_active_branch_id"),
-        "lix_active_branch_commit_id" => Some("lix_active_branch_commit_id"),
-        "lix_restore" => Some("lix_restore"),
-        _ => None,
+    let normalized = ident.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "current_timestamp" | "__lix_current_timestamp"
+    ) {
+        return Some("current_timestamp");
     }
+    PUBLIC_SCALAR_FUNCTION_NAMES
+        .iter()
+        .copied()
+        .find(|name| *name == normalized)
 }
 
 fn function_arity(args: &FunctionArguments) -> usize {
