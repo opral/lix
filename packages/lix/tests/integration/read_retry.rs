@@ -221,15 +221,18 @@ async fn expired_read_backs_off_until_cross_context_writer_settles() {
 
     // A writer in another browser context does not share this engine's write
     // gate. Keep expiring fresh snapshots until that external churn settles.
-    storage.expire_read_calls(64);
+    storage.expire_read_calls(usize::MAX);
     let settling_storage = storage.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A cross-context browser commit can include OPFS durability and a
+        // remote push before the next coherent read generation is available.
+        // Keep this longer than the old count-derived ~1 second retry window.
+        tokio::time::sleep(Duration::from_secs(2)).await;
         settling_storage.allow_reads();
     });
 
     let result = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(4),
         lix.execute(
             "SELECT value FROM lix_key_value WHERE key = $1",
             &[Value::Text("read-external-quiescence".into())],
@@ -244,8 +247,8 @@ async fn expired_read_backs_off_until_cross_context_writer_settles() {
         serde_json::json!(42)
     );
     assert!(
-        storage.expired_calls() > 1,
-        "the regression must exercise repeated cross-context invalidation",
+        storage.expired_calls() > 64,
+        "the regression must cross the old count-derived retry cap",
     );
 }
 
@@ -259,7 +262,7 @@ async fn perpetually_expired_read_remains_bounded() {
 
     storage.expire_read_calls(usize::MAX);
     let error = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(4),
         lix.execute("SELECT key FROM lix_key_value", &[]),
     )
     .await

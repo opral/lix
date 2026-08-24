@@ -1,14 +1,15 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import type {
 	WorkerConnection,
 	WorkerInput,
 	WorkerResponse,
 } from "./protocol.js";
-import { LixWorkerClient } from "./client.js";
+import { BindingLease, LixWorkerClient, workerBinding } from "./client.js";
 import { responseFromSyncFetch } from "./host.js";
 
-function fakeConnection() {
+function fakeConnection(options: { terminate?: () => Promise<void> } = {}) {
 	const sent: WorkerInput[] = [];
+	let terminateCount = 0;
 	let onMessage: (message: WorkerResponse) => void = () => undefined;
 	const connection: WorkerConnection = {
 		postMessage(message) {
@@ -20,9 +21,81 @@ function fakeConnection() {
 		onFatal() {},
 		ref() {},
 		unref() {},
-		async terminate() {},
+		async terminate() {
+			terminateCount += 1;
+			await options.terminate?.();
+		},
 	};
-	return { connection, sent, emit: (message: WorkerResponse) => onMessage(message) };
+	return {
+		connection,
+		sent,
+		emit: (message: WorkerResponse) => onMessage(message),
+		terminateCount: () => terminateCount,
+	};
+}
+
+test("failed close terminates the worker before releasing its binding", async () => {
+	const termination = deferred<void>();
+	const events: string[] = [];
+	const transport = fakeConnection({
+		terminate: async () => {
+			events.push("worker termination started");
+			await termination.promise;
+			events.push("worker termination finished");
+		},
+	});
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease();
+	let released = false;
+	const binding = workerBinding(
+		client,
+		new BindingLease(() => {
+			released = true;
+			events.push("binding released");
+		}),
+		0,
+	);
+
+	const closing = binding.close();
+	const request = transport.sent.find(
+		(message): message is Extract<WorkerInput, { id: number }> =>
+			"id" in message && message.operation.kind === "close",
+	);
+	if (!request) throw new Error("expected a worker close request");
+	transport.emit({
+		id: request.id,
+		ok: false,
+		error: {
+			name: "LixError",
+			message: "sync drain failed",
+			code: "LIX_ERROR_SYNC",
+		},
+	});
+
+	await vi.waitFor(() => {
+		expect(events).toEqual(["worker termination started"]);
+	});
+	expect(released).toBe(false);
+	termination.resolve();
+	await expect(closing).rejects.toThrow("sync drain failed");
+	expect(transport.terminateCount()).toBe(1);
+	expect(client.isDisposed).toBe(true);
+	expect(released).toBe(true);
+	expect(events).toEqual([
+		"worker termination started",
+		"worker termination finished",
+		"binding released",
+	]);
+});
+
+function deferred<T>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
 }
 
 test("browser sync resolves fresh headers for reconnect requests", async () => {
