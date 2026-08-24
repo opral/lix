@@ -56,7 +56,7 @@ pub(crate) use repository::{
     validate_repository_transaction_event_transfer,
 };
 pub(crate) use runtime::{
-    PreparedSync, SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode, prepare_sync_mode,
+    SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode, prepare_sync_mode,
 };
 
 pub(crate) const MAX_SYNC_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;

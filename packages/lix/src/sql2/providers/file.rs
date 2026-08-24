@@ -1077,9 +1077,10 @@ impl TableSpec for LixFileSpec {
                         )
                         .await
                         .map_err(|error| {
-                            DataFusionError::Execution(format!(
-                                "sql2 lix_file scan failed: {error}"
-                            ))
+                            DataFusionError::Context(
+                                "sql2 lix_file scan failed".to_string(),
+                                Box::new(lix_error_to_datafusion_error(error)),
+                            )
                         })?;
                         prepare_lix_file_rows(rows, &path_predicate)
                     }

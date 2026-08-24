@@ -22,6 +22,7 @@ use std::{
 };
 
 use crate::engine::{Engine, EngineOptions};
+use crate::common::ExpiredReadRetryState;
 use crate::session::SessionContext;
 use crate::session::{CoherentReadBatch, ExecuteOptions};
 #[cfg(test)]
@@ -397,44 +398,40 @@ where
     // window needs one handshake and snapshot before its application session
     // can be bound to the authority's account. Reopens with durable state for
     // this exact remote remain entirely local.
-    let mut prepared_sync: Option<crate::sync::PreparedSync> = if let Some(server) = server.as_ref()
-    {
-        if sync_requires_preparation(&storage, server.url.trim_end_matches('/')).await? {
-            Some(crate::sync::prepare_sync_mode(server).await?)
-        } else {
-            None
+    let (reopened_sync_account_id, mut prepared_sync) = if let Some(server) = server.as_ref() {
+        let state = retry_expired_read(|| {
+            load_sync_open_state(&storage, server.url.trim_end_matches('/'))
+        })
+        .await?;
+        match state {
+            SyncOpenState::NeedsPreparation => {
+                (None, Some(crate::sync::prepare_sync_mode(server).await?))
+            }
+            SyncOpenState::Ready { account_id } => (Some(account_id), None),
         }
     } else {
-        None
+        (None, None)
     };
     let initial_sync_branch_id = prepared_sync
         .as_ref()
         .map(|prepared| prepared.default_branch_id.clone());
-    let reopened_sync_account_id = if prepared_sync.is_none() {
-        if let Some(server) = server.as_ref() {
-            let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
-            let read = adapter
-                .begin_read(crate::storage_adapter::StorageReadOptions::default())
-                .await?;
-            crate::sync::load_sync_replica_account(&read, server.url.trim_end_matches('/')).await?
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let engine = open_or_initialize_engine(
-        storage,
-        wasm_runtime,
-        telemetry,
-        None,
-        initial_sync_branch_id.as_deref(),
-    )
+    let engine = retry_expired_read(|| {
+        open_or_initialize_engine(
+            storage.clone(),
+            wasm_runtime.clone(),
+            telemetry.clone(),
+            None,
+            initial_sync_branch_id.as_deref(),
+        )
+    })
     .await?;
-    let session = match reopened_sync_account_id {
-        Some(account_id) => engine.open_session_with_account(account_id).await?,
-        None => engine.open_session().await?,
-    };
+    let session = retry_expired_read(|| async {
+        match reopened_sync_account_id.as_ref() {
+            Some(account_id) => engine.open_session_with_account(account_id.clone()).await,
+            None => engine.open_session().await,
+        }
+    })
+    .await?;
     let mut lix = Lix {
         engine: Arc::new(engine),
         session: Arc::new(session),
@@ -459,10 +456,16 @@ where
     Ok(lix)
 }
 
-async fn sync_requires_preparation<StorageImpl>(
+#[derive(Debug, PartialEq, Eq)]
+enum SyncOpenState {
+    NeedsPreparation,
+    Ready { account_id: String },
+}
+
+async fn load_sync_open_state<StorageImpl>(
     storage: &StorageImpl,
     remote_id: &str,
-) -> Result<bool, LixError>
+) -> Result<SyncOpenState, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -474,13 +477,10 @@ where
         crate::init::repository_protocol_status(&read).await?,
         crate::init::RepositoryProtocolStatus::Missing
     ) {
-        return Ok(true);
+        return Ok(SyncOpenState::NeedsPreparation);
     }
-    if crate::sync::load_sync_replica_account(&read, remote_id)
-        .await?
-        .is_some()
-    {
-        return Ok(false);
+    if let Some(account_id) = crate::sync::load_sync_replica_account(&read, remote_id).await? {
+        return Ok(SyncOpenState::Ready { account_id });
     }
     if crate::sync::has_any_sync_replica_state(&read).await? {
         return Err(LixError::new(
@@ -488,7 +488,7 @@ where
             "an initialized sync replica cannot be rebound to a different remote",
         ));
     }
-    Ok(true)
+    Ok(SyncOpenState::NeedsPreparation)
 }
 
 impl<StorageImpl> Lix<StorageImpl>
@@ -1273,10 +1273,40 @@ where
     {
         Ok(engine) => Ok(engine),
         Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
-            Engine::initialize_with_main_branch_id(storage.clone(), initial_main_branch_id).await?;
+            match Engine::initialize_with_main_branch_id(storage.clone(), initial_main_branch_id)
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if error.code == "LIX_ERROR_ALREADY_INITIALIZED" => {}
+                Err(error) => return Err(error),
+            }
             new_engine(storage, wasm_runtime, telemetry, plugin_resource_limits).await
         }
         Err(error) => Err(error),
+    }
+}
+
+async fn retry_expired_read<T, Operation, OperationFuture>(
+    mut operation: Operation,
+) -> Result<T, LixError>
+where
+    Operation: FnMut() -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, LixError>>,
+{
+    let mut retry = ExpiredReadRetryState::default();
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let Some(delay) = retry.next_delay(&error) else {
+                    return Err(error);
+                };
+                tokio::task::yield_now().await;
+                if !delay.is_zero() {
+                    crate::sync::sleep(delay).await;
+                }
+            }
+        }
     }
 }
 
@@ -1573,10 +1603,11 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), None)
             .await
             .expect("simulate initialization before a crashed first bootstrap");
-        assert!(
-            sync_requires_preparation(&storage, "https://sync.example/repository")
+        assert_eq!(
+            load_sync_open_state(&storage, "https://sync.example/repository")
                 .await
                 .expect("preparation decision should load"),
+            SyncOpenState::NeedsPreparation,
             "an initialized store without state for this remote must bind the account before open returns",
         );
     }
@@ -1606,7 +1637,7 @@ mod tests {
             .await
             .expect("malformed replica state should commit");
 
-        let error = sync_requires_preparation(&storage, remote_id)
+        let error = load_sync_open_state(&storage, remote_id)
             .await
             .expect_err("malformed exact-remote state must not trigger a fresh bootstrap");
         assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
@@ -1642,13 +1673,16 @@ mod tests {
             .await
             .expect("replica state should commit");
 
-        assert!(
-            !sync_requires_preparation(&storage, remote_id)
+        assert_eq!(
+            load_sync_open_state(&storage, remote_id)
                 .await
                 .expect("exact remote decision should load"),
+            SyncOpenState::Ready {
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            },
             "a durable exact-remote replica must reopen without network preparation",
         );
-        let error = sync_requires_preparation(&storage, "https://sync.example/other-repository")
+        let error = load_sync_open_state(&storage, "https://sync.example/other-repository")
             .await
             .expect_err("an initialized replica cannot silently change authorities");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);

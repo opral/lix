@@ -153,6 +153,9 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
         history_before_checkpoint,
         "reactive refresh must not defer the same cold reconstruction",
     );
+    // Clear the deliberately injected push failure before close drains the
+    // connected outbox.
+    probe.set_push_offline(false);
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
     authority.close().await.expect("close authority");
