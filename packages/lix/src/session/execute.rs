@@ -4,11 +4,11 @@ use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
 
 use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
 use crate::common::ExecuteStatementMetadata;
+use crate::common::read_retry::ExpiredReadRetryState;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
 use crate::sql2;
@@ -42,13 +42,6 @@ use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AUTO_COMMIT_RETRIES: usize = 16;
-const MAX_EXPIRED_READ_RETRY_DURATION: Duration = Duration::from_secs(3);
-
-#[derive(Default)]
-struct ExpiredReadRetryState {
-    attempts: usize,
-    started_at: Option<web_time::Instant>,
-}
 
 enum LiteralParameterBuilder {
     Utf8(StringBuilder),
@@ -5330,19 +5323,6 @@ fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
     error
 }
 
-fn consume_expired_read_retry(state: &mut ExpiredReadRetryState, error: &LixError) -> bool {
-    if error.code != LixError::CODE_STORAGE_READ_EXPIRED {
-        return false;
-    }
-    let now = web_time::Instant::now();
-    let started_at = state.started_at.get_or_insert(now);
-    if now.duration_since(*started_at) >= MAX_EXPIRED_READ_RETRY_DURATION {
-        return false;
-    }
-    state.attempts += 1;
-    true
-}
-
 /// A storage such as browser OPFS may preserve coherent reads by expiring a
 /// multi-call snapshot when a commit lands between calls. Retry once on the
 /// optimistic path, then hold the same collaboration gate used by every Lix
@@ -5357,9 +5337,9 @@ async fn retry_expired_read_with_write_quiescence(
     guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
     already_quiesced: bool,
 ) -> bool {
-    if !consume_expired_read_retry(state, error) {
+    let Some(delay) = state.next_delay(error) else {
         return false;
-    }
+    };
     // Cross-context stores such as OPFS can invalidate a read while another
     // tab is committing or transferring ownership. Yield before reopening so
     // that handoff can finish; otherwise all bounded retries can run in one
@@ -5368,9 +5348,8 @@ async fn retry_expired_read_with_write_quiescence(
     if !already_quiesced && guard.is_none() {
         *guard = Some(Arc::clone(write_gate).lock_owned().await);
     }
-    if state.attempts > 1 {
-        let exponent = (state.attempts - 2).min(4) as u32;
-        crate::sync::sleep(Duration::from_millis(1_u64 << exponent)).await;
+    if !delay.is_zero() {
+        crate::sync::sleep(delay).await;
     }
     true
 }

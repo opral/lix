@@ -5,6 +5,7 @@ pub(crate) mod identity;
 pub(crate) mod json_pointer;
 pub(crate) mod lix_path;
 pub(crate) mod metadata;
+pub(crate) mod read_retry;
 pub(crate) mod string_dictionary;
 pub(crate) mod timestamp;
 pub(crate) mod types;

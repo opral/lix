@@ -13,6 +13,7 @@ struct ExpiringReadStorage {
     inner: Memory,
     remaining_expired_read_calls: Arc<AtomicUsize>,
     remaining_expired_scan_calls: Arc<AtomicUsize>,
+    read_calls_before_expiry: Arc<AtomicUsize>,
     expired_calls: Arc<AtomicUsize>,
 }
 
@@ -22,6 +23,7 @@ impl ExpiringReadStorage {
             inner: Memory::new(),
             remaining_expired_read_calls: Arc::new(AtomicUsize::new(0)),
             remaining_expired_scan_calls: Arc::new(AtomicUsize::new(0)),
+            read_calls_before_expiry: Arc::new(AtomicUsize::new(usize::MAX)),
             expired_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -33,6 +35,11 @@ impl ExpiringReadStorage {
     fn expire_read_calls(&self, count: usize) {
         self.remaining_expired_read_calls
             .store(count, Ordering::Release);
+    }
+
+    fn expire_read_call_after(&self, calls_before_expiry: usize) {
+        self.read_calls_before_expiry
+            .store(calls_before_expiry, Ordering::Release);
     }
 
     fn expire_next_scan_call(&self) {
@@ -54,18 +61,27 @@ struct ExpiringRead {
     inner: MemoryRead,
     remaining_expired_read_calls: Arc<AtomicUsize>,
     remaining_expired_scan_calls: Arc<AtomicUsize>,
+    read_calls_before_expiry: Arc<AtomicUsize>,
     expired_calls: Arc<AtomicUsize>,
 }
 
 impl ExpiringRead {
     fn expire_if_armed(&self) -> Result<(), StorageError> {
-        if self
+        let countdown_expired = self
+            .read_calls_before_expiry
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| match remaining {
+                usize::MAX => None,
+                0 => Some(usize::MAX),
+                remaining => Some(remaining - 1),
+            })
+            .is_ok_and(|remaining| remaining == 0);
+        let repeated_expiry = self
             .remaining_expired_read_calls
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
-            .is_ok()
-        {
+            .is_ok();
+        if countdown_expired || repeated_expiry {
             self.expired_calls.fetch_add(1, Ordering::AcqRel);
             return Err(StorageError::ReadExpired);
         }
@@ -102,6 +118,7 @@ impl Storage for ExpiringReadStorage {
             inner: self.inner.begin_read(options).await?,
             remaining_expired_read_calls: Arc::clone(&self.remaining_expired_read_calls),
             remaining_expired_scan_calls: Arc::clone(&self.remaining_expired_scan_calls),
+            read_calls_before_expiry: Arc::clone(&self.read_calls_before_expiry),
             expired_calls: Arc::clone(&self.expired_calls),
         })
     }
@@ -133,6 +150,68 @@ impl StorageRead for ExpiringRead {
         self.expire_if_armed()?;
         self.expire_scan_if_armed()?;
         self.inner.begin_scan(space, range, options).await
+    }
+}
+
+#[tokio::test]
+async fn repository_open_restarts_after_its_snapshot_expires() {
+    let storage = ExpiringReadStorage::new();
+    storage.expire_next_read_call();
+
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("repository open should restart as one coherent unit");
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+        &[
+            Value::Text("open-read-retry".into()),
+            Value::Text("ready".into()),
+        ],
+    )
+    .await
+    .expect("opened repository accepts writes");
+    let result = lix
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = $1",
+            &[Value::Text("open-read-retry".into())],
+        )
+        .await
+        .expect("opened repository accepts reads");
+
+    assert_eq!(
+        result.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!("ready")
+    );
+    assert_eq!(storage.expired_calls(), 1);
+}
+
+#[tokio::test]
+async fn initialized_repository_reopen_restarts_each_early_coherent_read() {
+    let storage = ExpiringReadStorage::new();
+    crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("initialize repository")
+        .close()
+        .await
+        .expect("close initializer");
+
+    for calls_before_expiry in 0..12 {
+        let expired_before = storage.expired_calls();
+        storage.expire_read_call_after(calls_before_expiry);
+        crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("initialized reopen should restart as one coherent unit")
+            .close()
+            .await
+            .expect("close reopened repository");
+        assert_eq!(
+            storage.expired_calls(),
+            expired_before + 1,
+            "the requested early read ordinal must be exercised"
+        );
     }
 }
 
