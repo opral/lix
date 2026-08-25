@@ -52,21 +52,22 @@ simulation_test!(
                  FROM lix_diff(\
                    'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
                  ) \
-                 WHERE row_pk = CAST('[\"a\"]' AS JSONB) \
+                 WHERE row_pk ->> 0 IN ('a', 'b') \
                  RETURNING commit_id",
                 &[],
             )
             .await
             .expect("relation-row revert should accept root/head scalar source commits");
-        assert_eq!(reverted.rows_affected(), 1);
+        assert_eq!(reverted.rows_affected(), 2);
         assert_eq!(reverted.columns(), &["commit_id"]);
+        assert_eq!(reverted.rows().len(), 1);
         assert_eq!(
             select_rows(
                 &session,
                 "SELECT key FROM lix_key_value WHERE key IN ('a', 'b') ORDER BY key",
             )
             .await,
-            vec![vec![Value::Text("b".to_string())]]
+            Vec::<Vec<Value>>::new(),
         );
 
         let applied = session
@@ -74,14 +75,15 @@ simulation_test!(
                 "INSERT INTO lix_apply (relation, row_pk) \
                  SELECT 'lix_key_value', row_pk \
                  FROM lix_diff('lix_key_value', lix_root_commit_id(), $1) \
-                 WHERE row_pk = CAST('[\"a\"]' AS JSONB) \
+                 WHERE row_pk ->> 0 IN ('a', 'b') \
                  RETURNING commit_id",
                 &[Value::Text(original_head)],
             )
             .await
             .expect("historical relation-row apply should resolve the root scalar source commit");
-        assert_eq!(applied.rows_affected(), 1);
+        assert_eq!(applied.rows_affected(), 2);
         assert_eq!(applied.columns(), &["commit_id"]);
+        assert_eq!(applied.rows().len(), 1);
 
         let head_before_checkpoint = engine
             .load_branch_head_commit_id(sim.main_branch_id())
@@ -247,6 +249,56 @@ simulation_test!(
             .await
             .is_empty()
         );
+    }
+);
+
+simulation_test!(
+    checkpoint_returning_reports_one_command_result_for_multiple_selections,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        let baseline = sim.initial_commit_id().to_string();
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES \
+                 ('a', 'one'), ('b', 'two'), ('c', 'three')",
+                &[],
+            )
+            .await
+            .expect("tracked inserts should succeed");
+        let head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("head should load")
+            .expect("head should exist")
+            .to_string();
+
+        let checkpointed = session
+            .execute(
+                "INSERT INTO lix_create_checkpoint (relation, row_pk) \
+                 SELECT 'lix_key_value', row_pk \
+                 FROM lix_diff('lix_key_value', $1, $2) \
+                 WHERE row_pk ->> 0 IN ('a', 'b', 'c') \
+                 RETURNING commit_id",
+                &[Value::Text(baseline), Value::Text(head)],
+            )
+            .await
+            .expect("multi-selection checkpoint should succeed");
+
+        assert_eq!(checkpointed.rows_affected(), 3);
+        assert_eq!(checkpointed.columns(), &["commit_id"]);
+        assert_eq!(
+            checkpointed.rows().len(),
+            1,
+            "RETURNING describes the one command result, not its three inputs",
+        );
+        checkpointed.rows()[0]
+            .get::<String>("commit_id")
+            .expect("checkpoint command result should contain its commit ID");
     }
 );
 

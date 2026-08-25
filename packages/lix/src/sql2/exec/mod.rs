@@ -36,15 +36,13 @@ impl SqlWriteResult {
             return Ok(Self::affected(outcome.rows_affected));
         };
         let rows = match outcome.commit_id {
-            Some(commit_id) => (0..outcome.rows_affected)
-                .map(|_| {
-                    returning
-                        .items
-                        .iter()
-                        .map(|_| crate::Value::Text(commit_id.clone()))
-                        .collect()
-                })
-                .collect(),
+            Some(commit_id) => vec![
+                returning
+                    .items
+                    .iter()
+                    .map(|_| crate::Value::Text(commit_id.clone()))
+                    .collect(),
+            ],
             None if outcome.rows_affected == 0 => Vec::new(),
             None => {
                 return Err(crate::LixError::new(
