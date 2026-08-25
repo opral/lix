@@ -1,6 +1,6 @@
 # Changenotes
 
-Changenotes are release-note fragments for user-facing changes in core Lix packages.
+Changenotes are release-note fragments for significant user-facing changes in core Lix packages.
 
 Add one Markdown file per change to this folder. Use a short descriptive filename, for example:
 
@@ -28,11 +28,16 @@ SQLite now avoids loading values for key-only point reads and uses native storag
 
 ## When To Add One
 
-Add a changenote for user-facing changes in the core packages above.
+Add a changenote only when users would reasonably need to know about the change
+when deciding whether to upgrade or when adapting their application. Consolidate
+related capabilities and fixes into one release-level theme.
 
 - Use `minor` for backward-compatible user-facing capability additions.
 - Use `patch` for user-facing fixes, compatibility fixes, and performance improvements.
 
 Lix does not publish major releases from changenotes. Coordinate breaking changes so they can ship in a minor release before adding a changenote.
 
-Do not add a changenote for repo-only, documentation-only, CI-only, test-only, or chore-only changes.
+Do not add a changenote for repo-only, documentation-only, CI-only, test-only,
+chore-only, implementation-detail, or narrowly scoped optimization changes.
+Avoid separate notes for internal hard cuts, storage mechanics, retry paths, or
+telemetry subspans unless they materially change the public contract.

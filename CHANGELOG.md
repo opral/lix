@@ -1,34 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.14.0 - 2026-08-25
 
-### Breaking
+### Minor
 
-- Renamed the Rust repository migration functions from `inspect_repository` and
-  `migrate_repository` to `inspect_lix` and `migrate_lix`. Migration remains an
-  explicit offline operation before `open_lix()`.
-- Removed the `@lix-js/sdk/workerd` entry point, its direct in-isolate WASM
-  snapshot bindings, and the now-unused synchronous WASM initializer.
-- Removed the public SQL script-parsing API (`parse_sql_script` /
-  `parseSqlScript`, `SqlScriptPlan`, `SqlScriptStatement`) from the Rust and
-  JavaScript SDKs. Hosts pass an array of statements to `executeBatch`;
-  `execute` remains one statement. Do not parse a script string into statements
-  on the host.
-- Removed the public `lix_branch_descriptor`, `lix_branch_ref`, and matching
-  history SQL relations. Use the writable `lix_branch` relation for branch
-  creation, metadata, and current head access.
-- Removed every public `*_by_branch` SQL relation and the public
-  `lixcol_branch_id` row-routing column. SQL relations now always use the
-  current session's active branch. Open another session to work with another
-  branch. Compare tracked relations with
-  `lix_diff(relation, from_commit_id, to_commit_id)`; compare the current
-  checkpoint with the active head to inspect uncheckpointed work.
-  `lixcol_global` and the global branch remain supported.
-- Replaced heterogeneous working diffs, `diff_id` command selections, and the
-  public `lix_commit_edge` relation with relation-specific commit diffs,
-  `(relation, row_pk)` command selections, and ordered
-  `lix_commit.parent_commit_ids`. Use `lix_root_commit_id()` to obtain the
-  repository's existing initial commit.
+- Added optional public profile URIs to repository accounts.
+
+  Applications can now associate an account with a machine-readable public profile while keeping authentication and authorization separate from presentation metadata.
+
+  v0.14 uses repository format v73. Existing repositories must run the explicit offline migration before opening; historical accounts receive `NULL` for the new field and profile updates remain durable.
+- Added durable local-first repository sync for offline-capable applications.
+
+  `openLix({ storage, server: { mode: "sync" } })` keeps reads and writes local while synchronizing with the server in the background. Browser applications can use OPFS for durable offline work, safely share a repository across tabs and workers, and recover when the owning tab closes.
+- Redesigned version control around session-scoped SQL relations and commit-to-commit diffs.
+
+  Use `lix_diff(relation, from_commit_id, to_commit_id)` to compare tracked relations, `lix_restore` to move a branch to an ancestor, and `lix_commit_ancestry()` plus commit parent IDs to inspect history. This replaces the former `*_by_branch`, branch descriptor/ref, heterogeneous working-diff, `diff_id`, and commit-edge surfaces; open a separate session for each branch.
+- Simplified the public SDK surface for serving, batching, migrations, and telemetry.
+
+  Serve a repository with `open_lix().with_storage(storage).serve().await`, submit atomic statement arrays through `executeBatch`, and run explicit offline migrations through `inspect_lix` and `migrate_lix`. Rust and JavaScript now share one stable telemetry contract. The former protocol constructors, Workerd entry point, SQL script parser, migration names, and legacy telemetry surface have been removed.
+
+### Patch
+
+- Improved browser, remote, and large-repository reliability and performance.
+
+  Concurrent tabs now open, synchronize, and query coherently; remote clients recover sessions and support larger sets of live observations; and diff, checkpoint, and sync operations avoid loading unused rows, payloads, and history.
 
 ## 0.12.3 - 2026-08-18
 
