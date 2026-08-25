@@ -190,12 +190,17 @@ where
         // compiler cannot prove all deeply nested SQL futures are Send.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                open_lix_inner(
-                    self.storage,
-                    self.wasm_runtime,
-                    self.telemetry,
-                    self.server,
-                )
+                // Opening is one restartable unit. In cross-context storage, a
+                // competing tab may commit during any phase, including sync
+                // bootstrap after the engine and primary session exist.
+                retry_expired_read(|| {
+                    open_lix_inner(
+                        self.storage.clone(),
+                        self.wasm_runtime.clone(),
+                        self.telemetry.clone(),
+                        self.server.clone(),
+                    )
+                })
                 .await
             })
         })
@@ -425,10 +430,7 @@ where
     // can be bound to the authority's account. Reopens with durable state for
     // this exact remote remain entirely local.
     let (reopened_sync_account_id, mut prepared_sync) = if let Some(server) = server.as_ref() {
-        let state = retry_expired_read(|| {
-            load_sync_open_state(&storage, server.url.trim_end_matches('/'))
-        })
-        .await?;
+        let state = load_sync_open_state(&storage, server.url.trim_end_matches('/')).await?;
         match state {
             SyncOpenState::NeedsPreparation => {
                 (None, Some(crate::sync::prepare_sync_mode(server).await?))
@@ -441,23 +443,18 @@ where
     let initial_sync_branch_id = prepared_sync
         .as_ref()
         .map(|prepared| prepared.default_branch_id.clone());
-    let engine = retry_expired_read(|| {
-        open_or_initialize_engine(
-            storage.clone(),
-            wasm_runtime.clone(),
-            telemetry.clone(),
-            None,
-            initial_sync_branch_id.as_deref(),
-        )
-    })
+    let engine = open_or_initialize_engine(
+        storage,
+        wasm_runtime,
+        telemetry,
+        None,
+        initial_sync_branch_id.as_deref(),
+    )
     .await?;
-    let session = retry_expired_read(|| async {
-        match reopened_sync_account_id.as_ref() {
-            Some(account_id) => engine.open_session_with_account(account_id.clone()).await,
-            None => engine.open_session().await,
-        }
-    })
-    .await?;
+    let session = match reopened_sync_account_id {
+        Some(account_id) => engine.open_session_with_account(account_id).await?,
+        None => engine.open_session().await?,
+    };
     let mut lix = Lix {
         engine: Arc::new(engine),
         session: Arc::new(session),
