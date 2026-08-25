@@ -13,6 +13,16 @@ import {
 	type OpfsRpcResponse,
 } from "../js/rpc.js";
 import { restoreSynchronousModeBestEffort } from "../js/sqlite-cleanup.js";
+import {
+	configureSqliteOpfsDurability,
+	fenceSqliteOpfsDurability,
+} from "../js/sqlite-durability.js";
+
+type CheckpointExecOptions = {
+	sql: string;
+	rowMode: "array";
+	resultRows: Array<Array<string | number | bigint | null>>;
+};
 
 test("does not replace a committed result with a synchronous cleanup error", () => {
 	const database = {
@@ -22,6 +32,66 @@ test("does not replace a committed result with a synchronous cleanup error", () 
 	} as Parameters<typeof restoreSynchronousModeBestEffort>[0];
 
 	expect(() => restoreSynchronousModeBestEffort(database, 1)).not.toThrow();
+});
+
+test("requires the SQLite modes used by the OPFS durability fence", () => {
+	const pragmas: string[] = [];
+	const database = {
+		selectValue: (sql: string) => {
+			pragmas.push(sql);
+			return sql.includes("locking_mode") ? "exclusive" : "wal";
+		},
+	};
+
+	configureSqliteOpfsDurability(database);
+	expect(pragmas).toEqual([
+		"PRAGMA locking_mode = EXCLUSIVE",
+		"PRAGMA journal_mode = WAL",
+	]);
+	expect(() =>
+		configureSqliteOpfsDurability({
+			...database,
+			selectValue: (sql) =>
+				sql.includes("locking_mode") ? "normal" : "wal",
+		}),
+	).toThrowError(expect.objectContaining({ code: "LIX_STORAGE_DURABILITY" }));
+	expect(() =>
+		configureSqliteOpfsDurability({
+			...database,
+			selectValue: (sql) =>
+				sql.includes("locking_mode") ? "exclusive" : "delete",
+		}),
+	).toThrowError(expect.objectContaining({ code: "LIX_STORAGE_DURABILITY" }));
+});
+
+test("accepts only a completed FULL WAL checkpoint as a durability fence", () => {
+	let checkpointSql: string | undefined;
+	const database = {
+		exec: (options: string | CheckpointExecOptions) => {
+			if (typeof options === "string") return;
+			checkpointSql = options.sql;
+			options.resultRows.push([0, 7, 7]);
+		},
+	};
+
+	fenceSqliteOpfsDurability(database);
+	expect(checkpointSql).toBe("PRAGMA wal_checkpoint(FULL)");
+
+	for (const result of [
+		[1, 7, 3],
+		[0, 7, 3],
+		[0, -1, -1],
+	] as const) {
+		expect(() =>
+			fenceSqliteOpfsDurability({
+				exec: (options: string | CheckpointExecOptions) => {
+					if (typeof options !== "string") {
+						options.resultRows.push([...result]);
+					}
+				},
+			}),
+		).toThrowError(expect.objectContaining({ code: "LIX_STORAGE_DURABILITY" }));
+	}
 });
 
 test("persists a complete local Lix", async () => {
@@ -429,31 +499,45 @@ test("keeps a complete SQL read coherent during cross-client commit churn", asyn
 	}
 });
 
-test("rejects durable reads instead of weakening their semantics", async () => {
-	const registration = new OpfsStorage({
-		name: `lix-opfs-durable-read-test:${crypto.randomUUID()}`,
-	}).lixStorage;
-	const worker = new Worker(new URL("./durable-read.worker.ts", import.meta.url), {
-		type: "module",
-	});
-	const result = new Promise<{ code: string | undefined }>((resolve, reject) => {
-		worker.onmessage = (event: MessageEvent<
-			| { ok: true; code: string | undefined }
-			| { ok: false; error: string }
-		>) => {
-			worker.terminate();
-			if (event.data.ok) resolve(event.data);
-			else reject(new Error(event.data.error));
-		};
-		worker.onerror = (event) => {
-			worker.terminate();
-			reject(event.error ?? new Error(event.message));
-		};
-	});
-	worker.postMessage({
-		registration,
-	});
-	expect((await result).code).toBe("LIX_STORAGE_DURABILITY");
+test("durable read fences a causally prior ordinary commit", async () => {
+	const name = `lix-opfs-durable-read-test:${crypto.randomUUID()}`;
+	const provider = await openProvider(new OpfsStorage({ name }).lixStorage);
+	const space: LixStorageSpace = {
+		id: 43,
+		name: "durable-read",
+		valueSemantics: "mutable",
+		valueIntegrity: "backendVerified",
+	};
+	const key = new TextEncoder().encode("causally-prior");
+	const value = new TextEncoder().encode("ordinary-commit");
+	try {
+		const write = await provider.beginWrite({
+			awaitDurable: false,
+			preconditions: [],
+			batchCapacityHintBytes: key.byteLength + value.byteLength,
+		});
+		await write.putMany(space, [{ key, value }]);
+		await write.commit();
+
+		const visibleRead = await provider.beginRead({
+			consistency: "latest",
+			durability: "visible",
+		});
+		const read = await provider.beginRead({
+			consistency: "latest",
+			durability: "durable",
+		});
+		// A durability fence changes physical persistence only. It must not
+		// publish a logical storage change or invalidate the visible read.
+		expect(read.snapshotCacheKey()).toBe(visibleRead.snapshotCacheKey());
+		expect(
+			await read.getMany([
+				{ space, keys: [key], options: { projection: "fullValue" } },
+			]),
+		).toEqual([{ kind: "fullValue", value }]);
+	} finally {
+		await provider.close();
+	}
 });
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {

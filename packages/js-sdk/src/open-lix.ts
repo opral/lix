@@ -62,6 +62,11 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	if (options.server !== undefined && syncServer === undefined) {
 		throw new TypeError("openLix() server mode must be 'remote' or 'sync'");
 	}
+	if (syncServer !== undefined && options.storage === undefined) {
+		throw new TypeError(
+			"openLix() sync mode requires a durability-capable storage adapter",
+		);
+	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
 		return new Lix(

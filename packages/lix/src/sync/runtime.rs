@@ -62,35 +62,12 @@ enum SyncDemandRequest {
 }
 
 #[derive(Debug)]
-pub(crate) struct PreparedSync {
-    transport: HttpSyncTransport,
-    snapshot: PreparedRepositorySnapshot,
-    lix_id: String,
-    pub(crate) default_branch_id: String,
-}
-
-#[derive(Debug)]
 pub(super) struct PreparedRepositorySnapshot {
     pub(super) metadata: SyncRepositoryPullResponse,
     pub(super) commits: Vec<super::SyncCommit>,
     pub(super) commit_headers: Vec<super::SyncCommitHeader>,
     pub(super) rows: Vec<super::SyncSnapshotRow>,
     pub(super) checkpoint_roots: BTreeMap<String, String>,
-}
-
-/// Performs the fresh-store bootstrap network operation exactly once.
-pub(crate) async fn prepare_sync_mode(
-    server: &crate::ServerOptions,
-) -> Result<PreparedSync, LixError> {
-    let remote_id = server.url.trim_end_matches('/');
-    let transport = HttpSyncTransport::connect(remote_id, &server.headers).await?;
-    let (snapshot, lix_id, default_branch_id) = fetch_repository_snapshot(&transport).await?;
-    Ok(PreparedSync {
-        transport,
-        snapshot,
-        lix_id,
-        default_branch_id,
-    })
 }
 
 pub(super) async fn fetch_repository_snapshot<Transport>(
@@ -320,7 +297,7 @@ impl Drop for SyncRuntime {
 pub(crate) async fn activate_sync_mode<StorageImpl>(
     lix: &mut Lix<StorageImpl>,
     server: &crate::ServerOptions,
-    prepared: Option<PreparedSync>,
+    initial_transport: Option<HttpSyncTransport>,
 ) -> Result<Arc<SyncRuntime>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -328,35 +305,6 @@ where
     let remote_id = server.url.trim_end_matches('/').to_owned();
     let headers = server.headers.clone();
     lix.set_sync_role(crate::sync::SyncRole::Replica)?;
-
-    // Reopens remain local. A fresh open hands in the already-fetched snapshot
-    // used to choose the repository's default branch during initialization.
-    let initial_transport = if let Some(prepared) = prepared {
-        register_blob_manifests(
-            lix,
-            &prepared.transport,
-            &prepared.snapshot.commits,
-            &prepared.snapshot.rows,
-        )
-        .await?;
-        let authority_lix_id = prepared.lix_id.clone();
-        lix.apply_sync_repository_snapshot(
-            &remote_id,
-            prepared.transport.active_account_id(),
-            &prepared.snapshot.metadata,
-            &prepared.snapshot.commits,
-            &prepared.snapshot.commit_headers,
-            &prepared.snapshot.rows,
-            &prepared.snapshot.checkpoint_roots,
-        )
-        .await?;
-        lix.align_repository_identity_for_sync(authority_lix_id)?;
-        lix.align_primary_account_for_sync(prepared.transport.active_account_id())
-            .await?;
-        Some(prepared.transport)
-    } else {
-        None
-    };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(SyncShutdown::Running);
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
@@ -2373,7 +2321,7 @@ mod tests {
             .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role");
         replica
-            .apply_sync_repository_snapshot(
+            .try_install_initial_sync_snapshot(
                 "https://sync.example/history",
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,

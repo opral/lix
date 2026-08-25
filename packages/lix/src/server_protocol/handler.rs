@@ -6678,7 +6678,7 @@ mod tests {
             .set_sync_role(crate::sync::SyncRole::Replica)
             .expect("set sparse replica role");
         replica
-            .apply_sync_repository_snapshot(
+            .try_install_initial_sync_snapshot(
                 "test://server-protocol-history",
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
