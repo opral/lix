@@ -17,6 +17,10 @@
 use lix::Memory;
 use lix::migration::{MigrationOptions, MigrationStatus, inspect_lix, migrate_lix};
 use lix::open_lix;
+#[cfg(feature = "server-protocol")]
+use lix::server_protocol::{ServerProtocolBody, ServerProtocolContext};
+#[cfg(feature = "server-protocol")]
+use lix::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan};
 
 const V68_SNAPSHOT: &[u8] = include_bytes!("fixtures/v68_bundled_csv_history.snapshot");
 // Generated with the protocol-v68 engine in `lix-engine-typed-main-current`:
@@ -226,4 +230,124 @@ async fn migrates_v68_fixture_and_reopens_with_current_and_history_rows() {
             "fixture should contain live {schema_key} history"
         );
     }
+}
+
+#[cfg(feature = "server-protocol")]
+#[tokio::test]
+async fn migrated_v68_fixture_serves_two_independent_protocol_sessions() {
+    use http::StatusCode;
+    use http_body_util::BodyExt as _;
+    use std::sync::{Arc, Mutex};
+
+    let storage = Memory::from_snapshot(V68_SNAPSHOT).expect("v68 golden snapshot should decode");
+    let Err(open_error) = open_lix().with_storage(storage.clone()).serve().await else {
+        panic!("protocol serving must require an explicit migration");
+    };
+    assert_eq!(open_error.code, "LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED");
+    migrate_lix(storage.clone(), MigrationOptions::default())
+        .await
+        .expect("v68 fixture should migrate");
+
+    let spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
+    let captured_spans = Arc::clone(&spans);
+    let protocol = open_lix()
+        .with_storage(storage)
+        .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured_spans.lock().expect("telemetry spans").push(span);
+        })))
+        .serve()
+        .await
+        .expect("migrated repository should serve without a root session");
+    assert_eq!(
+        spans
+            .lock()
+            .expect("telemetry spans")
+            .iter()
+            .filter(|span| span.start.name == "lix.repository.opened")
+            .count(),
+        0,
+        "serving a migrated repository must not create a hidden root session"
+    );
+
+    let mut session_ids = Vec::new();
+    for index in 0..2 {
+        let response = protocol
+            .handle(
+                http::Request::builder()
+                    .method("GET")
+                    .uri("/lix/v1")
+                    .body(ServerProtocolBody::empty())
+                    .expect("build handshake"),
+                ServerProtocolContext::anonymous(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect handshake")
+            .to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("decode handshake response");
+        let session_id = body["sessionId"]
+            .as_str()
+            .expect("handshake session id")
+            .to_owned();
+        session_ids.push(session_id.clone());
+
+        for (query_index, (sql, expected_rows)) in [
+            ("SELECT id, cells, order_key FROM csv_row", 1),
+            ("SELECT id FROM lix_history('csv_row')", 1),
+            ("SELECT schema_key FROM lix_registered_schema", 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = protocol
+                .handle(
+                    http::Request::builder()
+                        .method("POST")
+                        .uri("/lix/v1/execute")
+                        .header("lix-session-id", &session_id)
+                        .header(
+                            "idempotency-key",
+                            format!("migrated-v68-{index}-{query_index}"),
+                        )
+                        .header("content-type", "application/json")
+                        .body(ServerProtocolBody::from(
+                            serde_json::json!({ "sql": sql, "params": [] }).to_string(),
+                        ))
+                        .expect("build migrated query"),
+                    ServerProtocolContext::anonymous(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "query failed: {sql}");
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect migrated query")
+                .to_bytes();
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("decode migrated query");
+            assert!(
+                body["rows"]
+                    .as_array()
+                    .is_some_and(|rows| rows.len() >= expected_rows),
+                "migrated query returned too few rows: {sql}: {body}"
+            );
+        }
+    }
+    assert_ne!(session_ids[0], session_ids[1]);
+    assert_eq!(
+        spans
+            .lock()
+            .expect("telemetry spans")
+            .iter()
+            .filter(|span| span.start.name == "lix.repository.opened")
+            .count(),
+        2,
+        "each successful handshake must bind exactly one application session"
+    );
 }

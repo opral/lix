@@ -805,8 +805,6 @@ pub(crate) fn unix_time_ms() -> u64 {
 ///
 /// This is the only place that emits `lix.repository.opened`.
 /// Handshake session creation and in-process [`crate::open_lix`] call it.
-/// Protocol roots opened with [`crate::OpenLixBuilder::as_protocol_root`]
-/// skip it so a cached runtime can inherit a sink without emitting.
 /// Hosts that mint a session against an already-open runtime (MCP signed
 /// context, cache hit) should call the same helper instead of opening another
 /// engine.

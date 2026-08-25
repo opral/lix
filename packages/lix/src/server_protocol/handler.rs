@@ -2,6 +2,7 @@
 
 #![cfg_attr(test, allow(clippy::large_futures))]
 
+use crate::engine::Engine;
 use crate::session::ExecuteOptions;
 #[cfg(test)]
 use crate::session::media_upload::FILE_UPLOAD_PART_BYTES;
@@ -21,14 +22,14 @@ use lix::storage::Storage;
 use lix::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction, ObserveEvent,
-    ObserveEvents, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
+    ObserveEvents, OpenLixBuilder, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
-    future::Future,
+    future::{Future, IntoFuture},
     io,
     mem::size_of,
     pin::Pin,
@@ -425,11 +426,57 @@ impl Default for ServerProtocolOptions {
     }
 }
 
+/// Configures opening a repository as a Lix Server Protocol session factory.
+///
+/// Await directly for default limits, or set protocol-specific limits first
+/// with [`Self::with_options`].
+#[expect(missing_debug_implementations)]
+pub struct ServeLixBuilder<S> {
+    open: OpenLixBuilder<S>,
+    options: ServerProtocolOptions,
+}
+
+impl<S> ServeLixBuilder<S> {
+    pub(crate) fn new(open: OpenLixBuilder<S>) -> Self {
+        Self {
+            open,
+            options: ServerProtocolOptions::default(),
+        }
+    }
+
+    /// Sets resource limits for this repository's protocol sessions.
+    pub fn with_options(mut self, options: ServerProtocolOptions) -> Self {
+        self.options = options;
+        self
+    }
+}
+
+impl<S> IntoFuture for ServeLixBuilder<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    type Output = Result<LixServerProtocol<S>, LixError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                validate_server_protocol_options(self.options)?;
+                let engine = self.open.open_protocol_engine().await?;
+                Ok(LixServerProtocol::from_engine(
+                    Arc::new(engine),
+                    self.options,
+                ))
+            })
+        })
+    }
+}
+
 /// Persistent canonical protocol server for one Lix repository.
 ///
-/// A server owns one root [`Lix`] and opens every remote client as an
-/// independent branch-pinned session on that root's existing engine. Clones
-/// share the same bounded in-memory session registry.
+/// A server owns the repository engine and opens every remote client as an
+/// independent branch-pinned session. Server construction itself creates no
+/// application session. Clones share the same bounded in-memory session registry.
 #[expect(missing_debug_implementations)]
 pub struct LixServerProtocol<S>
 where
@@ -453,7 +500,7 @@ struct ServerInner<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    root: Arc<Lix<S>>,
+    engine: Arc<Engine<S>>,
     options: ServerProtocolOptions,
     registry: AsyncMutex<HashMap<String, Arc<SessionRecord<S>>>>,
     request_blob_budget: Arc<RequestBlobCacheBudget>,
@@ -1340,50 +1387,15 @@ impl<S> LixServerProtocol<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    /// Creates a protocol server with the default session limits.
-    ///
-    /// Open `root` with [`lix::OpenLixBuilder::as_protocol_root`] so attaching
-    /// a sink does not emit `lix.repository.opened` for the internal handle. Handshake
-    /// session creation remains the client bind.
-    pub fn new(root: Arc<Lix<S>>) -> Self {
-        Self::with_options(root, ServerProtocolOptions::default())
-            .expect("default protocol server options must be valid")
-    }
-
-    /// Creates a protocol server with explicit per-repository session limits.
-    pub fn with_options(
-        root: Arc<Lix<S>>,
+    fn from_engine(
+        engine: Arc<Engine<S>>,
         options: ServerProtocolOptions,
-    ) -> Result<Self, LixError> {
-        if options.max_sessions == 0 {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "protocol max_sessions must be greater than zero",
-            ));
-        }
-        if options.max_sessions > SESSION_OPEN_GATE_COUNT_MASK {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "protocol max_sessions exceeds the supported session-open limit",
-            ));
-        }
-        if options.max_request_body_bytes == 0 {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "protocol max_request_body_bytes must be greater than zero",
-            ));
-        }
-        if options.max_request_blob_cache_bytes == 0 {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "protocol max_request_blob_cache_bytes must be greater than zero",
-            ));
-        }
-        root.set_sync_role(crate::sync::SyncRole::Authority)?;
+    ) -> Self {
+        engine.sync_mode().set_role(crate::sync::SyncRole::Authority);
         let (close_result, _) = watch::channel(None);
-        Ok(Self {
+        Self {
             inner: Arc::new(ServerInner {
-                root,
+                engine,
                 options,
                 registry: AsyncMutex::new(HashMap::new()),
                 request_blob_budget: Arc::new(RequestBlobCacheBudget::new(
@@ -1393,7 +1405,7 @@ where
                 close_started: Once::new(),
                 close_result,
             }),
-        })
+        }
     }
 
     /// Handles one canonical protocol request.
@@ -1662,7 +1674,7 @@ where
             .all(|record| record.is_idle_expired(now, self.inner.options.session_idle_timeout))
     }
 
-    /// Closes every child session and finally the root repository session.
+    /// Closes every client session and rejects future handshakes.
     /// Repeated calls are safe.
     pub async fn close(&self) -> Result<(), LixError> {
         let mut close_result = self.inner.close_result.subscribe();
@@ -1713,11 +1725,6 @@ where
                 first_error = Some(error);
             }
         }
-        if let Err(error) = self.inner.root.close().await
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1728,33 +1735,78 @@ where
         principal: Option<ServerProtocolPrincipal>,
         durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Result<SessionLease<S>, ApiError> {
-        let _pending_open = self
+        let pending_open = self
             .inner
             .session_open_gate
             .reserve(self.inner.options.max_sessions)?;
-
-        let active_branch_id = match initial_active_branch_id {
-            Some(active_branch_id) => active_branch_id,
-            None => match self.inner.root.active_branch_id().await {
-                Ok(active_branch_id) => active_branch_id,
-                Err(error) => {
-                    if let Some(notifier) = &durable_terminal_storage_notifier {
-                        notifier.signal_if_terminal(&error);
-                    }
-                    return Err(error.into());
-                }
-            },
+        // Session opening may cross a durable storage boundary while creating
+        // an authenticated account. Own the entire lifecycle in a server task:
+        // dropping an HTTP request then detaches the join handle, while the
+        // task keeps its bounded reservation until storage and session cleanup
+        // reach a terminal result.
+        let server = self.clone();
+        let parent = tracing::Span::current();
+        // SAFETY: the task owns the protocol server and every session-open
+        // argument. Storage adapters and Engine are Send + Sync by this impl's
+        // bounds; the compiler cannot prove that across generic read lifetimes.
+        let opening = unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                server
+                    .create_session_tracked(
+                        pending_open,
+                        initial_active_branch_id,
+                        initial_active_account_id,
+                        principal,
+                        durable_terminal_storage_notifier,
+                    )
+                    .await
+            })
         };
+        tokio::spawn(
+            opening.instrument(parent).with_current_subscriber(),
+        )
+        .await
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("join Lix protocol session open: {error}"),
+            )
+        })?
+    }
+
+    async fn create_session_tracked(
+        &self,
+        _pending_open: PendingSessionOpen,
+        initial_active_branch_id: Option<String>,
+        initial_active_account_id: Option<String>,
+        principal: Option<ServerProtocolPrincipal>,
+        durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
+    ) -> Result<SessionLease<S>, ApiError> {
         // Validate and open the pinned child before evicting any idle session.
         // An invalid requested branch therefore cannot consume capacity or
         // evict another client.
         let active_account_id =
             initial_active_account_id.unwrap_or_else(|| lix::ANONYMOUS_ACCOUNT_ID.to_string());
-        let child = match self
+        if matches!(
+            &principal,
+            Some(ServerProtocolPrincipal::Authenticated { .. })
+        ) && let Err(error) = self
             .inner
-            .root
-            .open_internal_session(active_branch_id, active_account_id)
+            .engine
+            .ensure_account(&active_account_id, &active_account_id, "human")
             .await
+        {
+            if let Some(notifier) = &durable_terminal_storage_notifier {
+                notifier.signal_if_terminal(&error);
+            }
+            return Err(error.into());
+        }
+        let child = match Lix::open_protocol_session(
+            Arc::clone(&self.inner.engine),
+            initial_active_branch_id,
+            active_account_id,
+        )
+        .await
         {
             Ok(child) => child,
             Err(error) => {
@@ -1868,6 +1920,34 @@ where
         }
         Ok(())
     }
+}
+
+fn validate_server_protocol_options(options: ServerProtocolOptions) -> Result<(), LixError> {
+    if options.max_sessions == 0 {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "protocol max_sessions must be greater than zero",
+        ));
+    }
+    if options.max_sessions > SESSION_OPEN_GATE_COUNT_MASK {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "protocol max_sessions exceeds the supported session-open limit",
+        ));
+    }
+    if options.max_request_body_bytes == 0 {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "protocol max_request_body_bytes must be greater than zero",
+        ));
+    }
+    if options.max_request_blob_cache_bytes == 0 {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "protocol max_request_blob_cache_bytes must be greater than zero",
+        ));
+    }
+    Ok(())
 }
 
 async fn close_session_record<S>(record: &SessionRecord<S>) -> Result<(), LixError>
@@ -2018,17 +2098,6 @@ where
                 None => None,
             };
             let active_account_id = context.principal.account_id().to_owned();
-            if matches!(
-                context.principal,
-                ServerProtocolPrincipal::Authenticated { .. }
-            ) {
-                Box::pin(server.inner.root.ensure_account(
-                    &active_account_id,
-                    &active_account_id,
-                    "human",
-                ))
-                .await?;
-            }
             server
                 .create_session(
                     active_branch_id,
@@ -5178,7 +5247,6 @@ mod tests {
     }
 
     struct TestApp {
-        lix: Arc<Lix<Memory>>,
         server: LixServerProtocol<Memory>,
         router: Router<Memory>,
     }
@@ -5715,14 +5783,11 @@ mod tests {
     #[tokio::test]
     async fn fenced_storage_does_not_affect_resumed_cached_handshake() {
         let storage = FencedReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        let server = LixServerProtocol::new(root);
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve Lix");
         let router = handler(server.clone());
         let lease = server
             .create_session(None, None, None, None)
@@ -5762,14 +5827,12 @@ mod tests {
     #[tokio::test]
     async fn fenced_new_handshake_reports_terminal_storage_signal() {
         let storage = FencedReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        let router = handler(LixServerProtocol::new(root));
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve Lix");
+        let router = handler(server);
 
         storage.fence_reads();
         let (notifier, signal) = durable_terminal_storage_signal();
@@ -5796,18 +5859,21 @@ mod tests {
     #[tokio::test]
     async fn fenced_new_handshake_with_explicit_branch_reports_terminal_storage_signal() {
         let storage = FencedReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        let active_branch_id = root
+        let lix = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("open Lix");
+        let active_branch_id = lix
             .active_branch_id()
             .await
             .expect("read initial active branch");
-        let router = handler(LixServerProtocol::new(root));
+        lix.close().await.expect("close setup session");
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve Lix");
+        let router = handler(server);
 
         storage.fence_reads();
         let (notifier, signal) = durable_terminal_storage_signal();
@@ -5834,14 +5900,11 @@ mod tests {
     #[tokio::test]
     async fn fenced_observe_next_reports_terminal_storage_before_returning_error() {
         let storage = FencedReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        let server = LixServerProtocol::new(root);
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve Lix");
         let lease = server
             .create_session(None, None, None, None)
             .await
@@ -6026,14 +6089,11 @@ mod tests {
     #[tokio::test]
     async fn fenced_observe_after_headers_signals_and_ends_stream() {
         let storage = FencedReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        let server = LixServerProtocol::new(root);
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve Lix");
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
@@ -6080,14 +6140,11 @@ mod tests {
     #[tokio::test]
     async fn fenced_external_observe_watcher_signals_and_ends_stream() {
         let storage = FencedReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        let server = LixServerProtocol::new(root);
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve Lix");
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
@@ -6164,14 +6221,11 @@ mod tests {
     #[tokio::test]
     async fn fenced_multiplex_observe_aborts_live_sibling_before_next_body_poll() {
         let storage = FailOneBlockedReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        let server = LixServerProtocol::new(root);
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve Lix");
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
@@ -6255,14 +6309,11 @@ mod tests {
     #[tokio::test]
     async fn dropped_multiplex_response_aborts_unpolled_workers() {
         let storage = FailOneBlockedReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        let server = LixServerProtocol::new(root);
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve Lix");
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
@@ -6338,29 +6389,25 @@ mod tests {
     }
 
     async fn app_with_options(options: ServerProtocolOptions) -> TestApp {
-        let lix = Arc::new(open_lix().as_protocol_root().await.expect("open lix"));
-        let server =
-            LixServerProtocol::with_options(lix.clone(), options).expect("protocol server");
+        let server = open_lix()
+            .serve()
+            .with_options(options)
+            .await
+            .expect("serve lix");
         let router = handler(server.clone());
-        TestApp {
-            lix,
-            server,
-            router,
-        }
+        TestApp { server, router }
     }
 
     async fn router_with_storage<S>(storage: S) -> Router<S>
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
-        let lix = Arc::new(
-            open_lix()
-                .with_storage(storage)
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        handler(LixServerProtocol::new(lix))
+        let server = open_lix()
+            .with_storage(storage)
+            .serve()
+            .await
+            .expect("serve Lix");
+        handler(server)
     }
 
     #[tokio::test]
@@ -6504,7 +6551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotent_batch_hydrates_sparse_history_then_replays_one_durable_result() {
+    async fn batch_hydrates_sparse_history_before_applying_its_write() {
         let authority = open_lix().await.expect("open history authority");
         authority
             .execute(
@@ -6617,7 +6664,7 @@ mod tests {
         }
 
         let storage = DurableMemoryStorage::new();
-        crate::engine::Engine::initialize_with_main_branch_id(
+        Engine::initialize_with_main_branch_id(
             storage.clone(),
             Some(default_branch_id),
         )
@@ -6713,82 +6760,53 @@ mod tests {
             demand.succeed_for_test();
         });
 
-        let router = handler(LixServerProtocol::new(replica));
-        let (session_id, _) = new_session(&router).await;
-        let headers = [(IDEMPOTENCY_KEY_HEADER, "sparse-history-batch")];
-        let body = json!({
-            "statements": [
-                {
-                    "sql": format!(
-                        "SELECT COUNT(*) AS versions FROM lix_history('lix_file', '{head}')"
-                    ),
-                    "params": []
-                },
-                {
-                    "sql": "INSERT INTO lix_key_value (key, value) VALUES ('history-hydrated', 'once') RETURNING value",
-                    "params": []
-                }
-            ]
-        });
-        let first = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/execute-batch",
-            Some(&session_id),
-            &headers,
-            Some(body.clone()),
-        )
-        .await;
-        assert_eq!(first.status(), StatusCode::OK);
-        let first = response_json(first).await;
+        let statements = [
+            ExecuteBatchStatement {
+                sql: format!(
+                    "SELECT COUNT(*) AS versions FROM lix_history('lix_file', '{head}')"
+                ),
+                params: Vec::new(),
+                label: None,
+            },
+            ExecuteBatchStatement {
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ('history-hydrated', 'once') RETURNING value".to_string(),
+                params: Vec::new(),
+                label: None,
+            },
+        ];
+        let first = replica
+            .execute_batch(&statements)
+            .await
+            .expect("sparse history batch should hydrate and commit");
         assert!(
-            first[0]["rows"][0][0]["value"].as_i64().unwrap_or(0) >= 2,
-            "sparse history response: {first}"
+            first[0].rows()[0].get::<i64>("versions").unwrap_or(0) >= 2,
+            "sparse history response: {:?}",
+            first[0]
         );
         hydration.await.expect("history hydration task");
 
-        let replay = request_with_headers(
-            &router,
-            "POST",
-            "/lix/v1/execute-batch",
-            Some(&session_id),
-            &headers,
-            Some(body),
-        )
-        .await;
-        let replay_status = replay.status();
-        let replay = response_json(replay).await;
-        assert_eq!(replay_status, StatusCode::OK, "replay response: {replay}");
-        assert_eq!(replay, first);
-
-        let count = request(
-            &router,
-            "POST",
-            "/lix/v1/execute",
-            Some(&session_id),
-            Some(json!({
-                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'history-hydrated'"
-            })),
-        )
-        .await;
-        assert_eq!(count.status(), StatusCode::OK);
+        let count = replica
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'history-hydrated'",
+                &[],
+            )
+            .await
+            .expect("read hydrated batch write");
         assert_eq!(
-            response_json(count).await["rows"][0][0],
-            json!({ "kind": "int", "value": 1 })
+            count.rows()[0].get::<i64>("count"),
+            Ok(1),
+            "the write runs once after hydration"
         );
     }
 
     #[tokio::test]
     async fn keyed_write_without_durable_receipt_proof_is_not_acknowledged() {
         let storage = PostCommitUnknownStorage::new();
-        let lix = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        let server = LixServerProtocol::new(lix);
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve Lix");
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
         let headers = [(IDEMPOTENCY_KEY_HEADER, "memory-has-no-durable-proof")];
@@ -6836,20 +6854,13 @@ mod tests {
     }
 
     async fn app_with_tracing_telemetry() -> TestApp {
-        let lix = Arc::new(
-            open_lix()
-                .with_telemetry(Arc::new(OpenTelemetryTracingSink::new()))
-                .as_protocol_root()
-                .await
-                .expect("open lix"),
-        );
-        let server = LixServerProtocol::new(lix.clone());
+        let server = open_lix()
+            .with_telemetry(Arc::new(OpenTelemetryTracingSink::new()))
+            .serve()
+            .await
+            .expect("serve lix");
         let router = handler(server.clone());
-        TestApp {
-            lix,
-            server,
-            router,
-        }
+        TestApp { server, router }
     }
 
     async fn request(
@@ -7279,32 +7290,54 @@ mod tests {
         spans: Arc<Mutex<Vec<CompletedTelemetrySpan>>>,
     ) -> TestApp {
         let captured = Arc::clone(&spans);
-        let lix = Arc::new(
-            open_lix()
-                .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
-                    captured.lock().expect("spans").push(span);
-                })))
-                .as_protocol_root()
-                .await
-                .expect("open lix"),
-        );
-        let server = LixServerProtocol::new(lix.clone());
+        let server = open_lix()
+            .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
+                captured.lock().expect("spans").push(span);
+            })))
+            .serve()
+            .await
+            .expect("serve lix");
         let router = handler(server.clone());
-        TestApp {
-            lix,
-            server,
-            router,
-        }
+        TestApp { server, router }
     }
 
     #[tokio::test]
     async fn handshake_that_creates_a_session_emits_one_opened_span() {
         let spans = Arc::new(Mutex::new(Vec::new()));
         let app = app_with_callback_telemetry(Arc::clone(&spans)).await;
-        assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 0);
+        {
+            let spans = spans.lock().expect("spans");
+            assert_eq!(opened_spans(&spans).len(), 0);
+            assert!(
+                spans
+                    .iter()
+                    .filter(|span| span.start.name == "lix.engine.open")
+                    .count()
+                    >= 1
+            );
+            assert_eq!(
+                spans
+                    .iter()
+                    .filter(|span| span.start.name == "lix.session.open")
+                    .count(),
+                0,
+                "serving opens an engine, not a hidden application session"
+            );
+        }
 
         let (session_id, first) = new_session(&app.router).await;
-        assert_eq!(opened_spans(&spans.lock().expect("spans")).len(), 1);
+        {
+            let spans = spans.lock().expect("spans");
+            assert_eq!(opened_spans(&spans).len(), 1);
+            assert_eq!(
+                spans
+                    .iter()
+                    .filter(|span| span.start.name == "lix.session.open")
+                    .count(),
+                1,
+                "one handshake opens one application session"
+            );
+        }
 
         let resumed = request(&app.router, "GET", "/lix/v1/", Some(&session_id), None).await;
         assert_eq!(resumed.status(), StatusCode::OK);
@@ -7338,7 +7371,7 @@ mod tests {
     async fn handshake_without_a_sink_emits_no_opened_span() {
         let app = app().await;
         let (_session_id, _) = new_session(&app.router).await;
-        assert!(app.server.inner.root.telemetry().is_none());
+        assert!(app.server.inner.engine.telemetry().is_none());
     }
 
     #[tokio::test]
@@ -7498,6 +7531,10 @@ mod tests {
     async fn sync_router_roundtrips_inline_files_without_blob_routes() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
+        let client = {
+            let registry = app.server.inner.registry.lock().await;
+            Arc::clone(&registry.get(&session_id).expect("registered client").lix)
+        };
         let snapshot = request(
             &app.router,
             "GET",
@@ -7510,7 +7547,7 @@ mod tests {
         let snapshot = response_json(snapshot).await;
         let cursor = snapshot["cursor"].as_u64().expect("snapshot cursor");
 
-        app.lix
+        client
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, CAST('' AS BYTEA))",
                 &[Value::Text("/empty-inline.md".to_owned())],
@@ -7536,7 +7573,7 @@ mod tests {
         );
         let empty_cursor = empty_pull["cursor"].as_u64().expect("empty file cursor");
 
-        app.lix
+        client
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, CAST('inline' AS BYTEA))",
                 &[Value::Text("/nonempty-inline.md".to_owned())],
@@ -7581,8 +7618,12 @@ mod tests {
     #[tokio::test]
     async fn sync_history_and_push_roundtrip_commit_scoped_merge_provenance() {
         let app = app().await;
-        let source_branch = app
-            .lix
+        let (session_id, _) = new_session(&app.router).await;
+        let client = {
+            let registry = app.server.inner.registry.lock().await;
+            Arc::clone(&registry.get(&session_id).expect("registered client").lix)
+        };
+        let source_branch = client
             .create_branch(CreateBranchOptions {
                 id: Some("01920000-0000-7000-8000-000000001501".to_owned()),
                 name: "sync selected source".to_owned(),
@@ -7590,8 +7631,7 @@ mod tests {
             })
             .await
             .expect("source branch should be created");
-        let source = app
-            .lix
+        let source = client
             .open_another_session()
             .await
             .expect("source session should open");
@@ -7615,15 +7655,14 @@ mod tests {
             )
             .await
             .expect("source branch should span more than one commit");
-        app.lix
+        client
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('sync-target', 'authored')",
                 &[],
             )
             .await
             .expect("target branch should diverge");
-        let merge = app
-            .lix
+        let merge = client
             .merge_branch(lix::MergeBranchOptions {
                 source_branch_id: source_branch.id,
             })
@@ -7633,7 +7672,6 @@ mod tests {
             .created_merge_commit_id
             .expect("diverged branches should create a merge commit");
 
-        let (session_id, _) = new_session(&app.router).await;
         let history_path = format!("/lix/v1/sync/history?head={merge_commit_id}&limit=1");
         let history = request(&app.router, "GET", &history_path, Some(&session_id), None).await;
         assert_eq!(history.status(), StatusCode::OK);
@@ -7666,8 +7704,7 @@ mod tests {
             if imported.contains_key(&commit_id) {
                 continue;
             }
-            let response = app
-                .lix
+            let response = client
                 .sync_history(&commit_id, 1)
                 .await
                 .expect("source history closure should load");
@@ -7697,6 +7734,16 @@ mod tests {
             .expect("merge has a selected member");
         forged_selected["snapshot"] = json!({"key": "forged", "value": "forged"});
         let forged_target = self::app().await;
+        let (forged_session_id, _) = new_session(&forged_target.router).await;
+        let forged_client = {
+            let registry = forged_target.server.inner.registry.lock().await;
+            Arc::clone(
+                &registry
+                    .get(&forged_session_id)
+                    .expect("forged target session")
+                    .lix,
+            )
+        };
         let forged_request: SyncPushRequest = serde_json::from_value(json!({
             "commits": forged_commits,
             "inlineBlobs": [],
@@ -7709,14 +7756,23 @@ mod tests {
             }]
         }))
         .expect("forged request should decode");
-        let forged = forged_target
-            .lix
+        let forged = forged_client
             .push_sync_repository(&forged_request)
             .await
             .expect_err("forged selected payload must fail authority validation");
         assert_eq!(forged.code, LixError::CODE_INVALID_PARAM);
 
         let target = self::app().await;
+        let (target_session_id, _) = new_session(&target.router).await;
+        let target_client = {
+            let registry = target.server.inner.registry.lock().await;
+            Arc::clone(
+                &registry
+                    .get(&target_session_id)
+                    .expect("roundtrip target session")
+                    .lix,
+            )
+        };
         let replay_request: SyncPushRequest = serde_json::from_value(json!({
             "commits": imported.into_values().collect::<Vec<_>>(),
             "inlineBlobs": [],
@@ -7729,12 +7785,10 @@ mod tests {
             }]
         }))
         .expect("roundtrip request should decode");
-        target
-            .lix
+        target_client
             .push_sync_repository(&replay_request)
             .await
             .expect("valid full graph should import");
-        let (target_session_id, _) = new_session(&target.router).await;
 
         let roundtrip = request(
             &target.router,
@@ -11085,7 +11139,7 @@ mod tests {
         );
         assert!(
             spans.iter().all(|span| span.name != "lix.engine.open"),
-            "warm handshake must not reopen the protocol-root engine"
+            "warm handshake must not reopen the protocol engine"
         );
         assert_no_bound_parameter_or_bytea_fields(&spans);
     }
@@ -11239,7 +11293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_waits_for_pending_session_opens_before_closing_the_root() {
+    async fn close_waits_for_pending_session_opens_before_closing_the_server() {
         let app = app().await;
         let pending = app
             .server
@@ -11271,6 +11325,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_waits_for_authenticated_account_bootstrap() {
+        let storage = BlockingFencedWriteStorage::new();
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_options(ServerProtocolOptions {
+                max_sessions: 1,
+                ..ServerProtocolOptions::default()
+            })
+            .await
+            .expect("serve lix");
+        storage.block_next_write();
+
+        let opening_server = server.clone();
+        let opening = tokio::spawn(async move {
+            let account_id = "01920000-0000-7000-8000-0000000006a1";
+            opening_server
+                .create_session(
+                    None,
+                    Some(account_id.to_owned()),
+                    Some(ServerProtocolPrincipal::Authenticated {
+                        account_id: account_id.to_owned(),
+                        idempotency_scope: "test".to_owned(),
+                    }),
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_blocked_write())
+            .await
+            .expect("account bootstrap should reach storage");
+        assert_eq!(server.inner.session_open_gate.pending(), 1);
+
+        let closing_server = server.clone();
+        let mut closing = tokio::spawn(async move { closing_server.close().await });
+        while !server.inner.session_open_gate.is_closing() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut closing)
+                .await
+                .is_err(),
+            "close completed while authenticated account creation was still writing"
+        );
+
+        storage.release_blocked_write();
+        assert!(
+            opening
+                .await
+                .expect("join authenticated session open")
+                .is_err(),
+            "the fenced account write must fail the session open"
+        );
+        closing
+            .await
+            .expect("join server close")
+            .expect("close server");
+    }
+
+    #[tokio::test]
+    async fn cancelled_authenticated_handshake_remains_tracked_until_storage_finishes() {
+        let storage = BlockingFencedWriteStorage::new();
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_options(ServerProtocolOptions {
+                max_sessions: 1,
+                ..ServerProtocolOptions::default()
+            })
+            .await
+            .expect("serve lix");
+        storage.block_next_write();
+
+        let opening_server = server.clone();
+        let opening = tokio::spawn(async move {
+            let account_id = "01920000-0000-7000-8000-0000000006a2";
+            opening_server
+                .create_session(
+                    None,
+                    Some(account_id.to_owned()),
+                    Some(ServerProtocolPrincipal::Authenticated {
+                        account_id: account_id.to_owned(),
+                        idempotency_scope: "cancelled-test".to_owned(),
+                    }),
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_blocked_write())
+            .await
+            .expect("account bootstrap should reach storage");
+        assert_eq!(server.inner.session_open_gate.pending(), 1);
+
+        opening.abort();
+        let Err(cancelled) = opening.await else {
+            panic!("request-owned session open should be cancelled");
+        };
+        assert!(cancelled.is_cancelled());
+        assert_eq!(
+            server.inner.session_open_gate.pending(),
+            1,
+            "server-owned session creation must outlive request cancellation"
+        );
+
+        let closing_server = server.clone();
+        let mut closing = tokio::spawn(async move { closing_server.close().await });
+        while !server.inner.session_open_gate.is_closing() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut closing)
+                .await
+                .is_err(),
+            "close completed before cancelled account storage reached a terminal result"
+        );
+
+        storage.release_blocked_write();
+        closing
+            .await
+            .expect("join server close")
+            .expect("close server");
+        assert_eq!(server.inner.session_open_gate.pending(), 0);
+    }
+
+    #[tokio::test]
     async fn close_waits_for_eviction_cleanup_in_a_pending_session_open() {
         let app = app_with_options(ServerProtocolOptions {
             max_sessions: 1,
@@ -11290,10 +11469,8 @@ mod tests {
         // Shutdown must continue to track the whole create operation, not only
         // the child open and registry mutation.
         let first_transactions = first_record.transactions.lock().await;
-        let branch_id = app
-            .server
-            .inner
-            .root
+        let branch_id = first_record
+            .lix
             .active_branch_id()
             .await
             .expect("active branch");
@@ -11381,22 +11558,21 @@ mod tests {
     async fn concurrent_session_opens_do_not_hold_the_registry_lock_during_storage_reads() {
         const SESSION_COUNT: usize = 8;
         let storage = GatedReadStorage::new(SESSION_COUNT);
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open Lix"),
-        );
-        let branch_id = root.active_branch_id().await.expect("active branch");
-        let server = LixServerProtocol::with_options(
-            root,
-            ServerProtocolOptions {
+        let lix = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("open Lix");
+        let branch_id = lix.active_branch_id().await.expect("active branch");
+        lix.close().await.expect("close setup session");
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_options(ServerProtocolOptions {
                 max_sessions: SESSION_COUNT,
                 ..ServerProtocolOptions::default()
-            },
-        )
-        .expect("protocol server");
+            })
+            .await
+            .expect("serve Lix");
         storage.gate_next_reads(SESSION_COUNT);
 
         let mut tasks = tokio::task::JoinSet::new();
@@ -11611,16 +11787,18 @@ mod tests {
         )
         .await;
         assert_eq!(staged.status(), StatusCode::OK);
-        let visible = app
-            .server
-            .inner
-            .root
+        let (observer_id, _) = new_session(&app.router).await;
+        let observer = {
+            let registry = app.server.inner.registry.lock().await;
+            Arc::clone(&registry.get(&observer_id).expect("observer session").lix)
+        };
+        let visible = observer
             .execute(
                 "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'abandoned'",
                 &[],
             )
             .await
-            .expect("root should read committed state");
+            .expect("observer should read committed state");
         assert_eq!(visible.rows()[0].get::<i64>("count").unwrap(), 0);
 
         app.server.close().await.expect("server should close");
@@ -11630,22 +11808,16 @@ mod tests {
     #[tokio::test]
     async fn cancelled_cancellable_read_releases_session_for_close_and_replacement() {
         let storage = BlockingReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open lix"),
-        );
-        let server = LixServerProtocol::with_options(
-            root,
-            ServerProtocolOptions {
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
                 ..ServerProtocolOptions::default()
-            },
-        )
-        .expect("protocol server");
+            })
+            .await
+            .expect("serve lix");
         let router = handler(server.clone());
         let lease = server
             .create_session(None, None, None, None)
@@ -11701,14 +11873,11 @@ mod tests {
     #[tokio::test]
     async fn resumed_handshake_uses_cached_session_identity_and_closes() {
         let storage = BlockingReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open lix"),
-        );
-        let server = LixServerProtocol::new(root);
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve lix");
         let router = handler(server.clone());
         let lease = server
             .create_session(None, None, None, None)
@@ -11736,14 +11905,11 @@ mod tests {
     #[tokio::test]
     async fn cancelled_raw_file_read_releases_session_for_close() {
         let storage = BlockingReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open lix"),
-        );
-        let server = LixServerProtocol::new(root);
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve lix");
         let router = handler(server.clone());
         let lease = server
             .create_session(None, None, None, None)
@@ -11788,22 +11954,16 @@ mod tests {
     #[tokio::test]
     async fn cancelled_durable_operation_reports_terminal_storage_after_caller_cancellation() {
         let storage = BlockingFencedWriteStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open lix"),
-        );
-        let server = LixServerProtocol::with_options(
-            root,
-            ServerProtocolOptions {
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
                 ..ServerProtocolOptions::default()
-            },
-        )
-        .expect("protocol server");
+            })
+            .await
+            .expect("serve lix");
         let router = handler(server.clone());
         let lease = server
             .create_session(None, None, None, None)
@@ -11868,22 +12028,16 @@ mod tests {
     #[tokio::test]
     async fn cancelled_remote_commit_releases_transaction_pin_after_detached_work() {
         let storage = BlockingFencedWriteStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open lix"),
-        );
-        let server = LixServerProtocol::with_options(
-            root,
-            ServerProtocolOptions {
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
                 ..ServerProtocolOptions::default()
-            },
-        )
-        .expect("protocol server");
+            })
+            .await
+            .expect("serve lix");
         let router = handler(server.clone());
         let (session_id, _) = new_session(&router).await;
         let transaction_id = begin_remote_transaction(&router, &session_id).await;
@@ -12052,14 +12206,11 @@ mod tests {
     #[tokio::test]
     async fn cancelled_branch_switch_reports_terminal_storage_after_caller_cancellation() {
         let storage = BlockingFencedBranchControlReadStorage::new();
-        let root = Arc::new(
-            open_lix()
-                .with_storage(storage.clone())
-                .as_protocol_root()
-                .await
-                .expect("open lix"),
-        );
-        let server = LixServerProtocol::new(root);
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve lix");
         let router = handler(server.clone());
         let (session_id, _) = new_session(&router).await;
         let created = request(
@@ -12117,15 +12268,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_drains_children_and_root_and_is_idempotent() {
+    async fn close_drains_sessions_and_is_idempotent() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
         let child = {
             let registry = app.server.inner.registry.lock().await;
             Arc::clone(&registry.get(&session_id).expect("registered child").lix)
         };
-        let root = Arc::clone(&app.server.inner.root);
-
         app.server.close().await.expect("close server");
         app.server.close().await.expect("close server again");
         assert_eq!(
@@ -12133,13 +12282,6 @@ mod tests {
                 .execute("SELECT 1", &[])
                 .await
                 .expect_err("child closed")
-                .code,
-            LixError::CODE_CLOSED
-        );
-        assert_eq!(
-            root.execute("SELECT 1", &[])
-                .await
-                .expect_err("root closed")
                 .code,
             LixError::CODE_CLOSED
         );
@@ -12153,34 +12295,69 @@ mod tests {
 
     #[tokio::test]
     async fn zero_capacity_is_rejected() {
-        let lix = open_lix().as_protocol_root().await.expect("open lix");
-        let result = LixServerProtocol::with_options(
-            Arc::new(lix),
-            ServerProtocolOptions {
+        let result = open_lix()
+            .serve()
+            .with_options(ServerProtocolOptions {
                 max_sessions: 0,
                 session_idle_timeout: Duration::from_secs(1),
                 ..ServerProtocolOptions::default()
-            },
-        );
+            })
+            .await;
         let Err(error) = result else {
             panic!("zero capacity must be rejected");
         };
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
-        let result = LixServerProtocol::with_options(
-            Arc::new(
-                open_lix()
-                    .as_protocol_root()
-                    .await
-                    .expect("open second lix"),
-            ),
-            ServerProtocolOptions {
+        let result = open_lix()
+            .serve()
+            .with_options(ServerProtocolOptions {
                 max_request_blob_cache_bytes: 0,
                 ..ServerProtocolOptions::default()
-            },
-        );
+            })
+            .await;
         let Err(error) = result else {
             panic!("zero request blob cache capacity must be rejected");
+        };
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    }
+
+    #[tokio::test]
+    async fn sync_replica_configuration_cannot_be_served_as_an_authority() {
+        let result = open_lix()
+            .with_server(lix::ServerOptions::sync("https://example.invalid/repository"))
+            .serve()
+            .await;
+        let Err(error) = result else {
+            panic!("sync replica configuration must not open as an authority");
+        };
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    }
+
+    #[tokio::test]
+    async fn persisted_sync_replica_cannot_be_served_as_an_authority() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("initialize replica storage");
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            crate::sync::SYNC_REPLICA_STATE_SPACE,
+            crate::storage_adapter::StorageKey(Bytes::from_static(b"remote")),
+            br#"{"activeAccountId":"anonymous","cursor":0,"authoritativeBranches":{},"authorityKnownCommitIds":[]}"#
+                .to_vec(),
+        );
+        adapter
+            .commit_write_set(
+                writes,
+                crate::storage_adapter::StorageWriteOptions::default(),
+            )
+            .await
+            .expect("persist replica identity");
+
+        let result = open_lix().with_storage(storage).serve().await;
+        let Err(error) = result else {
+            panic!("persisted sync replica must not be promoted to authority");
         };
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     }

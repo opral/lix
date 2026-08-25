@@ -380,6 +380,39 @@ where
         .await
     }
 
+    /// Creates an active global account if it does not exist.
+    ///
+    /// Account bootstrap is an engine operation because protocol authorities
+    /// have no root application session. The short-lived system session is
+    /// always closed after the write attempt.
+    pub(crate) async fn ensure_account(
+        &self,
+        id: &str,
+        name: &str,
+        kind: &str,
+    ) -> Result<(), LixError> {
+        let system = self
+            .open_session_at_with_account(GLOBAL_BRANCH_ID, crate::SYSTEM_ACCOUNT_ID)
+            .await?;
+        let execute_result = system
+            .execute(
+                "INSERT INTO lix_account \
+                 (id, name, kind, status, lixcol_global, lixcol_untracked) \
+                 VALUES ($1, $2, $3, 'active', true, false) \
+                 ON CONFLICT (id) \
+                 DO NOTHING",
+                &[
+                    crate::Value::Text(id.to_string()),
+                    crate::Value::Text(name.to_string()),
+                    crate::Value::Text(kind.to_string()),
+                ],
+            )
+            .await;
+        let close_result = system.close().await;
+        execute_result?;
+        close_result
+    }
+
     /// Repairs the private working-diff projection produced by the former
     /// partial-checkpoint publication path. The branch control is the durable
     /// authority for `(head, checkpoint)`; HOT rows and their sparse epoch are

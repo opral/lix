@@ -92,8 +92,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use lix::server_protocol::{
-    FILE_UPLOAD_ID_HEADER, LixServerProtocol, SESSION_ID_HEADER, ServerProtocolBody,
-    ServerProtocolContext,
+    FILE_UPLOAD_ID_HEADER, SESSION_ID_HEADER, ServerProtocolBody, ServerProtocolContext,
 };
 use lix::storage::{
     CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
@@ -1325,14 +1324,11 @@ fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
     block_on(move || async move {
         {
             let storage = RocksDB::open(&path).expect("open durable round-trip store");
-            let lix = Arc::new(
-                open_lix()
-                    .with_storage(storage.clone())
-                    .as_protocol_root()
-                    .await
-                    .expect("open durable round-trip Lix"),
-            );
-            let server = LixServerProtocol::new(Arc::clone(&lix));
+            let server = open_lix()
+                .with_storage(storage.clone())
+                .serve()
+                .await
+                .expect("serve durable round-trip Lix");
             let handshake = server
                 .handle(
                     http::Request::builder()
