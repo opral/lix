@@ -9,7 +9,6 @@ use crate::LixError;
 use crate::branch::BranchRefReader;
 
 mod branch;
-mod branch_selection;
 mod change;
 mod columns;
 mod commit_ancestry;

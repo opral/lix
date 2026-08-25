@@ -20,7 +20,7 @@ use serde_json::Value as JsonValue;
 
 use crate::NullableKeyFilter;
 use crate::branch::BranchHeadControlContext;
-use crate::changelog::ChangeRecordProjection;
+use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::hot_state::TrackedHeadContext;
 use crate::plugin::runtime::WasmTypedRow;
 use crate::row_pk::{RowPk, RowPkComponentType};
@@ -36,7 +36,6 @@ use crate::tracked_state::{
     TrackedStateStoreReader,
 };
 
-use super::branch_selection::filter_conjuncts;
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 
@@ -296,6 +295,10 @@ where
                     let mut tracked = TrackedStateContext::new().reader(store.clone());
                     let direct_diff = if !route.request.retain_payloads
                         && let Some(branch_id) = active_branch_id.as_deref()
+                        && let (Ok(from_commit), Ok(to_commit)) = (
+                            CommitId::parse(&from_commit_id),
+                            CommitId::parse(&to_commit_id),
+                        )
                     {
                         match BranchHeadControlContext::new()
                             .reader(store.clone())
@@ -304,10 +307,9 @@ where
                             .map_err(lix_error_to_datafusion_error)?
                         {
                             Some(control)
-                                if control.head_commit_id.to_string() == to_commit_id
-                                    && control.working_diff_checkpoint_commit_id.is_some_and(
-                                        |checkpoint| checkpoint.to_string() == from_commit_id,
-                                    ) =>
+                                if control.head_commit_id == to_commit
+                                    && control.working_diff_checkpoint_commit_id
+                                        == Some(from_commit) =>
                             {
                                 TrackedHeadContext::new()
                                     .reader(store)
@@ -360,6 +362,24 @@ where
             ),
         })
     }
+}
+
+fn filter_conjuncts(filters: &[Expr]) -> Vec<Expr> {
+    fn append(expression: &Expr, conjuncts: &mut Vec<Expr>) {
+        match expression {
+            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+                append(&binary.left, conjuncts);
+                append(&binary.right, conjuncts);
+            }
+            _ => conjuncts.push(expression.clone()),
+        }
+    }
+
+    let mut conjuncts = Vec::new();
+    for filter in filters {
+        append(filter, &mut conjuncts);
+    }
+    conjuncts
 }
 
 #[derive(Clone, Debug)]
