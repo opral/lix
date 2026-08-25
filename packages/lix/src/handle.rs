@@ -1,7 +1,3 @@
-// The hard-cut keeps a small set of crate-internal transport and profiling
-// helpers that no longer have enabled in-crate callers.
-#![cfg_attr(test, allow(dead_code))]
-
 use lix::plugin::runtime::WasmRuntime;
 use lix::storage::Storage;
 use lix::telemetry::TelemetrySink;
@@ -9,8 +5,7 @@ use lix::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteBatchStatement,
     ExecuteIdempotency, ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, LixError,
     Memory, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    ObserveEvents, PreparedDmlParameterBatch, RedoReceipt, SwitchBranchOptions,
-    SwitchBranchReceipt, UndoReceipt, Value,
+    ObserveEvents, RedoReceipt, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
 };
 use std::{
     future::{Future, IntoFuture},
@@ -72,7 +67,6 @@ pub struct OpenLixBuilder<StorageImpl = Memory> {
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     server: Option<ServerOptions>,
-    skip_session_bind: bool,
 }
 
 impl Default for OpenLixBuilder<Memory> {
@@ -82,7 +76,6 @@ impl Default for OpenLixBuilder<Memory> {
             wasm_runtime: None,
             telemetry: None,
             server: None,
-            skip_session_bind: false,
         }
     }
 }
@@ -98,7 +91,6 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
             wasm_runtime: self.wasm_runtime,
             telemetry: self.telemetry,
             server: self.server,
-            skip_session_bind: self.skip_session_bind,
         }
     }
 
@@ -120,14 +112,50 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
         self
     }
 
-    /// Attaches a sink (if any) without emitting `lix.repository.opened`.
+    /// Opens the repository as a canonical Lix Server Protocol session factory.
     ///
-    /// Use this when the handle is only a protocol root or cached runtime
-    /// that later protocol sessions inherit. Handshake session creation and
-    /// explicit [`Lix::bind_session`] remain the client bind.
-    pub fn as_protocol_root(mut self) -> Self {
-        self.skip_session_bind = true;
-        self
+    /// Serving owns the repository engine directly and creates no application
+    /// session. Each successful protocol handshake retains exactly one
+    /// application session.
+    #[cfg(feature = "server-protocol")]
+    pub fn serve(self) -> crate::server_protocol::ServeLixBuilder<StorageImpl> {
+        crate::server_protocol::ServeLixBuilder::new(self)
+    }
+}
+
+#[cfg(feature = "server-protocol")]
+impl<StorageImpl> OpenLixBuilder<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    pub(crate) async fn open_protocol_engine(self) -> Result<Engine<StorageImpl>, LixError> {
+        if self.server.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "a Lix Server Protocol authority cannot also be a sync replica",
+            ));
+        }
+        let engine = retry_expired_read(|| {
+            open_or_initialize_engine(
+                self.storage.clone(),
+                self.wasm_runtime.clone(),
+                self.telemetry.clone(),
+                None,
+                None,
+            )
+        })
+        .await?;
+        let storage = engine.storage();
+        let read = storage
+            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .await?;
+        if crate::sync::has_any_sync_replica_state(&read).await? {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "a persisted sync replica cannot be served as a protocol authority",
+            ));
+        }
+        Ok(engine)
     }
 }
 
@@ -167,7 +195,6 @@ where
                     self.wasm_runtime,
                     self.telemetry,
                     self.server,
-                    self.skip_session_bind,
                 )
                 .await
             })
@@ -389,7 +416,6 @@ async fn open_lix_inner<StorageImpl>(
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     server: Option<ServerOptions>,
-    skip_session_bind: bool,
 ) -> Result<Lix<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -450,9 +476,7 @@ where
             }
         }
     }
-    if !skip_session_bind {
-        lix.bind_session();
-    }
+    lix.bind_session();
     Ok(lix)
 }
 
@@ -495,6 +519,44 @@ impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    #[cfg(feature = "server-protocol")]
+    pub(crate) async fn open_protocol_session(
+        engine: Arc<Engine<StorageImpl>>,
+        active_branch_id: Option<String>,
+        active_account_id: String,
+    ) -> Result<Self, LixError> {
+        let session = match active_branch_id {
+            Some(active_branch_id) => {
+                if engine
+                    .load_branch_head_commit_id(&active_branch_id)
+                    .await?
+                    .is_none()
+                {
+                    return Err(LixError::branch_not_found(
+                        active_branch_id,
+                        "open_protocol_session",
+                        "target",
+                    ));
+                }
+                engine
+                    .open_session_at_with_account(active_branch_id, active_account_id)
+                    .await?
+            }
+            None => {
+                engine
+                    .open_session_with_account(active_account_id)
+                    .await?
+            }
+        };
+        Ok(Self {
+            engine,
+            session: Arc::new(session),
+            primary_switch_gate: None,
+            sync_lease: None,
+            sync_demand_tx: None,
+        })
+    }
+
     async fn retry_sync_demands<T, Operation, OperationFuture>(
         &self,
         mut operation: Operation,
@@ -746,24 +808,6 @@ where
             .await
     }
 
-    pub(crate) async fn execute_with_options_and_metadata(
-        &self,
-        sql: &str,
-        params: &[Value],
-        options: ExecuteOptions,
-        metadata: ExecuteStatementMetadata,
-    ) -> Result<ExecuteResult, LixError> {
-        self.retry_sync_demands(|| {
-            self.session.execute_with_options_and_metadata(
-                sql,
-                params,
-                options.clone(),
-                metadata.clone(),
-            )
-        })
-        .await
-    }
-
     pub(crate) fn execute_with_idempotency_and_options_and_metadata(
         self: Arc<Self>,
         sql: String,
@@ -823,21 +867,6 @@ where
         Arc::clone(&self.session).execute_coherent_read_batch_owned(statements)
     }
 
-    /// Executes one prepared DML statement shape for a rectangular parameter
-    /// page in one atomic transaction. The SQL is planned once and each
-    /// parameter row produces one result in input order. This is the public
-    /// bulk-write contract used by generated/transport callers; unsupported
-    /// shapes fail closed rather than degrading to per-row SQL execution.
-    pub(crate) async fn execute_prepared_dml_batch(
-        &self,
-        sql: Arc<str>,
-        parameter_batch: PreparedDmlParameterBatch,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.session
-            .execute_prepared_dml_batch(sql, parameter_batch)
-            .await
-    }
-
     /// Classifies an atomic SQL batch for a caller that owns its transport
     /// lifecycle.
     pub(crate) fn execute_batch_disposition(
@@ -845,22 +874,6 @@ where
         statements: &[ExecuteBatchStatement],
     ) -> Result<ExecutionDisposition, LixError> {
         self.session.execute_batch_disposition(statements)
-    }
-
-    pub(crate) async fn execute_batch_with_options_and_metadata(
-        &self,
-        statements: &[ExecuteBatchStatement],
-        options: ExecuteOptions,
-        statement_metadata: Vec<ExecuteStatementMetadata>,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.retry_sync_demands(|| {
-            self.session.execute_batch_with_options_and_metadata(
-                statements,
-                options.clone(),
-                statement_metadata.clone(),
-            )
-        })
-        .await
     }
 
     pub(crate) fn execute_batch_with_idempotency_and_options_and_metadata(
@@ -936,11 +949,8 @@ where
     /// Records that this handle's session has bound to the repository.
     ///
     /// In-process [`open_lix`] and protocol handshake session creation call
-    /// this once. Protocol roots opened with
-    /// [`OpenLixBuilder::as_protocol_root`] skip it so attaching a sink does
-    /// not emit for the internal handle. Hosts that mint a session against an
-    /// already-open runtime should call the same helper instead of opening
-    /// another engine.
+    /// this once. Hosts that mint a session against an already-open runtime
+    /// should call the same helper instead of opening another engine.
     pub fn bind_session(&self) {
         let Ok(branch_id) = self.session.bound_branch_id() else {
             return;
@@ -961,25 +971,7 @@ where
         name: &str,
         kind: &str,
     ) -> Result<(), LixError> {
-        let system = Box::pin(
-            self.open_internal_session(lix::GLOBAL_BRANCH_ID.to_string(), lix::SYSTEM_ACCOUNT_ID),
-        )
-        .await?;
-        system
-            .execute(
-                "INSERT INTO lix_account \
-                 (id, name, kind, status, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, $2, $3, 'active', true, false) \
-                 ON CONFLICT (id) \
-                 DO NOTHING",
-                &[
-                    Value::Text(id.to_string()),
-                    Value::Text(name.to_string()),
-                    Value::Text(kind.to_string()),
-                ],
-            )
-            .await?;
-        Box::pin(system.close()).await
+        self.engine.ensure_account(id, name, kind).await
     }
 
     pub async fn create_branch(
@@ -1027,15 +1019,6 @@ where
         options: MergeBranchOptions,
     ) -> Result<MergeBranchReceipt, LixError> {
         self.retry_sync_demands(|| self.session.merge_branch(options.clone()))
-            .await
-    }
-
-    pub(crate) async fn replay_execute_idempotency_result(
-        &self,
-        idempotency: &ExecuteIdempotency,
-    ) -> Result<Option<ExecuteResult>, LixError> {
-        self.session
-            .replay_execute_idempotency_result(idempotency)
             .await
     }
 
@@ -1220,28 +1203,12 @@ where
         self.inner.execute_with_options(sql, params, options)
     }
 
-    /// Executes one prepared DML page atomically inside this transaction.
-    /// Shape changes and dependency barriers remain explicit `execute` calls.
-    pub(crate) async fn execute_prepared_dml_batch(
-        &mut self,
-        sql: Arc<str>,
-        parameter_batch: PreparedDmlParameterBatch,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.inner
-            .execute_prepared_dml_batch(sql, parameter_batch)
-            .await
-    }
-
     #[cfg(test)]
     pub(crate) async fn stage_test_row(
         &mut self,
         row: TransactionWriteRow,
     ) -> Result<(), LixError> {
         self.inner.stage_test_row(row).await
-    }
-
-    pub(crate) fn active_branch_id(&self) -> Result<&str, LixError> {
-        self.inner.active_branch_id()
     }
 
     pub async fn commit(self) -> Result<(), LixError> {
@@ -1471,51 +1438,6 @@ mod tests {
         let started = sink.started.lock().expect("started");
         assert!(started.iter().all(|name| *name != "lix.repository.opened"));
         assert!(started.contains(&"lix.sql.query"));
-    }
-
-    #[tokio::test]
-    async fn protocol_root_open_attaches_sink_without_emitting_opened() {
-        let spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
-        let captured = Arc::clone(&spans);
-        let telemetry = Arc::new(CallbackTelemetrySink::new(move |span| {
-            captured.lock().expect("spans").push(span);
-        }));
-        let lix = open_lix()
-            .with_telemetry(telemetry)
-            .as_protocol_root()
-            .await
-            .expect("open protocol root");
-        lix.execute("SELECT 1", &[]).await.expect("execute");
-
-        assert!(lix.telemetry().is_some());
-        let spans = spans.lock().expect("spans");
-        assert!(opened_spans(&spans).is_empty());
-        assert!(
-            spans.iter().any(|span| span.start.name == "lix.sql.query"),
-            "SQL spans still work on a protocol root"
-        );
-    }
-
-    #[tokio::test]
-    async fn protocol_root_then_explicit_bind_emits_one_opened_span() {
-        let spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
-        let captured = Arc::clone(&spans);
-        let telemetry = Arc::new(CallbackTelemetrySink::new(move |span| {
-            captured.lock().expect("spans").push(span);
-        }));
-        let lix = open_lix()
-            .with_telemetry(telemetry)
-            .as_protocol_root()
-            .await
-            .expect("open protocol root");
-        assert!(opened_spans(&spans.lock().expect("spans")).is_empty());
-
-        lix.bind_session();
-        let spans = spans.lock().expect("spans");
-        let opened = opened_spans(&spans);
-        assert_eq!(opened.len(), 1);
-        assert_eq!(opened[0].start.name, "lix.repository.opened");
-        assert_eq!(attribute_string(opened[0], "lix.id"), Some(lix.lix_id()));
     }
 
     #[tokio::test]
@@ -2019,13 +1941,7 @@ mod assume_send_future_proofs {
         wasm_runtime: Option<Arc<dyn WasmRuntime>>,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) {
-        is_send(&open_lix_inner(
-            storage,
-            wasm_runtime,
-            telemetry,
-            None,
-            false,
-        ));
+        is_send(&open_lix_inner(storage, wasm_runtime, telemetry, None));
     }
 
     // handle.rs -- Lix::switch_branch (body mirrored verbatim)

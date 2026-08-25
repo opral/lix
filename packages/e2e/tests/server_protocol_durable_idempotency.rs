@@ -162,14 +162,11 @@ async fn open_server() -> (
     String,
 ) {
     let storage = PostCommitUnknownSlateDB::new();
-    let lix = Arc::new(
-        lix::open_lix()
-            .with_storage(storage.clone())
-            .as_protocol_root()
-            .await
-            .expect("open Lix"),
-    );
-    let server = LixServerProtocol::new(lix);
+    let server = lix::open_lix()
+        .with_storage(storage.clone())
+        .serve()
+        .await
+        .expect("serve Lix");
     let handshake = request(&server, "GET", "/lix/v1", None, None, None).await;
     assert_eq!(handshake.status(), StatusCode::OK);
     let session_id = json_body(handshake).await["sessionId"]

@@ -17,8 +17,9 @@ use lix::server_protocol::{
     LixServerProtocol, ServerProtocolBody, ServerProtocolContext, ServerProtocolPrincipal,
 };
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, Lix, Memory, ServerOptions, Value, open_lix};
+use lix::{ExecuteBatchStatement, Lix, Memory, ServerOptions, Value, WireValue, open_lix};
 use lix_storage_filesystem::FilesystemStorage;
+use serde_json::{Value as JsonValue, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -47,7 +48,7 @@ struct HttpProbe {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn synced_partial_file_checkpoint_stays_off_cold_history() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     for index in 0..50 {
         put_value(
             &authority,
@@ -60,9 +61,10 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
         .create_checkpoint()
         .await
         .expect("checkpoint cold snapshot baseline");
+    authority.close().await.expect("close authority setup");
 
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
     probe.set_push_offline(true);
@@ -158,12 +160,11 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
     probe.set_push_offline(false);
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn first_local_write_pushes_before_deferred_history_is_read() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     authority
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/shared.md', CAST('Hello world' AS BYTEA))",
@@ -172,8 +173,10 @@ async fn first_local_write_pushes_before_deferred_history_is_read() {
         .await
         .expect("seed shared file");
     put_value(&authority, "head", "visible").await;
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
 
@@ -191,38 +194,21 @@ async fn first_local_write_pushes_before_deferred_history_is_read() {
         )
         .await
         .expect("edit file before reading history");
-    tokio::time::timeout(WAIT_TIMEOUT, async {
-        loop {
-            let result = authority
-                .execute(
-                    "SELECT content FROM lix_file WHERE path = '/shared.md'",
-                    &[],
-                )
-                .await
-                .expect("read authority file");
-            if result.rows()[0]
-                .get::<Vec<u8>>("content")
-                .expect("file content decodes")
-                == b"Hello worlds"
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("file edit reaches authority");
+    protocol_authority
+        .wait_for_file_content("/shared.md", b"Hello worlds")
+        .await;
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sync_runtime_outlives_the_primary_session() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "seed", "authority").await;
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::default()).await;
+    authority.close().await.expect("close authority setup");
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage.clone(), Arc::default()).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let primary = open_replica(replica_dir.path(), &url).await;
     let child = primary
@@ -232,14 +218,17 @@ async fn sync_runtime_outlives_the_primary_session() {
 
     primary.close().await.expect("close primary session");
     put_value(&child, "from-child", "after-primary-close").await;
-    wait_for_value(&authority, "from-child", "after-primary-close").await;
+    protocol_authority
+        .wait_for_value("from-child", "after-primary-close")
+        .await;
 
-    put_value(&authority, "from-authority", "child-still-live").await;
+    protocol_authority
+        .put_value("from-authority", "child-still-live")
+        .await;
     wait_for_value(&child, "from-authority", "child-still-live").await;
 
     child.close().await.expect("close final session");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 impl HttpProbe {
@@ -280,14 +269,16 @@ impl HttpProbe {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     let authority_lix_id = authority.lix_id().to_owned();
     put_value(&authority, "bootstrap-parent", "lazy-history").await;
     let history_parent = active_head(&authority).await;
     put_value(&authority, "bootstrap", "from-authority").await;
     let history_head = active_head(&authority).await;
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
 
@@ -349,28 +340,12 @@ async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
             .expect("new file content should decode"),
         b"works",
     );
-    wait_for_value(&authority, "local", "from-replica").await;
-    tokio::time::timeout(WAIT_TIMEOUT, async {
-        loop {
-            let rows = authority
-                .execute(
-                    "SELECT content FROM lix_file WHERE path = '/after-bootstrap.txt'",
-                    &[],
-                )
-                .await
-                .expect("authority file query succeeds");
-            if rows
-                .rows()
-                .first()
-                .is_some_and(|row| row.get::<Vec<u8>>("content").ok().as_deref() == Some(b"works"))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("timed out waiting for first synchronized file");
+    protocol_authority
+        .wait_for_value("local", "from-replica")
+        .await;
+    protocol_authority
+        .wait_for_file_content("/after-bootstrap.txt", b"works")
+        .await;
 
     replica.close().await.expect("close replica");
     drop(replica);
@@ -382,12 +357,11 @@ async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
     );
     reopened.close().await.expect("close reopened replica");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_pages() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     authority
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/gone.md', CAST('version one' AS BYTEA))",
@@ -439,9 +413,10 @@ async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_p
         put_value(&authority, &format!("history-page-{index:03}"), "value").await;
     }
     let head = active_head(&authority).await;
+    authority.close().await.expect("close authority setup");
 
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
 
@@ -492,12 +467,11 @@ async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_p
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     let inserted = authority
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/bounded.md', CAST('version-00' AS BYTEA)) RETURNING id",
@@ -546,9 +520,10 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
             .expect("authority history content decodes"),
         b"version-31",
     );
+    authority.close().await.expect("close authority setup");
 
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
     let history_before = probe.history_gets.load(Ordering::Acquire);
@@ -584,12 +559,11 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sparse_checkpoint_history_hydrates_missing_bodies_concurrently() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     let inserted = authority
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/checkpoint.md', CAST('version-00' AS BYTEA)) RETURNING id",
@@ -621,9 +595,10 @@ async fn sparse_checkpoint_history_hydrates_missing_bodies_concurrently() {
         );
     }
     let latest_checkpoint = latest_checkpoint.expect("latest checkpoint captured");
+    authority.close().await.expect("close authority setup");
 
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
     probe.set_round_trip_delay(Duration::from_millis(500));
@@ -651,12 +626,11 @@ async fn sparse_checkpoint_history_hydrates_missing_bodies_concurrently() {
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_bootstrap_pages_more_than_one_window_of_hot_rows() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     let statements = (0..OFFLINE_COMMIT_COUNT)
         .map(|index| ExecuteBatchStatement {
             label: None,
@@ -671,8 +645,9 @@ async fn fresh_bootstrap_pages_more_than_one_window_of_hot_rows() {
         .execute_batch(&statements)
         .await
         .expect("seed more hot rows than one snapshot page");
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
 
@@ -691,14 +666,14 @@ async fn fresh_bootstrap_pages_more_than_one_window_of_hot_rows() {
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn warm_filesystem_replica_reopens_and_writes_while_offline() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "cached", "durable").await;
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::default()).await;
+    authority.close().await.expect("close authority setup");
+    let (url, server_task) = serve(authority_storage.clone(), Arc::default()).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
     assert_eq!(
@@ -728,20 +703,20 @@ async fn warm_filesystem_replica_reopens_and_writes_while_offline() {
     );
 
     offline.close().await.expect("close offline replica");
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_identity_survives_fresh_push_and_offline_reopen() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "authenticated-seed", "server").await;
     let principal = ServerProtocolPrincipal::Authenticated {
         account_id: lix::SYSTEM_ACCOUNT_ID.to_owned(),
         idempotency_scope: "sync-mode-authenticated-e2e".to_owned(),
     };
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve_as(
-        Arc::clone(&authority),
+    let (url, server_task, protocol_authority) = serve_as_with_authority_session(
+        authority_storage.clone(),
         Arc::clone(&probe),
         principal.clone(),
     )
@@ -751,7 +726,9 @@ async fn authenticated_identity_survives_fresh_push_and_offline_reopen() {
 
     assert_eq!(active_account(&replica).await, lix::SYSTEM_ACCOUNT_ID);
     put_value(&replica, "authenticated-fresh", "accepted").await;
-    wait_for_value(&authority, "authenticated-fresh", "accepted").await;
+    protocol_authority
+        .wait_for_value("authenticated-fresh", "accepted")
+        .await;
     assert!(
         probe.pushes.load(Ordering::Acquire) > 0,
         "authenticated fresh write should reach the authority through sync push",
@@ -783,15 +760,16 @@ async fn authenticated_identity_survives_fresh_push_and_offline_reopen() {
         .close()
         .await
         .expect("close authenticated offline replica");
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn more_than_one_offline_push_window_drains_after_reconnect() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     let commits_before = commit_count(&authority).await;
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
     wait_for_counter(&probe.delta_pulls, 1).await;
@@ -824,7 +802,11 @@ async fn more_than_one_offline_push_window_drains_after_reconnect() {
     probe.set_offline(false);
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            if read_value(&authority, "offline-window").await.as_deref() == Some(expected.as_str())
+            if protocol_authority
+                .read_value("offline-window")
+                .await
+                .as_deref()
+                == Some(expected.as_str())
             {
                 break;
             }
@@ -834,7 +816,7 @@ async fn more_than_one_offline_push_window_drains_after_reconnect() {
     .await
     .expect("offline outbox should drain after reconnect");
     assert_eq!(
-        commit_count(&authority).await,
+        protocol_authority.commit_count().await,
         commits_before + OFFLINE_COMMIT_COUNT as i64,
     );
     assert!(
@@ -844,15 +826,16 @@ async fn more_than_one_offline_push_window_drains_after_reconnect() {
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_clients_receive_remote_writes_through_a_held_long_poll() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "seed", "ready").await;
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
     let alice_dir = TempDir::new().expect("alice tempdir");
     let bob_dir = TempDir::new().expect("bob tempdir");
     let alice = open_replica(alice_dir.path(), &url).await;
@@ -861,9 +844,13 @@ async fn two_clients_receive_remote_writes_through_a_held_long_poll() {
     wait_for_counter(&probe.delta_pulls, 2).await;
     put_value(&alice, "shared", "from-alice").await;
     wait_for_value(&bob, "shared", "from-alice").await;
-    wait_for_value(&authority, "shared", "from-alice").await;
+    protocol_authority
+        .wait_for_value("shared", "from-alice")
+        .await;
     wait_for_counter(&probe.delta_pulls, 3).await;
-    put_value(&authority, "server-originated", "from-authority").await;
+    protocol_authority
+        .put_value("server-originated", "from-authority")
+        .await;
     wait_for_value(&alice, "server-originated", "from-authority").await;
     wait_for_value(&bob, "server-originated", "from-authority").await;
 
@@ -871,20 +858,23 @@ async fn two_clients_receive_remote_writes_through_a_held_long_poll() {
         put_value(&alice, "concurrent-alice", "alice"),
         put_value(&bob, "concurrent-bob", "bob"),
     );
-    wait_for_value(&authority, "concurrent-alice", "alice").await;
-    wait_for_value(&authority, "concurrent-bob", "bob").await;
+    protocol_authority
+        .wait_for_value("concurrent-alice", "alice")
+        .await;
+    protocol_authority
+        .wait_for_value("concurrent-bob", "bob")
+        .await;
     wait_for_value(&alice, "concurrent-bob", "bob").await;
     wait_for_value(&bob, "concurrent-alice", "alice").await;
 
     alice.close().await.expect("close alice");
     bob.close().await.expect("close bob");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     authority
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/existing.md', CAST('base' AS BYTEA))",
@@ -892,8 +882,10 @@ async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
         )
         .await
         .expect("seed existing file");
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
     let alice_dir = TempDir::new().expect("alice tempdir");
     let bob_dir = TempDir::new().expect("bob tempdir");
     let alice = open_replica(alice_dir.path(), &url).await;
@@ -923,8 +915,12 @@ async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
     created.expect("Alice creates a file locally");
     edited.expect("Bob edits the existing file locally");
 
-    wait_for_file_content(&authority, "/created.md", b"created").await;
-    wait_for_file_content(&authority, "/existing.md", b"edited").await;
+    protocol_authority
+        .wait_for_file_content("/created.md", b"created")
+        .await;
+    protocol_authority
+        .wait_for_file_content("/existing.md", b"edited")
+        .await;
     wait_for_file_content(&alice, "/created.md", b"created").await;
     wait_for_file_content(&alice, "/existing.md", b"edited").await;
     wait_for_file_content(&bob, "/created.md", b"created").await;
@@ -939,7 +935,9 @@ async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
     // clients consume this authority-only event without another push, their
     // durable outboxes were empty after reconciliation.
     let pushes_after_convergence = probe.pushes.load(Ordering::Acquire);
-    put_value(&authority, "outbox-sentinel", "authority-only").await;
+    protocol_authority
+        .put_value("outbox-sentinel", "authority-only")
+        .await;
     wait_for_value(&alice, "outbox-sentinel", "authority-only").await;
     wait_for_value(&bob, "outbox-sentinel", "authority-only").await;
     assert_eq!(
@@ -951,12 +949,11 @@ async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
     alice.close().await.expect("close alice");
     bob.close().await.expect("close bob");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn small_file_observer_receives_remote_edit_without_a_chunk_round_trip() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     authority
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/shared.md', CAST('Hello world' AS BYTEA))",
@@ -964,9 +961,10 @@ async fn small_file_observer_receives_remote_edit_without_a_chunk_round_trip() {
         )
         .await
         .expect("seed shared file");
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
     probe.set_round_trip_delay(Duration::from_millis(100));
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
     let alice_dir = TempDir::new().expect("alice tempdir");
     let bob_dir = TempDir::new().expect("bob tempdir");
     let alice = open_replica(alice_dir.path(), &url).await;
@@ -1029,16 +1027,16 @@ async fn small_file_observer_receives_remote_edit_without_a_chunk_round_trip() {
     alice.close().await.expect("close alice");
     bob.close().await.expect("close bob");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn held_long_poll_stays_realtime_with_one_hundred_millisecond_rtt() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "seed", "ready").await;
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
     probe.set_round_trip_delay(Duration::from_millis(100));
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
     let alice_dir = TempDir::new().expect("alice tempdir");
     let bob_dir = TempDir::new().expect("bob tempdir");
     let alice = open_replica(alice_dir.path(), &url).await;
@@ -1065,22 +1063,23 @@ async fn held_long_poll_stays_realtime_with_one_hundred_millisecond_rtt() {
     alice.close().await.expect("close alice");
     bob.close().await.expect("close bob");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lost_push_ack_retries_the_same_commit_idempotently() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     let commits_before = commit_count(&authority).await;
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
     wait_for_counter(&probe.delta_pulls, 1).await;
 
     probe.drop_next_push_ack();
     put_value(&replica, "lost-ack", "once").await;
-    wait_for_value(&authority, "lost-ack", "once").await;
+    protocol_authority.wait_for_value("lost-ack", "once").await;
     replica
         .close()
         .await
@@ -1088,7 +1087,7 @@ async fn lost_push_ack_retries_the_same_commit_idempotently() {
     drop(replica);
     let replica = open_replica(replica_dir.path(), &url).await;
     wait_for_counter(&probe.pushes, 2).await;
-    assert_eq!(commit_count(&authority).await, commits_before + 1);
+    assert_eq!(protocol_authority.commit_count().await, commits_before + 1);
     assert_eq!(
         read_value(&replica, "lost-ack").await.as_deref(),
         Some("once")
@@ -1096,12 +1095,11 @@ async fn lost_push_ack_retries_the_same_commit_idempotently() {
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_chunks_remain_lazy_until_file_content_is_read() {
-    let authority = Arc::new(open_lix().await.expect("open authority"));
+    let (authority_storage, authority) = open_authority().await;
     let payload = (0..5 * 1024 * 1024 + 19)
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
@@ -1112,8 +1110,9 @@ async fn binary_chunks_remain_lazy_until_file_content_is_read() {
         )
         .await
         .expect("write authority binary file");
+    authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(Arc::clone(&authority), Arc::clone(&probe)).await;
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
 
@@ -1128,7 +1127,6 @@ async fn binary_chunks_remain_lazy_until_file_content_is_read() {
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
-    authority.close().await.expect("close authority");
 }
 
 async fn open_replica(path: &Path, url: &str) -> Lix<FilesystemStorage> {
@@ -1274,19 +1272,235 @@ async fn wait_for_counter(counter: &AtomicU64, expected: u64) {
     .expect("timed out waiting for HTTP protocol activity");
 }
 
-async fn serve(
-    authority: Arc<Lix<Memory>>,
-    probe: Arc<HttpProbe>,
-) -> (String, tokio::task::JoinHandle<()>) {
-    serve_as(authority, probe, ServerProtocolPrincipal::Anonymous).await
+async fn open_authority() -> (Memory, Arc<Lix<Memory>>) {
+    let storage = Memory::new();
+    let authority = Arc::new(
+        open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("open authority"),
+    );
+    (storage, authority)
+}
+
+async fn serve(storage: Memory, probe: Arc<HttpProbe>) -> (String, tokio::task::JoinHandle<()>) {
+    serve_as(storage, probe, ServerProtocolPrincipal::Anonymous).await
 }
 
 async fn serve_as(
-    authority: Arc<Lix<Memory>>,
+    storage: Memory,
     probe: Arc<HttpProbe>,
     principal: ServerProtocolPrincipal,
 ) -> (String, tokio::task::JoinHandle<()>) {
-    let protocol = LixServerProtocol::new(authority);
+    let protocol = open_lix()
+        .with_storage(storage)
+        .serve()
+        .await
+        .expect("serve authority");
+    spawn_http_server(protocol, probe, principal).await
+}
+
+async fn serve_with_authority_session(
+    storage: Memory,
+    probe: Arc<HttpProbe>,
+) -> (String, tokio::task::JoinHandle<()>, ProtocolAuthority) {
+    serve_as_with_authority_session(storage, probe, ServerProtocolPrincipal::Anonymous).await
+}
+
+async fn serve_as_with_authority_session(
+    storage: Memory,
+    probe: Arc<HttpProbe>,
+    principal: ServerProtocolPrincipal,
+) -> (String, tokio::task::JoinHandle<()>, ProtocolAuthority) {
+    let protocol = open_lix()
+        .with_storage(storage)
+        .serve()
+        .await
+        .expect("serve authority");
+    let authority = ProtocolAuthority::open(protocol.clone(), principal.clone()).await;
+    let (url, task) = spawn_http_server(protocol, probe, principal).await;
+    (url, task, authority)
+}
+
+struct ProtocolAuthority {
+    protocol: LixServerProtocol<Memory>,
+    context: ServerProtocolContext,
+    session_id: String,
+    next_idempotency_key: AtomicU64,
+}
+
+impl ProtocolAuthority {
+    async fn open(protocol: LixServerProtocol<Memory>, principal: ServerProtocolPrincipal) -> Self {
+        let context = ServerProtocolContext {
+            principal,
+            durable_terminal_storage_notifier: None,
+        };
+        let response = protocol
+            .handle(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lix/v1")
+                    .body(ServerProtocolBody::empty())
+                    .expect("build authority handshake"),
+                context.clone(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect authority handshake")
+            .to_bytes();
+        let body: JsonValue = serde_json::from_slice(&body).expect("decode authority handshake");
+        Self {
+            protocol,
+            context,
+            session_id: body["sessionId"]
+                .as_str()
+                .expect("authority session id")
+                .to_owned(),
+            next_idempotency_key: AtomicU64::new(0),
+        }
+    }
+
+    async fn execute(&self, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
+        let idempotency_key = self.next_idempotency_key.fetch_add(1, Ordering::AcqRel);
+        let params = params
+            .iter()
+            .map(WireValue::try_from_engine)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode authority execute params");
+        let response = self
+            .protocol
+            .handle(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/execute")
+                    .header("lix-session-id", &self.session_id)
+                    .header(
+                        "idempotency-key",
+                        format!("test-authority-{idempotency_key}"),
+                    )
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(ServerProtocolBody::from(
+                        json!({ "sql": sql, "params": params }).to_string(),
+                    ))
+                    .expect("build authority execute"),
+                self.context.clone(),
+            )
+            .await;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect authority execute")
+            .to_bytes();
+        let body: JsonValue = serde_json::from_slice(&body).expect("decode authority execute");
+        assert_eq!(status, StatusCode::OK, "authority execute failed: {body}");
+        serde_json::from_value::<Vec<Vec<WireValue>>>(body["rows"].clone())
+            .expect("decode authority execute rows")
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(WireValue::try_into_engine)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("decode authority row values")
+            })
+            .collect()
+    }
+
+    async fn put_value(&self, key: &str, value: &str) {
+        self.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            &[Value::Text(key.to_owned()), Value::Text(value.to_owned())],
+        )
+        .await;
+    }
+
+    async fn read_value(&self, key: &str) -> Option<String> {
+        self.execute(
+            "SELECT value FROM lix_key_value WHERE key = $1",
+            &[Value::Text(key.to_owned())],
+        )
+        .await
+        .into_iter()
+        .next()
+        .and_then(|row| row.into_iter().next())
+        .and_then(|value| match value {
+            Value::Jsonb(value) => value.as_json_string(),
+            Value::Text(value) => Some(value),
+            _ => None,
+        })
+    }
+
+    async fn read_file_content(&self, path: &str) -> Option<Vec<u8>> {
+        self.execute(
+            "SELECT content FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_owned())],
+        )
+        .await
+        .into_iter()
+        .next()
+        .and_then(|row| row.into_iter().next())
+        .and_then(|value| match value {
+            Value::Blob(value) => Some(value.to_vec()),
+            _ => None,
+        })
+    }
+
+    async fn commit_count(&self) -> i64 {
+        self.execute("SELECT COUNT(*) AS count FROM lix_commit", &[])
+            .await
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next())
+            .and_then(|value| match value {
+                Value::Integer(value) => Some(value),
+                _ => None,
+            })
+            .expect("integer authority commit count")
+    }
+
+    async fn wait_for_value(&self, key: &str, expected: &str) {
+        tokio::time::timeout(WAIT_TIMEOUT, async {
+            loop {
+                if self.read_value(key).await.as_deref() == Some(expected) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for authoritative value");
+    }
+
+    async fn wait_for_file_content(&self, path: &str, expected: &[u8]) {
+        tokio::time::timeout(WAIT_TIMEOUT, async {
+            loop {
+                if self.read_file_content(path).await.as_deref() == Some(expected) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for authoritative file content at {path}: {:?}",
+                String::from_utf8_lossy(expected),
+            )
+        });
+    }
+}
+
+async fn spawn_http_server(
+    protocol: LixServerProtocol<Memory>,
+    probe: Arc<HttpProbe>,
+    principal: ServerProtocolPrincipal,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind HTTP protocol listener");

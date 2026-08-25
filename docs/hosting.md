@@ -80,13 +80,14 @@ lix = { version = "0.11", features = ["server-protocol"] }
 Open a repository and keep one `LixServerProtocol` for as long as it is hosted:
 
 ```rust
-use std::sync::Arc;
 use lix::server_protocol::{
-    LixServerProtocol, ServerProtocolContext, ServerProtocolPrincipal,
+    ServerProtocolContext, ServerProtocolPrincipal,
 };
 
-let repository = Arc::new(lix::open_lix().await?);
-let protocol = LixServerProtocol::new(repository);
+let protocol = lix::open_lix()
+    .with_storage(storage)
+    .serve()
+    .await?;
 
 // Your host authenticates first, then calls the protocol.
 let context = ServerProtocolContext {

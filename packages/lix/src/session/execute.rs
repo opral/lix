@@ -1726,16 +1726,6 @@ where
         Ok(IdempotencyReceiptResolution::Replay(durable))
     }
 
-    pub(crate) async fn replay_execute_idempotency_result(
-        &self,
-        idempotency: &ExecuteIdempotency,
-    ) -> Result<Option<ExecuteResult>, LixError> {
-        match self.resolve_idempotency_receipt(idempotency).await? {
-            IdempotencyReceiptResolution::Absent => Ok(None),
-            IdempotencyReceiptResolution::Replay(receipt) => receipt.into_single_result().map(Some),
-        }
-    }
-
     async fn load_idempotency_receipt(
         &self,
         idempotency: &ExecuteIdempotency,

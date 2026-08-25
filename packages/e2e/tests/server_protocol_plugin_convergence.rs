@@ -1,20 +1,22 @@
 use std::io::{Cursor, Write as _};
 use std::path::Path;
-use std::sync::Arc;
-
 use http::{Request, StatusCode, header::CONTENT_TYPE};
 use http_body_util::BodyExt as _;
 use lix::server_protocol::{
     LixServerProtocol, SESSION_ID_HEADER, ServerProtocolBody, ServerProtocolContext,
     ServerProtocolResponse, TRANSACTION_ID_HEADER,
 };
-use lix::{Value, open_lix};
+use lix::{Memory, Value, open_lix};
 use serde_json::{Value as JsonValue, json};
 
 #[tokio::test]
 async fn same_base_server_protocol_plugin_writes_resolve_and_converge() {
-    let root = Arc::new(open_lix().as_protocol_root().await.expect("open Lix"));
-    root.execute(
+    let storage = Memory::new();
+    let setup = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open setup Lix");
+    setup.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[
             Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
@@ -23,14 +25,19 @@ async fn same_base_server_protocol_plugin_writes_resolve_and_converge() {
     )
     .await
     .expect("install JSON plugin");
-    root.execute(
+    setup.execute(
         "INSERT INTO lix_file (path, content) VALUES ('/remote-conflict.json', $1)",
         &[Value::Blob(br#"{"value":"base"}"#.to_vec().into())],
     )
     .await
     .expect("write base JSON file");
 
-    let protocol = LixServerProtocol::new(Arc::clone(&root));
+    setup.close().await.expect("close setup Lix");
+    let protocol = open_lix()
+        .with_storage(storage.clone())
+        .serve()
+        .await
+        .expect("serve Lix");
     let sessions = [
         open_session(&protocol).await,
         open_session(&protocol).await,
@@ -75,7 +82,11 @@ async fn same_base_server_protocol_plugin_writes_resolve_and_converge() {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
-    let forks = root
+    let verifier = open_lix()
+        .with_storage(storage)
+        .await
+        .expect("open verification Lix");
+    let forks = verifier
         .execute(
             "SELECT parent_id, COUNT(*) AS children FROM lix_commit_edge \
              GROUP BY parent_id HAVING COUNT(*) > 1",
@@ -84,6 +95,7 @@ async fn same_base_server_protocol_plugin_writes_resolve_and_converge() {
         .await
         .unwrap();
     assert_eq!(forks.len(), 0, "remote writers must not fork history");
+    verifier.close().await.expect("close verification Lix");
 
     let mut visible = Vec::new();
     for session in &sessions {
@@ -106,7 +118,7 @@ async fn same_base_server_protocol_plugin_writes_resolve_and_converge() {
     protocol.close().await.unwrap();
 }
 
-async fn open_session(protocol: &LixServerProtocol<lix::Memory>) -> String {
+async fn open_session(protocol: &LixServerProtocol<Memory>) -> String {
     let response = request(protocol, "GET", "/lix/v1", None, None, None).await;
     assert_eq!(response.status(), StatusCode::OK);
     response_json(response).await["sessionId"]
@@ -115,7 +127,7 @@ async fn open_session(protocol: &LixServerProtocol<lix::Memory>) -> String {
         .to_owned()
 }
 
-async fn begin_transaction(protocol: &LixServerProtocol<lix::Memory>, session: &str) -> String {
+async fn begin_transaction(protocol: &LixServerProtocol<Memory>, session: &str) -> String {
     let response = request(
         protocol,
         "POST",
@@ -133,7 +145,7 @@ async fn begin_transaction(protocol: &LixServerProtocol<lix::Memory>, session: &
 }
 
 async fn commit(
-    protocol: &LixServerProtocol<lix::Memory>,
+    protocol: &LixServerProtocol<Memory>,
     session: &str,
     transaction: &str,
 ) -> ServerProtocolResponse {
@@ -149,7 +161,7 @@ async fn commit(
 }
 
 async fn transaction_request(
-    protocol: &LixServerProtocol<lix::Memory>,
+    protocol: &LixServerProtocol<Memory>,
     method: &str,
     path: &str,
     session: &str,
@@ -168,7 +180,7 @@ async fn transaction_request(
 }
 
 async fn request(
-    protocol: &LixServerProtocol<lix::Memory>,
+    protocol: &LixServerProtocol<Memory>,
     method: &str,
     path: &str,
     session: Option<&str>,
