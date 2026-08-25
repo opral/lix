@@ -245,7 +245,7 @@ pub(crate) async fn build_write_session_with_options(
 }
 
 fn statement_uses_execution_function(statement: &DataFusionStatement, function_name: &str) -> bool {
-    use datafusion::sql::sqlparser::ast::{Expr, Visit, Visitor};
+    use datafusion::sql::sqlparser::ast::{Expr, TableFactor, Visit, Visitor};
     use std::ops::ControlFlow;
 
     struct ExecutionFunctionVisitor<'a> {
@@ -261,6 +261,16 @@ fn statement_uses_execution_function(statement: &DataFusionStatement, function_n
                     &function.name,
                     self.function_name,
                 )
+            {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(&mut self, table: &TableFactor) -> ControlFlow<Self::Break> {
+            if self.function_name == "lix_root_commit_id"
+                && let TableFactor::Table { name, args: Some(_), .. } = table
+                && crate::sql2::parse::object_name_is_public_function(name, "lix_state_at")
             {
                 return ControlFlow::Break(());
             }

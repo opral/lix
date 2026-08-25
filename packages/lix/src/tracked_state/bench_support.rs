@@ -56,6 +56,7 @@ fn stage_bench_commit_deltas(
         &CommitStateManifest {
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            global_scope: false,
             replay_debt: CommitStateReplayDebt {
                 depth: 1,
                 rows: u64::from(mutations.member_count),
@@ -65,6 +66,7 @@ fn stage_bench_commit_deltas(
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root: None,
+            row_pk_index_root_id: None,
         },
     )?;
     Ok(locators)
@@ -547,6 +549,7 @@ where
         let merged = CommitStateManifest {
             commit_id: merge_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            global_scope: false,
             replay_debt: CommitStateReplayDebt {
                 depth: self
                     .current_manifest
@@ -561,6 +564,7 @@ where
             touched_scope_filter: publication.touched_scope_filter().clone(),
             current_state_scoped_ranges: publication.root(),
             snapshot_root: None,
+            row_pk_index_root_id: None,
         };
         super::storage::stage_certified_commit_state_manifest(&mut writes, &merged, &publication)
             .expect("stage certified benchmark merge manifest");
@@ -769,6 +773,7 @@ fn bench_current_state_manifest(
     CommitStateManifest {
         commit_id,
         change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+        global_scope: false,
         replay_debt: CommitStateReplayDebt {
             depth: replay_depth,
             rows: u64::from(mutations.member_count),
@@ -778,6 +783,7 @@ fn bench_current_state_manifest(
         touched_scope_filter,
         current_state_scoped_ranges,
         snapshot_root: None,
+        row_pk_index_root_id: None,
     }
 }
 

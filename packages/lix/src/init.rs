@@ -93,9 +93,16 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// with the nullable `profile_uri` column. The schema catalog is repository
 /// data, so changing only the bundled initialization document would leave v72
 /// repositories on the historical SQL surface.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 73;
+///
+/// `v74` authenticates a row-primary-key secondary root beside every tracked-
+/// state commit authority, including rootless replay commits. The index makes
+/// historical PK reads bounded even when the row's file scope is not known by
+/// the SQL predicate.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 74;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v73";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v74";
+pub(crate) const REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP: &[u8] =
+    b"tracked-default-branch.v72-row-pk-bootstrap";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -115,6 +122,12 @@ pub(crate) enum RepositoryProtocolStatus {
 }
 
 pub(crate) fn parse_repository_protocol(value: &[u8]) -> RepositoryProtocolStatus {
+    // Explicit offline-migration fence. Older engines do not recognize this
+    // marker and therefore cannot open partially upgraded LXCS12 authorities;
+    // this engine resumes it as the v72 migration edge.
+    if value == REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP {
+        return RepositoryProtocolStatus::MigrationRequired { found_version: 72 };
+    }
     let Some(version_bytes) = value.strip_prefix(REPOSITORY_PROTOCOL_PREFIX) else {
         return RepositoryProtocolStatus::Malformed;
     };
@@ -528,6 +541,29 @@ where
                 )
             })?;
         let initial_mutations = staged_delta.mutation_inventory().clone();
+        let initial_segments = crate::tracked_state::staged_commit_delta_segment_bytes(
+            &writes,
+            plan.commit.id,
+            &initial_mutations,
+        )?;
+        let initial_members = crate::tracked_state::staged_commit_delta_members(
+            &read,
+            plan.commit.id,
+            &plan.commit.account_id,
+            &initial_mutations,
+            initial_segments,
+        )
+        .await?;
+        let mut row_pk_index_overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
+        let row_pk_index_root_id = crate::tracked_state::stage_row_pk_index_from_members(
+            &read,
+            &mut writes,
+            &mut row_pk_index_overlay,
+            None,
+            &initial_members,
+            plan.commit.id,
+        )
+        .await?;
         let physical_publication =
             crate::tracked_state::stage_current_state_scoped_ranges_from_published_parent(
                 &read,
@@ -547,7 +583,9 @@ where
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: initial_mutations,
                     touched_scope_filter: physical_publication.touched_scope_filter().clone(),
+                    global_scope: true,
                     current_state_scoped_ranges: physical_publication.root(),
+                    row_pk_index_root_id,
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
                 &physical_publication,
@@ -1224,20 +1262,20 @@ mod tests {
     #[test]
     fn repository_protocol_parser_distinguishes_versions() {
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v73"),
+            parse_repository_protocol(b"tracked-default-branch.v74"),
             RepositoryProtocolStatus::Current
         );
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v72"),
-            RepositoryProtocolStatus::MigrationRequired { found_version: 72 }
+            parse_repository_protocol(b"tracked-default-branch.v73"),
+            RepositoryProtocolStatus::MigrationRequired { found_version: 73 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v69"),
             RepositoryProtocolStatus::MigrationRequired { found_version: 69 }
         );
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v74"),
-            RepositoryProtocolStatus::TooNew { found_version: 74 }
+            parse_repository_protocol(b"tracked-default-branch.v75"),
+            RepositoryProtocolStatus::TooNew { found_version: 75 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),

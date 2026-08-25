@@ -508,8 +508,17 @@ pub(crate) struct CommitStateManifest {
     pub(crate) replay_debt: CommitStateReplayDebt,
     pub(crate) mutations: CommitStateMutationInventory,
     pub(crate) touched_scope_filter: CommitStateTouchedScopeFilter,
+    /// Immutable branch scope in which this commit was authored.
+    pub(crate) global_scope: bool,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    /// Monotonic identity catalog ordered by `(schema_key, row_pk, file_id)`.
+    ///
+    /// The catalog is published for every commit, including rootless replay
+    /// commits. Entries may outlive a row deletion; readers resolve each
+    /// candidate against canonical point-in-time state before returning it.
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) row_pk_index_root_id: Option<TrackedStateRootId>,
     /// Canonical snapshot metadata when this commit was published as a root
     /// fence. The tree chunks are rebuildable by content hash; this immutable
     /// pointer is the authority that permits readers to serve them.

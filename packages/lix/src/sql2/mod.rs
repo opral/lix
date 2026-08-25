@@ -19,8 +19,10 @@ mod predicate_typecheck;
 mod providers;
 #[cfg(test)]
 pub(crate) use providers::{
+    arm_state_at_traversal_probe,
     file_history_anchor_probe_census, file_history_bounded_frontier_census,
     file_history_raw_probe_limit_census, reset_file_history_anchor_probe_census,
+    take_state_at_traversal_probe,
 };
 mod read_only;
 mod result_metadata;

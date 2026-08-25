@@ -1095,6 +1095,53 @@ impl<S> TrackedStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    /// Enumerates every file-scoped identity that has used one of the exact
+    /// row PKs by this commit. The returned catalog is a monotonic superset;
+    /// callers must point-resolve the identities to filter deleted rows.
+    pub(crate) async fn enumerate_schema_row_pk_keys_at_commit(
+        &mut self,
+        commit_id: CommitId,
+        schema_key: &str,
+        row_pks: &[RowPk],
+    ) -> Result<Vec<TrackedStateKey>, LixError> {
+        if row_pks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let manifest = storage::load_commit_state_manifest(&self.store, commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has no commit-state manifest"),
+                )
+            })?;
+        let Some(root) = manifest.row_pk_index_root_id.as_ref() else {
+            if manifest
+                .snapshot_root
+                .as_ref()
+                .is_some_and(|root| root.row_count_estimate == 0)
+            {
+                return Ok(Vec::new());
+            }
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "commit '{commit_id}' has no row-PK index for point-in-time lookup"
+                ),
+            ));
+        };
+        let request = crate::tracked_state::row_pk_index_scan_request(schema_key, row_pks, false)?;
+        let entries = self.tree.scan(&self.store, root, &request).await?;
+        entries
+            .into_iter()
+            .map(|(key, _)| {
+                crate::tracked_state::decode_row_pk_index_key(
+                    &encode_key(&key),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) async fn scan_batch_at_commit(
         &mut self,
         commit_id: &str,
@@ -4408,7 +4455,7 @@ where
                     )
                 })?,
         };
-        let root_id = source.root_id;
+        let root_id = source.root_id.clone();
         self.staged_roots.insert(
             commit_id.to_string(),
             TrackedStateCommitRoot {
@@ -5557,7 +5604,9 @@ mod tests {
             replay_debt: Default::default(),
             mutations: Default::default(),
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
         storage::stage_commit_state_manifest(writes, &manifest)

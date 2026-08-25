@@ -176,8 +176,8 @@ impl DiffRelation {
             DataFusionError::Plan(format!("lix_diff does not support relation '{name}'"))
         })?;
         let mut fields = vec![
-            json_field("row_pk", false),
-            Field::new("diff_type", DataType::Utf8, false),
+            json_field("lixcol_row_pk", false),
+            Field::new("lixcol_diff_type", DataType::Utf8, false),
         ];
         for column in surface.columns.iter().filter(|column| column.is_public()) {
             let field = source_schema
@@ -199,7 +199,7 @@ impl DiffRelation {
                 );
             }
         }
-        fields.push(Field::new("row_count", DataType::Int64, false));
+        fields.push(Field::new("lixcol_row_count", DataType::Int64, false));
         Ok(Self {
             kind,
             schema: Arc::new(Schema::new(fields)),
@@ -235,7 +235,7 @@ where
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         if filter.column_refs().iter().any(|column| {
-            matches!(column.name.as_str(), "row_pk" | "from_id" | "to_id")
+            matches!(column.name.as_str(), "lixcol_row_pk" | "from_id" | "to_id")
                 || matches!(
                     column.name.as_str(),
                     "from_lixcol_file_id" | "to_lixcol_file_id"
@@ -313,7 +313,7 @@ where
                                         == Some(from_commit) =>
                             {
                                 TrackedHeadContext::new()
-                                    .reader(store)
+                                    .reader(store.clone())
                                     .working_diff_for_control(branch_id, control, &route.request)
                                     .await
                                     .map_err(lix_error_to_datafusion_error)?
@@ -332,8 +332,12 @@ where
                             .await
                             .map_err(lix_error_to_datafusion_error)?
                     };
+                    let from_global = commit_global_scope(&store, &from_commit_id).await?;
+                    let to_global = commit_global_scope(&store, &to_commit_id).await?;
                     let mut rows = match relation.kind {
-                        DiffRelationKind::Schema { .. } => schema_diff_rows(diff, &schema)?,
+                        DiffRelationKind::Schema { .. } => {
+                            schema_diff_rows(diff, &schema, from_global, to_global)?
+                        }
                         DiffRelationKind::File => {
                             file_diff_rows(
                                 &mut tracked,
@@ -341,6 +345,8 @@ where
                                 &schema,
                                 &from_commit_id,
                                 &to_commit_id,
+                                from_global,
+                                to_global,
                             )
                             .await?
                         }
@@ -351,6 +357,8 @@ where
                                 &schema,
                                 &from_commit_id,
                                 &to_commit_id,
+                                from_global,
+                                to_global,
                             )
                             .await?
                         }
@@ -392,7 +400,7 @@ struct DiffRoute {
 impl DiffRoute {
     fn from_filters(filters: &[Expr], relation: &DiffRelation, projection: &Schema) -> Self {
         let conjuncts = filter_conjuncts(filters);
-        let row_pk_values = optional_values(&conjuncts, "row_pk");
+        let row_pk_values = optional_values(&conjuncts, "lixcol_row_pk");
         let extracted_row_pk_values = extracted_first_row_pk_values(&conjuncts);
         let id_values =
             optional_values(&conjuncts, "from_id").or_else(|| optional_values(&conjuncts, "to_id"));
@@ -526,7 +534,7 @@ fn extracted_first_row_pk_values(conjuncts: &[Expr]) -> Option<Vec<String>> {
             let Expr::Column(column) = strip_cast(&function.args[0]) else {
                 return None;
             };
-            if column.name != "row_pk" {
+            if column.name != "lixcol_row_pk" {
                 return None;
             }
             let Expr::Literal(index, _) = strip_cast(&function.args[1]) else {
@@ -594,7 +602,29 @@ struct DiffSide {
     path: Option<String>,
 }
 
-fn schema_diff_rows(diff: TrackedStateDiff, projection: &Schema) -> Result<Vec<DiffSqlRow>> {
+async fn commit_global_scope(
+    store: &(impl StorageAdapterRead + Clone),
+    commit_id: &str,
+) -> Result<bool> {
+    let commit_id = CommitId::parse_lix(commit_id, "lix_diff commit ID")
+        .map_err(lix_error_to_datafusion_error)?;
+    crate::tracked_state::load_published_commit_state_topology(store, commit_id)
+        .await
+        .map_err(lix_error_to_datafusion_error)?
+        .map(|manifest| manifest.global_scope())
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "commit '{commit_id}' has no tracked-state authority"
+            ))
+        })
+}
+
+fn schema_diff_rows(
+    diff: TrackedStateDiff,
+    projection: &Schema,
+    from_global: bool,
+    to_global: bool,
+) -> Result<Vec<DiffSqlRow>> {
     let needs_side = projection
         .fields()
         .iter()
@@ -607,7 +637,7 @@ fn schema_diff_rows(diff: TrackedStateDiff, projection: &Schema) -> Result<Vec<D
                 diff_type: diff_type(entry.kind),
                 row_count: 1,
                 from: if needs_side {
-                    diff_side(entry, entry.visible_before(), &diff)?
+                    diff_side(entry, entry.visible_before(), &diff, from_global)?
                 } else {
                     None
                 },
@@ -616,6 +646,7 @@ fn schema_diff_rows(diff: TrackedStateDiff, projection: &Schema) -> Result<Vec<D
                         entry,
                         entry.after.as_ref().filter(|row| !row.deleted),
                         &diff,
+                        to_global,
                     )?
                 } else {
                     None
@@ -629,6 +660,7 @@ fn diff_side(
     entry: &TrackedStateDiffEntry,
     row: Option<&TrackedStateDiffRow>,
     diff: &TrackedStateDiff,
+    global: bool,
 ) -> Result<Option<DiffSide>> {
     let Some(row) = row else {
         return Ok(None);
@@ -651,7 +683,7 @@ fn diff_side(
     Ok(Some(DiffSide {
         id: single_row_pk_string(entry.identity.row_pk()),
         schema_key: entry.identity.schema_key().to_string(),
-        global: entry.identity.schema_key() == crate::checkpoint::CHECKPOINT_SCHEMA_KEY,
+        global,
         file_id: entry.identity.file_id().map(str::to_string),
         row_pk: entry.identity.row_pk().clone(),
         created_at: row.created_at.to_string(),
@@ -693,6 +725,8 @@ async fn file_diff_rows<S>(
     projection: &Schema,
     from_commit_id: &str,
     to_commit_id: &str,
+    from_global: bool,
+    to_global: bool,
 ) -> Result<Vec<DiffSqlRow>>
 where
     S: StorageAdapterRead,
@@ -803,6 +837,12 @@ where
         } else {
             None
         };
+        if let Some(side) = from.as_mut() {
+            side.global = from_global;
+        }
+        if let Some(side) = to.as_mut() {
+            side.global = to_global;
+        }
         if needs_paths {
             if let Some(side) = from.as_mut() {
                 side.path = Some(
@@ -827,7 +867,7 @@ where
             row_pk,
             diff_type: diff_type(kind),
             row_count: i64::try_from(group.row_count).map_err(|_| {
-                DataFusionError::Execution("lix_diff row_count exceeds INT8".to_string())
+                DataFusionError::Execution("lix_diff lixcol_row_count exceeds INT8".to_string())
             })?,
             from,
             to,
@@ -842,6 +882,8 @@ async fn directory_diff_rows<S>(
     projection: &Schema,
     from_commit_id: &str,
     to_commit_id: &str,
+    from_global: bool,
+    to_global: bool,
 ) -> Result<Vec<DiffSqlRow>>
 where
     S: StorageAdapterRead,
@@ -850,7 +892,7 @@ where
         .fields()
         .iter()
         .any(|field| matches!(field.name().as_str(), "from_path" | "to_path"));
-    let mut rows = schema_diff_rows(diff, projection)?;
+    let mut rows = schema_diff_rows(diff, projection, from_global, to_global)?;
     if needs_paths {
         let mut from_directory_cache = HashMap::new();
         let mut to_directory_cache = HashMap::new();
@@ -1023,7 +1065,7 @@ fn diff_record_batch(schema: SchemaRef, rows: &[DiffSqlRow]) -> Result<RecordBat
 
 fn diff_column_array(field: &Field, rows: &[DiffSqlRow]) -> Result<ArrayRef> {
     match field.name().as_str() {
-        "row_pk" => Ok(Arc::new(StringArray::from(
+        "lixcol_row_pk" => Ok(Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| {
                     row.row_pk
@@ -1032,10 +1074,10 @@ fn diff_column_array(field: &Field, rows: &[DiffSqlRow]) -> Result<ArrayRef> {
                 })
                 .collect::<Result<Vec<_>>>()?,
         ))),
-        "diff_type" => Ok(Arc::new(StringArray::from_iter_values(
+        "lixcol_diff_type" => Ok(Arc::new(StringArray::from_iter_values(
             rows.iter().map(|row| row.diff_type),
         ))),
-        "row_count" => Ok(Arc::new(Int64Array::from_iter_values(
+        "lixcol_row_count" => Ok(Arc::new(Int64Array::from_iter_values(
             rows.iter().map(|row| row.row_count),
         ))),
         name => {
@@ -1193,15 +1235,15 @@ mod tests {
         assert_eq!(
             &names[..6],
             &[
-                "row_pk",
-                "diff_type",
+                "lixcol_row_pk",
+                "lixcol_diff_type",
                 "from_key",
                 "to_key",
                 "from_value",
                 "to_value"
             ]
         );
-        assert_eq!(names.last(), Some(&"row_count"));
+        assert_eq!(names.last(), Some(&"lixcol_row_count"));
         assert!(!names.contains(&"diff_id"));
         assert!(!names.contains(&"before_change_id"));
         assert!(!names.contains(&"after_change_id"));
@@ -1230,7 +1272,11 @@ mod tests {
     fn relation_diff_pushes_schema_identity_without_loading_payloads() {
         let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
             .expect("key/value relation is registered");
-        let projection = Schema::new(vec![Field::new("row_count", DataType::Int64, false)]);
+        let projection = Schema::new(vec![Field::new(
+            "lixcol_row_count",
+            DataType::Int64,
+            false,
+        )]);
         let route = DiffRoute::from_filters(&[], &relation, &projection);
 
         assert_eq!(route.request.filter.schema_keys, vec!["lix_key_value"]);

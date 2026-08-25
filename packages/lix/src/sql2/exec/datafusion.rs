@@ -2879,6 +2879,7 @@ fn bind_table_function_parameters(
             let public_function_name = [
                 "lix_history",
                 "lix_diff",
+                "lix_state_at",
                 "lix_commit_ancestry",
             ]
             .into_iter()

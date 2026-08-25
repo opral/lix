@@ -212,25 +212,25 @@ async fn run<StorageImpl>(
         .get::<String>("commit_id")
         .expect("benchmark checkpoint ID");
     let file_sql = format!(
-        "SELECT row_pk, diff_type, row_count \
+        "SELECT lixcol_row_pk, lixcol_diff_type, lixcol_row_count \
          FROM lix_diff('lix_file', '{checkpoint}', lix_active_branch_commit_id()) \
-         WHERE row_pk ->> 0 = $1"
+         WHERE lixcol_row_pk ->> 0 = $1"
     );
     let full_sql = format!(
-        "SELECT row_pk, diff_type, row_count \
+        "SELECT lixcol_row_pk, lixcol_diff_type, lixcol_row_count \
          FROM lix_diff('lix_file', '{checkpoint}', lix_active_branch_commit_id())"
     );
     let file_schema_sql = format!(
-        "SELECT row_pk, diff_type, row_count \
+        "SELECT lixcol_row_pk, lixcol_diff_type, lixcol_row_count \
          FROM lix_diff('{SCHEMA_KEY}', '{checkpoint}', lix_active_branch_commit_id()) \
          WHERE to_lixcol_file_id = $1"
     );
     // Finite identity + file id: takes the existing bypass and resolves as a
     // point read. This is the floor a seekable file-scoped read aims at.
     let point_sql = format!(
-        "SELECT row_pk, diff_type, row_count \
+        "SELECT lixcol_row_pk, lixcol_diff_type, lixcol_row_count \
          FROM lix_diff('{SCHEMA_KEY}', '{checkpoint}', lix_active_branch_commit_id()) \
-         WHERE row_pk = CAST($1 AS JSONB)"
+         WHERE lixcol_row_pk = CAST($1 AS JSONB)"
     );
     // Live-state read of the same file. HOT_ROW is keyed
     // `schema_key ++ file_id ++ row_pk` and `hot_scan_entries` owns a

@@ -128,6 +128,8 @@ pub struct SyncCommitHeader {
     pub parent_commit_ids: Vec<String>,
     pub account_id: String,
     pub created_at: String,
+    #[serde(default)]
+    pub global_scope: bool,
     /// Monotonic authenticated generation used by commit topology checks.
     pub generation: u64,
     /// Optional logarithmic first-parent jump target.

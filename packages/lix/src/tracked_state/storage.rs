@@ -141,9 +141,11 @@ const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD18";
 // Version 10 splits the authority header from a separately keyed mutation
 // catalog and authenticates a content-addressed hierarchical part directory.
 // Version 11 adds the detached complete-state fence to snapshot-root metadata.
-// V10 remains readable because deployed repositories already contain these
-// immutable headers; the sync wire protocol itself has no compatibility lane.
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS11";
+// Version 12 authenticates the secondary `(schema_key, row_pk, file_id)`
+// identity tree beside the canonical snapshot root. V10 and V11 remain
+// readable for offline migration and historical compatibility.
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS12";
+const COMMIT_STATE_MANIFEST_V11_FORMAT_MAGIC: &[u8] = b"LXCS11";
 const COMMIT_STATE_MANIFEST_V10_FORMAT_MAGIC: &[u8] = b"LXCS10";
 // Version 3 authenticates direct-part ownership bitmaps. LXMI1 has a
 // materially different packed shape and is deliberately rejected.
@@ -743,8 +745,11 @@ struct StoredCommitStateManifest {
     #[musli(with = storage_codec::option)]
     mutation_directory_root: Option<super::mutation_directory::MutationDirectoryRoot>,
     touched_scope_filter: crate::tracked_state::types::CommitStateTouchedScopeFilter,
+    global_scope: bool,
     #[musli(with = storage_codec::option)]
     current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    #[musli(with = storage_codec::option)]
+    row_pk_index_root_id: Option<TrackedStateRootId>,
     #[musli(with = storage_codec::option)]
     snapshot_root: Option<Box<TrackedStateCommitRoot>>,
 }
@@ -772,6 +777,27 @@ struct StoredCommitStateManifestV10 {
 
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
+struct StoredCommitStateManifestV11 {
+    commit_id: CommitId,
+    change_account_id: String,
+    replay_debt: crate::tracked_state::CommitStateReplayDebt,
+    #[musli(with = storage_codec::option)]
+    selected_source_commit_id: Option<[u8; 16]>,
+    mutation_inventory_digest: [u8; 32],
+    mutation_transition_digest: [u8; 32],
+    mutation_member_count: u32,
+    mutation_part_count: u32,
+    #[musli(with = storage_codec::option)]
+    mutation_directory_root: Option<super::mutation_directory::MutationDirectoryRoot>,
+    touched_scope_filter: crate::tracked_state::types::CommitStateTouchedScopeFilter,
+    #[musli(with = storage_codec::option)]
+    current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    #[musli(with = storage_codec::option)]
+    snapshot_root: Option<Box<TrackedStateCommitRootV11>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
 struct TrackedStateCommitRootV10 {
     commit_id: CommitId,
     root_id: TrackedStateRootId,
@@ -779,6 +805,49 @@ struct TrackedStateCommitRootV10 {
     changed_key_count: u64,
     row_count_estimate: u64,
     tree_height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct TrackedStateCommitRootV11 {
+    commit_id: CommitId,
+    root_id: TrackedStateRootId,
+    parent_roots: Vec<crate::tracked_state::types::TrackedStateCommitRootParent>,
+    changed_key_count: u64,
+    row_count_estimate: u64,
+    tree_height: u32,
+    complete_state_fence: bool,
+}
+
+impl From<StoredCommitStateManifestV11> for StoredCommitStateManifest {
+    fn from(stored: StoredCommitStateManifestV11) -> Self {
+        Self {
+            commit_id: stored.commit_id,
+            change_account_id: stored.change_account_id,
+            replay_debt: stored.replay_debt,
+            selected_source_commit_id: stored.selected_source_commit_id,
+            mutation_inventory_digest: stored.mutation_inventory_digest,
+            mutation_transition_digest: stored.mutation_transition_digest,
+            mutation_member_count: stored.mutation_member_count,
+            mutation_part_count: stored.mutation_part_count,
+            mutation_directory_root: stored.mutation_directory_root,
+            touched_scope_filter: stored.touched_scope_filter,
+            global_scope: false,
+            current_state_scoped_ranges: stored.current_state_scoped_ranges,
+            row_pk_index_root_id: None,
+            snapshot_root: stored.snapshot_root.map(|root| {
+                Box::new(TrackedStateCommitRoot {
+                    commit_id: root.commit_id,
+                    root_id: root.root_id,
+                    parent_roots: root.parent_roots,
+                    changed_key_count: root.changed_key_count,
+                    row_count_estimate: root.row_count_estimate,
+                    tree_height: root.tree_height,
+                    complete_state_fence: root.complete_state_fence,
+                })
+            }),
+        }
+    }
 }
 
 impl From<StoredCommitStateManifestV10> for StoredCommitStateManifest {
@@ -794,7 +863,9 @@ impl From<StoredCommitStateManifestV10> for StoredCommitStateManifest {
             mutation_part_count: stored.mutation_part_count,
             mutation_directory_root: stored.mutation_directory_root,
             touched_scope_filter: stored.touched_scope_filter,
+            global_scope: false,
             current_state_scoped_ranges: stored.current_state_scoped_ranges,
+            row_pk_index_root_id: None,
             snapshot_root: stored.snapshot_root.map(|root| {
                 Box::new(TrackedStateCommitRoot {
                     commit_id: root.commit_id,
@@ -3571,6 +3642,14 @@ impl PublishedCommitStateTopology {
 
     pub(crate) fn current_state_scoped_ranges(&self) -> Option<&CurrentStateScopedRangeRoot> {
         self.header.current_state_scoped_ranges.as_deref()
+    }
+
+    pub(crate) fn row_pk_index_root_id(&self) -> Option<&TrackedStateRootId> {
+        self.header.row_pk_index_root_id.as_ref()
+    }
+
+    pub(crate) fn global_scope(&self) -> bool {
+        self.header.global_scope
     }
 
     pub(crate) fn complete_state_source_commit_id(&self) -> Option<CommitId> {
@@ -9353,11 +9432,25 @@ fn authoritative_live_change_matches(
 /// The marker is staged atomically with the commit header. Its presence keeps
 /// a header-only replica from being confused with an authored empty commit.
 pub(crate) fn stage_commit_history_deferred(writes: &mut StorageWriteSet, commit_id: CommitId) {
+    stage_commit_history_deferred_with_scope(writes, commit_id, false);
+}
+
+/// Marks one known commit's tracked history as deferred while retaining the
+/// immutable branch-family provenance carried by its sync header.
+pub(crate) fn stage_commit_history_deferred_with_scope(
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    global_scope: bool,
+) {
     writes.put(
         TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
         StorageKey(Bytes::from(commit_key(commit_id))),
         StorageValue {
-            bytes: Bytes::from_static(b"deferred"),
+            bytes: Bytes::from_static(if global_scope {
+                b"deferred-global"
+            } else {
+                b"deferred-local"
+            }),
         },
     );
 }
@@ -9390,6 +9483,32 @@ pub(crate) async fn commit_history_is_deferred(
     )
     .await?;
     Ok(result.value.into_iter().next().flatten().is_some())
+}
+
+/// Returns the immutable branch-family provenance retained with a deferred
+/// sync header. Legacy `deferred` markers predate global history and therefore
+/// decode as local scope.
+pub(crate) async fn deferred_commit_global_scope(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<bool>, LixError> {
+    let Some(bytes) = get_one(
+        store,
+        TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
+        commit_key(commit_id),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    match bytes.as_ref() {
+        b"deferred" | b"deferred-local" => Ok(Some(false)),
+        b"deferred-global" => Ok(Some(true)),
+        _ => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("commit '{commit_id}' has an invalid deferred-history marker"),
+        )),
+    }
 }
 
 pub(crate) async fn has_deferred_commit_history(
@@ -16073,7 +16192,9 @@ fn encode_commit_state_manifest(
         })?,
         mutation_directory_root: stored_inventory.directory_root.clone(),
         touched_scope_filter: manifest.touched_scope_filter.clone(),
+        global_scope: manifest.global_scope,
         current_state_scoped_ranges: manifest.current_state_scoped_ranges.clone(),
+        row_pk_index_root_id: manifest.row_pk_index_root_id.clone(),
         snapshot_root: manifest.snapshot_root.clone(),
     };
     let header_payload = storage_codec::encode("tracked_state commit_state_manifest", &header)?;
@@ -16385,7 +16506,9 @@ fn assemble_commit_state_manifest(
         replay_debt: stored.replay_debt,
         mutations,
         touched_scope_filter: stored.touched_scope_filter,
+        global_scope: stored.global_scope,
         current_state_scoped_ranges: stored.current_state_scoped_ranges,
+        row_pk_index_root_id: stored.row_pk_index_root_id,
         snapshot_root: stored.snapshot_root,
     };
     if u32::try_from(manifest.mutations.part_count()).ok() != Some(stored.mutation_part_count) {
@@ -16472,7 +16595,9 @@ fn assemble_shallow_commit_state_manifest(
         replay_debt: stored.replay_debt,
         mutations,
         touched_scope_filter: stored.touched_scope_filter,
+        global_scope: stored.global_scope,
         current_state_scoped_ranges: stored.current_state_scoped_ranges,
+        row_pk_index_root_id: stored.row_pk_index_root_id,
         snapshot_root: stored.snapshot_root,
     })
 }
@@ -16495,6 +16620,10 @@ fn decode_stored_commit_state_manifest(
 ) -> Result<StoredCommitStateManifest, LixError> {
     let stored = if let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC) {
         storage_codec::decode("tracked_state commit_state_manifest", payload)?
+    } else if let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_V11_FORMAT_MAGIC) {
+        let stored: StoredCommitStateManifestV11 =
+            storage_codec::decode("tracked_state v11 commit_state_manifest", payload)?;
+        stored.into()
     } else if let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_V10_FORMAT_MAGIC) {
         let stored: StoredCommitStateManifestV10 =
             storage_codec::decode("tracked_state v10 commit_state_manifest", payload)?;
@@ -17686,7 +17815,9 @@ mod tests {
             },
             mutations,
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: None,
         }
     }
@@ -22396,7 +22527,9 @@ mod tests {
                 parts: Vec::new(),
             },
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: None,
         }
     }
@@ -22454,7 +22587,9 @@ mod tests {
                 parts,
             },
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: None,
         }
     }
@@ -22708,6 +22843,64 @@ mod tests {
             .expect("deployed v10 manifest should remain readable");
         assert_eq!(decoded, stored);
         assert!(!decoded.snapshot_root.unwrap().complete_state_fence);
+    }
+
+    #[test]
+    fn commit_state_manifest_v11_decodes_without_a_row_pk_index() {
+        let mut manifest = commit_state_manifest_fixture();
+        manifest.replay_debt = CommitStateReplayDebt::default();
+        manifest.snapshot_root = Some(Box::new(TrackedStateCommitRoot {
+            commit_id: manifest.commit_id,
+            root_id: TrackedStateRootId::new([1; 32]),
+            parent_roots: Vec::new(),
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            complete_state_fence: true,
+        }));
+        let encoded = encode_commit_state_manifest(&manifest).expect("current fixture should encode");
+        let stored: super::StoredCommitStateManifest = storage_codec::decode(
+            "tracked_state current commit_state_manifest fixture",
+            encoded
+                .header
+                .strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC)
+                .expect("fixture has current magic"),
+        )
+        .expect("current fixture header should decode");
+        let legacy = super::StoredCommitStateManifestV11 {
+            commit_id: stored.commit_id,
+            change_account_id: stored.change_account_id.clone(),
+            replay_debt: stored.replay_debt,
+            selected_source_commit_id: stored.selected_source_commit_id,
+            mutation_inventory_digest: stored.mutation_inventory_digest,
+            mutation_transition_digest: stored.mutation_transition_digest,
+            mutation_member_count: stored.mutation_member_count,
+            mutation_part_count: stored.mutation_part_count,
+            mutation_directory_root: stored.mutation_directory_root.clone(),
+            touched_scope_filter: stored.touched_scope_filter.clone(),
+            current_state_scoped_ranges: stored.current_state_scoped_ranges.clone(),
+            snapshot_root: stored.snapshot_root.as_ref().map(|root| {
+                Box::new(super::TrackedStateCommitRootV11 {
+                    commit_id: root.commit_id,
+                    root_id: root.root_id.clone(),
+                    parent_roots: root.parent_roots.clone(),
+                    changed_key_count: root.changed_key_count,
+                    row_count_estimate: root.row_count_estimate,
+                    tree_height: root.tree_height,
+                    complete_state_fence: root.complete_state_fence,
+                })
+            }),
+        };
+        let payload =
+            storage_codec::encode("tracked_state v11 commit_state_manifest fixture", &legacy)
+                .expect("v11 fixture should encode");
+        let mut bytes = super::COMMIT_STATE_MANIFEST_V11_FORMAT_MAGIC.to_vec();
+        bytes.extend_from_slice(&payload);
+
+        let decoded = super::decode_stored_commit_state_manifest(&bytes)
+            .expect("deployed v11 manifest should remain readable");
+        assert_eq!(decoded.row_pk_index_root_id, None);
+        assert!(decoded.snapshot_root.unwrap().complete_state_fence);
     }
 
     #[test]

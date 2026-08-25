@@ -41,7 +41,6 @@ use crate::filesystem::{
     FilesystemPathSelection,
 };
 use crate::functions::FunctionProviderHandle;
-#[cfg(test)]
 use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::{
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
@@ -4343,7 +4342,6 @@ fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
     )
 }
 
-#[cfg(test)]
 async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
@@ -4357,6 +4355,24 @@ async fn lix_file_record_batch(
     )?;
     lix_file_record_batch_from_prepared(schema, blob_reader, plugin_render, load_data, prepared)
         .await
+}
+
+pub(super) async fn lix_file_state_record_batch(
+    schema: &SchemaRef,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    load_data: bool,
+    rows: Vec<MaterializedHotStateRow>,
+) -> Result<RecordBatch, LixError> {
+    let prepared = prepare_lix_file_rows(
+        MaterializedHotStateBatch::from_rows(rows),
+        &FilePathPredicate::All,
+    )?;
+    if prepared.needs_plugin_render(load_data) {
+        return Err(invalid_plugin_read_state(
+            "historical plugin-owned file is missing its durable materialization",
+        ));
+    }
+    lix_file_record_batch_from_prepared(schema, blob_reader, None, load_data, prepared).await
 }
 
 struct PreparedLixFileRows {

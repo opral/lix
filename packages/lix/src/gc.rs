@@ -3825,7 +3825,9 @@ mod tests {
             replay_debt: CommitStateReplayDebt::default(),
             mutations: CommitStateMutationInventory::default(),
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: Some(Box::new(TrackedStateCommitRoot {
                 commit_id,
                 root_id: TrackedStateRootId::new(root_hash),
@@ -3962,7 +3964,9 @@ mod tests {
             replay_debt: CommitStateReplayDebt::default(),
             mutations: CommitStateMutationInventory::default(),
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
         let _owner_control = replay_branch_control(owner, retired_ref, timestamp);
@@ -6041,7 +6045,9 @@ mod tests {
             },
             mutations,
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: None,
         }
     }

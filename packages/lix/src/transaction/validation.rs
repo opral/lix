@@ -55,7 +55,7 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
+pub(crate) const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 
 /// Immutable view of the final transaction write set before persistence.
 ///

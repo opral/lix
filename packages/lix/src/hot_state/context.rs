@@ -3094,7 +3094,9 @@ mod tests {
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: Default::default(),
                     touched_scope_filter: Default::default(),
+                    global_scope: false,
                     current_state_scoped_ranges: None,
+                    row_pk_index_root_id: None,
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
             )
@@ -3320,7 +3322,9 @@ mod tests {
                     },
                     mutations: Default::default(),
                     touched_scope_filter: Default::default(),
+                    global_scope: false,
                     current_state_scoped_ranges: None,
+                    row_pk_index_root_id: None,
                     snapshot_root: None,
                 },
             )
@@ -3527,7 +3531,9 @@ mod tests {
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: mutation_inventory,
                     touched_scope_filter: Default::default(),
+                    global_scope: false,
                     current_state_scoped_ranges: None,
+                    row_pk_index_root_id: None,
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
             )?;

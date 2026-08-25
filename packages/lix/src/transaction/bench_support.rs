@@ -692,7 +692,9 @@ mod tests {
 
         let inserted = fixture.insert_all_accounting().await;
         assert_eq!(inserted.logical_rows, BULK_ROWS);
-        assert!(inserted.staged_puts < 30, "{inserted:?}");
+        // The v74 row-PK index adds a bounded set of authenticated tree chunks
+        // while remaining independent of one-put-per-row publication.
+        assert!(inserted.staged_puts < 50, "{inserted:?}");
         assert_eq!(fixture.read_all().await, BULK_ROWS);
 
         let point_update = fixture.update_one_by_pk_accounting().await;
@@ -709,14 +711,15 @@ mod tests {
         // of being mirrored into a reverse-index space.
         //
         // The json_store epoch is the tenth staged put; the two retirement
-        // authority records bring the fixed total to twelve. They add one
+        // authority records and two row-PK index updates bring the fixed total
+        // to fourteen. They add one
         // space, batch, and storage call independent of repository scale. The
         // json_store epoch itself costs no extra space, batch, or call — the
         // revision space is already in this write set and its one-byte keys are
         // adjacent — and it is what lets the payload sweep reclaim superseded
         // out-of-band JSON at all: those rows are content addressed, so a
         // publisher can resolve onto a row an earlier sweep plan marked dead.
-        assert_eq!(point_update.staged_puts, 12, "{point_update:?}");
+        assert_eq!(point_update.staged_puts, 14, "{point_update:?}");
         assert_eq!(point_update.touched_spaces, 9, "{point_update:?}");
         assert_eq!(point_update.put_batches, 9, "{point_update:?}");
 
@@ -729,7 +732,7 @@ mod tests {
         bulk_fixture.insert_all().await;
         let updated = bulk_fixture.update_all_accounting().await;
         assert_eq!(updated.logical_rows, BULK_ROWS);
-        assert!(updated.staged_puts < 30, "{updated:?}");
+        assert!(updated.staged_puts < 50, "{updated:?}");
         assert_eq!(bulk_fixture.read_all().await, BULK_ROWS);
 
         let deleted = bulk_fixture.delete_all_accounting().await;

@@ -108,7 +108,7 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "SELECT COUNT(*) AS change_count, SUM(row_count) AS atom_count \
+                "SELECT COUNT(*) AS change_count, SUM(lixcol_row_count) AS atom_count \
                  FROM {WORKING_SOURCE}"
             ),
         )
@@ -128,8 +128,8 @@ async fn profile_sample(rows: usize, sample: usize) {
             &session,
             &format!(
                 "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk FROM {WORKING_SOURCE} \
-                 ORDER BY row_pk LIMIT {selected}"
+                 SELECT 'lix_key_value', lixcol_row_pk FROM {WORKING_SOURCE} \
+                 ORDER BY lixcol_row_pk LIMIT {selected}"
             ),
         )
         .await;
@@ -142,9 +142,9 @@ async fn profile_sample(rows: usize, sample: usize) {
             &session,
             &format!(
                 "INSERT INTO lix_apply (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk \
+                 SELECT 'lix_key_value', lixcol_row_pk \
                  FROM lix_diff('lix_key_value', '{baseline}', '{head}') \
-                 ORDER BY row_pk LIMIT {selected}"
+                 ORDER BY lixcol_row_pk LIMIT {selected}"
             ),
         )
         .await;
@@ -158,8 +158,8 @@ async fn profile_sample(rows: usize, sample: usize) {
             &session,
             &format!(
                 "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk FROM {WORKING_SOURCE} \
-                 ORDER BY row_pk LIMIT {checkpoint_selected}"
+                 SELECT 'lix_key_value', lixcol_row_pk FROM {WORKING_SOURCE} \
+                 ORDER BY lixcol_row_pk LIMIT {checkpoint_selected}"
             ),
         )
         .await;
@@ -232,9 +232,9 @@ async fn apply_fixture(rows: usize, selected: usize) -> (Lix<Memory>, String) {
 fn command_sql(command: &str, source: &str, extra_predicate: &str, selected: usize) -> String {
     format!(
         "INSERT INTO {command} (relation, row_pk) \
-         SELECT 'lix_key_value', row_pk FROM {source} \
+         SELECT 'lix_key_value', lixcol_row_pk FROM {source} \
          WHERE true {extra_predicate} \
-         ORDER BY row_pk LIMIT {selected}"
+         ORDER BY lixcol_row_pk LIMIT {selected}"
     )
 }
 

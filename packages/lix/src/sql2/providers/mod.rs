@@ -30,6 +30,9 @@ mod history_table_function;
 mod history_util;
 mod schema;
 mod schema_history;
+mod state_at;
+#[cfg(test)]
+pub(crate) use state_at::{arm_state_at_traversal_probe, take_state_at_traversal_probe};
 mod spec;
 pub(crate) use spec::{PhysicalScanKey, SpecScanExec, StatementScanKey};
 mod upsert;
@@ -89,6 +92,18 @@ where
         .is_some_and(|surface| selection.includes(surface))
     {
         diff::register_diff_function(session, ctx.changelog_query_source(), Arc::clone(&catalog));
+    }
+    if catalog
+        .surface("lix_state_at")
+        .is_some_and(|surface| selection.includes(surface))
+    {
+        state_at::register_state_at_function(
+            session,
+            ctx.changelog_query_source(),
+            Arc::clone(&catalog),
+            ctx.active_branch_id().to_string(),
+            ctx.blob_reader(),
+        );
     }
     register_read_from_catalog(
         session,
@@ -222,7 +237,7 @@ pub(crate) fn read_provider_selection(
     // live one.
     for statement in statements {
         collect_history_relation_literals(statement, &mut history_relations);
-        collect_diff_relation_literals(statement, &mut names);
+        collect_dynamic_relation_literals(statement, &mut names);
         if statement_requires_all_providers(statement) {
             requires_all = true;
             continue;
@@ -318,7 +333,7 @@ fn collect_history_relation_literals(
 /// Diff results inherit their relation's Arrow schema, so runtime schema
 /// literals must participate in snapshot-local catalog selection even though
 /// DataFusion only resolves the table-function name itself.
-fn collect_diff_relation_literals(
+fn collect_dynamic_relation_literals(
     statement: &datafusion::sql::parser::Statement,
     relations: &mut BTreeSet<String>,
 ) {
@@ -347,7 +362,9 @@ fn collect_diff_relation_literals(
             else {
                 return ControlFlow::Continue(());
             };
-            if !crate::sql2::parse::object_name_is_public_function(name, "lix_diff") {
+            if !crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
+                && !crate::sql2::parse::object_name_is_public_function(name, "lix_state_at")
+            {
                 return ControlFlow::Continue(());
             }
             let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value)))) =
@@ -367,7 +384,7 @@ fn collect_diff_relation_literals(
             let _ = statement.visit(&mut DiffRelationVisitor(relations));
         }
         DataFusionStatement::Explain(explain) => {
-            collect_diff_relation_literals(explain.statement.as_ref(), relations);
+            collect_dynamic_relation_literals(explain.statement.as_ref(), relations);
         }
         _ => {}
     }
@@ -562,6 +579,7 @@ where
             PublicSurfaceKind::SchemaBase { .. }
             | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::StateAtFunction
             | PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint
@@ -676,6 +694,18 @@ where
             Arc::clone(&catalog),
         );
     }
+    if catalog
+        .surface("lix_state_at")
+        .is_some_and(|surface| selection.includes(surface))
+    {
+        state_at::register_state_at_function(
+            session,
+            read_ctx.changelog_query_source(),
+            Arc::clone(&catalog),
+            read_ctx.active_branch_id().to_string(),
+            read_ctx.blob_reader(),
+        );
+    }
     register_read_from_catalog(
         session,
         read_ctx,
@@ -769,6 +799,7 @@ async fn register_write_from_catalog(
             PublicSurfaceKind::Change
             | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::StateAtFunction
             | PublicSurfaceKind::CommitAncestryFunction
             | PublicSurfaceKind::Restore => {}
             PublicSurfaceKind::SchemaBase { .. } => {}
@@ -1028,6 +1059,7 @@ mod tests {
                 "lix_commit_ancestry",
                 "lix_diff",
                 "lix_history",
+                "lix_state_at",
             ]
         );
         assert_eq!(
@@ -1044,8 +1076,8 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 20, "construction count");
-        assert_eq!(read_only.len() + writable.len(), 12, "surface count");
+        assert_eq!(all_read + writable.len(), 21, "construction count");
+        assert_eq!(read_only.len() + writable.len(), 13, "surface count");
     }
 
     #[test]

@@ -5545,9 +5545,9 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     .unwrap();
     let selected_diff_count = lix
         .execute(
-            "SELECT coalesce(sum(row_count), 0) AS count \
+            "SELECT coalesce(sum(lixcol_row_count), 0) AS count \
              FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-             WHERE row_pk ->> 0 = $1",
+             WHERE lixcol_row_pk ->> 0 = $1",
             &[
                 Value::Text(selected_file_id.clone()),
                 Value::Text(baseline_checkpoint.commit_id),
@@ -5561,9 +5561,9 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     assert!(selected_diff_count > 1, "CSV must fan out beyond lix_file");
     let selected_checkpoint = lix.execute(
         "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-         SELECT 'lix_file', row_pk \
+         SELECT 'lix_file', lixcol_row_pk \
          FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
-         WHERE row_pk ->> 0 = $1 \
+         WHERE lixcol_row_pk ->> 0 = $1 \
          RETURNING commit_id",
         &[Value::Text(selected_file_id.clone())],
     )
@@ -5574,7 +5574,7 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
         lix.execute(
             "SELECT COUNT(*) AS count \
              FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-             WHERE row_pk ->> 0 = $1",
+             WHERE lixcol_row_pk ->> 0 = $1",
             &[
                 Value::Text(selected_file_id.clone()),
                 Value::Text(selected_checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
@@ -5591,7 +5591,7 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
         lix.execute(
             "SELECT COUNT(*) AS count \
              FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-             WHERE row_pk ->> 0 = $1",
+             WHERE lixcol_row_pk ->> 0 = $1",
             &[
                 Value::Text(remaining_file_id),
                 Value::Text(selected_checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
