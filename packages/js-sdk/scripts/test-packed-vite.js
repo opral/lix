@@ -157,6 +157,7 @@ try {
 	for (const cspMode of ["worker-scoped", "global"]) {
 		server = await serve(distDir, cspMode);
 		await runBrowserSmoke(browser, server.port, cspMode);
+		await runConcurrentBrowserSmoke(browser, server.port);
 		await server.close();
 		server = undefined;
 	}
@@ -168,6 +169,45 @@ try {
 		console.log(`Kept smoke fixture at ${tempRoot}`);
 	} else {
 		await rm(tempRoot, { recursive: true, force: true });
+	}
+}
+
+async function runConcurrentBrowserSmoke(browser, port) {
+	const context = await browser.newContext();
+	const pages = await Promise.all([context.newPage(), context.newPage()]);
+	const browserErrors = pages.map(() => []);
+	for (const [index, page] of pages.entries()) {
+		page.on("console", (message) => {
+			if (message.type() === "error") browserErrors[index].push(message.text());
+		});
+		page.on("pageerror", (error) =>
+			browserErrors[index].push(error.stack ?? error.message),
+		);
+		page.setDefaultTimeout(120_000);
+	}
+	try {
+		await Promise.all(
+			pages.map((page) =>
+				page.goto(`http://127.0.0.1:${port}${base}`, {
+					waitUntil: "load",
+				}),
+			),
+		);
+		const results = await Promise.all(
+			pages.map(async (page) => {
+				await page.waitForFunction(() => "__lixProductionSmoke" in globalThis);
+				return page.evaluate(() => globalThis.__lixProductionSmoke);
+			}),
+		);
+		for (const result of results) {
+			assert.deepEqual(result, {
+				message: "production",
+				bundledPluginKeys: ["plugin_csv", "plugin_markdown"],
+			});
+		}
+		assert.deepEqual(browserErrors, [[], []]);
+	} finally {
+		await context.close();
 	}
 }
 
@@ -274,7 +314,9 @@ async function serve(root, cspMode) {
 			if (!fileStat.isFile()) throw new Error("Not a file");
 			response.writeHead(200, {
 				"Content-Type": contentType(filePath),
-				"Cache-Control": "no-store",
+				"Cache-Control": filePath.endsWith(".wasm")
+					? "public, max-age=31536000, immutable"
+					: "no-store",
 				"Content-Security-Policy": contentSecurityPolicy(
 					pathWithinRoot,
 					cspMode,
