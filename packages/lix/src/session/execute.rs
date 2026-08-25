@@ -5431,6 +5431,15 @@ mod tests {
             .await
             .expect("legacy cursor corruption should commit");
 
+        let fallback = session
+            .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
+            .await
+            .expect("a missing checkpoint cursor should fall back to the repository root");
+        assert_eq!(
+            fallback.rows()[0].get::<String>("commit_id").unwrap(),
+            restore_target
+        );
+
         let restored = session
             .execute(
                 "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",

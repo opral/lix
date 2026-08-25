@@ -7,8 +7,10 @@ use crate::branch::BranchHeadControlContext;
 use crate::changelog::CommitId;
 #[cfg(feature = "storage-benches")]
 use crate::changelog::{ChangelogContext, ChangelogReader, CommitScanRequest};
+use crate::commit_graph::CommitGraphContext;
 #[cfg(feature = "storage-benches")]
 use crate::commit_graph::CommitGraphNode;
+use crate::hot_state::{HotStateExactBatchRequest, HotStateExactRowRequest, HotStateReader};
 use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::transaction_types::{TransactionJson, TransactionWriteRow};
@@ -85,6 +87,76 @@ where
             format!("branch '{branch_id}' has no checkpoint cursor"),
         )
     })
+}
+
+/// Resolves the latest real checkpoint on the active branch's mainline.
+///
+/// The private working-diff cursor normally names a checkpoint, but branch
+/// creation and restore can initialize it to an arbitrary source commit. A
+/// cursor is therefore only a search anchor until its global checkpoint row
+/// has been verified. Following first parents keeps merged checkpoints from
+/// other branches out of this branch-scoped accessor.
+pub(crate) async fn latest_checkpoint_commit_id_at_head<S>(
+    store: S,
+    hot_state: &dyn HotStateReader,
+    branch_id: &str,
+    head_commit_id: CommitId,
+) -> Result<Option<CommitId>, LixError>
+where
+    S: StorageAdapterRead + Clone,
+{
+    let control = BranchHeadControlContext::new()
+        .reader(store.clone())
+        .load(branch_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::branch_not_found(branch_id, "resolve latest checkpoint", "branch")
+        })?;
+    if control.head_commit_id != head_commit_id {
+        return Err(LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            format!("branch '{branch_id}' head changed while resolving its latest checkpoint"),
+        ));
+    }
+    let Some(mut candidate) = control.working_diff_checkpoint_commit_id else {
+        return Ok(None);
+    };
+    let mut commit_graph = CommitGraphContext::new().reader(store);
+
+    loop {
+        let row_pk = RowPk::uuid_from_canonical(&candidate.to_string()).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("checkpoint candidate '{candidate}' has an invalid row identity: {error}"),
+            )
+        })?;
+        let markers = hot_state
+            .load_exact_batch(&HotStateExactBatchRequest {
+                rows: vec![HotStateExactRowRequest {
+                    schema_key: CHECKPOINT_SCHEMA_KEY.to_string(),
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
+                    row_pk,
+                    file_id: None,
+                }],
+                untracked: Some(false),
+                ..Default::default()
+            })
+            .await?;
+        if markers.row(0).is_some() {
+            return Ok(Some(candidate));
+        }
+
+        let node = commit_graph.load_node(&candidate).await?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("cannot resolve latest checkpoint: commit '{candidate}' is missing"),
+            )
+        })?;
+        let Some(first_parent) = node.parent_commit_ids.first().copied() else {
+            return Ok(None);
+        };
+        candidate = first_parent;
+    }
 }
 
 #[cfg(feature = "storage-benches")]

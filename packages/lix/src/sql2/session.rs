@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
+use crate::checkpoint::latest_checkpoint_commit_id_at_head;
 
 use super::branch_ref::CachingBranchRefReader;
 use super::planning_cache::PooledReadSession;
@@ -71,8 +72,23 @@ where
             .await?
             .map(|head| head.commit_id.to_string()),
     };
-    let root_commit_id = if statements.iter().any(statement_uses_root_commit_id) {
+    let root_commit_id = if statements
+        .iter()
+        .any(|statement| statement_uses_execution_function(statement, "lix_root_commit_id"))
+    {
         resolve_root_commit_id(ctx, active_branch_commit_id.as_deref()).await?
+    } else {
+        None
+    };
+    let latest_checkpoint_commit_id = if statements.iter().any(|statement| {
+        statement_uses_execution_function(statement, "lix_latest_checkpoint_commit_id")
+    }) {
+        resolve_latest_checkpoint_commit_id(
+            ctx,
+            active_branch_commit_id.as_deref(),
+            root_commit_id.as_deref(),
+        )
+        .await?
     } else {
         None
     };
@@ -82,6 +98,7 @@ where
         ctx.active_account_id(),
         Some(ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
+        latest_checkpoint_commit_id.as_deref(),
         root_commit_id.as_deref(),
     );
     let provider_selection = providers::read_provider_selection(pooled.state(), statements);
@@ -113,17 +130,29 @@ where
         .load_head(read_ctx.active_branch_id())
         .await?
         .map(|head| head.commit_id.to_string());
-    let root_commit_id = if statement_uses_root_commit_id(statement) {
+    let root_commit_id = if statement_uses_execution_function(statement, "lix_root_commit_id") {
         resolve_root_commit_id(read_ctx, active_branch_commit_id.as_deref()).await?
     } else {
         None
     };
+    let latest_checkpoint_commit_id =
+        if statement_uses_execution_function(statement, "lix_latest_checkpoint_commit_id") {
+            resolve_latest_checkpoint_commit_id(
+                read_ctx,
+                active_branch_commit_id.as_deref(),
+                root_commit_id.as_deref(),
+            )
+            .await?
+        } else {
+            None
+        };
     bind_execution_sql2_functions(
         session,
         read_ctx.functions(),
         read_ctx.active_account_id(),
         Some(read_ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
+        latest_checkpoint_commit_id.as_deref(),
         root_commit_id.as_deref(),
     );
     let write_ctx = SqlWriteContext::new(write_ctx);
@@ -205,6 +234,7 @@ pub(crate) async fn build_write_session_with_options(
         Some(&active_branch_id),
         Some(&active_branch_commit_id.commit_id.to_string()),
         None,
+        None,
     );
     providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
 
@@ -214,20 +244,22 @@ pub(crate) async fn build_write_session_with_options(
     })
 }
 
-fn statement_uses_root_commit_id(statement: &DataFusionStatement) -> bool {
+fn statement_uses_execution_function(statement: &DataFusionStatement, function_name: &str) -> bool {
     use datafusion::sql::sqlparser::ast::{Expr, Visit, Visitor};
     use std::ops::ControlFlow;
 
-    struct RootCommitVisitor;
+    struct ExecutionFunctionVisitor<'a> {
+        function_name: &'a str,
+    }
 
-    impl Visitor for RootCommitVisitor {
+    impl Visitor for ExecutionFunctionVisitor<'_> {
         type Break = ();
 
         fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
             if let Expr::Function(function) = expression
                 && crate::sql2::parse::object_name_is_public_function(
                     &function.name,
-                    "lix_root_commit_id",
+                    self.function_name,
                 )
             {
                 return ControlFlow::Break(());
@@ -237,14 +269,53 @@ fn statement_uses_root_commit_id(statement: &DataFusionStatement) -> bool {
     }
 
     match statement {
-        DataFusionStatement::Statement(statement) => {
-            statement.visit(&mut RootCommitVisitor).is_break()
-        }
+        DataFusionStatement::Statement(statement) => statement
+            .visit(&mut ExecutionFunctionVisitor { function_name })
+            .is_break(),
         DataFusionStatement::Explain(explain) => {
-            statement_uses_root_commit_id(explain.statement.as_ref())
+            statement_uses_execution_function(explain.statement.as_ref(), function_name)
         }
         _ => false,
     }
+}
+
+async fn resolve_latest_checkpoint_commit_id<C>(
+    context: &C,
+    active_branch_commit_id: Option<&str>,
+    root_commit_id: Option<&str>,
+) -> Result<Option<String>, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    let Some(active_branch_commit_id) = active_branch_commit_id else {
+        return Ok(None);
+    };
+    let head_commit_id = active_branch_commit_id
+        .parse::<crate::changelog::CommitId>()
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "active branch commit ID is invalid while resolving the latest checkpoint: {error}"
+                ),
+            )
+        })?;
+    let hot_state = context.hot_state();
+    if let Some(checkpoint_commit_id) = latest_checkpoint_commit_id_at_head(
+        context.changelog_query_source().store,
+        hot_state.as_ref(),
+        context.active_branch_id(),
+        head_commit_id,
+    )
+    .await?
+    {
+        return Ok(Some(checkpoint_commit_id.to_string()));
+    }
+
+    if let Some(root_commit_id) = root_commit_id {
+        return Ok(Some(root_commit_id.to_string()));
+    }
+    resolve_root_commit_id(context, Some(active_branch_commit_id)).await
 }
 
 async fn resolve_root_commit_id<C>(

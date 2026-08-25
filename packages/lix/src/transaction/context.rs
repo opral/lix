@@ -9194,7 +9194,29 @@ where
         let head = self.load_branch_head(&branch_id).await?.ok_or_else(|| {
             LixError::branch_not_found(&branch_id, "resolve diff source", "branch")
         })?;
-        let root = if from == DiffCommandSourceCommit::Root || to == DiffCommandSourceCommit::Root {
+        let uses_latest_checkpoint = from == DiffCommandSourceCommit::LatestCheckpoint
+            || to == DiffCommandSourceCommit::LatestCheckpoint;
+        let latest_checkpoint = if uses_latest_checkpoint {
+            let opening_read = self.opening_read();
+            let hot_state = self.hot_state.transaction_reader(
+                opening_read.clone(),
+                Arc::clone(&self.branch_head_control_cache),
+            );
+            crate::checkpoint::latest_checkpoint_commit_id_at_head(
+                opening_read,
+                &hot_state,
+                &branch_id,
+                head,
+            )
+            .await?
+            .map(|commit_id| commit_id.to_string())
+        } else {
+            None
+        };
+        let needs_root = from == DiffCommandSourceCommit::Root
+            || to == DiffCommandSourceCommit::Root
+            || (uses_latest_checkpoint && latest_checkpoint.is_none());
+        let root = if needs_root {
             let mut graph = CommitGraphContext::new().reader(self.opening_read());
             let mut current = head;
             loop {
@@ -9222,6 +9244,10 @@ where
             DiffCommandSourceCommit::Root => root
                 .clone()
                 .expect("a repository root was resolved when either source requested it"),
+            DiffCommandSourceCommit::LatestCheckpoint => latest_checkpoint
+                .clone()
+                .or_else(|| root.clone())
+                .expect("a latest checkpoint or repository root was resolved when requested"),
         };
         Ok((resolve(from), resolve(to)))
     }
@@ -9232,6 +9258,7 @@ enum DiffCommandSourceCommit {
     Literal(String),
     Root,
     ActiveHead,
+    LatestCheckpoint,
 }
 
 fn diff_command_source_commits(
@@ -9273,7 +9300,7 @@ fn diff_command_source_commits(
                 let FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) = argument else {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
-                        "diff command source commits must be text literals, parameters, or root/head functions",
+                        "diff command source commits must be text literals, parameters, or root/checkpoint/head functions",
                     ));
                 };
                 match expression {
@@ -9314,16 +9341,22 @@ fn diff_command_source_commits(
                             .eq_ignore_ascii_case("lix_active_branch_commit_id")
                         {
                             Ok(DiffCommandSourceCommit::ActiveHead)
+                        } else if function
+                            .name
+                            .to_string()
+                            .eq_ignore_ascii_case("lix_latest_checkpoint_commit_id")
+                        {
+                            Ok(DiffCommandSourceCommit::LatestCheckpoint)
                         } else {
                             Err(LixError::new(
                                 LixError::CODE_UNSUPPORTED_SQL,
-                                "diff command source commits only support lix_root_commit_id() and lix_active_branch_commit_id() functions",
+                                "diff command source commits only support lix_root_commit_id(), lix_latest_checkpoint_commit_id(), and lix_active_branch_commit_id() functions",
                             ))
                         }
                     }
                     _ => Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
-                        "diff command source commits must be text literals, parameters, or root/head functions",
+                        "diff command source commits must be text literals, parameters, or root/checkpoint/head functions",
                     )),
                 }
             };

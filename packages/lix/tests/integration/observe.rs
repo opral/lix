@@ -88,6 +88,73 @@ simulation_test!(observe_next_returns_initial_snapshot, |sim| async move {
     assert_key_value_row(&initial, "observe-initial", "v0");
 });
 
+simulation_test!(
+    observe_latest_checkpoint_diff_updates_without_changing_query_parameters,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
+        let mut events = raw_session
+            .observe(
+                "SELECT row_pk, diff_type \
+                 FROM lix_diff(\
+                   'lix_key_value', \
+                   lix_latest_checkpoint_commit_id(), \
+                   lix_active_branch_commit_id()\
+                 ) \
+                 ORDER BY row_pk",
+                &[],
+            )
+            .expect("checkpoint-to-head diff should open as one observed query");
+
+        let initial = next_event(&mut events, "initial clean checkpoint diff").await;
+        assert!(initial.rows.is_empty());
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('observe-checkpoint', 'draft')",
+                &[],
+            )
+            .await
+            .expect("working change should commit");
+        let changed = next_event(&mut events, "working change after checkpoint").await;
+        assert_eq!(changed.rows.len(), 1);
+        assert_eq!(
+            changed.rows.rows()[0].values(),
+            &[
+                Value::Jsonb(json!(["observe-checkpoint"]).into()),
+                Value::Text("added".to_string()),
+            ]
+        );
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should advance the observed branch baseline");
+        let checkpointed = next_event(&mut events, "clean diff after checkpoint").await;
+        assert!(
+            checkpointed.rows.is_empty(),
+            "the same observation should update when its checkpoint accessor changes"
+        );
+
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'next' WHERE key = 'observe-checkpoint'",
+                &[],
+            )
+            .await
+            .expect("later working change should commit");
+        let changed_again = next_event(&mut events, "working change after re-baseline").await;
+        assert_eq!(changed_again.rows.len(), 1);
+        assert_eq!(
+            changed_again.rows.rows()[0].values(),
+            &[
+                Value::Jsonb(json!(["observe-checkpoint"]).into()),
+                Value::Text("modified".to_string()),
+            ]
+        );
+    }
+);
+
 simulation_test!(observe_follows_in_place_branch_switch, |sim| async move {
     let engine = sim.boot_engine().await;
     let (raw_session, session) = open_default_session(&sim, &engine).await;

@@ -8,12 +8,9 @@ use crate::functions::FunctionProviderHandle;
 
 /// Per-session storage for the per-statement facts the execution UDFs report.
 ///
-/// The five execution functions (`lix_active_account_id`,
-/// `lix_active_branch_id`, `lix_active_branch_commit_id`, `uuidv7`,
-/// `CURRENT_TIMESTAMP`) used to be registered and deregistered on every statement so
-/// each one could capture that statement's values in its own fields. They are
-/// now registered once, when the session is created, and read this slot at
-/// invocation time instead.
+/// Execution functions such as `lix_active_branch_commit_id`,
+/// `lix_latest_checkpoint_commit_id`, and `CURRENT_TIMESTAMP` are registered
+/// once, when the session is created, and read this slot at invocation time.
 ///
 /// The slot is what makes that safe: a pooled session never carries a value from
 /// an earlier statement, because [`Self::bind`] overwrites every field before
@@ -28,6 +25,7 @@ struct ExecutionSlotValues {
     active_account_id: Option<String>,
     active_branch_id: Option<String>,
     active_branch_commit_id: Option<String>,
+    latest_checkpoint_commit_id: Option<String>,
     root_commit_id: Option<String>,
     functions: Option<FunctionProviderHandle>,
     current_timestamp: Option<LixTimestamp>,
@@ -54,12 +52,17 @@ impl ExecutionSlots {
         active_account_id: &str,
         active_branch_id: Option<&str>,
         active_branch_commit_id: Option<&str>,
+        latest_checkpoint_commit_id: Option<&str>,
         root_commit_id: Option<&str>,
     ) {
         let mut values = self.lock();
         assign(&mut values.active_account_id, Some(active_account_id));
         assign(&mut values.active_branch_id, active_branch_id);
         assign(&mut values.active_branch_commit_id, active_branch_commit_id);
+        assign(
+            &mut values.latest_checkpoint_commit_id,
+            latest_checkpoint_commit_id,
+        );
         assign(&mut values.root_commit_id, root_commit_id);
         values.functions = Some(functions);
         values.current_timestamp = None;
@@ -75,6 +78,10 @@ impl ExecutionSlots {
 
     pub(crate) fn active_branch_commit_id(&self) -> Option<String> {
         self.lock().active_branch_commit_id.clone()
+    }
+
+    pub(crate) fn latest_checkpoint_commit_id(&self) -> Option<String> {
+        self.lock().latest_checkpoint_commit_id.clone()
     }
 
     pub(crate) fn root_commit_id(&self) -> Option<String> {

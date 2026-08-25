@@ -85,20 +85,16 @@ simulation_test!(
         assert_eq!(applied.columns(), &["commit_id"]);
         assert_eq!(applied.rows().len(), 1);
 
-        let head_before_checkpoint = engine
-            .load_branch_head_commit_id(sim.main_branch_id())
-            .await
-            .expect("head before checkpoint should load")
-            .expect("head before checkpoint should exist")
-            .to_string();
         let checkpointed = session
             .execute(
                 "INSERT INTO lix_create_checkpoint (relation, row_pk) \
                  SELECT 'lix_key_value', row_pk \
-                 FROM lix_diff('lix_key_value', $1, $2) \
+                 FROM lix_diff(\
+                   'lix_key_value', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()\
+                 ) \
                  WHERE row_pk = CAST('[\"a\"]' AS JSONB) \
                  RETURNING commit_id",
-                &[Value::Text(baseline), Value::Text(head_before_checkpoint)],
+                &[],
             )
             .await
             .expect("partial relation-row checkpoint should succeed");
@@ -161,6 +157,96 @@ simulation_test!(
             .await
             .expect_err("duplicate public relation-row selections must fail atomically");
         assert_eq!(duplicate.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    }
+);
+
+simulation_test!(
+    diff_commands_resolve_the_active_branch_latest_checkpoint,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-baseline', 'saved')",
+                &[],
+            )
+            .await
+            .expect("baseline value should commit");
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should commit");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-working', 'draft')",
+                &[],
+            )
+            .await
+            .expect("working value should commit");
+        let working_head = session
+            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+            .await
+            .expect("working head should read")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("working head should be text");
+
+        let reverted = session
+            .execute(
+                "INSERT INTO lix_revert (relation, row_pk) \
+                 SELECT 'lix_key_value', row_pk \
+                 FROM lix_diff(\
+                   'lix_key_value', \
+                   lix_latest_checkpoint_commit_id(), \
+                   lix_active_branch_commit_id()\
+                 ) \
+                 RETURNING commit_id",
+                &[],
+            )
+            .await
+            .expect("revert should resolve the branch's checkpoint/head source commits");
+        assert_eq!(reverted.rows_affected(), 1);
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT key FROM lix_key_value WHERE key LIKE 'checkpoint-%' ORDER BY key",
+            )
+            .await,
+            vec![vec![Value::Text("checkpoint-baseline".to_string())]],
+            "revert must preserve checkpointed values while removing working changes"
+        );
+
+        let applied = session
+            .execute(
+                "INSERT INTO lix_apply (relation, row_pk) \
+                 SELECT 'lix_key_value', row_pk \
+                 FROM lix_diff(\
+                   'lix_key_value', \
+                   lix_latest_checkpoint_commit_id(), \
+                   $1\
+                 ) \
+                 RETURNING commit_id",
+                &[Value::Text(working_head)],
+            )
+            .await
+            .expect("apply should resolve the active branch checkpoint source");
+        assert_eq!(applied.rows_affected(), 1);
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT key FROM lix_key_value WHERE key LIKE 'checkpoint-%' ORDER BY key",
+            )
+            .await,
+            vec![
+                vec![Value::Text("checkpoint-baseline".to_string())],
+                vec![Value::Text("checkpoint-working".to_string())],
+            ],
+            "apply must resolve the actual checkpoint baseline and restore the historical row"
+        );
     }
 );
 

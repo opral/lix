@@ -16,18 +16,14 @@ tracked content.
 import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
-const checkpoint = await lix.execute(
-  "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_created_at DESC LIMIT 1",
-);
-const checkpointCommitId = checkpoint.rows[0].get("commit_id");
-const head = await lix.execute("SELECT lix_active_branch_commit_id() AS id");
-const headCommitId = head.rows[0].get("id");
-
 const changedFiles = await lix.execute(
   `SELECT row_pk, diff_type, from_path, to_path, row_count
-   FROM lix_diff('lix_file', $1, $2)
+   FROM lix_diff(
+     'lix_file',
+     lix_latest_checkpoint_commit_id(),
+     lix_active_branch_commit_id()
+   )
    ORDER BY coalesce(to_path, from_path)`,
-  [checkpointCommitId, headCommitId],
 );
 
 for (const row of changedFiles.rows) {
@@ -37,10 +33,14 @@ for (const row of changedFiles.rows) {
 const reverted = await lix.execute(
   `INSERT INTO lix_revert (relation, row_pk)
    SELECT 'lix_file', row_pk
-   FROM lix_diff('lix_file', $1, $2)
-   WHERE row_pk = $3
+   FROM lix_diff(
+     'lix_file',
+     lix_latest_checkpoint_commit_id(),
+     lix_active_branch_commit_id()
+   )
+   WHERE row_pk = $1
    RETURNING commit_id`,
-  [checkpointCommitId, headCommitId, changedFiles.rows[0].get("row_pk")],
+  [changedFiles.rows[0].get("row_pk")],
 );
 
 if (reverted.rows.length > 0) {
@@ -49,6 +49,11 @@ if (reverted.rows.length > 0) {
 
 await lix.close();
 ```
+
+`lix_latest_checkpoint_commit_id()` uses the active branch's checkpoint, not
+the newest repository-global checkpoint marker. Before the branch has a
+checkpoint, it returns `lix_root_commit_id()`, so the same query also works
+for a new branch.
 
 ## Diff rows
 
@@ -69,7 +74,11 @@ descriptor and content rows contributing to the aggregate:
 
 ```sql
 SELECT count(*) AS changed_files, sum(row_count) AS changed_rows
-FROM lix_diff('lix_file', $checkpoint_commit_id, $head_commit_id);
+FROM lix_diff(
+  'lix_file',
+  lix_latest_checkpoint_commit_id(),
+  lix_active_branch_commit_id()
+);
 ```
 
 `lix_diff('lix_directory', ...)` supports changes to directory descriptors,
@@ -100,7 +109,11 @@ The insert-only command sinks consume queries selecting `(relation, row_pk)`:
 ```sql
 INSERT INTO lix_revert (relation, row_pk)
 SELECT 'lix_file', row_pk
-FROM lix_diff('lix_file', $checkpoint_commit_id, $head_commit_id)
+FROM lix_diff(
+  'lix_file',
+  lix_latest_checkpoint_commit_id(),
+  lix_active_branch_commit_id()
+)
 WHERE coalesce(to_path, from_path) LIKE '/docs/%';
 
 INSERT INTO lix_apply (relation, row_pk)
@@ -110,7 +123,11 @@ WHERE to_done = true;
 
 INSERT INTO lix_create_checkpoint (relation, row_pk)
 SELECT 'lix_file', row_pk
-FROM lix_diff('lix_file', $checkpoint_commit_id, $head_commit_id)
+FROM lix_diff(
+  'lix_file',
+  lix_latest_checkpoint_commit_id(),
+  lix_active_branch_commit_id()
+)
 WHERE to_path LIKE '/docs/%'
 RETURNING commit_id;
 

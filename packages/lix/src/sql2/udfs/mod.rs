@@ -8,6 +8,7 @@ mod lix_json_get;
 mod lix_json_get_text;
 mod lix_json_predicate;
 mod lix_jsonb;
+mod lix_latest_checkpoint_commit_id;
 mod lix_octet_length;
 mod lix_root_commit_id;
 mod uuidv7;
@@ -49,8 +50,8 @@ pub(crate) fn register_static_sql2_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(lix_octet_length::LixOctetLength::new()));
 }
 
-/// Installs the five per-statement execution functions once, for the lifetime
-/// of the session.
+/// Installs the per-statement execution functions once, for the lifetime of
+/// the session.
 ///
 /// Each one holds only the session's [`ExecutionSlots`] and reads the current
 /// statement's value at invocation time, so a session can be pooled and reused
@@ -68,6 +69,9 @@ pub(crate) fn register_execution_sql2_functions(ctx: &SessionContext, slots: Arc
         lix_active_branch_commit_id::LixActiveBranchCommitId::new(Arc::clone(&slots)),
     ));
     ctx.register_udf(ScalarUDF::from(
+        lix_latest_checkpoint_commit_id::LixLatestCheckpointCommitId::new(Arc::clone(&slots)),
+    ));
+    ctx.register_udf(ScalarUDF::from(
         lix_root_commit_id::LixRootCommitId::new(Arc::clone(&slots)),
     ));
     ctx.register_udf(ScalarUDF::from(uuidv7::UuidV7 {
@@ -83,6 +87,7 @@ pub(crate) fn bind_execution_sql2_functions(
     active_account_id: &str,
     active_branch_id: Option<&str>,
     active_branch_commit_id: Option<&str>,
+    latest_checkpoint_commit_id: Option<&str>,
     root_commit_id: Option<&str>,
 ) {
     execution_slots(ctx).bind(
@@ -90,6 +95,7 @@ pub(crate) fn bind_execution_sql2_functions(
         active_account_id,
         active_branch_id,
         active_branch_commit_id,
+        latest_checkpoint_commit_id,
         root_commit_id,
     );
 }
@@ -106,6 +112,7 @@ pub(super) mod test_support {
             &ctx,
             system_sql2_function_provider(),
             crate::ANONYMOUS_ACCOUNT_ID,
+            None,
             None,
             None,
             None,
