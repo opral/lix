@@ -71,7 +71,8 @@ await reviewLix.close();
 
 `lix_history('<schema>')` is revision history anchored to a commit; it is not a
 current-state snapshot replacement. Use the branch-scoped session for current
-rows and `lix_diff()` for a commit-to-commit change set.
+rows and `lix_diff('acme_task', from_commit_id, to_commit_id)` for a
+relation-specific commit-to-commit change set.
 
 Use `lix_registered_schema` to discover available schemas. Use `lix_change` for activity across the whole repository. It is not limited to the active branch.
 

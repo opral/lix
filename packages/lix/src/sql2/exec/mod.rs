@@ -78,7 +78,6 @@ pub(crate) use datafusion::{
     execute_read_statement_in_session_from_parsed, execute_read_statement_in_session_with_result,
     execute_transaction_read_statement_from_parsed, prepare_read_session,
     prepare_read_session_at_head, query_result_from_batches, query_values_from_batches,
-    statement_has_table_function,
 };
 #[cfg(test)]
 pub(crate) use write::{
@@ -89,7 +88,7 @@ pub(crate) use write::{
 };
 pub(crate) use write::{
     WriteLogicalPlan as SqlWriteLogicalPlan, create_write_logical_plan_from_template,
-    create_write_plan_template_from_parsed, diff_command_query,
+    create_write_plan_template_from_parsed, diff_command_query, full_checkpoint_command,
     execute_write_logical_plan_parameter_batch, execute_write_logical_plan_prepared_dml_batch,
     execute_write_logical_plan_result_with_metadata, execute_write_logical_plan_value_batch,
     parameter_record_batch, parameter_row, write_plan_requires_post_stage_returning_checkpoint,

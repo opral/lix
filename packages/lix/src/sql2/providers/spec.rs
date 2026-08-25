@@ -225,12 +225,7 @@ where
         )))
     });
     source.fetch_rebind = Some(Arc::new(move |fetch| {
-        fetchable_scan_row_source_inner(
-            Arc::clone(&schema),
-            state.clone(),
-            fetch,
-            Arc::clone(&f),
-        )
+        fetchable_scan_row_source_inner(Arc::clone(&schema), state.clone(), fetch, Arc::clone(&f))
     }));
     source
 }

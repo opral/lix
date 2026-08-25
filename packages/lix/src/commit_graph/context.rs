@@ -1013,8 +1013,11 @@ fn history_change_identity(
 }
 
 pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChange {
-    let snapshot_content = crate::changelog::commit_row_snapshot_json(&node.commit_id.to_string())
-        .expect("lix_commit snapshot serialization should not fail");
+    let snapshot_content = crate::changelog::commit_row_snapshot_json(
+        &node.commit_id.to_string(),
+        &node.parent_commit_ids,
+    )
+    .expect("lix_commit snapshot serialization should not fail");
     let snapshot: serde_json::Value = serde_json::from_str(&snapshot_content)
         .expect("canonical lix_commit snapshot is valid JSON");
     let row_pk = RowPk::uuid_from_canonical(&node.commit_id.to_string())

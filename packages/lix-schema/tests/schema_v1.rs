@@ -312,5 +312,5 @@ fn official_migrations_all_validate() {
         from_json(&input).unwrap();
         count += 1;
     }
-    assert_eq!(count, 24);
+    assert_eq!(count, 23);
 }

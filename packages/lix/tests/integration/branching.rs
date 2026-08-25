@@ -809,10 +809,10 @@ simulation_test!(
         assert_key_value(&main, "main-merge-target", Some("\"main\"")).await;
         let working_diffs = main
             .execute(
-                "SELECT row_pk, diff_type \
-                 FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
-                 ORDER BY row_pk",
+                &format!(
+                    "SELECT row_pk, diff_type FROM {} ORDER BY row_pk",
+                    key_value_diff_relation(&main).await
+                ),
                 &[],
             )
             .await
@@ -1886,29 +1886,52 @@ async fn commit_parent_edges(
 ) -> Vec<(String, i64)> {
     let result = session
         .execute(
-            &format!(
-                "SELECT parent_id, parent_order \
-                 FROM lix_commit_edge \
-                 WHERE child_id = '{commit_id}' \
-                 ORDER BY parent_order"
-            ),
+            &format!("SELECT parent_commit_ids FROM lix_commit WHERE id = '{commit_id}'"),
             &[],
         )
         .await
-        .expect("commit edges should read");
-    result
-        .rows()
+        .expect("ordered commit parents should read");
+    let Value::Jsonb(parents) = &result.rows()[0].values()[0] else {
+        panic!("parent_commit_ids should be JSON");
+    };
+    parents
+        .to_value()
+        .as_array()
+        .expect("parent_commit_ids should be an array")
         .iter()
-        .map(|row| {
-            let Value::Text(value) = &row.values()[0] else {
-                panic!("parent_id should be text");
-            };
-            let Value::Integer(parent_order) = row.values()[1] else {
-                panic!("parent_order should be integer");
-            };
-            (value.clone(), parent_order)
+        .enumerate()
+        .map(|(order, parent)| {
+            (
+                parent.as_str().expect("parent id should be text").to_owned(),
+                i64::try_from(order).expect("parent order should fit an integer"),
+            )
         })
         .collect()
+}
+
+async fn key_value_diff_relation(session: &support::simulation_test::engine::SimSession) -> String {
+    let checkpoint = session
+        .execute(
+            "SELECT checkpoint.commit_id \
+             FROM lix_checkpoint AS checkpoint \
+             JOIN lix_commit_ancestry() AS ancestry \
+               ON ancestry.commit_id = checkpoint.commit_id \
+             ORDER BY ancestry.depth LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("latest checkpoint should resolve")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("checkpoint commit ID should decode");
+    let head = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("active head should resolve")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("active head commit ID should decode");
+    format!("lix_diff('lix_key_value', '{checkpoint}', '{head}')")
 }
 
 async fn assert_empty_merge_commit(
@@ -1989,10 +2012,11 @@ simulation_test!(
 
         let rows = draft
             .execute(
-                "SELECT diff_type, before_change_id, after_change_id \
-                 FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND row_pk = CAST('[\"branch-baseline\"]' AS JSONB)",
+                &format!(
+                    "SELECT diff_type, from_value, to_value FROM {} \
+                     WHERE row_pk = CAST('[\"branch-baseline\"]' AS JSONB)",
+                    key_value_diff_relation(&draft).await
+                ),
                 &[],
             )
             .await
@@ -2004,7 +2028,7 @@ simulation_test!(
         );
         let values = rows.rows()[0].values().to_vec();
         assert!(
-            matches!(&values[1], Value::Text(_)),
+            matches!(&values[1], Value::Jsonb(_)),
             "the first branch-local edit of a checkpointed row must carry a before image, got {values:?}"
         );
         assert_eq!(
@@ -2047,10 +2071,12 @@ simulation_test!(
 
         draft
             .execute(
-                "INSERT INTO lix_revert (diff_id) \
-                 SELECT diff_id FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND row_pk = CAST('[\"branch-revert\"]' AS JSONB)",
+                &format!(
+                    "INSERT INTO lix_revert (relation, row_pk) \
+                     SELECT 'lix_key_value', row_pk FROM {} \
+                     WHERE row_pk = CAST('[\"branch-revert\"]' AS JSONB)",
+                    key_value_diff_relation(&draft).await
+                ),
                 &[],
             )
             .await
@@ -2105,10 +2131,11 @@ simulation_test!(
 
         let rows = main
             .execute(
-                "SELECT diff_type, before_change_id \
-                 FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND row_pk = CAST('[\"merge-baseline\"]' AS JSONB)",
+                &format!(
+                    "SELECT diff_type, from_value FROM {} \
+                     WHERE row_pk = CAST('[\"merge-baseline\"]' AS JSONB)",
+                    key_value_diff_relation(&main).await
+                ),
                 &[],
             )
             .await
@@ -2120,7 +2147,7 @@ simulation_test!(
         );
         let values = rows.rows()[0].values().to_vec();
         assert!(
-            matches!(&values[1], Value::Text(_)),
+            matches!(&values[1], Value::Jsonb(_)),
             "the first post-merge edit of a checkpointed row must carry a before image, got {values:?}"
         );
         assert_eq!(
@@ -2157,9 +2184,11 @@ simulation_test!(
 
         let narrow = draft
             .execute(
-                "SELECT diff_type, before_change_id FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND row_pk = CAST('[\"branch-delete\"]' AS JSONB)",
+                &format!(
+                    "SELECT diff_type, from_value FROM {} \
+                     WHERE row_pk = CAST('[\"branch-delete\"]' AS JSONB)",
+                    key_value_diff_relation(&draft).await
+                ),
                 &[],
             )
             .await
@@ -2178,8 +2207,10 @@ simulation_test!(
 
         let broad = draft
             .execute(
-                "SELECT row_pk, diff_type FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
+                &format!(
+                    "SELECT row_pk, diff_type FROM {} ORDER BY row_pk",
+                    key_value_diff_relation(&draft).await
+                ),
                 &[],
             )
             .await
@@ -2256,8 +2287,10 @@ simulation_test!(
 
         let rows = draft
             .execute(
-                "SELECT row_pk, diff_type FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
+                &format!(
+                    "SELECT row_pk, diff_type FROM {} ORDER BY row_pk",
+                    key_value_diff_relation(&draft).await
+                ),
                 &[],
             )
             .await
@@ -2336,8 +2369,10 @@ simulation_test!(
 
         let rows = draft
             .execute(
-                "SELECT row_pk, diff_type FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
+                &format!(
+                    "SELECT row_pk, diff_type FROM {} ORDER BY row_pk",
+                    key_value_diff_relation(&draft).await
+                ),
                 &[],
             )
             .await
@@ -2396,9 +2431,11 @@ simulation_test!(
 
         let rows = main
             .execute(
-                "SELECT diff_type, before_change_id FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND row_pk = CAST('[\"switch-baseline\"]' AS JSONB)",
+                &format!(
+                    "SELECT diff_type, from_value FROM {} \
+                     WHERE row_pk = CAST('[\"switch-baseline\"]' AS JSONB)",
+                    key_value_diff_relation(&main).await
+                ),
                 &[],
             )
             .await
@@ -2450,7 +2487,10 @@ simulation_test!(
         assert_key_value(&draft, "branch-checkpoint", Some("\"after\"")).await;
         let rows = draft
             .execute(
-                "SELECT row_pk FROM lix_working_diff() WHERE schema_key = 'lix_key_value'",
+                &format!(
+                    "SELECT row_pk FROM {}",
+                    key_value_diff_relation(&draft).await
+                ),
                 &[],
             )
             .await

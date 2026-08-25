@@ -3098,7 +3098,7 @@ mod tests {
             history_fixture().await;
         let error = replica
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2)",
+                "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
                 &[Value::Text(parent.clone()), Value::Text(head.clone())],
             )
             .await
@@ -3180,7 +3180,7 @@ mod tests {
 
         replica
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2)",
+                "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
                 &[Value::Text(parent), Value::Text(head)],
             )
             .await
@@ -3319,7 +3319,7 @@ mod tests {
         );
         let error = replica
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2)",
+                "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
                 &[Value::Text(parent.clone()), Value::Text(head.clone())],
             )
             .await
@@ -3335,7 +3335,7 @@ mod tests {
             .expect("history demand succeeds");
         replica
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2)",
+                "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
                 &[Value::Text(parent), Value::Text(head)],
             )
             .await
@@ -3631,7 +3631,7 @@ mod tests {
             .expect("transaction begins");
         let error = transaction
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2)",
+                "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
                 &[Value::Text(parent.clone()), Value::Text(head)],
             )
             .await

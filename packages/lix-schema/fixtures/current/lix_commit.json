@@ -1,7 +1,7 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "lix_commit",
-  "description": "A commit is a stable point in project history. Branches point to commits. Use lix_commit_edge to inspect parent commits.",
+  "description": "A commit is a stable point in project history. Branches point to commits. Parent commit IDs are ordered, with the first parent representing the mainline.",
   "columns": [
     {
       "name": "id",
@@ -9,6 +9,12 @@
       "nullable": false,
       "default_expression": "uuidv7()",
       "description": "Stable identifier of this commit."
+    },
+    {
+      "name": "parent_commit_ids",
+      "type": "jsonb",
+      "nullable": false,
+      "description": "Ordered parent commit IDs; position zero is the first parent and later positions are merge parents."
     }
   ],
   "primary_key": [
@@ -16,7 +22,8 @@
   ],
   "examples": [
     {
-      "id": "commit_01jexample"
+      "id": "commit_01jexample",
+      "parent_commit_ids": []
     }
   ]
 }

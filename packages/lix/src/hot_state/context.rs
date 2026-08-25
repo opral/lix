@@ -3270,7 +3270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_derived_identities_choose_access_per_provider() {
+    async fn derived_commit_point_exposes_ordered_parent_ids() {
         let storage = StorageAdapter::new(Memory::new());
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3338,18 +3338,10 @@ mod tests {
             projection_branch_ids: vec![branch_id.to_string()],
             branch_heads: BranchHeads::default(),
         };
-        let edge_pk = RowPk::from_components(smallvec::smallvec![
-            crate::row_pk::RowPkComponent::Uuid(*child.as_uuid().as_bytes()),
-            crate::row_pk::RowPkComponent::Integer(0),
-        ])
-        .expect("valid edge identity");
         let request = HotStateScanRequest {
             filter: HotStateFilter {
-                schema_keys: vec!["lix_commit".to_string(), "lix_commit_edge".to_string()],
-                row_pks: vec![
-                    RowPk::uuid_from_bytes(*child.as_uuid().as_bytes()),
-                    edge_pk.clone(),
-                ],
+                schema_keys: vec!["lix_commit".to_string()],
+                row_pks: vec![RowPk::uuid_from_bytes(*child.as_uuid().as_bytes())],
                 branch_ids: vec![branch_id.to_string()],
                 ..HotStateFilter::default()
             },
@@ -3369,12 +3361,16 @@ mod tests {
         )
         .await
         .expect("mixed derived scan should succeed");
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().any(|row| row.schema_key == "lix_commit"));
-        assert!(
-            rows.iter()
-                .any(|row| row.schema_key == "lix_commit_edge" && row.row_pk == edge_pk)
-        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].schema_key, "lix_commit");
+        let snapshot = serde_json::from_str::<serde_json::Value>(
+            rows[0]
+                .snapshot_content
+                .as_ref()
+                .expect("derived commit snapshot should exist"),
+        )
+        .expect("derived commit snapshot should decode");
+        assert_eq!(snapshot["parent_commit_ids"], serde_json::json!([parent]));
     }
 
     async fn stage_materialized_live_rows(

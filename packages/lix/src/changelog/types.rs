@@ -897,8 +897,15 @@ pub(crate) struct GcPlan {
 ///
 /// Commit graph, live-state, and SQL change surfaces must produce the same
 /// representation from the canonical `changelog.commit` record.
-pub(crate) fn commit_row_snapshot_json(commit_id: &str) -> Result<String, LixError> {
-    serde_json::to_string(&serde_json::json!({ "id": commit_id })).map_err(|error| {
+pub(crate) fn commit_row_snapshot_json(
+    commit_id: &str,
+    parent_commit_ids: &[CommitId],
+) -> Result<String, LixError> {
+    serde_json::to_string(&serde_json::json!({
+        "id": commit_id,
+        "parent_commit_ids": parent_commit_ids,
+    }))
+    .map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("commit row snapshot serialization failed: {error}"),

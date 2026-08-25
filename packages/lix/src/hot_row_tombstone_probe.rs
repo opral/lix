@@ -203,10 +203,22 @@ async fn drop_all_tombstones(storage: &Memory) -> usize {
 
 /// Rows the working diff currently reports for one schema.
 async fn working_diff_rows(session: &SessionContext<Memory>, schema_key: &str) -> usize {
+    let checkpoint = session
+        .execute(
+            "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_created_at DESC LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("latest checkpoint should read")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("checkpoint ID should decode");
     session
         .execute(
-            "SELECT row_pk FROM lix_working_diff() WHERE schema_key = $1",
-            &[crate::Value::Text(schema_key.to_string())],
+            &format!(
+                "SELECT row_pk FROM lix_diff('{schema_key}', $1, lix_active_branch_commit_id())"
+            ),
+            &[crate::Value::Text(checkpoint)],
         )
         .await
         .expect("working diff should read")

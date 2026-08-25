@@ -552,12 +552,13 @@ where
 {
     let forks = lix
         .execute(
-            "SELECT parent_id, COUNT(*) AS children FROM lix_commit_edge \
-             GROUP BY parent_id HAVING COUNT(*) > 1",
+            "SELECT parent_commit_ids ->> 0 AS parent_id, COUNT(*) AS children \
+             FROM lix_commit WHERE parent_commit_ids ->> 0 IS NOT NULL \
+             GROUP BY parent_commit_ids ->> 0 HAVING COUNT(*) > 1",
             &[],
         )
         .await
-        .expect("commit edge fork query should run");
+        .expect("first-parent fork query should run");
     let forks = forks
         .rows()
         .iter()

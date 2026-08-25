@@ -1,32 +1,33 @@
 ---
-description: Create restore points and query changes since the latest checkpoint.
+description: Create restore points and query relation-specific changes between checkpoints and branch heads.
 ---
 
 # Checkpoints
 
 Lix automatically commits tracked changes. A checkpoint marks one of those
-states as a user-meaningful restore point. The changes after the newest
-checkpoint are the branch's working diffs.
-
-Create a checkpoint:
+states as a user-meaningful restore point. Compare its commit with the active
+branch head to inspect subsequent changes at the relation level your interface
+uses.
 
 ```ts
 const checkpoint = await lix.createCheckpoint();
 console.log("created checkpoint", checkpoint.commitId);
 ```
 
-`createCheckpoint()` checkpoints every working diff on the active branch and
-returns the new checkpoint commit ID.
+`createCheckpoint()` checkpoints the active branch and returns the new checkpoint
+commit ID. The equivalent full SQL checkpoint is a metadata-only operation:
+
+```sql
+INSERT INTO lix_create_checkpoint DEFAULT VALUES RETURNING commit_id;
+```
 
 ## Complete example
-
-This example writes a tracked row and inspects its working diff. It then
-creates a checkpoint and verifies that no working diffs remain:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
+const initial = await lix.createCheckpoint();
 
 await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
   "checkpoint-demo",
@@ -34,68 +35,61 @@ await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
 ]);
 
 const working = await lix.execute(
-  "SELECT row_pk, schema_key, diff_type FROM lix_working_diff()",
+  `SELECT row_pk, diff_type, from_value, to_value
+   FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id())`,
+  [initial.commitId],
 );
 
 for (const row of working.rows) {
-  console.log(row.get("diff_type"), row.get("schema_key"), row.get("row_pk"));
+  console.log(row.get("diff_type"), row.get("row_pk"));
 }
 
 const checkpoint = await lix.createCheckpoint();
-
-const checkpoints = await lix.execute(
-  "SELECT id, commit_id FROM lix_checkpoint WHERE commit_id = $1",
-  [checkpoint.commitId],
-);
-
-console.assert(checkpoints.rows.length === 1);
-
 const remaining = await lix.execute(
-  "SELECT COUNT(*) AS count FROM lix_working_diff()",
+  `SELECT count(*) AS count
+   FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id())`,
+  [checkpoint.commitId],
 );
 console.assert(remaining.rows[0].get("count") === 0);
 
 await lix.close();
 ```
 
-`result.rows` contains row objects. Read a column with `row.get("name")`.
-
 A runnable Rust version lives at
 [`checkpoints.rs`](https://github.com/opral/lix/blob/main/packages/lix/examples/checkpoints.rs).
 
 ## SQL surfaces
 
-Checkpointing and commit reachability use these read-only SQL surfaces:
-
 | Surface | Scope | Columns |
 | :-- | :-- | :-- |
-| `lix_working_diff()` | Active branch | `diff_id`, `row_pk`, `schema_key`, `file_id`, `diff_type`, `before_change_id`, `after_change_id` |
-| `lix_checkpoint` | Repository-global | `id`, `commit_id`, plus the standard `lixcol_*` row columns |
-| `lix_history('lix_checkpoint'[, commit_id])` | Global row-authorship history | `id`, `commit_id`, plus the standard history `lixcol_*` columns |
-| `lix_commit_ancestry()` | Active branch head | `commit_id`, `depth` |
-| `lix_commit_ancestry(commit_id)` | Explicit commit | `commit_id`, `depth` |
+| `lix_diff(relation, from_commit_id, to_commit_id)` | One relation across two explicit commits | `row_pk`, `diff_type`, `row_count`, and paired `from_<column>` / `to_<column>` relation columns |
+| `lix_checkpoint` | Repository-global checkpoint markers | `id`, `commit_id`, and standard `lixcol_*` columns |
+| `lix_commit` | Repository-global commit graph | `id`, `parent_commit_ids`, and standard `lixcol_*` columns |
+| `lix_history('lix_checkpoint'[, commit_id])` | Global checkpoint-row authorship history | Checkpoint columns and standard history `lixcol_*` columns |
+| `lix_commit_ancestry([commit_id])` | Active head or an explicit anchor | `commit_id`, `depth` |
+| `lix_root_commit_id()` | Repository root | Scalar ID of the repository bootstrap root |
 
-Working-diff relations are scoped to the current session. Open another session
-on another branch to inspect that branch without switching the primary session.
+`parent_commit_ids` is an ordered JSONB array: element zero is the mainline
+parent, and later elements are merge parents:
 
-`diff_type` is `added`, `modified`, or `removed`. Working diffs compare the
-current branch head with that branch's newest checkpoint. Creating a checkpoint
-makes the current head the new baseline, so `lix_working_diff()` is empty until
-another tracked change is committed.
+```sql
+SELECT parent_commit_ids ->> 0 AS parent_commit_id
+FROM lix_commit
+WHERE id = $checkpoint_commit_id;
+```
 
-`lix_working_diff()` reports one row per underlying schema change, the same
-granularity as `lix_change`. Its heterogeneous envelope exposes source-schema
-identity and change IDs; applications can join the affected `file_id` or row
-identity to typed current-state relations when presenting a composed review.
+The newest checkpoint remains a normal query:
 
-`lix_checkpoint` is a normal immutable global schema. Its current table retains
-checkpoint markers even when a branch restore abandons their commits. Join the
-table with `lix_commit_ancestry()` when you need checkpoints reachable from the
-active branch head:
+```sql
+SELECT commit_id
+FROM lix_checkpoint
+ORDER BY lixcol_created_at DESC
+LIMIT 1;
+```
 
-`lix_history('lix_checkpoint'[, commit_id])` remains the normal history of
-those global rows. It follows where checkpoint-row changes were authored; it
-does not interpret a row's `commit_id` as membership in another commit graph.
+`lix_checkpoint` retains checkpoint markers even when a branch restore abandons
+their commits. Join it with `lix_commit_ancestry()` when you need only checkpoints
+reachable from the active branch head:
 
 ```sql
 SELECT checkpoint.id, checkpoint.commit_id, ancestry.depth
@@ -105,14 +99,10 @@ JOIN lix_commit_ancestry() AS ancestry
 ORDER BY ancestry.depth, checkpoint.commit_id;
 ```
 
-The anchor itself has `depth = 0`; parents have depth `1`. A commit reachable
-through multiple merge paths appears once at its shortest depth. SQL row order
-is not implicit, so request it explicitly.
+The anchor has `depth = 0`; direct parents have depth `1`. A commit reachable
+through several merge paths appears once at its shortest depth.
 
-These surfaces are read-only. Create a checkpoint for every working diff
-through `lix.createCheckpoint()`, or checkpoint a SQL-selected subset
-through `lix_create_checkpoint`. See [Diff commands](./diff-commands.md).
-
-The foreground publication path has fixed storage, allocation, payload, and
-latency regression gates. See the reproducible
-[checkpoint performance qualification](./checkpoint-performance.md).
+Create a checkpoint for every tracked change through `lix.createCheckpoint()`
+or `INSERT INTO lix_create_checkpoint DEFAULT VALUES`. Select a subset through
+the `(relation, row_pk)` command form described in
+[Diff commands](./diff-commands.md).

@@ -11,13 +11,13 @@ Lix exposes logical application data through typed SQL relations:
 | Registered application row `X` | `<schema>`                   | `lix_history('<schema>')`                   |
 | Files                           | `lix_file`                   | `lix_history('lix_file')`                   |
 | Directories                     | `lix_directory`              | `lix_history('lix_directory')`              |
-| Working diffs                   | `lix_working_diff()`         | `lix_diff(from_commit, to_commit)`     |
+| Relation diffs                  | One row per changed relation row | `lix_diff(relation, from_commit, to_commit)` |
 | Checkpoints                     | `lix_checkpoint`             | `lix_history('lix_checkpoint')` for row-authorship history |
-| Commit graph                    | `lix_commit`, `lix_commit_edge` | `lix_commit_ancestry()` for active-head reachability |
+| Commit graph                    | `lix_commit.parent_commit_ids` | `lix_commit_ancestry()` for active-head reachability |
 
 The history functions read row revisions reachable from a commit;
-`lix_commit_ancestry()` reads the reachable commit set, and `lix_diff`
-compares two arbitrary commits. `lix_registered_schema` and its history
+`lix_commit_ancestry()` reads the reachable commit set, and `lix_diff` compares
+one relation across two arbitrary commits. `lix_registered_schema` and its history
 function provide schema discovery; `lix_key_value` and its history function
 provide shared repository metadata.
 `lix_change` records repository-wide activity; [History](./history.md)
@@ -41,10 +41,10 @@ other segment text is preserved exactly: the engine does not URL-decode,
 case-fold, or Unicode-normalize paths. Filesystem adapters diagnose names that
 the target host cannot represent.
 
-The checkpoint and diff relations are read-only. `lix_working_diff()` and
-`lix_diff()` expose a `diff_id` that can
-feed the `lix_revert`, `lix_apply`, and `lix_create_checkpoint` command sinks.
-`lix_checkpoint` does not carry a `diff_id`. See [Checkpoints](./checkpoints.md) and
+The checkpoint and diff relations are read-only. `lix_diff()` exposes `row_pk`,
+`diff_type`, `row_count`, and paired `from_<column>` / `to_<column>` relation
+columns. Pass `(relation, row_pk)` to the `lix_revert`, `lix_apply`, and
+`lix_create_checkpoint` command sinks. See [Checkpoints](./checkpoints.md) and
 [Diff commands](./diff-commands.md).
 
 ## The executable column contract
@@ -91,11 +91,11 @@ schema contributes another `RELATION` / `BASE` surface.
 
 | Class | Fixed surfaces |
 | --- | --- |
-| Relation / base | `lix_account`, `lix_checkpoint`, `lix_commit`, `lix_commit_edge`, `lix_key_value`, `lix_registered_schema` |
+| Relation / base | `lix_account`, `lix_checkpoint`, `lix_commit`, `lix_key_value`, `lix_registered_schema` |
 | Relation / view | `lix_branch`, `lix_change`, `lix_directory`, `lix_file` |
-| Table function | `lix_commit_ancestry`, `lix_diff`, `lix_history`, `lix_working_diff` |
+| Table function | `lix_commit_ancestry`, `lix_diff`, `lix_history` |
 | Command sink | `lix_apply`, `lix_create_checkpoint`, `lix_restore`, `lix_revert` |
-| Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `uuidv7` |
+| Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `lix_root_commit_id`, `uuidv7` |
 
 Standard SQL value expressions such as `CURRENT_TIMESTAMP` are supported SQL
 syntax, not Lix-owned scalar-function surfaces, and are therefore omitted from
@@ -103,8 +103,7 @@ syntax, not Lix-owned scalar-function surfaces, and are therefore omitted from
 
 Classify by SQL shape, not merely by whether data is computed dynamically.
 Unparameterized, table-shaped projections are views. Row producers invoked in
-the `FROM` clause with function syntax are table functions, including the
-zero-argument, active-branch-scoped `lix_working_diff()`. Side-effecting
+the `FROM` clause with function syntax are table functions. Side-effecting
 operations are command sinks and use `INSERT`; they are not table functions.
 This keeps commands out of relation and function discovery even when a command
 supports `RETURNING`.

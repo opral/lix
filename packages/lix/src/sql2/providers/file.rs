@@ -818,14 +818,9 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
     } else {
         None
     };
-    let batch = lix_file_record_batch_from_prepared(
-        &schema,
-        &blob_reader,
-        plugin_render,
-        true,
-        prepared,
-    )
-    .await?;
+    let batch =
+        lix_file_record_batch_from_prepared(&schema, &blob_reader, plugin_render, true, prepared)
+            .await?;
     crate::sql2::exec::datafusion::query_result_from_batches(
         &schema
             .fields()
@@ -4360,14 +4355,8 @@ async fn lix_file_record_batch(
         MaterializedHotStateBatch::from_rows(rows),
         &FilePathPredicate::All,
     )?;
-    lix_file_record_batch_from_prepared(
-        schema,
-        blob_reader,
-        plugin_render,
-        load_data,
-        prepared,
-    )
-    .await
+    lix_file_record_batch_from_prepared(schema, blob_reader, plugin_render, load_data, prepared)
+        .await
 }
 
 struct PreparedLixFileRows {

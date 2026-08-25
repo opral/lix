@@ -40,10 +40,11 @@ pub(crate) struct PublicScalarFunctionContract {
     pub(crate) class: PublicSurfaceClass,
 }
 
-pub(crate) const PUBLIC_SCALAR_FUNCTION_NAMES: [&str; 4] = [
+pub(crate) const PUBLIC_SCALAR_FUNCTION_NAMES: [&str; 5] = [
     "lix_active_account_id",
     "lix_active_branch_commit_id",
     "lix_active_branch_id",
+    "lix_root_commit_id",
     "uuidv7",
 ];
 
@@ -84,7 +85,6 @@ pub(crate) enum PublicSurfaceKind {
     HistoryFunction,
     DiffFunction,
     CommitAncestryFunction,
-    WorkingDiff,
     Revert,
     Apply,
     CreateCheckpoint,
@@ -102,8 +102,7 @@ impl PublicSurfaceKind {
             | Self::Change => matches!(class, PublicSurfaceClass::Relation(_)),
             Self::HistoryFunction
             | Self::DiffFunction
-            | Self::CommitAncestryFunction
-            | Self::WorkingDiff => class == PublicSurfaceClass::TableFunction,
+            | Self::CommitAncestryFunction => class == PublicSurfaceClass::TableFunction,
             Self::Revert | Self::Apply | Self::CreateCheckpoint | Self::Restore => {
                 class == PublicSurfaceClass::CommandSink
             }

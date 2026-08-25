@@ -2,23 +2,25 @@ use lix::{LixError, Value};
 
 use super::assert_rows_eq;
 
-simulation_test!(lix_surfaces_classifies_the_public_sql_contract, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_session()
-            .await
-            .expect("main session should open"),
-        &engine,
-    );
+simulation_test!(
+    lix_surfaces_classifies_the_public_sql_contract,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
-    let surfaces = session
+        let surfaces = session
         .execute(
             "SELECT surface_name, surface_class, relation_kind, can_read, can_insert, is_side_effecting \
              FROM information_schema.lix_surfaces \
              WHERE surface_name IN (\
                'lix_active_branch_id', 'lix_create_checkpoint', 'lix_diff',\
-               'lix_file', 'lix_restore', 'lix_working_diff'\
+               'lix_file', 'lix_restore', 'lix_root_commit_id'\
              ) \
              ORDER BY surface_name",
             &[],
@@ -26,101 +28,224 @@ simulation_test!(lix_surfaces_classifies_the_public_sql_contract, |sim| async mo
         .await
         .expect("the unified Lix surface catalog should be readable");
 
-    assert_rows_eq(
-        surfaces,
-        vec![
+        assert_rows_eq(
+            surfaces,
             vec![
-                Value::Text("lix_active_branch_id".to_string()),
-                Value::Text("SCALAR_FUNCTION".to_string()),
-                Value::Null,
-                Value::Boolean(true),
-                Value::Boolean(false),
-                Value::Boolean(false),
+                vec![
+                    Value::Text("lix_active_branch_id".to_string()),
+                    Value::Text("SCALAR_FUNCTION".to_string()),
+                    Value::Null,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("lix_create_checkpoint".to_string()),
+                    Value::Text("COMMAND_SINK".to_string()),
+                    Value::Null,
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                ],
+                vec![
+                    Value::Text("lix_diff".to_string()),
+                    Value::Text("TABLE_FUNCTION".to_string()),
+                    Value::Null,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("lix_file".to_string()),
+                    Value::Text("RELATION".to_string()),
+                    Value::Text("VIEW".to_string()),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("lix_restore".to_string()),
+                    Value::Text("COMMAND_SINK".to_string()),
+                    Value::Null,
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                ],
+                vec![
+                    Value::Text("lix_root_commit_id".to_string()),
+                    Value::Text("SCALAR_FUNCTION".to_string()),
+                    Value::Null,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(false),
+                ],
             ],
-            vec![
-                Value::Text("lix_create_checkpoint".to_string()),
-                Value::Text("COMMAND_SINK".to_string()),
-                Value::Null,
-                Value::Boolean(false),
-                Value::Boolean(true),
-                Value::Boolean(true),
-            ],
-            vec![
-                Value::Text("lix_diff".to_string()),
-                Value::Text("TABLE_FUNCTION".to_string()),
-                Value::Null,
-                Value::Boolean(true),
-                Value::Boolean(false),
-                Value::Boolean(false),
-            ],
-            vec![
-                Value::Text("lix_file".to_string()),
-                Value::Text("RELATION".to_string()),
-                Value::Text("VIEW".to_string()),
-                Value::Boolean(true),
-                Value::Boolean(true),
-                Value::Boolean(false),
-            ],
-            vec![
-                Value::Text("lix_restore".to_string()),
-                Value::Text("COMMAND_SINK".to_string()),
-                Value::Null,
-                Value::Boolean(false),
-                Value::Boolean(true),
-                Value::Boolean(true),
-            ],
-            vec![
-                Value::Text("lix_working_diff".to_string()),
-                Value::Text("TABLE_FUNCTION".to_string()),
-                Value::Null,
-                Value::Boolean(true),
-                Value::Boolean(false),
-                Value::Boolean(false),
-            ],
-        ],
-    );
+        );
 
-    let relations = session
-        .execute(
-            "SELECT table_name, table_type \
+        let relations = session
+            .execute(
+                "SELECT table_name, table_type \
              FROM information_schema.tables \
              WHERE table_schema = 'public' \
                AND table_name IN ('lix_change', 'lix_file', 'lix_key_value') \
              ORDER BY table_name",
-            &[],
-        )
-        .await
-        .expect("standard relation classification should be readable");
-    assert_rows_eq(
-        relations,
-        vec![
-            vec![
-                Value::Text("lix_change".to_string()),
-                Value::Text("VIEW".to_string()),
-            ],
-            vec![
-                Value::Text("lix_file".to_string()),
-                Value::Text("VIEW".to_string()),
-            ],
-            vec![
-                Value::Text("lix_key_value".to_string()),
-                Value::Text("BASE TABLE".to_string()),
-            ],
-        ],
-    );
-});
-
-simulation_test!(public_catalog_hides_internal_branch_surfaces, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_session()
+                &[],
+            )
             .await
-            .expect("main session should open"),
-        &engine,
-    );
+            .expect("standard relation classification should be readable");
+        assert_rows_eq(
+            relations,
+            vec![
+                vec![
+                    Value::Text("lix_change".to_string()),
+                    Value::Text("VIEW".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_file".to_string()),
+                    Value::Text("VIEW".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("BASE TABLE".to_string()),
+                ],
+            ],
+        );
+    }
+);
 
-    session
+simulation_test!(
+    diff_table_function_advertises_each_relations_typed_columns,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let columns = session
+            .execute(
+                "SELECT source_relation, result_column, data_type, is_nullable, lix_value_kind \
+             FROM information_schema.table_functions \
+             WHERE function_name = 'lix_diff' \
+               AND source_relation IN ('lix_file', 'lix_key_value') \
+               AND result_column IN (\
+                 'row_pk', 'diff_type', 'from_path', 'to_path', \
+                 'from_value', 'to_value', 'row_count'\
+               ) \
+             ORDER BY source_relation, ordinal_position",
+                &[],
+            )
+            .await
+            .expect("relation-specific diff result metadata should be readable");
+
+        assert_rows_eq(
+            columns,
+            vec![
+                vec![
+                    Value::Text("lix_file".to_string()),
+                    Value::Text("row_pk".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Text("JSONB".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_file".to_string()),
+                    Value::Text("diff_type".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Text("lix_file".to_string()),
+                    Value::Text("from_path".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("YES".to_string()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Text("lix_file".to_string()),
+                    Value::Text("to_path".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("YES".to_string()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Text("lix_file".to_string()),
+                    Value::Text("row_count".to_string()),
+                    Value::Text("BIGINT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("row_pk".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Text("JSONB".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("diff_type".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("from_value".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("YES".to_string()),
+                    Value::Text("JSONB".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("to_value".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("YES".to_string()),
+                    Value::Text("JSONB".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("row_count".to_string()),
+                    Value::Text("BIGINT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
+                ],
+            ],
+        );
+
+        let retired = session
+            .execute(
+                "SELECT result_column FROM information_schema.table_functions \
+             WHERE function_name = 'lix_diff' \
+               AND result_column IN ('diff_id', 'before_change_id', 'after_change_id')",
+                &[],
+            )
+            .await
+            .expect("retired diff metadata should remain queryable");
+        assert!(
+            retired.rows().is_empty(),
+            "retired diff columns must not be advertised"
+        );
+    }
+);
+
+simulation_test!(
+    public_catalog_hides_internal_branch_surfaces,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"no_explicit_branch_surface\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB), false, false)",
@@ -129,73 +254,74 @@ simulation_test!(public_catalog_hides_internal_branch_surfaces, |sim| async move
         .await
         .expect("registered schema insert should succeed");
 
-    let tables = session
-        .execute(
-            "SELECT table_name FROM information_schema.tables \
+        let tables = session
+            .execute(
+                "SELECT table_name FROM information_schema.tables \
              WHERE table_schema = 'public' AND table_name LIKE '%\\_by\\_branch' ESCAPE '\\'",
-            &[],
-        )
-        .await
-        .expect("public table catalog should be readable");
-    assert!(
-        tables.rows().is_empty(),
-        "no explicit-branch tables may remain"
-    );
+                &[],
+            )
+            .await
+            .expect("public table catalog should be readable");
+        assert!(
+            tables.rows().is_empty(),
+            "no explicit-branch tables may remain"
+        );
 
-    let branch_component_tables = session
-        .execute(
-            "SELECT table_name FROM information_schema.tables \
+        let branch_component_tables = session
+            .execute(
+                "SELECT table_name FROM information_schema.tables \
              WHERE table_schema = 'public' \
                AND table_name IN ('lix_branch_descriptor', 'lix_branch_ref')",
-            &[],
-        )
-        .await
-        .expect("public table catalog should be readable");
-    assert!(
-        branch_component_tables.rows().is_empty(),
-        "internal branch component tables must not be advertised"
-    );
+                &[],
+            )
+            .await
+            .expect("public table catalog should be readable");
+        assert!(
+            branch_component_tables.rows().is_empty(),
+            "internal branch component tables must not be advertised"
+        );
 
-    let branch_component_history = session
-        .execute(
-            "SELECT function_name FROM information_schema.table_functions \
+        let branch_component_history = session
+            .execute(
+                "SELECT function_name FROM information_schema.table_functions \
              WHERE function_schema = 'public' \
                AND function_name IN (\
                  'lix_branch_descriptor_history', 'lix_branch_ref_history'\
                )",
-            &[],
-        )
-        .await
-        .expect("public table-function catalog should be readable");
-    assert!(
-        branch_component_history.rows().is_empty(),
-        "internal branch history functions must not be advertised"
-    );
+                &[],
+            )
+            .await
+            .expect("public table-function catalog should be readable");
+        assert!(
+            branch_component_history.rows().is_empty(),
+            "internal branch history functions must not be advertised"
+        );
 
-    let columns = session
-        .execute(
-            "SELECT table_name FROM information_schema.columns \
+        let columns = session
+            .execute(
+                "SELECT table_name FROM information_schema.columns \
              WHERE table_schema = 'public' AND column_name = 'lixcol_branch_id'",
-            &[],
-        )
-        .await
-        .expect("public column catalog should be readable");
-    assert!(
-        columns.rows().is_empty(),
-        "no public data relation may expose lixcol_branch_id"
-    );
+                &[],
+            )
+            .await
+            .expect("public column catalog should be readable");
+        assert!(
+            columns.rows().is_empty(),
+            "no public data relation may expose lixcol_branch_id"
+        );
 
-    let error = session
-        .execute("SELECT * FROM no_explicit_branch_surface_by_branch", &[])
-        .await
-        .expect_err("retired explicit-branch table names must fail closed");
-    assert!(
-        error
-            .message
-            .contains("no_explicit_branch_surface_by_branch"),
-        "the unknown-table error should identify the retired surface: {error:?}"
-    );
-});
+        let error = session
+            .execute("SELECT * FROM no_explicit_branch_surface_by_branch", &[])
+            .await
+            .expect_err("retired explicit-branch table names must fail closed");
+        assert!(
+            error
+                .message
+                .contains("no_explicit_branch_surface_by_branch"),
+            "the unknown-table error should identify the retired surface: {error:?}"
+        );
+    }
+);
 
 simulation_test!(
     information_schema_never_exposes_raw_snapshot_content,

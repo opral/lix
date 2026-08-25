@@ -6,9 +6,7 @@ use crate::tracked_state::{MaterializedTrackedStateBatch, MaterializedTrackedSta
 /// text exposed by the `lixcol_row_pk` column.
 pub(super) fn row_pk_json_array(row_pk: &str) -> Result<String, LixError> {
     serde_json::to_string(&[row_pk]).map_err(|error| {
-        LixError::unknown(format!(
-            "failed to encode history row pk as JSON: {error}"
-        ))
+        LixError::unknown(format!("failed to encode history row pk as JSON: {error}"))
     })
 }
 

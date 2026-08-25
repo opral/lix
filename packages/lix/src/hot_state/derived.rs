@@ -12,14 +12,13 @@ use tracing::Instrument;
 
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::{ChangeId, CommitId};
-use crate::commit_graph::{CommitGraphContext, CommitGraphEdge, CommitGraphNode, commit_edges};
+use crate::commit_graph::{CommitGraphContext, CommitGraphNode};
 use crate::hot_state::{HotStateRowFilter, HotStateScanRequest, MaterializedHotStateRow};
 use crate::row_pk::{RowPk, RowPkComponent};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DerivedFileIdentity {
@@ -38,11 +37,6 @@ const COMMIT_DESCRIPTOR: DerivedProviderDescriptor = DerivedProviderDescriptor {
     untracked: false,
     file_identity: DerivedFileIdentity::Null,
 };
-const COMMIT_EDGE_DESCRIPTOR: DerivedProviderDescriptor = DerivedProviderDescriptor {
-    schema_key: COMMIT_EDGE_SCHEMA_KEY,
-    untracked: false,
-    file_identity: DerivedFileIdentity::Null,
-};
 const BRANCH_REF_DESCRIPTOR: DerivedProviderDescriptor = DerivedProviderDescriptor {
     schema_key: BRANCH_REF_SCHEMA_KEY,
     untracked: true,
@@ -51,7 +45,6 @@ const BRANCH_REF_DESCRIPTOR: DerivedProviderDescriptor = DerivedProviderDescript
 #[derive(Debug, Clone, Copy)]
 enum RegisteredDerivedProvider {
     Commit,
-    CommitEdge,
     BranchRef,
 }
 
@@ -59,7 +52,6 @@ impl RegisteredDerivedProvider {
     const fn descriptor(self) -> DerivedProviderDescriptor {
         match self {
             Self::Commit => COMMIT_DESCRIPTOR,
-            Self::CommitEdge => COMMIT_EDGE_DESCRIPTOR,
             Self::BranchRef => BRANCH_REF_DESCRIPTOR,
         }
     }
@@ -67,7 +59,6 @@ impl RegisteredDerivedProvider {
 
 const DERIVED_PROVIDERS: &[RegisteredDerivedProvider] = &[
     RegisteredDerivedProvider::Commit,
-    RegisteredDerivedProvider::CommitEdge,
     RegisteredDerivedProvider::BranchRef,
 ];
 
@@ -158,6 +149,7 @@ where
             for commit in commits {
                 rows.push(commit_row(
                     commit.commit_id,
+                    &commit.parent_commit_ids,
                     commit.change_id,
                     commit.created_at,
                     branch_id,
@@ -202,91 +194,11 @@ where
                 validate_commit_point_identity(*requested_commit_id, record)?;
                 rows.push(commit_row(
                     record.commit_id,
+                    &record.parent_commit_ids,
                     record.change_id,
                     record.created_at,
                     branch_id,
                 )?);
-            }
-        }
-        Ok(rows)
-    }
-}
-
-struct CommitEdgeProvider;
-
-#[async_trait]
-impl<S> DerivedHotStateProvider<S> for CommitEdgeProvider
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    fn descriptor(&self) -> DerivedProviderDescriptor {
-        COMMIT_EDGE_DESCRIPTOR
-    }
-
-    async fn scan_all(
-        &self,
-        reads: &mut DerivedReadContext<'_, S>,
-        scope: &DerivedScanScope<'_>,
-    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
-        let commits = reads.all_nodes().await?;
-        let edges = commit_edges(commits);
-        let mut rows = Vec::with_capacity(edges.len() * scope.branch_ids.len());
-        for branch_id in scope.branch_ids {
-            for edge in &edges {
-                rows.push(commit_edge_row(edge, branch_id)?);
-            }
-        }
-        Ok(rows)
-    }
-}
-
-#[async_trait]
-impl<S> DerivedRowPointProvider<S> for CommitEdgeProvider
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    async fn load_row_points(
-        &self,
-        reads: &mut DerivedReadContext<'_, S>,
-        row_pks: &[RowPk],
-        scope: &DerivedScanScope<'_>,
-    ) -> Result<Vec<MaterializedHotStateRow>, LixError> {
-        let edge_ids = row_pks
-            .iter()
-            .filter_map(commit_edge_id_from_row_pk)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let child_ids = edge_ids
-            .iter()
-            .map(|(child_commit_id, _)| *child_commit_id)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut graph_reader = reads.commit_graph.reader(reads.store);
-        let nodes = graph_reader.load_nodes(&child_ids).await?;
-        let nodes_by_id = nodes
-            .into_iter()
-            .filter_map(|(commit_id, node)| node.map(|node| (*commit_id, node)))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let mut edges = Vec::with_capacity(edge_ids.len());
-        for (child_commit_id, parent_order) in edge_ids {
-            let Some(node) = nodes_by_id.get(&child_commit_id) else {
-                continue;
-            };
-            let Some(parent_commit_id) = node.parent_commit_ids.get(parent_order as usize) else {
-                continue;
-            };
-            edges.push(CommitGraphEdge {
-                parent_commit_id: *parent_commit_id,
-                child_commit_id,
-                parent_order,
-            });
-        }
-        let mut rows = Vec::with_capacity(edges.len() * scope.branch_ids.len());
-        for branch_id in scope.branch_ids {
-            for edge in &edges {
-                rows.push(commit_edge_row(edge, branch_id)?);
             }
         }
         Ok(rows)
@@ -418,9 +330,6 @@ where
         RegisteredDerivedProvider::Commit => {
             append_point_provider_rows(&CommitProvider, reads, request, scope, rows).await
         }
-        RegisteredDerivedProvider::CommitEdge => {
-            append_point_provider_rows(&CommitEdgeProvider, reads, request, scope, rows).await
-        }
         RegisteredDerivedProvider::BranchRef => {
             append_point_provider_rows(&BranchRefProvider, reads, request, scope, rows).await
         }
@@ -530,20 +439,6 @@ fn commit_id_from_row_pk(row_pk: &RowPk) -> Option<CommitId> {
     Some(CommitId::new(uuid::Uuid::from_bytes(*bytes)))
 }
 
-fn commit_edge_id_from_row_pk(row_pk: &RowPk) -> Option<(CommitId, u32)> {
-    let [
-        RowPkComponent::Uuid(bytes),
-        RowPkComponent::Integer(parent_order),
-    ] = row_pk.components.as_slice()
-    else {
-        return None;
-    };
-    Some((
-        CommitId::new(uuid::Uuid::from_bytes(*bytes)),
-        u32::try_from(*parent_order).ok()?,
-    ))
-}
-
 fn uuid_string_from_row_pk(row_pk: &RowPk) -> Option<String> {
     let [RowPkComponent::Uuid(bytes)] = row_pk.components.as_slice() else {
         return None;
@@ -569,17 +464,13 @@ fn validate_commit_point_identity(
 
 fn commit_row(
     commit_id: CommitId,
+    parent_commit_ids: &[CommitId],
     change_id: ChangeId,
     created_at: crate::common::LixTimestamp,
     branch_id: &str,
 ) -> Result<MaterializedHotStateRow, LixError> {
     let snapshot_content =
-        serde_json::to_string(&serde_json::json!({ "id": commit_id })).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to encode derived lix_commit snapshot: {error}"),
-            )
-        })?;
+        crate::changelog::commit_row_snapshot_json(&commit_id.to_string(), parent_commit_ids)?;
     Ok(MaterializedHotStateRow {
         row_pk: RowPk::uuid_from_bytes(*commit_id.as_uuid().as_bytes()),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
@@ -592,42 +483,6 @@ fn commit_row(
         global: true,
         change_id: Some(change_id),
         commit_id: Some(commit_id),
-        untracked: false,
-        branch_id: branch_id.into(),
-    })
-}
-
-fn commit_edge_row(
-    edge: &CommitGraphEdge,
-    branch_id: &str,
-) -> Result<MaterializedHotStateRow, LixError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "parent_id": edge.parent_commit_id,
-        "child_id": edge.child_commit_id,
-        "parent_order": edge.parent_order,
-    }))
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode derived lix_commit_edge snapshot: {error}"),
-        )
-    })?;
-    Ok(MaterializedHotStateRow {
-        row_pk: RowPk::from_components(smallvec::smallvec![
-            RowPkComponent::Uuid(*edge.child_commit_id.as_uuid().as_bytes()),
-            RowPkComponent::Integer(i64::from(edge.parent_order)),
-        ])
-        .expect("commit edge primary key has two components"),
-        schema_key: COMMIT_EDGE_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content.into()),
-        metadata: None,
-        deleted: false,
-        created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
-        updated_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
-        global: true,
-        change_id: None,
-        commit_id: Some(edge.child_commit_id),
         untracked: false,
         branch_id: branch_id.into(),
     })

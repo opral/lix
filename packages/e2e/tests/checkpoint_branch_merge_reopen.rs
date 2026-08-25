@@ -213,19 +213,22 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "SELECT parent_id, parent_order FROM lix_commit_edge \
-         WHERE child_id = $1 ORDER BY parent_order",
+        "SELECT parent_commit_ids FROM lix_commit WHERE id = $1",
         &[Value::Text(commit_id.to_owned())],
     )
     .await
-    .expect("checkpoint parent edges read")
-    .rows()
+    .expect("ordered checkpoint parents read")
+    .rows()[0]
+    .get::<serde_json::Value>("parent_commit_ids")
+    .expect("parent IDs decode as JSON")
+    .as_array()
+    .expect("parent IDs form an array")
     .iter()
-    .map(|row| {
+    .enumerate()
+    .map(|(order, parent)| {
         (
-            row.get::<String>("parent_id").expect("parent id decodes"),
-            row.get::<i64>("parent_order")
-                .expect("parent order decodes"),
+            parent.as_str().expect("parent ID decodes").to_owned(),
+            i64::try_from(order).expect("parent order fits an integer"),
         )
     })
     .collect()

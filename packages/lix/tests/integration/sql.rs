@@ -93,6 +93,7 @@ macro_rules! simulation_test {
 mod checkpoint;
 mod delete_returning;
 mod diff_commands;
+mod diff_relation;
 mod schema_history;
 mod schema_view;
 mod errors;

@@ -247,15 +247,14 @@ simulation_test!(
             super::select_rows(
                 &session,
                 &format!(
-                    "SELECT schema_key, file_id \
-                     FROM lix_working_diff() \
-                     WHERE file_id = '{file_id}' \
-                       AND schema_key = 'lix_file_descriptor'"
+                    "SELECT diff_type, to_id \
+                     FROM lix_diff('lix_file', '{baseline}', '{renamed_head}') \
+                     WHERE row_pk ->> 0 = '{file_id}'"
                 ),
             )
             .await,
             vec![vec![
-                Value::Text("lix_file_descriptor".to_string()),
+                Value::Text("modified".to_string()),
                 Value::Text(file_id.to_string()),
             ]],
             "a pending rename must be visible through a natural working-diff file filter",
@@ -264,15 +263,14 @@ simulation_test!(
             super::select_rows(
                 &session,
                 &format!(
-                    "SELECT schema_key, file_id \
-                     FROM lix_diff('{baseline}', '{renamed_head}') \
-                     WHERE file_id = '{file_id}' \
-                       AND schema_key = 'lix_file_descriptor'"
+                    "SELECT diff_type, to_id \
+                     FROM lix_diff('lix_file', '{baseline}', '{renamed_head}') \
+                     WHERE row_pk ->> 0 = '{file_id}'"
                 ),
             )
             .await,
             vec![vec![
-                Value::Text("lix_file_descriptor".to_string()),
+                Value::Text("modified".to_string()),
                 Value::Text(file_id.to_string()),
             ]],
             "a pending rename must be visible through a natural historical diff file filter",

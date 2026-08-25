@@ -9,6 +9,9 @@ use lix::storage::Memory;
 use lix::{Lix, open_lix};
 use serde_json::json;
 
+const WORKING_SOURCE: &str =
+    "lix_diff('lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id())";
+
 fn diff_command_benches(c: &mut Criterion) {
     if std::env::var_os("LIX_DIFF_COMMAND_PROFILE").is_some() {
         profile();
@@ -19,7 +22,10 @@ fn diff_command_benches(c: &mut Criterion) {
         b.iter_batched(
             || runtime.block_on(seeded_session(1_000)),
             |session| {
-                runtime.block_on(execute(&session, "SELECT COUNT(*) FROM lix_working_diff()"));
+                runtime.block_on(execute(
+                    &session,
+                    &format!("SELECT COUNT(*) FROM {WORKING_SOURCE}"),
+                ));
             },
             BatchSize::LargeInput,
         );
@@ -29,7 +35,7 @@ fn diff_command_benches(c: &mut Criterion) {
             || {
                 runtime.block_on(async {
                     let session = seeded_session(1_000).await;
-                    let sql = command_sql("lix_revert", "lix_working_diff", "", 100);
+                    let sql = command_sql("lix_revert", WORKING_SOURCE, "", 100);
                     (session, sql)
                 })
             },
@@ -49,7 +55,7 @@ fn diff_command_benches(c: &mut Criterion) {
             || {
                 runtime.block_on(async {
                     let session = seeded_session(1_000).await;
-                    let sql = command_sql("lix_create_checkpoint", "lix_working_diff", "", 500);
+                    let sql = command_sql("lix_create_checkpoint", WORKING_SOURCE, "", 500);
                     (session, sql)
                 })
             },
@@ -93,7 +99,7 @@ async fn profile_sample(rows: usize, sample: usize) {
     let selected = (rows / 10).max(1);
 
     let scan = elapsed(async {
-        execute(&session, "SELECT COUNT(*) FROM lix_working_diff()").await;
+        execute(&session, &format!("SELECT COUNT(*) FROM {WORKING_SOURCE}")).await;
     })
     .await;
     emit("working_diff", rows, rows, sample, scan);
@@ -101,13 +107,10 @@ async fn profile_sample(rows: usize, sample: usize) {
     let atelier_count = elapsed(async {
         execute(
             &session,
-            "SELECT COUNT(*) AS change_count, \
-             COUNT(DISTINCT CASE \
-               WHEN file_id IS NOT NULL THEN file_id \
-               WHEN schema_key = 'lix_file_descriptor' THEN row_pk ->> 0 \
-               ELSE NULL \
-             END) AS file_count \
-             FROM lix_working_diff()",
+            &format!(
+                "SELECT COUNT(*) AS change_count, SUM(row_count) AS atom_count \
+                 FROM {WORKING_SOURCE}"
+            ),
         )
         .await;
     })
@@ -124,9 +127,8 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "INSERT INTO lix_revert (diff_id) \
-                 SELECT diff_id FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
+                "INSERT INTO lix_revert (relation, row_pk) \
+                 SELECT 'lix_key_value', row_pk FROM {WORKING_SOURCE} \
                  ORDER BY row_pk LIMIT {selected}"
             ),
         )
@@ -139,9 +141,9 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "INSERT INTO lix_apply (diff_id) \
-                 SELECT diff_id FROM lix_diff('{baseline}', '{head}') \
-                 WHERE schema_key = 'lix_key_value' \
+                "INSERT INTO lix_apply (relation, row_pk) \
+                 SELECT 'lix_key_value', row_pk \
+                 FROM lix_diff('lix_key_value', '{baseline}', '{head}') \
                  ORDER BY row_pk LIMIT {selected}"
             ),
         )
@@ -155,9 +157,8 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "INSERT INTO lix_create_checkpoint (diff_id) \
-                 SELECT diff_id FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
+                "INSERT INTO lix_create_checkpoint (relation, row_pk) \
+                 SELECT 'lix_key_value', row_pk FROM {WORKING_SOURCE} \
                  ORDER BY row_pk LIMIT {checkpoint_selected}"
             ),
         )
@@ -221,18 +222,18 @@ async fn apply_fixture(rows: usize, selected: usize) -> (Lix<Memory>, String) {
     let head = active_commit(&session).await;
     execute(
         &session,
-        &command_sql("lix_revert", "lix_working_diff", "", selected),
+        &command_sql("lix_revert", WORKING_SOURCE, "", selected),
     )
     .await;
-    let source = format!("lix_diff('{baseline}', '{head}')");
+    let source = format!("lix_diff('lix_key_value', '{baseline}', '{head}')");
     (session, command_sql("lix_apply", &source, "", selected))
 }
 
 fn command_sql(command: &str, source: &str, extra_predicate: &str, selected: usize) -> String {
     format!(
-        "INSERT INTO {command} (diff_id) \
-         SELECT diff_id FROM {source} \
-         WHERE schema_key = 'lix_key_value' {extra_predicate} \
+        "INSERT INTO {command} (relation, row_pk) \
+         SELECT 'lix_key_value', row_pk FROM {source} \
+         WHERE true {extra_predicate} \
          ORDER BY row_pk LIMIT {selected}"
     )
 }

@@ -10,7 +10,6 @@ use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
 
 use super::branch_ref::CachingBranchRefReader;
-use super::exec::statement_has_table_function;
 use super::planning_cache::PooledReadSession;
 use super::providers;
 use super::udfs::{
@@ -72,19 +71,19 @@ where
             .await?
             .map(|head| head.commit_id.to_string()),
     };
+    let root_commit_id = if statements.iter().any(statement_uses_root_commit_id) {
+        resolve_root_commit_id(ctx, active_branch_commit_id.as_deref()).await?
+    } else {
+        None
+    };
     bind_execution_sql2_functions(
         session,
         ctx.functions(),
         ctx.active_account_id(),
         Some(ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
+        root_commit_id.as_deref(),
     );
-    // `lix_diff` is a table-valued function, so only a statement that actually
-    // calls one can reach it. Registering it unconditionally took the session
-    // write lock on every read.
-    if statements.iter().any(statement_has_table_function) {
-        providers::register_diff_function(session, ctx.changelog_query_source());
-    }
     let provider_selection = providers::read_provider_selection(pooled.state(), statements);
     providers::register_read(
         session,
@@ -114,16 +113,19 @@ where
         .load_head(read_ctx.active_branch_id())
         .await?
         .map(|head| head.commit_id.to_string());
+    let root_commit_id = if statement_uses_root_commit_id(statement) {
+        resolve_root_commit_id(read_ctx, active_branch_commit_id.as_deref()).await?
+    } else {
+        None
+    };
     bind_execution_sql2_functions(
         session,
         read_ctx.functions(),
         read_ctx.active_account_id(),
         Some(read_ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
+        root_commit_id.as_deref(),
     );
-    if statement_has_table_function(statement) {
-        providers::register_diff_function(session, read_ctx.changelog_query_source());
-    }
     let write_ctx = SqlWriteContext::new(write_ctx);
     let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(
         Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone())),
@@ -202,6 +204,7 @@ pub(crate) async fn build_write_session_with_options(
         &write_ctx.active_account_id(),
         Some(&active_branch_id),
         Some(&active_branch_commit_id.commit_id.to_string()),
+        None,
     );
     providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
 
@@ -209,6 +212,76 @@ pub(crate) async fn build_write_session_with_options(
         datafusion: session,
         write_targets,
     })
+}
+
+fn statement_uses_root_commit_id(statement: &DataFusionStatement) -> bool {
+    use datafusion::sql::sqlparser::ast::{Expr, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    struct RootCommitVisitor;
+
+    impl Visitor for RootCommitVisitor {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+            if let Expr::Function(function) = expression
+                && crate::sql2::parse::object_name_is_public_function(
+                    &function.name,
+                    "lix_root_commit_id",
+                )
+            {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    match statement {
+        DataFusionStatement::Statement(statement) => {
+            statement.visit(&mut RootCommitVisitor).is_break()
+        }
+        DataFusionStatement::Explain(explain) => {
+            statement_uses_root_commit_id(explain.statement.as_ref())
+        }
+        _ => false,
+    }
+}
+
+async fn resolve_root_commit_id<C>(
+    context: &C,
+    active_branch_commit_id: Option<&str>,
+) -> Result<Option<String>, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    let Some(active_branch_commit_id) = active_branch_commit_id else {
+        return Ok(None);
+    };
+    let mut current = active_branch_commit_id
+        .parse::<crate::changelog::CommitId>()
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("active branch commit ID is invalid while resolving the root: {error}"),
+            )
+        })?;
+    let mut commit_graph = context.commit_graph();
+    loop {
+        let node = commit_graph.load_node(&current).await?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("cannot resolve repository root: commit '{current}' is missing"),
+            )
+        })?;
+        let Some(first_parent) = node.parent_commit_ids.first().copied() else {
+            return Ok(Some(node.commit_id.to_string()));
+        };
+        current = if node.first_parent_jump_span > 0 {
+            node.first_parent_jump_commit_id
+        } else {
+            first_parent
+        };
+    }
 }
 
 pub(crate) fn new_sql_session_context() -> SessionContext {

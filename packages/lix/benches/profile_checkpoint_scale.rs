@@ -399,8 +399,9 @@ where
         scalar_count(&lix, "SELECT count(*) AS count FROM lix_file").await,
         file_count
     );
+    let checkpoint_commit_id = nearest_checkpoint_commit_id(&lix).await;
     assert_eq!(
-        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff()").await,
+        working_file_diff_count(&lix, &checkpoint_commit_id).await,
         0
     );
     lix.close().await.expect("close checkpoint setup lix");
@@ -681,9 +682,9 @@ async fn run_workload<S>(
         expected_payloads,
         "checkpoint run must preserve the deterministic final file contents"
     );
+    let checkpoint_commit_id = nearest_checkpoint_commit_id(&lix).await;
     let working_diff_query_start = Instant::now();
-    let remaining_working_diffs =
-        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff()").await;
+    let remaining_working_diffs = working_file_diff_count(&lix, &checkpoint_commit_id).await;
     let working_diff_query_elapsed = working_diff_query_start.elapsed();
     assert_eq!(
         remaining_working_diffs, 0,
@@ -952,6 +953,49 @@ where
     usize::try_from(count).expect("count should be non-negative")
 }
 
+async fn nearest_checkpoint_commit_id<S>(lix: &Lix<S>) -> String
+where
+    S: BenchmarkStorage,
+{
+    lix.execute(
+        "SELECT checkpoint.commit_id AS commit_id \
+         FROM lix_checkpoint AS checkpoint \
+         JOIN lix_commit_ancestry() AS ancestry \
+           ON ancestry.commit_id = checkpoint.commit_id \
+         ORDER BY ancestry.depth, checkpoint.commit_id \
+         LIMIT 1",
+        &[],
+    )
+    .await
+    .expect("read the nearest checkpoint reachable from the active branch")
+    .rows()
+    .first()
+    .expect("checkpoint benchmark requires a reachable checkpoint")
+    .get::<String>("commit_id")
+    .expect("reachable checkpoint commit ID should be text")
+}
+
+async fn working_file_diff_count<S>(lix: &Lix<S>, checkpoint_commit_id: &str) -> usize
+where
+    S: BenchmarkStorage,
+{
+    let result = lix
+        .execute(
+            "SELECT count(*) AS count \
+             FROM lix_diff('lix_file', $1, lix_active_branch_commit_id())",
+            &[Value::Text(checkpoint_commit_id.to_owned())],
+        )
+        .await
+        .expect("execute checkpoint-to-head file diff count query");
+    let count = result
+        .rows()
+        .first()
+        .expect("file diff count query should return one row")
+        .get::<i64>("count")
+        .expect("file diff count should be an integer");
+    usize::try_from(count).expect("file diff count should be non-negative")
+}
+
 async fn load_file_payloads<S>(lix: &Lix<S>) -> BTreeMap<String, Vec<u8>>
 where
     S: BenchmarkStorage,
@@ -1210,9 +1254,9 @@ where
         .expect("open checkpoint surface lix");
     let open_elapsed = open_start.elapsed();
 
+    let checkpoint_commit_id = nearest_checkpoint_commit_id(&lix).await;
     let working_start = Instant::now();
-    let working_count =
-        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff()").await;
+    let working_count = working_file_diff_count(&lix, &checkpoint_commit_id).await;
     let working_elapsed = working_start.elapsed();
     let limited_sql = "SELECT commit_id FROM lix_checkpoint LIMIT 20";
     let medium_sql = "SELECT commit_id FROM lix_checkpoint LIMIT 128";

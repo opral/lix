@@ -3,21 +3,19 @@
 
 //! Scaling harness for **file-scoped** working-diff reads.
 //!
-//! `docs/diff-commands.md` documents `SELECT ... FROM lix_working_diff() WHERE
-//! file_id = $1` as the headline shape, but no benchmark covered it. This
+//! `docs/diff-commands.md` documents relation-specific `lix_diff` queries and
+//! file identities as the headline shape. This
 //! harness holds the *returned* row count fixed and grows the *total* dirty
 //! set since the checkpoint, so the slope answers one question: does a
 //! narrow file-scoped working-diff read cost O(rows returned) or O(all dirty
 //! rows in the branch)?
 //!
 //! Five query shapes are timed against the same fixture:
-//!   * `full`        — unfiltered `lix_working_diff` (the existing bench shape)
-//!   * `file`        — `WHERE file_id = $1`, the shape `docs/diff-commands.md`
-//!                     shows first
-//!   * `file_schema` — `WHERE file_id = $1 AND schema_key = $2`, the shape of
-//!                     the one file-scoped working-diff test in the tree
-//!   * `point`       — `WHERE schema_key = $1 AND row_pk = CAST($2 AS JSONB) AND
-//!                     file_id = $3`, which takes the finite-filter bypass in
+//!   * `full`        — unfiltered `lix_diff('lix_file', checkpoint, head)`
+//!   * `file`        — one file selected by its relation row identity
+//!   * `file_schema` — one file's rows in the registered schema relation
+//!   * `point`       — one schema row selected by its primary-key identity,
+//!                     which takes the finite-filter bypass in
 //!                     `hot_working_diff_entries` and therefore never reads the
 //!                     HOT_DIFF index or verifies its coverage proof. This is
 //!                     the control: it isolates the proof as the cost.
@@ -199,19 +197,41 @@ async fn run<StorageImpl>(
     dirty_rows(&session, &plan, changes_per_commit, rows_per_file).await;
 
     let probe_file = file_ids[0].clone();
-    let file_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
-                    FROM lix_working_diff() WHERE file_id = $1";
-    let full_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
-                    FROM lix_working_diff()";
-    // `schema_key + file_id`, the shape of the only file-scoped working-diff
-    // test in the tree. Still a full HOT_DIFF scan today.
-    let file_schema_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
-                           FROM lix_working_diff() WHERE file_id = $1 AND schema_key = $2";
+    let checkpoint = session
+        .execute(
+            "SELECT checkpoint.commit_id \
+             FROM lix_checkpoint AS checkpoint \
+             JOIN lix_commit_ancestry() AS ancestry \
+               ON ancestry.commit_id = checkpoint.commit_id \
+             ORDER BY ancestry.depth LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("load benchmark checkpoint")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("benchmark checkpoint ID");
+    let file_sql = format!(
+        "SELECT row_pk, diff_type, row_count \
+         FROM lix_diff('lix_file', '{checkpoint}', lix_active_branch_commit_id()) \
+         WHERE row_pk ->> 0 = $1"
+    );
+    let full_sql = format!(
+        "SELECT row_pk, diff_type, row_count \
+         FROM lix_diff('lix_file', '{checkpoint}', lix_active_branch_commit_id())"
+    );
+    let file_schema_sql = format!(
+        "SELECT row_pk, diff_type, row_count \
+         FROM lix_diff('{SCHEMA_KEY}', '{checkpoint}', lix_active_branch_commit_id()) \
+         WHERE to_lixcol_file_id = $1"
+    );
     // Finite identity + file id: takes the existing bypass and resolves as a
     // point read. This is the floor a seekable file-scoped read aims at.
-    let point_sql = "SELECT diff_id, row_pk, schema_key, file_id, diff_type \
-                     FROM lix_working_diff() \
-                     WHERE schema_key = $1 AND row_pk = CAST($2 AS JSONB) AND file_id = $3";
+    let point_sql = format!(
+        "SELECT row_pk, diff_type, row_count \
+         FROM lix_diff('{SCHEMA_KEY}', '{checkpoint}', lix_active_branch_commit_id()) \
+         WHERE row_pk = CAST($1 AS JSONB)"
+    );
     // Live-state read of the same file. HOT_ROW is keyed
     // `schema_key ++ file_id ++ row_pk` and `hot_scan_entries` owns a
     // file-first prefix route; the schema surface pushes `lixcol_file_id` into
@@ -221,27 +241,20 @@ async fn run<StorageImpl>(
     // one means the pushdown stopped reaching the seek.
     let row_scan_sql = format!("SELECT id FROM {SCHEMA_KEY} WHERE lixcol_file_id = $1");
     let file_params = vec![Value::Text(probe_file.clone())];
-    let file_schema_params = vec![
-        Value::Text(probe_file.clone()),
-        Value::Text(SCHEMA_KEY.to_string()),
-    ];
-    let point_params = vec![
-        Value::Text(SCHEMA_KEY.to_string()),
-        Value::Text(format!("[\"{}\"]", row_id(0, 0))),
-        Value::Text(probe_file.clone()),
-    ];
+    let file_schema_params = vec![Value::Text(probe_file.clone())];
+    let point_params = vec![Value::Text(format!("[\"{}\"]", row_id(0, 0)))];
 
     // Warm provider construction and the block cache outside the samples.
-    let file_rows = rows(&session, file_sql, &file_params).await;
-    let full_rows = rows(&session, full_sql, &[]).await;
-    let file_schema_rows = rows(&session, file_schema_sql, &file_schema_params).await;
-    let point_rows = rows(&session, point_sql, &point_params).await;
+    let file_rows = rows(&session, &file_sql, &file_params).await;
+    let full_rows = rows(&session, &full_sql, &[]).await;
+    let file_schema_rows = rows(&session, &file_schema_sql, &file_schema_params).await;
+    let point_rows = rows(&session, &point_sql, &point_params).await;
     let row_scan_rows_count = rows(&session, &row_scan_sql, &file_params).await;
 
-    let file = sample(&session, file_sql, &file_params, reps).await;
-    let full = sample(&session, full_sql, &[], reps).await;
-    let file_schema = sample(&session, file_schema_sql, &file_schema_params, reps).await;
-    let point = sample(&session, point_sql, &point_params, reps).await;
+    let file = sample(&session, &file_sql, &file_params, reps).await;
+    let full = sample(&session, &full_sql, &[], reps).await;
+    let file_schema = sample(&session, &file_schema_sql, &file_schema_params, reps).await;
+    let point = sample(&session, &point_sql, &point_params, reps).await;
     let row_scan = sample(&session, &row_scan_sql, &file_params, reps).await;
 
     println!(

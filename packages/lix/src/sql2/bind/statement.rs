@@ -92,11 +92,13 @@ pub(super) fn bind_insert_bound(
     require_write_capability(&table.surface, BoundWriteOp::Insert)?;
     // sqlparser represents standard `INSERT INTO table DEFAULT VALUES` as an
     // INSERT without a source and without target columns. Support it only for
-    // registered-schema base tables, where omitted properties are materialized
-    // by the schema's default machinery. Keep it distinct from `INSERT INTO
-    // table VALUES (...)`, whose implicit public column list is deliberately
-    // unsupported.
-    let default_values = matches!(table.surface.kind, PublicSurfaceKind::SchemaBase { .. })
+    // registered-schema base tables and the metadata-only full-checkpoint
+    // command. Keep it distinct from `INSERT INTO table VALUES (...)`, whose
+    // implicit public column list is deliberately unsupported.
+    let default_values = matches!(
+        table.surface.kind,
+        PublicSurfaceKind::SchemaBase { .. } | PublicSurfaceKind::CreateCheckpoint
+    )
         && insert.columns.is_empty()
         && insert.source.is_none();
     if insert.columns.is_empty() && !default_values {
@@ -117,8 +119,8 @@ pub(super) fn bind_insert_bound(
     }
     let input = if default_values {
         // Preserve the cardinality of `DEFAULT VALUES`: it inserts one row,
-        // whose public columns are all omitted and therefore materialized by
-        // the target schema's existing default machinery.
+        // with no selected relation rows. Registered schemas materialize
+        // defaults; the checkpoint command aliases the current branch state.
         BoundWriteInput::Values(BoundInsertValues {
             columns: Vec::new(),
             rows: vec![Vec::new()],
@@ -1356,7 +1358,6 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
             BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint)
         }
         PublicSurfaceKind::Change
-        | PublicSurfaceKind::WorkingDiff
         | PublicSurfaceKind::HistoryFunction
         | PublicSurfaceKind::DiffFunction
         | PublicSurfaceKind::Restore
@@ -1973,8 +1974,8 @@ mod tests {
     fn bind_statement_allows_only_commit_id_for_diff_command_insert_returning() {
         let bound = bind_statement(
             &parse_statement(
-                "INSERT INTO lix_revert (diff_id) \
-                 SELECT diff_id FROM lix_working_diff() \
+                "INSERT INTO lix_revert (relation, row_pk) \
+                 SELECT 'lix_key_value', CAST('[\"test\"]' AS JSONB) \
                  RETURNING commit_id AS created_commit_id",
             ),
             &[],
@@ -1994,8 +1995,8 @@ mod tests {
         ));
 
         for sql in [
-            "INSERT INTO lix_revert (diff_id) SELECT diff_id FROM lix_working_diff() RETURNING diff_id",
-            "INSERT INTO lix_revert (diff_id) SELECT diff_id FROM lix_working_diff() RETURNING *",
+            "INSERT INTO lix_revert (relation, row_pk) SELECT 'lix_key_value', CAST('[\"test\"]' AS JSONB) RETURNING row_pk",
+            "INSERT INTO lix_revert (relation, row_pk) SELECT 'lix_key_value', CAST('[\"test\"]' AS JSONB) RETURNING *",
         ] {
             let error = bind_statement(&parse_statement(sql), &[], "branch1")
                 .expect_err("unsupported INSERT RETURNING shape should fail");

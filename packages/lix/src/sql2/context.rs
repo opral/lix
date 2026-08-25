@@ -37,6 +37,14 @@ pub(crate) enum DiffCommand {
     CreateCheckpoint,
 }
 
+/// Relation-row identity selected by a public diff command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiffCommandSelection {
+    pub(crate) relation: String,
+    pub(crate) row_pk: crate::row_pk::RowPk,
+    pub(crate) source_commits: Option<(String, String)>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DiffCommandOutcome {
     pub(crate) rows_affected: u64,
@@ -304,7 +312,7 @@ pub(crate) trait SqlWriteExecutionContext: Send {
     async fn execute_diff_command(
         &mut self,
         _command: DiffCommand,
-        _diff_ids: Vec<String>,
+        _selections: Vec<DiffCommandSelection>,
     ) -> Result<DiffCommandOutcome, LixError> {
         Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -639,7 +647,7 @@ impl SqlWriteContext {
     pub(crate) async fn execute_diff_command(
         &self,
         command: DiffCommand,
-        diff_ids: Vec<String>,
+        selections: Vec<DiffCommandSelection>,
     ) -> Result<DiffCommandOutcome, LixError> {
         let _guard = self.gate.lock().await;
         self.ensure_context_live("execute_diff_command")?;
@@ -649,7 +657,7 @@ impl SqlWriteContext {
                 .as_ptr()
                 .as_mut()
                 .unwrap()
-                .execute_diff_command(command, diff_ids)
+                .execute_diff_command(command, selections)
                 .await
         }
     }

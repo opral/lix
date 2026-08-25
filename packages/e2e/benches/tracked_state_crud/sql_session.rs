@@ -782,8 +782,9 @@ where
         let result = execute(
             &self.session,
             &format!(
-                "SELECT COUNT(*) AS entries FROM lix_diff('{before}', '{after}') \
-                 WHERE schema_key = 'tracked_crud_insert' AND diff_type = 'added'"
+                "SELECT COUNT(*) AS entries \
+                 FROM lix_diff('tracked_crud_insert', '{before}', '{after}') \
+                 WHERE diff_type = 'added'"
             ),
         )
         .await;

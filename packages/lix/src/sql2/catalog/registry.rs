@@ -8,9 +8,9 @@ use serde_json::Value as JsonValue;
 use crate::LixError;
 
 use super::{
-    PublicColumn, PublicHistoryContract, PublicHistoryKind, PublicRelationKind,
-    PublicScalarFunctionContract, PublicSurfaceClass, PublicSurfaceContract, PublicSurfaceKind,
-    SurfaceCapabilities, PUBLIC_SCALAR_FUNCTION_NAMES,
+    PUBLIC_SCALAR_FUNCTION_NAMES, PublicColumn, PublicHistoryContract, PublicHistoryKind,
+    PublicRelationKind, PublicScalarFunctionContract, PublicSurfaceClass, PublicSurfaceContract,
+    PublicSurfaceKind, SurfaceCapabilities,
 };
 use crate::sql2::catalog::schema_surface_schema;
 use crate::sql2::catalog::{
@@ -124,9 +124,7 @@ impl PublicCatalog {
         self.surfaces.values()
     }
 
-    pub(crate) fn scalar_functions(
-        &self,
-    ) -> impl Iterator<Item = &PublicScalarFunctionContract> {
+    pub(crate) fn scalar_functions(&self) -> impl Iterator<Item = &PublicScalarFunctionContract> {
         self.scalar_functions.values()
     }
 
@@ -153,7 +151,6 @@ impl PublicCatalog {
                 Field::new("hidden", DataType::Boolean, false),
                 Field::new("commit_id", DataType::Utf8, false),
             ])),
-            PublicSurfaceKind::WorkingDiff => working_diff_schema(),
             PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
             | PublicSurfaceKind::CommitAncestryFunction => {
@@ -161,11 +158,10 @@ impl PublicCatalog {
             }
             PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
-            | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![Field::new(
-                "diff_id",
-                DataType::Utf8,
-                false,
-            )])),
+            | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![
+                Field::new("relation", DataType::Utf8, false),
+                json_field("row_pk", false),
+            ])),
             PublicSurfaceKind::Restore => Arc::new(Schema::new(vec![Field::new(
                 "commit_id",
                 DataType::Utf8,
@@ -278,21 +274,6 @@ impl PublicCatalog {
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
-            "lix_working_diff",
-            PublicSurfaceClass::TableFunction,
-            PublicSurfaceKind::WorkingDiff,
-            public_columns([
-                ("diff_id", false),
-                ("row_pk", false),
-                ("schema_key", false),
-                ("file_id", true),
-                ("diff_type", false),
-                ("before_change_id", true),
-                ("after_change_id", true),
-            ]),
-            SurfaceCapabilities::read_only(),
-        ))?;
-        self.insert(surface(
             "lix_history",
             PublicSurfaceClass::TableFunction,
             PublicSurfaceKind::HistoryFunction,
@@ -323,7 +304,8 @@ impl PublicCatalog {
                 PublicSurfaceClass::CommandSink,
                 kind,
                 vec![
-                    PublicColumn::public_insert_only("diff_id", false),
+                    PublicColumn::public_insert_only("relation", false),
+                    PublicColumn::public_insert_only("row_pk", false),
                     PublicColumn::public_read_only("commit_id", false),
                 ],
                 SurfaceCapabilities {
@@ -362,6 +344,14 @@ impl PublicCatalog {
 
     fn insert_schema_surfaces_from_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
         let parsed = crate::schema::parse_lix_schema(schema)?;
+        // Repositories created before the relation-diff hard cut can still
+        // contain this formerly seeded registration in their durable
+        // catalog. Ignore that exact retired bootstrap schema while reading
+        // old repositories; transaction normalization still rejects every
+        // attempt to register a new reserved `lix_*` schema at runtime.
+        if parsed.key == "lix_commit_edge" {
+            return Ok(());
+        }
         if Self::runtime_schema_key_uses_reserved_namespace(&parsed.key)
             && !crate::schema::is_seed_schema_key(&parsed.key)
         {
@@ -428,19 +418,6 @@ impl PublicCatalog {
         self.schema_specs.insert(spec.schema_key.clone(), spec);
         Ok(())
     }
-}
-
-fn working_diff_schema() -> SchemaRef {
-    let fields = vec![
-        Field::new("diff_id", DataType::Utf8, false),
-        json_field("row_pk", false),
-        Field::new("schema_key", DataType::Utf8, false),
-        Field::new("file_id", DataType::Utf8, true),
-        Field::new("diff_type", DataType::Utf8, false),
-        Field::new("before_change_id", DataType::Utf8, true),
-        Field::new("after_change_id", DataType::Utf8, true),
-    ];
-    Arc::new(Schema::new(fields))
 }
 
 fn filesystem_schema(include_data: bool) -> SchemaRef {
@@ -745,5 +722,24 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .expect("trusted bootstrap schemas own the reserved lix_* namespace");
+    }
+
+    #[test]
+    fn catalog_hides_retired_commit_edge_schema_in_existing_repositories() {
+        let retired_schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "lix_commit_edge",
+            "columns": [
+                { "name": "commit_id", "type": "text", "nullable": false },
+                { "name": "parent_commit_id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["commit_id", "parent_commit_id"],
+        });
+        let catalog = PublicCatalog::from_visible_schemas(&[retired_schema])
+            .expect("repositories retaining a retired bootstrap registration should open");
+
+        assert!(catalog.surface("lix_commit_edge").is_none());
+        assert!(catalog.history_relation("lix_commit_edge").is_none());
+        assert!(catalog.schema_spec("lix_commit_edge").is_none());
     }
 }

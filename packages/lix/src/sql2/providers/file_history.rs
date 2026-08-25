@@ -178,7 +178,8 @@ where
                     lookup_ids,
                     schema,
                     metadata_projection,
-                ), runtime_limit| async move {
+                ),
+                      runtime_limit| async move {
                     let mut rows = if runtime_limit == Some(0) {
                         Vec::new()
                     } else {
@@ -877,7 +878,9 @@ where
     let parent_commit_ids_by_commit = load_history_commit_parents(
         &commit_graph,
         &context_route.as_of_commit_ids,
-        context_route.max_depth.and_then(|depth| u32::try_from(depth).ok()),
+        context_route
+            .max_depth
+            .and_then(|depth| u32::try_from(depth).ok()),
     )
     .await?;
     let plugin_discovery = discover_file_history_plugins(
@@ -1002,7 +1005,8 @@ where
             .chain(plugin_owner_events)
             .chain(plugin_registry_events),
     );
-    let mut prepared = prepare_file_history_rows(&observed_states, events, route, public_predicate)?;
+    let mut prepared =
+        prepare_file_history_rows(&observed_states, events, route, public_predicate)?;
     if let Some(output_limit) = output_limit {
         prepared.truncate(output_limit);
     }

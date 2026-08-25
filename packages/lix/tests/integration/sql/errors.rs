@@ -388,9 +388,9 @@ simulation_test!(
                 "WITH RECURSIVE commit_walk(id) AS ( \
                  SELECT id FROM lix_commit \
                  UNION ALL \
-                 SELECT lix_commit_edge.child_id \
-                 FROM lix_commit_edge \
-                 JOIN commit_walk ON lix_commit_edge.parent_id = commit_walk.id \
+                 SELECT lix_commit.id \
+                 FROM lix_commit \
+                 JOIN commit_walk ON lix_commit.parent_commit_ids ->> 0 = commit_walk.id \
                  ) \
                  SELECT id FROM commit_walk",
                 &[],
@@ -399,5 +399,9 @@ simulation_test!(
             .expect_err("recursive CTE should return an error, not panic");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{error:?}");
+        assert!(
+            error.hint.as_deref().is_some_and(|hint| hint.contains("parent_commit_ids")),
+            "recursive graph errors should teach the supported direct-parent accessor"
+        );
     }
 );

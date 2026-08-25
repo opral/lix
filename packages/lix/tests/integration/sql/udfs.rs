@@ -2,6 +2,46 @@ use lix::{CreateBranchOptions, Value};
 use serde_json::json;
 
 simulation_test!(
+    lix_root_commit_id_returns_the_stable_repository_root,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("main session should open"),
+            &engine,
+        );
+        let expected_root = sim.initial_commit_id().to_string();
+
+        for value in ["one", "two", "three"] {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+                    &[Value::Text(format!("root-{value}")), Value::Text(value.to_owned())],
+                )
+                .await
+                .expect("tracked write should advance the active head");
+        }
+
+        let result = session
+            .execute("SELECT lix_root_commit_id() AS root_commit_id", &[])
+            .await
+            .expect("root commit UDF should execute");
+        assert_eq!(
+            result.rows()[0].get::<String>("root_commit_id").unwrap(),
+            expected_root
+        );
+
+        let parents = session
+            .execute(
+                "SELECT parent_commit_ids FROM lix_commit WHERE id = lix_root_commit_id()",
+                &[],
+            )
+            .await
+            .expect("the root commit should have no parents");
+        assert_eq!(parents.rows()[0].values(), &[Value::Jsonb(json!([]).into())]);
+    }
+);
+
+simulation_test!(
     lix_active_branch_commit_id_returns_active_head,
     |sim| async move {
         let engine = sim.boot_engine().await;
