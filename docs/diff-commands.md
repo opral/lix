@@ -125,8 +125,11 @@ directly is unsupported; select the affected `lix_file` rows instead.
 
 Each statement is atomic. An empty selection succeeds without creating a
 commit, duplicate selected identities are rejected, and every command supports
-`RETURNING commit_id`. Full checkpoints use `DEFAULT VALUES` and structurally
-reuse the branch state without copying application rows.
+`RETURNING commit_id`. A command that creates a commit returns exactly one row,
+regardless of how many relation-row identities it consumes. For relation-row
+selection commands, `rowsAffected` continues to report the number of selected
+identities. Full checkpoints report one affected row, use `DEFAULT VALUES`, and
+structurally reuse the branch state without copying application rows.
 
 Rows written with `lixcol_untracked` are absent from every diff. Untracked
 state belongs to the local repository replica and is not transported through
