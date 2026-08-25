@@ -5315,6 +5315,10 @@ enum WorkingDiffBaselineAction {
 }
 
 impl HotTrackedSnapshot {
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
     pub(crate) fn from_materialized_rows(
         tracked_rows: Vec<MaterializedTrackedStateRow>,
     ) -> Result<Self, LixError> {

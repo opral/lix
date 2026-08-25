@@ -40,7 +40,7 @@ async fn current_format_inspection_recognizes_v68_golden_snapshot() {
             .expect("v68 format inspection should succeed"),
         MigrationStatus::Required {
             from_version: 68,
-            to_version: 71,
+            to_version: 72,
         }
     );
 }
@@ -53,7 +53,7 @@ async fn migrates_external_v68_authority_and_plugin_and_engine_tombstones() {
         inspect_lix(&storage).await.unwrap(),
         MigrationStatus::Required {
             from_version: 68,
-            to_version: 71,
+            to_version: 72,
         }
     );
     let report = migrate_lix(storage.clone(), MigrationOptions::default())
@@ -152,19 +152,19 @@ async fn migrates_v68_fixture_and_reopens_with_current_and_history_rows() {
         .await
         .expect("v68 fixture should migrate");
     assert_eq!(report.from_version, 68);
-    assert_eq!(report.to_version, 71);
+    assert_eq!(report.to_version, 72);
     assert!(report.changes_rewritten >= 2);
     assert!(report.commit_members_rewritten >= 2);
     assert!(report.hot_rows_rewritten >= 1);
     assert_eq!(
         inspect_lix(&storage).await.unwrap(),
-        MigrationStatus::Current { version: 71 }
+        MigrationStatus::Current { version: 72 }
     );
     let retry = migrate_lix(storage.clone(), MigrationOptions::default())
         .await
         .expect("migration retry should be idempotent");
-    assert_eq!(retry.from_version, 71);
-    assert_eq!(retry.to_version, 71);
+    assert_eq!(retry.from_version, 72);
+    assert_eq!(retry.to_version, 72);
     assert_eq!(retry.changes_rewritten, 0);
 
     let migrated_snapshot = storage
@@ -251,7 +251,7 @@ async fn migrated_v68_fixture_serves_two_independent_protocol_sessions() {
     let spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
     let captured_spans = Arc::clone(&spans);
     let protocol = open_lix()
-        .with_storage(storage)
+        .with_storage(storage.clone())
         .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
             captured_spans.lock().expect("telemetry spans").push(span);
         })))
@@ -268,6 +268,9 @@ async fn migrated_v68_fixture_serves_two_independent_protocol_sessions() {
         0,
         "serving a migrated repository must not create a hidden root session"
     );
+    let before_handshake = storage
+        .export_snapshot()
+        .expect("capture migrated repository before handshake");
 
     let mut session_ids = Vec::new();
     for index in 0..2 {
@@ -295,6 +298,15 @@ async fn migrated_v68_fixture_serves_two_independent_protocol_sessions() {
             .expect("handshake session id")
             .to_owned();
         session_ids.push(session_id.clone());
+        if index == 0 {
+            assert_eq!(
+                storage
+                    .export_snapshot()
+                    .expect("capture repository after handshake"),
+                before_handshake,
+                "a v72 handshake must not repair or mutate repository storage"
+            );
+        }
 
         for (query_index, (sql, expected_rows)) in [
             ("SELECT id, cells, order_key FROM csv_row", 1),
