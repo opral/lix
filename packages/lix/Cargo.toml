@@ -118,6 +118,10 @@ path = "tests/hot_index_range_probe.rs"
 name = "migration_v68"
 path = "tests/migration_v68.rs"
 
+[[test]]
+name = "migration_v72"
+path = "tests/migration_v72.rs"
+
 [dependencies]
 lix_schema.workspace = true
 serde = { version = "1", features = ["derive"] }

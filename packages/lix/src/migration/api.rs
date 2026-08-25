@@ -32,6 +32,8 @@ const REPOSITORY_PROTOCOL_V68: &[u8] = b"tracked-default-branch.v68";
 const REPOSITORY_PROTOCOL_V69: &[u8] = b"tracked-default-branch.v69";
 const REPOSITORY_PROTOCOL_V70: &[u8] = b"tracked-default-branch.v70";
 const REPOSITORY_PROTOCOL_V71: &[u8] = b"tracked-default-branch.v71";
+const REPOSITORY_PROTOCOL_V72: &[u8] = b"tracked-default-branch.v72";
+const ACCOUNT_SCHEMA_KEY: &str = "lix_account";
 
 /// Bounds for explicit offline repository migrations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,10 +132,13 @@ where
 /// Offline, bounded repository migration to the current format.
 ///
 /// Callers must place the repository in maintenance mode and take their
-/// backend-level backup first. Each format edge publishes atomically. A v68
-/// migration may stop in a valid, retryable v69 state after its typed rewrite;
-/// chronology-root chunks may likewise be persisted unreferenced before each
-/// edge's final atomic manifest replacement and marker publication.
+/// backend-level backup first. Physical authority and marker replacements
+/// publish atomically. A v68 migration may stop in a valid, retryable v69
+/// state after its typed rewrite; chronology-root chunks may likewise be
+/// persisted unreferenced before each edge's final atomic manifest replacement
+/// and marker publication. The v72 logical schema amendment publishes one
+/// ordinary durable commit per branch and remains on v72 until every branch is
+/// complete, so interruption is also safely retryable.
 pub async fn migrate_lix<S>(
     storage: S,
     options: MigrationOptions,
@@ -148,7 +153,7 @@ where
         .map_err(storage_error)?;
     let from_version = match crate::init::repository_protocol_status(&read).await? {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (68 | 69 | 70 | 71),
+            found_version: found_version @ (68 | 69 | 70 | 71 | 72),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -199,8 +204,12 @@ where
             )
             .await?;
         }
-        let hot_rows_rewritten =
-            migrate_v71_working_diff_epochs(&adapter, &storage, options).await?;
+        let hot_rows_rewritten = if from_version <= 71 {
+            migrate_v71_working_diff_epochs(&adapter, &storage, options).await?
+        } else {
+            0
+        };
+        migrate_v72_account_profile_uri(&adapter, &storage, options).await?;
         return Ok(MigrationReport {
             from_version,
             to_version: CURRENT_FORMAT_VERSION,
@@ -296,6 +305,7 @@ where
     )
     .await?;
     let migrated_hot_rows = migrate_v71_working_diff_epochs(&adapter, &storage, options).await?;
+    migrate_v72_account_profile_uri(&adapter, &storage, options).await?;
     Ok(MigrationReport {
         from_version: 68,
         to_version: CURRENT_FORMAT_VERSION,
@@ -368,11 +378,143 @@ where
         storage,
         expected_revision,
         REPOSITORY_PROTOCOL_V71,
-        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        REPOSITORY_PROTOCOL_V72,
         crate::migration::publish::PublicationPlan::bounded(0, 0),
     )
     .await?;
     Ok(hot_rows_rewritten)
+}
+
+/// Persists the additive `lix_account.profile_uri` amendment in every live
+/// branch catalog before publishing v73.
+///
+/// Schema definitions are tracked repository rows. The migration therefore
+/// uses ordinary schema-amendment commits instead of silently substituting the
+/// bundled initialization JSON at read time. Each branch commit is durable;
+/// if the process stops before the final marker publication, retrying v72 is
+/// idempotent and finishes the remaining branches.
+async fn migrate_v72_account_profile_uri<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+    storage: &S,
+    options: MigrationOptions,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let read = SharedStorageAdapterRead::new(
+        adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?,
+    );
+    match crate::init::repository_protocol_status(&read).await? {
+        RepositoryProtocolStatus::MigrationRequired { found_version: 72 } => {}
+        status => {
+            return Err(migration_error(format!(
+                "v72 account-schema migration observed unexpected repository status {status:?}"
+            )));
+        }
+    }
+    let branch_ids = BranchHeadControlContext::new()
+        .reader(read.clone())
+        .scan()
+        .await?
+        .into_iter()
+        .map(|(branch_id, _)| branch_id)
+        .collect::<Vec<_>>();
+    if branch_ids.len() > options.max_changes {
+        return Err(LixError::new(
+            "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+            format!(
+                "v72 account-schema migration exceeds configured branch bound: {} branches",
+                branch_ids.len()
+            ),
+        ));
+    }
+    read.finish().map_err(storage_error)?;
+
+    let target = crate::schema::seed_schema_definition(ACCOUNT_SCHEMA_KEY)
+        .expect("lix_account is a built-in schema")
+        .clone();
+    let target_schema = lix_schema::from_value(target.clone()).map_err(|error| {
+        migration_error(format!("bundled lix_account schema is invalid: {error}"))
+    })?;
+    let engine = crate::engine::Engine::new_for_migration(storage.clone(), 72).await?;
+    for branch_id in branch_ids {
+        let session = engine.open_session_at_for_migration(&branch_id);
+        let result = session
+            .execute(
+                "SELECT value FROM lix_registered_schema \
+                 WHERE lixcol_row_pk = CAST('[\"lix_account\"]' AS JSONB)",
+                &[],
+            )
+            .await?;
+        let rows = result.rows();
+        let [row] = rows else {
+            return Err(migration_error(format!(
+                "branch '{branch_id}' must expose exactly one lix_account schema row, found {}",
+                rows.len()
+            )));
+        };
+        let [crate::Value::Jsonb(stored)] = row.values() else {
+            return Err(migration_error(format!(
+                "branch '{branch_id}' has a non-JSON lix_account schema row"
+            )));
+        };
+        let stored = stored.to_value();
+        if stored != target {
+            let stored_schema = lix_schema::from_value(stored).map_err(|error| {
+                migration_error(format!(
+                    "branch '{branch_id}' has an invalid persisted lix_account schema: {error}"
+                ))
+            })?;
+            if let Err(error) = lix_schema::validate_amendment(&stored_schema, &target_schema) {
+                // A repository may already contain a compatible amendment
+                // beyond the bundled v73 definition. It necessarily includes
+                // profile_uri because amendment columns are append-only.
+                if lix_schema::validate_amendment(&target_schema, &stored_schema).is_err() {
+                    return Err(migration_error(format!(
+                        "branch '{branch_id}' has a divergent lix_account schema: {error}"
+                    )));
+                }
+            } else {
+                let updated = session
+                    .execute(
+                        "UPDATE lix_registered_schema SET value = $1 \
+                         WHERE lixcol_row_pk = CAST('[\"lix_account\"]' AS JSONB)",
+                        &[crate::Value::Jsonb(target.clone().into())],
+                    )
+                    .await?;
+                if updated.rows_affected() != 1 {
+                    return Err(migration_error(format!(
+                        "branch '{branch_id}' updated {} lix_account schema rows instead of one",
+                        updated.rows_affected()
+                    )));
+                }
+            }
+        }
+        session.close().await?;
+    }
+    drop(engine);
+
+    let read = SharedStorageAdapterRead::new(
+        adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?,
+    );
+    let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+        .await
+        .map_err(storage_error)?;
+    read.finish().map_err(storage_error)?;
+    crate::migration::publish::publish(
+        storage,
+        expected_revision,
+        REPOSITORY_PROTOCOL_V72,
+        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        crate::migration::publish::PublicationPlan::bounded(0, 0),
+    )
+    .await
 }
 
 async fn migrate_working_diff_epoch<S>(
@@ -735,6 +877,11 @@ mod tests {
     #[tokio::test]
     async fn migrates_v69_with_a_marker_only_publication() {
         let storage = Memory::new();
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        lix.close().await.unwrap();
         let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
         let mut seed = adapter.new_write_set();
         seed.put(
@@ -941,7 +1088,7 @@ mod tests {
             inspect_lix(&storage).await.unwrap(),
             MigrationStatus::Required {
                 from_version: 70,
-                to_version: 72,
+                to_version: 73,
             }
         );
         assert_chronology_roots_promoted(
@@ -1004,14 +1151,14 @@ mod tests {
             inspect_lix(&storage).await.unwrap(),
             MigrationStatus::Required {
                 from_version: 71,
-                to_version: 72,
+                to_version: 73,
             }
         );
         let report = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
             .unwrap();
         assert_eq!(report.from_version, 71);
-        assert_eq!(report.to_version, 72);
+        assert_eq!(report.to_version, 73);
         assert!(
             report.hot_rows_rewritten > 0,
             "the v71 edge must repair the stale working-diff epoch before publishing v72"

@@ -40,7 +40,7 @@ async fn current_format_inspection_recognizes_v68_golden_snapshot() {
             .expect("v68 format inspection should succeed"),
         MigrationStatus::Required {
             from_version: 68,
-            to_version: 72,
+            to_version: 73,
         }
     );
 }
@@ -53,7 +53,7 @@ async fn migrates_external_v68_authority_and_plugin_and_engine_tombstones() {
         inspect_lix(&storage).await.unwrap(),
         MigrationStatus::Required {
             from_version: 68,
-            to_version: 72,
+            to_version: 73,
         }
     );
     let report = migrate_lix(storage.clone(), MigrationOptions::default())
@@ -152,19 +152,19 @@ async fn migrates_v68_fixture_and_reopens_with_current_and_history_rows() {
         .await
         .expect("v68 fixture should migrate");
     assert_eq!(report.from_version, 68);
-    assert_eq!(report.to_version, 72);
+    assert_eq!(report.to_version, 73);
     assert!(report.changes_rewritten >= 2);
     assert!(report.commit_members_rewritten >= 2);
     assert!(report.hot_rows_rewritten >= 1);
     assert_eq!(
         inspect_lix(&storage).await.unwrap(),
-        MigrationStatus::Current { version: 72 }
+        MigrationStatus::Current { version: 73 }
     );
     let retry = migrate_lix(storage.clone(), MigrationOptions::default())
         .await
         .expect("migration retry should be idempotent");
-    assert_eq!(retry.from_version, 72);
-    assert_eq!(retry.to_version, 72);
+    assert_eq!(retry.from_version, 73);
+    assert_eq!(retry.to_version, 73);
     assert_eq!(retry.changes_rewritten, 0);
 
     let migrated_snapshot = storage

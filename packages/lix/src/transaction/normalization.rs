@@ -651,7 +651,7 @@ pub(crate) fn remember_pending_registered_schema(
         validate_lix_schema(registered_schema_definition, snapshot)?;
     }
     let (key, schema) = schema_from_registered_snapshot(snapshot)?;
-    reject_reserved_schema_namespace(&key)?;
+    reject_reserved_schema_namespace_unless_exact_builtin(&key, &schema)?;
     validate_lix_schema_definition(&schema)?;
     schema_catalog.insert_schema_for_domain(domain, key, schema)?;
     Ok(())
@@ -671,6 +671,20 @@ pub(crate) fn reject_reserved_schema_namespace(key: &SchemaKey) -> Result<(), Li
     .with_hint(
         "Choose an application-owned schema key outside the reserved `lix` and `lix_*` namespace, for example `acme_task`.",
     ))
+}
+
+/// The offline repository migration persists an engine-owned schema through
+/// the ordinary schema-amendment transaction path. Permit only the exact
+/// bundled definition; arbitrary runtime schemas remain excluded from the
+/// reserved namespace.
+pub(crate) fn reject_reserved_schema_namespace_unless_exact_builtin(
+    key: &SchemaKey,
+    schema: &JsonValue,
+) -> Result<(), LixError> {
+    if crate::schema::seed_schema_definition(&key.schema_key) == Some(schema) {
+        return Ok(());
+    }
+    reject_reserved_schema_namespace(key)
 }
 
 #[cfg(test)]

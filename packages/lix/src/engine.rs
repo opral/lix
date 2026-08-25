@@ -151,6 +151,29 @@ where
         storage: StorageImpl,
         options: EngineOptions,
     ) -> Result<Self, LixError> {
+        Self::new_with_options_for_migration(storage, options, None).await
+    }
+
+    /// Opens the immediately preceding layout only for an explicit offline
+    /// migration whose edge changes logical repository data but not physical
+    /// storage decoding. Normal engine construction remains protocol-gated.
+    pub(crate) async fn new_for_migration(
+        storage: StorageImpl,
+        source_version: u32,
+    ) -> Result<Self, LixError> {
+        Self::new_with_options_for_migration(
+            storage,
+            EngineOptions::new(),
+            Some(source_version),
+        )
+        .await
+    }
+
+    async fn new_with_options_for_migration(
+        storage: StorageImpl,
+        options: EngineOptions,
+        migration_source_version: Option<u32>,
+    ) -> Result<Self, LixError> {
         let span = options.telemetry.as_ref().and_then(|sink| {
             ActiveTelemetrySpan::start_if_enabled(sink, &ENGINE_OPEN, Vec::new())
         });
@@ -172,7 +195,12 @@ where
                 commit_graph,
             ));
             let branch_ctx = Arc::new(BranchContext::new());
-            let lix_id = assert_initialized(storage.clone(), hot_state.as_ref()).await?;
+            let lix_id = assert_initialized(
+                storage.clone(),
+                hot_state.as_ref(),
+                migration_source_version,
+            )
+            .await?;
 
             // SessionContext::execute later projects these stable state contexts into one
             // execution-scoped SQL context, optionally wrapped by a transaction
@@ -294,27 +322,46 @@ where
             let active_branch_id = active_branch_id.into();
             let active_account_id = active_account_id.into();
             self.validate_active_account(&active_account_id).await?;
-            Ok(SessionContext::new(
-                SessionBranch::new(active_branch_id),
-                active_account_id,
-                self.storage(),
-                Arc::clone(&self.hot_state),
-                Arc::clone(&self.tracked_state),
-                Arc::clone(&self.binary_cas),
-                Arc::clone(&self.branch_ctx),
-                Arc::clone(&self.catalog_context),
-                Arc::clone(&self.sql_planning_cache),
-                Arc::clone(&self.deterministic_runtime_gate),
-                Arc::clone(&self.collaboration_write_gate),
-                Arc::clone(&self.commit_coordinator),
-                Arc::clone(&self.observe_coordinator),
-                Arc::clone(&self.observe_invalidation),
-                self.sync_mode.clone(),
-                self.plugin_host.clone(),
-                self.telemetry.clone(),
-            ))
+            Ok(self.session_at_unchecked(active_branch_id, active_account_id))
         })
         .await
+    }
+
+    /// Constructs the maintenance session needed to amend a historical
+    /// account schema before historical account payloads can be projected by
+    /// the current built-in definition. Only the explicit v72 migration uses
+    /// this path; ordinary sessions always validate their active account.
+    pub(crate) fn open_session_at_for_migration(
+        &self,
+        active_branch_id: impl Into<String>,
+    ) -> SessionContext<StorageImpl> {
+        self.session_at_unchecked(active_branch_id.into(), crate::SYSTEM_ACCOUNT_ID.to_owned())
+    }
+
+    fn session_at_unchecked(
+        &self,
+        active_branch_id: String,
+        active_account_id: String,
+    ) -> SessionContext<StorageImpl> {
+        SessionContext::new(
+            SessionBranch::new(active_branch_id),
+            active_account_id,
+            self.storage(),
+            Arc::clone(&self.hot_state),
+            Arc::clone(&self.tracked_state),
+            Arc::clone(&self.binary_cas),
+            Arc::clone(&self.branch_ctx),
+            Arc::clone(&self.catalog_context),
+            Arc::clone(&self.sql_planning_cache),
+            Arc::clone(&self.deterministic_runtime_gate),
+            Arc::clone(&self.collaboration_write_gate),
+            Arc::clone(&self.commit_coordinator),
+            Arc::clone(&self.observe_coordinator),
+            Arc::clone(&self.observe_invalidation),
+            self.sync_mode.clone(),
+            self.plugin_host.clone(),
+            self.telemetry.clone(),
+        )
     }
 
     pub(crate) async fn open_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
@@ -520,30 +567,41 @@ where
 async fn assert_initialized<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
     hot_state: &HotStateContext,
+    migration_source_version: Option<u32>,
 ) -> Result<Arc<str>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let read =
         SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
-    match crate::init::repository_protocol_status(&read).await? {
+    let protocol_status = crate::init::repository_protocol_status(&read).await?;
+    let protocol_accepted = protocol_status == crate::init::RepositoryProtocolStatus::Current
+        || matches!(
+            protocol_status,
+            crate::init::RepositoryProtocolStatus::MigrationRequired { found_version }
+                if migration_source_version == Some(found_version)
+        );
+    if protocol_accepted {
         // The protocol check must precede the live-state read: tracked-head
         // spaces keep their physical IDs across hard layout cuts, so an old
         // group value could otherwise be decoded before we reject it.
+        let reader = hot_state.reader(read);
+        let row = reader
+            .load_row(&HotStateRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                row_pk: RowPk::single("lix_id"),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await?;
+        return match row {
+            Some(row) => lix_id_from_snapshot(row.snapshot_content.as_deref()),
+            None => Err(not_initialized_error()),
+        };
+    }
+    match protocol_status {
         crate::init::RepositoryProtocolStatus::Current => {
-            let reader = hot_state.reader(read);
-            let row = reader
-                .load_row(&HotStateRowRequest {
-                    schema_key: "lix_key_value".to_string(),
-                    branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    row_pk: RowPk::single("lix_id"),
-                    file_id: NullableKeyFilter::Null,
-                })
-                .await?;
-            match row {
-                Some(row) => lix_id_from_snapshot(row.snapshot_content.as_deref()),
-                None => Err(not_initialized_error()),
-            }
+            unreachable!("current protocol status was accepted above")
         }
         crate::init::RepositoryProtocolStatus::MigrationRequired { found_version } => {
             Err(crate::init::migration_required_error(found_version))

@@ -248,6 +248,11 @@ impl CompiledSchema {
         self.columns.get(name).map(|column| column.data_type)
     }
 
+    /// Whether a declared column accepts SQL `NULL`.
+    pub fn column_nullable(&self, name: &str) -> Option<bool> {
+        self.columns.get(name).map(|column| column.nullable)
+    }
+
     /// Materializes Schema v1 defaults directly into a native row.
     pub fn apply_defaults(
         &self,
