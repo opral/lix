@@ -9302,15 +9302,17 @@ fn diff_command_source_commits(
                         )),
                     },
                     SqlExpr::Function(function) if matches!(&function.args, FunctionArguments::List(arguments) if arguments.args.is_empty()) => {
-                        if crate::sql2::parse::object_name_is_public_function(
-                            &function.name,
-                            "lix_root_commit_id",
-                        ) {
+                        if function
+                            .name
+                            .to_string()
+                            .eq_ignore_ascii_case("lix_root_commit_id")
+                        {
                             Ok(DiffCommandSourceCommit::Root)
-                        } else if crate::sql2::parse::object_name_is_public_function(
-                            &function.name,
-                            "lix_active_branch_commit_id",
-                        ) {
+                        } else if function
+                            .name
+                            .to_string()
+                            .eq_ignore_ascii_case("lix_active_branch_commit_id")
+                        {
                             Ok(DiffCommandSourceCommit::ActiveHead)
                         } else {
                             Err(LixError::new(
