@@ -9,6 +9,10 @@ on:
       - main
       - master
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -33,6 +37,9 @@ jobs:
 
       - name: Validate server protocol docs
         run: node scripts/validate-server-protocol-docs.mjs
+
+      - name: Validate CI workflow invariants
+        run: node --test scripts/ci-workflow.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
@@ -68,8 +75,19 @@ jobs:
         include:
           - name: Clippy
             task: clippy
+            workspace: .
           - name: Test
             task: test
+            workspace: .
+            junit: target/nextest/ci/junit.xml
+          - name: Tooling Test
+            task: tooling
+            workspace: tooling
+            junit: tooling/target/nextest/ci/junit.xml
+          - name: E2E Test
+            task: e2e
+            workspace: tooling
+            junit: tooling/target/nextest/ci-e2e/junit.xml
 
     steps:
       - name: Checkout repository
@@ -101,7 +119,7 @@ jobs:
           sudo apt-get install -y llvm-dev libclang-dev clang mold
 
       - name: Install cargo-nextest
-        if: matrix.task == 'test'
+        if: matrix.task != 'clippy'
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -113,8 +131,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: cargo-${{ matrix.task }}
-          workspaces: |
-            . -> target
+          workspaces: ${{ matrix.workspace }}
           cache-targets: true
           cache-workspace-crates: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -133,7 +150,8 @@ jobs:
         if: matrix.task == 'clippy'
         run: |
           cargo clippy --profile test --workspace --all-targets --all-features -- -D warnings
-          cargo clippy --locked --manifest-path tooling/Cargo.toml --profile test --workspace --all-targets --all-features -- -D warnings
+          cargo clippy --locked --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-targets --all-features -- -D warnings
+          cargo clippy --locked --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --all-targets --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace,system-allocation-profiler -- -D warnings
 
       # The one supported configuration nothing else here builds: `cfg(test)`
       # with `storage-benches` OFF, which is exactly what a plain
@@ -198,37 +216,46 @@ jobs:
         # the second sat invisible behind the first for hours because CI could
         # only ever report one.
         if: matrix.task == 'test'
-        run: |
-          cargo nextest run --config-file .config/nextest.toml --profile ci --cargo-profile test --workspace --all-features --timings
-          cargo nextest run --config-file .config/nextest.toml --profile ci --locked --manifest-path tooling/Cargo.toml --cargo-profile test --workspace --exclude lix_e2e --all-features --timings
-          cargo nextest run --config-file .config/nextest.toml --profile ci-e2e --locked --manifest-path tooling/Cargo.toml --cargo-profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --timings
+        run: cargo nextest run --config-file .config/nextest.toml --profile ci --cargo-profile test --workspace --all-features --lib --tests --timings
+
+      - name: Run Rust tooling tests with nextest
+        if: matrix.task == 'tooling'
+        run: cargo nextest run --config-file .config/nextest.toml --profile ci --locked --manifest-path tooling/Cargo.toml --cargo-profile test --workspace --exclude lix_e2e --all-features --lib --tests --timings
+
+      # Cargo's default test target selection also compiles every example even
+      # though nextest cannot execute their main functions. The e2e package has
+      # 30 examples; explicitly selecting tests avoids rebuilding all 30 while
+      # Clippy above still checks their compilation. This package has no library
+      # target, so passing --lib would fail before any tests could run.
+      - name: Run Rust E2E tests with nextest
+        if: matrix.task == 'e2e'
+        run: cargo nextest run --config-file .config/nextest.toml --profile ci-e2e --locked --manifest-path tooling/Cargo.toml --cargo-profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --tests --timings
 
       - name: Upload Rust test timing reports
-        if: matrix.task == 'test' && !cancelled()
+        if: matrix.task != 'clippy' && !cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: rust-nextest-junit
-          path: |
-            target/nextest/ci/junit.xml
-            tooling/target/nextest/ci/junit.xml
-            tooling/target/nextest/ci-e2e/junit.xml
+          name: rust-nextest-junit-${{ matrix.task }}
+          path: ${{ matrix.junit }}
           if-no-files-found: error
 
       - name: Upload Cargo build timings
-        if: matrix.task == 'test' && !cancelled()
+        if: matrix.task != 'clippy' && !cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: rust-cargo-timings
-          path: target/cargo-timings/*.html
+          name: rust-cargo-timings-${{ matrix.task }}
+          path: ${{ matrix.workspace }}/target/cargo-timings/*.html
           if-no-files-found: warn
 
       # Nextest deliberately does not execute rustdoc tests. Keep their Cargo
       # feature/package scopes aligned with the nextest runs above.
       - name: Run Rust doctests
         if: matrix.task == 'test'
-        run: |
-          cargo test --doc --profile test --workspace --all-features --no-fail-fast
-          cargo test --doc --locked --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
+        run: cargo test --doc --profile test --workspace --all-features --no-fail-fast
+
+      - name: Run Rust tooling doctests
+        if: matrix.task == 'tooling'
+        run: cargo test --doc --locked --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-features --no-fail-fast
 
       # The e2e test compilation above already builds the real workspace plugin
       # artifacts. This one external fixture covers the distinct risk: whether
