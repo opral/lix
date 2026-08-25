@@ -21,6 +21,10 @@ const MIGRATIONS: &[Migration] = &[
         from_version: 70,
         to_version: 71,
     },
+    Migration {
+        from_version: 71,
+        to_version: 72,
+    },
 ];
 
 pub(crate) fn registered_migrations() -> &'static [Migration] {
@@ -60,7 +64,14 @@ mod tests {
                 to_version: 71,
             })
         );
-        assert_eq!(registered_migrations().len(), 3);
+        assert_eq!(
+            migration_from(71),
+            Some(&Migration {
+                from_version: 71,
+                to_version: 72,
+            })
+        );
+        assert_eq!(registered_migrations().len(), 4);
         assert_eq!(migration_from(crate::init::CURRENT_FORMAT_VERSION), None);
     }
 }

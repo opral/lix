@@ -3,7 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 
 use crate::LixError;
-use crate::branch::BranchHeadControlContext;
+use crate::branch::{
+    BranchHeadControlContext, branch_head_control_precondition, stage_branch_head_control,
+};
+use crate::hot_state::{
+    CompleteWorkingDiffMode, HotTrackedSnapshot, TrackedHeadContext, TrackedWorkingDiffEpoch,
+    WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
+};
 use crate::init::{
     CURRENT_FORMAT_VERSION, REPOSITORY_PROTOCOL_KEY, REPOSITORY_PROTOCOL_SPACE,
     RepositoryProtocolStatus, parse_repository_protocol,
@@ -14,8 +20,10 @@ use crate::storage_adapter::{
     StoragePrecondition as Precondition, StorageProjectedValue as ProjectedValue, StorageRead,
     StorageReadOptions as ReadOptions, StorageWrite, StorageWriteOptions as WriteOptions,
 };
+use crate::storage_adapter::StorageWriteOptions as AdapterWriteOptions;
 use crate::tracked_state::{
-    CommitStateReplayDebt, TrackedStateContext,
+    CommitStateReplayDebt, TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
+    TrackedStateScanRequest,
     encode_commit_state_manifest_replacement_for_migration,
     load_rebuild_plans_to_nearest_available_root_bounded, stage_rebuild_plan_with_writer,
 };
@@ -23,6 +31,7 @@ use crate::tracked_state::{
 const REPOSITORY_PROTOCOL_V68: &[u8] = b"tracked-default-branch.v68";
 const REPOSITORY_PROTOCOL_V69: &[u8] = b"tracked-default-branch.v69";
 const REPOSITORY_PROTOCOL_V70: &[u8] = b"tracked-default-branch.v70";
+const REPOSITORY_PROTOCOL_V71: &[u8] = b"tracked-default-branch.v71";
 
 /// Bounds for explicit offline repository migrations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,7 +148,7 @@ where
         .map_err(storage_error)?;
     let from_version = match crate::init::repository_protocol_status(&read).await? {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (68 | 69 | 70),
+            found_version: found_version @ (68 | 69 | 70 | 71),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -179,21 +188,25 @@ where
             )
             .await?;
         }
-        promote_chronology_roots(
-            &adapter,
-            &storage,
-            options,
-            70,
-            REPOSITORY_PROTOCOL_V70,
-            crate::init::REPOSITORY_PROTOCOL_VALUE,
-        )
-        .await?;
+        if from_version <= 70 {
+            promote_chronology_roots(
+                &adapter,
+                &storage,
+                options,
+                70,
+                REPOSITORY_PROTOCOL_V70,
+                REPOSITORY_PROTOCOL_V71,
+            )
+            .await?;
+        }
+        let hot_rows_rewritten =
+            migrate_v71_working_diff_epochs(&adapter, &storage, options).await?;
         return Ok(MigrationReport {
             from_version,
             to_version: CURRENT_FORMAT_VERSION,
             changes_rewritten: 0,
             commit_members_rewritten: 0,
-            hot_rows_rewritten: 0,
+            hot_rows_rewritten,
         });
     }
     let expected_revision =
@@ -279,16 +292,216 @@ where
         options,
         70,
         REPOSITORY_PROTOCOL_V70,
-        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        REPOSITORY_PROTOCOL_V71,
     )
     .await?;
+    let migrated_hot_rows = migrate_v71_working_diff_epochs(&adapter, &storage, options).await?;
     Ok(MigrationReport {
         from_version: 68,
         to_version: CURRENT_FORMAT_VERSION,
         changes_rewritten,
         commit_members_rewritten: commit_plan.member_count,
-        hot_rows_rewritten,
+        hot_rows_rewritten: hot_rows_rewritten.saturating_add(migrated_hot_rows),
     })
+}
+
+/// Moves the former session-open compatibility repair into the explicit
+/// offline repository migration. Once the v72 marker is published, opening a
+/// client session only allocates session state and never repairs storage.
+async fn migrate_v71_working_diff_epochs<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+    storage: &S,
+    options: MigrationOptions,
+) -> Result<u64, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let read = SharedStorageAdapterRead::new(
+        adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?,
+    );
+    match crate::init::repository_protocol_status(&read).await? {
+        RepositoryProtocolStatus::MigrationRequired { found_version: 71 } => {}
+        status => {
+            return Err(migration_error(format!(
+                "v71 working-diff migration observed unexpected repository status {status:?}"
+            )));
+        }
+    }
+    let branch_ids = BranchHeadControlContext::new()
+        .reader(read.clone())
+        .scan()
+        .await?
+        .into_iter()
+        .map(|(branch_id, _)| branch_id)
+        .collect::<Vec<_>>();
+    if branch_ids.len() > options.max_changes {
+        return Err(LixError::new(
+            "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+            format!(
+                "v71 working-diff migration exceeds configured branch bound: {} branches",
+                branch_ids.len()
+            ),
+        ));
+    }
+    read.finish().map_err(storage_error)?;
+
+    let mut hot_rows_rewritten = 0_u64;
+    for branch_id in branch_ids {
+        hot_rows_rewritten = hot_rows_rewritten
+            .saturating_add(migrate_working_diff_epoch(adapter, &branch_id).await?);
+    }
+
+    let read = SharedStorageAdapterRead::new(
+        adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?,
+    );
+    let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+        .await
+        .map_err(storage_error)?;
+    read.finish().map_err(storage_error)?;
+    crate::migration::publish::publish(
+        storage,
+        expected_revision,
+        REPOSITORY_PROTOCOL_V71,
+        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        crate::migration::publish::PublicationPlan::bounded(0, 0),
+    )
+    .await?;
+    Ok(hot_rows_rewritten)
+}
+
+async fn migrate_working_diff_epoch<S>(
+    storage: &crate::storage_adapter::StorageAdapter<S>,
+    branch_id: &str,
+) -> Result<u64, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let read = SharedStorageAdapterRead::new(
+        storage
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?,
+    );
+    let mut observations = BranchHeadControlContext::new()
+        .reader(read.clone())
+        .load_observed(&[branch_id.to_owned()])
+        .await?;
+    let observation = observations
+        .pop()
+        .expect("one requested branch produces one observation");
+    let Some(mut control) = observation.control else {
+        return Ok(0);
+    };
+    let Some(checkpoint_commit_id) = control.working_diff_checkpoint_commit_id else {
+        return Ok(0);
+    };
+    let epoch = TrackedHeadContext::new()
+        .reader(read.clone())
+        .working_diff_epoch(branch_id)
+        .await?;
+    if epoch.as_ref().is_some_and(|epoch| {
+        epoch.checkpoint_commit_id == checkpoint_commit_id
+            && epoch.generation == control.tracked_generation
+    }) {
+        return Ok(0);
+    }
+
+    let current = load_migration_hot_snapshot(&read, branch_id, control.head_commit_id).await?;
+    let hot_rows_rewritten = current.len() as u64;
+    let checkpoint =
+        load_migration_hot_snapshot(&read, branch_id, checkpoint_commit_id).await?;
+    let generation = crate::changelog::CommitId::with_change_address_space(uuid::Uuid::now_v7());
+    let mut coverage = WorkingDiffIndexCoverage::default();
+    let mut writes = storage.new_write_set();
+    let (_, schema_keys) = TrackedHeadContext::new()
+        .writer(&read, &mut writes)
+        .stage_complete_current_state_with_working_diff(
+            branch_id,
+            generation,
+            current,
+            Some(control.tracked_generation),
+            &[],
+            &[],
+            &BTreeSet::new(),
+            if control.head_commit_id == checkpoint_commit_id {
+                CompleteWorkingDiffMode::ResetClean
+            } else {
+                CompleteWorkingDiffMode::Rebase {
+                    checkpoint_commit_id,
+                    checkpoint,
+                }
+            },
+            &mut coverage,
+        )
+        .await?;
+    stage_tracked_working_diff_epoch(
+        &mut writes,
+        branch_id,
+        TrackedWorkingDiffEpoch {
+            checkpoint_commit_id,
+            generation,
+            coverage,
+        },
+    )?;
+    control.tracked_generation = generation;
+    control.current_state_revision = control
+        .current_state_revision
+        .checked_add(1)
+        .ok_or_else(|| migration_error("branch current-state revision overflowed"))?;
+    control.reset_schema_presence();
+    control.note_schemas(schema_keys.iter().map(String::as_str));
+    stage_branch_head_control(&mut writes, branch_id, control)?;
+    let preconditions = vec![branch_head_control_precondition(
+        branch_id,
+        observation.raw_token,
+    )?];
+    read.finish().map_err(storage_error)?;
+    storage
+        .commit_write_set(
+            writes,
+            AdapterWriteOptions {
+                preconditions,
+                ..AdapterWriteOptions::default()
+            },
+        )
+        .await
+        .map(|_| hot_rows_rewritten)
+        .map_err(LixError::from)
+}
+
+async fn load_migration_hot_snapshot(
+    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    commit_id: crate::changelog::CommitId,
+) -> Result<HotTrackedSnapshot, LixError> {
+    let rows = TrackedStateContext::new()
+        .reader(read)
+        .scan_batch_at_commit(
+            &commit_id.to_string(),
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns::default(),
+                limit: None,
+            },
+        )
+        .await?
+        .into_rows()
+        .into_iter()
+        .filter(|row| {
+            branch_id == crate::GLOBAL_BRANCH_ID
+                || row.schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
+        })
+        .collect();
+    HotTrackedSnapshot::from_materialized_rows(rows)
 }
 
 /// Promotes every distinct live branch chronology root to a durable root.
@@ -512,6 +725,9 @@ fn migration_error(message: impl Into<String>) -> LixError {
 mod tests {
     use super::*;
     use crate::changelog::CommitId;
+    use crate::hot_state::{
+        TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
+    };
     use crate::storage::{Memory, StorageWrite, WriteOptions};
     use crate::storage_adapter::{PutBatch, PutEntry, StorageValue};
     use crate::tracked_state::TrackedStateRootId;
@@ -555,7 +771,7 @@ mod tests {
     async fn seed_rooted_head_with_rootless_checkpoint_cursor(
         storage: &Memory,
         protocol: &'static [u8],
-    ) -> (CommitId, CommitId, TrackedStateRootId) {
+    ) -> (String, CommitId, CommitId, TrackedStateRootId) {
         let lix = crate::open_lix()
             .with_storage(storage.clone())
             .await
@@ -577,13 +793,13 @@ mod tests {
             .scan()
             .await
             .unwrap();
-        let mut candidates = controls.into_iter().filter_map(|(_, control)| {
+        let mut candidates = controls.into_iter().filter_map(|(branch_id, control)| {
             control
                 .working_diff_checkpoint_commit_id
                 .filter(|checkpoint_commit_id| *checkpoint_commit_id != control.head_commit_id)
-                .map(|_| control)
+                .map(|_| (branch_id, control))
         });
-        let control = candidates
+        let (branch_id, control) = candidates
             .next()
             .expect("fixture should have one branch with a distinct checkpoint cursor");
         assert!(
@@ -658,7 +874,12 @@ mod tests {
             .unwrap();
         fixture.commit().await.unwrap();
 
-        (head_commit_id, checkpoint_commit_id, head_root_id)
+        (
+            branch_id,
+            head_commit_id,
+            checkpoint_commit_id,
+            head_root_id,
+        )
     }
 
     async fn assert_chronology_roots_promoted(
@@ -699,7 +920,7 @@ mod tests {
     #[tokio::test]
     async fn v69_promotion_roots_head_and_distinct_checkpoint_cursor_before_v70() {
         let storage = Memory::new();
-        let (head_commit_id, checkpoint_commit_id, head_root_id) =
+        let (_branch_id, head_commit_id, checkpoint_commit_id, head_root_id) =
             seed_rooted_head_with_rootless_checkpoint_cursor(
                 &storage,
                 REPOSITORY_PROTOCOL_V69,
@@ -720,7 +941,7 @@ mod tests {
             inspect_lix(&storage).await.unwrap(),
             MigrationStatus::Required {
                 from_version: 70,
-                to_version: 71,
+                to_version: 72,
             }
         );
         assert_chronology_roots_promoted(
@@ -745,25 +966,56 @@ mod tests {
     #[tokio::test]
     async fn v70_repair_promotes_distinct_rootless_checkpoint_cursor() {
         let storage = Memory::new();
-        let (head_commit_id, checkpoint_commit_id, head_root_id) =
+        let (branch_id, head_commit_id, checkpoint_commit_id, head_root_id) =
             seed_rooted_head_with_rootless_checkpoint_cursor(
                 &storage,
                 REPOSITORY_PROTOCOL_V70,
             )
             .await;
 
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        promote_chronology_roots(
+            &adapter,
+            &storage,
+            MigrationOptions::default(),
+            70,
+            REPOSITORY_PROTOCOL_V70,
+            REPOSITORY_PROTOCOL_V71,
+        )
+        .await
+        .unwrap();
+        let mut stale_epoch = adapter.new_write_set();
+        stage_tracked_working_diff_epoch(
+            &mut stale_epoch,
+            &branch_id,
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id,
+                generation: CommitId::with_change_address_space(uuid::Uuid::now_v7()),
+                coverage: WorkingDiffIndexCoverage::default(),
+            },
+        )
+        .unwrap();
+        adapter
+            .commit_write_set(stale_epoch, Default::default())
+            .await
+            .unwrap();
+
         assert_eq!(
             inspect_lix(&storage).await.unwrap(),
             MigrationStatus::Required {
-                from_version: 70,
-                to_version: 71,
+                from_version: 71,
+                to_version: 72,
             }
         );
         let report = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
             .unwrap();
-        assert_eq!(report.from_version, 70);
-        assert_eq!(report.to_version, 71);
+        assert_eq!(report.from_version, 71);
+        assert_eq!(report.to_version, 72);
+        assert!(
+            report.hot_rows_rewritten > 0,
+            "the v71 edge must repair the stale working-diff epoch before publishing v72"
+        );
         assert_chronology_roots_promoted(
             &storage,
             head_commit_id,

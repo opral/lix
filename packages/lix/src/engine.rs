@@ -1,19 +1,12 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::BinaryCasContext;
-use crate::branch::{
-    BranchContext, BranchHeadControlContext, BranchRefReader, branch_head_control_precondition,
-    stage_branch_head_control,
-};
+use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
-use crate::hot_state::{
-    CompleteWorkingDiffMode, HotStateContext, HotTrackedSnapshot, TrackedHeadContext,
-    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
-};
+use crate::hot_state::HotStateContext;
 use crate::hot_state::HotStateRowRequest;
 use crate::init::InitReceipt;
 use crate::observe_coordinator::ObserveCoordinator;
@@ -28,16 +21,14 @@ use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection, StoragePrefix,
-    StorageError, StorageReadOptions, StorageWriteOptions, StorageWriteSetError,
+    StorageReadOptions, StorageWriteOptions,
 };
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::sync::SyncModeState;
 use crate::telemetry::{
     ActiveTelemetrySpan, ENGINE_OPEN, SESSION_OPEN, TelemetrySink, instrument_lix_result,
 };
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
-};
+use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
 use crate::{LixError, NullableKeyFilter};
 
@@ -303,8 +294,6 @@ where
             let active_branch_id = active_branch_id.into();
             let active_account_id = active_account_id.into();
             self.validate_active_account(&active_account_id).await?;
-            self.repair_stale_working_diff_epoch(&active_branch_id)
-                .await?;
             Ok(SessionContext::new(
                 SessionBranch::new(active_branch_id),
                 active_account_id,
@@ -355,8 +344,6 @@ where
             )
             .await?;
             drop(read);
-            self.repair_stale_working_diff_epoch(&active_branch_id)
-                .await?;
             Ok(SessionContext::new(
                 SessionBranch::new(active_branch_id),
                 active_account_id,
@@ -411,159 +398,6 @@ where
         let close_result = system.close().await;
         execute_result?;
         close_result
-    }
-
-    /// Repairs the private working-diff projection produced by the former
-    /// partial-checkpoint publication path. The branch control is the durable
-    /// authority for `(head, checkpoint)`; HOT rows and their sparse epoch are
-    /// derived serving state, so rebuilding them does not alter repository
-    /// history or any public API surface.
-    async fn repair_stale_working_diff_epoch(&self, branch_id: &str) -> Result<(), LixError> {
-        // Healthy session opens must not serialize behind writes or sync
-        // imports. Read the two private coordinates optimistically and take
-        // the write gate only when repair may actually be necessary.
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let control = BranchHeadControlContext::new()
-            .reader(read.clone())
-            .load(branch_id)
-            .await?;
-        let Some(control) = control else {
-            return Ok(());
-        };
-        let Some(checkpoint_commit_id) = control.working_diff_checkpoint_commit_id else {
-            return Ok(());
-        };
-        let epoch = TrackedHeadContext::new()
-            .reader(read)
-            .working_diff_epoch(branch_id)
-            .await?;
-        if epoch.as_ref().is_some_and(|epoch| {
-            epoch.checkpoint_commit_id == checkpoint_commit_id
-                && epoch.generation == control.tracked_generation
-        }) {
-            return Ok(());
-        }
-
-        let _write_guard = self.collaboration_write_gate.lock().await;
-        for _attempt in 0..3 {
-            let read = SharedStorageAdapterRead::new(
-                self.storage
-                    .begin_read(StorageReadOptions::default())
-                    .await?,
-            );
-            let mut observations = BranchHeadControlContext::new()
-                .reader(read.clone())
-                .load_observed(&[branch_id.to_owned()])
-                .await?;
-            let observation = observations
-                .pop()
-                .expect("one requested branch produces one observation");
-            let Some(mut control) = observation.control else {
-                return Ok(());
-            };
-            let Some(checkpoint_commit_id) = control.working_diff_checkpoint_commit_id else {
-                return Ok(());
-            };
-            let epoch = TrackedHeadContext::new()
-                .reader(read.clone())
-                .working_diff_epoch(branch_id)
-                .await?;
-            if epoch.as_ref().is_some_and(|epoch| {
-                epoch.checkpoint_commit_id == checkpoint_commit_id
-                    && epoch.generation == control.tracked_generation
-            }) {
-                return Ok(());
-            }
-
-            let current = load_repair_hot_snapshot(
-                &read,
-                branch_id,
-                control.head_commit_id,
-            )
-            .await?;
-            let checkpoint = load_repair_hot_snapshot(
-                &read,
-                branch_id,
-                checkpoint_commit_id,
-            )
-            .await?;
-            let generation = crate::changelog::CommitId::with_change_address_space(
-                uuid::Uuid::now_v7(),
-            );
-            let mut coverage = WorkingDiffIndexCoverage::default();
-            let mut writes = self.storage.new_write_set();
-            let (_, schema_keys) = TrackedHeadContext::new()
-                .writer(&read, &mut writes)
-                .stage_complete_current_state_with_working_diff(
-                    branch_id,
-                    generation,
-                    current,
-                    Some(control.tracked_generation),
-                    &[],
-                    &[],
-                    &BTreeSet::new(),
-                    if control.head_commit_id == checkpoint_commit_id {
-                        CompleteWorkingDiffMode::ResetClean
-                    } else {
-                        CompleteWorkingDiffMode::Rebase {
-                            checkpoint_commit_id,
-                            checkpoint,
-                        }
-                    },
-                    &mut coverage,
-                )
-                .await?;
-            stage_tracked_working_diff_epoch(
-                &mut writes,
-                branch_id,
-                TrackedWorkingDiffEpoch {
-                    checkpoint_commit_id,
-                    generation,
-                    coverage,
-                },
-            )?;
-            control.tracked_generation = generation;
-            control.current_state_revision = control
-                .current_state_revision
-                .checked_add(1)
-                .ok_or_else(|| LixError::unknown("branch current-state revision overflowed"))?;
-            control.reset_schema_presence();
-            control.note_schemas(schema_keys.iter().map(String::as_str));
-            stage_branch_head_control(&mut writes, branch_id, control)?;
-            let preconditions = vec![branch_head_control_precondition(
-                branch_id,
-                observation.raw_token,
-            )?];
-            drop(read);
-            match self
-                .storage
-                .commit_write_set(
-                    writes,
-                    StorageWriteOptions {
-                        preconditions,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) => {
-                    self.observe_invalidation.bump();
-                    return Ok(());
-                }
-                Err(StorageWriteSetError::Storage(
-                    StorageError::WriteConflict | StorageError::PreconditionFailed(_),
-                )) => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(LixError::new(
-            LixError::CODE_TRANSACTION_CONFLICT,
-            format!("branch '{branch_id}' changed while repairing its working-diff epoch"),
-        ))
     }
 
     /// Rebuilds the tracked serving commit root for one branch from changelog.
@@ -681,35 +515,6 @@ where
         }
         Ok(())
     }
-}
-
-async fn load_repair_hot_snapshot(
-    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    commit_id: crate::changelog::CommitId,
-) -> Result<HotTrackedSnapshot, LixError> {
-    let rows = TrackedStateContext::new()
-        .reader(read)
-        .scan_batch_at_commit(
-            &commit_id.to_string(),
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    include_tombstones: true,
-                    ..TrackedStateFilter::default()
-                },
-                read_columns: TrackedStateReadColumns::default(),
-                limit: None,
-            },
-        )
-        .await?
-        .into_rows()
-        .into_iter()
-        .filter(|row| {
-            branch_id == GLOBAL_BRANCH_ID
-                || row.schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
-        })
-        .collect();
-    HotTrackedSnapshot::from_materialized_rows(rows)
 }
 
 async fn assert_initialized<StorageImpl>(
