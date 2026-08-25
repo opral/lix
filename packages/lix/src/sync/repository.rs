@@ -2449,9 +2449,12 @@ where
         };
         if self.load_sync_repository_cursor(remote_id).await?.is_some() {
             return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "sync snapshot can only initialize a cursor-less replica",
-            ));
+                LixError::CODE_STORAGE_READ_EXPIRED,
+                "the sync bootstrap snapshot was invalidated by another opener",
+            )
+            .with_details(serde_json::json!({
+                "retryable": true,
+            })));
         }
         self.install_sync_snapshot(
             remote_id,
@@ -6877,6 +6880,71 @@ mod tests {
             .await
             .expect("snapshot should initialize replica");
         replica
+    }
+
+    #[tokio::test]
+    async fn second_bootstrap_snapshot_restarts_repository_open() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (branch_id, _) = default_head(&snapshot);
+        let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
+        let storage = Memory::new();
+        Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
+            .await
+            .expect("replica storage should initialize");
+        let first_opener = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("first opener should open");
+        first_opener
+            .set_sync_role(super::super::SyncRole::Replica)
+            .expect("replica role should install");
+        first_opener
+            .apply_sync_repository_snapshot(
+                TEST_REMOTE,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                &snapshot,
+                &history.commits,
+                &history.commit_headers,
+                &rows,
+                &checkpoint_roots,
+            )
+            .await
+            .expect("first opener should initialize the replica");
+
+        let second_opener = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("second opener should open the shared storage");
+        second_opener
+            .set_sync_role(super::super::SyncRole::Replica)
+            .expect("replica role should install");
+        let error = second_opener
+            .apply_sync_repository_snapshot(
+                TEST_REMOTE,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                &snapshot,
+                &history.commits,
+                &history.commit_headers,
+                &rows,
+                &checkpoint_roots,
+            )
+            .await
+            .expect_err("a stale concurrent bootstrap must restart repository open");
+
+        assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({
+                "retryable": true,
+            }))
+        );
     }
 
     async fn hydrate_delta_blobs<AuthorityStorage, ReplicaStorage>(
