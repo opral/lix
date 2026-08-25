@@ -581,6 +581,7 @@ struct DiffSqlRow {
 struct DiffSide {
     id: Option<String>,
     schema_key: String,
+    global: bool,
     file_id: Option<String>,
     row_pk: RowPk,
     created_at: String,
@@ -649,6 +650,7 @@ fn diff_side(
     Ok(Some(DiffSide {
         id: single_row_pk_string(entry.identity.row_pk()),
         schema_key: entry.identity.schema_key().to_string(),
+        global: entry.identity.schema_key() == crate::checkpoint::CHECKPOINT_SCHEMA_KEY,
         file_id: entry.identity.file_id().map(str::to_string),
         row_pk: entry.identity.row_pk().clone(),
         created_at: row.created_at.to_string(),
@@ -910,6 +912,7 @@ fn materialized_side(
     Ok(Some(DiffSide {
         id: single_row_pk_string(row.row_pk()),
         schema_key: row.schema_key().to_string(),
+        global: row.schema_key() == crate::checkpoint::CHECKPOINT_SCHEMA_KEY,
         file_id: row.file_id().map(str::to_string),
         row_pk: row.row_pk().clone(),
         created_at: row.created_at().to_string(),
@@ -1073,7 +1076,8 @@ fn side_value(side: Option<&DiffSide>, column: &str) -> Result<Option<lix_schema
         "lixcol_updated_at" => Some(lix_schema::Value::Text(side.updated_at.clone())),
         "lixcol_change_id" => Some(lix_schema::Value::Text(side.change_id.clone())),
         "lixcol_commit_id" => Some(lix_schema::Value::Text(side.commit_id.clone())),
-        "lixcol_global" | "lixcol_untracked" => Some(lix_schema::Value::Boolean(false)),
+        "lixcol_global" => Some(lix_schema::Value::Boolean(side.global)),
+        "lixcol_untracked" => Some(lix_schema::Value::Boolean(false)),
         "lixcol_metadata" => side
             .metadata
             .clone()

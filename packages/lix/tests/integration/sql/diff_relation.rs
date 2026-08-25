@@ -118,6 +118,82 @@ simulation_test!(relation_diff_pairs_schema_columns_and_inverts_sides, |sim| asy
     );
 });
 
+simulation_test!(relation_diff_preserves_global_scope_on_both_sides, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine.open_session().await.expect("session should open"),
+        &engine,
+    );
+    let local_before = sim.initial_commit_id().to_string();
+    let global_before = engine
+        .load_branch_head_commit_id(lix::GLOBAL_BRANCH_ID)
+        .await
+        .expect("global head should load")
+        .expect("global head should exist")
+        .to_string();
+
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('local-scope', 'value')",
+            &[],
+        )
+        .await
+        .expect("branch-local insert should succeed");
+    let local_after = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("local head should load")
+        .expect("local head should exist")
+        .to_string();
+    session
+        .create_checkpoint()
+        .await
+        .expect("checkpoint should publish a global row");
+    let global_after = engine
+        .load_branch_head_commit_id(lix::GLOBAL_BRANCH_ID)
+        .await
+        .expect("updated global head should load")
+        .expect("updated global head should exist")
+        .to_string();
+
+    assert_eq!(
+        select_rows(
+            &session,
+            &format!(
+                "SELECT from_lixcol_global, to_lixcol_global \
+                 FROM lix_diff('lix_checkpoint', '{global_before}', '{global_after}')"
+            ),
+        )
+        .await,
+        vec![vec![Value::Null, Value::Boolean(true)]],
+        "global checkpoint additions preserve the source relation's scope",
+    );
+    assert_eq!(
+        select_rows(
+            &session,
+            &format!(
+                "SELECT from_lixcol_global, to_lixcol_global \
+                 FROM lix_diff('lix_checkpoint', '{global_after}', '{global_before}')"
+            ),
+        )
+        .await,
+        vec![vec![Value::Boolean(true), Value::Null]],
+        "reversing a global checkpoint diff preserves its global before-side",
+    );
+    assert_eq!(
+        select_rows(
+            &session,
+            &format!(
+                "SELECT from_lixcol_global, to_lixcol_global \
+                 FROM lix_diff('lix_key_value', '{local_before}', '{local_after}')"
+            ),
+        )
+        .await,
+        vec![vec![Value::Null, Value::Boolean(false)]],
+        "branch-local relation rows remain local in diff metadata",
+    );
+});
+
 simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
