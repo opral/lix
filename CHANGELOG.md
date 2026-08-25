@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.13.0 - 2026-08-25
+
+### Minor
+
+- Added optional public profile URIs to repository accounts.
+
+  Applications can now associate an account with a machine-readable public profile while keeping authentication and authorization separate from presentation metadata.
+
+  Existing repositories durably add the nullable account column through the v72 to v73 repository migration.
+- Added `lix_commit_ancestry()` for querying commits reachable from the active branch through SQL.
+
+  The table function defaults to the active branch head, accepts an explicit commit anchor, and reports each reachable commit with its shortest ancestry depth.
+- Added `information_schema.lix_surfaces` for discovering whether each public SQL surface is a relation, table function, command sink, or scalar function, including whether a relation is a base or view.
+
+  The catalog also reports read and write capabilities, includes `lix_diff` and `lix_restore`, and classifies composed file, directory, branch, and change relations as views.
+- Configure `OpenTelemetryTracingSink` with an explicit `tracing::Dispatch`.
+
+  The zero-argument constructor was removed. The captured dispatch must contain a `tracing-opentelemetry` layer and now governs both span enablement and creation, independent of ambient task or thread subscribers.
+- Added durable local-first repository sync for `openLix({ storage, server: { mode: "sync" } })`.
+
+  Reads and writes stay local while Lix synchronizes commits with the server in the background. Browser apps can use OPFS for durable offline work. Older history and binary content download only when needed.
+- Moved legacy working-diff repair out of application and protocol session opening and into the explicit offline repository migration. Repository format v72 guarantees current working-diff epochs before the engine opens, so successful handshakes allocate session state without repairing repository storage.
+- Added `@lix-js/storage-opfs`, a durable SQLite Wasm + OPFS storage provider for browser Lix repositories. It supports multiple Lix workers and tabs attaching to the same repository through one package-owned SQLite connection.
+
+  Storage change watches wake `lix.observe()` after commits from another worker or tab, recover missed broadcasts through heartbeat state, and survive owner-tab failover. Lix transparently restarts full read queries when a concurrent commit expires their snapshot.
+
+  Auto-commit mutations and mutation batches also restart as a whole when their planning snapshot expires or optimistic commit validation loses a race. The provider is covered for offline reads and writes, reload and abrupt-tab recovery, branch and repository isolation, divergent local engines, and cross-tab convergence.
+- Centralized first-time sync admission around one durable replica binding and one atomic snapshot installer. Simultaneous opens now restart through the existing whole-open retry path until one publication is durable; aliases cannot claim the same local replica.
+
+  Hard cut: JavaScript sync calls must now pass `storage` (`openLix({ storage, server: { mode: "sync", ... } })`). The implicit volatile Memory fallback no longer type-checks and is rejected at runtime because Memory cannot prove durable bootstrap publication.
+- Replace heterogeneous working diffs with relation-specific commit comparisons and row-based diff commands.
+
+  `lix_diff(relation, from_commit_id, to_commit_id)` now exposes paired before/after relation columns, aggregated file changes, and underlying changed-row counts. Revert, apply, and partial checkpoints select `(relation, row_pk)`; commit parents and the repository root are available through `lix_commit.parent_commit_ids` and `lix_root_commit_id()`.
+- Removed the `@lix-js/sdk/workerd` entry point, its direct in-isolate WASM snapshot bindings, and the now-unused synchronous WASM initializer.
+- Added the `lix_restore` command sink to move the active branch head to an ancestor commit without creating a new commit.
+
+  Call it with `INSERT INTO lix_restore (commit_id) VALUES (...)`. Restore is available through the existing `execute()` API on local and remote sessions. Orphaned commits remain eligible for ordinary garbage collection, while checkpoint rows are retained.
+- Open a Lix Server Protocol authority with `open_lix().with_storage(storage).serve().await`.
+
+  Serving now owns the repository engine directly and retains one application session per successful handshake. The former `OpenLixBuilder::as_protocol_root()`, `LixServerProtocol::new()`, and `LixServerProtocol::with_options()` APIs were removed. Configure limits with `open_lix().serve().with_options(options).await`.
+- Removed the public SQL script-parsing API from the Rust and JavaScript SDKs.
+
+  Hosts no longer call `parse_sql_script` / `parseSqlScript`. `execute()` runs one statement. To run several statements atomically, pass an array of `{ sql, params? }` objects to `executeBatch()`.
+
+### Patch
+
+- OPFS-backed Lix repositories now batch point reads through SQLite and suppress delayed retry replays after an owner request completes. This keeps checkpointing and other bounded foreground operations responsive while multiple browser clients bootstrap the same repository.
+- Fixed concurrent cold starts of Lix in multiple browser tabs.
+
+  Browser workers now coordinate the initial load of the fingerprinted Lix WebAssembly asset so every tab opens reliably while retaining immutable asset caching.
+- Partial checkpoints now reuse selected payloads already present in a synced repository snapshot instead of hydrating each cold source commit.
+- Production telemetry now uses one stable eleven-name contract across native tracing and JavaScript callbacks.
+
+  SQL is hard-cut to `lix.sql.query`, `lix.sql.batch`, and `lix.sql.coherent_read_batch`; repository binding is `lix.repository.opened`; cold open is `lix.engine.open` plus `lix.session.open`. Writes expose additive `lix.transaction.materialize`, `lix.transaction.storage`, and `lix.transaction.notify` phases with a shared `lix.commit_cohort_id`. Callback spans use schema v2 and carry trace, span, and parent IDs. Fine-grained `lix_perf` diagnostics remain DEBUG-only.
+- Indexed equality reads now include rows written with `lixcol_untracked = true`, fixing point-filtered joins that could previously return null-extended children even though an unfiltered join found them.
+- Kept browser working-diff reads local when the sparse index cannot certify its coverage.
+
+  Lix now falls back to authoritative HOT rows and resolves snapshot-local payloads before hydrating canonical commit history.
+- Kept partial checkpoints on the history-free working-diff path.
+
+  Lix now carries unselected changes into the new checkpoint epoch atomically, avoiding cold history reconstruction and sync hydration on the next write or partial checkpoint.
+- Added a vendor-neutral `lix.repository.opened` engine span when a client session binds to a Lix.
+
+  In-process `open_lix()` and protocol handshake session creation each emit one span. Protocol servers opened with `open_lix().serve()` attach their telemetry sink while creating no application session and emitting no opened span. Hosts that mint a session against an already-open runtime call `Lix::bind_session()` or `lix::bind_session`.
+- Kept packed browser working diffs local by classifying checkpoint additions from their compact current-state authority instead of hydrating historical payload owners.
+- Kept restarted partial checkpoints over packed replacements on the local working-diff path instead of replaying repository history.
+- Repository sync now preserves structured server error details while adding the HTTP status, allowing hosts to react to states such as an in-progress migration.
+- Relation-specific `lix_diff()` queries honor SQL projection when constructing result rows, avoiding row identities, changed payloads, and file descriptors that an aggregate or narrow query did not request. Empty projections such as `COUNT(*)` also avoid allocating one placeholder row per change.
+- Fixed remote observations failing when an application opens more than 32 live queries.
+
+  The remote client now keeps each multiplex stream within the server's safety limit while transparently distributing additional observations across coordinated streams.
+- Fixed simultaneous repository opens against shared browser storage.
+
+  Lix now restarts the complete open lifecycle when a concurrent commit invalidates its coherent read, so another tab finishing sync bootstrap cannot leave the repository half-open.
+- Prevented transient cross-tab writes from interrupting coherent SQL reads in browser repositories.
+
+  Lix now gives competing OPFS commits time to settle before retrying the complete query, while preserving bounded failure under continuous invalidation.
+- Preserved typed storage-expiry errors through `lix_file` and `lix_directory` scans and restarted repository opening coherently after concurrent browser commits.
+- Remote `openLix({ server })` now uses one Rust Lix Server Protocol client.
+
+  JavaScript only supplies `fetch` and authentication headers. Session expiry (`LIX_ERROR_PROTOCOL_SESSION_GONE` and `LIX_ERROR_PROTOCOL_SERVER_CLOSED`) recovers once by opening a new session that pins the last known branch, then retries the original request.
+- Lix is now the only producer of engine performance records: every stable production span goes through the per-engine TelemetrySink.
+
+  Hosts attach one sink. JavaScript `onSpan` and native tracing export the same eleven names and ids. Coordinated commits carry `lix.commit_cohort_id` and links to every logical transaction. Dropped operations finish as `cancelled`. Legacy INFO names (`SELECT`, `SQL batch`, `lix.opened`) are gone; the SQL verb lives on `db.operation.name`.
+
 ## Unreleased
 
 ### Breaking
