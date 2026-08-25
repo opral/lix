@@ -2447,16 +2447,8 @@ where
                 "sync repository snapshot installer requires snapshot metadata",
             ));
         };
-        if self.load_sync_repository_cursor(remote_id).await?.is_some() {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_READ_EXPIRED,
-                "the sync bootstrap snapshot was invalidated by another opener",
-            )
-            .with_details(serde_json::json!({
-                "retryable": true,
-            })));
-        }
-        self.install_sync_snapshot(
+        let result = self
+            .install_sync_snapshot(
             remote_id,
             active_account_id,
             *cursor,
@@ -2468,7 +2460,22 @@ where
             rows,
             checkpoint_roots,
         )
-        .await
+            .await;
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if error.code == LixError::CODE_TRANSACTION_CONFLICT
+            && self.load_sync_repository_cursor(remote_id).await?.is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_READ_EXPIRED,
+                "the sync bootstrap snapshot was invalidated by another opener",
+            )
+            .with_details(serde_json::json!({
+                "retryable": true,
+            })));
+        }
+        Err(error)
     }
 
     pub(crate) async fn align_sync_branch_checkpoint(
@@ -5288,7 +5295,7 @@ mod tests {
         CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, NullableKeyFilter, SwitchBranchOptions, Value,
         open_lix,
     };
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -5303,6 +5310,7 @@ mod tests {
         atomic_ref_receipts: Arc<AtomicU64>,
         branch_publications_without_receipt: Arc<AtomicU64>,
         fail_next_replica_receipt: Arc<AtomicU64>,
+        bootstrap_commit_barrier: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
     }
 
     struct SyncAccountingRead {
@@ -5317,6 +5325,7 @@ mod tests {
         atomic_ref_receipts: Arc<AtomicU64>,
         branch_publications_without_receipt: Arc<AtomicU64>,
         fail_next_replica_receipt: Arc<AtomicU64>,
+        bootstrap_commit_barrier: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
         touches_branch_control: bool,
         touches_replica_state: bool,
     }
@@ -5355,6 +5364,14 @@ mod tests {
         fn fail_next_replica_receipt(&self) {
             self.fail_next_replica_receipt.store(1, Ordering::Relaxed);
         }
+
+        fn gate_bootstrap_commits(&self, participants: usize) {
+            *self
+                .bootstrap_commit_barrier
+                .lock()
+                .expect("bootstrap gate should lock") =
+                Some(Arc::new(tokio::sync::Barrier::new(participants)));
+        }
     }
 
     impl Storage for SyncAccountingStorage {
@@ -5388,6 +5405,7 @@ mod tests {
                     &self.branch_publications_without_receipt,
                 ),
                 fail_next_replica_receipt: Arc::clone(&self.fail_next_replica_receipt),
+                bootstrap_commit_barrier: Arc::clone(&self.bootstrap_commit_barrier),
                 touches_branch_control: false,
                 touches_replica_state: false,
             })
@@ -5437,6 +5455,17 @@ mod tests {
 
         async fn commit(self) -> Result<CommitResult, StorageError> {
             self.write_transactions.fetch_add(1, Ordering::Relaxed);
+            let bootstrap_commit_barrier = if self.touches_replica_state {
+                self.bootstrap_commit_barrier
+                    .lock()
+                    .expect("bootstrap gate should lock")
+                    .clone()
+            } else {
+                None
+            };
+            if let Some(barrier) = bootstrap_commit_barrier {
+                barrier.wait().await;
+            }
             if self.touches_replica_state
                 && self.fail_next_replica_receipt.swap(0, Ordering::Relaxed) != 0
             {
@@ -6883,7 +6912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_bootstrap_snapshot_restarts_repository_open() {
+    async fn concurrent_bootstrap_loser_restarts_repository_open() {
         let authority = open_lix().await.expect("authority should open");
         authority
             .set_sync_role(super::super::SyncRole::Authority)
@@ -6894,7 +6923,7 @@ mod tests {
             .expect("snapshot should load");
         let (branch_id, _) = default_head(&snapshot);
         let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
-        let storage = Memory::new();
+        let storage = SyncAccountingStorage::default();
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
@@ -6905,28 +6934,17 @@ mod tests {
         first_opener
             .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
-        first_opener
-            .apply_sync_repository_snapshot(
-                TEST_REMOTE,
-                crate::ANONYMOUS_ACCOUNT_ID,
-                &snapshot,
-                &history.commits,
-                &history.commit_headers,
-                &rows,
-                &checkpoint_roots,
-            )
-            .await
-            .expect("first opener should initialize the replica");
-
         let second_opener = open_lix()
-            .with_storage(storage)
+            .with_storage(storage.clone())
             .await
             .expect("second opener should open the shared storage");
         second_opener
             .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
-        let error = second_opener
-            .apply_sync_repository_snapshot(
+
+        storage.gate_bootstrap_commits(2);
+        let (first, second) = tokio::join!(
+            first_opener.apply_sync_repository_snapshot(
                 TEST_REMOTE,
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
@@ -6934,10 +6952,28 @@ mod tests {
                 &history.commit_headers,
                 &rows,
                 &checkpoint_roots,
-            )
-            .await
-            .expect_err("a stale concurrent bootstrap must restart repository open");
+            ),
+            second_opener.apply_sync_repository_snapshot(
+                TEST_REMOTE,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                &snapshot,
+                &history.commits,
+                &history.commit_headers,
+                &rows,
+                &checkpoint_roots,
+            ),
+        );
 
+        let mut successes = 0;
+        let mut loser = None;
+        for result in [first, second] {
+            match result {
+                Ok(()) => successes += 1,
+                Err(error) => loser = Some(error),
+            }
+        }
+        assert_eq!(successes, 1, "exactly one bootstrap should publish");
+        let error = loser.expect("the concurrent bootstrap loser should restart");
         assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
         assert_eq!(
             error.details,
