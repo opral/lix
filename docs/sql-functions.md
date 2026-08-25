@@ -12,6 +12,8 @@ operators; there are no public `lix_json_*` functions.
 | `lix_active_account_id()` | text | Active SQL-session account. |
 | `lix_active_branch_id()` | text | Active branch. |
 | `lix_active_branch_commit_id()` | text | Active branch head pinned for the statement. |
+| `lix_latest_checkpoint_commit_id()` | text | Active branch's latest checkpoint, or the repository root if it has none. |
+| `lix_root_commit_id()` | text | Repository bootstrap root. |
 | `uuidv7()` | uuid | Generate a UUIDv7 value. |
 | `CURRENT_TIMESTAMP` | timestamptz | Transaction-start instant at microsecond precision. |
 
@@ -53,6 +55,20 @@ SELECT lixcol_depth, title
 FROM lix_history('acme_task')
 WHERE id = 't1'
 ORDER BY lixcol_depth;
+```
+
+`lix_latest_checkpoint_commit_id()` returns the latest checkpoint for the
+active branch, not the newest repository-global checkpoint. If the branch has
+no checkpoint, it returns `lix_root_commit_id()`. Use both branch-scoped
+accessors to read working changes in one query:
+
+```sql
+SELECT row_pk, diff_type
+FROM lix_diff(
+  'lix_file',
+  lix_latest_checkpoint_commit_id(),
+  lix_active_branch_commit_id()
+);
 ```
 
 `lix_commit_ancestry()` returns the active head at depth `0` and every

@@ -40,10 +40,11 @@ pub(crate) struct PublicScalarFunctionContract {
     pub(crate) class: PublicSurfaceClass,
 }
 
-pub(crate) const PUBLIC_SCALAR_FUNCTION_NAMES: [&str; 5] = [
+pub(crate) const PUBLIC_SCALAR_FUNCTION_NAMES: [&str; 6] = [
     "lix_active_account_id",
     "lix_active_branch_commit_id",
     "lix_active_branch_id",
+    "lix_latest_checkpoint_commit_id",
     "lix_root_commit_id",
     "uuidv7",
 ];

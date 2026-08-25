@@ -20,7 +20,8 @@ simulation_test!(
              FROM information_schema.lix_surfaces \
              WHERE surface_name IN (\
                'lix_active_branch_id', 'lix_create_checkpoint', 'lix_diff',\
-               'lix_file', 'lix_restore', 'lix_root_commit_id'\
+               'lix_file', 'lix_latest_checkpoint_commit_id', \
+               'lix_restore', 'lix_root_commit_id'\
              ) \
              ORDER BY surface_name",
             &[],
@@ -61,6 +62,14 @@ simulation_test!(
                     Value::Text("VIEW".to_string()),
                     Value::Boolean(true),
                     Value::Boolean(true),
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("lix_latest_checkpoint_commit_id".to_string()),
+                    Value::Text("SCALAR_FUNCTION".to_string()),
+                    Value::Null,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
                     Value::Boolean(false),
                 ],
                 vec![

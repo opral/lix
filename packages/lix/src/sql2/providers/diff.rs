@@ -109,6 +109,7 @@ fn text_argument(
         let value = match function.func.name() {
             "lix_root_commit_id" => slots.root_commit_id(),
             "lix_active_branch_commit_id" => slots.active_branch_commit_id(),
+            "lix_latest_checkpoint_commit_id" => slots.latest_checkpoint_commit_id(),
             _ => None,
         };
         if let Some(value) = value {

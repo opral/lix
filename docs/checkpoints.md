@@ -27,7 +27,7 @@ INSERT INTO lix_create_checkpoint DEFAULT VALUES RETURNING commit_id;
 import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
-const initial = await lix.createCheckpoint();
+await lix.createCheckpoint();
 
 await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
   "checkpoint-demo",
@@ -36,19 +36,25 @@ await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
 
 const working = await lix.execute(
   `SELECT row_pk, diff_type, from_value, to_value
-   FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id())`,
-  [initial.commitId],
+   FROM lix_diff(
+     'lix_key_value',
+     lix_latest_checkpoint_commit_id(),
+     lix_active_branch_commit_id()
+   )`,
 );
 
 for (const row of working.rows) {
   console.log(row.get("diff_type"), row.get("row_pk"));
 }
 
-const checkpoint = await lix.createCheckpoint();
+await lix.createCheckpoint();
 const remaining = await lix.execute(
   `SELECT count(*) AS count
-   FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id())`,
-  [checkpoint.commitId],
+   FROM lix_diff(
+     'lix_key_value',
+     lix_latest_checkpoint_commit_id(),
+     lix_active_branch_commit_id()
+   )`,
 );
 console.assert(remaining.rows[0].get("count") === 0);
 
@@ -67,6 +73,7 @@ A runnable Rust version lives at
 | `lix_commit` | Repository-global commit graph | `id`, `parent_commit_ids`, and standard `lixcol_*` columns |
 | `lix_history('lix_checkpoint'[, commit_id])` | Global checkpoint-row authorship history | Checkpoint columns and standard history `lixcol_*` columns |
 | `lix_commit_ancestry([commit_id])` | Active head or an explicit anchor | `commit_id`, `depth` |
+| `lix_latest_checkpoint_commit_id()` | Active branch | Latest checkpoint commit ID, or the repository root if the branch has no checkpoint |
 | `lix_root_commit_id()` | Repository root | Scalar ID of the repository bootstrap root |
 
 `parent_commit_ids` is an ordered JSONB array: element zero is the mainline
@@ -78,7 +85,22 @@ FROM lix_commit
 WHERE id = $checkpoint_commit_id;
 ```
 
-The newest checkpoint remains a normal query:
+Use `lix_latest_checkpoint_commit_id()` to resolve the active branch's working
+baseline. It returns the branch's latest checkpoint, or `lix_root_commit_id()`
+when the branch has no checkpoint. Pair it with the active head to inspect
+working changes in one query, including before the first checkpoint:
+
+```sql
+SELECT row_pk, diff_type
+FROM lix_diff(
+  'lix_file',
+  lix_latest_checkpoint_commit_id(),
+  lix_active_branch_commit_id()
+);
+```
+
+Checkpoint markers in `lix_checkpoint` are repository-global. Querying the
+newest marker can therefore return a checkpoint from a different branch:
 
 ```sql
 SELECT commit_id
