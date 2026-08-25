@@ -40,7 +40,12 @@ test("nextest compiles test targets without building unused examples", () => {
 	const commands = workflow.match(/^\s*run: cargo nextest run .+$/gm) ?? [];
 	assert.equal(commands.length, 3);
 	for (const command of commands) {
-		assert.match(command, /--lib --tests/);
+		assert.match(command, /--tests/);
+		if (command.includes("-p lix_e2e")) {
+			assert.doesNotMatch(command, /--lib\b/);
+		} else {
+			assert.match(command, /--lib --tests/);
+		}
 		assert.doesNotMatch(command, /--examples|--all-targets/);
 	}
 });

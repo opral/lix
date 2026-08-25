@@ -224,11 +224,12 @@ jobs:
 
       # Cargo's default test target selection also compiles every example even
       # though nextest cannot execute their main functions. The e2e package has
-      # 30 examples; explicitly selecting libraries and tests avoids rebuilding
-      # all 30 while Clippy above still checks their compilation.
+      # 30 examples; explicitly selecting tests avoids rebuilding all 30 while
+      # Clippy above still checks their compilation. This package has no library
+      # target, so passing --lib would fail before any tests could run.
       - name: Run Rust E2E tests with nextest
         if: matrix.task == 'e2e'
-        run: cargo nextest run --config-file .config/nextest.toml --profile ci-e2e --locked --manifest-path tooling/Cargo.toml --cargo-profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --lib --tests --timings
+        run: cargo nextest run --config-file .config/nextest.toml --profile ci-e2e --locked --manifest-path tooling/Cargo.toml --cargo-profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --tests --timings
 
       - name: Upload Rust test timing reports
         if: matrix.task != 'clippy' && !cancelled()
