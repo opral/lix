@@ -6854,8 +6854,9 @@ mod tests {
     }
 
     async fn app_with_tracing_telemetry() -> TestApp {
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let server = open_lix()
-            .with_telemetry(Arc::new(OpenTelemetryTracingSink::new()))
+            .with_telemetry(Arc::new(OpenTelemetryTracingSink::new(dispatch)))
             .serve()
             .await
             .expect("serve lix");
@@ -11145,6 +11146,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_telemetry_dispatch_survives_an_unrelated_ambient_subscriber() {
+        let capture = CaptureLayer::default();
+        let spans = Arc::clone(&capture.spans);
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("lix-test");
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(capture)
+                .with(tracing_opentelemetry::layer().with_tracer(tracer)),
+        );
+        let server = open_lix()
+            .with_telemetry(Arc::new(OpenTelemetryTracingSink::new(dispatch)))
+            .serve()
+            .await
+            .expect("serve lix");
+        let app = TestApp {
+            router: handler(server.clone()),
+            server,
+        };
+
+        let _ambient = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let (session_id, _) = new_session(&app.router).await;
+        assert!(!session_id.is_empty());
+
+        let spans = spans.lock().expect("capture spans");
+        require_span(&spans, "lix.session.open");
+        require_span(&spans, "lix.repository.opened");
+    }
+
+    #[tokio::test]
     async fn explicit_transaction_exports_one_transaction_notify_span() {
         let capture = CaptureLayer::default();
         let spans = Arc::clone(&capture.spans);
@@ -11195,8 +11226,9 @@ mod tests {
         let capture = CaptureLayer::default();
         let spans = Arc::clone(&capture.spans);
         let (_provider, _subscriber) = set_otel_capture_default(capture);
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let _lix = open_lix()
-            .with_telemetry(Arc::new(OpenTelemetryTracingSink::new()))
+            .with_telemetry(Arc::new(OpenTelemetryTracingSink::new(dispatch)))
             .await
             .expect("open lix");
 

@@ -286,50 +286,62 @@ pub(crate) fn new_span_context(parent: Option<&SpanContext>) -> SpanContext {
 
 /// OpenTelemetry-compliant adapter from engine telemetry into `tracing`.
 ///
-/// The active subscriber must include `tracing-opentelemetry`. This adapter
-/// sets real OpenTelemetry parents, links, attributes, and status, and returns
-/// the context assigned by that layer. It never creates shadow identifiers.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct OpenTelemetryTracingSink;
+/// `dispatch` must contain a `tracing-opentelemetry` layer. Capturing it at
+/// construction keeps span creation independent from whichever subscriber is
+/// ambient on the thread or task that later runs a Lix operation.
+#[derive(Clone)]
+pub struct OpenTelemetryTracingSink {
+    dispatch: tracing::Dispatch,
+}
+
+impl std::fmt::Debug for OpenTelemetryTracingSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenTelemetryTracingSink")
+            .finish_non_exhaustive()
+    }
+}
 
 impl OpenTelemetryTracingSink {
-    pub fn new() -> Self {
-        Self
+    pub fn new(dispatch: tracing::Dispatch) -> Self {
+        Self { dispatch }
     }
 }
 
 impl TelemetrySink for OpenTelemetryTracingSink {
     fn enabled(&self, descriptor: &TelemetrySpanDescriptor) -> bool {
-        match descriptor.class {
+        tracing::dispatcher::with_default(&self.dispatch, || match descriptor.class {
             TelemetrySpanClass::Sql | TelemetrySpanClass::Performance => {
                 tracing::enabled!(target: "lix_sql", tracing::Level::INFO)
             }
             TelemetrySpanClass::Lifecycle => {
                 tracing::enabled!(target: "lix", tracing::Level::INFO)
             }
-        }
+        })
     }
 
     fn start_span(&self, start: TelemetrySpanStart) -> Box<dyn TelemetrySpanHandle> {
-        let span = (start.descriptor.create_tracing_span)();
-        if let Some(parent) = start.parent_span_context.as_ref() {
-            span.set_parent(
-                OpenTelemetryContext::new().with_remote_span_context(parent.clone()),
-            )
-            .expect("tracing-opentelemetry rejected the Lix span parent");
-        }
-        for link in &start.links {
-            span.add_link(link.clone());
-        }
-        for attribute in &start.attributes {
-            record_attribute(&span, attribute);
-        }
-        let span_context = span.context().span().span_context().clone();
-        assert!(
-            span_context.is_valid(),
-            "OpenTelemetryTracingSink requires an active tracing-opentelemetry layer"
-        );
-        Box::new(OpenTelemetryTracingSpan { span, span_context })
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            let span = (start.descriptor.create_tracing_span)();
+            if let Some(parent) = start.parent_span_context.as_ref() {
+                span.set_parent(
+                    OpenTelemetryContext::new().with_remote_span_context(parent.clone()),
+                )
+                .expect("tracing-opentelemetry rejected the Lix span parent");
+            }
+            for link in &start.links {
+                span.add_link(link.clone());
+            }
+            for attribute in &start.attributes {
+                record_attribute(&span, attribute);
+            }
+            let span_context = span.context().span().span_context().clone();
+            assert!(
+                span_context.is_valid(),
+                "OpenTelemetryTracingSink dispatch must contain an active tracing-opentelemetry layer"
+            );
+            Box::new(OpenTelemetryTracingSpan { span, span_context })
+        })
     }
 }
 
@@ -1196,11 +1208,12 @@ mod tests {
             .with_simple_exporter(exporter.clone())
             .build();
         let tracer = provider.tracer("lix");
-        let _subscriber = tracing::subscriber::set_default(
+        let dispatch = tracing::Dispatch::new(
             tracing_subscriber::registry()
                 .with(tracing_opentelemetry::layer().with_tracer(tracer)),
         );
-        let sink: Arc<dyn TelemetrySink> = Arc::new(OpenTelemetryTracingSink::new());
+        let sink: Arc<dyn TelemetrySink> =
+            Arc::new(OpenTelemetryTracingSink::new(dispatch));
         let parent = ActiveTelemetrySpan::start(
             &sink,
             TelemetrySpanStart::new(&SQL_BATCH, Vec::new()),
