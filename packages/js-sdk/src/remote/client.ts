@@ -1,4 +1,5 @@
 import type { LixBinding } from "../binding-types.js";
+import { initializeBrowserWasm } from "../browser-wasm-init.js";
 import type { RemoteLixServerOptions } from "../types.js";
 import { SERVER_PROTOCOL_PATH } from "./server-protocol.js";
 
@@ -29,10 +30,13 @@ function initializeWasm(): Promise<unknown> {
 			},
 		);
 	} else {
-		initialization = initWasm();
+		initialization = initializeBrowserWasm(
+			initWasm,
+			new URL("../wasm/lix_js_sdk_bg.wasm", import.meta.url),
+		);
 	}
 	wasmInitialized = initialization;
-	return initialization;
+	return wasmInitialized;
 }
 
 export async function openRemoteLixBinding(
