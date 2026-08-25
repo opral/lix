@@ -35,10 +35,7 @@ function initializeWasm(): Promise<unknown> {
 			new URL("../wasm/lix_js_sdk_bg.wasm", import.meta.url),
 		);
 	}
-	wasmInitialized = initialization.catch((error) => {
-		wasmInitialized = undefined;
-		throw error;
-	});
+	wasmInitialized = initialization;
 	return wasmInitialized;
 }
 
