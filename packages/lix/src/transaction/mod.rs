@@ -9,6 +9,7 @@ mod staged_commit_changes;
 mod staging;
 mod stale_commit;
 mod validation;
+pub(crate) use validation::MAX_DIRECTORY_PARENT_DEPTH;
 
 #[cfg(feature = "storage-benches")]
 pub mod bench {

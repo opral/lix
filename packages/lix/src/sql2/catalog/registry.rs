@@ -153,6 +153,7 @@ impl PublicCatalog {
             ])),
             PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::StateAtFunction
             | PublicSurfaceKind::CommitAncestryFunction => {
                 return None;
             }
@@ -284,6 +285,13 @@ impl PublicCatalog {
             "lix_diff",
             PublicSurfaceClass::TableFunction,
             PublicSurfaceKind::DiffFunction,
+            Vec::new(),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_state_at",
+            PublicSurfaceClass::TableFunction,
+            PublicSurfaceKind::StateAtFunction,
             Vec::new(),
             SurfaceCapabilities::read_only(),
         ))?;

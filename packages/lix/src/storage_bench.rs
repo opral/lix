@@ -114,6 +114,7 @@ fn stage_bench_commit_deltas(
         &crate::tracked_state::CommitStateManifest {
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            global_scope: false,
             replay_debt: crate::tracked_state::CommitStateReplayDebt {
                 depth: 1,
                 rows: u64::from(mutations.member_count),
@@ -123,6 +124,7 @@ fn stage_bench_commit_deltas(
             touched_scope_filter: Default::default(),
             current_state_scoped_ranges: None,
             snapshot_root: None,
+            row_pk_index_root_id: None,
         },
     )?;
     Ok(staged.locators)
@@ -1844,6 +1846,7 @@ where
             &crate::tracked_state::CommitStateManifest {
                 commit_id: record.commit_id,
                 change_account_id: record.account_id.clone(),
+                global_scope: false,
                 replay_debt: crate::tracked_state::CommitStateReplayDebt {
                     depth: 1,
                     rows: 0,
@@ -1853,6 +1856,7 @@ where
                 touched_scope_filter: Default::default(),
                 current_state_scoped_ranges: None,
                 snapshot_root: None,
+                row_pk_index_root_id: None,
             },
         )?;
     }

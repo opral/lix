@@ -236,6 +236,7 @@ mod tests {
             "lix_registered_schema",
             "lix_restore",
             "lix_revert",
+            "lix_state_at",
         ];
 
         assert_eq!(actual, expected);
@@ -364,7 +365,7 @@ mod tests {
             "columns": [
                 { "name": "id", "type": "text", "nullable": false },
                 { "name": "name", "type": "text", "nullable": true },
-                { "name": "lixcol_internal", "type": "text", "nullable": true },
+                { "name": "user_internal", "type": "text", "nullable": true },
             ],
             "primary_key": ["id"],
         })])

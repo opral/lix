@@ -63,13 +63,36 @@ no checkpoint, it returns `lix_root_commit_id()`. Use both branch-scoped
 accessors to read working changes in one query:
 
 ```sql
-SELECT row_pk, diff_type
+SELECT lixcol_row_pk, lixcol_diff_type
 FROM lix_diff(
   'lix_file',
   lix_latest_checkpoint_commit_id(),
   lix_active_branch_commit_id()
 );
 ```
+
+`lix_state_at(relation, commit_id)` returns the complete tracked state of a
+relation at one commit. Its columns are identical to the live relation, and
+entities that did not exist at that commit produce no row:
+
+```sql
+SELECT id, path, content
+FROM lix_state_at('lix_file', $1)
+WHERE id IN ($2, $3);
+```
+
+The relation argument must be a text literal. The commit may be a text
+parameter or `lix_root_commit_id()` / `lix_active_branch_commit_id()`. Primary
+key `=` and `IN` predicates are pushed into the point-in-time read, so batched
+entity lookups do not scan unrelated tracked rows. Untracked rows are never
+included.
+
+The result is scoped to the tree rooted at the supplied commit; a local-branch
+read does not inherit global rows. To reconstruct a full pinned live view,
+overlay the local state on the separately pinned global state. The overlay's
+global arm must be anti-joined against the nearest local `lix_history`
+identities, including deleted identities: a local tombstone shadows a global
+row even though `lix_state_at` itself does not expose tombstones.
 
 `lix_commit_ancestry()` returns the active head at depth `0` and every
 reachable ancestor once at its shortest depth. Pass one commit ID to use an

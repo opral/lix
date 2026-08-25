@@ -784,7 +784,7 @@ where
             &format!(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('tracked_crud_insert', '{before}', '{after}') \
-                 WHERE diff_type = 'added'"
+                 WHERE lixcol_diff_type = 'added'"
             ),
         )
         .await;

@@ -138,6 +138,17 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
 ) -> Result<SchemaSurfaceSpec, LixError> {
     let parsed = crate::schema::parse_lix_schema(schema)?;
     let schema_key = parsed.key.clone();
+    if let Some(column) = parsed.columns.iter().find(|column| {
+        column.name.starts_with("lixcol_") || column.name.contains("_lixcol_")
+    }) {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!(
+                "schema '{schema_key}' column '{}' uses the reserved lixcol_ segment",
+                column.name
+            ),
+        ));
+    }
     let schema_fingerprint = *parsed
         .wire_fingerprint()
         .map_err(|error| {
@@ -480,9 +491,18 @@ mod tests {
             .as_array_mut()
             .expect("columns")
             .push(json!({ "name": "lixcol_user_value", "type": "text", "nullable": true }));
-        let reserved = derive_schema_surface_spec_from_schema(&reserved)
-            .expect("reserved-name schema should still derive");
-        assert!(!reserved.columnar_snapshot_bijective);
+        let error = derive_schema_surface_spec_from_schema(&reserved)
+            .expect_err("reserved-name schema must be rejected");
+        assert!(error.message.contains("reserved lixcol_ segment"));
+
+        let mut prefixed_reserved = path_value_schema("text");
+        prefixed_reserved["columns"]
+            .as_array_mut()
+            .expect("columns")
+            .push(json!({ "name": "from_lixcol_user_value", "type": "text", "nullable": true }));
+        let error = derive_schema_surface_spec_from_schema(&prefixed_reserved)
+            .expect_err("embedded reserved segment must be rejected");
+        assert!(error.message.contains("reserved lixcol_ segment"));
     }
 
     #[test]

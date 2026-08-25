@@ -29,7 +29,7 @@ simulation_test!(relation_diff_pairs_schema_columns_and_inverts_sides, |sim| asy
         select_rows(
             &session,
             &format!(
-                "SELECT row_pk, diff_type, from_key, to_key, from_value, to_value, row_count \
+                "SELECT lixcol_row_pk, lixcol_diff_type, from_key, to_key, from_value, to_value, lixcol_row_count \
                  FROM lix_diff('lix_key_value', '{baseline}', '{inserted}')"
             ),
         )
@@ -49,7 +49,7 @@ simulation_test!(relation_diff_pairs_schema_columns_and_inverts_sides, |sim| asy
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_key, to_key, from_value, to_value \
+                "SELECT lixcol_diff_type, from_key, to_key, from_value, to_value \
                  FROM lix_diff('lix_key_value', '{inserted}', '{baseline}')"
             ),
         )
@@ -79,7 +79,7 @@ simulation_test!(relation_diff_pairs_schema_columns_and_inverts_sides, |sim| asy
             &session,
             "SELECT count(*) FROM lix_diff(\
                  'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
-             ) WHERE row_pk = CAST('[\"note\"]' AS JSONB)",
+             ) WHERE lixcol_row_pk = CAST('[\"note\"]' AS JSONB)",
         )
         .await,
         vec![vec![Value::Integer(1)]],
@@ -103,9 +103,9 @@ simulation_test!(relation_diff_pairs_schema_columns_and_inverts_sides, |sim| asy
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_value, to_value, row_count \
+                "SELECT lixcol_diff_type, from_value, to_value, lixcol_row_count \
                  FROM lix_diff('lix_key_value', '{inserted}', '{updated}') \
-                 WHERE row_pk = CAST('[\"note\"]' AS JSONB)"
+                 WHERE lixcol_row_pk = CAST('[\"note\"]' AS JSONB)"
             ),
         )
         .await,
@@ -218,7 +218,7 @@ simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |si
     let added = select_rows(
         &session,
         &format!(
-            "SELECT row_pk, diff_type, from_path, to_path, row_count \
+            "SELECT lixcol_row_pk, lixcol_diff_type, from_path, to_path, lixcol_row_count \
              FROM lix_diff('lix_file', '{baseline}', '{inserted}')"
         ),
     )
@@ -232,7 +232,7 @@ simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |si
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_path, to_path, row_count \
+                "SELECT lixcol_diff_type, from_path, to_path, lixcol_row_count \
                  FROM lix_diff('lix_file', '{inserted}', '{baseline}')"
             ),
         )
@@ -257,7 +257,7 @@ simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |si
             &session,
             &format!(
                 "SELECT count(*) FROM lix_diff('lix_file', '{baseline}', '{inserted}') \
-                 WHERE row_pk ->> 0 = '{file_id}'"
+                 WHERE lixcol_row_pk ->> 0 = '{file_id}'"
             ),
         )
         .await,
@@ -268,7 +268,7 @@ simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |si
         select_rows(
             &session,
             &format!(
-                "SELECT count(*), sum(row_count) \
+                "SELECT count(*), sum(lixcol_row_count) \
                  FROM lix_diff('lix_file', '{baseline}', '{inserted}')"
             ),
         )
@@ -291,7 +291,7 @@ simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |si
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_path, to_path FROM lix_diff('lix_file', '{inserted}', '{renamed}')"
+                "SELECT lixcol_diff_type, from_path, to_path FROM lix_diff('lix_file', '{inserted}', '{renamed}')"
             ),
         )
         .await,
@@ -316,7 +316,7 @@ simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |si
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_path, to_path FROM lix_diff('lix_file', '{renamed}', '{removed}')"
+                "SELECT lixcol_diff_type, from_path, to_path FROM lix_diff('lix_file', '{renamed}', '{removed}')"
             ),
         )
         .await,
@@ -330,7 +330,7 @@ simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |si
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_path, to_path \
+                "SELECT lixcol_diff_type, from_path, to_path \
                  FROM lix_diff('lix_file', '{removed}', '{renamed}')"
             ),
         )
@@ -366,7 +366,7 @@ simulation_test!(relation_diff_tracks_directory_descriptor_add_rename_and_remove
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_path, to_path, row_count \
+                "SELECT lixcol_diff_type, from_path, to_path, lixcol_row_count \
                  FROM lix_diff('lix_directory', '{baseline}', '{inserted}')"
             ),
         )
@@ -393,7 +393,7 @@ simulation_test!(relation_diff_tracks_directory_descriptor_add_rename_and_remove
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_path, to_path \
+                "SELECT lixcol_diff_type, from_path, to_path \
                  FROM lix_diff('lix_directory', '{inserted}', '{renamed}')"
             ),
         )
@@ -419,7 +419,7 @@ simulation_test!(relation_diff_tracks_directory_descriptor_add_rename_and_remove
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_path, to_path \
+                "SELECT lixcol_diff_type, from_path, to_path \
                  FROM lix_diff('lix_directory', '{renamed}', '{removed}')"
             ),
         )
@@ -465,4 +465,95 @@ simulation_test!(relation_diff_requires_explicit_relation_and_commit_ids, |sim| 
         .expect_err("aggregate file bytes are deliberately unsupported");
     assert!(file_content.message.contains("does not support content projection"));
     assert!(file_content.message.contains("lix_history"));
+});
+
+simulation_test!(relation_diff_fences_machinery_from_user_column_names, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine.open_session().await.expect("session should open"),
+        &engine,
+    );
+
+    let reserved = session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"reserved_name_collision\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"from_lixcol_user_value\",\"type\":\"text\",\"nullable\":true}],\"primary_key\":[\"id\"]}' AS JSONB), false, false)",
+            &[],
+        )
+        .await
+        .expect_err("schema registration must reject the reserved lixcol_ segment");
+    assert!(reserved.message.contains("reserved lixcol_ segment"));
+
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"diff_name_collision\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"diff_type\",\"type\":\"text\",\"nullable\":false},{\"name\":\"row_count\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"depth\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"from_path\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB), false, false)",
+            &[],
+        )
+        .await
+        .expect("collision schema should register");
+    let baseline = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("baseline head should load")
+        .expect("baseline head should exist")
+        .to_string();
+
+    session
+        .execute(
+            "INSERT INTO diff_name_collision (id, diff_type, row_count, depth, from_path) \
+             VALUES ('row-1', 'user-kind', 7, 3, '/user-path')",
+            &[],
+        )
+        .await
+        .expect("collision row should insert");
+    let head = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("updated head should load")
+        .expect("updated head should exist")
+        .to_string();
+
+    assert_eq!(
+        select_rows(
+            &session,
+            &format!(
+                "SELECT lixcol_row_pk, lixcol_diff_type, lixcol_row_count, \
+                 from_diff_type, to_diff_type, from_row_count, to_row_count, \
+                 from_depth, to_depth, from_from_path, to_from_path \
+                 FROM lix_diff('diff_name_collision', '{baseline}', '{head}')"
+            ),
+        )
+        .await,
+        vec![vec![
+            Value::Jsonb(json!(["row-1"]).into()),
+            Value::Text("added".to_string()),
+            Value::Integer(1),
+            Value::Null,
+            Value::Text("user-kind".to_string()),
+            Value::Null,
+            Value::Integer(7),
+            Value::Null,
+            Value::Integer(3),
+            Value::Null,
+            Value::Text("/user-path".to_string()),
+        ]]
+    );
+
+    for retired in ["row_pk", "diff_type", "row_count"] {
+        let error = session
+            .execute(
+                &format!(
+                    "SELECT {retired} FROM lix_diff('diff_name_collision', '{baseline}', '{head}')"
+                ),
+                &[],
+            )
+            .await
+            .expect_err("retired diff machinery alias must not exist");
+        assert!(
+            error.message.contains(retired),
+            "error should identify retired column {retired}: {}",
+            error.message
+        );
+    }
 });

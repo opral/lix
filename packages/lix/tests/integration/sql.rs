@@ -96,6 +96,7 @@ mod diff_commands;
 mod diff_relation;
 mod schema_history;
 mod schema_view;
+mod state_at;
 mod errors;
 mod history_conformance;
 mod information_schema;

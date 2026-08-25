@@ -6,6 +6,7 @@ use crate::LixError;
 use crate::branch::{
     BranchHeadControlContext, branch_head_control_precondition, stage_branch_head_control,
 };
+use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
 use crate::hot_state::{
     CompleteWorkingDiffMode, HotTrackedSnapshot, TrackedHeadContext, TrackedWorkingDiffEpoch,
     WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
@@ -24,7 +25,7 @@ use crate::storage_adapter::StorageWriteOptions as AdapterWriteOptions;
 use crate::tracked_state::{
     CommitStateReplayDebt, TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
     TrackedStateScanRequest,
-    encode_commit_state_manifest_replacement_for_migration,
+    backfill_row_pk_index_for_commit, encode_commit_state_manifest_replacement_for_migration,
     load_rebuild_plans_to_nearest_available_root_bounded, stage_rebuild_plan_with_writer,
 };
 
@@ -33,6 +34,7 @@ const REPOSITORY_PROTOCOL_V69: &[u8] = b"tracked-default-branch.v69";
 const REPOSITORY_PROTOCOL_V70: &[u8] = b"tracked-default-branch.v70";
 const REPOSITORY_PROTOCOL_V71: &[u8] = b"tracked-default-branch.v71";
 const REPOSITORY_PROTOCOL_V72: &[u8] = b"tracked-default-branch.v72";
+const REPOSITORY_PROTOCOL_V73: &[u8] = b"tracked-default-branch.v73";
 const ACCOUNT_SCHEMA_KEY: &str = "lix_account";
 
 /// Bounds for explicit offline repository migrations.
@@ -153,7 +155,7 @@ where
         .map_err(storage_error)?;
     let from_version = match crate::init::repository_protocol_status(&read).await? {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (68 | 69 | 70 | 71 | 72),
+            found_version: found_version @ (68 | 69 | 70 | 71 | 72 | 73),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -209,7 +211,10 @@ where
         } else {
             0
         };
-        migrate_v72_account_profile_uri(&adapter, &storage, options).await?;
+        if from_version <= 72 {
+            migrate_v72_account_profile_uri(&adapter, &storage, options).await?;
+        }
+        migrate_v73_row_pk_indexes(&adapter, &storage, options).await?;
         return Ok(MigrationReport {
             from_version,
             to_version: CURRENT_FORMAT_VERSION,
@@ -306,6 +311,7 @@ where
     .await?;
     let migrated_hot_rows = migrate_v71_working_diff_epochs(&adapter, &storage, options).await?;
     migrate_v72_account_profile_uri(&adapter, &storage, options).await?;
+    migrate_v73_row_pk_indexes(&adapter, &storage, options).await?;
     Ok(MigrationReport {
         from_version: 68,
         to_version: CURRENT_FORMAT_VERSION,
@@ -401,6 +407,32 @@ async fn migrate_v72_account_profile_uri<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    // The v72 logical amendment below publishes ordinary commits. Current
+    // commit publication maintains the v74 secondary index, so bootstrap the
+    // inherited authorities while the repository is still fenced by its v72
+    // marker. Keeping the marker unchanged makes interruption retryable and
+    // lets the amendment commits inherit the index normally.
+    let marker = load_repository_protocol_marker(adapter).await?;
+    if marker.as_deref() == Some(REPOSITORY_PROTOCOL_V72) {
+        backfill_missing_row_pk_indexes(
+            adapter,
+            storage,
+            options,
+            72,
+            REPOSITORY_PROTOCOL_V72,
+            crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP,
+            "v72 row-PK-index bootstrap",
+            false,
+        )
+        .await?;
+    } else if marker.as_deref()
+        != Some(crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP)
+    {
+        return Err(migration_error(
+            "v72 row-PK-index bootstrap observed an unexpected protocol marker",
+        ));
+    }
+
     let read = SharedStorageAdapterRead::new(
         adapter
             .begin_read(ReadOptions::default())
@@ -510,11 +542,342 @@ where
     crate::migration::publish::publish(
         storage,
         expected_revision,
-        REPOSITORY_PROTOCOL_V72,
-        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP,
+        REPOSITORY_PROTOCOL_V73,
         crate::migration::publish::PublicationPlan::bounded(0, 0),
     )
     .await
+}
+
+async fn load_repository_protocol_marker<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+) -> Result<Option<Bytes>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let read = adapter
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(storage_error)?;
+    let values = crate::storage_adapter::PointReadPlan::new(
+        REPOSITORY_PROTOCOL_SPACE,
+        &[Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY))],
+    )
+    .materialize(&read, GetOptions::default())
+    .await
+    .map_err(storage_error)?;
+    Ok(values.value.into_iter().next().flatten().and_then(|value| {
+        match value {
+            ProjectedValue::FullValue(value) => Some(value),
+            ProjectedValue::KeyOnly => None,
+        }
+    }))
+}
+
+/// Backfills every commit authority's row-PK permutation before publishing
+/// v74, including rootless replay commits.
+///
+/// Tree chunks are content-addressed and may safely be staged before the
+/// authority flip. Manifest replacements and the protocol marker remain one
+/// atomic publication, so interruption either leaves a retryable v73
+/// repository or a complete v74 repository.
+async fn migrate_v73_row_pk_indexes<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+    storage: &S,
+    options: MigrationOptions,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    backfill_missing_row_pk_indexes(
+        adapter,
+        storage,
+        options,
+        73,
+        REPOSITORY_PROTOCOL_V73,
+        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        "v73 row-PK-index migration",
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn backfill_missing_row_pk_indexes<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+    storage: &S,
+    options: MigrationOptions,
+    expected_version: u32,
+    expected_protocol: &'static [u8],
+    target_protocol: &'static [u8],
+    operation: &'static str,
+    preflight_reserved_columns: bool,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let read = SharedStorageAdapterRead::new(
+        adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?,
+    );
+    match crate::init::repository_protocol_status(&read).await? {
+        RepositoryProtocolStatus::MigrationRequired { found_version }
+            if found_version == expected_version => {}
+        status => {
+            return Err(migration_error(format!(
+                "{operation} observed unexpected repository status {status:?}"
+            )));
+        }
+    }
+    if preflight_reserved_columns {
+        preflight_v74_registered_schemas(&read, options).await?;
+    }
+    let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+        .await
+        .map_err(storage_error)?;
+    let commit_ids = crate::tracked_state::scan_commit_state_manifest_commit_ids(&read).await?;
+    if commit_ids.len() > options.max_changes {
+        return Err(LixError::new(
+            "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+            format!(
+                "{operation} exceeds configured commit bound: {} commits",
+                commit_ids.len()
+            ),
+        ));
+    }
+
+    let global_head = BranchHeadControlContext::new()
+        .reader(read.clone())
+        .load(crate::GLOBAL_BRANCH_ID)
+        .await?
+        .ok_or_else(|| migration_error("row-PK-index migration found no global branch"))?
+        .head_commit_id;
+    // Branch-family provenance was not persisted before v74. The first-parent
+    // chain is the recoverable authored lineage: merge secondary parents may
+    // come from another family and must not become global merely because the
+    // current global head reaches them.
+    let mut global_commits = BTreeSet::new();
+    let mut next_global = Some(global_head);
+    while let Some(commit_id) = next_global {
+        if !global_commits.insert(commit_id) {
+            return Err(migration_error(format!(
+                "{operation} found a cycle in the global first-parent lineage at '{commit_id}'"
+            )));
+        }
+        if global_commits.len() > options.max_changes {
+            return Err(LixError::new(
+                "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+                format!("{operation} exceeds configured global-lineage commit bound"),
+            ));
+        }
+        let ids = [commit_id];
+        let record = ChangelogContext::new()
+            .reader(read.clone())
+            .load_commits(CommitLoadRequest { commit_ids: &ids })
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .ok_or_else(|| {
+                migration_error(format!(
+                    "{operation} global lineage commit '{commit_id}' is missing"
+                ))
+            })?;
+        next_global = record.parent_commit_ids.first().copied();
+    }
+
+    let mut chunk_writes = adapter.new_write_set();
+    let mut replacements = Vec::new();
+    let mut visited_rows = 0usize;
+    for commit_id in commit_ids {
+        let mut manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
+            .await?
+            .ok_or_else(|| {
+                migration_error(format!(
+                    "{operation} commit '{commit_id}' has no commit-state manifest"
+                ))
+            })?;
+        if manifest.row_pk_index_root_id.is_some() {
+            continue;
+        }
+        let (root, row_count) = backfill_row_pk_index_for_commit(
+            &read,
+            &mut chunk_writes,
+            &manifest,
+            options.max_changes.saturating_sub(visited_rows),
+        )
+        .await?;
+        visited_rows = visited_rows.checked_add(row_count).ok_or_else(|| {
+            migration_error(format!("{operation} row count exceeds usize"))
+        })?;
+        manifest.global_scope = global_commits.contains(&commit_id);
+        manifest.row_pk_index_root_id = root;
+        replacements.push(manifest);
+    }
+
+    let chunk_stats = chunk_writes.stats();
+    if chunk_stats.written_bytes > options.max_preflight_bytes as u64 {
+        return Err(LixError::new(
+            "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+            format!(
+                "{operation} exceeds configured byte bound: {} bytes",
+                chunk_stats.written_bytes
+            ),
+        ));
+    }
+    if chunk_stats.staged_puts != 0 || chunk_stats.staged_deletes != 0 {
+        let mut write = storage
+            .begin_write(WriteOptions {
+                await_durable: true,
+                preconditions: vec![
+                    Precondition::KeyValueEquals {
+                        space: REPOSITORY_PROTOCOL_SPACE,
+                        key: Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY)),
+                        expected: Bytes::from_static(expected_protocol),
+                    },
+                    crate::storage_adapter::repository_mutation_revision_precondition(
+                        expected_revision.clone(),
+                    ),
+                ],
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        if let Err(error) = chunk_writes.lower_into(&mut write).await {
+            let _ = write.rollback().await;
+            return Err(error.into());
+        }
+        write.commit().await.map_err(storage_error)?;
+    }
+    read.finish().map_err(storage_error)?;
+
+    let mut publication = crate::migration::publish::PublicationPlan::bounded(
+        replacements.len().saturating_mul(2),
+        options.max_preflight_bytes,
+    );
+    for manifest in replacements {
+        for (space, key, value) in
+            encode_commit_state_manifest_replacement_for_migration(&manifest)?
+        {
+            publication.replace_immutable(space, vec![(key, value)])?;
+        }
+    }
+    crate::migration::publish::publish(
+        storage,
+        expected_revision,
+        expected_protocol,
+        target_protocol,
+        publication,
+    )
+    .await
+}
+
+async fn preflight_v74_registered_schemas(
+    read: &(impl crate::storage_adapter::StorageAdapterRead + Clone),
+    options: MigrationOptions,
+) -> Result<(), LixError> {
+    let heads = BranchHeadControlContext::new()
+        .reader(read.clone())
+        .scan()
+        .await?
+        .into_iter()
+        .map(|(_, control)| control.head_commit_id)
+        .collect::<BTreeSet<_>>();
+    if heads.len() > options.max_changes {
+        return Err(LixError::new(
+            "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+            format!(
+                "v74 schema preflight exceeds configured branch-head bound: {} heads",
+                heads.len()
+            ),
+        ));
+    }
+
+    let mut inspected = 0usize;
+    let mut inspected_bytes = 0usize;
+    for head in heads {
+        let remaining = options.max_changes.saturating_sub(inspected);
+        let rows = TrackedStateContext::new()
+            .reader(read.clone())
+            .scan_batch_at_commit(
+                &head.to_string(),
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["lix_registered_schema".to_owned()],
+                        file_ids: vec![crate::NullableKeyFilter::Null],
+                        ..TrackedStateFilter::default()
+                    },
+                    read_columns: TrackedStateReadColumns {
+                        columns: vec!["snapshot".to_owned()],
+                    },
+                    limit: Some(remaining.saturating_add(1)),
+                },
+            )
+            .await?;
+        inspected = inspected.checked_add(rows.len()).ok_or_else(|| {
+            migration_error("v74 schema preflight row count exceeds usize")
+        })?;
+        if inspected > options.max_changes {
+            return Err(LixError::new(
+                "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+                format!(
+                    "v74 schema preflight exceeds configured row bound: {inspected} rows"
+                ),
+            ));
+        }
+        for row in rows.iter() {
+            let schema_key = row.row_pk().as_single_string_owned().map_err(|error| {
+                migration_error(format!(
+                    "v74 schema preflight found an invalid registered-schema identity: {error}"
+                ))
+            })?;
+            let schema = match row
+                .decoded_snapshot()
+                .and_then(|typed| typed.row.get("value"))
+            {
+                Some(lix_schema::Value::Jsonb(value)) => value.clone().into_value(),
+                _ => {
+                    return Err(migration_error(format!(
+                        "v74 schema preflight could not decode registered schema '{schema_key}' at commit '{head}'"
+                    )));
+                }
+            };
+            inspected_bytes = inspected_bytes
+                .checked_add(serde_json::to_vec(&schema).map_err(|error| {
+                    migration_error(format!(
+                        "v74 schema preflight could not size registered schema '{schema_key}': {error}"
+                    ))
+                })?.len())
+                .ok_or_else(|| migration_error("v74 schema preflight byte count exceeds usize"))?;
+            if inspected_bytes > options.max_preflight_bytes {
+                return Err(LixError::new(
+                    "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+                    format!(
+                        "v74 schema preflight exceeds configured byte bound: {inspected_bytes} bytes"
+                    ),
+                ));
+            }
+            validate_v74_registered_schema(&schema_key, &schema)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_v74_registered_schema(
+    schema_key: &str,
+    schema: &serde_json::Value,
+) -> Result<(), LixError> {
+    crate::schema::parse_lix_schema(schema).map(|_| ()).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_MIGRATION_SCHEMA_INCOMPATIBLE",
+            format!(
+                "repository cannot migrate to v74 while registered schema '{schema_key}' uses a reserved column: {}. With a v73-capable engine, register a replacement schema under a new key, migrate its rows, remove the old schema, and then retry",
+                error.message
+            ),
+        )
+    })
 }
 
 async fn migrate_working_diff_epoch<S>(
@@ -874,6 +1237,24 @@ mod tests {
     use crate::storage_adapter::{PutBatch, PutEntry, StorageValue};
     use crate::tracked_state::TrackedStateRootId;
 
+    #[test]
+    fn v74_preflight_teaches_legacy_reserved_column_rename() {
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "legacy_reserved_column",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "lixcol_user_value", "type": "text", "nullable": true }
+            ],
+            "primary_key": ["id"]
+        });
+        let error = validate_v74_registered_schema("legacy_reserved_column", &schema)
+            .expect_err("v74 must reject a formerly valid reserved column name");
+        assert_eq!(error.code, "LIX_ERROR_MIGRATION_SCHEMA_INCOMPATIBLE");
+        assert!(error.message.contains("lixcol_user_value"));
+        assert!(error.message.contains("replacement schema under a new key"));
+    }
+
     #[tokio::test]
     async fn migrates_v69_with_a_marker_only_publication() {
         let storage = Memory::new();
@@ -915,6 +1296,149 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn migrates_v73_repository_to_v74() {
+        let storage = Memory::new();
+        let (_branch_id, head_commit_id, rootless_commit_id, _) =
+            seed_rooted_head_with_rootless_checkpoint_cursor(
+                &storage,
+                REPOSITORY_PROTOCOL_V73,
+            )
+            .await;
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+
+        assert_eq!(
+            inspect_lix(&storage).await.unwrap(),
+            MigrationStatus::Required {
+                from_version: 73,
+                to_version: 74,
+            }
+        );
+        let pre_migration = SharedStorageAdapterRead::new(
+            adapter.begin_read(ReadOptions::default()).await.unwrap(),
+        );
+        let pre_migration_commit_ids =
+            crate::tracked_state::scan_commit_state_manifest_commit_ids(&pre_migration)
+                .await
+                .unwrap();
+        for commit_id in pre_migration_commit_ids {
+            let manifest =
+                crate::tracked_state::load_commit_state_manifest(&pre_migration, commit_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                manifest.row_pk_index_root_id.is_none(),
+                "v73 fixture commit '{commit_id}' must genuinely lack the new index"
+            );
+        }
+        assert!(
+            crate::tracked_state::load_commit_state_manifest(
+                &pre_migration,
+                rootless_commit_id,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot_root
+            .is_none()
+        );
+        pre_migration.finish().unwrap();
+        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.from_version, 73);
+        assert_eq!(report.to_version, 74);
+        assert_eq!(
+            inspect_lix(&storage).await.unwrap(),
+            MigrationStatus::Current { version: 74 }
+        );
+
+        let read = SharedStorageAdapterRead::new(
+            adapter.begin_read(ReadOptions::default()).await.unwrap(),
+        );
+        let commit_ids = crate::tracked_state::scan_commit_state_manifest_commit_ids(&read)
+            .await
+            .unwrap();
+        assert!(commit_ids.contains(&head_commit_id));
+        assert!(commit_ids.contains(&rootless_commit_id));
+        for commit_id in commit_ids {
+            let manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                manifest.row_pk_index_root_id.is_some(),
+                "migrated commit '{commit_id}' must carry an index authority, including an empty root"
+            );
+        }
+        let rootless = crate::tracked_state::load_commit_state_manifest(&read, rootless_commit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rootless.snapshot_root.is_none(),
+            "v74 backfill must index rootless history without promoting it"
+        );
+        let mut tracked = TrackedStateContext::new().reader(read.clone());
+        let keys = tracked
+            .enumerate_schema_row_pk_keys_at_commit(
+                head_commit_id,
+                "lix_key_value",
+                &[crate::row_pk::RowPk::single("migration-shared-pk")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            keys.into_iter()
+                .map(|key| key.file_id.expect("fixture rows are file-scoped"))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "01920000-0000-7000-8000-0000000000a1".to_owned(),
+                "01920000-0000-7000-8000-0000000000a2".to_owned(),
+            ])
+        );
+        drop(tracked);
+        read.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn v72_index_bootstrap_uses_a_resumable_rejected_marker() {
+        let storage = Memory::new();
+        seed_rooted_head_with_rootless_checkpoint_cursor(&storage, REPOSITORY_PROTOCOL_V72).await;
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+
+        backfill_missing_row_pk_indexes(
+            &adapter,
+            &storage,
+            MigrationOptions::default(),
+            72,
+            REPOSITORY_PROTOCOL_V72,
+            crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP,
+            "test v72 bootstrap",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_repository_protocol_marker(&adapter)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP)
+        );
+        assert!(
+            crate::engine::Engine::new(storage.clone()).await.is_err(),
+            "normal engine open must reject an interrupted bootstrap"
+        );
+        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+            .await
+            .expect("migration should resume from the transitional marker");
+        assert_eq!(report.from_version, 72);
+        assert_eq!(report.to_version, 74);
+    }
+
     async fn seed_rooted_head_with_rootless_checkpoint_cursor(
         storage: &Memory,
         protocol: &'static [u8],
@@ -925,6 +1449,22 @@ mod tests {
             .unwrap();
         lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('migration-chronology-head', 'rooted')",
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.execute(
+            "INSERT INTO lix_file (id, path) VALUES \
+             ('01920000-0000-7000-8000-0000000000a1', '/migration-a'), \
+             ('01920000-0000-7000-8000-0000000000a2', '/migration-b')",
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_file_id) VALUES \
+             ('migration-shared-pk', 'a', '01920000-0000-7000-8000-0000000000a1'), \
+             ('migration-shared-pk', 'b', '01920000-0000-7000-8000-0000000000a2')",
             &[],
         )
         .await
@@ -970,11 +1510,22 @@ mod tests {
             .expect("fixture head should already be rooted")
             .root_id
             .clone();
-        let mut checkpoint_manifest =
-            crate::tracked_state::load_commit_state_manifest(&read, checkpoint_commit_id)
-                .await
-                .unwrap()
-                .unwrap();
+        let commit_ids = crate::tracked_state::scan_commit_state_manifest_commit_ids(&read)
+            .await
+            .unwrap();
+        let mut manifests = Vec::with_capacity(commit_ids.len());
+        for commit_id in commit_ids {
+            manifests.push(
+                crate::tracked_state::load_commit_state_manifest(&read, commit_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let checkpoint_manifest = manifests
+            .iter_mut()
+            .find(|manifest| manifest.commit_id == checkpoint_commit_id)
+            .expect("fixture checkpoint manifest should be retained");
         assert!(checkpoint_manifest.snapshot_root.is_some());
         checkpoint_manifest.snapshot_root = None;
         checkpoint_manifest.replay_debt = CommitStateReplayDebt {
@@ -982,10 +1533,13 @@ mod tests {
             rows: u64::from(checkpoint_manifest.mutations.member_count),
             bytes: 1,
         };
-        let replacements = encode_commit_state_manifest_replacement_for_migration(
-            &checkpoint_manifest,
-        )
-        .unwrap();
+        let replacements = manifests
+            .into_iter()
+            .flat_map(|mut manifest| {
+                manifest.row_pk_index_root_id = None;
+                encode_commit_state_manifest_replacement_for_migration(&manifest).unwrap()
+            })
+            .collect::<Vec<_>>();
         read.finish().unwrap();
 
         let mut fixture = storage.begin_write(WriteOptions::default()).await.unwrap();
@@ -1088,7 +1642,7 @@ mod tests {
             inspect_lix(&storage).await.unwrap(),
             MigrationStatus::Required {
                 from_version: 70,
-                to_version: 73,
+                to_version: CURRENT_FORMAT_VERSION,
             }
         );
         assert_chronology_roots_promoted(
@@ -1151,14 +1705,14 @@ mod tests {
             inspect_lix(&storage).await.unwrap(),
             MigrationStatus::Required {
                 from_version: 71,
-                to_version: 73,
+                to_version: CURRENT_FORMAT_VERSION,
             }
         );
         let report = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
             .unwrap();
         assert_eq!(report.from_version, 71);
-        assert_eq!(report.to_version, 73);
+        assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
         assert!(
             report.hot_rows_rewritten > 0,
             "the v71 edge must repair the stale working-diff epoch before publishing v72"

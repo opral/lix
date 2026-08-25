@@ -571,7 +571,9 @@ fn stage_test_commit_state_manifest(
         replay_debt,
         mutations,
         touched_scope_filter: Default::default(),
+        global_scope: false,
         current_state_scoped_ranges: None,
+        row_pk_index_root_id: None,
         snapshot_root: snapshot_root.map(Box::new),
     };
     crate::tracked_state::stage_commit_state_manifest(writes, &manifest)

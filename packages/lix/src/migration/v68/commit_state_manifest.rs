@@ -230,8 +230,11 @@ struct CurrentManifestWire {
     replay_debt: CommitStateReplayDebt,
     mutations: CurrentInventoryWire,
     touched_scope_filter: TouchedScopeFilterWire,
+    global_scope: bool,
     #[musli(with = storage_codec::option)]
     current_state_scoped_ranges: Option<Box<ScopedRangeAuthorityWire>>,
+    #[musli(with = storage_codec::option)]
+    row_pk_index_root_id: Option<TrackedStateRootId>,
     #[musli(with = storage_codec::option)]
     snapshot_root: Option<Box<TrackedStateCommitRoot>>,
 }
@@ -569,7 +572,9 @@ fn assemble_manifest(
             parts,
         },
         touched_scope_filter: stored.touched_scope_filter,
+        global_scope: false,
         current_state_scoped_ranges,
+        row_pk_index_root_id: None,
         snapshot_root: stored.snapshot_root,
     };
     let encoded = storage_codec::encode("upgraded v68 commit-state manifest", &wire)?;

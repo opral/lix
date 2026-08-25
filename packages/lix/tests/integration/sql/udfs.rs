@@ -169,7 +169,7 @@ simulation_test!(
             .expect("draft should diverge");
         let diff = draft
             .execute(
-                "SELECT row_pk FROM lix_diff(\
+                "SELECT lixcol_row_pk FROM lix_diff(\
                  'lix_key_value', lix_latest_checkpoint_commit_id(), \
                  lix_active_branch_commit_id())",
                 &[],

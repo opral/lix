@@ -1737,6 +1737,7 @@ mod tests {
             parent_commit_ids: Vec::new(),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
+            global_scope: false,
             selected_source_commit_id: None,
             state_alias: None,
             members: vec![super::super::commit::SyncCommitMember {

@@ -45,6 +45,8 @@ pub struct SyncCommit {
     pub parent_commit_ids: Vec<String>,
     pub account_id: String,
     pub created_at: String,
+    #[serde(default)]
+    pub global_scope: bool,
     pub selected_source_commit_id: Option<String>,
     /// Authenticated O(1) representation of a complete-state checkpoint.
     /// The source is a dependency and `state_root_id` binds the alias to the
@@ -455,6 +457,10 @@ where
             .collect(),
         account_id: record.account_id,
         created_at: record.created_at.to_string(),
+        global_scope: crate::tracked_state::load_published_commit_state_topology(store, commit_id)
+            .await?
+            .ok_or_else(|| LixError::unknown(format!("sync commit '{commit_id}' has no tracked-state authority")))?
+            .global_scope(),
         selected_source_commit_id: selected_source_commit_id.map(|source| source.to_string()),
         state_alias,
         members,
@@ -824,6 +830,7 @@ mod tests {
             parent_commit_ids: Vec::new(),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             created_at: "2026-08-19T00:00:00Z".to_owned(),
+            global_scope: false,
             selected_source_commit_id: None,
             state_alias: None,
             members: vec![member("b", 1), member("a", 2)],
@@ -886,6 +893,7 @@ mod tests {
             parent_commit_ids: vec![parent.to_string()],
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             created_at: "2026-08-19T00:00:00Z".to_owned(),
+            global_scope: false,
             selected_source_commit_id: None,
             state_alias: Some(SyncCommitStateAlias {
                 source_commit_id: source.to_string(),

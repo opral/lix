@@ -16,6 +16,7 @@ mod diff_id;
 mod merge;
 pub(crate) mod mutation_directory;
 pub(crate) mod replacement_part;
+mod row_pk_index;
 mod row_materialization;
 mod scoped_current_state;
 pub(crate) mod scoped_range;
@@ -58,6 +59,10 @@ pub(crate) use replacement_part::{
     EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS, REPLACEMENT_PART_TARGET_BYTES,
     ReplacementPartRowRef, encode_replacement_part_with_compressor,
 };
+pub(crate) use row_pk_index::{
+    backfill_row_pk_index_for_commit, decode_row_pk_index_key, row_pk_index_scan_request,
+    stage_row_pk_index_from_deltas, stage_row_pk_index_from_members,
+};
 pub(crate) use row_materialization::{
     MaterializedTrackedStateBatch, MaterializedTrackedStateExactBatch,
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
@@ -89,7 +94,9 @@ pub(crate) use storage::{
     CommitDeltaReplacementScope, EnvelopeCertifiedNativeProjectionBatch,
     EnvelopeCertifiedNativeProjectionSegment, ExclusiveRowSnapshotBatch,
     OrderedAddressableCommitDeltaStage, PublishedCommitStateTopology, StagedCommitStateManifest,
+    TrackedStateChunkOverlay,
     commit_delta_contains_schema, commit_delta_member_scopes, commit_history_is_deferred,
+    deferred_commit_global_scope,
     complete_state_fence_change_owner_commit_ids, direct_change_locator,
     deferred_commit_history_ids,
     encode_commit_state_manifest_replacement_for_migration, load_authoritative_live_change_records,
@@ -108,7 +115,9 @@ pub(crate) use storage::{
     stage_addressable_commit_deltas, stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_history_available,
-    stage_commit_history_deferred, stage_commit_state_manifest_with_handle,
+    stage_commit_history_deferred, stage_commit_history_deferred_with_scope,
+    stage_commit_state_manifest_with_handle,
+    staged_commit_delta_members, staged_commit_delta_segment_bytes,
     stage_current_state_scoped_ranges_from_complete_state_source,
     sync_history_required_for_commits,
     stage_current_state_scoped_ranges_from_published_parent,

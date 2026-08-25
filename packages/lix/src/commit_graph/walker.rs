@@ -1551,7 +1551,9 @@ mod tests {
                 },
                 mutations: CommitStateMutationInventory::default(),
                 touched_scope_filter: Default::default(),
+                global_scope: false,
                 current_state_scoped_ranges: None,
+                row_pk_index_root_id: None,
                 snapshot_root: None,
             },
         )

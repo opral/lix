@@ -596,7 +596,9 @@ pub(super) async fn plan_commit_authorities(
             replay_debt: old.replay_debt,
             mutations,
             touched_scope_filter: CommitStateTouchedScopeFilter::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: old.snapshot_root,
         };
         stage_commit_state_manifest(&mut writes, &manifest)?;

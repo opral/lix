@@ -3720,13 +3720,13 @@ fn simple_string_primary_key_index(spec: &SchemaSurfaceSpec, column_name: &str) 
 /// decoder that visits only selected fields. This is a physical execution
 /// choice; the SQL schema and result contract are the same in both cases.
 #[derive(Clone, Copy)]
-enum RowBatchProjection {
+pub(super) enum RowBatchProjection {
     ParsedSnapshots,
     RawTrackedProjection,
 }
 
 impl RowBatchProjection {
-    fn for_request(request: &HotStateScanRequest) -> Self {
+    pub(super) fn for_request(request: &HotStateScanRequest) -> Self {
         if request.filter.row_pks.is_empty() {
             Self::RawTrackedProjection
         } else {
@@ -3735,7 +3735,7 @@ impl RowBatchProjection {
     }
 }
 
-fn row_record_batch(
+pub(super) fn row_record_batch(
     spec: &SchemaSurfaceSpec,
     schema: SchemaRef,
     rows: &MaterializedHotStateBatch,

@@ -720,6 +720,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             &staged_delta_index,
             &checkpoint_state_sources,
             &staged_snapshot_roots,
+            &commit_rows
+                .iter()
+                .filter(|commit| commit.global_scope)
+                .map(|commit| commit.commit_id)
+                .collect(),
         )?
     } else {
         Vec::new()
@@ -2260,6 +2265,7 @@ fn materialize_staged_sync_commits(
     staged_delta_index: &StagedCommitDeltaIndex,
     checkpoint_state_sources: &BTreeMap<CommitId, CommitId>,
     staged_snapshot_roots: &BTreeMap<CommitId, TrackedStateCommitRoot>,
+    global_commit_ids: &BTreeSet<CommitId>,
 ) -> Result<Vec<crate::sync::SyncCommit>, LixError> {
     use crate::sync::{
         SyncCommit, SyncCommitMemberRef, SyncCommitStateAlias, encode_sync_commit_member,
@@ -2464,6 +2470,7 @@ fn materialize_staged_sync_commits(
                 .collect(),
             account_id: staged.record.account_id.clone(),
             created_at: staged.record.created_at.to_string(),
+            global_scope: global_commit_ids.contains(commit_id),
             selected_source_commit_id: selected_source_commit_id.map(|id| id.to_string()),
             state_alias,
             members,
@@ -6257,6 +6264,7 @@ where
     Box::pin(async move {
         let mut published_manifests =
             BTreeMap::<CommitId, crate::tracked_state::StagedCommitStateManifest>::new();
+        let mut row_pk_index_overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
         if staged_commits.len() != commit_rows.len()
             || commit_rows
                 .iter()
@@ -6272,6 +6280,11 @@ where
             .sort_unstable_by_key(|staged| (staged.record.generation, staged.record.commit_id));
         for staged in publication_order {
             let record = &staged.record;
+            let global_scope = commit_rows
+                .iter()
+                .find(|commit| commit.commit_id == record.commit_id)
+                .expect("publication order was validated against finalized commits")
+                .global_scope;
             let rootless = rootless_commit_ids.contains(&record.commit_id);
             let snapshot_root = snapshot_roots.get(&record.commit_id).cloned();
             if rootless == snapshot_root.is_some() {
@@ -6508,6 +6521,88 @@ where
                 crate::tracked_state::incomplete_touched_scope_filter,
                 |publication| publication.touched_scope_filter().clone(),
             );
+            let row_pk_base_commit_id = if complete_state_fence {
+                snapshot_root
+                    .as_ref()
+                    .and_then(|root| root.parent_roots.first())
+                    .map(|source| source.commit_id)
+            } else {
+                mutations.selected_source_commit_id().or(first_parent)
+            };
+            let loaded_row_pk_base = if let Some(base_id) = row_pk_base_commit_id
+                && !published_manifests.contains_key(&base_id)
+                && !external_parent_manifests.contains_key(&base_id)
+            {
+                crate::tracked_state::load_published_commit_state_topology(read, base_id).await?
+            } else {
+                None
+            };
+            let mut row_pk_base_root = row_pk_base_commit_id.and_then(|base_id| {
+                published_manifests
+                    .get(&base_id)
+                    .and_then(|manifest| manifest.row_pk_index_root_id.clone())
+                    .or_else(|| {
+                        external_parent_manifests
+                            .get(&base_id)
+                            .and_then(|manifest| manifest.row_pk_index_root_id().cloned())
+                    })
+                    .or_else(|| {
+                        loaded_row_pk_base
+                            .as_ref()
+                            .and_then(|manifest| manifest.row_pk_index_root_id().cloned())
+                    })
+            });
+            if row_pk_base_commit_id.is_some() && row_pk_base_root.is_none() {
+                let base_id = row_pk_base_commit_id.expect("checked above");
+                let base_rows = TrackedStateContext::new()
+                    .reader(&*read)
+                    .scan_batch_at_commit(
+                        &base_id.to_string(),
+                        &TrackedStateScanRequest::default(),
+                    )
+                    .await?
+                    .into_rows();
+                row_pk_base_root = crate::tracked_state::stage_row_pk_index_from_deltas(
+                    read,
+                    writes,
+                    &mut row_pk_index_overlay,
+                    base_rows.iter().map(|row| TrackedStateDeltaRef {
+                        schema_key: &row.schema_key,
+                        file_id: row.file_id.as_deref(),
+                        row_pk: &row.row_pk,
+                        change_id: row.change_id,
+                        commit_id: row.commit_id,
+                        deleted: false,
+                        created_at: LixTimestamp::expect_parse("created_at", &row.created_at),
+                        updated_at: LixTimestamp::expect_parse("updated_at", &row.updated_at),
+                    }),
+                    base_id,
+                )
+                .await?;
+            }
+            let staged_segments =
+                crate::tracked_state::staged_commit_delta_segment_bytes(
+                    writes,
+                    record.commit_id,
+                    &mutations,
+                )?;
+            let row_pk_members = crate::tracked_state::staged_commit_delta_members(
+                read,
+                record.commit_id,
+                &record.account_id,
+                &mutations,
+                staged_segments,
+            )
+            .await?;
+            let row_pk_index_root_id = crate::tracked_state::stage_row_pk_index_from_members(
+                read,
+                writes,
+                &mut row_pk_index_overlay,
+                row_pk_base_root.as_ref(),
+                &row_pk_members,
+                record.commit_id,
+            )
+            .await?;
             if mutations.replacement_generation.is_some() {
                 mutations.parts.clear();
             }
@@ -6521,7 +6616,9 @@ where
                 },
                 mutations,
                 touched_scope_filter,
+                global_scope,
                 current_state_scoped_ranges,
+                row_pk_index_root_id,
                 snapshot_root: snapshot_root.map(Box::new),
             };
             let staged_manifest = if let Some(publication) = catalog_publication.as_ref() {
@@ -6699,6 +6796,7 @@ struct FinalizedCommitRow {
     parent_commit_ids: Vec<CommitId>,
     created_at: LixTimestamp,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
+    global_scope: bool,
 }
 
 struct PendingTrackedRoot {
@@ -6732,6 +6830,7 @@ async fn finalize_commit_rows(
             parent_commit_ids: vec![intermediate.parent_commit_id],
             created_at,
             selected_change_batches,
+            global_scope: intermediate.branch_id == crate::GLOBAL_BRANCH_ID,
         });
         tracked_roots.push(PendingTrackedRoot {
             branch_id: intermediate.branch_id,
@@ -6782,6 +6881,7 @@ async fn finalize_commit_rows(
             parent_commit_ids: parent_commit_ids.clone(),
             created_at: timestamp,
             selected_change_batches,
+            global_scope: branch_id == crate::GLOBAL_BRANCH_ID,
         });
         tracked_roots.push(PendingTrackedRoot {
             branch_id,
@@ -9776,12 +9876,14 @@ mod tests {
                 parent_commit_ids: vec![CommitId::for_test_label("parent-commit")],
                 created_at: ts("2026-01-01T00:00:01Z"),
                 selected_change_batches: Vec::new(),
+                global_scope: false,
             },
             FinalizedCommitRow {
                 commit_id: CommitId::for_test_label("parent-commit"),
                 parent_commit_ids: Vec::new(),
                 created_at: ts("2026-01-01T00:00:00Z"),
                 selected_change_batches: Vec::new(),
+                global_scope: false,
             },
         ];
         let mut rootless_commit_ids = BTreeSet::from([CommitId::for_test_label("parent-commit")]);
@@ -9918,6 +10020,7 @@ mod tests {
                     .unwrap_or_default(),
                 created_at: ts("2026-01-01T00:00:00Z"),
                 selected_change_batches: Vec::new(),
+                global_scope: false,
             })
             .collect::<Vec<_>>();
         let row_indices = commit_ids
@@ -10892,6 +10995,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            global_scope: false,
         }];
         let loaded = load_selected_change_records(&read, &commit_rows)
             .await

@@ -1836,7 +1836,7 @@ fn directory_snapshot_from_live_row(
         .transpose()
 }
 
-fn lix_directory_record_batch(
+pub(super) fn lix_directory_record_batch(
     schema: &SchemaRef,
     rows: &MaterializedHotStateBatch,
 ) -> Result<RecordBatch, LixError> {

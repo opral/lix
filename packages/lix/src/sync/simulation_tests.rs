@@ -586,8 +586,8 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT row_pk FROM __LIX_RELATION_DIFF__ \
-                 WHERE row_pk = CAST('[\"selected\"]' AS JSONB)",
+                "SELECT lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+                 WHERE lixcol_row_pk = CAST('[\"selected\"]' AS JSONB)",
             )
             .await,
             &[],
@@ -595,7 +595,7 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
         .await
         .expect("selected working diff should be hot")
         .rows()[0]
-        .get::<serde_json::Value>("row_pk")
+        .get::<serde_json::Value>("lixcol_row_pk")
         .expect("selected primary key should decode");
     let head_commit_id_text = replica
         .lix
@@ -694,7 +694,7 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT row_pk FROM __LIX_RELATION_DIFF__ ORDER BY row_pk",
+                "SELECT lixcol_row_pk FROM __LIX_RELATION_DIFF__ ORDER BY lixcol_row_pk",
             )
             .await,
             &[],
@@ -704,7 +704,7 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
     assert_eq!(remaining.rows().len(), 1);
     assert_eq!(
         remaining.rows()[0]
-            .get::<serde_json::Value>("row_pk")
+            .get::<serde_json::Value>("lixcol_row_pk")
             .expect("remaining row key"),
         serde_json::json!(["remaining"]),
     );
@@ -746,8 +746,8 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
 				&replica.lix,
 				"lix_key_value",
 				"INSERT INTO lix_create_checkpoint (relation, row_pk) \
-				 SELECT 'lix_key_value', row_pk FROM __LIX_RELATION_DIFF__ \
-				 WHERE row_pk = CAST('[\"working-00\"]' AS JSONB) \
+				 SELECT 'lix_key_value', lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+				 WHERE lixcol_row_pk = CAST('[\"working-00\"]' AS JSONB) \
 				 RETURNING commit_id",
 			)
 			.await,
@@ -762,7 +762,7 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
 			&working_diff_sql(
 				&replica.lix,
 				"lix_key_value",
-				"SELECT row_pk FROM __LIX_RELATION_DIFF__ ORDER BY row_pk",
+				"SELECT lixcol_row_pk FROM __LIX_RELATION_DIFF__ ORDER BY lixcol_row_pk",
 			)
 			.await,
 			&[],
@@ -771,7 +771,9 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
 		.expect("unselected snapshot-local diff should remain readable");
 	assert_eq!(remaining.rows().len(), 49);
 	assert_eq!(
-		remaining.rows()[0].get::<serde_json::Value>("row_pk").unwrap(),
+		remaining.rows()[0]
+			.get::<serde_json::Value>("lixcol_row_pk")
+			.unwrap(),
 		serde_json::json!(["working-01"]),
 	);
 }
@@ -815,8 +817,8 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT row_pk FROM __LIX_RELATION_DIFF__ \
-                 WHERE row_pk = CAST('[\"owner-00\"]' AS JSONB)",
+                "SELECT lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+                 WHERE lixcol_row_pk = CAST('[\"owner-00\"]' AS JSONB)",
             )
             .await,
             &[],
@@ -824,7 +826,7 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
         .await
         .expect("working diff should already be HOT")
         .rows()[0]
-        .get::<serde_json::Value>("row_pk")
+        .get::<serde_json::Value>("lixcol_row_pk")
         .expect("selected primary key should decode");
     assert!(
         crate::tracked_state::take_point_replay_authority_batch_probe_for_test().is_empty(),
@@ -982,8 +984,8 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
                 &replica.lix,
                 "lix_file",
                 "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_file', row_pk FROM __LIX_RELATION_DIFF__ \
-                 WHERE row_pk ->> 0 = $1 RETURNING commit_id",
+                 SELECT 'lix_file', lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+                 WHERE lixcol_row_pk ->> 0 = $1 RETURNING commit_id",
             )
             .await,
             &[Value::Text(selected_file_id)],
@@ -1105,8 +1107,8 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                 &replica.lix,
                 "lix_key_value",
                 "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk FROM __LIX_RELATION_DIFF__ \
-                 WHERE row_pk ->> 0 = 'selected-recreate' RETURNING commit_id",
+                 SELECT 'lix_key_value', lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+                 WHERE lixcol_row_pk ->> 0 = 'selected-recreate' RETURNING commit_id",
             )
             .await,
             &[],
@@ -1136,7 +1138,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                 &replica.lix,
                 "lix_key_value",
                 "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ \
-                 WHERE row_pk ->> 0 = 'selected-recreate'",
+                 WHERE lixcol_row_pk ->> 0 = 'selected-recreate'",
             )
             .await,
             &[],
@@ -1154,7 +1156,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                 &replica.lix,
                 "lix_key_value",
                 "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ \
-                 WHERE row_pk ->> 0 = 'remaining'",
+                 WHERE lixcol_row_pk ->> 0 = 'remaining'",
             )
             .await,
             &[],
@@ -1174,7 +1176,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                 &replica.lix,
                 "lix_key_value",
                 "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ \
-                 WHERE row_pk ->> 0 = 'remaining'",
+                 WHERE lixcol_row_pk ->> 0 = 'remaining'",
             )
             .await,
             &[],
@@ -1262,7 +1264,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                 &working_diff_sql(
                     &replica.lix,
                     "lix_file",
-                    "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ WHERE row_pk ->> 0 = $1",
+                    "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ WHERE lixcol_row_pk ->> 0 = $1",
                 )
                 .await,
                 &[Value::Text(selected_file_id.clone())],
@@ -1285,8 +1287,8 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                     &replica.lix,
                     "lix_file",
                     "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                     SELECT 'lix_file', row_pk FROM __LIX_RELATION_DIFF__ \
-                     WHERE row_pk ->> 0 = $1 RETURNING commit_id",
+                     SELECT 'lix_file', lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+                     WHERE lixcol_row_pk ->> 0 = $1 RETURNING commit_id",
                 )
                 .await,
                 &[Value::Text(selected_file_id.clone())],
@@ -1314,7 +1316,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                 &working_diff_sql(
                     &replica.lix,
                     "lix_file",
-                    "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ WHERE row_pk ->> 0 = $1",
+                    "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ WHERE lixcol_row_pk ->> 0 = $1",
                 )
                 .await,
                 &[Value::Text(selected_file_id)],
@@ -1366,8 +1368,8 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
 			&working_diff_sql(
 				&replica.lix,
 				"lix_key_value",
-				"SELECT row_pk FROM __LIX_RELATION_DIFF__ \
-				 WHERE row_pk = CAST('[\"selected\"]' AS JSONB)",
+				"SELECT lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+				 WHERE lixcol_row_pk = CAST('[\"selected\"]' AS JSONB)",
 			)
 			.await,
 			&[],
@@ -1375,7 +1377,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
 		.await
 		.unwrap()
 		.rows()[0]
-		.get::<serde_json::Value>("row_pk")
+		.get::<serde_json::Value>("lixcol_row_pk")
 		.unwrap();
 	replica
 		.lix
@@ -1419,8 +1421,8 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
 			&working_diff_sql(
 				&replica.lix,
 				"lix_key_value",
-				"SELECT row_pk FROM __LIX_RELATION_DIFF__ \
-				 WHERE row_pk = CAST('[\"selected\"]' AS JSONB)",
+				"SELECT lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+				 WHERE lixcol_row_pk = CAST('[\"selected\"]' AS JSONB)",
 			)
 			.await,
 			&[],
@@ -1428,7 +1430,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
 		.await
 		.unwrap()
 		.rows()[0]
-		.get::<serde_json::Value>("row_pk")
+		.get::<serde_json::Value>("lixcol_row_pk")
 		.unwrap();
 	let head_commit_id = replica
 		.lix
@@ -1567,8 +1569,8 @@ async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Si
                 &replica.lix,
                 "lix_key_value",
                 "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk FROM __LIX_RELATION_DIFF__ \
-                 WHERE coalesce(row_pk ->> 0, '') = 'selected' RETURNING commit_id",
+                 SELECT 'lix_key_value', lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+                 WHERE coalesce(lixcol_row_pk ->> 0, '') = 'selected' RETURNING commit_id",
             )
             .await,
             &[],
@@ -1593,7 +1595,7 @@ async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Si
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT row_pk ->> 0 AS key FROM __LIX_RELATION_DIFF__",
+                "SELECT lixcol_row_pk ->> 0 AS key FROM __LIX_RELATION_DIFF__",
             )
             .await,
             &[],
@@ -1622,8 +1624,8 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT row_pk FROM __LIX_RELATION_DIFF__ \
-                 WHERE row_pk = CAST('[\"selected\"]' AS JSONB)",
+                "SELECT lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+                 WHERE lixcol_row_pk = CAST('[\"selected\"]' AS JSONB)",
             )
             .await,
             &[],
@@ -1631,7 +1633,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
         .await
         .unwrap()
         .rows()[0]
-        .get::<serde_json::Value>("row_pk")
+        .get::<serde_json::Value>("lixcol_row_pk")
         .unwrap();
 
     crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
@@ -1654,7 +1656,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT diff_type, row_pk FROM __LIX_RELATION_DIFF__",
+                "SELECT lixcol_diff_type, lixcol_row_pk FROM __LIX_RELATION_DIFF__",
             )
             .await,
             &[],
@@ -1662,10 +1664,15 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
         .await
         .unwrap();
     assert_eq!(remaining.rows().len(), 1);
-    assert_eq!(remaining.rows()[0].get::<String>("diff_type").unwrap(), "removed");
     assert_eq!(
         remaining.rows()[0]
-            .get::<serde_json::Value>("row_pk")
+            .get::<String>("lixcol_diff_type")
+            .unwrap(),
+        "removed"
+    );
+    assert_eq!(
+        remaining.rows()[0]
+            .get::<serde_json::Value>("lixcol_row_pk")
             .unwrap(),
         serde_json::json!(["removed"]),
     );
@@ -1678,7 +1685,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
                     &replica.lix,
                     "lix_key_value",
                     "SELECT COUNT(*) AS count FROM __LIX_RELATION_DIFF__ \
-                     WHERE diff_type = 'removed'",
+                     WHERE lixcol_diff_type = 'removed'",
                 )
                 .await,
                 &[],
@@ -1720,8 +1727,8 @@ async fn stale_partial_checkpoint_epoch_repairs_in_migration(_sim: Simulation) {
 			&working_diff_sql(
 				&replica.lix,
 				"lix_key_value",
-				"SELECT row_pk FROM __LIX_RELATION_DIFF__ \
-				 WHERE row_pk = CAST('[\"selected\"]' AS JSONB)",
+				"SELECT lixcol_row_pk FROM __LIX_RELATION_DIFF__ \
+				 WHERE lixcol_row_pk = CAST('[\"selected\"]' AS JSONB)",
 			)
 			.await,
 			&[],
@@ -1729,7 +1736,7 @@ async fn stale_partial_checkpoint_epoch_repairs_in_migration(_sim: Simulation) {
 		.await
 		.unwrap()
 		.rows()[0]
-		.get::<serde_json::Value>("row_pk")
+		.get::<serde_json::Value>("lixcol_row_pk")
 		.unwrap();
 	replica
 		.lix
