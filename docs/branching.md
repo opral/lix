@@ -43,8 +43,9 @@ await draftLix.close();
 ```
 
 Each session has independent branch selection, transactions, observations, and
-lifecycle. Use `lix_diff(mainCommit, draftCommit)` when the desired result is a
-commit-to-commit change set rather than two current-state result sets.
+lifecycle. Use `lix_diff('acme_section', mainCommit, draftCommit)` when the
+desired result is a relation-specific commit-to-commit change set rather than
+two current-state result sets.
 
 ## Preview a merge
 

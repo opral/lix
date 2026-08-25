@@ -3878,6 +3878,10 @@ async fn execute_prepared_transaction_write<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    if let Some(returning) = sql2::full_checkpoint_command(&plan) {
+        let outcome = transaction.execute_full_checkpoint_command().await?;
+        return sql2::SqlWriteResult::diff_command(outcome, returning.as_ref());
+    }
     if let Some((command, query_sql, returning)) = sql2::diff_command_query(&plan) {
         let outcome = transaction
             .execute_diff_command_query_owned(command, query_sql, params.to_vec())
@@ -5427,12 +5431,6 @@ mod tests {
             .await
             .expect("legacy cursor corruption should commit");
 
-        let broken = session
-            .execute("SELECT * FROM lix_working_diff()", &[])
-            .await
-            .expect_err("legacy branch should reproduce the missing-cursor failure");
-        assert!(broken.message.contains("has no checkpoint cursor"));
-
         let restored = session
             .execute(
                 "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
@@ -5445,7 +5443,11 @@ mod tests {
             restore_target
         );
         let working_diff = session
-            .execute("SELECT * FROM lix_working_diff()", &[])
+            .execute(
+                "SELECT row_pk FROM lix_diff(\
+                 'lix_key_value', $1, lix_active_branch_commit_id())",
+                &[Value::Text(restore_target.clone())],
+            )
             .await
             .expect("working diff should read after repair");
         assert!(working_diff.rows().is_empty());
@@ -6714,8 +6716,9 @@ mod tests {
 
         let diff = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'rootless_ordered_insert_probe' AND diff_type = 'added'",
+                "SELECT COUNT(*) AS entries \
+                 FROM lix_diff('rootless_ordered_insert_probe', $1, $2) \
+                 WHERE diff_type = 'added'",
                 &[
                     Value::Text(baseline.commit_id.to_string()),
                     Value::Text(head.commit_id.to_string()),
@@ -6796,8 +6799,9 @@ mod tests {
         assert_eq!(updated.rows()[0].get::<String>("value").unwrap(), "updated");
         let update_diff = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'rootless_ordered_insert_probe' AND diff_type = 'modified'",
+                "SELECT COUNT(*) AS entries \
+                 FROM lix_diff('rootless_ordered_insert_probe', $1, $2) \
+                 WHERE diff_type = 'modified'",
                 &[
                     Value::Text(head.commit_id.to_string()),
                     Value::Text(descendant.commit_id.to_string()),
@@ -6977,8 +6981,9 @@ mod tests {
         );
         let fence_diff = main_session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'rootless_ordered_insert_probe' AND diff_type = 'modified'",
+                "SELECT COUNT(*) AS entries \
+                 FROM lix_diff('rootless_ordered_insert_probe', $1, $2) \
+                 WHERE diff_type = 'modified'",
                 &[
                     Value::Text(reseed_head.commit_id.to_string()),
                     Value::Text(rooted_fence.to_string()),
@@ -7228,8 +7233,9 @@ mod tests {
 
         let inserted_diff = main
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'columnar_lifecycle_probe' AND diff_type = 'added'",
+                "SELECT COUNT(*) AS entries \
+                 FROM lix_diff('columnar_lifecycle_probe', $1, $2) \
+                 WHERE diff_type = 'added'",
                 &[
                     Value::Text(before_insert.to_string()),
                     Value::Text(inserted_head.to_string()),
@@ -7395,8 +7401,9 @@ mod tests {
             .expect("merged head should exist");
         let merged_diff = main
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'columnar_lifecycle_probe' AND diff_type = 'modified'",
+                "SELECT COUNT(*) AS entries \
+                 FROM lix_diff('columnar_lifecycle_probe', $1, $2) \
+                 WHERE diff_type = 'modified'",
                 &[
                     Value::Text(checkpoint.commit_id.to_string()),
                     Value::Text(merged_head.to_string()),
@@ -7537,7 +7544,9 @@ mod tests {
         );
         let working_diff = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_working_diff() WHERE schema_key = 'ordered_packed_update_probe' AND diff_type = 'added'",
+                "SELECT COUNT(*) AS entries \
+                 FROM lix_diff('ordered_packed_update_probe', lix_root_commit_id(), lix_active_branch_commit_id()) \
+                 WHERE diff_type = 'added'",
                 &[],
             )
             .await
@@ -7582,12 +7591,16 @@ mod tests {
             partial.rows()[0].get::<serde_json::Value>("value").unwrap(),
             serde_json::json!("partial-0000")
         );
-        session
+        let checkpoint = session
             .create_checkpoint()
             .await
             .expect("replaced packed current base should remain checkpointable");
         let working_diff = session
-            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff()", &[])
+            .execute(
+                "SELECT COUNT(*) AS entries \
+                 FROM lix_diff('ordered_packed_update_probe', $1, lix_active_branch_commit_id())",
+                &[Value::Text(checkpoint.commit_id)],
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -7682,10 +7695,13 @@ mod tests {
 
         let diff = session
             .execute(
-                "SELECT count(*) AS count FROM lix_working_diff() \
-                 WHERE schema_key = 'packed_replacement_working_diff_probe' \
-                   AND diff_type = 'modified'",
-                &[],
+                "SELECT count(*) AS count \
+                 FROM lix_diff('packed_replacement_working_diff_probe', $1, $2) \
+                 WHERE diff_type = 'modified'",
+                &[
+                    Value::Text(checkpoint_commit_id.clone()),
+                    Value::Text(head_commit_id.clone()),
+                ],
             )
             .await
             .expect("ambiguous packed payload comparison should resolve locally");
@@ -9518,8 +9534,9 @@ mod tests {
         ] {
             let diff = session
                 .execute(
-                    "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                     WHERE schema_key = 'packed_replacement_probe' AND diff_type = 'modified'",
+                    "SELECT COUNT(*) AS entries \
+                     FROM lix_diff('packed_replacement_probe', $1, $2) \
+                     WHERE diff_type = 'modified'",
                     &[Value::Text(before.clone()), Value::Text(after.clone())],
                 )
                 .await
@@ -9685,8 +9702,9 @@ mod tests {
         );
         let merged_diff = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'packed_replacement_probe' AND diff_type = 'modified'",
+                "SELECT COUNT(*) AS entries \
+                 FROM lix_diff('packed_replacement_probe', $1, $2) \
+                 WHERE diff_type = 'modified'",
                 &[
                     Value::Text(second_commit_id.clone()),
                     Value::Text(merged_commit_id.clone()),

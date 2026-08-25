@@ -894,8 +894,8 @@ where
     let expected_diff = map_diff_oracle(&base, &target_before_preview);
     let diff_measure = measure_async(|| async {
         lix.execute(
-            "SELECT row_pk, diff_type, before_change_id, after_change_id \
-             FROM lix_diff($1, $2) WHERE schema_key = 'branch_bench_row' ORDER BY row_pk",
+            "SELECT row_pk, diff_type, from_id, to_id \
+             FROM lix_diff('branch_bench_row', $1, $2) ORDER BY row_pk",
             &[
                 Value::Text(preview.base_commit_id.clone()),
                 Value::Text(preview.target_head_commit_id.clone()),
@@ -920,25 +920,23 @@ where
                 .expect("single-string diff identity")
                 .to_owned();
             let kind = row.get::<String>("diff_type").expect("diff type");
-            let change_id = |column| match row.value(column).expect("diff change-id column") {
+            let side_id = |column| match row.value(column).expect("diff side identity column") {
                 Value::Null => None,
                 Value::Text(id) => Some(id.clone()),
                 other => panic!("unexpected {column} value {other:?}"),
             };
-            let before = change_id("before_change_id");
-            let after = change_id("after_change_id");
+            let before = side_id("from_id");
+            let after = side_id("to_id");
             match kind.as_str() {
                 "added" => assert!(before.is_none() && after.is_some()),
-                "modified" => assert!(before.is_some() && after.is_some() && before != after),
-                // Removal is represented by a durable tombstone change, so
-                // both endpoint change identities are present and distinct.
-                "removed" => assert!(before.is_some() && after.is_some() && before != after),
+                "modified" => assert!(before.is_some() && after.is_some()),
+                "removed" => assert!(before.is_some() && after.is_none()),
                 other => panic!("unexpected diff kind {other:?}"),
             }
             assert!(
                 before.as_deref().is_none_or(|id| !id.is_empty())
                     && after.as_deref().is_none_or(|id| !id.is_empty()),
-                "diff change identities must be non-empty"
+                "diff row identities must be non-empty"
             );
             (id, kind)
         })
@@ -1547,12 +1545,16 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "SELECT parent_id FROM lix_commit_edge WHERE child_id = $1",
+        "SELECT parent_commit_ids FROM lix_commit WHERE id = $1",
         &[Value::Text(commit_id.to_owned())],
     )
     .await
     .expect("query merge parents")
-    .rows()
+    .rows()[0]
+    .get::<serde_json::Value>("parent_commit_ids")
+    .expect("merge parents should decode as JSON")
+    .as_array()
+    .expect("merge parents should form an array")
     .len()
 }
 

@@ -59,6 +59,27 @@ pub(crate) fn diff_command_query(
     ))
 }
 
+pub(crate) fn full_checkpoint_command(
+    plan: &SqlLogicalPlan,
+) -> Option<Option<crate::sql2::bind::write::BoundReturning>> {
+    let SqlLogicalPlan::Write(write) = plan else {
+        return None;
+    };
+    if !matches!(
+        write.plan.bound.target,
+        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint)
+    ) {
+        return None;
+    }
+    let crate::sql2::bind::write::BoundWriteInput::Values(values) = &write.plan.bound.input else {
+        return None;
+    };
+    if !values.columns.is_empty() || values.rows.len() != 1 || !values.rows[0].is_empty() {
+        return None;
+    }
+    Some(write.plan.bound.returning.clone())
+}
+
 /// Returns whether an explicit transaction needs a statement checkpoint
 /// before executing this `RETURNING` write. Generic providers construct their
 /// result from a staged postimage. Direct row writes are the one fast path

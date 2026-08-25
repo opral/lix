@@ -11,8 +11,10 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::LixError;
+use crate::row_pk::RowPk;
 use crate::sql2::error::lix_error_to_datafusion_error;
-use crate::sql2::{DiffCommand, SqlWriteContext, WriteAccess};
+use crate::sql2::result_metadata::json_field;
+use crate::sql2::{DiffCommand, DiffCommandSelection, SqlWriteContext, WriteAccess};
 
 use super::spec::{InsertApply, PlannedScan, TableSpec, register_spec_table, scan_row_source};
 
@@ -83,12 +85,12 @@ impl TableSpec for DiffCommandSpec {
         Ok(Some(Arc::new(move |batches| {
             let write_ctx = write_ctx.clone();
             Box::pin(async move {
-                let diff_ids = diff_ids_from_batches(&batches)?;
-                if diff_ids.is_empty() {
+                let selections = selections_from_batches(&batches)?;
+                if selections.is_empty() {
                     return Ok(0);
                 }
                 write_ctx
-                    .execute_diff_command(command, diff_ids)
+                    .execute_diff_command(command, selections)
                     .await
                     .map(|outcome| outcome.rows_affected)
                     .map_err(lix_error_to_datafusion_error)
@@ -99,34 +101,55 @@ impl TableSpec for DiffCommandSpec {
 
 fn command_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("diff_id", DataType::Utf8, false),
+        Field::new("relation", DataType::Utf8, false),
+        json_field("row_pk", false),
         Field::new("commit_id", DataType::Utf8, false),
     ]))
 }
 
-fn diff_ids_from_batches(batches: &[RecordBatch]) -> Result<Vec<String>> {
-    let mut ids = Vec::new();
+fn selections_from_batches(batches: &[RecordBatch]) -> Result<Vec<DiffCommandSelection>> {
+    let mut selections = Vec::new();
     for batch in batches {
-        let values = batch
-            .column_by_name("diff_id")
-            .ok_or_else(|| DataFusionError::Execution("diff_id column is required".to_string()))?
+        let relations = batch
+            .column_by_name("relation")
+            .ok_or_else(|| DataFusionError::Execution("relation column is required".to_string()))?
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| DataFusionError::Execution("diff_id must be text".to_string()))?;
-        for index in 0..values.len() {
-            if values.is_null(index) {
+            .ok_or_else(|| DataFusionError::Execution("relation must be text".to_string()))?;
+        let row_pks = batch
+            .column_by_name("row_pk")
+            .ok_or_else(|| DataFusionError::Execution("row_pk column is required".to_string()))?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("row_pk must be JSONB".to_string()))?;
+        for index in 0..relations.len() {
+            if relations.is_null(index) || row_pks.is_null(index) {
                 return Err(DataFusionError::Execution(
-                    "diff_id cannot be NULL".to_string(),
+                    "relation and row_pk cannot be NULL".to_string(),
                 ));
             }
-            ids.push(values.value(index).to_string());
+            let row_pk = RowPk::from_json_array_text(row_pks.value(index)).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "row_pk must be a JSON primary-key array: {error}"
+                ))
+            })?;
+            selections.push(DiffCommandSelection {
+                relation: relations.value(index).to_string(),
+                row_pk,
+                source_commits: None,
+            });
         }
     }
-    ids.sort();
-    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+    selections.sort_by(|left, right| {
+        (&left.relation, &left.row_pk).cmp(&(&right.relation, &right.row_pk))
+    });
+    if selections
+        .windows(2)
+        .any(|pair| pair[0].relation == pair[1].relation && pair[0].row_pk == pair[1].row_pk)
+    {
         return Err(DataFusionError::Execution(
-            "diff command selection contains duplicate diff_id rows".to_string(),
+            "diff command selection contains duplicate (relation, row_pk) rows".to_string(),
         ));
     }
-    Ok(ids)
+    Ok(selections)
 }

@@ -17,7 +17,7 @@ pub(crate) use commit_ancestry::commit_ancestry_schema;
 mod diff;
 mod directory;
 mod directory_history;
-pub(crate) use diff::{diff_schema, register_diff_function};
+pub(crate) use diff::relation_diff_schema;
 mod diff_command;
 mod file;
 mod file_history;
@@ -35,8 +35,6 @@ mod spec;
 pub(crate) use spec::{PhysicalScanKey, SpecScanExec, StatementScanKey};
 mod upsert;
 mod values;
-mod working_diff;
-pub(crate) use working_diff::working_diff_schema;
 
 use crate::sql2::catalog::{
     PublicCatalog, PublicHistoryKind, PublicSurfaceContract, PublicSurfaceKind,
@@ -87,6 +85,12 @@ where
     } else {
         Arc::clone(PublicCatalog::fixed_system_shared())
     };
+    if catalog
+        .surface("lix_diff")
+        .is_some_and(|surface| selection.includes(surface))
+    {
+        diff::register_diff_function(session, ctx.changelog_query_source(), Arc::clone(&catalog));
+    }
     register_read_from_catalog(
         session,
         ctx,
@@ -219,6 +223,7 @@ pub(crate) fn read_provider_selection(
     // live one.
     for statement in statements {
         collect_history_relation_literals(statement, &mut history_relations);
+        collect_diff_relation_literals(statement, &mut names);
         if statement_requires_all_providers(statement) {
             requires_all = true;
             continue;
@@ -306,6 +311,64 @@ fn collect_history_relation_literals(
         }
         DataFusionStatement::Explain(explain) => {
             collect_history_relation_literals(explain.statement.as_ref(), relations);
+        }
+        _ => {}
+    }
+}
+
+/// Diff results inherit their relation's Arrow schema, so runtime schema
+/// literals must participate in snapshot-local catalog selection even though
+/// DataFusion only resolves the table-function name itself.
+fn collect_diff_relation_literals(
+    statement: &datafusion::sql::parser::Statement,
+    relations: &mut BTreeSet<String>,
+) {
+    use std::ops::ControlFlow;
+
+    use datafusion::sql::parser::Statement as DataFusionStatement;
+    use datafusion::sql::sqlparser::ast::{
+        Expr as SqlExpr, FunctionArg, FunctionArgExpr, TableFactor, Value as SqlValue, Visit,
+        Visitor,
+    };
+
+    struct DiffRelationVisitor<'a>(&'a mut BTreeSet<String>);
+
+    impl Visitor for DiffRelationVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            let TableFactor::Table {
+                name,
+                args: Some(arguments),
+                ..
+            } = table_factor
+            else {
+                return ControlFlow::Continue(());
+            };
+            if !crate::sql2::parse::object_name_is_public_function(name, "lix_diff") {
+                return ControlFlow::Continue(());
+            }
+            let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value)))) =
+                arguments.args.first()
+            else {
+                return ControlFlow::Continue(());
+            };
+            if let SqlValue::SingleQuotedString(relation_name) = &value.value {
+                self.0.insert(relation_name.clone());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    match statement {
+        DataFusionStatement::Statement(statement) => {
+            let _ = statement.visit(&mut DiffRelationVisitor(relations));
+        }
+        DataFusionStatement::Explain(explain) => {
+            collect_diff_relation_literals(explain.statement.as_ref(), relations);
         }
         _ => {}
     }
@@ -444,17 +507,6 @@ where
                     &surface.name,
                     ctx.hot_state(),
                     Arc::clone(&branch_ref),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::WorkingDiff => {
-                working_diff::register_working_diff_provider(
-                    session,
-                    &surface.name,
-                    ctx.active_branch_id().to_string(),
-                    Arc::clone(&branch_ref),
-                    ctx.commit_graph(),
-                    ctx.changelog_query_source(),
                 )
                 .await?;
             }
@@ -615,6 +667,16 @@ where
     // Reuse that immutable metadata, then install read-only providers from the
     // committed read capability and writable providers from the overlay.
     let catalog = write_ctx.public_catalog()?;
+    if catalog
+        .surface("lix_diff")
+        .is_some_and(|surface| selection.includes(surface))
+    {
+        diff::register_diff_function(
+            session,
+            read_ctx.changelog_query_source(),
+            Arc::clone(&catalog),
+        );
+    }
     register_read_from_catalog(
         session,
         read_ctx,
@@ -706,7 +768,6 @@ async fn register_write_from_catalog(
                 .await?;
             }
             PublicSurfaceKind::Change
-            | PublicSurfaceKind::WorkingDiff
             | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
             | PublicSurfaceKind::CommitAncestryFunction
@@ -738,7 +799,7 @@ mod tests {
 
     use super::{
         ProviderSelection, ReadProviderScope, branch, change, directory, directory_history, file,
-        file_history, is_write_surface, read_provider_selection, schema, working_diff,
+        file_history, is_write_surface, read_provider_selection, schema,
     };
 
     fn selection_for_sql(sql: &[&str]) -> ProviderSelection {
@@ -867,6 +928,18 @@ mod tests {
     }
 
     #[test]
+    fn diff_provider_selection_loads_runtime_relation_schema_for_dynamic_side_columns() {
+        assert_eq!(
+            selection_for_sql(&["SELECT to_value FROM lix_diff('lix_key_value', $1, $2)"]),
+            selected_names(&["lix_diff", "lix_key_value"]),
+        );
+        assert!(
+            selection_for_sql(&["SELECT * FROM lix_diff('runtime_note', $1, $2)"])
+                .requires_visible_schemas()
+        );
+    }
+
+    #[test]
     fn referenced_provider_selection_keeps_catalog_wide_information_schema_semantics() {
         assert_eq!(
             selection_for_sql(&["SELECT * FROM information_schema.tables"]),
@@ -956,7 +1029,6 @@ mod tests {
                 "lix_commit_ancestry",
                 "lix_diff",
                 "lix_history",
-                "lix_working_diff",
             ]
         );
         assert_eq!(
@@ -973,8 +1045,8 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 21, "construction count");
-        assert_eq!(read_only.len() + writable.len(), 13, "surface count");
+        assert_eq!(all_read + writable.len(), 20, "construction count");
+        assert_eq!(read_only.len() + writable.len(), 12, "surface count");
     }
 
     #[test]
@@ -1018,11 +1090,6 @@ mod tests {
             &catalog,
             "lix_change",
             change::lix_change_schema(),
-        );
-        assert_surface_schema_matches_provider_schema(
-            &catalog,
-            "lix_working_diff",
-            working_diff::working_diff_schema(),
         );
         assert_history_schema_matches_provider_schema(
             &catalog,

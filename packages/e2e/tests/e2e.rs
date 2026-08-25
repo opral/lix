@@ -5525,7 +5525,7 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     )
     .await
     .unwrap();
-    lix.create_checkpoint().await.unwrap();
+    let baseline_checkpoint = lix.create_checkpoint().await.unwrap();
     let selected_file_id = file_id_at_path(&lix, "/selected.csv").await;
     let remaining_file_id = file_id_at_path(&lix, "/remaining.csv").await;
 
@@ -5545,8 +5545,13 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     .unwrap();
     let selected_diff_count = lix
         .execute(
-            "SELECT COUNT(*) AS count FROM lix_working_diff() WHERE file_id = $1",
-            &[Value::Text(selected_file_id.clone())],
+            "SELECT coalesce(sum(row_count), 0) AS count \
+             FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
+             WHERE row_pk ->> 0 = $1",
+            &[
+                Value::Text(selected_file_id.clone()),
+                Value::Text(baseline_checkpoint.commit_id),
+            ],
         )
         .await
         .unwrap()
@@ -5554,9 +5559,11 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
         .get::<i64>("count")
         .unwrap();
     assert!(selected_diff_count > 1, "CSV must fan out beyond lix_file");
-    lix.execute(
-        "INSERT INTO lix_create_checkpoint (diff_id) \
-         SELECT diff_id FROM lix_working_diff() WHERE file_id = $1 \
+    let selected_checkpoint = lix.execute(
+        "INSERT INTO lix_create_checkpoint (relation, row_pk) \
+         SELECT 'lix_file', row_pk \
+         FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
+         WHERE row_pk ->> 0 = $1 \
          RETURNING commit_id",
         &[Value::Text(selected_file_id.clone())],
     )
@@ -5565,8 +5572,13 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
 
     assert_eq!(
         lix.execute(
-            "SELECT COUNT(*) AS count FROM lix_working_diff() WHERE file_id = $1",
-            &[Value::Text(selected_file_id.clone())],
+            "SELECT COUNT(*) AS count \
+             FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
+             WHERE row_pk ->> 0 = $1",
+            &[
+                Value::Text(selected_file_id.clone()),
+                Value::Text(selected_checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
+            ],
         )
         .await
         .unwrap()
@@ -5577,8 +5589,13 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     );
     assert!(
         lix.execute(
-            "SELECT COUNT(*) AS count FROM lix_working_diff() WHERE file_id = $1",
-            &[Value::Text(remaining_file_id)],
+            "SELECT COUNT(*) AS count \
+             FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
+             WHERE row_pk ->> 0 = $1",
+            &[
+                Value::Text(remaining_file_id),
+                Value::Text(selected_checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
+            ],
         )
         .await
         .unwrap()

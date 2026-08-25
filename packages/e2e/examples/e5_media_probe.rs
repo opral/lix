@@ -334,7 +334,7 @@ async fn mode_agent(dir: PathBuf, asset_bytes: usize, files: usize, rounds: usiz
 
         let after = active_commit(&lix).await;
         lix.execute(
-            &format!("SELECT COUNT(*) FROM lix_diff('{before}', '{after}')"),
+            &format!("SELECT COUNT(*) FROM lix_diff('lix_file', '{before}', '{after}')"),
             &[],
         )
         .await

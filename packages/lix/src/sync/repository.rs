@@ -7220,12 +7220,48 @@ mod tests {
     }
 
     async fn working_diff_count(lix: &Lix<Memory>) -> i64 {
-        lix.execute("SELECT COUNT(*) AS count FROM lix_working_diff()", &[])
+        let branch_id = lix
+            .active_branch_id()
+            .await
+            .expect("active branch should remain readable");
+        let adapter = lix.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch control read should open");
+        let checkpoint = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("active branch control should remain readable")
+            .expect("active branch control should exist")
+            .working_diff_checkpoint_commit_id
+            .expect("active branch should have a checkpoint cursor")
+            .to_string();
+        drop(read);
+        let key_values = lix
+            .execute(
+                "SELECT COUNT(*) AS count \
+                 FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id())",
+                &[Value::Text(checkpoint.clone())],
+            )
             .await
             .expect("working diff should remain readable")
             .rows()[0]
             .get::<i64>("count")
-            .expect("working diff count should decode")
+            .expect("working diff count should decode");
+        let files = lix
+            .execute(
+                "SELECT COUNT(*) AS count \
+                 FROM lix_diff('lix_file', $1, lix_active_branch_commit_id())",
+                &[Value::Text(checkpoint)],
+            )
+            .await
+            .expect("working file diff should remain readable")
+            .rows()[0]
+            .get::<i64>("count")
+            .expect("working file diff count should decode");
+        key_values + files
     }
 
     async fn read_file_content(lix: &Lix<Memory>, path: &str) -> Value {
@@ -10222,8 +10258,9 @@ mod tests {
         );
         let peer_diff = peer
             .execute(
-                "SELECT schema_key, diff_type, before_change_id, after_change_id FROM lix_working_diff()",
-                &[],
+                "SELECT row_pk, diff_type \
+                 FROM lix_diff('lix_file', $1, lix_active_branch_commit_id())",
+                &[Value::Text(pushed_checkpoint.to_owned())],
             )
             .await
             .expect("peer working diff should load");
@@ -10306,7 +10343,7 @@ mod tests {
 
         let diff = replica
             .execute(
-                "SELECT schema_key, diff_type FROM lix_diff($1, $2)",
+                "SELECT diff_type FROM lix_diff('lix_file', $1, $2)",
                 &[Value::Text(checkpoint), Value::Text(head)],
             )
             .await
@@ -10496,7 +10533,7 @@ mod tests {
         let diff = loop {
             match replica
                 .execute(
-                    "SELECT DISTINCT file_id FROM lix_diff($1, $2) WHERE file_id IS NOT NULL",
+                    "SELECT row_pk ->> 0 AS file_id FROM lix_diff('lix_file', $1, $2)",
                     &[
                         Value::Text(previous_checkpoint.clone()),
                         Value::Text(latest_checkpoint.clone()),

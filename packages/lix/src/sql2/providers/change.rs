@@ -104,11 +104,8 @@ where
                     for change in canonical_changes {
                         match change {
                             LixChangeRow::Direct(change) => changes.push(
-                                materialize_changelog_change_record(
-                                    change,
-                                    payload_projection,
-                                )
-                                .map_err(lix_error_to_datafusion_error)?,
+                                materialize_changelog_change_record(change, payload_projection)
+                                    .map_err(lix_error_to_datafusion_error)?,
                             ),
                             LixChangeRow::DerivedCommit(change) => changes.push(
                                 materialize_commit_graph_change(change, payload_projection)

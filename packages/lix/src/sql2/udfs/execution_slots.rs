@@ -28,6 +28,7 @@ struct ExecutionSlotValues {
     active_account_id: Option<String>,
     active_branch_id: Option<String>,
     active_branch_commit_id: Option<String>,
+    root_commit_id: Option<String>,
     functions: Option<FunctionProviderHandle>,
     current_timestamp: Option<LixTimestamp>,
 }
@@ -53,11 +54,13 @@ impl ExecutionSlots {
         active_account_id: &str,
         active_branch_id: Option<&str>,
         active_branch_commit_id: Option<&str>,
+        root_commit_id: Option<&str>,
     ) {
         let mut values = self.lock();
         assign(&mut values.active_account_id, Some(active_account_id));
         assign(&mut values.active_branch_id, active_branch_id);
         assign(&mut values.active_branch_commit_id, active_branch_commit_id);
+        assign(&mut values.root_commit_id, root_commit_id);
         values.functions = Some(functions);
         values.current_timestamp = None;
     }
@@ -72,6 +75,10 @@ impl ExecutionSlots {
 
     pub(crate) fn active_branch_commit_id(&self) -> Option<String> {
         self.lock().active_branch_commit_id.clone()
+    }
+
+    pub(crate) fn root_commit_id(&self) -> Option<String> {
+        self.lock().root_commit_id.clone()
     }
 
     /// The statement's function provider.

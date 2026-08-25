@@ -214,19 +214,46 @@ impl LixInformationSchemaProvider {
             .surfaces()
             .filter(|surface| surface.class == PublicSurfaceClass::TableFunction)
         {
+            if surface.kind == PublicSurfaceKind::DiffFunction {
+                for relation in self.public_catalog.surfaces().filter(|relation| {
+                    matches!(
+                        relation.kind,
+                        PublicSurfaceKind::File
+                            | PublicSurfaceKind::Directory
+                            | PublicSurfaceKind::SchemaBase { .. }
+                    )
+                }) {
+                    let provider_schema = super::providers::relation_diff_schema(
+                        self.public_catalog.as_ref(),
+                        &relation.name,
+                    )?;
+                    for (position, field) in provider_schema.fields().iter().enumerate() {
+                        function_catalog.push(self.public_catalog_name.clone());
+                        function_schema.push(self.public_schema_name.clone());
+                        function_name.push(surface.name.clone());
+                        source_relation.push(Some(relation.name.clone()));
+                        argument_signature.push(
+                            "(relation TEXT, from_commit_id TEXT, to_commit_id TEXT)".to_string(),
+                        );
+                        result_column.push(field.name().clone());
+                        ordinal_position.push((position + 1) as u64);
+                        is_nullable
+                            .push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
+                        data_type.push(public_sql_type(field.data_type()));
+                        lix_value_kind.push(
+                            field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_string()),
+                        );
+                    }
+                }
+                continue;
+            }
             let (signature, provider_schema) = match surface.kind {
                 PublicSurfaceKind::HistoryFunction => continue,
                 PublicSurfaceKind::CommitAncestryFunction => (
                     "() | (commit_id TEXT)",
                     super::providers::commit_ancestry_schema(),
                 ),
-                PublicSurfaceKind::WorkingDiff => {
-                    ("()", super::providers::working_diff_schema())
-                }
-                PublicSurfaceKind::DiffFunction => (
-                    "(from_commit_id TEXT, to_commit_id TEXT)",
-                    super::providers::diff_schema(),
-                ),
+                PublicSurfaceKind::DiffFunction => unreachable!("relation-specific diffs handled above"),
                 _ => {
                     return Err(DataFusionError::Execution(format!(
                         "table function '{}' has a non-function semantic kind",

@@ -20,9 +20,15 @@
 - Removed every public `*_by_branch` SQL relation and the public
   `lixcol_branch_id` row-routing column. SQL relations now always use the
   current session's active branch. Open another session to work with another
-  branch, use that session's `lix_working_diff` for uncheckpointed work, and
-  use `lix_diff(from_commit, to_commit)` for commit-to-commit comparison.
+  branch. Compare tracked relations with
+  `lix_diff(relation, from_commit_id, to_commit_id)`; compare the current
+  checkpoint with the active head to inspect uncheckpointed work.
   `lixcol_global` and the global branch remain supported.
+- Replaced heterogeneous working diffs, `diff_id` command selections, and the
+  public `lix_commit_edge` relation with relation-specific commit diffs,
+  `(relation, row_pk)` command selections, and ordered
+  `lix_commit.parent_commit_ids`. Use `lix_root_commit_id()` to obtain the
+  repository's existing initial commit.
 
 ## 0.12.3 - 2026-08-18
 

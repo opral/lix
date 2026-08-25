@@ -6,6 +6,13 @@ use super::select_rows;
 #[tokio::test(flavor = "current_thread")]
 async fn checkpoints_example_sql_contract() {
     let lix = crate::open_lix().await.expect("example repository opens");
+    let root_commit_id = lix
+        .execute("SELECT lix_root_commit_id() AS commit_id", &[])
+        .await
+        .expect("repository root should resolve")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("root commit ID should decode");
 
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
@@ -17,12 +24,19 @@ async fn checkpoints_example_sql_contract() {
     .await
     .expect("example tracked write succeeds");
 
+    let head_commit_id = lix
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("active head should resolve")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("active head commit ID should decode");
     let working_diffs = lix
         .execute(
-            "SELECT row_pk, schema_key, diff_type
-             FROM lix_working_diff()
-             ORDER BY schema_key, row_pk",
-            &[],
+            "SELECT row_pk, diff_type
+             FROM lix_diff('lix_key_value', $1, $2)
+             ORDER BY row_pk",
+            &[Value::Text(root_commit_id), Value::Text(head_commit_id)],
         )
         .await
         .expect("example working diff query succeeds");
@@ -32,12 +46,6 @@ async fn checkpoints_example_sql_contract() {
             .get::<serde_json::Value>("row_pk")
             .expect("row_pk is JSON"),
         json!(["checkpoint-demo"])
-    );
-    assert_eq!(
-        working_diffs.rows()[0]
-            .get::<String>("schema_key")
-            .expect("schema_key is text"),
-        "lix_key_value"
     );
     assert_eq!(
         working_diffs.rows()[0]
@@ -73,7 +81,13 @@ async fn checkpoints_example_sql_contract() {
     );
 
     let remaining = lix
-        .execute("SELECT COUNT(*) AS count FROM lix_working_diff()", &[])
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_diff('lix_key_value', $1, $2)",
+            &[
+                Value::Text(checkpoint.commit_id.clone()),
+                Value::Text(checkpoint.commit_id),
+            ],
+        )
         .await
         .expect("example final working diff query succeeds");
     assert_eq!(
@@ -137,37 +151,40 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT row_pk, schema_key, diff_type \
-                 FROM lix_working_diff() ORDER BY schema_key, row_pk",
+                &format!(
+                    "SELECT row_pk, diff_type FROM {} ORDER BY row_pk",
+                    key_value_diff_relation(&session).await
+                ),
             )
             .await,
             vec![vec![
                 Value::Jsonb(json!(["checkpoint-key"]).into()),
-                Value::Text("lix_key_value".to_string()),
                 Value::Text("added".to_string()),
             ]]
         );
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT row_pk, schema_key, diff_type \
-                 FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND row_pk = CAST('[\"checkpoint-key\"]' AS JSONB)",
+                &format!(
+                    "SELECT row_pk, diff_type FROM {} \
+                     WHERE row_pk = CAST('[\"checkpoint-key\"]' AS JSONB)",
+                    key_value_diff_relation(&session).await
+                ),
             )
             .await,
             vec![vec![
                 Value::Jsonb(json!(["checkpoint-key"]).into()),
-                Value::Text("lix_key_value".to_string()),
                 Value::Text("added".to_string()),
             ]]
         );
         assert!(
             select_rows(
                 &session,
-                "SELECT row_pk \
-                 FROM lix_working_diff() \
-                 WHERE schema_key = 'other_schema'",
+                &format!(
+                    "SELECT row_pk FROM {} \
+                     WHERE row_pk = CAST('[\"other-key\"]' AS JSONB)",
+                    key_value_diff_relation(&session).await
+                ),
             )
             .await
             .is_empty()
@@ -188,7 +205,14 @@ simulation_test!(
         );
 
         assert_eq!(
-            select_rows(&session, "SELECT COUNT(*) FROM lix_working_diff()").await,
+            select_rows(
+                &session,
+                &format!(
+                    "SELECT COUNT(*) FROM {}",
+                    key_value_diff_relation(&session).await
+                ),
+            )
+            .await,
             vec![vec![Value::Integer(0)]]
         );
         assert_eq!(
@@ -259,8 +283,8 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT parent_id FROM lix_commit_edge \
-                     WHERE child_id = '{}'",
+                    "SELECT parent_commit_ids ->> 0 FROM lix_commit \
+                     WHERE id = '{}'",
                     receipt.commit_id
                 ),
             )
@@ -490,10 +514,10 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT row_pk, diff_type \
-                 FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
-                 ORDER BY row_pk",
+                &format!(
+                    "SELECT row_pk, diff_type FROM {} ORDER BY row_pk",
+                    key_value_diff_relation(&session).await
+                ),
             )
             .await,
             vec![
@@ -511,10 +535,11 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT diff_type \
-                 FROM lix_working_diff() \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND row_pk = CAST('[\"working-removed\"]' AS JSONB)",
+                &format!(
+                    "SELECT diff_type FROM {} \
+                     WHERE row_pk = CAST('[\"working-removed\"]' AS JSONB)",
+                    key_value_diff_relation(&session).await
+                ),
             )
             .await,
             vec![vec![Value::Text("removed".to_string())]],
@@ -522,6 +547,33 @@ simulation_test!(
         );
     }
 );
+
+async fn key_value_diff_relation(
+    session: &crate::support::simulation_test::engine::SimSession,
+) -> String {
+    let checkpoint = session
+        .execute(
+            "SELECT checkpoint.commit_id \
+             FROM lix_checkpoint AS checkpoint \
+             JOIN lix_commit_ancestry() AS ancestry \
+               ON ancestry.commit_id = checkpoint.commit_id \
+             ORDER BY ancestry.depth LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("latest checkpoint should resolve")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("checkpoint commit ID should decode");
+    let head = session
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .await
+        .expect("active head should resolve")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("active head commit ID should decode");
+    format!("lix_diff('lix_key_value', '{checkpoint}', '{head}')")
+}
 
 #[cfg(any())]
 simulation_test!(

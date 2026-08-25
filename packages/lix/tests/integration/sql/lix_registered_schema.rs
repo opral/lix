@@ -311,6 +311,7 @@ simulation_test!(
         for schema_key in [
             "lix",
             "lix_file",
+            "lix_commit_edge",
             "lix_key_value_history",
             "lix_file_descriptor",
             "lix_file_descriptor_history",
@@ -406,7 +407,6 @@ simulation_test!(
             "lix_change",
             "lix_checkpoint",
             "lix_commit",
-            "lix_commit_edge",
             "lix_directory_descriptor",
             "lix_file_descriptor",
             "lix_key_value",
@@ -443,7 +443,8 @@ simulation_test!(
                  FROM information_schema.table_functions \
                  WHERE (function_name = 'lix_history' \
                         AND source_relation IN ('lix_checkpoint', 'lix_key_value', 'lix_registered_schema')) \
-                    OR function_name IN ('lix_working_diff', 'lix_diff') \
+                    OR (function_name = 'lix_diff' \
+                        AND source_relation IN ('lix_checkpoint', 'lix_key_value', 'lix_registered_schema')) \
                  GROUP BY function_name, source_relation \
                  ORDER BY function_name, source_relation",
                 &[],
@@ -453,7 +454,18 @@ simulation_test!(
         assert_rows_eq(
             table_functions,
             vec![
-                vec![Value::Text("lix_diff".to_string()), Value::Null],
+                vec![
+                    Value::Text("lix_diff".to_string()),
+                    Value::Text("lix_checkpoint".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_diff".to_string()),
+                    Value::Text("lix_key_value".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_diff".to_string()),
+                    Value::Text("lix_registered_schema".to_string()),
+                ],
                 vec![
                     Value::Text("lix_history".to_string()),
                     Value::Text("lix_checkpoint".to_string()),
@@ -466,7 +478,6 @@ simulation_test!(
                     Value::Text("lix_history".to_string()),
                     Value::Text("lix_registered_schema".to_string()),
                 ],
-                vec![Value::Text("lix_working_diff".to_string()), Value::Null],
             ],
         );
         for surface_name in [

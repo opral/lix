@@ -160,24 +160,23 @@ async fn commit_parent_ids(
 ) -> Vec<String> {
     let result = session
         .execute(
-            &format!(
-                "SELECT parent_id \
-                 FROM lix_commit_edge \
-                 WHERE child_id = '{commit_id}' \
-                 ORDER BY parent_id"
-            ),
+            &format!("SELECT parent_commit_ids FROM lix_commit WHERE id = '{commit_id}'"),
             &[],
         )
         .await
-        .expect("commit edge rows should read");
-    result
-        .rows()
+        .expect("ordered commit parents should read");
+    let Value::Jsonb(parents) = &result.rows()[0].values()[0] else {
+        panic!("parent_commit_ids should be JSON");
+    };
+    let mut parents = parents
+        .to_value()
+        .as_array()
+        .expect("parent_commit_ids should be an array")
         .iter()
-        .map(|row| match &row.values()[0] {
-            Value::Text(parent_id) => parent_id.clone(),
-            value => panic!("expected parent_id string, got {value:?}"),
-        })
-        .collect()
+        .map(|parent| parent.as_str().expect("parent id should be text").to_owned())
+        .collect::<Vec<_>>();
+    parents.sort();
+    parents
 }
 
 async fn commit_ids(

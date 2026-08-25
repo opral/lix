@@ -13,6 +13,6 @@ pub(crate) use scope_digest_census::{
 };
 pub(crate) use types::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
-    CommitGraphEdge, CommitGraphHistory, CommitGraphNode, CommitGraphReader,
+    CommitGraphHistory, CommitGraphNode, CommitGraphReader,
     ReachableCommitGraphNode, commit_edges,
 };

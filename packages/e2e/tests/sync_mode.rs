@@ -102,8 +102,10 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
     let history_before_checkpoint = probe.history_gets.load(Ordering::Acquire);
     let checkpoint = replica
         .execute(
-            "INSERT INTO lix_create_checkpoint (diff_id) \
-             SELECT diff_id FROM lix_working_diff() WHERE file_id = $1 \
+            "INSERT INTO lix_create_checkpoint (relation, row_pk) \
+             SELECT 'lix_file', row_pk \
+             FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
+             WHERE row_pk ->> 0 = $1 \
              RETURNING commit_id",
             &[Value::Text(selected_file_id.clone())],
         )
@@ -121,8 +123,13 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
     assert_eq!(
         replica
             .execute(
-                "SELECT COUNT(*) AS count FROM lix_working_diff() WHERE file_id = $1",
-                &[Value::Text(selected_file_id.clone())],
+                "SELECT COUNT(*) AS count \
+                 FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
+                 WHERE row_pk ->> 0 = $1",
+                &[
+                    Value::Text(selected_file_id.clone()),
+                    Value::Text(checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
+                ],
             )
             .await
             .expect("first reactive working-diff read stays HOT")
@@ -134,10 +141,10 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
     assert!(
         replica
             .execute(
-                "SELECT COUNT(*) AS count FROM lix_working_diff() AS diff \
-                 JOIN lix_file AS file ON file.id = diff.file_id \
-                 WHERE file.path = '/remaining.md'",
-                &[],
+                "SELECT COUNT(*) AS count \
+                 FROM lix_diff('lix_file', $1, lix_active_branch_commit_id()) \
+                 WHERE to_path = '/remaining.md'",
+                &[Value::Text(checkpoint.rows()[0].get::<String>("commit_id").unwrap())],
             )
             .await
             .expect("unselected file remains dirty")
@@ -295,7 +302,7 @@ async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
     let history_gets_before_demand = probe.history_gets.load(Ordering::Acquire);
     replica
         .execute(
-            "SELECT COUNT(*) AS entries FROM lix_diff($1, $2)",
+            "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
             &[Value::Text(history_parent), Value::Text(history_head)],
         )
         .await

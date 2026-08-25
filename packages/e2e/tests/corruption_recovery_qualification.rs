@@ -183,7 +183,7 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
     assert_probe_value(&lix, "after").await;
     let diff = lix
         .execute(
-            "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) WHERE schema_key = 'lix_key_value'",
+            "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
             &[Value::Text(checkpoint_head), Value::Text(updated_head)],
         )
         .await
@@ -273,8 +273,8 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
     assert_eq!(healthy.rows().len(), 8, "healthy tracked tree row count");
     let healthy_diff = lix
         .execute(
-            "SELECT schema_key, diff_type FROM lix_diff($1, $2) \
-             WHERE schema_key = 'lix_key_value'",
+            "SELECT 'lix_key_value' AS schema_key, diff_type \
+             FROM lix_diff('lix_key_value', $1, $2)",
             &[
                 Value::Text(checkpoint_head.clone()),
                 Value::Text(updated_head.clone()),
@@ -299,8 +299,8 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         Ok(lix) => {
             let result = lix
                 .execute(
-                    "SELECT schema_key, diff_type FROM lix_diff($1, $2) \
-                     WHERE schema_key = 'lix_key_value'",
+                    "SELECT 'lix_key_value' AS schema_key, diff_type \
+                     FROM lix_diff('lix_key_value', $1, $2)",
                     &[Value::Text(checkpoint_head), Value::Text(updated_head)],
                 )
                 .await;

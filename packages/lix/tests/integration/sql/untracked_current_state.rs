@@ -357,7 +357,7 @@ simulation_test!(
             &engine,
         );
 
-        session
+        let checkpoint = session
             .create_checkpoint()
             .await
             .expect("empty checkpoint should succeed");
@@ -374,7 +374,11 @@ simulation_test!(
                 .await
                 .expect("history-free current-state mutation should succeed");
             let working_diff = session
-                .execute("SELECT COUNT(*) FROM lix_working_diff()", &[])
+                .execute(
+                    "SELECT COUNT(*) FROM lix_diff(\
+                     'lix_key_value', $1, lix_active_branch_commit_id())",
+                    &[Value::Text(checkpoint.commit_id.clone())],
+                )
                 .await
                 .expect("working diff should read");
             assert_eq!(

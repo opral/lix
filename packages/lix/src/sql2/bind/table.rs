@@ -227,7 +227,6 @@ mod tests {
             "lix_checkpoint",
             "lix_commit",
             "lix_commit_ancestry",
-            "lix_commit_edge",
             "lix_create_checkpoint",
             "lix_diff",
             "lix_directory",
@@ -237,7 +236,6 @@ mod tests {
             "lix_registered_schema",
             "lix_restore",
             "lix_revert",
-            "lix_working_diff",
         ];
 
         assert_eq!(actual, expected);
@@ -255,7 +253,6 @@ mod tests {
             "lix_registered_schema",
             "lix_checkpoint",
             "lix_history",
-            "lix_working_diff",
         ] {
             assert!(
                 catalog.surface(surface_name).is_some(),

@@ -324,7 +324,7 @@ pub(crate) fn schema_exposed_as_schema_surface(schema_key: &str) -> bool {
 
 pub(crate) fn schema_exposed_as_history_surface(schema_key: &str) -> bool {
     schema_exposed_as_schema_surface(schema_key)
-        && !matches!(schema_key, "lix_commit" | "lix_commit_edge")
+        && schema_key != "lix_commit"
 }
 
 pub(crate) fn schema_surface_schema(

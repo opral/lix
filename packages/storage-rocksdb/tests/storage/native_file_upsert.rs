@@ -149,11 +149,11 @@ where
     let head = active_branch_commit_id(lix).await;
     let result = lix
         .execute(
-            "SELECT parent_id FROM lix_commit_edge WHERE child_id = $1",
+            "SELECT parent_commit_ids ->> 0 AS parent_id FROM lix_commit WHERE id = $1",
             &[Value::Text(head)],
         )
         .await
-        .expect("read commit edge");
+        .expect("read first commit parent");
     assert_eq!(result.rows().len(), 1);
     assert_eq!(
         result.rows()[0]

@@ -83,9 +83,9 @@ use crate::session::{
     SessionBranch, encode_receipt,
 };
 use crate::sql2::{
-    ChangelogQuerySource, DiffCommand, HistoryQuerySource, SessionFileViewKey,
-    SessionFileViewMutation, SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource,
-    SqlExecutionContext, SqlHistoryQuerySource,
+    ChangelogQuerySource, DiffCommand, DiffCommandSelection, HistoryQuerySource,
+    SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,
+    SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
@@ -102,8 +102,8 @@ use crate::telemetry::{
     instrument_lix_result,
 };
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateKey,
-    TrackedStateStoreReader,
+    TrackedStateContext, TrackedStateDiffEntry, TrackedStateDiffKind, TrackedStateDiffRequest,
+    TrackedStateFilter, TrackedStateKey, TrackedStateStoreReader,
 };
 use crate::transaction::commit;
 use crate::transaction::normalization::{
@@ -1693,9 +1693,10 @@ where
                     .discard_pending_plugin_actor_publications()
                     .await;
                 if let Some(materialize_span) = materialize_span {
-                    materialize_span.finish(Status::error(error.code.clone()), vec![
-                        TelemetryAttribute::string("error.type", error.code.clone()),
-                    ]);
+                    materialize_span.finish(
+                        Status::error(error.code.clone()),
+                        vec![TelemetryAttribute::string("error.type", error.code.clone())],
+                    );
                 }
                 return Err(error);
             }
@@ -8159,8 +8160,8 @@ where
     /// Applies a tracked-state transition resolved from two immutable commits.
     ///
     /// This is the internal counterpart to the public diff command. The
-    /// caller supplies typed identities instead of user-facing `diff_id`
-    /// strings. The transaction's coherent opening head certifies the current
+    /// caller supplies typed tracked-state identities. The transaction's
+    /// coherent opening head certifies the current
     /// side, so undo/redo does not need to reload visible live state after it
     /// has already read that exact historical root.
     pub(crate) async fn execute_tracked_state_transition(
@@ -8397,7 +8398,7 @@ where
             let identity = diff_record_identity(before.or(after).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    format!("diff_id '{diff_id}' has no resolvable side"),
+                    "selected relation row has no resolvable change",
                 )
             })?);
             if let (Some(before), Some(after)) = (before, after)
@@ -8405,7 +8406,7 @@ where
             {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    format!("diff_id '{diff_id}' joins changes for different rows"),
+                    "selected relation row joins changes for different rows",
                 ));
             }
             if !identities.insert(identity.clone()) {
@@ -8549,6 +8550,424 @@ where
         })
     }
 
+    /// Resolves public relation identities against one coherent immutable diff.
+    /// Encoded change pairs remain a private implementation detail of the
+    /// existing selected/unselected machinery.
+    async fn resolve_diff_command_selections(
+        &mut self,
+        command: DiffCommand,
+        selections: &[DiffCommandSelection],
+    ) -> Result<Vec<String>, LixError> {
+        let unique = selections
+            .iter()
+            .map(|selection| (&selection.relation, &selection.row_pk))
+            .collect::<BTreeSet<_>>();
+        if unique.len() != selections.len() {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "diff command selection contains duplicate (relation, row_pk) rows",
+            ));
+        }
+
+        let catalog = self.sql_public_catalog()?;
+        let mut schema_selections = BTreeMap::<&str, BTreeMap<RowPk, usize>>::new();
+        let mut file_selections = BTreeMap::new();
+        let mut file_descriptor_row_pks = Vec::new();
+        for (index, selection) in selections.iter().enumerate() {
+            match selection.relation.as_str() {
+                "lix_file" => {
+                    let file_id = selection.row_pk.as_single_string_owned().map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            "lix_file selections require a single file-id primary key",
+                        )
+                    })?;
+                    let JsonValue::Array(parts) = selection.row_pk.as_json_array_value()? else {
+                        unreachable!("RowPk always serializes as a JSON array")
+                    };
+                    let descriptor_row_pk =
+                        RowPk::from_json_values(&parts, &[crate::row_pk::RowPkComponentType::Uuid])
+                            .map_err(|error| {
+                                LixError::new(
+                                    LixError::CODE_TYPE_MISMATCH,
+                                    format!("lix_file row_pk must contain a UUID file id: {error}"),
+                                )
+                            })?;
+                    file_descriptor_row_pks.push(descriptor_row_pk);
+                    file_selections.insert(file_id, index);
+                }
+                "lix_directory" => {
+                    return Err(LixError::new(
+                        LixError::CODE_UNSUPPORTED_SQL,
+                        "lix_directory command selections require recursive foreign-key closure and are not supported yet",
+                    ));
+                }
+                relation => {
+                    let spec = catalog.schema_spec(relation).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_UNSUPPORTED_SQL,
+                            format!("diff commands do not support relation '{relation}'"),
+                        )
+                    })?;
+                    let JsonValue::Array(parts) = selection.row_pk.as_json_array_value()? else {
+                        unreachable!("RowPk always serializes as a JSON array")
+                    };
+                    let typed_row_pk =
+                        RowPk::from_json_values(&parts, &spec.primary_key_component_types)
+                            .map_err(|error| {
+                                LixError::new(
+                                    LixError::CODE_TYPE_MISMATCH,
+                                    format!("row_pk does not match relation '{relation}': {error}"),
+                                )
+                            })?;
+                    schema_selections
+                        .entry(relation)
+                        .or_default()
+                        .insert(typed_row_pk, index);
+                }
+            }
+        }
+        if !schema_selections.is_empty() && !file_selections.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "diff commands do not support mixing lix_file and schema relation selections",
+            ));
+        }
+
+        let mut requests = Vec::new();
+        if file_selections.is_empty() {
+            let schema_keys = schema_selections
+                .keys()
+                .map(|relation| (*relation).to_string())
+                .collect();
+            let row_pks = schema_selections
+                .values()
+                .flat_map(|rows| rows.keys().cloned())
+                .collect();
+            requests.push(TrackedStateDiffRequest {
+                filter: TrackedStateFilter {
+                    schema_keys,
+                    row_pks,
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                },
+                retain_payloads: false,
+            });
+        } else {
+            requests.push(TrackedStateDiffRequest {
+                filter: TrackedStateFilter {
+                    file_ids: file_selections
+                        .keys()
+                        .cloned()
+                        .map(NullableKeyFilter::Value)
+                        .collect(),
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                },
+                retain_payloads: false,
+            });
+            requests.push(TrackedStateDiffRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![FILE_DESCRIPTOR_SCHEMA_KEY.to_string()],
+                    row_pks: file_descriptor_row_pks,
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                },
+                retain_payloads: false,
+            });
+            if command == DiffCommand::CreateCheckpoint {
+                requests.push(TrackedStateDiffRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+                        include_tombstones: true,
+                        ..TrackedStateFilter::default()
+                    },
+                    retain_payloads: false,
+                });
+            }
+        }
+
+        let source = selections
+            .iter()
+            .filter_map(|selection| selection.source_commits.as_ref())
+            .collect::<BTreeSet<_>>();
+        if source.len() > 1 {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "diff commands support one source commit pair per statement",
+            ));
+        }
+        let mut entries = Vec::new();
+        if command == DiffCommand::Apply {
+            let (from_commit_id, to_commit_id) = source.into_iter().next().cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "lix_apply requires a selection from exactly one lix_diff(relation, from_commit_id, to_commit_id)",
+                )
+            })?;
+            let mut tracked = self.tracked_state_reader().await;
+            for request in &requests {
+                entries.extend(
+                    tracked
+                        .diff_commits(&from_commit_id, &to_commit_id, request)
+                        .await?
+                        .entries,
+                );
+            }
+        } else {
+            let branch_id = self.active_branch_id.clone();
+            let control = BranchHeadControlContext::new()
+                .reader(self.opening_read())
+                .load(&branch_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::branch_not_found(&branch_id, "resolve diff selection", "branch")
+                })?;
+            let checkpoint = control.working_diff_checkpoint_commit_id.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("branch '{branch_id}' has no checkpoint cursor"),
+                )
+            })?;
+            for request in &requests {
+                let direct = TrackedHeadContext::new()
+                    .reader(self.opening_read())
+                    .working_diff_for_control(&branch_id, control, request)
+                    .await?;
+                if let Some(direct) = direct {
+                    entries.extend(direct.diff.entries);
+                } else {
+                    let mut tracked = self.tracked_state_reader().await;
+                    entries.extend(
+                        tracked
+                            .diff_commits(
+                                &checkpoint.to_string(),
+                                &control.head_commit_id.to_string(),
+                                request,
+                            )
+                            .await?
+                            .entries,
+                    );
+                }
+            }
+        }
+
+        let selected_directory_ids =
+            if command == DiffCommand::CreateCheckpoint && !file_selections.is_empty() {
+                self.selected_file_directory_closure(&entries, &file_selections)
+                    .await?
+            } else {
+                BTreeSet::new()
+            };
+        let mut matched = BTreeSet::new();
+        let mut resolved = Vec::new();
+        for entry in entries {
+            if entry.identity.schema_key() == CHECKPOINT_SCHEMA_KEY
+                || entry.identity.schema_key() == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+            {
+                continue;
+            }
+            let mut selected = false;
+            if let Some(index) = schema_selections
+                .get(entry.identity.schema_key())
+                .and_then(|rows| rows.get(entry.identity.row_pk()))
+            {
+                matched.insert(*index);
+                selected = true;
+            }
+            if let Some(file_id) = entry.identity.file_id()
+                && let Some(index) = file_selections.get(file_id)
+            {
+                matched.insert(*index);
+                selected = true;
+            }
+            if entry.identity.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
+                && let Ok(file_id) = entry.identity.row_pk().as_single_string_owned()
+                && let Some(index) = file_selections.get(file_id.as_str())
+            {
+                matched.insert(*index);
+                selected = true;
+            }
+            if entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                && entry
+                    .identity
+                    .row_pk()
+                    .as_single_string_owned()
+                    .is_ok_and(|directory_id| selected_directory_ids.contains(&directory_id))
+            {
+                selected = true;
+            }
+            if selected {
+                resolved.push(entry.diff_id()?);
+            }
+        }
+        if matched.len() != selections.len() {
+            return Err(unknown_diff_selection());
+        }
+        resolved.sort();
+        resolved.dedup();
+        Ok(resolved)
+    }
+
+    /// Includes only changed, live ancestors of selected file descriptors.
+    /// Unrelated dirty directories remain in the unselected working interval.
+    async fn selected_file_directory_closure(
+        &mut self,
+        entries: &[TrackedStateDiffEntry],
+        file_selections: &BTreeMap<String, usize>,
+    ) -> Result<BTreeSet<String>, LixError> {
+        if !entries.iter().any(|entry| {
+            entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                && entry.kind != TrackedStateDiffKind::Removed
+        }) {
+            return Ok(BTreeSet::new());
+        }
+        let mut change_ids = BTreeSet::new();
+        for entry in entries {
+            let selected_file_descriptor = entry.identity.schema_key()
+                == FILE_DESCRIPTOR_SCHEMA_KEY
+                && entry
+                    .identity
+                    .row_pk()
+                    .as_single_string_owned()
+                    .is_ok_and(|file_id| file_selections.contains_key(&file_id));
+            let live_directory = entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                && entry.kind != TrackedStateDiffKind::Removed;
+            if (selected_file_descriptor || live_directory)
+                && let Some(after) = entry.after.as_ref().filter(|after| !after.deleted)
+            {
+                change_ids.insert(after.change_id);
+            }
+        }
+        if change_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let mut records =
+            futures_util::future::try_join_all(change_ids.iter().copied().map(|change_id| {
+                let read = &read;
+                async move {
+                    crate::tracked_state::load_change_record_by_id(read, change_id)
+                        .await
+                        .map(|record| (change_id, record))
+                }
+            }))
+            .await?
+            .into_iter()
+            .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
+            .collect::<HashMap<_, _>>();
+        let missing = change_ids
+            .into_iter()
+            .filter(|change_id| !records.contains_key(change_id))
+            .collect::<Vec<_>>();
+        records.extend(load_change_records(&read, missing.into_iter()).await?);
+        let payloads = materialize_known_change_payloads(
+            records.into_values(),
+            ChangeRecordProjection {
+                snapshot_content: true,
+                metadata: false,
+                snapshot: false,
+                raw_snapshot: false,
+            },
+        )?;
+        let mut file_parents = Vec::new();
+        let mut directory_parents = BTreeMap::new();
+        for payload in payloads.into_values() {
+            let Some(identity) = payload.identity else {
+                continue;
+            };
+            let Some(snapshot) = payload.snapshot_content else {
+                continue;
+            };
+            let snapshot: JsonValue = serde_json::from_str(snapshot.as_ref()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("filesystem closure descriptor is invalid: {error}"),
+                )
+            })?;
+            match identity.schema_key.as_str() {
+                FILE_DESCRIPTOR_SCHEMA_KEY => {
+                    if let Some(parent_id) =
+                        snapshot.get("directory_id").and_then(JsonValue::as_str)
+                    {
+                        file_parents.push(parent_id.to_string());
+                    }
+                }
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                    let directory_id = identity.row_pk.as_single_string_owned()?;
+                    let parent_id = snapshot
+                        .get("parent_id")
+                        .and_then(JsonValue::as_str)
+                        .map(ToOwned::to_owned);
+                    directory_parents.insert(directory_id, parent_id);
+                }
+                _ => {}
+            }
+        }
+        let mut selected = BTreeSet::new();
+        for mut directory_id in file_parents {
+            while selected.insert(directory_id.clone()) {
+                let Some(Some(parent_id)) = directory_parents.get(&directory_id) else {
+                    break;
+                };
+                directory_id.clone_from(parent_id);
+            }
+        }
+        Ok(selected)
+    }
+
+    pub(crate) async fn execute_full_checkpoint_command(
+        &mut self,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        let branch_id = self.active_branch_id.clone();
+        let (previous_recovery, mut gc_state) =
+            self.checkpoint_publication_state(&branch_id).await?;
+        let head_commit_id = self
+            .load_branch_head(&branch_id)
+            .await?
+            .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
+        let previous_checkpoint_commit_id = self
+            .checkpoint_commit_id_at_head(&branch_id, head_commit_id)
+            .await?;
+        let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
+        gc_state.checkpoint_sequence =
+            gc_state.checkpoint_sequence.checked_add(1).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "checkpoint sequence overflow",
+                )
+            })?;
+        if let Some(previous_recovery) = previous_recovery {
+            gc_state.add_collectible_interval(previous_recovery.interval_has_commits);
+        }
+        let commit_id = self.stage_checkpoint_boundary_commit(
+            branch_id,
+            previous_checkpoint_commit_id,
+            head_commit_id,
+            interval_has_commits,
+            gc_state,
+        )?;
+        let checkpoint_commit_id = CommitId::parse_lix(&commit_id, "checkpoint commit id")?;
+        let mut checkpoint_rows = RawWriteBatch::with_capacity(1);
+        checkpoint_rows.push(checkpoint_stage_row(
+            &checkpoint_commit_id,
+            self.functions.call_uuid_v7().to_string(),
+        ));
+        self.stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
+            rows: checkpoint_rows,
+        })
+        .await?;
+        Ok(crate::sql2::DiffCommandOutcome {
+            rows_affected: 1,
+            commit_id: Some(commit_id),
+        })
+    }
+
     async fn execute_checkpoint_selection(
         &mut self,
         diff_ids: Vec<String>,
@@ -8564,20 +8983,15 @@ where
             .reader(self.opening_read())
             .load(&branch_id)
             .await?
-            .ok_or_else(|| {
-                LixError::branch_not_found(&branch_id, "create checkpoint", "target")
-            })?;
+            .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
         if control.head_commit_id != head_commit_id {
             return Err(LixError::new(
                 LixError::CODE_TRANSACTION_CONFLICT,
-                format!(
-                    "branch '{branch_id}' head changed while loading its checkpoint cursor"
-                ),
+                format!("branch '{branch_id}' head changed while loading its checkpoint cursor"),
             ));
         }
-        let previous_checkpoint_commit_id = control
-            .working_diff_checkpoint_commit_id
-            .ok_or_else(|| {
+        let previous_checkpoint_commit_id =
+            control.working_diff_checkpoint_commit_id.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("branch '{branch_id}' has no checkpoint cursor"),
@@ -8585,11 +8999,7 @@ where
             })?;
         let direct_diff = TrackedHeadContext::new()
             .reader(self.opening_read())
-            .working_diff_for_control(
-                &branch_id,
-                control,
-                &TrackedStateDiffRequest::default(),
-            )
+            .working_diff_for_control(&branch_id, control, &TrackedStateDiffRequest::default())
             .await?;
         let hot_working_diff_certified = direct_diff.is_some();
         let diff = match direct_diff {
@@ -8609,7 +9019,7 @@ where
         if requested.len() != diff_ids.len() {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
-                "checkpoint selection contains duplicate diff_id rows",
+                "checkpoint selection contains duplicate relation-row changes",
             ));
         }
         let mut matched = BTreeSet::new();
@@ -8625,7 +9035,7 @@ where
             let target = entry.after.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    format!("working diff '{diff_id}' has no target row"),
+                    "selected working relation row has no target change",
                 )
             })?;
             if requested.contains(&diff_id) {
@@ -8719,36 +9129,240 @@ where
         params: Vec<Value>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         let statement = crate::sql2::parse_statement(&query_sql)?;
+        let source_commits = if command == DiffCommand::Apply {
+            let source = diff_command_source_commits(&statement, &params)?;
+            match source {
+                Some((from, to)) => Some(self.resolve_diff_command_source_commits(from, to).await?),
+                None => None,
+            }
+        } else {
+            None
+        };
         let result = self
             .execute_read_sql_statement(query_sql, statement, params)
             .await?;
-        if result.columns.len() != 1 {
+        if result.columns.len() != 2 {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
                 format!(
-                    "diff command query must return exactly one column, got {}",
+                    "diff command query must return relation and row_pk, got {} columns",
                     result.columns.len()
                 ),
             ));
         }
-        let mut diff_ids = Vec::with_capacity(result.rows.len());
+        let mut selections = Vec::with_capacity(result.rows.len());
         for row in result.rows {
-            let [Value::Text(diff_id)] = row.as_slice() else {
+            let [Value::Text(relation), Value::Jsonb(row_pk)] = row.as_slice() else {
                 return Err(LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    "diff command query must return non-null text diff_id values",
+                    "diff command query must return non-null relation text and JSONB row_pk values",
                 ));
             };
-            diff_ids.push(diff_id.clone());
+            let row_pk = RowPk::from_json_array_text(&row_pk.to_string()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("row_pk must be a JSON primary-key array: {error}"),
+                )
+            })?;
+            selections.push(DiffCommandSelection {
+                relation: relation.clone(),
+                row_pk,
+                source_commits: source_commits.clone(),
+            });
         }
-        if diff_ids.is_empty() {
+        if selections.is_empty() {
             return Ok(crate::sql2::DiffCommandOutcome {
                 rows_affected: 0,
                 commit_id: None,
             });
         }
-        self.execute_diff_command(command, diff_ids).await
+        self.execute_diff_command(command, selections).await
     }
+
+    async fn resolve_diff_command_source_commits(
+        &mut self,
+        from: DiffCommandSourceCommit,
+        to: DiffCommandSourceCommit,
+    ) -> Result<(String, String), LixError> {
+        if let (DiffCommandSourceCommit::Literal(from), DiffCommandSourceCommit::Literal(to)) =
+            (&from, &to)
+        {
+            return Ok((from.clone(), to.clone()));
+        }
+
+        let branch_id = self.active_branch_id.clone();
+        let head = self.load_branch_head(&branch_id).await?.ok_or_else(|| {
+            LixError::branch_not_found(&branch_id, "resolve diff source", "branch")
+        })?;
+        let root = if from == DiffCommandSourceCommit::Root || to == DiffCommandSourceCommit::Root {
+            let mut graph = CommitGraphContext::new().reader(self.opening_read());
+            let mut current = head;
+            loop {
+                let node = graph.load_node(&current).await?.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("cannot resolve repository root: commit '{current}' is missing"),
+                    )
+                })?;
+                let Some(first_parent) = node.parent_commit_ids.first().copied() else {
+                    break Some(node.commit_id.to_string());
+                };
+                current = if node.first_parent_jump_span > 0 {
+                    node.first_parent_jump_commit_id
+                } else {
+                    first_parent
+                };
+            }
+        } else {
+            None
+        };
+        let resolve = |source| match source {
+            DiffCommandSourceCommit::Literal(value) => value,
+            DiffCommandSourceCommit::ActiveHead => head.to_string(),
+            DiffCommandSourceCommit::Root => root
+                .clone()
+                .expect("a repository root was resolved when either source requested it"),
+        };
+        Ok((resolve(from), resolve(to)))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DiffCommandSourceCommit {
+    Literal(String),
+    Root,
+    ActiveHead,
+}
+
+fn diff_command_source_commits(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Result<Option<(DiffCommandSourceCommit, DiffCommandSourceCommit)>, LixError> {
+    use std::ops::ControlFlow;
+
+    use datafusion::sql::sqlparser::ast::{
+        Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, TableFactor,
+        Value as SqlValue, Visit, Visitor,
+    };
+
+    struct SourceVisitor<'a> {
+        params: &'a [Value],
+        sources: Vec<(DiffCommandSourceCommit, DiffCommandSourceCommit)>,
+        error: Option<LixError>,
+    }
+
+    impl Visitor for SourceVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+            let TableFactor::Table {
+                name,
+                args: Some(arguments),
+                ..
+            } = factor
+            else {
+                return ControlFlow::Continue(());
+            };
+            if !name.to_string().eq_ignore_ascii_case("lix_diff") {
+                return ControlFlow::Continue(());
+            }
+            if arguments.args.len() != 3 {
+                return ControlFlow::Continue(());
+            }
+            let resolve = |argument: &FunctionArg| -> Result<DiffCommandSourceCommit, LixError> {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) = argument else {
+                    return Err(LixError::new(
+                        LixError::CODE_UNSUPPORTED_SQL,
+                        "diff command source commits must be text literals, parameters, or root/head functions",
+                    ));
+                };
+                match expression {
+                    SqlExpr::Value(value) => match &value.value {
+                        SqlValue::SingleQuotedString(value) => {
+                            Ok(DiffCommandSourceCommit::Literal(value.clone()))
+                        }
+                        SqlValue::Placeholder(placeholder) => {
+                            let index = placeholder
+                                .strip_prefix('$')
+                                .and_then(|index| index.parse::<usize>().ok())
+                                .and_then(|index| index.checked_sub(1));
+                            match index.and_then(|index| self.params.get(index)) {
+                                Some(Value::Text(value)) => {
+                                    Ok(DiffCommandSourceCommit::Literal(value.clone()))
+                                }
+                                _ => Err(LixError::new(
+                                    LixError::CODE_TYPE_MISMATCH,
+                                    "diff command source commit parameters must be non-null text",
+                                )),
+                            }
+                        }
+                        _ => Err(LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            "diff command source commits must be non-null text",
+                        )),
+                    },
+                    SqlExpr::Function(function) if matches!(&function.args, FunctionArguments::List(arguments) if arguments.args.is_empty()) => {
+                        if crate::sql2::parse::object_name_is_public_function(
+                            &function.name,
+                            "lix_root_commit_id",
+                        ) {
+                            Ok(DiffCommandSourceCommit::Root)
+                        } else if crate::sql2::parse::object_name_is_public_function(
+                            &function.name,
+                            "lix_active_branch_commit_id",
+                        ) {
+                            Ok(DiffCommandSourceCommit::ActiveHead)
+                        } else {
+                            Err(LixError::new(
+                                LixError::CODE_UNSUPPORTED_SQL,
+                                "diff command source commits only support lix_root_commit_id() and lix_active_branch_commit_id() functions",
+                            ))
+                        }
+                    }
+                    _ => Err(LixError::new(
+                        LixError::CODE_UNSUPPORTED_SQL,
+                        "diff command source commits must be text literals, parameters, or root/head functions",
+                    )),
+                }
+            };
+            match (resolve(&arguments.args[1]), resolve(&arguments.args[2])) {
+                (Ok(from), Ok(to)) => self.sources.push((from, to)),
+                (Err(error), _) | (_, Err(error)) => {
+                    self.error = Some(error);
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = SourceVisitor {
+        params,
+        sources: Vec::new(),
+        error: None,
+    };
+    if let DataFusionStatement::Statement(statement) = statement {
+        let _ = statement.visit(&mut visitor);
+    }
+    if let Some(error) = visitor.error {
+        return Err(error);
+    }
+    visitor.sources.sort();
+    visitor.sources.dedup();
+    if visitor.sources.len() > 1 {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "diff commands support exactly one source commit pair per statement",
+        ));
+    }
+    Ok(visitor.sources.into_iter().next())
+}
+
+fn unknown_diff_selection() -> LixError {
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        "selected relation row is not present in the source diff",
+    )
 }
 
 async fn load_immutable_mutation_predecessors<R>(
@@ -8838,7 +9452,7 @@ fn required_diff_change<'a>(
 fn stale_or_unknown_diff_id() -> LixError {
     LixError::new(
         LixError::CODE_CONSTRAINT_VIOLATION,
-        "stale or unknown diff_id; re-evaluate the source diff and retry",
+        "selected relation row changed; re-evaluate the source diff and retry",
     )
 }
 
@@ -10219,14 +10833,20 @@ where
     async fn execute_diff_command(
         &mut self,
         command: DiffCommand,
-        diff_ids: Vec<String>,
+        selections: Vec<DiffCommandSelection>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-        match command {
+        let selected_rows = selections.len() as u64;
+        let diff_ids = self
+            .resolve_diff_command_selections(command, &selections)
+            .await?;
+        let mut outcome = match command {
             DiffCommand::Revert | DiffCommand::Apply => {
                 self.execute_apply_or_revert(command, diff_ids).await
             }
             DiffCommand::CreateCheckpoint => self.execute_checkpoint_selection(diff_ids).await,
-        }
+        }?;
+        outcome.rows_affected = selected_rows;
+        Ok(outcome)
     }
 
     async fn restore_active_branch(&mut self, commit_id: String) -> Result<(), LixError> {

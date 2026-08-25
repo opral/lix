@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
 
 use lix::{CreateBranchOptions, LixError, MergeBranchOptions, Value};
+use serde_json::json;
 
 use super::select_rows;
 
 simulation_test!(
-    lix_commit_surfaces_expose_commits_and_edges,
+    lix_commit_surfaces_expose_ordered_parent_commit_ids,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -45,7 +46,7 @@ simulation_test!(
         let commit_rows = select_rows(
             &session,
             &format!(
-                "SELECT id, lixcol_global, lixcol_untracked \
+                "SELECT id, parent_commit_ids, parent_commit_ids ->> 0, lixcol_global, lixcol_untracked \
                  FROM lix_commit WHERE id = '{second_head}'"
             ),
         )
@@ -54,31 +55,18 @@ simulation_test!(
             commit_rows,
             vec![vec![
                 Value::Text(second_head.clone()),
+                Value::Jsonb(json!([first_head]).into()),
+                Value::Text(first_head),
                 Value::Boolean(true),
                 Value::Boolean(false),
             ]]
         );
 
-        let edge_rows = select_rows(
-            &session,
-            &format!(
-                "SELECT parent_id, child_id, parent_order, lixcol_global, lixcol_untracked \
-                 FROM lix_commit_edge WHERE child_id = '{second_head}'"
-            ),
-        )
-        .await;
-        assert_eq!(
-            edge_rows,
-            vec![vec![
-                Value::Text(first_head.clone()),
-                Value::Text(second_head.clone()),
-                Value::Integer(0),
-                Value::Boolean(true),
-                Value::Boolean(false),
-            ]]
-        );
-
-        for table in ["lix_commit_by_branch", "lix_commit_edge_by_branch"] {
+        for table in [
+            "lix_commit_edge",
+            "lix_commit_by_branch",
+            "lix_commit_edge_by_branch",
+        ] {
             let error = session
                 .execute(&format!("SELECT * FROM {table}"), &[])
                 .await
@@ -155,21 +143,21 @@ simulation_test!(
             vec![vec![Value::Text(branch_head.clone())]]
         );
 
-        let main_edge_rows = select_rows(
+        let main_parent_rows = select_rows(
             &main,
-            &format!("SELECT child_id FROM lix_commit_edge WHERE child_id = '{branch_head}'"),
+            &format!("SELECT parent_commit_ids FROM lix_commit WHERE id = '{branch_head}'"),
         )
         .await;
-        let branch_edge_rows = select_rows(
+        let branch_parent_rows = select_rows(
             &branch,
-            &format!("SELECT child_id FROM lix_commit_edge WHERE child_id = '{branch_head}'"),
+            &format!("SELECT parent_commit_ids FROM lix_commit WHERE id = '{branch_head}'"),
         )
         .await;
         assert_eq!(
-            main_edge_rows, branch_edge_rows,
-            "derived commit surfaces should also expose global commit-derived rows"
+            main_parent_rows, branch_parent_rows,
+            "ordered parents must be visible globally regardless of the active branch"
         );
-        assert_eq!(main_edge_rows, vec![vec![Value::Text(branch_head)]]);
+        assert_eq!(main_parent_rows.len(), 1);
     }
 );
 
@@ -410,6 +398,18 @@ simulation_test!(
             .await
             .expect("merge head should load")
             .expect("merge head should exist");
+        assert_eq!(
+            select_rows(
+                &main,
+                &format!("SELECT parent_commit_ids FROM lix_commit WHERE id = '{merge_head}'"),
+            )
+            .await,
+            vec![vec![Value::Jsonb(
+                json!([main_parent.clone(), draft_parent.clone()]).into(),
+            )]],
+            "merge parent ordering preserves the mainline before the merge parent"
+        );
+
         let mut parents = [main_parent, draft_parent];
         parents.sort();
 
@@ -442,19 +442,12 @@ simulation_test!(
             &engine,
         );
 
-        for (schema_key, tables) in [
-            ("lix_commit", vec!["lix_commit"]),
-            ("lix_commit_edge", vec!["lix_commit_edge"]),
-        ] {
-            let schema_properties = builtin_schema_property_names(schema_key);
-            for table in tables {
-                let surface_columns = non_system_column_names(&session, table).await;
-                assert_eq!(
-                    surface_columns, schema_properties,
-                    "{table} data columns should match {schema_key} properties"
-                );
-            }
-        }
+        let schema_properties = builtin_schema_property_names("lix_commit");
+        let surface_columns = non_system_column_names(&session, "lix_commit").await;
+        assert_eq!(
+            surface_columns, schema_properties,
+            "lix_commit data columns should match its canonical schema properties"
+        );
     }
 );
 
@@ -470,10 +463,8 @@ simulation_test!(
             &engine,
         );
 
-        for table in ["lix_commit", "lix_commit_edge"] {
-            let rows = select_rows(&session, &format!("SELECT count(*) FROM {table}")).await;
-            assert_single_count(rows, table);
-        }
+        let rows = select_rows(&session, "SELECT count(*) FROM lix_commit").await;
+        assert_single_count(rows, "lix_commit");
     }
 );
 
@@ -499,7 +490,6 @@ fn text_value(value: &Value) -> String {
 fn builtin_schema_property_names(schema_key: &str) -> BTreeSet<String> {
     let schema = match schema_key {
         "lix_commit" => include_str!("../../../src/schema/builtin/lix_commit.json"),
-        "lix_commit_edge" => include_str!("../../../src/schema/builtin/lix_commit_edge.json"),
         other => panic!("unexpected builtin schema key: {other}"),
     };
     let schema = serde_json::from_str::<serde_json::Value>(schema)

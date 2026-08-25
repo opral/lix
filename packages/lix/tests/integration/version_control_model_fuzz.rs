@@ -680,11 +680,26 @@ async fn assert_working_diff(
     expected: &[(String, &'static str)],
     label: &str,
 ) {
+    let checkpoint = session
+        .execute(
+            "SELECT checkpoint.commit_id \
+             FROM lix_checkpoint AS checkpoint \
+             JOIN lix_commit_ancestry() AS ancestry \
+               ON ancestry.commit_id = checkpoint.commit_id \
+             ORDER BY ancestry.depth LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label}: checkpoint read failed: {error:?}"))
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap_or_else(|error| panic!("{label}: checkpoint ID should be text: {error:?}"));
     let rows = session
         .execute(
-            "SELECT row_pk, diff_type FROM lix_working_diff() \
-             WHERE schema_key = 'lix_key_value' ORDER BY row_pk",
-            &[],
+            "SELECT row_pk, diff_type \
+             FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id()) \
+             ORDER BY row_pk",
+            &[Value::Text(checkpoint)],
         )
         .await
         .unwrap_or_else(|error| panic!("{label}: working diff read failed: {error:?}"));

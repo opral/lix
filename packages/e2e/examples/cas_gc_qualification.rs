@@ -546,8 +546,7 @@ where
         .expect("switch session branch");
     let diff = session
         .execute(
-            "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-             WHERE schema_key = 'lix_binary_blob_ref'",
+            "SELECT COUNT(*) AS entries FROM lix_diff('lix_file', $1, $2)",
             &[
                 Value::Text(fixture.root_a.clone()),
                 Value::Text(fixture.root_b.clone()),

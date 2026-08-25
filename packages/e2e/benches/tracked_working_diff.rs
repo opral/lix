@@ -51,8 +51,9 @@ const DEFAULT_UNRELATED_HISTORY_WIDTH: usize = 1;
 const UNRELATED_HISTORY_STORAGE_BATCH: usize = 100_000;
 const INSERT_BATCH_SIZE: usize = 500;
 const MERGE_PREVIEW_SOURCE_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000901";
-const WORKING_DIFF_SQL: &str = "SELECT row_pk, schema_key, diff_type, before_change_id, after_change_id \
-    FROM lix_working_diff() ORDER BY schema_key, row_pk";
+const WORKING_DIFF_SQL: &str = "SELECT row_pk, diff_type, row_count \
+    FROM lix_diff('working_diff_row', $1, lix_active_branch_commit_id()) \
+    ORDER BY row_pk";
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -976,8 +977,22 @@ async fn profile_working_diff_query<StorageImpl>(session: &Lix<StorageImpl>) -> 
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    let checkpoint = session
+        .execute(
+            "SELECT checkpoint.commit_id \
+             FROM lix_checkpoint AS checkpoint \
+             JOIN lix_commit_ancestry() AS ancestry \
+               ON ancestry.commit_id = checkpoint.commit_id \
+             ORDER BY ancestry.depth LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("query current working-diff checkpoint")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("working-diff checkpoint ID");
     session
-        .execute(WORKING_DIFF_SQL, &[])
+        .execute(WORKING_DIFF_SQL, &[Value::Text(checkpoint)])
         .await
         .expect("query populated working diff")
         .len()

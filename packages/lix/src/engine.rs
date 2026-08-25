@@ -679,6 +679,27 @@ mod tests {
         register_json_pointer_schema_in_scope(session, true).await;
     }
 
+    async fn json_pointer_diff_relation(session: &SessionContext<Memory>) -> String {
+        let checkpoint = session
+            .execute(
+                "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_created_at DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("latest checkpoint should resolve")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("checkpoint commit ID should decode");
+        let head = session
+            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+            .await
+            .expect("active head should resolve")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("active head commit ID should decode");
+        format!("lix_diff('json_pointer', '{checkpoint}', '{head}')")
+    }
+
     #[tokio::test]
     async fn healthy_session_open_does_not_wait_for_the_write_gate() {
         let storage = Memory::new();
@@ -1445,8 +1466,10 @@ mod tests {
             .expect("changelog count should be numeric");
         let diff_before = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_working_diff() \
-                 WHERE schema_key = 'json_pointer'",
+                &format!(
+                    "SELECT COUNT(*) AS entries FROM {}",
+                    json_pointer_diff_relation(&session).await
+                ),
                 &[],
             )
             .await
@@ -1485,8 +1508,10 @@ mod tests {
             .expect("changelog count should be numeric");
         let diff_after = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_working_diff() \
-                 WHERE schema_key = 'json_pointer'",
+                &format!(
+                    "SELECT COUNT(*) AS entries FROM {}",
+                    json_pointer_diff_relation(&session).await
+                ),
                 &[],
             )
             .await
@@ -1642,8 +1667,10 @@ mod tests {
         let index_before = hits.index_scan.load(Ordering::Relaxed);
         let broad = session
             .execute(
-                "SELECT row_pk, diff_type FROM lix_working_diff() \
-                 WHERE schema_key = 'json_pointer' ORDER BY row_pk",
+                &format!(
+                    "SELECT row_pk, diff_type FROM {} ORDER BY row_pk",
+                    json_pointer_diff_relation(&session).await
+                ),
                 &[],
             )
             .await
@@ -1691,9 +1718,11 @@ mod tests {
             let primary_before = hits.primary_scan.load(Ordering::Relaxed);
             let finite = session
                 .execute(
-                    "SELECT row_pk, diff_type FROM lix_working_diff() \
-                     WHERE schema_key = 'json_pointer' AND row_pk = CAST($1 AS JSONB) \
-                     ORDER BY row_pk",
+                    &format!(
+                        "SELECT row_pk, diff_type FROM {} \
+                         WHERE row_pk = CAST($1 AS JSONB) ORDER BY row_pk",
+                        json_pointer_diff_relation(&session).await
+                    ),
                     &[crate::Value::Text(requested_row_pk.clone())],
                 )
                 .await
@@ -1852,15 +1881,13 @@ mod tests {
             .await
             .expect("untracked insert should commit");
 
-        type DiffRow = (String, String, Option<String>, String);
+        type DiffRow = (String, Option<String>, String);
         fn collect(result: &crate::ExecuteResult) -> Vec<DiffRow> {
             let mut rows = result
                 .rows()
                 .iter()
                 .map(|row| {
                     (
-                        row.get::<String>("schema_key")
-                            .expect("schema_key should decode"),
                         row.get::<serde_json::Value>("row_pk")
                             .expect("row_pk should decode")
                             .to_string(),
@@ -1875,8 +1902,12 @@ mod tests {
             rows.sort();
             rows
         }
-        const COLUMNS: &str = "SELECT row_pk, schema_key, file_id, diff_type \
-                               FROM lix_working_diff()";
+        let relation = json_pointer_diff_relation(&session).await;
+        let columns = format!(
+            "SELECT row_pk, \
+             COALESCE(to_lixcol_file_id, from_lixcol_file_id) AS file_id, diff_type \
+             FROM {relation}"
+        );
 
         use std::sync::atomic::Ordering;
         let hits = &crate::hot_state::WORKING_DIFF_PATH_HITS;
@@ -1884,7 +1915,7 @@ mod tests {
         let index_before = hits.index_scan.load(Ordering::Relaxed);
         let broad = collect(
             &session
-                .execute(COLUMNS, &[])
+                .execute(&columns, &[])
                 .await
                 .expect("unfiltered working-diff read should execute"),
         );
@@ -1895,8 +1926,7 @@ mod tests {
         assert!(
             broad
                 .iter()
-                .any(|(schema, _, file, kind)| schema == "json_pointer"
-                    && file.as_deref() == Some(files[0])
+                .any(|(_, file, kind)| file.as_deref() == Some(files[0])
                     && kind == "removed"),
             "fixture should produce a removed row inside the probed file"
         );
@@ -1906,7 +1936,12 @@ mod tests {
             let scoped = collect(
                 &session
                     .execute(
-                        &format!("{COLUMNS} WHERE file_id = $1"),
+                        &format!(
+                            "{columns} WHERE from_lixcol_file_id = $1 \
+                             UNION ALL \
+                             {columns} WHERE to_lixcol_file_id = $1 \
+                               AND from_lixcol_file_id IS NULL"
+                        ),
                         &[crate::Value::Text(file.to_string())],
                     )
                     .await
@@ -1918,7 +1953,7 @@ mod tests {
             );
             let want = broad
                 .iter()
-                .filter(|(_, _, row_file, _)| row_file.as_deref() == Some(file))
+                .filter(|(_, row_file, _)| row_file.as_deref() == Some(file))
                 .cloned()
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -1926,42 +1961,6 @@ mod tests {
                 "the file-scoped working-diff bypass disagrees with the index scan for {file}"
             );
 
-            let primary_before = hits.primary_scan.load(Ordering::Relaxed);
-            let scoped_schema = collect(
-                &session
-                    .execute(
-                        &format!("{COLUMNS} WHERE file_id = $1 AND schema_key = $2"),
-                        &[
-                            crate::Value::Text(file.to_string()),
-                            crate::Value::Text("json_pointer".to_string()),
-                        ],
-                    )
-                    .await
-                    .expect("file+schema working-diff read should execute"),
-            );
-            assert!(
-                hits.primary_scan.load(Ordering::Relaxed) > primary_before,
-                "the file+schema working-diff read for {file} must take the primary-row bypass"
-            );
-            let want_schema = want
-                .iter()
-                .filter(|(schema, _, _, _)| schema == "json_pointer")
-                .cloned()
-                .collect::<Vec<_>>();
-            assert_eq!(
-                scoped_schema, want_schema,
-                "the file+schema working-diff bypass disagrees with the index scan for {file}"
-            );
-            if file == files[0] {
-                // The dirtied file descriptor proves the bare `file_id` shape
-                // resolved a schema domain wider than the one predicate-named
-                // schema, rather than silently answering json_pointer only.
-                assert!(
-                    want.len() > want_schema.len(),
-                    "fixture should put a non-json_pointer schema in {file}'s diff, \
-                     otherwise the FILE_SPACE schema-domain resolution is untested"
-                );
-            }
         }
     }
 
@@ -2282,7 +2281,13 @@ mod tests {
             "checkpoint rotation must not synchronously scan and delete the superseded sparse epoch"
         );
         let logical = session
-            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff()", &[])
+            .execute(
+                &format!(
+                    "SELECT COUNT(*) AS entries FROM {}",
+                    json_pointer_diff_relation(&session).await
+                ),
+                &[],
+            )
             .await
             .expect("post-checkpoint logical diff should execute");
         assert_eq!(
@@ -2350,7 +2355,13 @@ mod tests {
             "the second immutable checkpoint row remains while the superseded branch epoch is reclaimed"
         );
         let logical = session
-            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff()", &[])
+            .execute(
+                &format!(
+                    "SELECT COUNT(*) AS entries FROM {}",
+                    json_pointer_diff_relation(&session).await
+                ),
+                &[],
+            )
             .await
             .expect("second post-checkpoint logical diff should execute");
         assert_eq!(

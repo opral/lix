@@ -2878,7 +2878,6 @@ fn bind_table_function_parameters(
             };
             let public_function_name = [
                 "lix_history",
-                "lix_working_diff",
                 "lix_diff",
                 "lix_commit_ancestry",
             ]
@@ -3031,7 +3030,7 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
                 "recursive CTEs are not supported by Lix SQL",
             )
             .with_hint(
-                "Use lix_commit_ancestry() for transitive commit traversal, explicit graph surfaces such as lix_commit and lix_commit_edge for topology, or a typed history surface instead of WITH RECURSIVE.",
+                "Use lix_commit_ancestry() for transitive commit traversal, lix_commit.parent_commit_ids for direct ordered parents, or a typed history surface instead of WITH RECURSIVE.",
             ));
         }
         _ => {}
@@ -4193,11 +4192,11 @@ mod tests {
         async fn execute_diff_command(
             &mut self,
             _command: crate::sql2::DiffCommand,
-            diff_ids: Vec<String>,
+            selections: Vec<crate::sql2::DiffCommandSelection>,
         ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
             Ok(crate::sql2::DiffCommandOutcome {
-                rows_affected: diff_ids.len() as u64,
-                commit_id: (!diff_ids.is_empty()).then(|| "commit-diff-command".to_string()),
+                rows_affected: selections.len() as u64,
+                commit_id: (!selections.is_empty()).then(|| "commit-diff-command".to_string()),
             })
         }
 
@@ -4468,8 +4467,9 @@ mod tests {
         };
         let plan = create_write_logical_plan(
             &mut ctx,
-            "INSERT INTO lix_revert (diff_id) \
-             SELECT diff_id FROM (VALUES ('d1.test')) AS selected(diff_id) \
+            "INSERT INTO lix_revert (relation, row_pk) \
+             SELECT relation, CAST(row_pk AS JSONB) \
+             FROM (VALUES ('lix_key_value', '[\"test\"]')) AS selected(relation, row_pk) \
              RETURNING commit_id",
         )
         .await
@@ -5475,7 +5475,6 @@ mod tests {
             .await
             .expect("engine should initialize");
         let engine = Engine::new(storage).await.expect("engine should open");
-        let branch_id = init_receipt.main_branch_id.clone();
         let session = engine
             .open_session_at(init_receipt.main_branch_id)
             .await
@@ -5510,37 +5509,26 @@ mod tests {
                 .expect("count should be numeric"),
             3
         );
-        let before_delete = engine
-            .load_branch_head_commit_id(&branch_id)
-            .await
-            .expect("head before delete should load")
-            .expect("head before delete should exist");
-
         let deleted = session
             .execute("DELETE FROM test_state_schema", &[])
             .await
             .expect("whole collection should delete");
         assert_eq!(deleted.rows_affected(), 3);
-        let after_delete = engine
-            .load_branch_head_commit_id(&branch_id)
-            .await
-            .expect("head after delete should load")
-            .expect("head after delete should exist");
-        let diff = session
+        let generation = session
             .execute(
-                &format!(
-                    "SELECT schema_key, diff_type FROM lix_diff('{before_delete}', '{after_delete}')"
-                ),
+                "SELECT schema_key, snapshot_content IS NOT NULL AS is_added \
+                 FROM lix_change WHERE schema_key = 'lix_collection_generation'",
                 &[],
             )
             .await
-            .expect("collection delete diff should query");
+            .expect("collection generation fact should query");
         assert_eq!(
-            rows_from_execute_result(diff).1,
+            rows_from_execute_result(generation).1,
             vec![vec![
                 Value::Text("lix_collection_generation".to_string()),
-                Value::Text("added".to_string())
-            ]]
+                Value::Boolean(true),
+            ]],
+            "whole-collection deletion authors one generation fact instead of row tombstones",
         );
         let marker_changes = session
             .execute(

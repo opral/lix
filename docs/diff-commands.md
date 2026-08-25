@@ -1,39 +1,46 @@
 ---
-description: Select native Lix diffs with SQL and feed them atomically into revert, apply, and checkpoint commands.
+description: Compare typed Lix relations across commits and select rows atomically for revert, apply, or checkpoint commands.
 ---
 
 # Diff commands
 
-Diff commands act on a chosen subset of changes: revert selected changes, apply
-changes from history, or checkpoint a subset of your work while the rest stays
-in progress. You select diffs with a SQL query and pipe the resulting
-`diff_id` rows into a command.
+`lix_diff(relation, from_commit_id, to_commit_id)` compares one relation across
+two explicitly selected commits. A file is one row of `lix_file`; a registered
+schema row is one row of its schema relation. Commands consume that same
+`(relation, row_pk)` identity, so selecting a file also selects its underlying
+tracked content.
 
-## Complete example
-
-Revert every working change in one file:
+## Review changed files
 
 ```ts
 import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
+const checkpoint = await lix.execute(
+  "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_created_at DESC LIMIT 1",
+);
+const checkpointCommitId = checkpoint.rows[0].get("commit_id");
+const head = await lix.execute("SELECT lix_active_branch_commit_id() AS id");
+const headCommitId = head.rows[0].get("id");
 
-// Inspect what would be reverted.
-const diffs = await lix.execute(
-  "SELECT diff_id, diff_type FROM lix_working_diff() WHERE file_id = $1",
-  ["file_1"],
+const changedFiles = await lix.execute(
+  `SELECT row_pk, diff_type, from_path, to_path, row_count
+   FROM lix_diff('lix_file', $1, $2)
+   ORDER BY coalesce(to_path, from_path)`,
+  [checkpointCommitId, headCommitId],
 );
 
-for (const row of diffs.rows) {
-  console.log(row.get("diff_type"), row.get("diff_id"));
+for (const row of changedFiles.rows) {
+  console.log(row.get("diff_type"), row.get("to_path") ?? row.get("from_path"));
 }
 
-// Revert them in one atomic statement.
 const reverted = await lix.execute(
-  `INSERT INTO lix_revert (diff_id)
-   SELECT diff_id FROM lix_working_diff() WHERE file_id = $1
+  `INSERT INTO lix_revert (relation, row_pk)
+   SELECT 'lix_file', row_pk
+   FROM lix_diff('lix_file', $1, $2)
+   WHERE row_pk = $3
    RETURNING commit_id`,
-  ["file_1"],
+  [checkpointCommitId, headCommitId, changedFiles.rows[0].get("row_pk")],
 );
 
 if (reverted.rows.length > 0) {
@@ -43,103 +50,85 @@ if (reverted.rows.length > 0) {
 await lix.close();
 ```
 
-`result.rows` contains row objects. Read a column with `row.get("name")`.
+## Diff rows
 
-## Diff sources
+Every relation diff exposes `row_pk`, `diff_type`, `row_count`, and a
+`from_<column>` / `to_<column>` pair for each column of the compared relation.
+`diff_type` is `added`, `modified`, or `removed`. Added rows have empty `from_`
+values; removed rows have empty `to_` values. Use
+`coalesce(to_path, from_path)` when displaying a path that also covers removed
+or renamed files.
 
-`lix_working_diff()` compares the current session's active branch head with its
-latest checkpoint. Open another session on another branch to inspect that
-branch's working diff. Its columns are listed in the
-[checkpoint SQL surfaces table](./checkpoints.md#sql-surfaces).
+Projecting `from_content` or `to_content` for `lix_file` is unsupported because
+reconstructing historical file bytes would turn lightweight diff reads into blob
+materialization. Query `lix_history('lix_file', commit_id)` when file bytes are
+required.
 
-`lix_diff` compares any two commits. Both commit arguments are required:
+`row_count` is `1` for a changed schema row. For a file it counts the underlying
+descriptor and content rows contributing to the aggregate:
 
 ```sql
-SELECT diff_id, row_pk, schema_key, file_id, diff_type,
-       before_change_id, after_change_id
-FROM lix_diff($1, $2);
+SELECT count(*) AS changed_files, sum(row_count) AS changed_rows
+FROM lix_diff('lix_file', $checkpoint_commit_id, $head_commit_id);
+```
+
+`lix_diff('lix_directory', ...)` supports changes to directory descriptors,
+including directory creation, removal, and renaming. Rolling changed files or
+their content up into an otherwise unchanged parent directory is unsupported;
+query `lix_diff('lix_file', ...)` for file-level changes and aggregate those
+rows by path when directory summaries are needed.
+
+Bulk deletion of an entire schema collection is represented by an internal
+collection-generation marker, not individual row changes. Expanding that marker
+into per-row `lix_diff` results is unsupported; delete selected rows individually
+when row-level history or diff visibility is required.
+
+Both commit IDs are required. `lix_root_commit_id()` returns the repository
+root; comparing it with another commit reports files present in that commit as
+added rows. Genesis comparisons of internal bootstrap schema rows are
+unsupported because those metadata rows already exist in the bootstrap root.
+
+```sql
+SELECT row_pk, to_path
+FROM lix_diff('lix_file', lix_root_commit_id(), $commit_id);
 ```
 
 ## Commands
 
-Three insert-only command sinks consume a one-column query of `diff_id` rows:
+The insert-only command sinks consume queries selecting `(relation, row_pk)`:
 
 ```sql
--- Revert selected changes from their after side to their before side.
-INSERT INTO lix_revert (diff_id)
-SELECT diff_id
-FROM lix_working_diff()
-WHERE file_id = $1;
+INSERT INTO lix_revert (relation, row_pk)
+SELECT 'lix_file', row_pk
+FROM lix_diff('lix_file', $checkpoint_commit_id, $head_commit_id)
+WHERE coalesce(to_path, from_path) LIKE '/docs/%';
 
--- Apply selected changes from their before side to their after side.
-INSERT INTO lix_apply (diff_id)
-SELECT diff_id
-FROM lix_diff($1, $2)
-WHERE schema_key = 'acme_task';
+INSERT INTO lix_apply (relation, row_pk)
+SELECT 'acme_task', row_pk
+FROM lix_diff('acme_task', $from_commit_id, $to_commit_id)
+WHERE to_done = true;
 
--- Move only the selected working diffs behind a new checkpoint.
-INSERT INTO lix_create_checkpoint (diff_id)
-SELECT diff_id
-FROM lix_working_diff()
-WHERE file_id <> $1;
-```
-
-The source is a normal SQL query, so filters, joins, ordering, and limits stay
-inside the database. To submit a `diff_id` your application already holds, use
-a parameterized `VALUES` relation:
-
-```sql
-INSERT INTO lix_revert (diff_id)
-SELECT diff_id FROM (VALUES ($1)) AS selected(diff_id);
-```
-
-Lix rejects direct `INSERT ... VALUES`. Every command must be
-`INSERT ... SELECT`; the query may read a Lix relation, a `VALUES` relation, a
-CTE, or another valid query.
-
-## Semantics
-
-Each statement is atomic: it either fully succeeds or changes nothing.
-
-Revert and apply check that every selected row is still on the side the
-command starts from. If someone changed a row after you selected its diff,
-the whole statement fails and nothing changes — re-query and retry.
-
-An empty selection succeeds, does nothing, and creates no commit. You do not
-need a preflight query.
-
-A partial checkpoint commits the selected state as a checkpoint and preserves
-the unselected working state in a child commit. Both commits and the
-branch-head move publish atomically. Checkpoint naming is not part of this API.
-
-Every command supports `RETURNING commit_id`:
-
-```sql
-INSERT INTO lix_apply (diff_id)
-SELECT diff_id
-FROM lix_diff($1, $2)
-WHERE file_id = $3
+INSERT INTO lix_create_checkpoint (relation, row_pk)
+SELECT 'lix_file', row_pk
+FROM lix_diff('lix_file', $checkpoint_commit_id, $head_commit_id)
+WHERE to_path LIKE '/docs/%'
 RETURNING commit_id;
+
+INSERT INTO lix_create_checkpoint DEFAULT VALUES RETURNING commit_id;
 ```
 
-For a non-empty selection, every returned row carries the same engine-created
-commit ID, and both the affected-row count and the returned-row count equal
-the number of consumed diffs. An empty selection returns zero rows.
+Selecting a file includes the tracked rows composing that file. Partial file
+checkpoints also include required ancestor directory descriptors. Selections
+outside the supported dependency-closure paths fail with a descriptive error
+instead of producing an invalid checkpoint. Selecting `lix_directory` rows
+directly is unsupported; select the affected `lix_file` rows instead.
 
-## Note on `diff_id`
+Each statement is atomic. An empty selection succeeds without creating a
+commit, duplicate selected identities are rejected, and every command supports
+`RETURNING commit_id`. Full checkpoints use `DEFAULT VALUES` and structurally
+reuse the branch state without copying application rows.
 
-Treat `diff_id` as opaque: select it, pipe it into a command. It is a
-deterministic, versioned encoding of the native before/after change pair (its
-current textual form starts with `d1.`), but clients must not construct or
-decode it. Use `before_change_id` and `after_change_id` for joins to
-`lix_change` and for debugging.
-
-A `diff_id` is only valid while the row is still on the side the command
-starts from, so it is a short-lived selection token rather than a durable
-handle — do not persist one and expect it to resolve later. It also describes a
-change, not a row's history: a row that was deleted in an earlier
-checkpoint and later re-added encodes the same way as one that was never
-present, even though `before_change_id` still reports the underlying row.
-
-These command names describe state transformations. They are not a session
-undo/redo stack.
+Rows written with `lixcol_untracked` are absent from every diff. Untracked
+state belongs to the local repository replica and is not transported through
+commit-based synchronization; use a separate service for state that needs
+synchronization without version history.
