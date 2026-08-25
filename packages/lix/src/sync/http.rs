@@ -20,7 +20,7 @@ pub(super) const SYNC_TRANSPORT_ERROR_CODE: &str = "LIX_ERROR_SYNC_TRANSPORT";
 const SESSION_HEADER: &str = "lix-session-id";
 
 #[derive(Debug)]
-pub(super) struct RawHttpRequest {
+pub(crate) struct RawHttpRequest {
     pub method: Method,
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -30,13 +30,13 @@ pub(super) struct RawHttpRequest {
 }
 
 #[derive(Debug)]
-pub(super) struct RawHttpResponse {
+pub(crate) struct RawHttpResponse {
     pub status: u16,
     pub status_text: String,
     pub body: Vec<u8>,
 }
 
-pub(super) trait RawHttpClient: SyncTransportBounds {
+pub(crate) trait RawHttpClient: SyncTransportBounds {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse>;
 }
 

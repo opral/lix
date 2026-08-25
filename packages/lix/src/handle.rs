@@ -107,6 +107,10 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
     }
 
     /// Runs this repository as a local replica of `server`.
+    ///
+    /// Sync replicas require a storage adapter that implements durable reads.
+    /// The default in-memory adapter is intentionally not supported because it
+    /// cannot prove that a bootstrap snapshot survived its publication fence.
     pub fn with_server(mut self, server: ServerOptions) -> Self {
         self.server = Some(server);
         self
@@ -430,12 +434,18 @@ where
     // can be bound to the authority's account. Reopens with durable state for
     // this exact remote remain entirely local.
     let (reopened_sync_account_id, mut prepared_sync) = if let Some(server) = server.as_ref() {
-        let state = load_sync_open_state(&storage, server.url.trim_end_matches('/')).await?;
-        match state {
-            SyncOpenState::NeedsPreparation => {
-                (None, Some(crate::sync::prepare_sync_mode(server).await?))
+        match crate::sync::inspect_sync_bootstrap(
+            &storage,
+            server.url.trim_end_matches('/'),
+        )
+        .await?
+        {
+            crate::sync::SyncBootstrapAdmission::Prepare => {
+                (None, Some(crate::sync::prepare_sync_bootstrap(server).await?))
             }
-            SyncOpenState::Ready { account_id } => (Some(account_id), None),
+            crate::sync::SyncBootstrapAdmission::Ready { account_id } => {
+                (Some(account_id), None)
+            }
         }
     } else {
         (None, None)
@@ -444,7 +454,7 @@ where
         .as_ref()
         .map(|prepared| prepared.default_branch_id.clone());
     let engine = open_or_initialize_engine(
-        storage,
+        storage.clone(),
         wasm_runtime,
         telemetry,
         None,
@@ -465,9 +475,23 @@ where
     if let Some(server) = server {
         match server.mode {
             ServerMode::Sync => {
-                let runtime =
-                    crate::sync::activate_sync_mode(&mut lix, &server, prepared_sync.take())
-                        .await?;
+                let initial_transport = if let Some(prepared) = prepared_sync.take() {
+                    Some(crate::sync::install_sync_bootstrap(
+                        &mut lix,
+                        &storage,
+                        &server,
+                        prepared,
+                    )
+                    .await?)
+                } else {
+                    None
+                };
+                let runtime = crate::sync::activate_sync_mode(
+                    &mut lix,
+                    &server,
+                    initial_transport,
+                )
+                .await?;
                 lix.sync_demand_tx = Some(runtime.demand_tx.clone());
                 lix.sync_lease = Some(SyncSessionLease::root(runtime));
             }
@@ -475,41 +499,6 @@ where
     }
     lix.bind_session();
     Ok(lix)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SyncOpenState {
-    NeedsPreparation,
-    Ready { account_id: String },
-}
-
-async fn load_sync_open_state<StorageImpl>(
-    storage: &StorageImpl,
-    remote_id: &str,
-) -> Result<SyncOpenState, LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
-    let read = adapter
-        .begin_read(crate::storage_adapter::StorageReadOptions::default())
-        .await?;
-    if matches!(
-        crate::init::repository_protocol_status(&read).await?,
-        crate::init::RepositoryProtocolStatus::Missing
-    ) {
-        return Ok(SyncOpenState::NeedsPreparation);
-    }
-    if let Some(account_id) = crate::sync::load_sync_replica_account(&read, remote_id).await? {
-        return Ok(SyncOpenState::Ready { account_id });
-    }
-    if crate::sync::has_any_sync_replica_state(&read).await? {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "an initialized sync replica cannot be rebound to a different remote",
-        ));
-    }
-    Ok(SyncOpenState::NeedsPreparation)
 }
 
 impl<StorageImpl> Lix<StorageImpl>
@@ -1514,98 +1503,6 @@ mod tests {
         assert_eq!(result, "hydrated");
         assert_eq!(attempts.load(Ordering::Relaxed), 4);
         responder.await.expect("demand responder should finish");
-    }
-
-    #[tokio::test]
-    async fn initialized_store_without_remote_replica_state_prepares_synchronously() {
-        let storage = Memory::new();
-        Engine::initialize_with_main_branch_id(storage.clone(), None)
-            .await
-            .expect("simulate initialization before a crashed first bootstrap");
-        assert_eq!(
-            load_sync_open_state(&storage, "https://sync.example/repository")
-                .await
-                .expect("preparation decision should load"),
-            SyncOpenState::NeedsPreparation,
-            "an initialized store without state for this remote must bind the account before open returns",
-        );
-    }
-
-    #[tokio::test]
-    async fn malformed_remote_replica_state_fails_closed() {
-        let storage = Memory::new();
-        Engine::initialize_with_main_branch_id(storage.clone(), None)
-            .await
-            .expect("initialize replica storage");
-        let remote_id = "https://sync.example/repository";
-        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
-        let mut writes = adapter.new_write_set();
-        writes.put(
-            crate::sync::SYNC_REPLICA_STATE_SPACE,
-            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(remote_id.as_bytes())),
-            serde_json::to_vec(&serde_json::json!({
-                "activeAccountId": crate::ANONYMOUS_ACCOUNT_ID
-            }))
-            .expect("malformed replica state should encode"),
-        );
-        adapter
-            .commit_write_set(
-                writes,
-                crate::storage_adapter::StorageWriteOptions::default(),
-            )
-            .await
-            .expect("malformed replica state should commit");
-
-        let error = load_sync_open_state(&storage, remote_id)
-            .await
-            .expect_err("malformed exact-remote state must not trigger a fresh bootstrap");
-        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
-        assert!(error.message.contains("decode sync replica state"));
-        assert!(error.message.contains("missing field `cursor`"));
-    }
-
-    #[tokio::test]
-    async fn initialized_replica_reopens_only_for_its_exact_remote() {
-        let storage = Memory::new();
-        Engine::initialize_with_main_branch_id(storage.clone(), None)
-            .await
-            .expect("initialize replica storage");
-        let remote_id = "https://sync.example/repository";
-        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
-        let mut writes = adapter.new_write_set();
-        writes.put(
-            crate::sync::SYNC_REPLICA_STATE_SPACE,
-            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(remote_id.as_bytes())),
-            serde_json::to_vec(&serde_json::json!({
-                "activeAccountId": crate::ANONYMOUS_ACCOUNT_ID,
-                "cursor": 0,
-                "authoritativeBranches": {},
-                "authorityKnownCommitIds": []
-            }))
-            .expect("replica state should encode"),
-        );
-        adapter
-            .commit_write_set(
-                writes,
-                crate::storage_adapter::StorageWriteOptions::default(),
-            )
-            .await
-            .expect("replica state should commit");
-
-        assert_eq!(
-            load_sync_open_state(&storage, remote_id)
-                .await
-                .expect("exact remote decision should load"),
-            SyncOpenState::Ready {
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
-            },
-            "a durable exact-remote replica must reopen without network preparation",
-        );
-        let error = load_sync_open_state(&storage, "https://sync.example/other-repository")
-            .await
-            .expect_err("an initialized replica cannot silently change authorities");
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(error.message.contains("different remote"));
     }
 
     #[tokio::test]

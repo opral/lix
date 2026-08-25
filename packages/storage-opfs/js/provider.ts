@@ -30,6 +30,10 @@ import {
 } from "./buffered-write.js";
 import { StorageChangeNotifier } from "./change-watch.js";
 import { restoreSynchronousModeBestEffort } from "./sqlite-cleanup.js";
+import {
+	configureSqliteOpfsDurability,
+	fenceSqliteOpfsDurability,
+} from "./sqlite-durability.js";
 
 type SqliteValue =
 	| string
@@ -64,7 +68,6 @@ const SQLITE_VFS_DIRECTORY = "/lix/sqlite-sahpool";
 // a handful of indexed joins.
 const READ_MANY_KEYS_PER_QUERY = 300;
 const SQLITE_SCHEMA = `
-PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA temp_store = MEMORY;
 PRAGMA auto_vacuum = INCREMENTAL;
@@ -112,6 +115,7 @@ export class OpfsBackend implements LixStorageProvider {
 			const sqlite3 = await initializeSqlite();
 			pool = await getPool(sqlite3, name);
 			database = new pool.OpfsSAHPoolDb("/repository.sqlite3");
+			configureSqliteOpfsDurability(database);
 			database.exec(SQLITE_SCHEMA);
 			return new OpfsBackend(database, pool, releaseLock);
 		} catch (error) {
@@ -129,10 +133,7 @@ export class OpfsBackend implements LixStorageProvider {
 	async beginRead(options: LixStorageReadOptions): Promise<LixStorageRead> {
 		this.#assertOpen();
 		if (options.durability === "durable") {
-			throw storageError(
-				"LIX_STORAGE_DURABILITY",
-				"SQLite OPFS storage does not support durable reads",
-			);
+			fenceSqliteOpfsDurability(this.#database);
 		}
 		return new OpfsRead(this, this.#generation);
 	}

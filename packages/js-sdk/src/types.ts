@@ -76,7 +76,7 @@ export type OpenLixOptions =
 			telemetry?: never;
 	  }
 	| {
-			storage?: import("./storage-adapter.js").LixStorage;
+			storage: import("./storage-adapter.js").LixStorage;
 			server: SyncLixServerOptions;
 			telemetry?: LixTelemetryOptions;
 	  };

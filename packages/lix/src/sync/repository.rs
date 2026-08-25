@@ -451,6 +451,20 @@ struct SyncReplicaState {
     authority_known_commit_ids: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum SyncReplicaBinding {
+    Unbound,
+    Exact { account_id: String },
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InitialSyncSnapshotInstall {
+    Installed,
+    ExistingExact,
+    ExistingOther,
+}
+
 /// The authority's complete coordinate for one known branch.
 ///
 /// Absence from `SyncReplicaState::authoritative_branches` means the branch has
@@ -568,6 +582,36 @@ pub(crate) async fn load_sync_replica_account(
         .await?
         .0
         .map(|state| state.active_account_id))
+}
+
+pub(super) async fn inspect_sync_replica_binding(
+    read: &(impl StorageAdapterRead + ?Sized),
+    remote_id: &str,
+) -> Result<SyncReplicaBinding, LixError> {
+    let exact = load_replica_state(read, remote_id).await?.0;
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
+    let mut cursor = read
+        .begin_scan(
+            SYNC_REPLICA_STATE_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    let keys = cursor.next_page(2).await?;
+    match (exact, keys.len()) {
+        (None, 0) => Ok(SyncReplicaBinding::Unbound),
+        (None, _) => Ok(SyncReplicaBinding::Other),
+        (Some(state), 1) => Ok(SyncReplicaBinding::Exact {
+            account_id: state.active_account_id,
+        }),
+        (Some(_), _) => Ok(SyncReplicaBinding::Other),
+    }
 }
 
 pub(crate) async fn has_any_sync_replica_state(
@@ -2424,7 +2468,7 @@ where
         }
     }
 
-    pub(crate) async fn apply_sync_repository_snapshot(
+    pub(crate) async fn try_install_initial_sync_snapshot(
         &self,
         remote_id: &str,
         active_account_id: &str,
@@ -2433,7 +2477,7 @@ where
         commit_headers: &[SyncCommitHeader],
         rows: &[SyncSnapshotRow],
         checkpoint_roots: &BTreeMap<String, String>,
-    ) -> Result<(), LixError> {
+    ) -> Result<InitialSyncSnapshotInstall, LixError> {
         let _collaboration_guard = self.lock_collaboration_writes().await;
         let SyncRepositoryPullResponse::Snapshot {
             cursor,
@@ -2447,7 +2491,7 @@ where
                 "sync repository snapshot installer requires snapshot metadata",
             ));
         };
-        let result = self.install_sync_snapshot(
+        self.install_sync_snapshot(
             remote_id,
             active_account_id,
             *cursor,
@@ -2458,22 +2502,7 @@ where
             commit_headers,
             rows,
             checkpoint_roots,
-        ).await;
-        let Err(error) = result else {
-            return Ok(());
-        };
-        if error.code == LixError::CODE_TRANSACTION_CONFLICT
-            && self.load_sync_repository_cursor(remote_id).await?.is_some()
-        {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_READ_EXPIRED,
-                "the sync bootstrap snapshot was invalidated by another opener",
-            )
-            .with_details(serde_json::json!({
-                "retryable": true,
-            })));
-        }
-        Err(error)
+        ).await
     }
 
     pub(crate) async fn align_sync_branch_checkpoint(
@@ -2572,7 +2601,7 @@ where
         commit_headers: &[SyncCommitHeader],
         rows: &[SyncSnapshotRow],
         checkpoint_roots: &BTreeMap<String, String>,
-    ) -> Result<(), LixError> {
+    ) -> Result<InitialSyncSnapshotInstall, LixError> {
         super::validate_sync_remote_id(remote_id)?;
         let mut parsed_heads = BTreeMap::new();
         for commit in head_commits {
@@ -2644,6 +2673,15 @@ where
         }
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        match inspect_sync_replica_binding(&read, remote_id).await? {
+            SyncReplicaBinding::Unbound => {}
+            SyncReplicaBinding::Exact { .. } => {
+                return Ok(InitialSyncSnapshotInstall::ExistingExact);
+            }
+            SyncReplicaBinding::Other => {
+                return Ok(InitialSyncSnapshotInstall::ExistingOther);
+            }
+        }
         let branch_ids = branches
             .iter()
             .map(|branch| branch.branch_id.clone())
@@ -3179,6 +3217,13 @@ where
             },
             None,
         )?;
+        preconditions.push(StoragePrecondition::RangeEmpty {
+            space: SYNC_REPLICA_STATE_SPACE,
+            range: StoragePrefix {
+                bytes: Bytes::new(),
+            }
+            .to_range()?,
+        });
         crate::json_store::stage_json_publication_fence(&read, &mut writes, &mut preconditions)
             .await?;
         drop(read);
@@ -3194,7 +3239,7 @@ where
             .await?;
         self.notify_observers_for_sync();
         self.sync_mode_state().notify_sync_change();
-        Ok(())
+        Ok(InitialSyncSnapshotInstall::Installed)
     }
 
     pub(crate) async fn push_sync_repository(
@@ -5288,7 +5333,7 @@ mod tests {
         MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage, StorageError,
         StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
-    use crate::storage_adapter::SharedStorageAdapterRead;
+    use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter};
     use crate::{
         CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, NullableKeyFilter, SwitchBranchOptions, Value,
         open_lix,
@@ -5818,7 +5863,7 @@ mod tests {
             .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         replica
-            .apply_sync_repository_snapshot(
+            .try_install_initial_sync_snapshot(
                 TEST_REMOTE,
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
@@ -6895,7 +6940,7 @@ mod tests {
             .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         replica
-            .apply_sync_repository_snapshot(
+            .try_install_initial_sync_snapshot(
                 TEST_REMOTE,
                 crate::ANONYMOUS_ACCOUNT_ID,
                 snapshot,
@@ -6910,11 +6955,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_bootstrap_loser_restarts_repository_open() {
+    async fn concurrent_initial_snapshots_cannot_publish_two_remote_bindings() {
         let authority = open_lix().await.expect("authority should open");
-        authority
-            .set_sync_role(super::super::SyncRole::Authority)
-            .expect("authority role should install");
         let snapshot = authority
             .pull_sync_repository(None, 1)
             .await
@@ -6925,25 +6967,24 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
-        let first_opener = open_lix()
+        let first = open_lix()
             .with_storage(storage.clone())
             .await
             .expect("first opener should open");
-        first_opener
-            .set_sync_role(super::super::SyncRole::Replica)
-            .expect("replica role should install");
-        let second_opener = open_lix()
+        let second = open_lix()
             .with_storage(storage.clone())
             .await
-            .expect("second opener should open the shared storage");
-        second_opener
-            .set_sync_role(super::super::SyncRole::Replica)
-            .expect("replica role should install");
+            .expect("second opener should open");
+        for opener in [&first, &second] {
+            opener
+                .set_sync_role(super::super::SyncRole::Replica)
+                .expect("replica role should install");
+        }
 
         storage.gate_bootstrap_commits(2);
-        let (first, second) = tokio::join!(
-            first_opener.apply_sync_repository_snapshot(
-                TEST_REMOTE,
+        let (first_result, second_result) = tokio::join!(
+            first.try_install_initial_sync_snapshot(
+                "https://sync.example/first",
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
                 &history.commits,
@@ -6951,8 +6992,8 @@ mod tests {
                 &rows,
                 &checkpoint_roots,
             ),
-            second_opener.apply_sync_repository_snapshot(
-                TEST_REMOTE,
+            second.try_install_initial_sync_snapshot(
+                "https://sync.example/second",
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
                 &history.commits,
@@ -6962,22 +7003,80 @@ mod tests {
             ),
         );
 
-        let mut successes = 0;
-        let mut loser = None;
-        for result in [first, second] {
-            match result {
-                Ok(()) => successes += 1,
-                Err(error) => loser = Some(error),
-            }
-        }
-        assert_eq!(successes, 1, "exactly one bootstrap should publish");
-        let error = loser.expect("the concurrent bootstrap loser should restart");
-        assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+        let results = [first_result, second_result];
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({
-                "retryable": true,
-            }))
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(InitialSyncSnapshotInstall::Installed)))
+                .count(),
+            1,
+            "exactly one remote may claim an unbound replica"
+        );
+        let loser = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .expect("the competing remote should lose atomically");
+        assert_eq!(loser.code, LixError::CODE_TRANSACTION_CONFLICT);
+
+        let serialized_loser = if matches!(
+            results[0],
+            Ok(InitialSyncSnapshotInstall::Installed)
+        ) {
+            second
+                .try_install_initial_sync_snapshot(
+                    "https://sync.example/second",
+                    crate::ANONYMOUS_ACCOUNT_ID,
+                    &snapshot,
+                    &history.commits,
+                    &history.commit_headers,
+                    &rows,
+                    &checkpoint_roots,
+                )
+                .await
+        } else {
+            first
+                .try_install_initial_sync_snapshot(
+                    "https://sync.example/first",
+                    crate::ANONYMOUS_ACCOUNT_ID,
+                    &snapshot,
+                    &history.commits,
+                    &history.commit_headers,
+                    &rows,
+                    &checkpoint_roots,
+                )
+                .await
+        }
+        .expect("the coherent binding scan should classify a later alias");
+        assert_eq!(
+            serialized_loser,
+            InitialSyncSnapshotInstall::ExistingOther
+        );
+
+        let adapter = StorageAdapter::new(storage);
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("published replica state should be readable");
+        let mut cursor = read
+            .begin_scan(
+                SYNC_REPLICA_STATE_SPACE,
+                StoragePrefix {
+                    bytes: Bytes::new(),
+                }
+                .to_range()
+                .expect("full replica-state range should be valid"),
+                StorageBeginScanOptions::default(),
+            )
+            .await
+            .expect("replica-state scan should open");
+        assert_eq!(
+            cursor
+                .next_page(2)
+                .await
+                .expect("replica-state scan should complete")
+                .len(),
+            1,
+            "the repository must have one binding owner"
         );
     }
 
@@ -7036,7 +7135,7 @@ mod tests {
             .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         replica
-            .apply_sync_repository_snapshot(
+            .try_install_initial_sync_snapshot(
                 TEST_REMOTE,
                 crate::ANONYMOUS_ACCOUNT_ID,
                 snapshot,
@@ -8689,7 +8788,7 @@ mod tests {
             .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         let error = replica
-            .apply_sync_repository_snapshot(
+            .try_install_initial_sync_snapshot(
                 TEST_REMOTE,
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
@@ -8740,7 +8839,7 @@ mod tests {
             .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         let error = replica
-            .apply_sync_repository_snapshot(
+            .try_install_initial_sync_snapshot(
                 TEST_REMOTE,
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
@@ -8787,7 +8886,7 @@ mod tests {
         let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
 
         let error = local
-            .apply_sync_repository_snapshot(
+            .try_install_initial_sync_snapshot(
                 TEST_REMOTE,
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
@@ -8857,7 +8956,7 @@ mod tests {
             .set_sync_role(super::super::SyncRole::Replica)
             .expect("replica role should install");
         let error = replica
-            .apply_sync_repository_snapshot(
+            .try_install_initial_sync_snapshot(
                 TEST_REMOTE,
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,

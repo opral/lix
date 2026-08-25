@@ -204,7 +204,7 @@ impl Replica {
         register_blob_manifests(&lix, &transport, &snapshot.commits, &snapshot.rows)
             .await
             .expect("simulation snapshot blob manifests should register");
-        lix.apply_sync_repository_snapshot(
+        lix.try_install_initial_sync_snapshot(
             REMOTE_ID,
             transport.active_account_id(),
             &snapshot.metadata,

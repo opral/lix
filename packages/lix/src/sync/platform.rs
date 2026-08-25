@@ -65,6 +65,7 @@ mod tests {
     fn shared_sync_modules_have_no_target_specific_policy() {
         for (name, source) in [
             ("blob.rs", include_str!("blob.rs")),
+            ("bootstrap.rs", include_str!("bootstrap.rs")),
             ("commit.rs", include_str!("commit.rs")),
             ("contract.rs", include_str!("contract.rs")),
             ("http.rs", include_str!("http.rs")),

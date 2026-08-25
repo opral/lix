@@ -8,6 +8,7 @@
 //! cancellation.
 
 mod blob;
+mod bootstrap;
 mod commit;
 mod contract;
 mod http;
@@ -28,6 +29,10 @@ use crate::LixError;
 pub(crate) use blob::validate_sync_blob_manifest;
 pub(crate) use commit::{
     SyncCommit, SyncCommitMemberRef, SyncCommitStateAlias, encode_sync_commit_member,
+};
+pub(crate) use bootstrap::{
+    SyncBootstrapAdmission, inspect_sync_bootstrap, install_sync_bootstrap,
+    prepare_sync_bootstrap,
 };
 pub(crate) use contract::SyncTransport;
 #[cfg(target_family = "wasm")]
@@ -50,13 +55,14 @@ pub(crate) use commit::{
 };
 pub(crate) use repository::{
     SYNC_REPLICA_STATE_SPACE, SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE,
-    has_any_sync_replica_state, load_pending_sync_export_commit_ids,
-    load_replayable_repository_event_commit_ids, load_sync_replica_account,
+    load_pending_sync_export_commit_ids, load_replayable_repository_event_commit_ids,
     stage_repository_transaction_event,
     validate_repository_transaction_event_transfer,
 };
+#[cfg(feature = "server-protocol")]
+pub(crate) use repository::has_any_sync_replica_state;
 pub(crate) use runtime::{
-    SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode, prepare_sync_mode,
+    SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode,
 };
 
 pub(crate) const MAX_SYNC_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;

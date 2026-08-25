@@ -10,7 +10,6 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { execFile } from "node:child_process";
-import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -64,56 +63,17 @@ test("filesystem storage is owned by its adapter package", async () => {
 	expect("LocalFilesystem" in sdk).toBe(false);
 });
 
-test("sync mode forwards static headers through the native transport", async () => {
-	let sawStaticAuthorization = false;
-	const server = createServer((request, response) => {
-		sawStaticAuthorization ||= request.headers.authorization === "Bearer static-native";
-		response.setHeader("content-type", "application/json");
-		if (request.url?.endsWith("/lix/v1")) {
-			response.end(
-				JSON.stringify({
-					sessionId: "js-sync-test-session",
-					activeAccountId: "00000000-0000-7000-8000-000000000002",
-				}),
-			);
-			return;
-		}
-		if (request.url?.includes("/sync/pull")) {
-			response.statusCode = 503;
-			response.end(
-				JSON.stringify({
-					error: {
-						code: "LIX_TEST_STOP",
-						message: "stop after observing native sync headers",
-					},
-				}),
-			);
-			return;
-		}
-		response.statusCode = 404;
-		response.end(JSON.stringify({ error: { code: "NOT_FOUND", message: "not found" } }));
-	});
-	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-	const address = server.address();
-	if (!address || typeof address === "string") {
-		server.close();
-		throw new Error("sync test server did not expose a TCP address");
-	}
-
+test("sync mode requires an explicit durability-capable storage adapter", async () => {
 	await expect(
+		// @ts-expect-error Sync deliberately has no implicit volatile Memory fallback.
 		openLix({
 			server: {
 				mode: "sync",
-				url: `http://127.0.0.1:${address.port}/repository`,
-				headers: { Authorization: "Bearer static-native" },
+				url: "https://sync.example/repository",
 			},
 		}),
-	).rejects.toThrow(/stop after observing native sync headers/u);
-	expect(sawStaticAuthorization).toBe(true);
-	await new Promise<void>((resolve, reject) =>
-		server.close((error) => (error ? reject(error) : resolve())),
-	);
-}, 30_000);
+	).rejects.toThrow(/requires a durability-capable storage adapter/u);
+});
 
 test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 	let activeParent = {
