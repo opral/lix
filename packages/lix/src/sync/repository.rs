@@ -2447,8 +2447,7 @@ where
                 "sync repository snapshot installer requires snapshot metadata",
             ));
         };
-        let result = self
-            .install_sync_snapshot(
+        let result = self.install_sync_snapshot(
             remote_id,
             active_account_id,
             *cursor,
@@ -2459,8 +2458,7 @@ where
             commit_headers,
             rows,
             checkpoint_roots,
-        )
-            .await;
+        ).await;
         let Err(error) = result else {
             return Ok(());
         };
