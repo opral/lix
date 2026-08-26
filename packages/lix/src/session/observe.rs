@@ -414,6 +414,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_base_execute_retries_an_expired_refresh_read() {
+        // The lazy base refresh reads outside the execute read loop's retry
+        // protection; a concurrent commit expiring its coherent read must be
+        // retried, not surfaced from a one-shot execute.
+        let expire_reads = Arc::new(AtomicU64::new(0));
+        let storage = ExpiringStorage {
+            inner: Memory::new(),
+            expire_reads: Arc::clone(&expire_reads),
+        };
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("initialize storage");
+        let engine = Engine::new(storage).await.expect("open engine");
+        let session = engine
+            .open_session_at(&receipt.main_branch_id)
+            .await
+            .expect("open pinned main session");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('observed', 'yes')",
+                &[],
+            )
+            .await
+            .expect("insert commits");
+        // The insert left the base stale; expire the refresh's next read.
+        expire_reads.store(1, Ordering::SeqCst);
+        let rows = session
+            .execute("SELECT value FROM lix_key_value WHERE key = 'observed'", &[])
+            .await
+            .expect("a transient expired refresh read must not fail the execute");
+        assert_eq!(rows.rows().len(), 1);
+    }
+
+    #[tokio::test]
     async fn transient_expired_read_reevaluates_instead_of_erroring_the_stream() {
         let expire_reads = Arc::new(AtomicU64::new(0));
         let storage = ExpiringStorage {
