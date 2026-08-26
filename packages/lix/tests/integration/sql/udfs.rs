@@ -12,7 +12,7 @@ simulation_test!(
                 .expect("main session should open"),
             &engine,
         );
-        let expected_root = sim.initial_commit_id().to_string();
+        let expected_root = sim.initial_global_commit_id().to_string();
 
         for value in ["one", "two", "three"] {
             session

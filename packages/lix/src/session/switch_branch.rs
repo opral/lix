@@ -29,9 +29,10 @@ where
     ) -> Result<SwitchBranchReceipt, LixError> {
         let branch_id = options.branch_id;
         // Keep the existing session/collaboration lease so branch deletion
-        // cannot race target validation. Switching is session-local and does
-        // not create a repository commit.
-        let _write_access = self.begin_session_write_access().await?;
+        // cannot race target validation. A switch is normally session-local;
+        // when the selected local branch pins an older global head, the lazy
+        // auto-rebase below also publishes one metadata-only commit.
+        let write_access = self.begin_session_write_access().await?;
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
@@ -48,6 +49,13 @@ where
         self.ensure_open()?;
         self.branch.set(branch_id.clone())?;
         self.observe_invalidation.bump();
+        drop(reader);
+        drop(read);
+        drop(write_access);
+        // Refresh at the explicit checkout boundary. This keeps observers and
+        // other read helpers from discovering that they need an internal write
+        // while already evaluating a stable snapshot.
+        self.refresh_active_branch_base_if_stale().await?;
 
         Ok(SwitchBranchReceipt { branch_id })
     }
@@ -182,7 +190,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_switch_reads_only_the_authoritative_target_control() {
+    async fn switching_a_stale_branch_publishes_one_bounded_base_refresh() {
         let storage = CountingStorage::new();
         let receipt = Engine::initialize(storage.clone())
             .await
@@ -213,16 +221,13 @@ mod tests {
         let delta = storage.snapshot().delta_since(before);
 
         assert_eq!(switched.branch_id, branch.id);
-        assert_eq!(
-            delta,
-            CounterSnapshot {
-                begin_reads: 1,
-                begin_writes: 0,
-                get_many_calls: 1,
-                get_many_keys: 1,
-                scan_calls: 0,
-            },
-            "pinned switching must read only the target branch-head control"
+        assert_eq!(delta.begin_writes, 1, "stale checkout needs one commit");
+        assert!(
+            delta.begin_reads <= 4
+                && delta.get_many_calls <= 80
+                && delta.get_many_keys <= 96
+                && delta.scan_calls <= 20,
+            "metadata-only auto-rebase must remain bounded, saw {delta:?}"
         );
     }
 }

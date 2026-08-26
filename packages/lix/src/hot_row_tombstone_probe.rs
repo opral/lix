@@ -2728,11 +2728,12 @@ async fn clean_pre_image_delete_still_publishes_a_tombstone() {
     );
 }
 
-/// INVERSION 2 — the rule must refuse when the generation has a base.
+/// INVERSION 2 — a forked local overlay can elide an interval-local no-op.
 ///
-/// Gate (a) is shared with checkpoint compaction and is what keeps a tombstone
-/// that is shadowing a base row. A branch forked from a published head serves
-/// through a root current base, so its generation has one.
+/// Composite commits no longer encode global inheritance as a HOT generation
+/// base. Rows inserted and deleted entirely after the local checkpoint are
+/// absent from both the local overlay and pinned global base, so retaining a
+/// tombstone would be redundant even though the branch has a commit base.
 #[tokio::test]
 async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
     const N: usize = 50;
@@ -2758,15 +2759,6 @@ async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
         .await
         .expect("branch should switch");
 
-    let census = row_census(&storage).await;
-    // Engagement precondition: without a base this arm proves nothing.
-    assert!(
-        census.packed_bases > 0 || census.root_bases > 0,
-        "this inversion needs a base in the generation, saw packed={} root={}",
-        census.packed_bases,
-        census.root_bases
-    );
-
     let before = elision_counters();
     insert_rows_named(&session, "p13base", "ephem", N).await;
     delete_rows_named(&session, "p13base", "ephem", N).await;
@@ -2779,16 +2771,16 @@ async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
 
     // Engagement in the `>=` direction only - safe under counter bleed,
     // because a concurrent test can only inflate it. It establishes that this
-    // route runs at all; what establishes that gate (a) *refused for these
-    // rows* is the fixture-local tombstone count below.
+    // fixture exercised the elision route; the local footprint below proves
+    // that a logical commit base is not mistaken for a physical HOT base.
     assert!(
         counters.candidates >= N as u64,
         "the deltas must reach the route, or the refusal below is vacuous, saw {}",
         counters.candidates
     );
     assert_eq!(
-        census.tombstones, N,
-        "gate (a) must keep every tombstone while a base is visible"
+        census.tombstones, 0,
+        "a pinned commit base must not block interval-local no-op elision"
     );
 
     let session = reopen_session(&storage).await;

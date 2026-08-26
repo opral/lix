@@ -41,10 +41,9 @@ use crate::tracked_state::{
     stage_ordered_addressable_commit_deltas,
 };
 use crate::transaction::context::PendingRestoreIntent;
-#[cfg(test)]
-use crate::transaction::staged_commit_changes::StagedCommitChangeBatchBuilder;
 use crate::transaction::staged_commit_changes::{
-    StagedCommitChangeBatch, StagedCommitChangeRef, StagedCommitChangeRefs,
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, StagedCommitChangeRef,
+    StagedCommitChangeRefs,
 };
 use crate::transaction::staging::{
     OrderedMutationJournal, PreparedInsertSelection, PreparedWriteSet,
@@ -363,7 +362,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     ))
     .await?;
     let commit_rows = finalized.commit_rows;
-    let tracked_roots = finalized.tracked_roots;
+    let mut tracked_roots = finalized.tracked_roots;
+    assign_local_overlay_parents(&*read, &commit_rows, &mut tracked_roots).await?;
     // v69 certified batches are already native packet pages and do not need
     // expansion through an intermediate JSON-root representation.
     let certified_packet_root_rows = BTreeMap::<CommitId, Vec<MaterializedHotStateRow>>::new();
@@ -1236,6 +1236,7 @@ async fn stage_changelog_commits(
                 commit_id,
                 generation,
                 parent_commit_ids: commit.parent_commit_ids.clone(),
+                base_commit_id: commit.base_commit_id,
                 first_parent_jump_commit_id: first_parent_jump.0,
                 first_parent_jump_span: first_parent_jump.1,
                 account_id: active_account_id.to_string(),
@@ -1305,6 +1306,7 @@ async fn stage_changelog_commits(
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
+            base_commit_id: commit_row.base_commit_id,
             first_parent_jump_commit_id: first_parent_jumps[&commit_row.commit_id].0,
             first_parent_jump_span: first_parent_jumps[&commit_row.commit_id].1,
             account_id: active_account_id.to_string(),
@@ -2468,6 +2470,7 @@ fn materialize_staged_sync_commits(
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            base_commit_id: staged.record.base_commit_id.map(|id| id.to_string()),
             account_id: staged.record.account_id.clone(),
             created_at: staged.record.created_at.to_string(),
             global_scope: global_commit_ids.contains(commit_id),
@@ -2628,7 +2631,7 @@ async fn certify_complete_replacement_generations(
             )
         );
         let ordered_identity_digest = replacement_proof.ordered_identity_digest;
-        let mut current = root.parent_commit_id;
+        let mut current = root.state_parent_commit_id;
         let mut seen = BTreeSet::new();
         let mut lifecycle_summary = None;
         let fallback_commit_id = loop {
@@ -2754,7 +2757,7 @@ async fn certify_ordered_journal_replacement_generations(
             file_id: None,
         };
         let proof = journal.replacement_proof();
-        let mut current = root.parent_commit_id;
+        let mut current = root.state_parent_commit_id;
         let mut seen = BTreeSet::new();
         let mut lifecycle_summary = journal
             .overlay_lifecycle_certificate()
@@ -3152,7 +3155,7 @@ async fn build_lifecycle_tracked_snapshots(
         if !required.contains(&root.commit_id) {
             continue;
         }
-        let mut rows = match root.parent_commit_id {
+        let mut rows = match root.state_parent_commit_id {
             None => BTreeMap::new(),
             Some(parent_commit_id) if snapshots.contains_key(&parent_commit_id) => snapshots
                 .get(&parent_commit_id)
@@ -3263,6 +3266,41 @@ async fn load_persisted_lifecycle_tracked_snapshot(
             (key, row)
         })
         .collect())
+}
+
+async fn load_local_overlay_with_inherited_catalog(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    commit_id: CommitId,
+) -> Result<BTreeMap<TrackedStateKey, MaterializedTrackedStateRow>, LixError> {
+    let mut rows = load_persisted_lifecycle_tracked_snapshot(read, branch_id, commit_id).await?;
+    if branch_id == crate::GLOBAL_BRANCH_ID {
+        return Ok(rows);
+    }
+    let node = crate::commit_graph::CommitGraphContext::new()
+        .reader(read)
+        .load_node(&commit_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_COMMIT_NOT_FOUND,
+                format!("lifecycle target '{commit_id}' does not exist"),
+            )
+        })?;
+    if let Some(base_commit_id) = node.base_commit_id {
+        for (key, row) in load_persisted_lifecycle_tracked_snapshot(
+            read,
+            crate::GLOBAL_BRANCH_ID,
+            base_commit_id,
+        )
+        .await?
+        {
+            if row.schema_key == "lix_registered_schema" {
+                rows.entry(key).or_insert(row);
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn lifecycle_selected_tracked_row(
@@ -3674,6 +3712,140 @@ async fn stage_tracked_head(
         let certified_columnar_parts = mutation_inventories
             .get(&root.commit_id)
             .and_then(|inventory| inventory.columnar_parts.as_ref());
+
+        // A lazy composite-base refresh has no logical row delta, but it must
+        // replace the branch's old complete HOT generation with the durable
+        // local overlay. The mutable global plane then supplies exactly the
+        // newly pinned base without stale inherited rows shadowing it.
+        let parent_base_commit_id = if root.branch_id != crate::GLOBAL_BRANCH_ID
+            && state_row_indices.is_empty()
+            && staged.selected_change_batches.is_empty()
+            && !is_checkpoint_publication
+        {
+            if let Some(parent_commit_id) = root.parent_commit_id {
+                crate::commit_graph::CommitGraphContext::new()
+                    .reader(read)
+                    .load_node(&parent_commit_id)
+                    .await?
+                    .map(|node| node.base_commit_id)
+            } else {
+                Some(None)
+            }
+        } else {
+            None
+        };
+        let is_base_refresh = parent_base_commit_id
+            .is_some_and(|parent_base| parent_base != staged.record.base_commit_id);
+        if is_base_refresh {
+            let parent_control = parent_control.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "base refresh has no previous branch control",
+                )
+            })?;
+            let mut local_overlay = match root.state_parent_commit_id {
+                None => BTreeMap::new(),
+                Some(parent_commit_id) => {
+                    load_persisted_lifecycle_tracked_snapshot(
+                        read,
+                        &root.branch_id,
+                        parent_commit_id,
+                    )
+                    .await?
+                }
+            };
+            if let Some(base_commit_id) = staged.record.base_commit_id {
+                let inherited_catalog = load_persisted_lifecycle_tracked_snapshot(
+                    read,
+                    crate::GLOBAL_BRANCH_ID,
+                    base_commit_id,
+                )
+                .await?;
+                for (key, row) in inherited_catalog {
+                    if row.schema_key == "lix_registered_schema" {
+                        local_overlay.entry(key).or_insert(row);
+                    }
+                }
+            }
+            let serving_catalog = local_overlay
+                .iter()
+                .filter(|(_, row)| row.schema_key == "lix_registered_schema")
+                .map(|(key, row)| (key.clone(), row.clone()))
+                .collect::<Vec<_>>();
+            let checkpoint_commit_id = parent_control
+                .working_diff_checkpoint_commit_id
+                .unwrap_or(root.parent_commit_id.expect("refresh has a parent"));
+            let checkpoint_node = crate::commit_graph::CommitGraphContext::new()
+                .reader(read)
+                .load_node(&checkpoint_commit_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_COMMIT_NOT_FOUND,
+                        format!("base refresh checkpoint '{checkpoint_commit_id}' is missing"),
+                    )
+                })?;
+            let mut checkpoint_overlay = if checkpoint_node.base_commit_id.is_none() {
+                BTreeMap::new()
+            } else {
+                load_persisted_lifecycle_tracked_snapshot(
+                    read,
+                    &root.branch_id,
+                    checkpoint_commit_id,
+                )
+                .await?
+            };
+            // Registered-schema rows in a local HOT generation are a serving
+            // cache, not local working changes. Compare both sides against the
+            // newly pinned catalog so a global schema refresh stays clean.
+            for (key, row) in serving_catalog {
+                checkpoint_overlay.insert(key, row);
+            }
+            let generation = lifecycle_generation(
+                &root.branch_id,
+                root.commit_id,
+                root.ref_change_id,
+            );
+            let mut coverage = WorkingDiffIndexCoverage::default();
+            tracked_head
+                .writer(read, writes)
+                .stage_complete_current_state_with_working_diff(
+                    &root.branch_id,
+                    generation,
+                    HotTrackedSnapshot::from_materialized_rows(
+                        local_overlay.into_values().collect(),
+                    )?,
+                    Some(parent_control.tracked_generation),
+                    &[],
+                    &[],
+                    &BTreeSet::new(),
+                    CompleteWorkingDiffMode::Rebase {
+                        checkpoint_commit_id,
+                        checkpoint: HotTrackedSnapshot::from_materialized_rows(
+                            checkpoint_overlay.into_values().collect(),
+                        )?,
+                    },
+                    &mut coverage,
+                )
+                .await?;
+            stage_tracked_working_diff_epoch(
+                writes,
+                &root.branch_id,
+                TrackedWorkingDiffEpoch {
+                    checkpoint_commit_id,
+                    generation,
+                    coverage,
+                },
+            )?;
+            let control = normal_branch_head_control(
+                root,
+                Some(parent_control),
+                generation,
+                Some(checkpoint_commit_id),
+            )?;
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+            continue;
+        }
 
         // A checkpoint changes the authenticated epoch/control, not current
         // row values. Take the O(deletes) route before constructing ordinary
@@ -5234,7 +5406,7 @@ async fn stage_root_backed_branch_publication(
                     )
                 })?;
                 let target_rows =
-                    load_persisted_lifecycle_tracked_snapshot(read, branch_id, head_commit_id)
+                    load_local_overlay_with_inherited_catalog(read, branch_id, head_commit_id)
                         .await?
                         .into_values()
                         .collect();
@@ -5272,9 +5444,9 @@ async fn stage_root_backed_branch_publication(
                 // later ordinary write cannot observe a cursor bound to the
                 // retired generation.
                 let current =
-                    load_persisted_lifecycle_tracked_snapshot(read, branch_id, head_commit_id)
+                    load_local_overlay_with_inherited_catalog(read, branch_id, head_commit_id)
                         .await?;
-                let checkpoint = load_persisted_lifecycle_tracked_snapshot(
+                let checkpoint = load_local_overlay_with_inherited_catalog(
                     read,
                     branch_id,
                     checkpoint_commit_id,
@@ -5313,11 +5485,47 @@ async fn stage_root_backed_branch_publication(
                     },
                 )?;
             } else {
-                tracked_head.writer(read, writes).stage_root_current_base(
-                    branch_id,
-                    generation,
-                    head_commit_id,
-                );
+                let node = crate::commit_graph::CommitGraphContext::new()
+                    .reader(read)
+                    .load_node(&head_commit_id)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_COMMIT_NOT_FOUND,
+                            format!("branch target '{head_commit_id}' does not exist"),
+                        )
+                    })?;
+                if branch_id != crate::GLOBAL_BRANCH_ID && node.base_commit_id.is_some() {
+                    let current = load_local_overlay_with_inherited_catalog(
+                        read,
+                        branch_id,
+                        head_commit_id,
+                    )
+                    .await?;
+                    let mut coverage = WorkingDiffIndexCoverage::default();
+                    tracked_head
+                        .writer(read, writes)
+                        .stage_complete_current_state_with_working_diff(
+                            branch_id,
+                            generation,
+                            HotTrackedSnapshot::from_materialized_rows(
+                                current.into_values().collect(),
+                            )?,
+                            None,
+                            &[],
+                            &[],
+                            &BTreeSet::new(),
+                            CompleteWorkingDiffMode::ResetClean,
+                            &mut coverage,
+                        )
+                        .await?;
+                } else {
+                    tracked_head.writer(read, writes).stage_root_current_base(
+                        branch_id,
+                        generation,
+                        head_commit_id,
+                    );
+                }
             }
             generation
         }
@@ -6071,6 +6279,10 @@ async fn stage_tracked_roots(
                 continue;
             }
         }
+        let state_row_indices = tracked_row_indices_by_commit
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if let Some(journal) = ordered_replacements.get(&root.commit_id) {
             let assignment = ordered_replacement_assignments
                 .get(&root.commit_id)
@@ -6098,7 +6310,7 @@ async fn stage_tracked_roots(
                 row_pk: first_row.row_pk,
             });
             let commit_id_text = root.commit_id.to_string();
-            let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
+            let parent_commit_id_text = root.state_parent_commit_id.map(|id| id.to_string());
             if tracked_writer
                 .try_stage_bulk_parent_root_from_ordered_mutations(
                     &commit_id_text,
@@ -6126,10 +6338,6 @@ async fn stage_tracked_roots(
                 .await?;
             continue;
         }
-        let state_row_indices = tracked_row_indices_by_commit
-            .get(&root.commit_id)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
         let replacement_markers = certified_replacement_markers_by_commit
             .get(&root.commit_id)
             .unwrap_or(&no_replacement_markers);
@@ -6154,7 +6362,7 @@ async fn stage_tracked_roots(
             && tracked_state_rows_are_strictly_sorted(state_rows, state_row_indices)
         {
             let commit_id_text = root.commit_id.to_string();
-            let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
+            let parent_commit_id_text = root.state_parent_commit_id.map(|id| id.to_string());
             let file_delete_cascades = state_row_indices
                 .iter()
                 .filter_map(|&row_index| {
@@ -6228,7 +6436,7 @@ async fn stage_tracked_roots(
         // lix_commit rows from the commit graph. Keeping them out of this tree
         // also preserves the one-mutation path for ordinary singleton writes.
         let commit_id_text = root.commit_id.to_string();
-        let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
+        let parent_commit_id_text = root.state_parent_commit_id.map(|id| id.to_string());
         tracked_writer
             .stage_commit_root_with_absence_guards(
                 &commit_id_text,
@@ -6794,6 +7002,7 @@ struct FinalizedCommitRows {
 struct FinalizedCommitRow {
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
+    base_commit_id: Option<CommitId>,
     created_at: LixTimestamp,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
     global_scope: bool,
@@ -6802,7 +7011,12 @@ struct FinalizedCommitRow {
 struct PendingTrackedRoot {
     branch_id: String,
     commit_id: CommitId,
+    /// Causal first parent in the public commit DAG.
     parent_commit_id: Option<CommitId>,
+    /// Parent of the immutable physical state root. A local overlay never
+    /// inherits a global root, even when that global commit is its causal
+    /// parent; the global state is composed separately through base_commit_id.
+    state_parent_commit_id: Option<CommitId>,
     /// Metadata for the public synthesized `lix_branch_ref` row.
     ref_change_id: ChangeId,
     ref_updated_at: LixTimestamp,
@@ -6818,6 +7032,18 @@ async fn finalize_commit_rows(
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
     let mut tracked_roots = Vec::new();
+    let staged_global_commit_id = commit_change_refs_by_branch
+        .get(crate::GLOBAL_BRANCH_ID)
+        .filter(|refs| !refs.is_empty() || refs.allow_empty)
+        .map(|refs| refs.commit_id);
+    let current_global_commit_id = commit_parent_heads
+        .get(crate::GLOBAL_BRANCH_ID)
+        .copied()
+        .flatten();
+    // The local root is an immutable overlay. Closing it over a staged global
+    // root is therefore metadata-only and safe: no staged global payload must
+    // be selected into the local delta.
+    let local_base_commit_id = staged_global_commit_id.or(current_global_commit_id);
 
     for intermediate in intermediate_commits {
         let change_refs = intermediate.change_refs;
@@ -6828,6 +7054,9 @@ async fn finalize_commit_rows(
         commit_rows.push(FinalizedCommitRow {
             commit_id,
             parent_commit_ids: vec![intermediate.parent_commit_id],
+            base_commit_id: (intermediate.branch_id != crate::GLOBAL_BRANCH_ID)
+                .then_some(local_base_commit_id)
+                .flatten(),
             created_at,
             selected_change_batches,
             global_scope: intermediate.branch_id == crate::GLOBAL_BRANCH_ID,
@@ -6836,6 +7065,7 @@ async fn finalize_commit_rows(
             branch_id: intermediate.branch_id,
             commit_id,
             parent_commit_id: Some(intermediate.parent_commit_id),
+            state_parent_commit_id: Some(intermediate.parent_commit_id),
             ref_change_id: branch_ref_change_id,
             ref_updated_at: created_at,
             publish_head: false,
@@ -6879,6 +7109,9 @@ async fn finalize_commit_rows(
         commit_rows.push(FinalizedCommitRow {
             commit_id,
             parent_commit_ids: parent_commit_ids.clone(),
+            base_commit_id: (branch_id != crate::GLOBAL_BRANCH_ID)
+                .then_some(local_base_commit_id)
+                .flatten(),
             created_at: timestamp,
             selected_change_batches,
             global_scope: branch_id == crate::GLOBAL_BRANCH_ID,
@@ -6887,6 +7120,7 @@ async fn finalize_commit_rows(
             branch_id,
             commit_id,
             parent_commit_id,
+            state_parent_commit_id: parent_commit_id,
             ref_change_id: branch_ref_change_id,
             ref_updated_at: timestamp,
             publish_head: true,
@@ -6897,6 +7131,66 @@ async fn finalize_commit_rows(
         commit_rows,
         tracked_roots,
     })
+}
+
+/// Separates causal topology from physical state inheritance. Branches may be
+/// created or fast-forwarded directly to a global commit, but their first
+/// authored local root must begin as an empty overlay rather than copying that
+/// global snapshot into local authority.
+async fn assign_local_overlay_parents(
+    read: &(impl StorageAdapterRead + ?Sized),
+    commit_rows: &[FinalizedCommitRow],
+    tracked_roots: &mut [PendingTrackedRoot],
+) -> Result<(), LixError> {
+    let staged_scope = commit_rows
+        .iter()
+        .map(|row| (row.commit_id, row.global_scope))
+        .collect::<BTreeMap<_, _>>();
+    let external_parents = tracked_roots
+        .iter()
+        .filter_map(|root| root.parent_commit_id)
+        .filter(|parent| !staged_scope.contains_key(parent))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let external_nodes = if external_parents.is_empty() {
+        BTreeMap::new()
+    } else {
+        crate::commit_graph::CommitGraphContext::new()
+            .reader(read)
+            .load_nodes(&external_parents)
+            .await?
+            .into_iter()
+            .map(|(id, node)| (*id, node))
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    for root in tracked_roots {
+        if root.branch_id == crate::GLOBAL_BRANCH_ID {
+            continue;
+        }
+        let Some(parent) = root.parent_commit_id else {
+            root.state_parent_commit_id = None;
+            continue;
+        };
+        let parent_is_global = staged_scope.get(&parent).copied().or_else(|| {
+            external_nodes
+                .get(&parent)
+                .and_then(Option::as_ref)
+                .map(|node| node.base_commit_id.is_none())
+        });
+        match parent_is_global {
+            Some(true) => root.state_parent_commit_id = None,
+            Some(false) => root.state_parent_commit_id = Some(parent),
+            None => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("cannot resolve physical state parent '{parent}'"),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolves every branch touched by a prepared commit from the same coherent
@@ -6944,6 +7238,12 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
         )
         .collect::<BTreeSet<_>>();
     required_branch_ids.extend(commit_parent_branch_ids.iter().copied());
+    if commit_parent_branch_ids
+        .iter()
+        .any(|branch_id| *branch_id != crate::GLOBAL_BRANCH_ID)
+    {
+        required_branch_ids.insert(crate::GLOBAL_BRANCH_ID);
+    }
 
     let branch_ref = branch_ctx.ref_reader(read);
     let mut parent_heads = BTreeMap::new();
@@ -6959,7 +7259,9 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
                 "target",
             ));
         }
-        if commit_parent_branch_ids.contains(&branch_id) {
+        if commit_parent_branch_ids.contains(&branch_id)
+            || branch_id == crate::GLOBAL_BRANCH_ID
+        {
             parent_heads.insert(branch_id.to_string(), head);
         }
     }
@@ -7299,8 +7601,12 @@ mod tests {
     #[tokio::test]
     async fn branch_creation_owner_publishes_checkpoint_serving_context() {
         let storage = StorageAdapter::new(Memory::new());
+        let receipt = crate::init::initialize(storage.clone(), &TrackedStateContext::new())
+            .await
+            .expect("fixture repository should initialize");
         let branch_id = "01960000-0000-7000-8000-0000000000b1";
-        let recovered_head = commit_id("branch-bridge-recovered-head");
+        let recovered_head = CommitId::parse_lix(&receipt.initial_commit_id, "fixture main head")
+            .expect("fixture main head parses");
         let checkpoint = commit_id("branch-bridge-checkpoint");
         let target = ExplicitBranchHeadTarget {
             head_commit_id: Some(recovered_head),
@@ -8310,7 +8616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_branch_ref_may_target_commit_staged_by_same_transaction() {
+    async fn local_branch_ref_rejects_a_base_less_commit_staged_by_same_transaction() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -8339,32 +8645,10 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("same-write branch-ref read should open");
-        let (writes, preconditions) =
-            commit_prepared_writes(&binary_cas, &branch_ctx, None, &mut read, prepared)
-                .await
-                .expect("branch ref may target a commit staged by the same transaction");
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    ..StorageWriteOptions::default()
-                },
-            )
+        let error = commit_prepared_writes(&binary_cas, &branch_ctx, None, &mut read, prepared)
             .await
-            .expect("same-write branch ref should commit");
-
-        let head = branch_ctx
-            .ref_reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("same-write branch-ref verification read should open"),
-            )
-            .load_head_commit_id(target_branch)
-            .await
-            .expect("same-write branch head should load");
-        assert_eq!(head, Some(commit_id(target_commit)));
+            .expect_err("a local branch cannot point directly at a base-less global commit");
+        assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
     }
 
     #[tokio::test]
@@ -9439,8 +9723,8 @@ mod tests {
 
         assert_eq!(
             counts.branch_control_get_many_calls.load(Ordering::Relaxed),
-            3,
-            "serial tracked-head staging reads the local control for parent/publication plus the global account fence"
+            4,
+            "serial local staging reads parent/publication controls plus the pinned global base/account fences"
         );
         assert_eq!(
             counts.v10_marker_get_many_calls.load(Ordering::Relaxed),
@@ -9874,6 +10158,7 @@ mod tests {
             FinalizedCommitRow {
                 commit_id: CommitId::for_test_label("child-commit"),
                 parent_commit_ids: vec![CommitId::for_test_label("parent-commit")],
+                base_commit_id: None,
                 created_at: ts("2026-01-01T00:00:01Z"),
                 selected_change_batches: Vec::new(),
                 global_scope: false,
@@ -9881,6 +10166,7 @@ mod tests {
             FinalizedCommitRow {
                 commit_id: CommitId::for_test_label("parent-commit"),
                 parent_commit_ids: Vec::new(),
+                base_commit_id: None,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 selected_change_batches: Vec::new(),
                 global_scope: false,
@@ -10018,6 +10304,7 @@ mod tests {
                     .checked_sub(1)
                     .map(|parent| vec![commit_ids[parent]])
                     .unwrap_or_default(),
+                base_commit_id: None,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 selected_change_batches: Vec::new(),
                 global_scope: false,
@@ -10944,6 +11231,7 @@ mod tests {
                         let commit_id = commit_id(&format!("missing-fallback-owner-{index}"));
 						CommitRecord {
 							format_version: COMMIT_RECORD_FORMAT_VERSION,
+							base_commit_id: None,
                             commit_id,
                             generation: 0,
                             parent_commit_ids: Vec::new(),
@@ -10985,6 +11273,7 @@ mod tests {
         let commit_rows = [FinalizedCommitRow {
             commit_id: commit_id("fallback-checkpoint"),
             parent_commit_ids: Vec::new(),
+            base_commit_id: None,
             created_at: timestamp,
             selected_change_batches: (0..CHANGE_COUNT)
                 .map(|index| {

@@ -1015,7 +1015,10 @@ where
                 ));
             }
             for boundary in response.boundaries {
-                if !returned.contains(&boundary.commit_id) {
+                let is_external_base = response_commits.iter().any(|commit| {
+                    commit.base_commit_id.as_deref() == Some(boundary.commit_id.as_str())
+                });
+                if !returned.contains(&boundary.commit_id) && !is_external_base {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PARAM,
                         format!(
@@ -1735,6 +1738,9 @@ mod tests {
             commit_id: crate::changelog::CommitId::for_test_label("runtime-inline-commit")
                 .to_string(),
             parent_commit_ids: Vec::new(),
+            base_commit_id: Some(
+                crate::changelog::CommitId::for_test_label("runtime-inline-base").to_string(),
+            ),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             global_scope: false,

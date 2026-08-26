@@ -347,6 +347,7 @@ fn sync_header_from_record(record: &CommitRecord, global_scope: bool) -> SyncCom
             .iter()
             .map(ToString::to_string)
             .collect(),
+        base_commit_id: record.base_commit_id.map(|id| id.to_string()),
         account_id: record.account_id.clone(),
         created_at: record.created_at.to_string(),
         global_scope,
@@ -973,6 +974,32 @@ fn snapshot_rows_hot_snapshot<'a>(
     )
 }
 
+fn snapshot_rows_with_inherited_catalog<'a>(
+    branch_id: &str,
+    all_rows: &'a [ParsedSnapshotRow],
+    local_rows: &[&'a ParsedSnapshotRow],
+) -> BTreeMap<(String, Option<String>, RowPk), &'a ParsedSnapshotRow> {
+    let mut rows = BTreeMap::new();
+    if branch_id != crate::GLOBAL_BRANCH_ID {
+        for row in all_rows.iter().filter(|row| {
+            row.branch_id == crate::GLOBAL_BRANCH_ID
+                && row.schema_key == "lix_registered_schema"
+        }) {
+            rows.insert(
+                (row.schema_key.clone(), row.file_id.clone(), row.row_pk.clone()),
+                row,
+            );
+        }
+    }
+    for &row in local_rows {
+        rows.insert(
+            (row.schema_key.clone(), row.file_id.clone(), row.row_pk.clone()),
+            row,
+        );
+    }
+    rows
+}
+
 impl ParsedMember {
     fn change_record(&self) -> ChangeRecord {
         ChangeRecord {
@@ -1058,6 +1085,7 @@ struct ParsedCommit {
     wire: SyncCommit,
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
+    base_commit_id: Option<CommitId>,
     account_id: String,
     created_at: LixTimestamp,
     selected_source_commit_id: Option<CommitId>,
@@ -1069,6 +1097,7 @@ struct ParsedCommit {
 struct ParsedSyncHeader {
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
+    base_commit_id: Option<CommitId>,
     account_id: String,
     created_at: LixTimestamp,
     global_scope: bool,
@@ -1124,9 +1153,33 @@ impl ParsedSyncHeader {
                 ));
             }
         };
+        let base_commit_id = header
+            .base_commit_id
+            .as_deref()
+            .map(|base| CommitId::parse_lix(base, "sync base commit header"))
+            .transpose()?;
+        if base_commit_id == Some(commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync commit header cannot use itself as its base",
+            ));
+        }
+        if header.global_scope && base_commit_id.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "global sync commit header must not have a base",
+            ));
+        }
+        if !header.global_scope && base_commit_id.is_none() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "local sync commit header must have a base",
+            ));
+        }
         Ok(Self {
             commit_id,
             parent_commit_ids,
+            base_commit_id,
             account_id: header.account_id.clone(),
             created_at: parse_sync_timestamp("sync header createdAt", &header.created_at)?,
             global_scope: header.global_scope,
@@ -1142,6 +1195,7 @@ impl ParsedSyncHeader {
             commit_id: self.commit_id,
             generation: self.generation,
             parent_commit_ids: self.parent_commit_ids.clone(),
+            base_commit_id: self.base_commit_id,
             first_parent_jump_commit_id: self.first_parent_jump_commit_id,
             first_parent_jump_span: self.first_parent_jump_span,
             account_id: self.account_id.clone(),
@@ -1175,6 +1229,18 @@ fn validate_sync_header_set(
     }
 
     for header in headers.values() {
+        if let Some(base_commit_id) = header.base_commit_id
+            && let Some(base) = headers.get(&base_commit_id)
+            && !base.global_scope
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "{context} header '{}' uses non-global base '{}'",
+                    header.commit_id, base_commit_id
+                ),
+            ));
+        }
         let known_parent_generations = header
             .parent_commit_ids
             .iter()
@@ -1260,6 +1326,17 @@ impl ParsedCommit {
             .map(|parent| CommitId::parse_lix(parent, "sync parent commit id"))
             .collect::<Result<Vec<_>, _>>()?;
         let created_at = parse_sync_timestamp("sync commit createdAt", &wire.created_at)?;
+        let base_commit_id = wire
+            .base_commit_id
+            .as_deref()
+            .map(|base| CommitId::parse_lix(base, "sync base commit id"))
+            .transpose()?;
+        if base_commit_id == Some(commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync commit cannot use itself as its base",
+            ));
+        }
         let selected_source_commit_id = wire
             .selected_source_commit_id
             .as_deref()
@@ -1291,6 +1368,7 @@ impl ParsedCommit {
             wire: wire.clone(),
             commit_id,
             parent_commit_ids,
+            base_commit_id,
             account_id: wire.account_id.clone(),
             created_at,
             selected_source_commit_id,
@@ -1303,6 +1381,7 @@ impl ParsedCommit {
         self.parent_commit_ids
             .iter()
             .copied()
+            .chain(self.base_commit_id)
             .chain(self.state_alias.iter().map(|(source, _)| *source))
     }
 }
@@ -1537,7 +1616,7 @@ async fn load_sync_hot_snapshot(
     branch_id: &str,
     commit_id: CommitId,
 ) -> Result<HotTrackedSnapshot, LixError> {
-    let rows = TrackedStateContext::new()
+    let mut rows: Vec<MaterializedTrackedStateRow> = TrackedStateContext::new()
         .reader(read)
         .scan_batch_at_commit(
             &commit_id.to_string(),
@@ -1558,6 +1637,40 @@ async fn load_sync_hot_snapshot(
                 || row.schema_key != crate::checkpoint::CHECKPOINT_SCHEMA_KEY
         })
         .collect();
+    if branch_id != crate::GLOBAL_BRANCH_ID {
+        let node = CommitGraphContext::new()
+            .reader(read)
+            .load_node(&commit_id)
+            .await?
+            .ok_or_else(|| LixError::commit_not_found(commit_id.to_string(), "sync", "hot head"))?;
+        if let Some(base_commit_id) = node.base_commit_id {
+            let inherited_catalog = TrackedStateContext::new()
+                .reader(read)
+                .scan_batch_at_commit(
+                    &base_commit_id.to_string(),
+                    &TrackedStateScanRequest {
+                        filter: TrackedStateFilter {
+                            schema_keys: vec!["lix_registered_schema".to_owned()],
+                            include_tombstones: true,
+                            ..TrackedStateFilter::default()
+                        },
+                        read_columns: TrackedStateReadColumns::default(),
+                        limit: None,
+                    },
+                )
+                .await?
+                .into_rows();
+            for inherited in inherited_catalog {
+                if !rows.iter().any(|local| {
+                    local.schema_key == inherited.schema_key
+                        && local.file_id == inherited.file_id
+                        && local.row_pk == inherited.row_pk
+                }) {
+                    rows.push(inherited);
+                }
+            }
+        }
+    }
     HotTrackedSnapshot::from_materialized_rows(rows)
 }
 
@@ -2007,6 +2120,7 @@ where
                             )
                         })?;
                         pending.extend(record.parent_commit_ids.iter().copied());
+                        pending.extend(record.base_commit_id);
                         if let Some(alias) = load_sync_commit_state_alias(&read, cursor).await? {
                             pending.push(CommitId::parse_lix(
                                 &alias.source_commit_id,
@@ -2098,6 +2212,7 @@ where
                         commit
                             .parent_commit_ids
                             .iter()
+                            .chain(commit.base_commit_id.iter())
                             .chain(
                                 commit
                                     .state_alias
@@ -2748,14 +2863,21 @@ where
                         ),
                     )
                 })?;
-            let pristine_initialization = record.parent_commit_ids.is_empty()
+            let pristine_topology = if branch.branch_id == crate::GLOBAL_BRANCH_ID {
+                record.parent_commit_ids.is_empty() && record.base_commit_id.is_none()
+            } else {
+                record.base_commit_id == local_global_head
+                    && record
+                        .base_commit_id
+                        .is_some_and(|base| record.parent_commit_ids.as_slice() == [base])
+            };
+            let pristine_initialization = pristine_topology
                 && record.account_id == crate::SYSTEM_ACCOUNT_ID
                 && local.head_commit_id == local.tracked_generation
                 && local.working_diff_checkpoint_commit_id == Some(local.head_commit_id)
                 && local.current_state_revision == 0
                 && local.created_at == local.updated_at
-                && (branch.branch_id == crate::GLOBAL_BRANCH_ID
-                    || local_global_head == Some(local.head_commit_id));
+                ;
             if !pristine_initialization {
                 return Err(LixError::new(
                     LixError::CODE_TRANSACTION_CONFLICT,
@@ -2823,6 +2945,7 @@ where
                 )
             })?;
             if header.parent_commit_ids != commit.parent_commit_ids
+                || header.base_commit_id != commit.base_commit_id
                 || header.account_id != commit.account_id
                 || header.created_at != commit.created_at
                 || header.global_scope != commit.wire.global_scope
@@ -3091,6 +3214,13 @@ where
 
         let mut row_pk_index_overlay = TrackedStateChunkOverlay::new();
         for head in snapshot_body_ids.iter().copied() {
+            // A sparse snapshot may advertise a checkpoint coordinate whose
+            // header/body is intentionally deferred. Its rows still seed the
+            // hot checkpoint baseline; immutable state authority is installed
+            // later through the structured history-demand path.
+            let (Some(record), Some(header)) = (records.get(&head), header_by_id.get(&head)) else {
+                continue;
+            };
             let row_owner = branches
                 .iter()
                 .find(|branch| branch.head_commit_id.as_deref() == Some(head.to_string().as_str()))
@@ -3115,7 +3245,11 @@ where
                 .cloned()
                 .ok_or_else(|| LixError::unknown("sync snapshot did not stage its root"))?;
             drop(tracked_writer);
-            snapshot_root.changed_key_count = u64::try_from(parsed_heads[&head].members.len())
+            snapshot_root.changed_key_count = u64::try_from(
+                parsed_heads
+                    .get(&head)
+                    .map_or(head_rows.len(), |commit| commit.members.len()),
+            )
                 .map_err(|_| LixError::unknown("sync head mutation count exceeds u64"))?;
             snapshot_root.complete_state_fence = true;
             let row_pk_index_root_id = stage_row_pk_index_from_deltas(
@@ -3128,16 +3262,16 @@ where
             .await?;
             let mutations = head_mutations
                 .remove(&head)
-                .expect("head mutations were staged");
+                .unwrap_or_default();
             stage_commit_state_manifest_with_handle(
                 &mut writes,
                 &CommitStateManifest {
                     commit_id: head,
-                    change_account_id: parsed_heads[&head].account_id.clone(),
+                    change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations,
                     touched_scope_filter: incomplete_touched_scope_filter(),
-                    global_scope: header_by_id[&head].global_scope,
+                    global_scope: header.global_scope,
                     current_state_scoped_ranges: None,
                     row_pk_index_root_id,
                     snapshot_root: Some(Box::new(snapshot_root)),
@@ -3180,10 +3314,24 @@ where
                     .filter(|row| row.branch_id == checkpoint)
                     .collect::<Vec<_>>()
             };
-            let current_snapshot =
-                snapshot_rows_hot_snapshot(&branch.branch_id, branch_rows.iter().copied())?;
-            let checkpoint_snapshot =
-                snapshot_rows_hot_snapshot(&branch.branch_id, checkpoint_rows.iter().copied())?;
+            let current_rows = snapshot_rows_with_inherited_catalog(
+                &branch.branch_id,
+                &parsed_rows,
+                &branch_rows,
+            );
+            let checkpoint_rows = snapshot_rows_with_inherited_catalog(
+                &branch.branch_id,
+                &parsed_rows,
+                &checkpoint_rows,
+            );
+            let current_snapshot = snapshot_rows_hot_snapshot(
+                &branch.branch_id,
+                current_rows.into_values(),
+            )?;
+            let checkpoint_snapshot = snapshot_rows_hot_snapshot(
+                &branch.branch_id,
+                checkpoint_rows.into_values(),
+            )?;
             let mut coverage = WorkingDiffIndexCoverage::default();
             let (_, schemas) = TrackedHeadContext::new()
                 .writer(&read, &mut writes)
@@ -3478,7 +3626,10 @@ where
                 }
             }
             for commit_id in boundary_roots.keys() {
-                if !parsed.contains_key(commit_id) {
+                let is_external_base = parsed
+                    .values()
+                    .any(|commit| commit.base_commit_id == Some(*commit_id));
+                if !parsed.contains_key(commit_id) && !is_external_base {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PARAM,
                         format!("sync history boundary '{commit_id}' is outside its page"),
@@ -3585,14 +3736,59 @@ where
 
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        // A history page may carry a materialized global base boundary without
+        // spending one of its bounded causal body slots on that base. Promote
+        // the already-certified sparse header to an empty synthetic body; the
+        // boundary rows below are the complete state authority.
+        let external_boundary_ids = boundary_roots
+            .keys()
+            .filter(|commit_id| !parsed.contains_key(commit_id))
+            .copied()
+            .collect::<Vec<_>>();
+        for commit_id in external_boundary_ids {
+            let record = load_commit_record(&read, commit_id).await?.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_COMMIT_NOT_FOUND,
+                    format!("sync history base boundary '{commit_id}' has no header"),
+                )
+            })?;
+            let global_scope = deferred_commit_global_scope(&read, commit_id)
+                .await?
+                .or_else(|| {
+                    boundary_roots
+                        .contains_key(&commit_id)
+                        .then_some(record.base_commit_id.is_none())
+                })
+                .unwrap_or(false);
+            let wire = SyncCommit {
+                commit_id: commit_id.to_string(),
+                parent_commit_ids: record
+                    .parent_commit_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                base_commit_id: record.base_commit_id.map(|base| base.to_string()),
+                account_id: record.account_id.clone(),
+                created_at: record.created_at.to_string(),
+                global_scope,
+                selected_source_commit_id: None,
+                state_alias: None,
+                members: Vec::new(),
+            };
+            parsed.insert(commit_id, ParsedCommit::parse(&wire)?);
+        }
         let default_branch_id = self.repository_default_branch_id_for_sync(&read).await?;
         if parsed_refs
             .iter()
-            .any(|(update, _, _, head, _)| update.branch_id == default_branch_id && head.is_none())
+            .any(|(update, _, _, head, _)| {
+                (update.branch_id == default_branch_id
+                    || update.branch_id == crate::GLOBAL_BRANCH_ID)
+                    && head.is_none()
+            })
         {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                "sync push cannot delete the repository default branch",
+                "sync push cannot delete the repository default or global branch",
             ));
         }
         let observations = BranchHeadControlContext::new()
@@ -3677,7 +3873,9 @@ where
         for (commit_id, commit) in &parsed {
             match load_sync_commit(&read, *commit_id).await {
                 Ok(Some(stored)) => {
-                    if stored != commit.wire {
+                    let materialized_external_boundary = boundary_rows.contains_key(commit_id)
+                        && commit.members.is_empty();
+                    if stored != commit.wire && !materialized_external_boundary {
                         return Err(LixError::new(
                             LixError::CODE_INVALID_PARAM,
                             format!(
@@ -3722,6 +3920,7 @@ where
                             )
                         })?;
                     if record.parent_commit_ids != commit.parent_commit_ids
+                        || record.base_commit_id != commit.base_commit_id
                         || record.account_id != commit.account_id
                         || record.created_at != commit.created_at
                         || deferred_commit_global_scope(&read, *commit_id)
@@ -3757,12 +3956,17 @@ where
         let dependencies = parsed
             .iter()
             .flat_map(|(commit_id, commit)| {
-                commit.parent_commit_ids.iter().copied().chain(
-                    (!boundary_rows.contains_key(commit_id))
-                        .then_some(commit.state_alias.as_ref())
-                        .flatten()
-                        .map(|(source, _)| *source),
-                )
+                commit
+                    .parent_commit_ids
+                    .iter()
+                    .copied()
+                    .chain(commit.base_commit_id)
+                    .chain(
+                        (!boundary_rows.contains_key(commit_id))
+                            .then_some(commit.state_alias.as_ref())
+                            .flatten()
+                            .map(|(source, _)| *source),
+                    )
             })
             .filter(|dependency| !parsed.contains_key(dependency))
             .collect::<BTreeSet<_>>();
@@ -3798,6 +4002,31 @@ where
                 );
             }
         }
+        for commit in parsed.values() {
+            let Some(base_commit_id) = commit.base_commit_id else {
+                continue;
+            };
+            let base_is_global = parsed
+                .get(&base_commit_id)
+                .map(|base| base.wire.global_scope)
+                .or_else(|| {
+                    published_topologies
+                        .get(&base_commit_id)
+                        .map(|topology| topology.global_scope())
+                })
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_COMMIT_NOT_FOUND,
+                        format!("sync base commit '{base_commit_id}' has no state authority"),
+                    )
+                })?;
+            if !base_is_global {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("sync base commit '{base_commit_id}' is not global"),
+                ));
+            }
+        }
         for (_, _, _, head, checkpoint) in &parsed_refs {
             if let Some(head) = head
                 && !parsed.contains_key(head)
@@ -3828,6 +4057,37 @@ where
                             )
                         })?,
                 );
+            }
+        }
+        for (update, _, _, head, checkpoint) in &parsed_refs {
+            if update.branch_id != crate::GLOBAL_BRANCH_ID {
+                continue;
+            }
+            for target in [head, checkpoint].into_iter().flatten() {
+                let (global_scope, base_commit_id) = if let Some(commit) = parsed.get(target) {
+                    (commit.wire.global_scope, commit.base_commit_id)
+                } else {
+                    let record = records.get(target).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_COMMIT_NOT_FOUND,
+                            format!("sync global ref target '{target}' does not exist"),
+                        )
+                    })?;
+                    let global_scope = load_published_commit_state_topology(&read, *target)
+                        .await?
+                        .map(|topology| topology.global_scope())
+                        .or(deferred_commit_global_scope(&read, *target).await?)
+                        .unwrap_or(false);
+                    (global_scope, record.base_commit_id)
+                };
+                if !global_scope || base_commit_id.is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "sync global branch target '{target}' is not a base-native global commit"
+                        ),
+                    ));
+                }
             }
         }
 
@@ -3924,10 +4184,27 @@ where
                 ));
             };
             let commit = &parsed[&commit_id];
+            let state_parent_commit_id = commit.parent_commit_ids.first().copied().filter(|parent| {
+                commit.wire.global_scope
+                    || !parsed
+                        .get(parent)
+                        .map(|parent| parent.wire.global_scope)
+                        .or_else(|| {
+                            published_topologies
+                                .get(parent)
+                                .map(|topology| topology.global_scope())
+                        })
+                        .or_else(|| {
+                            records
+                                .get(parent)
+                                .map(|record| record.base_commit_id.is_none())
+                        })
+                        .unwrap_or(false)
+            });
             let parent = if boundary_rows.contains_key(&commit_id) {
                 None
             } else {
-                commit.parent_commit_ids.first().map(ToString::to_string)
+                state_parent_commit_id.map(|parent| parent.to_string())
             };
             let root_deltas = if let Some(rows) = boundary_rows.get(&commit_id) {
                 rows.iter()
@@ -3971,11 +4248,11 @@ where
             }
             if commit.state_alias.is_none()
                 && !boundary_rows.contains_key(&commit_id)
-                && let Some(parent) = commit.parent_commit_ids.first()
-                && root.parent_roots.first().map(|root| root.commit_id) != Some(*parent)
+                && root.parent_roots.first().map(|root| root.commit_id)
+                    != state_parent_commit_id
             {
                 return Err(LixError::unknown(format!(
-                    "sync import root '{commit_id}' did not retain first parent '{parent}'",
+                    "sync import root '{commit_id}' did not retain physical overlay parent '{state_parent_commit_id:?}'",
                 )));
             }
             if boundary_rows.contains_key(&commit_id) {
@@ -4304,7 +4581,25 @@ where
                     .state_alias
                     .as_ref()
                     .map(|(source_commit_id, _)| *source_commit_id)
-                    .or_else(|| commit.parent_commit_ids.first().copied())
+                    .or_else(|| {
+                        commit.parent_commit_ids.first().copied().filter(|parent| {
+                            commit.wire.global_scope
+                                || !parsed
+                                    .get(parent)
+                                    .map(|parent| parent.wire.global_scope)
+                                    .or_else(|| {
+                                        published_topologies
+                                            .get(parent)
+                                            .map(|topology| topology.global_scope())
+                                    })
+                                    .or_else(|| {
+                                        records
+                                            .get(parent)
+                                            .map(|record| record.base_commit_id.is_none())
+                                    })
+                                    .unwrap_or(false)
+                        })
+                    })
             };
             let row_pk_base_root = row_pk_base_commit_id.and_then(|base_id| {
                 staged_manifests
@@ -4500,6 +4795,7 @@ where
                 commit_id,
                 generation,
                 parent_commit_ids: commit.parent_commit_ids.clone(),
+                base_commit_id: commit.base_commit_id,
                 first_parent_jump_commit_id: first_parent_jump.0,
                 first_parent_jump_span: first_parent_jump.1,
                 account_id: commit.account_id.clone(),
@@ -5123,6 +5419,11 @@ where
             .iter()
             .map(|record| record.commit_id)
             .collect::<BTreeSet<_>>();
+        let external_base_ids = newest_first
+            .iter()
+            .filter_map(|record| record.base_commit_id)
+            .filter(|base| !body_ids.contains(base))
+            .collect::<BTreeSet<_>>();
         let mut boundary_ids = newest_first
             .iter()
             .filter(|record| {
@@ -5133,6 +5434,11 @@ where
             })
             .map(|record| record.commit_id)
             .collect::<BTreeSet<_>>();
+        // A local commit is not a complete state authority without its pinned
+        // global base. When that base is outside the bounded body page, ship
+        // it as a materialized boundary just like an external causal parent.
+        // This keeps every history response independently importable.
+        boundary_ids.extend(external_base_ids.iter().copied());
         let mut commits = Vec::with_capacity(newest_first.len());
         for record in newest_first.iter().rev() {
             commits.push(
@@ -5169,6 +5475,7 @@ where
         let mut header_ids = body_ids.clone();
         for record in &newest_first {
             header_ids.extend(record.parent_commit_ids.iter().copied());
+            header_ids.extend(record.base_commit_id);
             if record.first_parent_jump_span > 0 {
                 header_ids.insert(record.first_parent_jump_commit_id);
             }
@@ -5185,6 +5492,11 @@ where
                 && header_ids.insert(record.first_parent_jump_commit_id)
             {
                 pending_header_ids.push(record.first_parent_jump_commit_id);
+            }
+            if let Some(base_commit_id) = record.base_commit_id
+                && header_ids.insert(base_commit_id)
+            {
+                pending_header_ids.push(base_commit_id);
             }
         }
         let mut commit_headers = Vec::with_capacity(header_ids.len());
@@ -6724,7 +7036,11 @@ mod tests {
         let SyncRepositoryPullResponse::Delta { events, .. } = &delta else {
             panic!("incremental pull should be a delta");
         };
-        assert_eq!(events.len(), 2, "fixture must contain one event per branch");
+        assert_eq!(
+            events.len(),
+            3,
+            "fixture contains the stale secondary checkout refresh plus one user event per branch"
+        );
         storage.reset();
 
         replica
@@ -6734,8 +7050,8 @@ mod tests {
 
         assert_eq!(
             storage.write_transaction_count(),
-            1,
-            "independent direct fast-forwards share one atomic page publication",
+            2,
+            "the atomic page publication is followed by one local composite-base refresh",
         );
         assert_eq!(storage.atomic_ref_receipt_count(), 1);
         assert_eq!(read_key_value(&replica, "main-fold").await, "main");
@@ -8552,19 +8868,33 @@ mod tests {
             .await
             .expect("source snapshot should load");
         let (_, source_head) = default_head(&source_snapshot);
-        let source_commit = source
+        let source_history = source
             .sync_history(&source_head, 1)
             .await
-            .expect("source history should load")
+            .expect("source history should load");
+        let source_commit = source_history
             .commits
-            .into_iter()
-            .next()
+            .iter()
+            .cloned()
+            .find(|commit| commit.commit_id == source_head)
             .expect("source head commit should exist");
+        let mut source_commits = source_history.commits.clone();
+        if let Some(base) = source_commit.base_commit_id.as_deref() {
+            let base_commit = source
+                .sync_history(base, 1)
+                .await
+                .expect("source base history should load")
+                .commits
+                .into_iter()
+                .find(|commit| commit.commit_id == base)
+                .expect("source base body should exist");
+            source_commits.push(base_commit);
+        }
 
         let target = open_lix().await.expect("target should open");
         let branch_id = "01920000-0000-7000-8000-000000001499".to_string();
         let request = SyncPushRequest {
-            commits: vec![source_commit.clone()],
+            commits: source_commits,
             ref_updates: vec![SyncRefUpdate {
                 branch_id: branch_id.clone(),
                 expected_head_commit_id: None,
@@ -8584,7 +8914,13 @@ mod tests {
             .expect("exact replay should be idempotent");
         assert_eq!(second.cursor, first.cursor);
         let mut conflicting = request.clone();
-        conflicting.commits[0].members[0].snapshot = Some(serde_json::json!({"different": true}));
+        conflicting
+            .commits
+            .iter_mut()
+            .find(|commit| !commit.members.is_empty())
+            .expect("dependency closure contains authored bootstrap members")
+            .members[0]
+            .snapshot = Some(serde_json::json!({"different": true}));
         let error = target
             .push_sync_repository(&conflicting)
             .await
@@ -8595,8 +8931,10 @@ mod tests {
                 .sync_history(&source_head, 1)
                 .await
                 .expect("imported history should load")
-                .commits,
-            vec![source_commit]
+                .commits
+                .into_iter()
+                .find(|commit| commit.commit_id == source_head),
+            Some(source_commit)
         );
 
         target
@@ -8932,8 +9270,10 @@ mod tests {
                 .sync_history(&head, 1)
                 .await
                 .expect("imported history should load")
-                .commits,
-            vec![commit],
+                .commits
+                .into_iter()
+                .find(|candidate| candidate.commit_id == head),
+            Some(commit),
         );
     }
 
@@ -9268,8 +9608,8 @@ mod tests {
         );
         assert_eq!(
             boundary_ids.len(),
-            2,
-            "the merge and the page's oldest first-parent commit both need boundaries"
+            3,
+            "the merge, oldest causal body, and external global base all need boundaries"
         );
 
         let mut rows = Vec::new();
@@ -9381,7 +9721,7 @@ mod tests {
             .expect_err("history body must retain the header's immutable scope");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(
-            error.message.contains("body disagrees with its header"),
+            error.message.contains("global sync commit must not have a base"),
             "unexpected error: {}",
             error.message
         );

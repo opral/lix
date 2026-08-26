@@ -64,6 +64,7 @@ impl CommitGraphContext {
             store,
             node_cache: HashMap::new(),
             reachable_nodes_cache: HashMap::new(),
+            state_dependency_nodes_cache: HashMap::new(),
             member_changes_cache: HashMap::new(),
         }
     }
@@ -80,6 +81,8 @@ where
     /// result from the unbounded one, but an already materialized unbounded
     /// walk answers every bounded request without touching storage again.
     reachable_nodes_cache: HashMap<(CommitId, Option<u32>), Arc<[ReachableCommitGraphNode]>>,
+    state_dependency_nodes_cache:
+        HashMap<(CommitId, Option<u32>), Arc<[ReachableCommitGraphNode]>>,
     // A reader is bound to one pinned storage snapshot for the duration of a
     // SQL statement. File-history shaping asks the same reader for distinct
     // schema slices of that history, so retain immutable change records here.
@@ -259,6 +262,54 @@ where
         }
         let nodes = Arc::from(walk_reachable_nodes(self, head_commit_id, max_depth).await?);
         self.reachable_nodes_cache
+            .insert((*head_commit_id, max_depth), Arc::clone(&nodes));
+        Ok(nodes)
+    }
+
+    /// History closes over both causal parents and the exact global state
+    /// dependency. Base edges remain excluded from ancestry, merge-base,
+    /// generation, and first-parent acceleration.
+    async fn state_dependency_nodes_within_depth(
+        &mut self,
+        head_commit_id: &CommitId,
+        max_depth: Option<u32>,
+    ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
+        if let Some(nodes) = self
+            .state_dependency_nodes_cache
+            .get(&(*head_commit_id, max_depth))
+        {
+            return Ok(Arc::clone(nodes));
+        }
+        if let Some(max_depth_value) = max_depth
+            && let Some(nodes) = self
+                .state_dependency_nodes_cache
+                .get(&(*head_commit_id, None))
+        {
+            let bounded = nodes
+                .iter()
+                .take_while(|reachable| reachable.depth <= max_depth_value)
+                .cloned()
+                .collect::<Arc<[_]>>();
+            self.state_dependency_nodes_cache
+                .insert((*head_commit_id, max_depth), Arc::clone(&bounded));
+            return Ok(bounded);
+        }
+        let mut walk = ReachableWalk::new_state_dependencies(*head_commit_id);
+        let mut nodes = Vec::new();
+        while let Some(layer) = walk.next_layer(self).await? {
+            let depth = layer.depth;
+            nodes.extend(
+                layer
+                    .commits
+                    .into_iter()
+                    .map(|commit| ReachableCommitGraphNode { commit, depth }),
+            );
+            if max_depth.is_some_and(|max| depth >= max) {
+                break;
+            }
+        }
+        let nodes = Arc::from(nodes);
+        self.state_dependency_nodes_cache
             .insert((*head_commit_id, max_depth), Arc::clone(&nodes));
         Ok(nodes)
     }
@@ -493,7 +544,7 @@ where
         // depth-bounded topology, because callers reuse it for commit metadata.
         let Some(limit) = request.limit else {
             let nodes = self
-                .reachable_nodes_within_depth(start_commit_id, request.max_depth)
+                .state_dependency_nodes_within_depth(start_commit_id, request.max_depth)
                 .await?;
             if shaping.may_include_members
                 && crate::tracked_state::has_deferred_commit_history(&self.store).await?
@@ -545,7 +596,7 @@ where
         // Bounded row demand stops the traversal itself. Breadth-first layers
         // arrive in the same order the entries are published, so the first
         // `limit` entries are exactly the ones an unbounded read would expose.
-        let mut walk = ReachableWalk::new(*start_commit_id);
+        let mut walk = ReachableWalk::new_state_dependencies(*start_commit_id);
         let mut reachable_nodes = Vec::new();
         while state.entries.len() < limit {
             let Some(layer) = walk.next_layer(self).await? else {
@@ -774,6 +825,7 @@ fn commit_graph_node_from_record(
         account_id: record.account_id,
         generation: record.generation,
         parent_commit_ids: record.parent_commit_ids,
+        base_commit_id: record.base_commit_id,
         first_parent_jump_commit_id: record.first_parent_jump_commit_id,
         first_parent_jump_span: record.first_parent_jump_span,
         created_at: record.created_at,
@@ -1016,6 +1068,7 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
     let snapshot_content = crate::changelog::commit_row_snapshot_json(
         &node.commit_id.to_string(),
         &node.parent_commit_ids,
+        node.base_commit_id,
     )
     .expect("lix_commit snapshot serialization should not fail");
     let snapshot: serde_json::Value = serde_json::from_str(&snapshot_content)
@@ -1655,6 +1708,7 @@ mod tests {
                 commits: vec![CommitRecord {
                     touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                     format_version: 3,
+                    base_commit_id: None,
                     commit_id,
                     generation: 0,
                     parent_commit_ids: Vec::new(),
@@ -2203,6 +2257,7 @@ mod tests {
             let record = CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 3,
+                base_commit_id: None,
                 commit_id,
                 generation,
                 parent_commit_ids: change.parent_commit_ids.clone(),
@@ -2293,6 +2348,7 @@ mod tests {
         append.commits.push(CommitRecord {
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
+            base_commit_id: None,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
@@ -2343,6 +2399,7 @@ mod tests {
                 .iter()
                 .map(|parent_id| CommitId::for_test_label(parent_id))
                 .collect(),
+            base_commit_id: None,
             first_parent_jump_commit_id: commit_id,
             first_parent_jump_span: 0,
             created_at: ts("2026-01-01T00:00:00Z"),

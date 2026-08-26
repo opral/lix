@@ -153,7 +153,18 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(storage_error)?;
-    let from_version = match crate::init::repository_protocol_status(&read).await? {
+    let protocol_status = crate::init::repository_protocol_status(&read).await?;
+    if let RepositoryProtocolStatus::MigrationRequired { found_version } = protocol_status
+        && !crate::migration::registry::has_complete_migration_path(
+            found_version,
+            CURRENT_FORMAT_VERSION,
+        )
+    {
+        return Err(migration_error(format!(
+            "repository v{found_version} predates the v{CURRENT_FORMAT_VERSION} complete-snapshot commit format; no in-place migration is available"
+        )));
+    }
+    let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
             found_version: found_version @ (68 | 69 | 70 | 71 | 72 | 73),
         } => found_version,
@@ -1256,7 +1267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_v69_with_a_marker_only_publication() {
+    async fn v69_marker_is_rejected_by_the_v75_hard_cut() {
         let storage = Memory::new();
         let lix = crate::open_lix()
             .with_storage(storage.clone())
@@ -1275,31 +1286,23 @@ mod tests {
             .await
             .unwrap();
 
-        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+        let error = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
-            .unwrap();
-        assert_eq!(
-            report,
-            MigrationReport {
-                from_version: 69,
-                to_version: CURRENT_FORMAT_VERSION,
-                changes_rewritten: 0,
-                commit_members_rewritten: 0,
-                hot_rows_rewritten: 0,
-            }
-        );
+            .expect_err("v75 intentionally has no in-place migration from v69");
+        assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
         assert_eq!(
             inspect_lix(&storage).await.unwrap(),
-            MigrationStatus::Current {
-                version: CURRENT_FORMAT_VERSION,
+            MigrationStatus::Required {
+                from_version: 69,
+                to_version: CURRENT_FORMAT_VERSION,
             }
         );
     }
 
     #[tokio::test]
-    async fn migrates_v73_repository_to_v74() {
+    async fn v73_repository_is_rejected_before_v74_backfill() {
         let storage = Memory::new();
-        let (_branch_id, head_commit_id, rootless_commit_id, _) =
+        let (_branch_id, _head_commit_id, rootless_commit_id, _) =
             seed_rooted_head_with_rootless_checkpoint_cursor(
                 &storage,
                 REPOSITORY_PROTOCOL_V73,
@@ -1311,7 +1314,7 @@ mod tests {
             inspect_lix(&storage).await.unwrap(),
             MigrationStatus::Required {
                 from_version: 73,
-                to_version: 74,
+                to_version: CURRENT_FORMAT_VERSION,
             }
         );
         let pre_migration = SharedStorageAdapterRead::new(
@@ -1344,62 +1347,17 @@ mod tests {
             .is_none()
         );
         pre_migration.finish().unwrap();
-        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+        let error = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
-            .unwrap();
-        assert_eq!(report.from_version, 73);
-        assert_eq!(report.to_version, 74);
+            .expect_err("v75 intentionally has no in-place migration from v73");
+        assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
         assert_eq!(
             inspect_lix(&storage).await.unwrap(),
-            MigrationStatus::Current { version: 74 }
+            MigrationStatus::Required {
+                from_version: 73,
+                to_version: CURRENT_FORMAT_VERSION,
+            }
         );
-
-        let read = SharedStorageAdapterRead::new(
-            adapter.begin_read(ReadOptions::default()).await.unwrap(),
-        );
-        let commit_ids = crate::tracked_state::scan_commit_state_manifest_commit_ids(&read)
-            .await
-            .unwrap();
-        assert!(commit_ids.contains(&head_commit_id));
-        assert!(commit_ids.contains(&rootless_commit_id));
-        for commit_id in commit_ids {
-            let manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                manifest.row_pk_index_root_id.is_some(),
-                "migrated commit '{commit_id}' must carry an index authority, including an empty root"
-            );
-        }
-        let rootless = crate::tracked_state::load_commit_state_manifest(&read, rootless_commit_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            rootless.snapshot_root.is_none(),
-            "v74 backfill must index rootless history without promoting it"
-        );
-        let mut tracked = TrackedStateContext::new().reader(read.clone());
-        let keys = tracked
-            .enumerate_schema_row_pk_keys_at_commit(
-                head_commit_id,
-                "lix_key_value",
-                &[crate::row_pk::RowPk::single("migration-shared-pk")],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            keys.into_iter()
-                .map(|key| key.file_id.expect("fixture rows are file-scoped"))
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "01920000-0000-7000-8000-0000000000a1".to_owned(),
-                "01920000-0000-7000-8000-0000000000a2".to_owned(),
-            ])
-        );
-        drop(tracked);
-        read.finish().unwrap();
     }
 
     #[tokio::test]
@@ -1432,11 +1390,10 @@ mod tests {
             crate::engine::Engine::new(storage.clone()).await.is_err(),
             "normal engine open must reject an interrupted bootstrap"
         );
-        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+        let error = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
-            .expect("migration should resume from the transitional marker");
-        assert_eq!(report.from_version, 72);
-        assert_eq!(report.to_version, 74);
+            .expect_err("v75 must not resume a legacy transitional migration");
+        assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
     }
 
     async fn seed_rooted_head_with_rootless_checkpoint_cursor(
@@ -1653,15 +1610,10 @@ mod tests {
         )
         .await;
 
-        migrate_lix(storage.clone(), MigrationOptions::default())
+        let error = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
-            .unwrap();
-        let lix = crate::open_lix()
-            .with_storage(storage.clone())
-            .await
-            .unwrap();
-        lix.create_checkpoint().await.unwrap();
-        lix.close().await.unwrap();
+            .expect_err("v75 intentionally cuts after the tested v69-to-v70 edge");
+        assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
     }
 
     #[tokio::test]
@@ -1708,15 +1660,10 @@ mod tests {
                 to_version: CURRENT_FORMAT_VERSION,
             }
         );
-        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+        let error = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
-            .unwrap();
-        assert_eq!(report.from_version, 71);
-        assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
-        assert!(
-            report.hot_rows_rewritten > 0,
-            "the v71 edge must repair the stale working-diff epoch before publishing v72"
-        );
+            .expect_err("v75 intentionally cuts after the tested v70-to-v71 edge");
+        assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
         assert_chronology_roots_promoted(
             &storage,
             head_commit_id,
@@ -1725,8 +1672,5 @@ mod tests {
         )
         .await;
 
-        let lix = crate::open_lix().with_storage(storage).await.unwrap();
-        lix.create_checkpoint().await.unwrap();
-        lix.close().await.unwrap();
     }
 }

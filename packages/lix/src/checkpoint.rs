@@ -187,6 +187,7 @@ where
                     account_id: record.account_id,
                     generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids,
+                    base_commit_id: record.base_commit_id,
                     first_parent_jump_commit_id: record.first_parent_jump_commit_id,
                     first_parent_jump_span: record.first_parent_jump_span,
                     created_at: record.created_at,

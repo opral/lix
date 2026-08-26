@@ -753,6 +753,7 @@ async fn stage_test_changelog_commit(
     let record = CommitRecord {
         touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
         format_version: 4,
+        base_commit_id: None,
         commit_id: typed_commit_id,
         generation,
         parent_commit_ids: typed_parent_ids,

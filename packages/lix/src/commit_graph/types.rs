@@ -30,6 +30,9 @@ pub(crate) struct CommitGraphNode {
     pub(crate) account_id: String,
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
+    /// Exact global snapshot composed underneath this commit. `None` marks a
+    /// base-native commit (including commits on the global branch).
+    pub(crate) base_commit_id: Option<CommitId>,
     pub(crate) first_parent_jump_commit_id: CommitId,
     pub(crate) first_parent_jump_span: u64,
     pub(crate) created_at: LixTimestamp,

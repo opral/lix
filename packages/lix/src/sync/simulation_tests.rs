@@ -1699,7 +1699,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
     );
 }
 
-async fn stale_partial_checkpoint_epoch_repairs_in_migration(_sim: Simulation) {
+async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
 	let authority = fresh_authority().await;
 	write_key_value(&authority, "selected", "baseline").await;
 	write_key_value(&authority, "remaining", "baseline").await;
@@ -1791,42 +1791,18 @@ async fn stale_partial_checkpoint_epoch_repairs_in_migration(_sim: Simulation) {
 	crate::tracked_state::arm_diff_commits_test_probe(&checkpoint_commit_id, &head_commit_id);
 
 	replica.lix.close().await.unwrap();
-	crate::migration::migrate_lix(
+	let error = crate::migration::migrate_lix(
 		replica.storage.clone(),
 		crate::migration::MigrationOptions::default(),
 	)
 	.await
-	.expect("offline migration should repair the stale derived epoch");
-	replica.restart().await;
-	assert_eq!(
-		crate::tracked_state::take_diff_commits_test_probe(
-			&checkpoint_commit_id,
-			&head_commit_id,
-		),
-		0,
-		"migration must repair the stale derived epoch directly from rooted snapshots",
+	.expect_err("the complete-snapshot hard cut must reject a pre-v75 repository");
+	assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
+	assert!(error.message.contains("predates the v75 complete-snapshot"));
+	let _ = crate::tracked_state::take_diff_commits_test_probe(
+		&checkpoint_commit_id,
+		&head_commit_id,
 	);
-	assert_eq!(
-		replica
-			.lix
-			.execute(
-				&working_diff_sql(
-					&replica.lix,
-					"lix_key_value",
-					"SELECT COUNT(*) AS count FROM __LIX_RELATION_DIFF__",
-				)
-				.await,
-				&[],
-			)
-			.await
-			.unwrap()
-			.rows()[0]
-			.get::<i64>("count")
-			.unwrap(),
-		1,
-		"migration repair must retain the unselected change",
-	);
-	replica.write("selected", "after-reopen").await;
 }
 
 async fn deterministic_sync_command_traces(_sim: Simulation) {
@@ -1918,8 +1894,8 @@ sync_simulation_test!(
     partial_checkpoint_rebases_unselected_tombstone
 );
 sync_simulation_test!(
-	stale_partial_checkpoint_epoch_repairs_in_migration,
-	stale_partial_checkpoint_epoch_repairs_in_migration
+	pre_v75_partial_checkpoint_repository_is_rejected,
+	pre_v75_partial_checkpoint_repository_is_rejected
 );
 
 struct XorShift64(u64);

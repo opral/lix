@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
@@ -14,6 +15,7 @@ use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
 };
 use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision};
+use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::domain::Domain;
 use crate::filesystem::FilesystemPathIndexReader;
@@ -166,6 +168,8 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) file_views: SessionFileViews,
     pub(super) observe_coordinator: Arc<ObserveCoordinator>,
     pub(super) observe_invalidation: Arc<ObserveInvalidation>,
+    pub(super) base_refresh_generation: Arc<AtomicU64>,
+    pub(super) observed_global_head: Arc<RwLock<Option<CommitId>>>,
     pub(super) sync_mode: SyncModeState,
     /// Internal sync sessions apply canonical rows and must not enqueue those
     /// maintenance writes as new client proposals.
@@ -242,6 +246,7 @@ where
         transaction_manager: SessionTransactionManager,
         file_views: SessionFileViews,
     ) -> Self {
+        let base_refresh_generation = Arc::new(AtomicU64::new(observe_invalidation.generation()));
         Self {
             branch,
             active_account_id: Arc::from(active_account_id),
@@ -258,6 +263,8 @@ where
             file_views,
             observe_coordinator,
             observe_invalidation,
+            base_refresh_generation,
+            observed_global_head: Arc::new(RwLock::new(None)),
             sync_mode,
             sync_outbox_suppressed: false,
             plugin_host,
@@ -525,6 +532,12 @@ where
                     &outcome.storage_stats,
                     outcome.commit_cohort_id.as_deref(),
                 );
+                if self.branch.get()?.as_str() != GLOBAL_BRANCH_ID {
+                    self.base_refresh_generation.store(
+                        self.observe_invalidation.generation(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
                 after_commit_result?;
                 Ok(value)
             }

@@ -2,7 +2,9 @@
 //!
 //! This module describes migration edges independently from their physical
 //! implementation. Normal repository opening never runs migrations. Inspect
-//! and migrate closed repositories explicitly before opening an engine:
+//! closed repositories before opening an engine. Migration is available only
+//! when the registry has a complete path to the current format; intentional
+//! hard cuts return an error:
 //!
 //! ```no_run
 //! # async fn example(storage: lix::Memory) -> Result<(), lix::LixError> {

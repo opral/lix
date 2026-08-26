@@ -262,7 +262,7 @@ impl Event {
 /// Stable URL prefix owned by the Lix Server Protocol.
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 /// Canonical method and path registry for protocol hosts and conformance tools.
 pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
     ("GET", "/lix/v1"),

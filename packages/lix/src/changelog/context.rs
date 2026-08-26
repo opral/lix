@@ -156,7 +156,8 @@ fn change_value_capacity(change: &ChangeRecord) -> usize {
 }
 
 fn commit_value_capacity(commit: &CommitRecord) -> usize {
-    113usize.saturating_add(commit.parent_commit_ids.len().saturating_mul(16))
+    // Packed nullable base: one option tag plus the UUID payload when present.
+    130usize.saturating_add(commit.parent_commit_ids.len().saturating_mul(16))
 }
 
 #[derive(Debug)]
@@ -1069,6 +1070,7 @@ mod sparse_append_tests {
             crate::common::LixTimestamp::expect_parse("test timestamp", "1970-01-01T00:00:00.000Z");
         let record = CommitRecord {
             format_version: COMMIT_RECORD_FORMAT_VERSION,
+            base_commit_id: None,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),

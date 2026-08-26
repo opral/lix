@@ -164,6 +164,7 @@ mod tests {
         let record = CommitRecord {
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
+            base_commit_id: None,
             commit_id,
             generation: 70,
             parent_commit_ids: vec![CommitId::for_test_label("codec-segment-parent")],

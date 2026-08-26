@@ -3661,6 +3661,13 @@ impl PublishedCommitStateTopology {
             .map(|source| source.commit_id)
     }
 
+    pub(crate) fn complete_state_fence(&self) -> bool {
+        self.header
+            .snapshot_root
+            .as_ref()
+            .is_some_and(|root| root.complete_state_fence)
+    }
+
     fn topology_ref(&self) -> super::scoped_current_state::CommitStateTopologyRef<'_> {
         super::scoped_current_state::CommitStateTopologyRef {
             commit_id: self.header.commit_id,
@@ -17830,6 +17837,7 @@ mod tests {
         let record = CommitRecord {
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 3,
+            base_commit_id: None,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),

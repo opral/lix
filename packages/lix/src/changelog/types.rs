@@ -342,7 +342,7 @@ pub(crate) struct ChangelogAppend {
 }
 
 /// Current on-disk shape of [`CommitRecord`].
-pub(crate) const COMMIT_RECORD_FORMAT_VERSION: u32 = 5;
+pub(crate) const COMMIT_RECORD_FORMAT_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
@@ -353,13 +353,18 @@ pub(crate) struct CommitRecord {
     /// Version 5 adds `touched_scope_digest`, the per-commit membership test
     /// that lets history traversal skip loading a commit's replay-state
     /// authority. This is a breaking on-disk change: the record codec is
-    /// packed, so v4 bytes do not decode as v5.
+    /// packed, so v4 bytes do not decode as v5. Version 6 adds the pinned
+    /// global base. This deliberately is not a parent edge: parents describe
+    /// causal history, while the base describes the complete state resolved
+    /// by this commit.
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
     /// Longest-path distance from a graph root. Every parent has a strictly
     /// smaller generation, enabling bounded priority graph walks.
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) base_commit_id: Option<CommitId>,
     /// Myers applicative-random-access-stack jump. It is derived from this
     /// record's first parent and lives in the same immutable authority.
     pub(crate) first_parent_jump_commit_id: CommitId,
@@ -625,6 +630,7 @@ mod topology_tests {
         CommitRecord {
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
+            base_commit_id: None,
             commit_id,
             generation: depth,
             parent_commit_ids: parent.into_iter().collect(),
@@ -900,10 +906,12 @@ pub(crate) struct GcPlan {
 pub(crate) fn commit_row_snapshot_json(
     commit_id: &str,
     parent_commit_ids: &[CommitId],
+    base_commit_id: Option<CommitId>,
 ) -> Result<String, LixError> {
     serde_json::to_string(&serde_json::json!({
         "id": commit_id,
         "parent_commit_ids": parent_commit_ids,
+        "base_commit_id": base_commit_id,
     }))
     .map_err(|error| {
         LixError::new(

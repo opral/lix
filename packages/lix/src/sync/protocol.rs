@@ -126,6 +126,7 @@ pub struct SyncPushResponse {
 pub struct SyncCommitHeader {
     pub commit_id: String,
     pub parent_commit_ids: Vec<String>,
+    pub base_commit_id: Option<String>,
     pub account_id: String,
     pub created_at: String,
     #[serde(default)]
