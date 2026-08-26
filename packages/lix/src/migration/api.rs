@@ -517,11 +517,14 @@ where
 /// files reference directories absent from the same tree. Every strict v75
 /// read of such a tree fails. The repair injects the missing directory rows
 /// as tree index entries referencing the directory's existing authoritative
-/// change record, resolved from the branch heads' trees or from any commit
-/// tree that still carries the descriptor — the recoverable sources. No new
-/// change records are created and commit deltas stay untouched, so
-/// touched-scope digests remain valid; the referenced owning commits are
-/// already retained by the commits whose trees carry them.
+/// change record, resolved to the version current as of the repaired
+/// commit: among every candidate row version found in any commit tree, only
+/// those whose owning commit is an ancestor of the repaired commit are
+/// admissible, and the newest such version wins — a later rename or move at
+/// a branch head never leaks backward into history. No new change records
+/// are created and commit deltas stay untouched, so touched-scope digests
+/// remain valid; the referenced owning commits are already retained by the
+/// commits whose trees carry them.
 ///
 /// Tree-chunk writes commit here — content-addressed, safe if orphaned by a
 /// crash — while the returned manifests must be published by the caller
@@ -564,35 +567,79 @@ where
         })
     }
 
-    /// Expands the missing set to its full ancestor closure through `source`,
-    /// or reports the first directory id no recoverable source resolves.
-    fn missing_directory_closure(
+    struct CommitGraphNode {
+        created_at: crate::common::LixTimestamp,
+        parents: Vec<crate::changelog::CommitId>,
+        base: Option<crate::changelog::CommitId>,
+    }
+
+    /// Every commit whose state the given commit resolves: the causal parent
+    /// closure plus, for local commits, the pinned global base lineage their
+    /// trees compose beneath the local overlay.
+    fn commit_ancestors(
+        commit_id: crate::changelog::CommitId,
+        commit_graph: &BTreeMap<crate::changelog::CommitId, CommitGraphNode>,
+    ) -> BTreeSet<crate::changelog::CommitId> {
+        let mut seen = BTreeSet::new();
+        let mut worklist = vec![commit_id];
+        while let Some(current) = worklist.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if let Some(node) = commit_graph.get(&current) {
+                worklist.extend(node.parents.iter().copied());
+                if let Some(base) = node.base {
+                    worklist.push(base);
+                }
+            }
+        }
+        seen
+    }
+
+    /// Expands the missing set to its full ancestor-directory closure,
+    /// resolving each directory to its version as of the repaired commit:
+    /// only candidate rows owned by one of the commit's ancestors are
+    /// admissible, and the newest such version wins. Returns the first id no
+    /// admissible candidate resolves.
+    fn resolve_missing_directory_closure(
         present: &BTreeSet<String>,
         referenced: &BTreeSet<String>,
-        source: &BTreeMap<String, crate::tracked_state::MaterializedTrackedStateRow>,
-    ) -> Result<Vec<String>, String> {
-        let mut missing = Vec::new();
+        ancestors: &BTreeSet<crate::changelog::CommitId>,
+        candidates: &BTreeMap<String, Vec<crate::tracked_state::MaterializedTrackedStateRow>>,
+        commit_graph: &BTreeMap<crate::changelog::CommitId, CommitGraphNode>,
+    ) -> Result<BTreeMap<String, crate::tracked_state::MaterializedTrackedStateRow>, String> {
+        let mut resolved = BTreeMap::new();
         let mut worklist = referenced
             .difference(present)
             .cloned()
             .collect::<Vec<_>>();
-        let mut seen = BTreeSet::new();
         while let Some(id) = worklist.pop() {
-            if !seen.insert(id.clone()) {
+            if resolved.contains_key(&id) {
                 continue;
             }
-            let Some(row) = source.get(&id) else {
+            let row = candidates
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .filter(|row| ancestors.contains(&row.commit_id))
+                .max_by_key(|row| {
+                    (
+                        commit_graph.get(&row.commit_id).map(|node| node.created_at),
+                        row.commit_id,
+                    )
+                })
+                .cloned();
+            let Some(row) = row else {
                 return Err(id);
             };
-            if let Some(parent) = snapshot_text(row, "parent_id")
+            if let Some(parent) = snapshot_text(&row, "parent_id")
                 && !present.contains(&parent)
             {
                 worklist.push(parent);
             }
-            missing.push(id);
+            resolved.insert(id, row);
         }
-        missing.sort();
-        Ok(missing)
+        Ok(resolved)
     }
 
     fn push_missing_directories(
@@ -626,51 +673,64 @@ where
         .map_err(storage_error)?;
     let commit_ids = crate::tracked_state::scan_commit_state_manifest_commit_ids(&read).await?;
 
-    // The recoverable descriptor sources: directory rows visible at any
-    // branch head's tree, extended below with every audited commit tree so a
-    // directory later deleted from all heads still resolves. First writer
-    // wins — the repair needs any resolvable authoritative change record for
-    // the id, not the newest revision.
-    let heads = BranchHeadControlContext::new()
-        .reader(read.clone())
-        .scan()
-        .await?
-        .into_iter()
-        .map(|(_, control)| control.head_commit_id)
-        .collect::<BTreeSet<_>>();
-    let mut source = BTreeMap::<String, crate::tracked_state::MaterializedTrackedStateRow>::new();
-    let mut reader = TrackedStateContext::new().reader(read.clone());
-    for head in &heads {
-        let rows = reader
-            .scan_batch_at_commit(
-                &head.to_string(),
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_owned()],
-                        ..TrackedStateFilter::default()
-                    },
-                    read_columns: TrackedStateReadColumns::default(),
-                    // Scans truncate silently at their limit; request one row
-                    // beyond the bound so truncation is detected, never
-                    // mistaken for a complete result.
-                    limit: Some(options.max_changes.saturating_add(1)),
-                },
-            )
-            .await?
-            .into_rows();
-        if rows.len() > options.max_changes {
-            return Err(LixError::new(
-                "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
-                format!("{operation} head tree exceeds configured row bound"),
-            ));
-        }
-        for row in rows {
-            let Some(id) = snapshot_text(&row, "id") else {
-                continue;
+    // The commit graph resolves version admissibility below: a candidate
+    // directory row may repair a commit only when its owning commit is an
+    // ancestor. Records decode with the current codec because the v6 rewrite
+    // runs earlier in this same migration step's chain.
+    let mut commit_graph = BTreeMap::new();
+    let mut cursor = read
+        .begin_scan(
+            crate::changelog::COMMIT_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await
+        .map_err(storage_error)?;
+    while let Some(entries) = cursor.next_chunk().await.map_err(storage_error)? {
+        for entry in entries {
+            if commit_graph.len() > options.max_changes {
+                return Err(LixError::new(
+                    "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+                    format!(
+                        "{operation} exceeds configured commit bound: {} commits",
+                        commit_graph.len()
+                    ),
+                ));
+            }
+            let ProjectedValue::FullValue(value) = entry.value else {
+                return Err(migration_error(format!(
+                    "{operation} commit scan omitted a value"
+                )));
             };
-            source.entry(id).or_insert(row);
+            let record = crate::storage_codec::decode::<crate::changelog::CommitRecord>(
+                "commit record",
+                &value,
+            )
+            .map_err(|error| {
+                migration_error(format!(
+                    "{operation} could not decode a commit record: {error}"
+                ))
+            })?;
+            commit_graph.insert(
+                record.commit_id,
+                CommitGraphNode {
+                    created_at: record.created_at,
+                    parents: record.parent_commit_ids.clone(),
+                    base: record.base_commit_id,
+                },
+            );
         }
     }
+    drop(cursor);
+    let mut candidates =
+        BTreeMap::<String, Vec<crate::tracked_state::MaterializedTrackedStateRow>>::new();
+    let mut reader = TrackedStateContext::new().reader(read.clone());
 
     // First pass: audit every commit tree. An incomplete tree defers to the
     // second pass so its closure resolves against directory rows from every
@@ -729,7 +789,16 @@ where
             if row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
                 && let Some(id) = snapshot_text(&row, "id")
             {
-                source.entry(id).or_insert(row);
+                // Every distinct version of the directory row is a repair
+                // candidate; admissibility per commit is decided by
+                // ancestry when a closure resolves.
+                let versions = candidates.entry(id).or_default();
+                if !versions
+                    .iter()
+                    .any(|existing| existing.change_id == row.change_id)
+                {
+                    versions.push(row);
+                }
             }
         }
         if referenced.difference(&present).next().is_some() {
@@ -743,13 +812,21 @@ where
     let mut injected_total = 0_u64;
     for (commit_id, present, referenced) in audits {
         let commit_key = commit_id.to_string();
-        let missing = missing_directory_closure(&present, &referenced, &source)
-            .map_err(|id| {
-                migration_error(format!(
-                    "{operation} cannot resolve directory '{id}' referenced by commit \
-                     '{commit_id}' from any branch head or commit tree"
-                ))
-            })?;
+        let ancestors = commit_ancestors(commit_id, &commit_graph);
+        let missing_rows = resolve_missing_directory_closure(
+            &present,
+            &referenced,
+            &ancestors,
+            &candidates,
+            &commit_graph,
+        )
+        .map_err(|id| {
+            migration_error(format!(
+                "{operation} cannot resolve directory '{id}' referenced by commit \
+                 '{commit_id}' from any tree owned by that commit's ancestry"
+            ))
+        })?;
+        let missing = missing_rows.keys().cloned().collect::<Vec<_>>();
 
         let mut manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
             .await?
@@ -762,7 +839,7 @@ where
             crate::tracked_state::TrackedStateMutationBatchBuilder::with_row_capacity(
                 missing.len(),
             );
-        push_missing_directories(&mut injected, &missing, &source)?;
+        push_missing_directories(&mut injected, &missing, &missing_rows)?;
         let (primary, secondary) =
             crate::tracked_state::with_row_pk_index_mutations(injected.finish())?;
 
@@ -829,7 +906,7 @@ where
                     index_value_ref(row)?,
                 );
             }
-            push_missing_directories(&mut full, &missing, &source)?;
+            push_missing_directories(&mut full, &missing, &missing_rows)?;
             let result = tree
                 .apply_mutations_with_overlay(
                     &read,

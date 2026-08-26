@@ -194,6 +194,50 @@ simulation_test!(relation_diff_preserves_global_scope_on_both_sides, |sim| async
     );
 });
 
+simulation_test!(working_diff_span_reports_global_provenance, |sim| async move {
+    // Regression: the checkpoint-to-head working span with an identity-only
+    // provenance projection selected the HOT fast path, which carries no
+    // provenance sets — a local edit shadowing an inherited global row
+    // reported its global before-side as local.
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine.open_session().await.expect("session should open"),
+        &engine,
+    );
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_global) \
+             VALUES ('shadowed', 'global-value', TRUE)",
+            &[],
+        )
+        .await
+        .expect("global insert should succeed");
+    session
+        .create_checkpoint()
+        .await
+        .expect("checkpoint should pin the working-diff cursor");
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('shadowed', 'local-shadow') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            &[],
+        )
+        .await
+        .expect("active upsert should shadow the inherited global row");
+
+    assert_eq!(
+        select_rows(
+            &session,
+            "SELECT from_lixcol_global, to_lixcol_global \
+             FROM lix_diff('lix_key_value', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()) \
+             WHERE lixcol_row_pk = CAST('[\"shadowed\"]' AS JSONB)",
+        )
+        .await,
+        vec![vec![Value::Boolean(true), Value::Boolean(false)]],
+        "the shadowed row's before-side is the inherited global version",
+    );
+});
+
 simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(

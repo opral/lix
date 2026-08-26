@@ -303,7 +303,18 @@ where
                     // checkpoint-to-head case, retain HOT_DIFF as the sparse
                     // candidate index and still resolve the final winners
                     // through the composite overlay below.
+                    let needs_global_provenance = schema.fields().iter().any(|field| {
+                        matches!(
+                            field.name().as_str(),
+                            "from_lixcol_global" | "to_lixcol_global"
+                        )
+                    });
+                    // Global provenance must come from the composite overlay
+                    // resolution: the HOT epoch diff carries effective rows
+                    // but not which side an inherited global row supplied, so
+                    // provenance projections take the cold route.
                     let direct_candidates = if !route.request.retain_payloads
+                        && !needs_global_provenance
                         && from_descriptor.base_commit_id == to_descriptor.base_commit_id
                         && let Some(branch_id) = active_branch_id.as_deref()
                         && let (Ok(from_commit), Ok(to_commit)) = (
@@ -344,12 +355,6 @@ where
                         direct_candidates,
                     )
                     .await?;
-                    let needs_global_provenance = schema.fields().iter().any(|field| {
-                        matches!(
-                            field.name().as_str(),
-                            "from_lixcol_global" | "to_lixcol_global"
-                        )
-                    });
                     let (from_global_rows, to_global_rows) = if needs_global_provenance {
                         (from_global_rows, to_global_rows)
                     } else {

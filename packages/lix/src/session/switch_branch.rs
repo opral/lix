@@ -47,6 +47,7 @@ where
             )
             .await?;
         self.ensure_open()?;
+        let previous_branch_id = self.bound_branch_id()?;
         self.branch.set(branch_id.clone())?;
         self.observe_invalidation.bump();
         drop(reader);
@@ -54,8 +55,15 @@ where
         drop(write_access);
         // Refresh at the explicit checkout boundary. This keeps observers and
         // other read helpers from discovering that they need an internal write
-        // while already evaluating a stable snapshot.
-        self.refresh_active_branch_base_if_stale().await?;
+        // while already evaluating a stable snapshot. The selector must move
+        // before the bump so the refresh's staleness gate sees the switch;
+        // an error therefore restores the previous selector — a failed
+        // switch must not leave the session silently on the target branch.
+        if let Err(error) = self.refresh_active_branch_base_if_stale().await {
+            self.branch.set(previous_branch_id)?;
+            self.observe_invalidation.bump();
+            return Err(error);
+        }
 
         Ok(SwitchBranchReceipt { branch_id })
     }
@@ -229,6 +237,94 @@ mod tests {
                 && delta.scan_calls <= 20,
             "metadata-only auto-rebase must remain bounded, saw {delta:?}"
         );
+    }
+
+    /// Fails every `begin_write` while armed; reads pass through.
+    #[derive(Clone)]
+    struct WriteFailStorage {
+        inner: Memory,
+        fail_writes: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Storage for WriteFailStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                return Err(StorageError::Corruption("injected write failure".into()));
+            }
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_boundary_refresh_rolls_back_the_branch_selector() {
+        // A stale checkout's boundary refresh publishes one commit. When that
+        // write fails, switch_branch returns Err — and must leave the session
+        // on its previous branch, not silently on the target.
+        let fail_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let storage = WriteFailStorage {
+            inner: Memory::new(),
+            fail_writes: Arc::clone(&fail_writes),
+        };
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("initialize storage");
+        let engine = Engine::new(storage).await.expect("open engine");
+        let session = engine
+            .open_session_at(&receipt.main_branch_id)
+            .await
+            .expect("open pinned main session");
+        let branch = session
+            .create_branch(CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-00000000c003".to_owned()),
+                name: "refresh-rollback".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create switch target");
+
+        fail_writes.store(true, Ordering::SeqCst);
+        let result = session
+            .switch_branch(SwitchBranchOptions {
+                branch_id: branch.id.clone(),
+            })
+            .await;
+        fail_writes.store(false, Ordering::SeqCst);
+
+        // This setup is the bounded-refresh test's: the stale checkout needs
+        // exactly one commit, so the injected write failure must surface.
+        result.expect_err("the boundary refresh write was injected to fail");
+        assert_eq!(
+            session
+                .active_branch_id()
+                .await
+                .expect("read active branch"),
+            receipt.main_branch_id,
+            "a failed switch must leave the session on its previous branch"
+        );
+        // The session stays fully usable and can complete the switch.
+        let switched = session
+            .switch_branch(SwitchBranchOptions {
+                branch_id: branch.id.clone(),
+            })
+            .await
+            .expect("retry succeeds once writes recover");
+        assert_eq!(switched.branch_id, branch.id);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
