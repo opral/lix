@@ -510,6 +510,122 @@ where
     Ok(members_injected)
 }
 
+fn migration_snapshot_text(
+    row: &crate::tracked_state::MaterializedTrackedStateRow,
+    field: &str,
+) -> Option<String> {
+    let snapshot = row.decoded_snapshot.as_ref()?;
+    match snapshot.row.get(field) {
+        Some(lix_schema::Value::Text(value)) => Some(value.clone()),
+        Some(lix_schema::Value::Uuid(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+struct CommitGraphNode {
+    parents: Vec<crate::changelog::CommitId>,
+    base: Option<crate::changelog::CommitId>,
+}
+
+/// Every commit whose state the given commit resolves: the causal parent
+/// closure plus, for local commits, the pinned global base lineage their
+/// trees compose beneath the local overlay.
+fn commit_ancestors(
+    commit_id: crate::changelog::CommitId,
+    commit_graph: &BTreeMap<crate::changelog::CommitId, CommitGraphNode>,
+) -> BTreeSet<crate::changelog::CommitId> {
+    let mut seen = BTreeSet::new();
+    let mut worklist = vec![commit_id];
+    while let Some(current) = worklist.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(node) = commit_graph.get(&current) {
+            worklist.extend(node.parents.iter().copied());
+            if let Some(base) = node.base {
+                worklist.push(base);
+            }
+        }
+    }
+    seen
+}
+
+/// Expands the missing set to its full ancestor-directory closure, resolving
+/// each directory to its version as of the repaired commit: only candidate
+/// rows owned by one of the commit's ancestors are admissible, and the
+/// causally newest admissible version wins — a version is superseded exactly
+/// when its owning commit is a strict ancestor of another admissible
+/// version's owner. Wall-clock timestamps never rank versions: synchronized
+/// commit headers carry remote clocks and are not monotonic along the graph.
+/// An id with no admissible version, or with causally incomparable surviving
+/// versions, fails closed.
+fn resolve_missing_directory_closure(
+    present: &BTreeSet<String>,
+    referenced: &BTreeSet<String>,
+    ancestors: &BTreeSet<crate::changelog::CommitId>,
+    candidates: &BTreeMap<String, Vec<crate::tracked_state::MaterializedTrackedStateRow>>,
+    commit_graph: &BTreeMap<crate::changelog::CommitId, CommitGraphNode>,
+) -> Result<BTreeMap<String, crate::tracked_state::MaterializedTrackedStateRow>, (String, &'static str)>
+{
+    let mut resolved = BTreeMap::new();
+    let mut worklist = referenced
+        .difference(present)
+        .cloned()
+        .collect::<Vec<_>>();
+    while let Some(id) = worklist.pop() {
+        if resolved.contains_key(&id) {
+            continue;
+        }
+        let admissible = candidates
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter(|row| ancestors.contains(&row.commit_id))
+            .collect::<Vec<_>>();
+        if admissible.is_empty() {
+            return Err((id, "no tree owned by that commit's ancestry carries it"));
+        }
+        let mut owner_ancestry = BTreeMap::new();
+        for row in &admissible {
+            owner_ancestry
+                .entry(row.commit_id)
+                .or_insert_with(|| commit_ancestors(row.commit_id, commit_graph));
+        }
+        let mut winner: Option<&crate::tracked_state::MaterializedTrackedStateRow> = None;
+        let mut ambiguous = false;
+        for row in &admissible {
+            let strictly_superseded = admissible.iter().any(|other| {
+                owner_ancestry[&other.commit_id].contains(&row.commit_id)
+                    && !owner_ancestry[&row.commit_id].contains(&other.commit_id)
+            });
+            if strictly_superseded {
+                continue;
+            }
+            match winner {
+                None => winner = Some(row),
+                Some(current) if current.change_id == row.change_id => {}
+                Some(_) => ambiguous = true,
+            }
+        }
+        if ambiguous {
+            return Err((
+                id,
+                "its surviving versions are causally incomparable merge ancestors",
+            ));
+        }
+        let row = winner
+            .expect("a non-empty admissible set has a maximal element")
+            .clone();
+        if let Some(parent) = migration_snapshot_text(&row, "parent_id")
+            && !present.contains(&parent)
+        {
+            worklist.push(parent);
+        }
+        resolved.insert(id, row);
+    }
+    Ok(resolved)
+}
+
 /// Repairs filesystem closure inside every commit tree before v75 publishes.
 ///
 /// v72-era partial checkpoints on migrated repositories could commit a file
@@ -520,8 +636,9 @@ where
 /// change record, resolved to the version current as of the repaired
 /// commit: among every candidate row version found in any commit tree, only
 /// those whose owning commit is an ancestor of the repaired commit are
-/// admissible, and the newest such version wins — a later rename or move at
-/// a branch head never leaks backward into history. No new change records
+/// admissible, and the causally newest such version wins — a later rename
+/// or move at a branch head never leaks backward into history, and
+/// wall-clock order never decides between versions. No new change records
 /// are created and commit deltas stay untouched, so touched-scope digests
 /// remain valid; the referenced owning commits are already retained by the
 /// commits whose trees carry them.
@@ -541,18 +658,6 @@ where
     const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
     const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
-    fn snapshot_text(
-        row: &crate::tracked_state::MaterializedTrackedStateRow,
-        field: &str,
-    ) -> Option<String> {
-        let snapshot = row.decoded_snapshot.as_ref()?;
-        match snapshot.row.get(field) {
-            Some(lix_schema::Value::Text(value)) => Some(value.clone()),
-            Some(lix_schema::Value::Uuid(value)) => Some(value.to_string()),
-            _ => None,
-        }
-    }
-
     fn index_value_ref(
         row: &crate::tracked_state::MaterializedTrackedStateRow,
     ) -> Result<crate::tracked_state::TrackedStateIndexValueRef, LixError> {
@@ -565,81 +670,6 @@ where
             updated_at: crate::common::LixTimestamp::parse(&row.updated_at)
                 .map_err(|error| migration_error(format!("repair updated_at: {error}")))?,
         })
-    }
-
-    struct CommitGraphNode {
-        created_at: crate::common::LixTimestamp,
-        parents: Vec<crate::changelog::CommitId>,
-        base: Option<crate::changelog::CommitId>,
-    }
-
-    /// Every commit whose state the given commit resolves: the causal parent
-    /// closure plus, for local commits, the pinned global base lineage their
-    /// trees compose beneath the local overlay.
-    fn commit_ancestors(
-        commit_id: crate::changelog::CommitId,
-        commit_graph: &BTreeMap<crate::changelog::CommitId, CommitGraphNode>,
-    ) -> BTreeSet<crate::changelog::CommitId> {
-        let mut seen = BTreeSet::new();
-        let mut worklist = vec![commit_id];
-        while let Some(current) = worklist.pop() {
-            if !seen.insert(current) {
-                continue;
-            }
-            if let Some(node) = commit_graph.get(&current) {
-                worklist.extend(node.parents.iter().copied());
-                if let Some(base) = node.base {
-                    worklist.push(base);
-                }
-            }
-        }
-        seen
-    }
-
-    /// Expands the missing set to its full ancestor-directory closure,
-    /// resolving each directory to its version as of the repaired commit:
-    /// only candidate rows owned by one of the commit's ancestors are
-    /// admissible, and the newest such version wins. Returns the first id no
-    /// admissible candidate resolves.
-    fn resolve_missing_directory_closure(
-        present: &BTreeSet<String>,
-        referenced: &BTreeSet<String>,
-        ancestors: &BTreeSet<crate::changelog::CommitId>,
-        candidates: &BTreeMap<String, Vec<crate::tracked_state::MaterializedTrackedStateRow>>,
-        commit_graph: &BTreeMap<crate::changelog::CommitId, CommitGraphNode>,
-    ) -> Result<BTreeMap<String, crate::tracked_state::MaterializedTrackedStateRow>, String> {
-        let mut resolved = BTreeMap::new();
-        let mut worklist = referenced
-            .difference(present)
-            .cloned()
-            .collect::<Vec<_>>();
-        while let Some(id) = worklist.pop() {
-            if resolved.contains_key(&id) {
-                continue;
-            }
-            let row = candidates
-                .get(&id)
-                .into_iter()
-                .flatten()
-                .filter(|row| ancestors.contains(&row.commit_id))
-                .max_by_key(|row| {
-                    (
-                        commit_graph.get(&row.commit_id).map(|node| node.created_at),
-                        row.commit_id,
-                    )
-                })
-                .cloned();
-            let Some(row) = row else {
-                return Err(id);
-            };
-            if let Some(parent) = snapshot_text(&row, "parent_id")
-                && !present.contains(&parent)
-            {
-                worklist.push(parent);
-            }
-            resolved.insert(id, row);
-        }
-        Ok(resolved)
     }
 
     fn push_missing_directories(
@@ -720,7 +750,6 @@ where
             commit_graph.insert(
                 record.commit_id,
                 CommitGraphNode {
-                    created_at: record.created_at,
                     parents: record.parent_commit_ids.clone(),
                     base: record.base_commit_id,
                 },
@@ -770,15 +799,15 @@ where
         for row in &rows {
             match row.schema_key.as_str() {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                    if let Some(id) = snapshot_text(row, "id") {
+                    if let Some(id) = migration_snapshot_text(row, "id") {
                         present.insert(id);
                     }
-                    if let Some(parent) = snapshot_text(row, "parent_id") {
+                    if let Some(parent) = migration_snapshot_text(row, "parent_id") {
                         referenced.insert(parent);
                     }
                 }
                 FILE_DESCRIPTOR_SCHEMA_KEY => {
-                    if let Some(directory) = snapshot_text(row, "directory_id") {
+                    if let Some(directory) = migration_snapshot_text(row, "directory_id") {
                         referenced.insert(directory);
                     }
                 }
@@ -787,7 +816,7 @@ where
         }
         for row in rows {
             if row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-                && let Some(id) = snapshot_text(&row, "id")
+                && let Some(id) = migration_snapshot_text(&row, "id")
             {
                 // Every distinct version of the directory row is a repair
                 // candidate; admissibility per commit is decided by
@@ -820,10 +849,10 @@ where
             &candidates,
             &commit_graph,
         )
-        .map_err(|id| {
+        .map_err(|(id, reason)| {
             migration_error(format!(
                 "{operation} cannot resolve directory '{id}' referenced by commit \
-                 '{commit_id}' from any tree owned by that commit's ancestry"
+                 '{commit_id}': {reason}"
             ))
         })?;
         let missing = missing_rows.keys().cloned().collect::<Vec<_>>();
@@ -1745,6 +1774,98 @@ mod tests {
                 version: CURRENT_FORMAT_VERSION,
             }
         );
+    }
+
+    fn repair_candidate_row(
+        directory_id: &str,
+        created_at: &str,
+        change_label: &str,
+        commit_id: CommitId,
+    ) -> crate::tracked_state::MaterializedTrackedStateRow {
+        crate::tracked_state::MaterializedTrackedStateRow {
+            row_pk: crate::row_pk::RowPk::single(directory_id),
+            schema_key: "lix_directory_descriptor".to_string(),
+            file_id: None,
+            snapshot_content: None,
+            decoded_snapshot: None,
+            metadata: None,
+            deleted: false,
+            created_at: created_at.to_string(),
+            updated_at: created_at.to_string(),
+            change_id: crate::changelog::ChangeId::for_test_label(change_label),
+            commit_id,
+        }
+    }
+
+    fn repair_test_commit(label: u128) -> CommitId {
+        CommitId::with_change_address_space(uuid::Uuid::from_u128(label))
+    }
+
+    #[test]
+    fn repair_resolution_ranks_versions_causally_not_by_wall_clock() {
+        // Chain A <- B <- C. The version owned by ancestor A carries a LATER
+        // wall clock than the causally newer version owned by B: clocks are
+        // not monotonic along the graph, so B's version must win.
+        let a = repair_test_commit(0xA1);
+        let b = repair_test_commit(0xB2);
+        let c = repair_test_commit(0xC3);
+        let mut graph = BTreeMap::new();
+        graph.insert(a, CommitGraphNode { parents: vec![], base: None });
+        graph.insert(b, CommitGraphNode { parents: vec![a], base: None });
+        graph.insert(c, CommitGraphNode { parents: vec![b], base: None });
+        let mut candidates = BTreeMap::new();
+        candidates.insert(
+            "d1".to_string(),
+            vec![
+                repair_candidate_row("d1", "2026-01-05T00:00:00.000Z", "stale-late-clock", a),
+                repair_candidate_row("d1", "2026-01-01T00:00:00.000Z", "current-early-clock", b),
+            ],
+        );
+        let present = BTreeSet::new();
+        let referenced = BTreeSet::from(["d1".to_string()]);
+        let ancestors = commit_ancestors(c, &graph);
+
+        let resolved =
+            resolve_missing_directory_closure(&present, &referenced, &ancestors, &candidates, &graph)
+                .expect("linear versions resolve");
+        assert_eq!(
+            resolved["d1"].change_id,
+            crate::changelog::ChangeId::for_test_label("current-early-clock"),
+            "the causally newest admissible version wins regardless of clocks"
+        );
+    }
+
+    #[test]
+    fn repair_resolution_fails_closed_on_incomparable_versions() {
+        // Merge M of B and D, each owning a different version of the same
+        // directory: no causal winner exists, so the repair must refuse
+        // rather than guess.
+        let a = repair_test_commit(0xA1);
+        let b = repair_test_commit(0xB2);
+        let d = repair_test_commit(0xD4);
+        let m = repair_test_commit(0xE5);
+        let mut graph = BTreeMap::new();
+        graph.insert(a, CommitGraphNode { parents: vec![], base: None });
+        graph.insert(b, CommitGraphNode { parents: vec![a], base: None });
+        graph.insert(d, CommitGraphNode { parents: vec![a], base: None });
+        graph.insert(m, CommitGraphNode { parents: vec![b, d], base: None });
+        let mut candidates = BTreeMap::new();
+        candidates.insert(
+            "d1".to_string(),
+            vec![
+                repair_candidate_row("d1", "2026-01-01T00:00:00.000Z", "left-version", b),
+                repair_candidate_row("d1", "2026-01-02T00:00:00.000Z", "right-version", d),
+            ],
+        );
+        let present = BTreeSet::new();
+        let referenced = BTreeSet::from(["d1".to_string()]);
+        let ancestors = commit_ancestors(m, &graph);
+
+        let (id, reason) =
+            resolve_missing_directory_closure(&present, &referenced, &ancestors, &candidates, &graph)
+                .expect_err("incomparable merge-ancestor versions must fail closed");
+        assert_eq!(id, "d1");
+        assert!(reason.contains("incomparable"), "got reason: {reason}");
     }
 
     #[tokio::test]

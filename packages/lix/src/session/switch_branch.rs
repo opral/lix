@@ -28,6 +28,11 @@ where
         options: SwitchBranchOptions,
     ) -> Result<SwitchBranchReceipt, LixError> {
         let branch_id = options.branch_id;
+        // One switch at a time across session clones: the selector moves
+        // before the boundary refresh below (its staleness gate keys off the
+        // observer bump), and a refresh failure rolls the selector back —
+        // both steps must not interleave with another clone's switch.
+        let _switch_serial = self.branch.begin_switch().await;
         // Keep the existing session/collaboration lease so branch deletion
         // cannot race target validation. A switch is normally session-local;
         // when the selected local branch pins an older global head, the lazy
