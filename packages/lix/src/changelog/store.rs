@@ -254,6 +254,9 @@ mod tests {
             ("changelog/context.rs .stage(", 2),
             // Production. Reclamation only: removes records, introduces no name.
             ("changelog/gc.rs .delete(", 1),
+            // Production. The v74->v75 offline migration rewrites every v5
+            // record to the v6 complete-snapshot arity in one fenced batch.
+            ("migration/api.rs .put(", 1),
             // Test fixtures, all absent from the non-test build.
             ("changelog/gc.rs .delete_batch(", 1),
             ("commit_graph/walker.rs .delete(", 2),

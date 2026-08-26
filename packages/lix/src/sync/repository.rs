@@ -2943,10 +2943,20 @@ where
                 "sync snapshot branch checkpoint",
             )?);
         }
-        let snapshot_body_ids = head_ids
+        let mut snapshot_body_ids = head_ids
             .union(&checkpoint_ids)
             .copied()
             .collect::<BTreeSet<_>>();
+        // A local head or checkpoint is not a complete state authority
+        // without its pinned global base, so the snapshot ships that base's
+        // body inline. Accept exactly the bases the accepted bodies name;
+        // bases are global commits and carry no base of their own.
+        let inline_base_ids = snapshot_body_ids
+            .iter()
+            .filter_map(|commit_id| parsed_heads.get(commit_id))
+            .filter_map(|commit| commit.base_commit_id)
+            .collect::<BTreeSet<_>>();
+        snapshot_body_ids.extend(inline_base_ids);
         let required_checkpoint_roots = branches
             .iter()
             .filter_map(|branch| {

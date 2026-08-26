@@ -122,6 +122,10 @@ path = "tests/migration_v68.rs"
 name = "migration_v72"
 path = "tests/migration_v72.rs"
 
+[[test]]
+name = "migration_v72_filesystem"
+path = "tests/migration_v72_filesystem.rs"
+
 [dependencies]
 lix_schema.workspace = true
 serde = { version = "1", features = ["derive"] }
@@ -215,3 +219,7 @@ ruzstd = { version = "0.8", default-features = false, features = ["std"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen-futures = "0.4"
+
+[[test]]
+name = "investigate_peter"
+path = "tests/investigate_peter.rs"
