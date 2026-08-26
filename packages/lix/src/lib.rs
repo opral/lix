@@ -83,7 +83,7 @@ mod json_predicate_pushdown_probe;
 pub(crate) mod hot_state;
 pub(crate) mod init;
 pub(crate) mod json_store;
-pub mod migration;
+mod migration;
 /// The declared module layer order and the test that enforces it. Test-only:
 /// it contains no engine code, just the layering artifact and its guard.
 #[cfg(test)]
@@ -141,8 +141,9 @@ pub mod wasm;
 #[doc(hidden)]
 pub use plugin::runtime::default::runtime as default_wasm_runtime;
 pub use handle::{
-    ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction, OpenAnotherSessionBuilder,
-    OpenLixBuilder, ServerMode, ServerOptions, TransactionExecuteBuilder, open_lix,
+    CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
+    OpenAnotherSessionBuilder, OpenLixBuilder, OpenMigrationReport, OpenPhase, OpenProgress,
+    OpenProgressSink, OpenReport, ServerMode, ServerOptions, TransactionExecuteBuilder, open_lix,
 };
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]

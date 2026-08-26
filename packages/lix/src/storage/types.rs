@@ -21,6 +21,16 @@ pub enum ValueSemantics {
     Immutable,
 }
 
+/// Whether repository storage is primary data or can be reconstructed from it.
+///
+/// The distinction belongs to Lix's storage-format registry. Backends only
+/// provide ordered key spaces; they do not decide migration policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StorageSpaceRole {
+    Authoritative,
+    Rebuildable,
+}
+
 /// Who is responsible for detecting corruption of a space's *value* bytes.
 ///
 /// This exists because one space in the engine authenticates its own values
@@ -63,6 +73,7 @@ pub struct StorageSpace {
     pub value_semantics: ValueSemantics,
     /// Who detects value corruption in this space. See [`ValueIntegrity`].
     pub value_integrity: ValueIntegrity,
+    pub role: StorageSpaceRole,
 }
 
 impl StorageSpace {
@@ -84,6 +95,7 @@ impl StorageSpace {
             name,
             value_semantics,
             value_integrity: ValueIntegrity::BackendVerified,
+            role: StorageSpaceRole::Authoritative,
         }
     }
 
@@ -115,6 +127,7 @@ impl StorageSpace {
             name,
             value_semantics,
             value_integrity: ValueIntegrity::ContentAddressed,
+            role: StorageSpaceRole::Authoritative,
         }
     }
 
@@ -190,6 +203,7 @@ impl StorageSpace {
             // the key's digest, so this view must not claim the engine will
             // authenticate them.
             value_integrity: ValueIntegrity::BackendVerified,
+            role: self.role,
         }
     }
 }

@@ -88,6 +88,35 @@ test("failed close terminates the worker before releasing its binding", async ()
 	]);
 });
 
+test("open progress crosses the worker boundary without controlling open", () => {
+	const transport = fakeConnection();
+	const progress = vi.fn(() => {
+		throw new Error("consumer callback failed");
+	});
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease(undefined, undefined, undefined, progress);
+
+	expect(() =>
+		transport.emit({
+			kind: "open.progress",
+			progress: {
+				phase: "migrating",
+				fromFormat: 74,
+				toFormat: 75,
+				completed: 1,
+				total: 2,
+			},
+		}),
+	).not.toThrow();
+	expect(progress).toHaveBeenCalledWith({
+		phase: "migrating",
+		fromFormat: 74,
+		toFormat: 75,
+		completed: 1,
+		total: 2,
+	});
+});
+
 function deferred<T>() {
 	let resolve!: (value: T | PromiseLike<T>) => void;
 	let reject!: (reason?: unknown) => void;

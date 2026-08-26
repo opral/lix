@@ -113,6 +113,8 @@ pub const SYNC_MATERIALIZED_STATE_ALIAS_SPACE: StorageSpace =
 pub const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = crate::gc::CHECKPOINT_RECOVERY_REF_SPACE;
 pub const CHECKPOINT_GC_STATE_SPACE: StorageSpace = crate::gc::CHECKPOINT_GC_STATE_SPACE;
 pub const COMMIT_RETIREMENT_INTENT_SPACE: StorageSpace = crate::gc::COMMIT_RETIREMENT_INTENT_SPACE;
+/// Stable, unbanked control row selecting the active physical repository epoch.
+pub const REPOSITORY_EPOCH_SPACE: StorageSpace = crate::storage_adapter::REPOSITORY_EPOCH_SPACE;
 
 #[cfg(test)]
 mod tests {
@@ -166,6 +168,7 @@ mod tests {
         CHECKPOINT_RECOVERY_REF_SPACE,
         CHECKPOINT_GC_STATE_SPACE,
         COMMIT_RETIREMENT_INTENT_SPACE,
+        REPOSITORY_EPOCH_SPACE,
     ];
 
     /// The published handles must be the registry, exactly and in order.

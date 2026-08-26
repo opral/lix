@@ -87,6 +87,7 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
         "gc.commit_retirement_intent.v1",
         ValueSemantics::Mutable,
     ),
+    crate::storage_adapter::REPOSITORY_EPOCH_SPACE,
 ];
 
 /// Space ids the constructor check cannot reject yet.

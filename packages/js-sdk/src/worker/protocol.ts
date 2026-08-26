@@ -11,6 +11,8 @@ import type {
 	SwitchBranchOptions,
 	LixTelemetrySpan,
 	LixTelemetryParentContext,
+	LixOpenProgress,
+	LixOpenReport,
 	OpenAnotherSessionOptions,
 } from "../types.js";
 
@@ -49,6 +51,7 @@ export type WorkerOperation =
 			kind: "open";
 			storage: LixStorageConfig;
 			telemetryEnabled: boolean;
+			progressEnabled: boolean;
 			server?: WorkerSyncServerOptions;
 	  }
 	| { kind: "openAnotherSession"; options: OpenAnotherSessionOptions }
@@ -135,6 +138,7 @@ export type WorkerResponse =
 	| { id: number; ok: true; value?: unknown }
 	| { id: number; ok: false; error: SerializedWorkerError }
 	| { kind: "telemetry"; span: LixTelemetrySpan }
+	| { kind: "open.progress"; progress: LixOpenProgress }
 	| { kind: "sync.headers"; requestId: number }
 	| { kind: "sync.fetch"; requestId: number; request: WorkerSyncFetchRequest }
 	| { kind: "sync.fetch.cancel"; requestId: number };

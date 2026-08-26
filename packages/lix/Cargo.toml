@@ -126,6 +126,10 @@ path = "tests/migration_v72.rs"
 name = "migration_v72_filesystem"
 path = "tests/migration_v72_filesystem.rs"
 
+[[test]]
+name = "migration_v75"
+path = "tests/migration_v75.rs"
+
 [dependencies]
 lix_schema.workspace = true
 serde = { version = "1", features = ["derive"] }

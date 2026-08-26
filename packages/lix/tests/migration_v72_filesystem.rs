@@ -17,7 +17,6 @@
 //! ("filesystem descriptor references missing directory"), which fails every
 //! `lix_diff` / `lix_state_at` read touching the relation at that commit.
 
-use lix::migration::{MigrationOptions, MigrationStatus, inspect_lix, migrate_lix};
 use lix::{Memory, Value, open_lix};
 use std::collections::HashSet;
 
@@ -52,24 +51,16 @@ fn assert_files_resolve_directories(
 async fn checkpointed_directories_survive_the_v74_migration() {
     let storage = Memory::from_snapshot(V72_FILESYSTEM_SNAPSHOT)
         .expect("v72 filesystem fixture should decode");
-    assert_eq!(
-        inspect_lix(&storage).await.expect("inspect fixture"),
-        MigrationStatus::Required {
-            from_version: 72,
-            to_version: 75,
-        }
-    );
-
-    let report = migrate_lix(storage.clone(), MigrationOptions::default())
-        .await
-        .expect("v72 filesystem fixture should migrate");
-    assert_eq!(report.from_version, 72);
-    assert_eq!(report.to_version, 75);
-
     let lix = open_lix()
         .with_storage(storage)
         .await
-        .expect("migrated repository should open");
+        .expect("opening the v72 filesystem fixture should migrate it automatically");
+    let migration = lix
+        .open_report()
+        .migration
+        .expect("the open report should record the automatic migration");
+    assert_eq!(migration.from_format, 72);
+    assert_eq!(migration.to_format, 76);
 
     let checkpoints = lix
         .execute(
@@ -79,7 +70,11 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         .await
         .expect("checkpoint listing");
     // Bootstrap checkpoint + full + partial.
-    assert_eq!(checkpoints.rows().len(), 3, "fixture carries three checkpoints");
+    assert_eq!(
+        checkpoints.rows().len(),
+        3,
+        "fixture carries three checkpoints"
+    );
 
     for row in checkpoints.rows() {
         let commit_id = row.get::<String>("commit_id").expect("commit id");
@@ -116,9 +111,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
             &[Value::Text(commit_id.clone())],
         )
         .await
-        .unwrap_or_else(|error| {
-            panic!("root diff with paths at {commit_id} should read: {error}")
-        });
+        .unwrap_or_else(|error| panic!("root diff with paths at {commit_id} should read: {error}"));
     }
 
     // Authoring after migration: a partial checkpoint on a migrated
@@ -132,7 +125,10 @@ async fn checkpointed_directories_survive_the_v74_migration() {
     .await
     .expect("create /notes/today.md on the migrated repository");
     let new_file = lix
-        .execute("SELECT id FROM lix_file WHERE path = '/notes/today.md'", &[])
+        .execute(
+            "SELECT id FROM lix_file WHERE path = '/notes/today.md'",
+            &[],
+        )
         .await
         .expect("read new file id");
     let new_file_id = new_file.rows()[0].get::<String>("id").expect("file id");
@@ -192,32 +188,4 @@ async fn checkpointed_directories_survive_the_v74_migration() {
     assert_files_resolve_directories(&files, &directories, "at the post-migration checkpoint");
 
     lix.close().await.expect("close migrated repository");
-}
-
-#[tokio::test]
-async fn bounded_migration_fails_loudly_instead_of_publishing_v75() {
-    // A row budget below the repository's tracked rows must refuse the
-    // migration — whichever chain step's bound fires first — and never
-    // publish v75 over partially processed trees. (The repair step's own
-    // bound is unit-tested in migration::api.)
-    let storage = Memory::from_snapshot(V72_FILESYSTEM_SNAPSHOT)
-        .expect("v72 filesystem fixture should decode");
-    let error = migrate_lix(
-        storage.clone(),
-        MigrationOptions {
-            max_changes: 12,
-            ..MigrationOptions::default()
-        },
-    )
-    .await
-    .expect_err("a bound below the repository's row count must fail the migration");
-    assert_eq!(error.code, "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED");
-    // The refused migration left the marker untouched: still migratable.
-    assert_eq!(
-        inspect_lix(&storage).await.expect("inspect after refusal"),
-        MigrationStatus::Required {
-            from_version: 72,
-            to_version: 75,
-        }
-    );
 }

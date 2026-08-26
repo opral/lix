@@ -7,7 +7,7 @@ use crate::init::{REPOSITORY_PROTOCOL_KEY, REPOSITORY_PROTOCOL_SPACE, REPOSITORY
 use crate::storage_adapter::{
     PutBatch, PutEntry, Storage, StorageError, StorageKey as Key, StorageKeyRange as KeyRange,
     StoragePrecondition as Precondition, StorageSpace, StorageValue as StoredValue, StorageWrite,
-    StorageWriteOptions as WriteOptions, ValueSemantics,
+    StorageWriteOptions as WriteOptions, ValueSemantics, StorageAdapter,
 };
 
 /// Fully preflighted physical mutations. Construction stays private so the
@@ -92,7 +92,7 @@ impl Default for PublicationPlan {
 /// transaction. The marker precondition fences concurrent writers and the
 /// marker update shares the same atomic commit as every authority rewrite.
 pub(super) async fn publish<S>(
-    storage: &S,
+    storage: &StorageAdapter<S>,
     expected_mutation_revision: Option<Bytes>,
     expected_protocol_value: &'static [u8],
     target_protocol_value: &'static [u8],
@@ -106,7 +106,7 @@ where
         target_protocol_value.to_vec(),
     )])?;
     let mut write = storage
-        .begin_write(WriteOptions {
+        .begin_migration_write(WriteOptions {
             await_durable: true,
             preconditions: vec![
                 Precondition::KeyValueEquals {
@@ -114,7 +114,7 @@ where
                     key: Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY)),
                     expected: Bytes::from_static(expected_protocol_value),
                 },
-                crate::storage_adapter::StorageAdapter::<S>::mutation_revision_precondition(
+                StorageAdapter::<S>::mutation_revision_precondition(
                     expected_mutation_revision,
                 ),
             ],
@@ -228,10 +228,10 @@ mod tests {
         let mut plan = PublicationPlan::default();
         plan.replace_immutable(IMMUTABLE, vec![(b"same-key".to_vec(), b"v69".to_vec())])
             .unwrap();
-        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        let adapter = StorageAdapter::new(storage.clone());
         let revision = adapter.load_mutation_revision().await.unwrap();
         publish(
-            &storage,
+            &adapter,
             revision,
             b"tracked-default-branch.v68",
             REPOSITORY_PROTOCOL_VALUE,
@@ -288,7 +288,7 @@ mod tests {
         .await
         .unwrap();
         seed.commit().await.unwrap();
-        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        let adapter = StorageAdapter::new(storage.clone());
         let stale_revision = adapter.load_mutation_revision().await.unwrap();
 
         let mut concurrent = adapter.new_write_set();
@@ -299,7 +299,7 @@ mod tests {
             .unwrap();
 
         let error = publish(
-            &storage,
+            &adapter,
             stale_revision,
             b"tracked-default-branch.v68",
             REPOSITORY_PROTOCOL_VALUE,

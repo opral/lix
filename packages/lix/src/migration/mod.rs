@@ -1,29 +1,16 @@
-//! Repository-format migration API.
+//! Engine-owned repository-format migration.
 //!
-//! This module describes migration edges independently from their physical
-//! implementation. Normal repository opening never runs migrations. Inspect
-//! closed repositories before opening an engine. Migration is available only
-//! when the registry has a complete path to the current format; intentional
-//! hard cuts return an error:
-//!
-//! ```no_run
-//! # async fn example(storage: lix::Memory) -> Result<(), lix::LixError> {
-//! use lix::migration::{MigrationOptions, MigrationStatus, inspect_lix, migrate_lix};
-//!
-//! if matches!(inspect_lix(&storage).await?, MigrationStatus::Required { .. }) {
-//!     migrate_lix(storage.clone(), MigrationOptions::default()).await?;
-//! }
-//!
-//! let lix = lix::open_lix().with_storage(storage).await?;
-//! # lix.close().await?;
-//! # Ok(())
-//! # }
-//! ```
+//! Opening a Lix is the sole policy boundary. Keeping this module private
+//! prevents applications from fragmenting the ecosystem with their own
+//! migration ordering, limits, or recovery rules.
 
 mod api;
+mod epoch;
 mod publish;
 mod registry;
 
-pub use api::{
-    MigrationOptions, MigrationReport, MigrationStatus, inspect_lix, migrate_lix,
+pub(crate) use api::{
+    MigrationOptions, MigrationStatus, inspect_lix, inspect_lix_with_adapter,
+    migrate_lix_with_adapter,
 };
+pub(crate) use epoch::admit_repository;

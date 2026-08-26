@@ -1936,17 +1936,11 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
         include_bytes!("fixtures/v72_partial_checkpoints.snapshot");
     let authority_storage =
         Memory::from_snapshot(V72_PARTIAL_CHECKPOINTS).expect("decode v72 fixture");
-    lix::migration::migrate_lix(
-        authority_storage.clone(),
-        lix::migration::MigrationOptions::default(),
-    )
-    .await
-    .expect("migrate fixture to the current format");
     let authority = Arc::new(
         open_lix()
             .with_storage(authority_storage.clone())
             .await
-            .expect("open migrated authority"),
+            .expect("open and automatically upgrade authority"),
     );
     let checkpoints = authority
         .execute(

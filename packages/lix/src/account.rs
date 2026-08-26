@@ -131,11 +131,11 @@ mod tests {
     async fn ordinary_commits_keep_the_token_while_account_writes_rotate_it() {
         const AUTHOR_ID: &str = "01920000-0000-7000-8000-0000000006a1";
         let storage = Memory::new();
-        let adapter = StorageAdapter::new(storage.clone());
         let lix = open_lix()
             .with_storage(storage)
             .await
             .expect("repository should open");
+        let adapter = lix.storage_adapter();
 
         let initialized = current_token(&adapter)
             .await

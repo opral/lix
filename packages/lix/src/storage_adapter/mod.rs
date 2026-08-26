@@ -14,6 +14,7 @@
 )]
 
 mod context;
+mod epoch;
 mod point;
 mod read_scope;
 #[cfg(test)]
@@ -36,8 +37,9 @@ pub use crate::storage::{
     ReadDurability as StorageReadDurability, ReadEntry as StorageReadEntry,
     ReadOptions as StorageReadOptions, ScanChunk as StorageScanChunk,
     ScanCursor as StorageScanCursor, ScanOrder as StorageScanOrder, SpaceId as StorageSpaceId,
-    Storage, StorageError, StorageRead, StorageSpace, StoredValue as StorageValue, ValueIntegrity,
-    ValueSemantics, WriteOptions as StorageWriteOptions,
+    Storage, StorageError, StorageRead, StorageSpace, StorageSpaceRole,
+    StoredValue as StorageValue, ValueIntegrity, ValueSemantics,
+    WriteOptions as StorageWriteOptions,
 };
 pub(crate) use crate::storage::{Capability as StorageCapability, PutBatch, PutEntry};
 
@@ -46,6 +48,7 @@ pub(crate) use context::{
     load_repository_mutation_revision, repository_mutation_revision_precondition,
     stage_mutation_revision,
 };
+pub(crate) use epoch::{EpochBank, REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE};
 pub(crate) use point::exact_get_many;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
 pub(crate) use read_scope::SharedStorageAdapterRead;

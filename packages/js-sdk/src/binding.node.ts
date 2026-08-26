@@ -8,6 +8,7 @@ import type {
 	SyncServerBindingOptions,
 	TelemetryDispatch,
 	TelemetryParentContext,
+	OpenProgressDispatch,
 } from "./binding-types.js";
 
 type NativeAddon = {
@@ -17,6 +18,7 @@ type NativeAddon = {
 			telemetryParentJson?: string,
 			serverUrl?: string,
 			serverHeaders?: [string, string][],
+			openProgress?: (progressJson: string) => void,
 		): Promise<NativeLixBinding>;
 		openFilesystemStorage(
 			path: string,
@@ -25,6 +27,7 @@ type NativeAddon = {
 			telemetryParentJson?: string,
 			serverUrl?: string,
 			serverHeaders?: [string, string][],
+			openProgress?: (progressJson: string) => void,
 		): Promise<NativeLixBinding>;
 	};
 };
@@ -139,16 +142,27 @@ export async function openLixBinding(
 	telemetry?: TelemetryDispatch,
 	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
+	openProgress?: OpenProgressDispatch,
 ): Promise<LixBinding> {
 	try {
-		return await openNativeLixBinding(storage, telemetry, telemetryParent, server);
+		return await openNativeLixBinding(
+			storage,
+			telemetry,
+			telemetryParent,
+			server,
+			openProgress,
+		);
 	} catch (nativeError) {
 		if (storage.kind !== "memory" || server !== undefined) throw nativeError;
 		try {
 			const { openMemoryWasmBinding } = await import(
 				"./binding.node-wasm.js"
 			);
-			return await openMemoryWasmBinding(telemetry, telemetryParent);
+			return await openMemoryWasmBinding(
+				telemetry,
+				telemetryParent,
+				openProgress,
+			);
 		} catch (wasmError) {
 			throw new AggregateError(
 				[nativeError, wasmError],
@@ -163,10 +177,20 @@ export async function openNativeLixBinding(
 	telemetry?: TelemetryDispatch,
 	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
+	openProgress?: OpenProgressDispatch,
 ): Promise<LixBinding> {
 	if (server?.fetch) {
 		throw new TypeError("Custom sync fetch is only supported by the browser worker");
 	}
+	const nativeOpenProgress = openProgress
+		? (progressJson: string) => {
+				try {
+					openProgress(JSON.parse(progressJson));
+				} catch {
+					// Open progress is observational and cannot fail repository opening.
+				}
+			}
+		: undefined;
 	switch (storage.kind) {
 		case "memory": {
 			const nativeAddon = loadNativeAddon();
@@ -179,6 +203,7 @@ export async function openNativeLixBinding(
 					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
 					server?.url,
 					server?.headers,
+					nativeOpenProgress,
 				));
 			}
 			return normalizeNativeBinding(await nativeAddon.Lix.openMemory(
@@ -186,6 +211,7 @@ export async function openNativeLixBinding(
 				undefined,
 				server?.url,
 				server?.headers,
+				nativeOpenProgress,
 			));
 		}
 		case "jsStorage":
@@ -203,6 +229,7 @@ export async function openNativeLixBinding(
 					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
 					server?.url,
 					server?.headers,
+					nativeOpenProgress,
 				));
 			}
 			return normalizeNativeBinding(await nativeAddon.Lix.openFilesystemStorage(
@@ -212,6 +239,7 @@ export async function openNativeLixBinding(
 				undefined,
 				server?.url,
 				server?.headers,
+				nativeOpenProgress,
 			));
 		}
 	}

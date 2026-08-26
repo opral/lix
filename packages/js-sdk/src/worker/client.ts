@@ -7,6 +7,8 @@ import type {
 } from "../binding-types.js";
 import type {
 	LixTelemetryOptions,
+	LixOpenProgress,
+	LixOpenReport,
 	RemoteLixFetch,
 	SyncLixServerOptions,
 } from "../types.js";
@@ -40,17 +42,19 @@ export async function openLixWorker(
 	onDisposed?: () => void,
 	telemetry?: LixTelemetryOptions,
 	server?: SyncServerRuntimeOptions,
+	onProgress?: (progress: LixOpenProgress) => void,
 ): Promise<LixWorkerClient> {
 	let client = idleWorkers.pop();
 	while (client?.isDisposed) client = idleWorkers.pop();
 	client ??= new LixWorkerClient();
-	client.beginLease(onDisposed, telemetry, server);
+	client.beginLease(onDisposed, telemetry, server, onProgress);
 	try {
-		await client.request(
+		client.openReport = await client.request<LixOpenReport | undefined>(
 			{
 				kind: "open",
 				storage,
 				telemetryEnabled: telemetry !== undefined,
+				progressEnabled: onProgress !== undefined,
 				server: serializeSyncServer(server),
 			},
 			0,
@@ -68,6 +72,7 @@ export async function openLixWorkerBinding(
 	onDisposed?: () => void,
 	telemetry?: LixTelemetryOptions,
 	server?: SyncServerRuntimeOptions,
+	onProgress?: (progress: LixOpenProgress) => void,
 ): Promise<LixBinding> {
 	if (openDirectLixBinding) {
 		const telemetryDispatch = telemetry
@@ -84,6 +89,7 @@ export async function openLixWorkerBinding(
 			telemetryDispatch,
 			telemetry?.parentContext?.(),
 			await resolveDirectSyncServer(server),
+			onProgress,
 		);
 		if (binding) {
 			const operationAwareBinding = telemetry?.parentContext
@@ -96,7 +102,13 @@ export async function openLixWorkerBinding(
 			);
 		}
 	}
-	const client = await openLixWorker(storage, onDisposed, telemetry, server);
+	const client = await openLixWorker(
+		storage,
+		onDisposed,
+		telemetry,
+		server,
+		onProgress,
+	);
 	return workerBinding(
 		client,
 		new BindingLease(() => releaseWorker(client)),
@@ -255,6 +267,7 @@ export function workerBinding(
 	};
 
 	return {
+		openReport: () => client.openReport,
 		setTelemetryParent: () => {},
 		openAnotherSession: async (options) => {
 			const openedSessionId = await request<number>({
@@ -360,6 +373,8 @@ export class LixWorkerClient {
 	private onDisposed?: () => void;
 	private telemetry?: LixTelemetryOptions;
 	private syncServer?: SyncServerRuntimeOptions;
+	private onProgress?: (progress: LixOpenProgress) => void;
+	openReport: LixOpenReport | undefined;
 	private readonly syncFetchControllers = new Map<number, AbortController>();
 
 	constructor(
@@ -377,12 +392,14 @@ export class LixWorkerClient {
 		onDisposed?: () => void,
 		telemetry?: LixTelemetryOptions,
 		syncServer?: SyncServerRuntimeOptions,
+		onProgress?: (progress: LixOpenProgress) => void,
 	): void {
 		if (this.disposed || this.leased) throw workerClosedError();
 		this.leased = true;
 		this.onDisposed = onDisposed;
 		this.telemetry = telemetry;
 		this.syncServer = syncServer;
+		this.onProgress = onProgress;
 	}
 
 	endLease(): void {
@@ -392,6 +409,8 @@ export class LixWorkerClient {
 		this.onDisposed = undefined;
 		this.telemetry = undefined;
 		this.syncServer = undefined;
+		this.onProgress = undefined;
+		this.openReport = undefined;
 		for (const controller of this.syncFetchControllers.values()) controller.abort();
 		this.syncFetchControllers.clear();
 		onDisposed?.();
@@ -463,6 +482,13 @@ export class LixWorkerClient {
 					this.telemetry?.onSpan(message.span);
 				} catch {
 					// Telemetry callbacks are isolated from Lix operation results.
+				}
+				break;
+			case "open.progress":
+				try {
+					this.onProgress?.(message.progress);
+				} catch {
+					// Open progress is observational and cannot fail repository opening.
 				}
 				break;
 			case "sync.headers":

@@ -5,6 +5,7 @@ import type {
 	SyncServerBindingOptions,
 	TelemetryDispatch,
 	TelemetryParentContext,
+	OpenProgressDispatch,
 } from "./binding-types.js";
 import { initializeBrowserWasm } from "./browser-wasm-init.js";
 
@@ -29,11 +30,17 @@ export async function openLixBinding(
 	telemetry?: TelemetryDispatch,
 	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
+	openProgress?: OpenProgressDispatch,
 ): Promise<LixBinding> {
 	await initializeWasm();
 	switch (storage.kind) {
 		case "memory":
-			return openMemory(telemetry, telemetryParent, server) as Promise<LixBinding>;
+			return openMemory(
+				telemetry,
+				telemetryParent,
+				server,
+				openProgress,
+			) as Promise<LixBinding>;
 		case "jsStorage": {
 			const module = (await import(
 				/* @vite-ignore */ storage.moduleUrl
@@ -50,6 +57,7 @@ export async function openLixBinding(
 					telemetry,
 					telemetryParent,
 					server,
+					openProgress,
 				)) as unknown as LixBinding;
 				return binding;
 			} catch (error) {
