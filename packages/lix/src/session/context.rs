@@ -112,12 +112,22 @@ pub(crate) async fn load_default_branch_id_from_index(
 #[derive(Clone)]
 pub(crate) struct SessionBranch {
     branch_id: Arc<RwLock<String>>,
+    // Serializes switch_branch across session clones: the checkout's
+    // boundary refresh runs after session write access drops, so without
+    // this lock a concurrent clone's switch could interleave with a
+    // failing switch's selector rollback.
+    switch_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SessionBranch {
+    pub(crate) async fn begin_switch(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.switch_serial).lock_owned().await
+    }
+
     pub(crate) fn new(branch_id: String) -> Self {
         Self {
             branch_id: Arc::new(RwLock::new(branch_id)),
+            switch_serial: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
