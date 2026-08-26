@@ -5872,6 +5872,47 @@ mod tests {
         }
     }
 
+    async fn close_history_boundary_bodies(authority: &Lix, history: &mut SyncHistoryResponse) {
+        let missing = history
+            .boundaries
+            .iter()
+            .filter(|boundary| {
+                !history
+                    .commits
+                    .iter()
+                    .any(|commit| commit.commit_id == boundary.commit_id)
+            })
+            .map(|boundary| boundary.commit_id.clone())
+            .collect::<Vec<_>>();
+        let mut headers = history
+            .commit_headers
+            .drain(..)
+            .map(|header| (header.commit_id.clone(), header))
+            .collect::<BTreeMap<_, _>>();
+        for commit_id in missing {
+            let dependency = authority
+                .sync_history(&commit_id, 1)
+                .await
+                .expect("external history boundary body should load");
+            for commit in dependency.commits {
+                if !history
+                    .commits
+                    .iter()
+                    .any(|existing| existing.commit_id == commit.commit_id)
+                {
+                    history.commits.push(commit);
+                }
+            }
+            headers.extend(
+                dependency
+                    .commit_headers
+                    .into_iter()
+                    .map(|header| (header.commit_id.clone(), header)),
+            );
+        }
+        history.commit_headers = headers.into_values().collect();
+    }
+
     #[tokio::test]
     async fn ancestry_walk_stops_at_an_absent_lazy_history_boundary() {
         let lix = open_lix().await.expect("open Lix");
@@ -8121,10 +8162,11 @@ mod tests {
             .commit_write_set(deleted_locators, StorageWriteOptions::default())
             .await
             .expect("test should emulate a sparse replica missing selected locators");
-        let repeated_history = authority
+        let mut repeated_history = authority
             .sync_history(&repeated_id, 1)
             .await
             .expect("detached selected history should load");
+        close_history_boundary_bodies(&authority, &mut repeated_history).await;
         let mut repeated_boundary_rows = Vec::new();
         for boundary in &repeated_history.boundaries {
             let page = authority
@@ -8268,10 +8310,11 @@ mod tests {
         assert_eq!(replica_commit.members, authority_commit.members);
 
         for authored_commit in authored_commits {
-            let history = authority
+            let mut history = authority
                 .sync_history(&authored_commit.to_string(), 1)
                 .await
                 .expect("authored history should load");
+            close_history_boundary_bodies(&authority, &mut history).await;
             let mut boundary_rows = Vec::new();
             for boundary in &history.boundaries {
                 let mut continuation = None;
@@ -8493,10 +8536,11 @@ mod tests {
             .await
             .expect("checkpoint snapshot should load");
         let (_, head) = default_head(&snapshot);
-        let checkpoint_history = authority
+        let mut checkpoint_history = authority
             .sync_history(&head, 1)
             .await
             .expect("checkpoint body should load");
+        close_history_boundary_bodies(&authority, &mut checkpoint_history).await;
         let mut checkpoint_rows = Vec::new();
         for boundary in &checkpoint_history.boundaries {
             let page = authority
@@ -8526,10 +8570,11 @@ mod tests {
         let authored_commit_id = direct_change_locator(shared_change_id_parsed)
             .expect("locally authored change should encode its commit address")
             .commit_id;
-        let authored_history = authority
+        let mut authored_history = authority
             .sync_history(&authored_commit_id.to_string(), 1)
             .await
             .expect("selected change's authored body should load");
+        close_history_boundary_bodies(&authority, &mut authored_history).await;
         assert!(
             authored_history.commits[0]
                 .members
@@ -9440,7 +9485,7 @@ mod tests {
             .clone()
             .expect("merge push should advance the branch");
 
-        let page = authority
+        let mut page = authority
             .sync_history(&merge_head, 2)
             .await
             .expect("cold merge page should load");
@@ -9480,6 +9525,8 @@ mod tests {
             3,
             "the merge, oldest causal body, and external global base all need boundaries"
         );
+        let expected_page_commits = page.commits.clone();
+        close_history_boundary_bodies(&authority, &mut page).await;
 
         let mut rows = Vec::new();
         for boundary in &page.boundaries {
@@ -9501,36 +9548,10 @@ mod tests {
                 continuation = Some(next);
             }
         }
-        let mut import_commits = page.commits.clone();
-        let mut import_headers = page
-            .commit_headers
-            .iter()
-            .cloned()
-            .map(|header| (header.commit_id.clone(), header))
-            .collect::<BTreeMap<_, _>>();
-        for boundary in &page.boundaries {
-            if import_commits
-                .iter()
-                .any(|commit| commit.commit_id == boundary.commit_id)
-            {
-                continue;
-            }
-            let dependency = authority
-                .sync_history(&boundary.commit_id, 1)
-                .await
-                .expect("external boundary body should load");
-            import_commits.extend(dependency.commits);
-            import_headers.extend(
-                dependency
-                    .commit_headers
-                    .into_iter()
-                    .map(|header| (header.commit_id.clone(), header)),
-            );
-        }
-        cold.import_sync_history_headers(&import_headers.into_values().collect::<Vec<_>>())
+        cold.import_sync_history_headers(&page.commit_headers)
             .await
             .expect("cold replica should accept sparse topology");
-        cold.import_sync_history_boundaries(&import_commits, &page.boundaries, &rows)
+        cold.import_sync_history_boundaries(&page.commits, &page.boundaries, &rows)
             .await
             .expect("cold replica should import a merge page with two boundaries");
         assert_eq!(
@@ -9538,7 +9559,7 @@ mod tests {
                 .await
                 .expect("imported merge history should be readable")
                 .commits,
-            page.commits,
+            expected_page_commits,
         );
     }
 
@@ -10986,10 +11007,11 @@ mod tests {
                             .to_owned()]
                     };
                     for commit_id in commit_ids {
-                        let page = authority
+                        let mut page = authority
                             .sync_history(&commit_id, 100)
                             .await
                             .expect("deferred diff history should load from authority");
+                        close_history_boundary_bodies(&authority, &mut page).await;
                         let mut boundary_rows = Vec::new();
                         for boundary in &page.boundaries {
                             let rows = authority
