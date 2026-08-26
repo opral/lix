@@ -475,8 +475,27 @@ async fn commit_root_is_global<S: StorageAdapterRead + Clone>(store: S, commit_i
         .map_err(lix_error_to_datafusion_error)?;
     let manifest = crate::tracked_state::load_published_commit_state_topology(&store, commit_id)
         .await
+        .map_err(lix_error_to_datafusion_error)?;
+    let Some(manifest) = manifest else {
+        // A sparse sync replica holds this commit's header with a deferred
+        // history body; classify the absence as a typed sync demand so the
+        // session hydrates and retries instead of failing the read.
+        return Err(lix_error_to_datafusion_error(
+            crate::tracked_state::missing_commit_state_manifest_error(&store, commit_id).await,
+        ));
+    };
+    // A manifest can also arrive ahead of its deferred body (bootstrap sends
+    // checkpoint headers hot). Reading the tree then would materialize a
+    // partial batch — e.g. a file descriptor without its directory — so the
+    // whole read demands hydration up front.
+    if crate::tracked_state::commit_history_is_deferred(&store, commit_id)
+        .await
         .map_err(lix_error_to_datafusion_error)?
-        .ok_or_else(|| DataFusionError::Execution(format!("commit '{commit_id}' has no tracked-state authority")))?;
+    {
+        return Err(lix_error_to_datafusion_error(
+            crate::tracked_state::sync_history_required_for_commits(&[commit_id]),
+        ));
+    }
     Ok(manifest.global_scope())
 }
 

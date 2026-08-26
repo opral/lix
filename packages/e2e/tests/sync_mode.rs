@@ -1653,3 +1653,184 @@ async fn stop_server(task: tokio::task::JoinHandle<()>) {
     task.abort();
     let _ = task.await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_replica_reads_point_in_time_filesystem_state() {
+    // Regression: a freshly bootstrapped replica holds hot state plus
+    // deferred history payloads. lix_state_at and lix_diff at an old
+    // checkpoint must hydrate the missing payloads (like lix_history does)
+    // instead of reading a partial tree — which surfaced as
+    // "filesystem descriptor references missing directory" and empty
+    // directory trees on a repository whose server copy is consistent.
+    let (authority_storage, authority) = open_authority().await;
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/sales/playbook.md', CAST('one' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("create /sales/playbook.md");
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/docs/handbook/inside.md', CAST('two' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("create /docs/handbook/inside.md");
+    let first_checkpoint = authority
+        .create_checkpoint()
+        .await
+        .expect("checkpoint seeded filesystem");
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/brand/logo.md', CAST('three' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("create /brand/logo.md");
+    let second_checkpoint = authority
+        .create_checkpoint()
+        .await
+        .expect("checkpoint second filesystem state");
+    // Enough later commits that the checkpoint payloads stay cold on a
+    // fresh bootstrap.
+    for index in 0..105 {
+        put_value(&authority, &format!("state-at-page-{index:03}"), "value").await;
+    }
+    authority.close().await.expect("close authority setup");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+
+    let commit_id = first_checkpoint.commit_id.clone();
+    let files = replica
+        .execute(
+            "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
+            &[Value::Text(commit_id.clone())],
+        )
+        .await
+        .expect("point-in-time file state hydrates on a fresh replica");
+    let file_names = files
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("name").expect("file name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        file_names.len(),
+        2,
+        "first checkpoint holds both seeded files, got {file_names:?}"
+    );
+
+    let directories = replica
+        .execute(
+            "SELECT id, name FROM lix_state_at('lix_directory', $1)",
+            &[Value::Text(commit_id.clone())],
+        )
+        .await
+        .expect("point-in-time directory state hydrates on a fresh replica");
+    let directory_names = directories
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("name").expect("directory name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        directory_names.len(),
+        3,
+        "first checkpoint holds sales, docs, handbook — got {directory_names:?}"
+    );
+    let directory_ids = directories
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").expect("directory id"))
+        .collect::<std::collections::HashSet<_>>();
+    for file in files.rows() {
+        if let Ok(directory_id) = file.get::<String>("directory_id") {
+            assert!(
+                directory_ids.contains(&directory_id),
+                "file references directory '{directory_id}' missing from the same tree"
+            );
+        }
+    }
+
+    // The product's checkpoint-open read: a root diff with resolved paths.
+    let diff = replica
+        .execute(
+            "SELECT to_path FROM lix_diff('lix_file', lix_root_commit_id(), $1) ORDER BY to_path",
+            &[Value::Text(commit_id)],
+        )
+        .await
+        .expect("root diff with paths hydrates on a fresh replica");
+    let paths = diff
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("to_path").expect("path"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![
+            "/docs/handbook/inside.md".to_string(),
+            "/sales/playbook.md".to_string(),
+        ],
+        "resolved historical paths"
+    );
+
+    // The product's checkpoint click: the span between two checkpoints,
+    // with both sides' paths resolved through their own commit trees.
+    let span = replica
+        .execute(
+            "SELECT lixcol_diff_type, coalesce(to_path, from_path) AS path
+             FROM lix_diff('lix_file', $1, $2)
+             ORDER BY coalesce(to_path, from_path)",
+            &[
+                Value::Text(first_checkpoint.commit_id.clone()),
+                Value::Text(second_checkpoint.commit_id.clone()),
+            ],
+        )
+        .await
+        .expect("checkpoint-span diff hydrates on a fresh replica");
+    let span_rows = span
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("lixcol_diff_type").expect("diff type"),
+                row.get::<String>("path").expect("path"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        span_rows,
+        vec![("added".to_string(), "/brand/logo.md".to_string())],
+        "checkpoint span resolves through both pinned trees"
+    );
+
+    // The newest checkpoint reads completely as well — the tree the
+    // product opens first.
+    let latest_directories = replica
+        .execute(
+            "SELECT name FROM lix_state_at('lix_directory', $1) ORDER BY name",
+            &[Value::Text(second_checkpoint.commit_id.clone())],
+        )
+        .await
+        .expect("latest checkpoint directory state hydrates");
+    let latest_names = latest_directories
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("name").expect("directory name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        latest_names,
+        vec![
+            "brand".to_string(),
+            "docs".to_string(),
+            "handbook".to_string(),
+            "sales".to_string(),
+        ],
+        "latest checkpoint holds every directory"
+    );
+
+    replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+}
