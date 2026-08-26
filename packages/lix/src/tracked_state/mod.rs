@@ -112,7 +112,6 @@ pub(crate) use storage::{
     load_local_commit_delta_members_with_payloads, load_local_selected_change_owner_commit_ids,
     load_owned_commit_delta_entries, load_owned_commit_delta_entries_one_ordered_ref,
     load_published_commit_state_topology, load_retained_commit_snapshots_for_schemas,
-    missing_commit_state_manifest_error,
     scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_members,
     scan_commit_delta_values, scan_commit_state_manifest_commit_ids,
     selected_change_selection_fingerprint,
