@@ -58,7 +58,6 @@ pub mod changelog;
 pub(crate) mod changelog;
 pub(crate) mod checkpoint;
 pub(crate) mod collection_generation;
-pub mod debug_export;
 pub(crate) mod columnar_row_group;
 pub(crate) mod commit_graph;
 mod common;

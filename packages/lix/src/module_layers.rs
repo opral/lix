@@ -116,7 +116,6 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
         "json_predicate_pushdown_probe",
         "cfg(test) measurement probe",
     ),
-    ("debug_export", "one-off storage export tooling"),
     ("lib", "crate root"),
     ("module_layers", "this guard"),
     ("migration", "offline repository format migration"),
