@@ -26,8 +26,8 @@ use crate::storage_adapter::{
 };
 use crate::storage_adapter::StorageWriteOptions as AdapterWriteOptions;
 use crate::tracked_state::{
-    CommitStateReplayDebt, TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
-    TrackedStateScanRequest,
+    CommitStateReplayDebt, TrackedStateContext, TrackedStateFilter, TrackedStateKeyRef,
+    TrackedStateReadColumns, TrackedStateScanRequest,
     backfill_row_pk_index_for_commit, encode_commit_state_manifest_replacement_for_migration,
     load_rebuild_plans_to_nearest_available_root_bounded, stage_rebuild_plan_with_writer,
 };
@@ -241,12 +241,13 @@ where
         if from_version <= 73 {
             migrate_v73_row_pk_indexes(&adapter, &storage, options).await?;
         }
-        migrate_v74_complete_snapshot_commits(&adapter, &storage, options).await?;
+        let commit_members_rewritten =
+            migrate_v74_complete_snapshot_commits(&adapter, &storage, options).await?;
         return Ok(MigrationReport {
             from_version,
             to_version: CURRENT_FORMAT_VERSION,
             changes_rewritten: commit_records_rewritten,
-            commit_members_rewritten: 0,
+            commit_members_rewritten,
             hot_rows_rewritten,
         });
     }
@@ -647,6 +648,8 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let rewritten = rewrite_commit_records_to_v6(adapter, storage, options, 74).await?;
+    let (members_injected, repaired_manifests) =
+        repair_filesystem_closure(adapter, storage, options).await?;
     let read = SharedStorageAdapterRead::new(
         adapter
             .begin_read(ReadOptions::default())
@@ -657,15 +660,365 @@ where
         .await
         .map_err(storage_error)?;
     read.finish().map_err(storage_error)?;
+    let mut publication = crate::migration::publish::PublicationPlan::bounded(
+        repaired_manifests.len().saturating_mul(2),
+        options.max_preflight_bytes,
+    );
+    for manifest in repaired_manifests {
+        for (space, key, value) in
+            encode_commit_state_manifest_replacement_for_migration(&manifest)?
+        {
+            publication.replace_immutable(space, vec![(key, value)])?;
+        }
+    }
     crate::migration::publish::publish(
         storage,
         expected_revision,
         REPOSITORY_PROTOCOL_V74,
         crate::init::REPOSITORY_PROTOCOL_VALUE,
-        crate::migration::publish::PublicationPlan::bounded(0, 0),
+        publication,
     )
     .await?;
-    Ok(rewritten)
+    Ok(rewritten.saturating_add(members_injected))
+}
+
+/// Repairs filesystem closure inside every commit tree before v75 publishes.
+///
+/// v72-era partial checkpoints on migrated repositories could commit a file
+/// descriptor without its swept ancestor directories, leaving trees whose
+/// files reference directories absent from the same tree. Every strict v75
+/// read of such a tree fails. The repair injects the missing directory rows
+/// as tree index entries referencing the directory's existing authoritative
+/// change record, resolved from the branch heads' trees — the recoverable
+/// descriptor. No new change records are created and commit deltas stay
+/// untouched, so touched-scope digests remain valid; the referenced owning
+/// commits are already retained by the branches that reach them.
+async fn repair_filesystem_closure<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+    storage: &S,
+    options: MigrationOptions,
+) -> Result<(u64, Vec<crate::tracked_state::CommitStateManifest>), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+    const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+
+    fn snapshot_text(
+        row: &crate::tracked_state::MaterializedTrackedStateRow,
+        field: &str,
+    ) -> Option<String> {
+        let snapshot = row.decoded_snapshot.as_ref()?;
+        match snapshot.row.get(field) {
+            Some(lix_schema::Value::Text(value)) => Some(value.clone()),
+            Some(lix_schema::Value::Uuid(value)) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    fn index_value_ref(
+        row: &crate::tracked_state::MaterializedTrackedStateRow,
+    ) -> Result<crate::tracked_state::TrackedStateIndexValueRef, LixError> {
+        Ok(crate::tracked_state::TrackedStateIndexValueRef {
+            change_id: row.change_id,
+            commit_id: row.commit_id,
+            deleted: false,
+            created_at: crate::common::LixTimestamp::parse(&row.created_at)
+                .map_err(|error| migration_error(format!("repair created_at: {error}")))?,
+            updated_at: crate::common::LixTimestamp::parse(&row.updated_at)
+                .map_err(|error| migration_error(format!("repair updated_at: {error}")))?,
+        })
+    }
+
+    let operation = "v74 filesystem-closure repair";
+    let read = SharedStorageAdapterRead::new(
+        adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?,
+    );
+    let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+        .await
+        .map_err(storage_error)?;
+    let commit_ids = crate::tracked_state::scan_commit_state_manifest_commit_ids(&read).await?;
+
+    // The recoverable descriptor source: directory rows visible at any
+    // branch head's tree.
+    let heads = BranchHeadControlContext::new()
+        .reader(read.clone())
+        .scan()
+        .await?
+        .into_iter()
+        .map(|(_, control)| control.head_commit_id)
+        .collect::<BTreeSet<_>>();
+    let mut source = BTreeMap::<String, crate::tracked_state::MaterializedTrackedStateRow>::new();
+    let mut reader = TrackedStateContext::new().reader(read.clone());
+    for head in &heads {
+        let rows = reader
+            .scan_batch_at_commit(
+                &head.to_string(),
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_owned()],
+                        ..TrackedStateFilter::default()
+                    },
+                    read_columns: TrackedStateReadColumns::default(),
+                    limit: Some(options.max_changes),
+                },
+            )
+            .await?
+            .into_rows();
+        for row in rows {
+            let Some(id) = snapshot_text(&row, "id") else {
+                continue;
+            };
+            source.entry(id).or_insert(row);
+        }
+    }
+
+    let mut chunk_writes = adapter.new_write_set();
+    let mut replacements = Vec::new();
+    let mut injected_total = 0_u64;
+    let mut visited_rows = 0_usize;
+    for commit_id in commit_ids {
+        let commit_key = commit_id.to_string();
+        let rows = reader
+            .scan_batch_at_commit(
+                &commit_key,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![
+                            FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
+                            DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_owned(),
+                        ],
+                        ..TrackedStateFilter::default()
+                    },
+                    read_columns: TrackedStateReadColumns::default(),
+                    limit: Some(options.max_changes.saturating_sub(visited_rows)),
+                },
+            )
+            .await?
+            .into_rows();
+        visited_rows = visited_rows.saturating_add(rows.len());
+        if visited_rows > options.max_changes {
+            return Err(LixError::new(
+                "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+                format!("{operation} exceeds configured row bound"),
+            ));
+        }
+
+        let mut present = BTreeSet::new();
+        let mut referenced = BTreeSet::new();
+        for row in &rows {
+            match row.schema_key.as_str() {
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                    if let Some(id) = snapshot_text(row, "id") {
+                        present.insert(id);
+                    }
+                    if let Some(parent) = snapshot_text(row, "parent_id") {
+                        referenced.insert(parent);
+                    }
+                }
+                FILE_DESCRIPTOR_SCHEMA_KEY => {
+                    if let Some(directory) = snapshot_text(row, "directory_id") {
+                        referenced.insert(directory);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut missing = Vec::new();
+        let mut worklist = referenced
+            .difference(&present)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        while let Some(id) = worklist.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(row) = source.get(&id) else {
+                return Err(migration_error(format!(
+                    "{operation} cannot resolve directory '{id}' referenced by commit \
+                     '{commit_id}' from any branch head"
+                )));
+            };
+            if let Some(parent) = snapshot_text(row, "parent_id")
+                && !present.contains(&parent)
+            {
+                worklist.push(parent);
+            }
+            missing.push(id);
+        }
+        if missing.is_empty() {
+            continue;
+        }
+        missing.sort();
+
+        let mut manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
+            .await?
+            .ok_or_else(|| {
+                migration_error(format!(
+                    "{operation} commit '{commit_id}' has no commit-state manifest"
+                ))
+            })?;
+        let mut injected =
+            crate::tracked_state::TrackedStateMutationBatchBuilder::with_row_capacity(
+                missing.len(),
+            );
+        for id in &missing {
+            let row = source.get(id).expect("resolved above");
+            injected.push(
+                TrackedStateKeyRef {
+                    schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+                    file_id: row.file_id.as_deref(),
+                    row_pk: &row.row_pk,
+                },
+                index_value_ref(row)?,
+            );
+        }
+        let (primary, secondary) =
+            crate::tracked_state::with_row_pk_index_mutations(injected.finish())?;
+
+        let mut overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
+        let tree = crate::tracked_state::TrackedStateTree::new();
+        if let Some(existing_root) = manifest.snapshot_root.as_deref() {
+            let result = tree
+                .apply_mutations_with_overlay(
+                    &read,
+                    &mut chunk_writes,
+                    &mut overlay,
+                    Some(&existing_root.root_id),
+                    primary,
+                    Some(&commit_key),
+                )
+                .await?;
+            let mut repaired_root = existing_root.clone();
+            repaired_root.root_id = result.root_id;
+            repaired_root.changed_key_count = repaired_root
+                .changed_key_count
+                .saturating_add(missing.len() as u64);
+            repaired_root.row_count_estimate = repaired_root
+                .row_count_estimate
+                .saturating_add(missing.len() as u64);
+            repaired_root.tree_height = result.tree_height as u32;
+            manifest.snapshot_root = Some(Box::new(repaired_root));
+        } else {
+            // Rootless commits serve reads by replaying deltas, where the
+            // injected entries would never appear. Materialize a complete
+            // fenced root from the commit's full resolved state plus the
+            // injected directories.
+            let full_rows = reader
+                .scan_batch_at_commit(
+                    &commit_key,
+                    &TrackedStateScanRequest {
+                        limit: Some(options.max_changes),
+                        ..TrackedStateScanRequest::default()
+                    },
+                )
+                .await?
+                .into_rows();
+            let mut full = crate::tracked_state::TrackedStateMutationBatchBuilder::with_row_capacity(
+                full_rows.len() + missing.len(),
+            );
+            for row in &full_rows {
+                full.push(
+                    TrackedStateKeyRef {
+                        schema_key: &row.schema_key,
+                        file_id: row.file_id.as_deref(),
+                        row_pk: &row.row_pk,
+                    },
+                    index_value_ref(row)?,
+                );
+            }
+            for id in &missing {
+                let row = source.get(id).expect("resolved above");
+                full.push(
+                    TrackedStateKeyRef {
+                        schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+                        file_id: row.file_id.as_deref(),
+                        row_pk: &row.row_pk,
+                    },
+                    index_value_ref(row)?,
+                );
+            }
+            let result = tree
+                .apply_mutations_with_overlay(
+                    &read,
+                    &mut chunk_writes,
+                    &mut overlay,
+                    None,
+                    full.finish(),
+                    Some(&commit_key),
+                )
+                .await?;
+            manifest.snapshot_root =
+                Some(Box::new(crate::tracked_state::TrackedStateCommitRoot {
+                    commit_id,
+                    root_id: result.root_id,
+                    parent_roots: Vec::new(),
+                    changed_key_count: result.row_count as u64,
+                    row_count_estimate: result.row_count as u64,
+                    tree_height: result.tree_height as u32,
+                    complete_state_fence: true,
+                }));
+            manifest.replay_debt = CommitStateReplayDebt::default();
+        }
+
+        let row_pk_base = manifest.row_pk_index_root_id.clone();
+        let result = tree
+            .apply_mutations_with_overlay(
+                &read,
+                &mut chunk_writes,
+                &mut overlay,
+                row_pk_base.as_ref(),
+                secondary,
+                Some(&commit_key),
+            )
+            .await?;
+        manifest.row_pk_index_root_id = Some(result.root_id);
+
+        injected_total = injected_total.saturating_add(missing.len() as u64);
+        replacements.push(manifest);
+    }
+    drop(reader);
+    read.finish().map_err(storage_error)?;
+
+    let chunk_stats = chunk_writes.stats();
+    if chunk_stats.written_bytes > options.max_preflight_bytes as u64 {
+        return Err(LixError::new(
+            "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+            format!(
+                "{operation} exceeds configured byte bound: {} bytes",
+                chunk_stats.written_bytes
+            ),
+        ));
+    }
+    if chunk_stats.staged_puts != 0 || chunk_stats.staged_deletes != 0 {
+        let mut write = storage
+            .begin_write(WriteOptions {
+                await_durable: true,
+                preconditions: vec![
+                    Precondition::KeyValueEquals {
+                        space: REPOSITORY_PROTOCOL_SPACE,
+                        key: Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY)),
+                        expected: Bytes::from_static(REPOSITORY_PROTOCOL_V74),
+                    },
+                    crate::storage_adapter::repository_mutation_revision_precondition(
+                        expected_revision,
+                    ),
+                ],
+                ..WriteOptions::default()
+            })
+            .await
+            .map_err(storage_error)?;
+        if let Err(error) = chunk_writes.lower_into(&mut write).await {
+            let _ = write.rollback().await;
+            return Err(error.into());
+        }
+        write.commit().await.map_err(storage_error)?;
+    }
+    Ok((injected_total, replacements))
 }
 
 /// Rewrites every v5 commit record to the v6 complete-snapshot arity.

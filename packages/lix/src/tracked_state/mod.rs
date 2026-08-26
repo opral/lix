@@ -62,7 +62,10 @@ pub(crate) use replacement_part::{
 pub(crate) use row_pk_index::{
     backfill_row_pk_index_for_commit, decode_row_pk_index_key, row_pk_index_scan_request,
     stage_row_pk_index_from_deltas, stage_row_pk_index_from_members,
+    with_row_pk_index_mutations,
 };
+pub(crate) use codec::TrackedStateMutationBatchBuilder;
+pub(crate) use tree::TrackedStateTree;
 pub(crate) use row_materialization::{
     MaterializedTrackedStateBatch, MaterializedTrackedStateExactBatch,
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
@@ -172,7 +175,8 @@ pub(crate) use types::{
     CommitStateMutationInventory, CommitStateReplayDebt, CommitStateTouchedScopeFilter,
     MaterializedTrackedStateRow, RowPkRangeBound, TrackedStateBaseCoordinate,
     TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateCommitRootParent,
-    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
+    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateIndexValueRef,
+    TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
     row_pk_satisfies_bounds,
 };
