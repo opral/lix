@@ -1114,16 +1114,21 @@ where
         } else {
             let newest_not_after = global_chronology
                 .partition_point(|(created_at, _, _)| *created_at <= record.created_at);
-            // Clock skew across devices can stamp a local commit earlier
-            // than every global-lineage commit — the lineage root carries
-            // the creating device's clock. Clamp to the oldest lineage
-            // commit instead of failing the migration forever: a synced
-            // local commit observed at least the state the lineage began
-            // with.
-            let index = newest_not_after.saturating_sub(1);
-            let (_, _, base) = global_chronology
-                .get(index)
-                .expect("the global lineage walk pushed at least the head");
+            // A local commit stamped before every global-lineage commit
+            // means the timestamps contradict the chronological premise
+            // itself (device clock skew). Fail closed before any write: a
+            // guessed base would permanently misattribute every later
+            // `lix_state_at` read at this commit with no error, ever. The
+            // named commit gives the operator something to investigate.
+            let Some((_, _, base)) = newest_not_after
+                .checked_sub(1)
+                .and_then(|index| global_chronology.get(index))
+            else {
+                return Err(migration_error(format!(
+                    "{operation} local commit '{}' predates every global-lineage commit",
+                    record.commit_id
+                )));
+            };
             Some(*base)
         };
         let upgraded = crate::changelog::CommitRecord {
