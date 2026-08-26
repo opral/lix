@@ -114,7 +114,10 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
         refresh_commit_id = active_commit_id(&source).await;
         assert_eq!(
             commit_parent_edges(&main, &refresh_commit_id).await,
-            vec![(fork_commit_id.clone(), 0)],
+            vec![
+                (fork_commit_id.clone(), 0),
+                (checkpoint_commit_id.clone(), 1),
+            ],
         );
         assert_eq!(
             commit_base_id(&main, &refresh_commit_id).await,
@@ -161,7 +164,10 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
     );
     assert_eq!(
         commit_parent_edges(&main, &refresh_commit_id).await,
-        vec![(fork_commit_id.clone(), 0)],
+        vec![
+            (fork_commit_id.clone(), 0),
+            (checkpoint_commit_id.clone(), 1),
+        ],
     );
     assert_eq!(
         commit_base_id(&main, &refresh_commit_id).await,
@@ -181,7 +187,7 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
         })
         .await
         .expect("disjoint merge preview after cold reopen");
-    assert_eq!(preview.base_commit_id, fork_commit_id);
+    assert_eq!(preview.base_commit_id, checkpoint_commit_id);
     assert_eq!(preview.outcome, MergeBranchOutcome::MergeCommitted);
     assert!(preview.conflicts.is_empty());
     assert_eq!(

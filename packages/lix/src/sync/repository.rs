@@ -3108,7 +3108,7 @@ where
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
         for commit_id in header_by_id.keys().copied() {
-            if snapshot_body_ids.contains(&commit_id) {
+            if parsed_heads.contains_key(&commit_id) {
                 stage_commit_history_available(&mut writes, commit_id);
             } else {
                 stage_commit_history_deferred_with_scope(
