@@ -89,6 +89,19 @@ impl Memory {
         Self::default()
     }
 
+    /// Builds an in-memory storage from raw physical entries — 4-byte
+    /// big-endian space prefix followed by the logical key. Debug/export
+    /// tooling only: bypasses write semantics entirely.
+    pub fn from_physical_entries(
+        entries: impl IntoIterator<Item = (Key, Bytes)>,
+    ) -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(PersistentMap::from_sorted(
+                entries.into_iter().collect(),
+            ))),
+        }
+    }
+
     /// Opens an in-memory storage from a deterministic snapshot previously
     /// returned by [`Self::export_snapshot`].
     pub fn from_snapshot(snapshot: &[u8]) -> Result<Self, StorageError> {
