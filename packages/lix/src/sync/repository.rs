@@ -8809,17 +8809,14 @@ mod tests {
             .find(|commit| commit.commit_id == source_head)
             .cloned()
             .expect("source head commit should exist");
-        let mut source_commits = source_history.commits.clone();
+        let source_commits = source_history.commits.clone();
         if let Some(base) = source_commit.base_commit_id.as_deref() {
-            let base_commit = source
-                .sync_history(base, 1)
-                .await
-                .expect("source base history should load")
-                .commits
-                .into_iter()
-                .find(|commit| commit.commit_id == base)
-                .expect("source base body should exist");
-            source_commits.push(base_commit);
+            assert!(
+                source_commits
+                    .iter()
+                    .any(|commit| commit.commit_id == base),
+                "history inlines the pinned base dependency",
+            );
         }
 
         let target = open_lix().await.expect("target should open");

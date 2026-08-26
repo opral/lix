@@ -1658,26 +1658,42 @@ mod tests {
                     next = commit.parent_commit_ids.first().cloned();
                     newest_first.push(commit);
                 }
-                let returned = newest_first
+                let body_ids = newest_first
                     .iter()
-                    .map(|commit| commit.commit_id.as_str())
+                    .map(|commit| commit.commit_id.clone())
                     .collect::<BTreeSet<_>>();
-                let boundaries = newest_first
+                let external_base_ids = newest_first
+                    .iter()
+                    .filter_map(|commit| commit.base_commit_id.clone())
+                    .filter(|base| !body_ids.contains(base))
+                    .collect::<BTreeSet<_>>();
+                let mut boundary_ids = newest_first
                     .iter()
                     .filter(|commit| {
                         commit
                             .parent_commit_ids
-                            .first()
-                            .is_some_and(|parent| !returned.contains(parent.as_str()))
+                            .iter()
+                            .any(|parent| !body_ids.contains(parent))
                     })
-                    .map(|commit| {
+                    .map(|commit| commit.commit_id.clone())
+                    .collect::<BTreeSet<_>>();
+                boundary_ids.extend(external_base_ids.iter().cloned());
+                let boundaries = boundary_ids
+                    .into_iter()
+                    .map(|commit_id| {
                         self.history_boundaries
-                            .get(&commit.commit_id)
+                            .get(&commit_id)
                             .cloned()
                             .expect("test boundary has a certified live root")
                     })
                     .collect();
                 newest_first.reverse();
+                newest_first.extend(external_base_ids.into_iter().map(|commit_id| {
+                    self.commits
+                        .get(&commit_id)
+                        .cloned()
+                        .expect("test base dependency has a canonical body")
+                }));
                 Ok(super::super::SyncHistoryResponse {
                     commits: newest_first,
                     commit_headers: self.commit_headers.clone(),
@@ -2559,7 +2575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deep_history_fetches_one_requested_body_with_bounded_headers() {
+    async fn deep_history_inlines_base_body_without_an_extra_request() {
         let authority = open_lix().await.expect("authority opens");
         for index in 0..32 {
             authority
@@ -2584,7 +2600,23 @@ mod tests {
             .sync_history(&head, 1)
             .await
             .expect("authority exports one deep head");
-        assert_eq!(response.commits.len(), 1);
+        let head_commit = response
+            .commits
+            .iter()
+            .find(|commit| commit.commit_id == head)
+            .expect("response contains the requested head");
+        let base_commit_id = head_commit
+            .base_commit_id
+            .clone()
+            .expect("authored head pins its global base");
+        assert_eq!(response.commits.len(), 2);
+        assert!(
+            response
+                .commits
+                .iter()
+                .any(|commit| commit.commit_id == base_commit_id),
+            "the pinned base body is an inline dependency",
+        );
         assert!(
             response.commit_headers.len() <= 6,
             "header closure must stay bounded independently of history depth",
@@ -2622,7 +2654,19 @@ mod tests {
         )
         .await
         .expect("deep head fetch succeeds");
-        assert_eq!(fetched.commits.len(), 1);
+        assert_eq!(fetched.commits.len(), 2);
+        assert!(
+            fetched
+                .commits
+                .iter()
+                .any(|commit| commit.commit_id == head)
+        );
+        assert!(
+            fetched
+                .commits
+                .iter()
+                .any(|commit| commit.commit_id == base_commit_id)
+        );
         assert!(fetched.commit_headers.len() <= 6);
         assert_eq!(
             *calls.lock().expect("history calls lock"),
@@ -3376,7 +3420,17 @@ mod tests {
         )
         .await
         .expect("precise history fetch succeeds");
-        assert_eq!(fetched.commits.len(), 1);
+        assert_eq!(
+            fetched.commits.len(),
+            2,
+            "the one causal body carries its pinned base dependency inline",
+        );
+        assert!(
+            fetched
+                .commits
+                .iter()
+                .any(|commit| commit.commit_id == parent)
+        );
         assert_eq!(
             *calls.lock().expect("history calls lock"),
             vec![vec![parent]],
