@@ -5480,7 +5480,7 @@ mod tests {
     }
 
     /// The branch-control space, identified the way the storage layer
-    /// identifies it: by space id.
+    /// identifies it: by the logical portion of its space id.
     ///
     /// This gate has to recognise the authoritative branch-control read that
     /// `switch_branch` issues. It used to recognise it by *name*, and a space
@@ -5494,14 +5494,15 @@ mod tests {
     /// version bump but still breaks on an actual rename, because it is still
     /// a contract on the name.
     ///
-    /// The id is the durable identity: it is the first four bytes of every
-    /// physical key, so changing it for a live space is a layout break rather
-    /// than a routine bump, and `0x0004_0020` came through `v10 -> v11`
-    /// untouched. The declaration this pins to is
-    /// `lix::registered_spaces::BRANCH_HEAD_CONTROL_SPACE`, which is `pub` only
-    /// under the `storage-benches` feature that this crate deliberately does
-    /// not enable; the id is therefore restated here rather than imported.
+    /// The low 30 bits are the durable logical identity; epoch routing reserves
+    /// the high two bits to select the physical bank. Changing the logical id
+    /// for a live space is a layout break rather than a routine bump, and
+    /// `0x0004_0020` came through `v10 -> v11` untouched. The declaration this
+    /// pins to is `lix::registered_spaces::BRANCH_HEAD_CONTROL_SPACE`, which is
+    /// `pub` only under the `storage-benches` feature that this crate deliberately
+    /// does not enable; the id is therefore restated here rather than imported.
     const BRANCH_HEAD_CONTROL_SPACE_ID: SpaceId = SpaceId(0x0004_0020);
+    const EPOCH_BANK_MASK: u32 = 0xc000_0000;
 
     #[derive(Clone)]
     struct BlockingFencedBranchControlReadStorage {
@@ -5594,7 +5595,10 @@ mod tests {
         ) -> Result<GetManyResult, StorageError> {
             let reads_branch_control = requests
                 .iter()
-                .any(|request| request.space.id == BRANCH_HEAD_CONTROL_SPACE_ID);
+                .any(|request| {
+                    SpaceId(request.space.id.0 & !EPOCH_BANK_MASK)
+                        == BRANCH_HEAD_CONTROL_SPACE_ID
+                });
             if reads_branch_control
                 && self
                     .gate

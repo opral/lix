@@ -116,6 +116,13 @@ pub const COMMIT_RETIREMENT_INTENT_SPACE: StorageSpace = crate::gc::COMMIT_RETIR
 /// Stable, unbanked control row selecting the active physical repository epoch.
 pub const REPOSITORY_EPOCH_SPACE: StorageSpace = crate::storage_adapter::REPOSITORY_EPOCH_SPACE;
 
+/// Every registered storage space in physical-id order.
+///
+/// Adapter qualification and capacity profiles use this to inspect or copy a
+/// complete repository without duplicating the engine's storage registry. The
+/// list includes the unbanked repository-epoch control space.
+pub const ALL_STORAGE_SPACES: &[StorageSpace] = crate::storage_spaces::ALL_STORAGE_SPACES;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,7 +189,7 @@ mod tests {
     fn the_published_handles_are_exactly_the_registry() {
         assert_eq!(
             PUBLISHED,
-            crate::storage_spaces::ALL_STORAGE_SPACES,
+            ALL_STORAGE_SPACES,
             "the published space handles drifted from ALL_STORAGE_SPACES; \
              add the new space here, or point the stale handle back at its \
              registry row",

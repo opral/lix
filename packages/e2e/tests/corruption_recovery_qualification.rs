@@ -31,10 +31,12 @@ trait DurableBackend: Storage + Clone + Send + Sync + 'static {
     async fn corrupt_binary_chunk(
         &self,
         path: &Path,
+        storage: &StorageAdapter<Self>,
         target_key: &[u8],
         target_value: &[u8],
         offset: usize,
-    );
+    ) where
+        Self: Sized;
 }
 
 #[async_trait]
@@ -50,11 +52,13 @@ impl DurableBackend for RocksDB {
     async fn corrupt_binary_chunk(
         &self,
         _path: &Path,
+        storage: &StorageAdapter<Self>,
         target_key: &[u8],
         _target_value: &[u8],
         offset: usize,
     ) {
-        replace_immutable_value_with_corruption(self, BINARY_CHUNK_SPACE, target_key, offset).await;
+        replace_immutable_value_with_corruption(storage, BINARY_CHUNK_SPACE, target_key, offset)
+            .await;
         self.flush().expect("flush corrupt RocksDB binary chunk");
     }
 }
@@ -74,6 +78,7 @@ impl DurableBackend for SlateDB {
     async fn corrupt_binary_chunk(
         &self,
         path: &Path,
+        _storage: &StorageAdapter<Self>,
         _target_key: &[u8],
         target_value: &[u8],
         offset: usize,
@@ -103,7 +108,11 @@ async fn qualify_10k_history_manifest<B: DurableBackend>() {
     let directory = tempfile::tempdir().expect("create 10K-history corruption fixture");
     let path = directory.path();
     let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
+    let lix = open_lix()
+        .with_storage(database.clone())
+        .await
+        .expect("open 10K-history corruption fixture");
+    let storage = lix.storage_adapter();
     let fixture = seed_merge_base_fixture_for_bench(
         &storage,
         10_000,
@@ -111,12 +120,18 @@ async fn qualify_10k_history_manifest<B: DurableBackend>() {
     )
     .await
     .expect("seed 10K production commit graph");
+    lix.close().await.expect("close seeded 10K fixture");
+    drop(lix);
     database.flush_all().await;
     drop(storage);
     drop(database);
 
     let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
+    let lix = open_lix()
+        .with_storage(database.clone())
+        .await
+        .expect("cold reopen 10K-history fixture");
+    let storage = lix.storage_adapter();
     assert_eq!(
         merge_base_for_bench(&storage, &fixture.left_head, &fixture.right_head)
             .await
@@ -132,16 +147,25 @@ async fn qualify_10k_history_manifest<B: DurableBackend>() {
         .expect("benchmark head is a UUID")
         .as_bytes()
         .to_vec();
-    replace_immutable_value_with_corruption(&database, COMMIT_MANIFEST_SPACE, &target_key, 0).await;
+    lix.close().await.expect("close healthy 10K reopen");
+    drop(lix);
+    replace_immutable_value_with_corruption(&storage, COMMIT_MANIFEST_SPACE, &target_key, 0).await;
     database.flush_all().await;
     drop(storage);
     drop(database);
 
     let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
-    let error = prepare_merge_for_bench(&storage, &fixture.left_head, &fixture.right_head)
-        .await
-        .expect_err("corrupt commit manifest must fail closed");
+    let error = match open_lix().with_storage(database.clone()).await {
+        Ok(lix) => {
+            let storage = lix.storage_adapter();
+            let result =
+                prepare_merge_for_bench(&storage, &fixture.left_head, &fixture.right_head).await;
+            let _ = lix.close().await;
+            drop(lix);
+            result.expect_err("corrupt commit manifest must fail closed")
+        }
+        Err(error) => error,
+    };
     assert!(
         error.to_string().contains("commit_state_manifest"),
         "unexpected manifest corruption error: {error}"
@@ -172,6 +196,7 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
     .expect("update healthy probe");
     let updated_head = active_head(&lix).await;
     lix.close().await.expect("close seeded workspace");
+    drop(lix);
     database.flush_all().await;
     drop(database);
 
@@ -197,13 +222,13 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
         .await
         .expect("healthy redo should survive reopen");
     assert_probe_value(&lix, "after").await;
+    let storage = lix.storage_adapter();
     lix.close().await.expect("close healthy reopened workspace");
+    drop(lix);
     database.flush_all().await;
-    drop(database);
-
-    let database = B::open(path);
-    corrupt_every_mutable_value(&database, BRANCH_CONTROL_SPACE, 4).await;
+    corrupt_every_mutable_value(&storage, BRANCH_CONTROL_SPACE, 4).await;
     database.flush_all().await;
+    drop(storage);
     drop(database);
 
     let database = B::open(path);
@@ -211,6 +236,7 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
         Ok(lix) => {
             let result = lix.execute("SELECT * FROM lix_key_value", &[]).await;
             let _ = lix.close().await;
+            drop(lix);
             result.expect_err("corrupt branch control must fail on first read")
         }
         Err(error) => error,
@@ -255,6 +281,7 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         .expect("checkpoint updated tracked-tree fixture");
     let updated_head = active_head(&lix).await;
     lix.close().await.expect("close tracked-tree fixture");
+    drop(lix);
     database.flush_all().await;
     drop(database);
 
@@ -287,11 +314,14 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         1,
         "healthy tracked-tree diff row count"
     );
+    let storage = lix.storage_adapter();
     lix.close()
         .await
         .expect("close healthy tracked-tree reopen");
-    corrupt_every_mutable_value(&database, TREE_CHUNK_SPACE, 0).await;
+    drop(lix);
+    corrupt_every_mutable_value(&storage, TREE_CHUNK_SPACE, 0).await;
     database.flush_all().await;
+    drop(storage);
     drop(database);
 
     let database = B::open(path);
@@ -305,6 +335,7 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
                 )
                 .await;
             let _ = lix.close().await;
+            drop(lix);
             result.expect_err("corrupt tracked tree chunk must fail on historical diff")
         }
         Err(error) => error,
@@ -322,41 +353,60 @@ async fn qualify_binary_payload_chunk<B: DurableBackend>() {
     let directory = tempfile::tempdir().expect("create binary-payload corruption fixture");
     let path = directory.path();
     let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
+    let lix = open_lix()
+        .with_storage(database.clone())
+        .await
+        .expect("open binary-payload fixture");
+    let storage = lix.storage_adapter();
     let payload = vec![b'x'; 2 * 1024 * 1024];
     let hash = write_binary_cas_for_bench(&storage, &payload)
         .await
         .expect("seed binary payload");
+    lix.close().await.expect("close binary-payload fixture");
+    drop(lix);
     database.flush_all().await;
     drop(storage);
     drop(database);
 
     let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
+    let lix = open_lix()
+        .with_storage(database.clone())
+        .await
+        .expect("cold reopen binary-payload fixture");
+    let storage = lix.storage_adapter();
     assert_eq!(
         read_binary_cas_for_bench(&storage, &hash)
             .await
             .expect("healthy binary payload should survive cold reopen"),
         Some(payload)
     );
-    let chunks = inventory(&database, BINARY_CHUNK_SPACE).await;
+    let chunks = inventory(&storage, BINARY_CHUNK_SPACE).await;
     let target = chunks.first().expect("binary payload should own a chunk");
+    lix.close()
+        .await
+        .expect("close healthy binary-payload reopen");
+    drop(lix);
     database
-        .corrupt_binary_chunk(path, &target.0, &target.1, 0)
+        .corrupt_binary_chunk(path, &storage, &target.0, &target.1, 0)
         .await;
     drop(storage);
     drop(database);
 
     let database = B::open(path);
-    let storage = StorageAdapter::new(database.clone());
-    let error = read_binary_cas_for_bench(&storage, &hash)
-        .await
-        .expect_err("corrupt file/plugin payload chunk must fail closed");
+    let error = match open_lix().with_storage(database.clone()).await {
+        Ok(lix) => {
+            let storage = lix.storage_adapter();
+            let result = read_binary_cas_for_bench(&storage, &hash).await;
+            let _ = lix.close().await;
+            drop(lix);
+            result.expect_err("corrupt file/plugin payload chunk must fail closed")
+        }
+        Err(error) => error,
+    };
     assert!(
         error.to_string().contains("chunk") || error.to_string().contains("hash"),
         "unexpected binary payload corruption error: {error}"
     );
-    drop(storage);
     drop(database);
 }
 
@@ -383,8 +433,10 @@ async fn assert_probe_value<B: Storage + Clone + Send + Sync + 'static>(lix: &Li
     );
 }
 
-async fn inventory<B: Storage + Clone>(database: &B, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let storage = StorageAdapter::new(database.clone());
+async fn inventory<B: Storage + Clone>(
+    storage: &StorageAdapter<B>,
+    name: &str,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     let read = storage
         .begin_read(StorageReadOptions::default())
         .await
@@ -406,10 +458,13 @@ fn storage_space(name: &str) -> StorageSpace {
     lix::storage_bench::storage_space_by_id(id)
 }
 
-async fn corrupt_every_mutable_value<B: Storage + Clone>(database: &B, name: &str, offset: usize) {
-    let entries = inventory(database, name).await;
+async fn corrupt_every_mutable_value<B: Storage + Clone>(
+    storage: &StorageAdapter<B>,
+    name: &str,
+    offset: usize,
+) {
+    let entries = inventory(storage, name).await;
     assert!(!entries.is_empty(), "corruption target '{name}' is empty");
-    let storage = StorageAdapter::new(database.clone());
     let mut writes = storage.new_write_set();
     let space = storage_space(name);
     assert_eq!(
@@ -435,19 +490,18 @@ async fn corrupt_every_mutable_value<B: Storage + Clone>(database: &B, name: &st
 }
 
 async fn replace_immutable_value_with_corruption<B: Storage + Clone>(
-    database: &B,
+    storage: &StorageAdapter<B>,
     name: &str,
     target_key: &[u8],
     offset: usize,
 ) {
-    let entries = inventory(database, name).await;
+    let entries = inventory(storage, name).await;
     let (_, mut value) = entries
         .into_iter()
         .find(|(key, _)| key == target_key)
         .unwrap_or_else(|| panic!("corruption target key is absent from '{name}'"));
     assert!(offset < value.len(), "corruption offset for '{name}'");
     value[offset] ^= 1;
-    let storage = StorageAdapter::new(database.clone());
     let space = storage_space(name);
     assert_eq!(
         space.value_semantics,

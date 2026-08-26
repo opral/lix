@@ -196,8 +196,9 @@ async fn open_browser_storage(
         sink
     });
     let open_progress = open_progress_dispatch.map(|dispatch| {
-        Arc::new(BrowserOpenProgressSink(BrowserFunctionDispatch(dispatch)))
-            as Arc<dyn OpenProgressSink>
+        let sink: Arc<dyn OpenProgressSink> =
+            Arc::new(BrowserOpenProgressSink(BrowserFunctionDispatch(dispatch)));
+        sink
     });
     #[derive(Deserialize)]
     struct BrowserSyncServerOptions {

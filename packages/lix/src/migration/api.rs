@@ -29,11 +29,22 @@ const REPOSITORY_PROTOCOL_V73: &[u8] = b"tracked-default-branch.v73";
 const REPOSITORY_PROTOCOL_V74: &[u8] = b"tracked-default-branch.v74";
 const ACCOUNT_SCHEMA_KEY: &str = "lix_account";
 
-/// Bounds for explicit offline repository migrations.
+/// Work bounds used by migration qualification and fault-injection tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MigrationOptions {
     pub max_changes: usize,
     pub max_preflight_bytes: usize,
+}
+
+impl MigrationOptions {
+    /// Automatic upgrades cannot strand a valid repository behind a fixed
+    /// limit that applications have no public API to override.
+    pub(crate) const fn automatic() -> Self {
+        Self {
+            max_changes: usize::MAX,
+            max_preflight_bytes: usize::MAX,
+        }
+    }
 }
 
 impl Default for MigrationOptions {

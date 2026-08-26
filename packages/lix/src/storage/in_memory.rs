@@ -89,6 +89,11 @@ impl Memory {
         Self::default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn shared_handle_count(&self) -> usize {
+        Arc::strong_count(&self.entries)
+    }
+
     /// Opens an in-memory storage from a deterministic snapshot previously
     /// returned by [`Self::export_snapshot`].
     pub fn from_snapshot(snapshot: &[u8]) -> Result<Self, StorageError> {

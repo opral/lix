@@ -150,7 +150,6 @@ pub(crate) async fn prepare_sync_bootstrap(
 
 pub(crate) async fn install_sync_bootstrap<StorageImpl>(
     lix: &mut Lix<StorageImpl>,
-    _storage: &StorageImpl,
     server: &crate::ServerOptions,
     prepared: PreparedSyncBootstrap,
 ) -> Result<HttpSyncTransport, LixError>

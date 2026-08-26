@@ -1,23 +1,18 @@
-use std::{
-    ops::Bound,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{ops::Bound, sync::Arc, time::Duration};
 
 use bytes::Bytes;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use futures_util::{FutureExt as _, select_biased};
 
 use crate::engine::{Engine, EngineOptions};
 use crate::storage_adapter::{
-    EpochBank, PutBatch, PutEntry, REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE,
-    Storage, StorageAdapter, StorageAdapterRead as _,
-    StorageBeginScanOptions as BeginScanOptions, StorageCoreProjection as CoreProjection,
-    StorageError, StorageGetManyRequest as GetManyRequest, StorageGetOptions as GetOptions,
-    StorageKey as Key, StorageKeyRange as KeyRange, StoragePrecondition as Precondition,
-    StorageProjectedValue as ProjectedValue, StorageRead, StorageReadOptions as ReadOptions,
-    StorageValue as StoredValue, StorageWrite, StorageWriteOptions as WriteOptions,
+    EpochBank, PutBatch, PutEntry, REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE, Storage,
+    StorageAdapter, StorageAdapterRead as _, StorageBeginScanOptions as BeginScanOptions,
+    StorageCoreProjection as CoreProjection, StorageError, StorageGetManyRequest as GetManyRequest,
+    StorageGetOptions as GetOptions, StorageKey as Key, StorageKeyRange as KeyRange,
+    StoragePrecondition as Precondition, StorageProjectedValue as ProjectedValue, StorageRead,
+    StorageReadOptions as ReadOptions, StorageValue as StoredValue, StorageWrite,
+    StorageWriteOptions as WriteOptions,
 };
 use crate::{LixError, OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport};
 
@@ -62,7 +57,14 @@ where
 {
     'admission: loop {
         match load_pointer(storage).await? {
-            Some((PointerState::Active { bank, generation, format }, bytes)) => {
+            Some((
+                PointerState::Active {
+                    bank,
+                    generation,
+                    format,
+                },
+                bytes,
+            )) => {
                 if format > crate::init::CURRENT_FORMAT_VERSION {
                     return Err(epoch_error(format!(
                         "repository epoch format v{format} is newer than this engine's v{}",
@@ -70,7 +72,8 @@ where
                     )));
                 }
                 if format < crate::init::CURRENT_FORMAT_VERSION {
-                    return migrate_active(storage, bank, generation, format, bytes, progress).await;
+                    return migrate_active(storage, bank, generation, format, bytes, progress)
+                        .await;
                 }
                 if generation >= 2 {
                     let _ = schedule_legacy_retirement(storage.clone(), bytes.clone());
@@ -221,7 +224,9 @@ where
         .map_err(storage_error)?;
     match (source, source_format) {
         (EpochBank::Legacy, 0) => {
-            delete_epoch_control(&mut write).await.map_err(storage_error)?;
+            delete_epoch_control(&mut write)
+                .await
+                .map_err(storage_error)?;
         }
         (EpochBank::Legacy, _format) => {
             let marker = observed_source_marker.ok_or_else(|| {
@@ -230,14 +235,13 @@ where
             write
                 .put_many(
                     crate::init::REPOSITORY_PROTOCOL_SPACE,
-                    single_put(
-                        crate::init::REPOSITORY_PROTOCOL_KEY,
-                        marker.clone(),
-                    ),
+                    single_put(crate::init::REPOSITORY_PROTOCOL_KEY, marker.clone()),
                 )
                 .await
                 .map_err(storage_error)?;
-            delete_epoch_control(&mut write).await.map_err(storage_error)?;
+            delete_epoch_control(&mut write)
+                .await
+                .map_err(storage_error)?;
             crate::storage_adapter::stage_mutation_revision(&mut write)
                 .await
                 .map_err(storage_error)?;
@@ -283,43 +287,51 @@ where
             }
             return Err(storage_error(error));
         }
-        let _heartbeat = match start_migration_heartbeat(storage.clone(), migrating_bytes.clone()) {
+        let heartbeat = match start_migration_heartbeat(storage.clone(), migrating_bytes.clone()) {
             Ok(heartbeat) => heartbeat,
             Err(error) => {
                 delete_pointer(storage, &migrating_bytes).await?;
                 return Err(error);
             }
         };
-        let candidate = StorageAdapter::for_epoch_migration(
-            storage.clone(),
-            target,
-            migrating_bytes.clone(),
-        );
-        let initialize = async {
-            clear_bank(&candidate).await?;
-            Engine::initialize_with_adapter(candidate.clone(), None).await?;
-            Ok::<(), LixError>(())
+        let result = async {
+            let candidate = StorageAdapter::for_epoch_migration(
+                storage.clone(),
+                target,
+                migrating_bytes.clone(),
+            );
+            // Allocate and publish the empty bank, but leave repository
+            // initialization to the normal engine-open path. Sync bootstrap
+            // learns the authority's default branch only after admission, and
+            // that path must be able to supply it to the initializer. An active
+            // empty bank is restart-safe: the next open observes the missing
+            // protocol marker and completes initialization.
+            if let Err(error) = clear_bank(&candidate).await {
+                delete_pointer(storage, &migrating_bytes).await?;
+                return Err(error);
+            }
+            let active = PointerState::Active {
+                bank: target,
+                generation: 1,
+                format: crate::init::CURRENT_FORMAT_VERSION,
+            };
+            let active_bytes = encode_pointer(active);
+            replace_pointer(storage, &migrating_bytes, &active_bytes).await?;
+            Ok(EpochAdmission {
+                adapter: StorageAdapter::for_epoch(storage.clone(), target, active_bytes),
+                report: OpenReport {
+                    format: crate::init::CURRENT_FORMAT_VERSION,
+                    // This admission owns the fresh open; the engine-open path
+                    // completes initialization after sync can supply its
+                    // authoritative default branch.
+                    initialized: true,
+                    migration: None,
+                },
+            })
         }
         .await;
-        if let Err(error) = initialize {
-            delete_pointer(storage, &migrating_bytes).await?;
-            return Err(error);
-        }
-        let active = PointerState::Active {
-            bank: target,
-            generation: 1,
-            format: crate::init::CURRENT_FORMAT_VERSION,
-        };
-        let active_bytes = encode_pointer(active);
-        replace_pointer(storage, &migrating_bytes, &active_bytes).await?;
-        return Ok(EpochAdmission {
-            adapter: StorageAdapter::for_epoch(storage.clone(), target, active_bytes),
-            report: OpenReport {
-                format: crate::init::CURRENT_FORMAT_VERSION,
-                initialized: true,
-                migration: None,
-            },
-        });
+        heartbeat.stop().await?;
+        return result;
     }
 
     let from_format = match legacy_status {
@@ -334,7 +346,9 @@ where
             )));
         }
         super::MigrationStatus::Malformed | super::MigrationStatus::Missing => {
-            return Err(epoch_error("repository has no valid versioned protocol marker"));
+            return Err(epoch_error(
+                "repository has no valid versioned protocol marker",
+            ));
         }
     };
     if from_format < 72
@@ -358,7 +372,10 @@ where
     emit_migrating(progress, from_format);
     let source = StorageAdapter::new(storage.clone());
     let target_bank = EpochBank::A;
-    let source_revision = source.load_mutation_revision().await.map_err(storage_error)?;
+    let source_revision = source
+        .load_mutation_revision()
+        .await
+        .map_err(storage_error)?;
     let migrating = PointerState::Migrating {
         source: EpochBank::Legacy,
         source_format: from_format,
@@ -367,20 +384,18 @@ where
         attempt: uuid::Uuid::now_v7(),
     };
     let migrating_bytes = encode_pointer(migrating);
-    if let Err(error) = claim_legacy(
-        storage,
-        source_revision,
-        &original_marker,
-        &migrating_bytes,
-    )
-    .await
+    if let Err(error) =
+        claim_legacy(storage, source_revision, &original_marker, &migrating_bytes).await
     {
-        if matches!(error, StorageError::PreconditionFailed(_) | StorageError::WriteConflict) {
+        if matches!(
+            error,
+            StorageError::PreconditionFailed(_) | StorageError::WriteConflict
+        ) {
             return Box::pin(admit_repository(storage, progress)).await;
         }
         return Err(storage_error(error));
     }
-    let _heartbeat = match start_migration_heartbeat(storage.clone(), migrating_bytes.clone()) {
+    let heartbeat = match start_migration_heartbeat(storage.clone(), migrating_bytes.clone()) {
         Ok(heartbeat) => heartbeat,
         Err(error) => {
             rollback_legacy(storage, &migrating_bytes, &original_marker).await?;
@@ -388,87 +403,87 @@ where
         }
     };
 
-    let target = StorageAdapter::for_epoch_migration(
-        storage.clone(),
-        target_bank,
-        migrating_bytes.clone(),
-    );
-
-    let migration_source = StorageAdapter::for_epoch_migration(
-        storage.clone(),
-        EpochBank::Legacy,
-        migrating_bytes.clone(),
-    );
-    let fenced_revision = migration_source
-        .load_mutation_revision()
-        .await
-        .map_err(storage_error)?;
-    let candidate_result = async {
-        clear_bank(&target).await?;
-        let _ = copy_repository(&migration_source, &target).await?;
-        let mut marker_write = target.new_write_set();
-        marker_write.put(
-            crate::init::REPOSITORY_PROTOCOL_SPACE,
-            crate::init::REPOSITORY_PROTOCOL_KEY,
-            original_marker.as_ref(),
-        );
-        target
-            .commit_write_set(marker_write, WriteOptions::default())
-            .await
-            .map_err(|error| epoch_error(format!("candidate marker write failed: {error}")))?;
-        super::migrate_lix_with_adapter(
+    let result = async {
+        let target = StorageAdapter::for_epoch_migration(
             storage.clone(),
-            target.clone(),
-            super::MigrationOptions::default(),
-        )
-        .await?;
-        emit_validating(progress, from_format);
-        match super::inspect_lix_with_adapter(&target).await? {
-            super::MigrationStatus::Current { .. } => {}
-            status => {
-                return Err(epoch_error(format!(
-                    "candidate repository validation observed {status:?}"
-                )));
+            target_bank,
+            migrating_bytes.clone(),
+        );
+
+        let migration_source = StorageAdapter::for_epoch_migration(
+            storage.clone(),
+            EpochBank::Legacy,
+            migrating_bytes.clone(),
+        );
+        let fenced_revision = migration_source
+            .load_mutation_revision()
+            .await
+            .map_err(storage_error)?;
+        let candidate_result = async {
+            clear_bank(&target).await?;
+            let _ = copy_repository(&migration_source, &target).await?;
+            let mut marker_write = target.new_write_set();
+            marker_write.put(
+                crate::init::REPOSITORY_PROTOCOL_SPACE,
+                crate::init::REPOSITORY_PROTOCOL_KEY,
+                original_marker.as_ref(),
+            );
+            target
+                .commit_write_set(marker_write, WriteOptions::default())
+                .await
+                .map_err(|error| epoch_error(format!("candidate marker write failed: {error}")))?;
+            super::migrate_lix_with_adapter(
+                storage.clone(),
+                target.clone(),
+                super::MigrationOptions::automatic(),
+            )
+            .await?;
+            emit_validating(progress, from_format);
+            match super::inspect_lix_with_adapter(&target).await? {
+                super::MigrationStatus::Current { .. } => {}
+                status => {
+                    return Err(epoch_error(format!(
+                        "candidate repository validation observed {status:?}"
+                    )));
+                }
             }
+            let engine = Engine::new_with_adapter(target.clone(), EngineOptions::new()).await?;
+            drop(engine);
+            Ok::<(), LixError>(())
         }
-        let engine = Engine::new_with_adapter(target.clone(), EngineOptions::new()).await?;
-        drop(engine);
-        Ok::<(), LixError>(())
+        .await;
+        if let Err(error) = candidate_result {
+            rollback_legacy(storage, &migrating_bytes, &original_marker).await?;
+            return Err(error);
+        }
+
+        let active = PointerState::Active {
+            bank: target_bank,
+            generation: 1,
+            format: crate::init::CURRENT_FORMAT_VERSION,
+        };
+        let active_bytes = encode_pointer(active);
+        if let Err(error) =
+            activate_legacy(storage, &migrating_bytes, fenced_revision, &active_bytes).await
+        {
+            rollback_legacy(storage, &migrating_bytes, &original_marker).await?;
+            return Err(storage_error(error));
+        }
+        Ok(EpochAdmission {
+            adapter: StorageAdapter::for_epoch(storage.clone(), target_bank, active_bytes),
+            report: OpenReport {
+                format: crate::init::CURRENT_FORMAT_VERSION,
+                initialized: false,
+                migration: Some(OpenMigrationReport {
+                    from_format,
+                    to_format: crate::init::CURRENT_FORMAT_VERSION,
+                }),
+            },
+        })
     }
     .await;
-    if let Err(error) = candidate_result {
-        rollback_legacy(storage, &migrating_bytes, &original_marker).await?;
-        return Err(error);
-    }
-
-    let active = PointerState::Active {
-        bank: target_bank,
-        generation: 1,
-        format: crate::init::CURRENT_FORMAT_VERSION,
-    };
-    let active_bytes = encode_pointer(active);
-    if let Err(error) = activate_legacy(
-        storage,
-        &migrating_bytes,
-        fenced_revision,
-        &active_bytes,
-    )
-    .await
-    {
-        rollback_legacy(storage, &migrating_bytes, &original_marker).await?;
-        return Err(storage_error(error));
-    }
-    Ok(EpochAdmission {
-        adapter: StorageAdapter::for_epoch(storage.clone(), target_bank, active_bytes),
-        report: OpenReport {
-            format: crate::init::CURRENT_FORMAT_VERSION,
-            initialized: false,
-            migration: Some(OpenMigrationReport {
-                from_format,
-                to_format: crate::init::CURRENT_FORMAT_VERSION,
-            }),
-        },
-    })
+    heartbeat.stop().await?;
+    result
 }
 
 async fn migrate_active<S>(
@@ -491,14 +506,14 @@ where
             crate::init::CURRENT_FORMAT_VERSION
         )));
     }
-    let source = StorageAdapter::for_epoch(
-        storage.clone(),
-        source_bank,
-        active_source_bytes.clone(),
-    );
+    let source =
+        StorageAdapter::for_epoch(storage.clone(), source_bank, active_source_bytes.clone());
     emit_migrating(progress, from_format);
     let target_bank = source_bank.alternate();
-    let source_revision = source.load_mutation_revision().await.map_err(storage_error)?;
+    let source_revision = source
+        .load_mutation_revision()
+        .await
+        .map_err(storage_error)?;
     let migrating = PointerState::Migrating {
         source: source_bank,
         source_format: from_format,
@@ -535,7 +550,7 @@ where
         }
         return Err(storage_error(error));
     }
-    let _heartbeat = match start_migration_heartbeat(storage.clone(), migrating_bytes.clone()) {
+    let heartbeat = match start_migration_heartbeat(storage.clone(), migrating_bytes.clone()) {
         Ok(heartbeat) => heartbeat,
         Err(error) => {
             replace_pointer(storage, &migrating_bytes, &active_source_bytes).await?;
@@ -543,59 +558,64 @@ where
         }
     };
 
-    let target = StorageAdapter::for_epoch_migration(
-        storage.clone(),
-        target_bank,
-        migrating_bytes.clone(),
-    );
-    let migration_source = StorageAdapter::for_epoch_migration(
-        storage.clone(),
-        source_bank,
-        migrating_bytes.clone(),
-    );
-
-    let candidate_result = async {
-        clear_bank(&target).await?;
-        let _ = copy_repository(&migration_source, &target).await?;
-        super::migrate_lix_with_adapter(
+    let result = async {
+        let target = StorageAdapter::for_epoch_migration(
             storage.clone(),
-            target.clone(),
-            super::MigrationOptions::default(),
-        )
-        .await?;
-        emit_validating(progress, from_format);
-        let engine = Engine::new_with_adapter(target.clone(), EngineOptions::new()).await?;
-        drop(engine);
-        Ok::<(), LixError>(())
+            target_bank,
+            migrating_bytes.clone(),
+        );
+        let migration_source = StorageAdapter::for_epoch_migration(
+            storage.clone(),
+            source_bank,
+            migrating_bytes.clone(),
+        );
+
+        let candidate_result = async {
+            clear_bank(&target).await?;
+            let _ = copy_repository(&migration_source, &target).await?;
+            super::migrate_lix_with_adapter(
+                storage.clone(),
+                target.clone(),
+                super::MigrationOptions::automatic(),
+            )
+            .await?;
+            emit_validating(progress, from_format);
+            let engine = Engine::new_with_adapter(target.clone(), EngineOptions::new()).await?;
+            drop(engine);
+            Ok::<(), LixError>(())
+        }
+        .await;
+        if let Err(error) = candidate_result {
+            replace_pointer(storage, &migrating_bytes, &active_source_bytes).await?;
+            return Err(error);
+        }
+
+        let active = PointerState::Active {
+            bank: target_bank,
+            generation: source_generation.saturating_add(1),
+            format: crate::init::CURRENT_FORMAT_VERSION,
+        };
+        let active_bytes = encode_pointer(active);
+        replace_pointer(storage, &migrating_bytes, &active_bytes).await?;
+        // Keep the immediately previous bank for rollback. Once a later epoch has
+        // activated, the pre-epoch layout is older than that rollback window and
+        // can be reclaimed without making cleanup part of publication success.
+        let _ = schedule_legacy_retirement(storage.clone(), active_bytes.clone());
+        Ok(EpochAdmission {
+            adapter: StorageAdapter::for_epoch(storage.clone(), target_bank, active_bytes),
+            report: OpenReport {
+                format: crate::init::CURRENT_FORMAT_VERSION,
+                initialized: false,
+                migration: Some(OpenMigrationReport {
+                    from_format,
+                    to_format: crate::init::CURRENT_FORMAT_VERSION,
+                }),
+            },
+        })
     }
     .await;
-    if let Err(error) = candidate_result {
-        replace_pointer(storage, &migrating_bytes, &active_source_bytes).await?;
-        return Err(error);
-    }
-
-    let active = PointerState::Active {
-        bank: target_bank,
-        generation: source_generation.saturating_add(1),
-        format: crate::init::CURRENT_FORMAT_VERSION,
-    };
-    let active_bytes = encode_pointer(active);
-    replace_pointer(storage, &migrating_bytes, &active_bytes).await?;
-    // Keep the immediately previous bank for rollback. Once a later epoch has
-    // activated, the pre-epoch layout is older than that rollback window and
-    // can be reclaimed without making cleanup part of publication success.
-    let _ = schedule_legacy_retirement(storage.clone(), active_bytes.clone());
-    Ok(EpochAdmission {
-        adapter: StorageAdapter::for_epoch(storage.clone(), target_bank, active_bytes),
-        report: OpenReport {
-            format: crate::init::CURRENT_FORMAT_VERSION,
-            initialized: false,
-            migration: Some(OpenMigrationReport {
-                from_format,
-                to_format: crate::init::CURRENT_FORMAT_VERSION,
-            }),
-        },
-    })
+    heartbeat.stop().await?;
+    result
 }
 
 fn schedule_legacy_retirement<S>(storage: S, active_pointer: Bytes) -> Result<(), LixError>
@@ -734,7 +754,10 @@ async fn load_pointer<S>(storage: &S) -> Result<Option<(PointerState, Bytes)>, L
 where
     S: Storage + ?Sized,
 {
-    let read = storage.begin_read(ReadOptions::default()).await.map_err(storage_error)?;
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(storage_error)?;
     let keys = [Key(Bytes::from_static(REPOSITORY_EPOCH_KEY))];
     let values = read
         .get_many(&[GetManyRequest {
@@ -757,12 +780,7 @@ async fn load_lease<S>(storage: &S) -> Result<Option<Bytes>, LixError>
 where
     S: Storage + ?Sized,
 {
-    load_storage_value(
-        storage,
-        REPOSITORY_EPOCH_SPACE,
-        REPOSITORY_EPOCH_LEASE_KEY,
-    )
-    .await
+    load_storage_value(storage, REPOSITORY_EPOCH_SPACE, REPOSITORY_EPOCH_LEASE_KEY).await
 }
 
 async fn load_source_marker<S>(storage: &S) -> Result<Option<Bytes>, LixError>
@@ -811,13 +829,40 @@ where
         }))
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+type HeartbeatStopSender = std::sync::mpsc::Sender<()>;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+type HeartbeatStopReceiver = std::sync::mpsc::Receiver<()>;
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+type HeartbeatStopSender = tokio::sync::watch::Sender<bool>;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+type HeartbeatStopReceiver = tokio::sync::watch::Receiver<bool>;
+
 struct MigrationHeartbeat {
-    stopped: Arc<AtomicBool>,
+    stop: HeartbeatStopSender,
+    done: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl MigrationHeartbeat {
+    async fn stop(mut self) -> Result<(), LixError> {
+        signal_heartbeat_stop(&self.stop);
+        let done = self
+            .done
+            .take()
+            .expect("migration heartbeat completion receiver is present");
+        done.await.map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "repository migration heartbeat stopped without releasing its storage handle",
+            )
+        })
+    }
 }
 
 impl Drop for MigrationHeartbeat {
     fn drop(&mut self) {
-        self.stopped.store(true, Ordering::Release);
+        signal_heartbeat_stop(&self.stop);
     }
 }
 
@@ -828,16 +873,15 @@ fn start_migration_heartbeat<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let stopped = Arc::new(AtomicBool::new(false));
-    let task_stopped = Arc::clone(&stopped);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let (stop, mut stop_rx) = std::sync::mpsc::channel();
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+    let (done_tx, done) = tokio::sync::oneshot::channel();
     let task = async move {
         let mut current = Bytes::from_static(b"0");
         let mut sequence = 1_u64;
-        loop {
-            heartbeat_sleep().await;
-            if task_stopped.load(Ordering::Acquire) {
-                break;
-            }
+        while wait_for_heartbeat_interval(&mut stop_rx).await {
             let next = Bytes::from(sequence.to_string());
             if advance_lease(&storage, &migrating, &current, &next)
                 .await
@@ -863,16 +907,49 @@ where
             current = next;
             sequence = sequence.saturating_add(1);
         }
+        // Completion is also the lifetime barrier: release every task-owned
+        // storage clone before waking the opener that is joining us.
+        drop(storage);
+        drop(migrating);
+        let _ = done_tx.send(());
     };
     crate::background_task::spawn("lix-repository-migration-heartbeat", move || task)?;
-    Ok(MigrationHeartbeat { stopped })
+    Ok(MigrationHeartbeat {
+        stop,
+        done: Some(done),
+    })
 }
 
-async fn heartbeat_sleep() {
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    std::thread::sleep(MIGRATION_HEARTBEAT_INTERVAL);
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    crate::sync::sleep(MIGRATION_HEARTBEAT_INTERVAL).await;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn signal_heartbeat_stop(stop: &HeartbeatStopSender) {
+    let _ = stop.send(());
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn signal_heartbeat_stop(stop: &HeartbeatStopSender) {
+    let _ = stop.send(true);
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn wait_for_heartbeat_interval(stop: &mut HeartbeatStopReceiver) -> bool {
+    matches!(
+        stop.recv_timeout(MIGRATION_HEARTBEAT_INTERVAL),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    )
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+async fn wait_for_heartbeat_interval(stop: &mut HeartbeatStopReceiver) -> bool {
+    if *stop.borrow() {
+        return false;
+    }
+    let timer = crate::sync::sleep(MIGRATION_HEARTBEAT_INTERVAL).fuse();
+    let changed = stop.changed().fuse();
+    futures_util::pin_mut!(timer, changed);
+    select_biased! {
+        _ = changed => false,
+        _ = timer => true,
+    }
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -942,7 +1019,9 @@ where
         })
         .await
         .map_err(storage_error)?;
-    put_pointer(&mut write, active.clone()).await.map_err(storage_error)?;
+    put_pointer(&mut write, active.clone())
+        .await
+        .map_err(storage_error)?;
     write.commit().await.map_err(storage_error)?;
     Ok(())
 }
@@ -1008,7 +1087,10 @@ where
     write
         .put_many(
             crate::init::REPOSITORY_PROTOCOL_SPACE,
-            single_put(crate::init::REPOSITORY_PROTOCOL_KEY, Bytes::from_static(LEGACY_FENCE)),
+            single_put(
+                crate::init::REPOSITORY_PROTOCOL_KEY,
+                Bytes::from_static(LEGACY_FENCE),
+            ),
         )
         .await?;
     crate::storage_adapter::stage_mutation_revision(&mut write).await?;
@@ -1045,11 +1127,7 @@ where
     Ok(())
 }
 
-async fn rollback_legacy<S>(
-    storage: &S,
-    migrating: &Bytes,
-    marker: &Bytes,
-) -> Result<(), LixError>
+async fn rollback_legacy<S>(storage: &S, migrating: &Bytes, marker: &Bytes) -> Result<(), LixError>
 where
     S: Storage,
 {
@@ -1072,7 +1150,9 @@ where
         )
         .await
         .map_err(storage_error)?;
-    delete_epoch_control(&mut write).await.map_err(storage_error)?;
+    delete_epoch_control(&mut write)
+        .await
+        .map_err(storage_error)?;
     crate::storage_adapter::stage_mutation_revision(&mut write)
         .await
         .map_err(storage_error)?;
@@ -1080,7 +1160,11 @@ where
     Ok(())
 }
 
-async fn replace_pointer<S>(storage: &S, expected: &Bytes, replacement: &Bytes) -> Result<(), LixError>
+async fn replace_pointer<S>(
+    storage: &S,
+    expected: &Bytes,
+    replacement: &Bytes,
+) -> Result<(), LixError>
 where
     S: Storage,
 {
@@ -1120,7 +1204,9 @@ where
         })
         .await
         .map_err(storage_error)?;
-    delete_epoch_control(&mut write).await.map_err(storage_error)?;
+    delete_epoch_control(&mut write)
+        .await
+        .map_err(storage_error)?;
     write.commit().await.map_err(storage_error)?;
     Ok(())
 }
@@ -1130,7 +1216,10 @@ where
     W: StorageWrite,
 {
     write
-        .put_many(REPOSITORY_EPOCH_SPACE, single_put(REPOSITORY_EPOCH_KEY, bytes))
+        .put_many(
+            REPOSITORY_EPOCH_SPACE,
+            single_put(REPOSITORY_EPOCH_KEY, bytes),
+        )
         .await
 }
 
@@ -1374,11 +1463,7 @@ mod tests {
         );
 
         let mut writes = admitted.adapter.new_write_set();
-        writes.put(
-            crate::json_store::JSON_SPACE,
-            &b"stale"[..],
-            &b"write"[..],
-        );
+        writes.put(crate::json_store::JSON_SPACE, &b"stale"[..], &b"write"[..]);
         let error = admitted
             .adapter
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -1405,11 +1490,8 @@ mod tests {
         publish_migration_claim_absent(&storage, &first)
             .await
             .unwrap();
-        let stale = StorageAdapter::for_epoch_migration(
-            storage.clone(),
-            EpochBank::B,
-            first.clone(),
-        );
+        let stale =
+            StorageAdapter::for_epoch_migration(storage.clone(), EpochBank::B, first.clone());
         let retry = encode_pointer(PointerState::Migrating {
             source: EpochBank::A,
             source_format: 75,
@@ -1514,21 +1596,13 @@ mod tests {
             attempt: uuid::Uuid::from_u128(3),
         };
         let bytes = encode_pointer(state);
-        claim_legacy(&storage, None, &marker, &bytes)
-            .await
-            .unwrap();
+        claim_legacy(&storage, None, &marker, &bytes).await.unwrap();
         let lease = load_lease(&storage).await.unwrap().unwrap();
         let stored_marker = load_source_marker(&storage).await.unwrap().unwrap();
 
-        recover_interrupted_migration(
-            &storage,
-            state,
-            &bytes,
-            Some(&lease),
-            Some(&stored_marker),
-        )
-        .await
-        .unwrap();
+        recover_interrupted_migration(&storage, state, &bytes, Some(&lease), Some(&stored_marker))
+            .await
+            .unwrap();
 
         assert_eq!(
             load_storage_value(
@@ -1555,7 +1629,9 @@ mod tests {
             attempt: uuid::Uuid::from_u128(4),
         };
         let migrating = encode_pointer(state);
-        replace_pointer(&storage, &active, &migrating).await.unwrap();
+        replace_pointer(&storage, &active, &migrating)
+            .await
+            .unwrap();
 
         let lease = Bytes::from_static(b"0");
         let mut raw = storage.begin_write(WriteOptions::default()).await.unwrap();
@@ -1589,6 +1665,21 @@ mod tests {
         assert_eq!(first.adapter.epoch_bank(), EpochBank::A);
         assert_eq!(second.adapter.epoch_bank(), EpochBank::A);
         assert_ne!(first.report.initialized, second.report.initialized);
+    }
+
+    #[tokio::test]
+    async fn open_reports_initialization_after_empty_epoch_publication_restart() {
+        let storage = crate::Memory::new();
+        let admission = admit_repository(&storage, None).await.unwrap();
+        assert!(admission.report.initialized);
+        drop(admission);
+
+        let lix = crate::open_lix()
+            .with_storage(storage)
+            .await
+            .expect("open should initialize the already-published empty epoch");
+        assert!(lix.open_report().initialized);
+        lix.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -1634,10 +1725,37 @@ mod tests {
 
         crate::sync::sleep(Duration::from_millis(250)).await;
         assert_eq!(load_pointer(&storage).await.unwrap().unwrap().1, bytes);
-        drop(heartbeat);
+        heartbeat.stop().await.unwrap();
         delete_pointer(&storage, &bytes).await.unwrap();
 
         let admitted = waiter.await.unwrap().unwrap();
         assert!(admitted.report.initialized);
+    }
+
+    #[tokio::test]
+    async fn stopping_heartbeat_releases_its_storage_handle() {
+        let storage = crate::Memory::new();
+        let state = PointerState::Migrating {
+            source: EpochBank::Legacy,
+            source_format: 0,
+            target: EpochBank::A,
+            generation: 1,
+            attempt: uuid::Uuid::from_u128(7),
+        };
+        let bytes = encode_pointer(state);
+        publish_migration_claim_absent(&storage, &bytes)
+            .await
+            .unwrap();
+        assert_eq!(storage.shared_handle_count(), 1);
+
+        let heartbeat = start_migration_heartbeat(storage.clone(), bytes).unwrap();
+        assert_eq!(storage.shared_handle_count(), 2);
+        heartbeat.stop().await.unwrap();
+
+        assert_eq!(
+            storage.shared_handle_count(),
+            1,
+            "stop completion must be a barrier after the task-owned handle drops"
+        );
     }
 }

@@ -94,6 +94,7 @@ pub struct OpenReport {
 struct RetainingOpenProgressSink {
     downstream: Option<Arc<dyn OpenProgressSink>>,
     migrated_from: AtomicU32,
+    initialized: AtomicBool,
 }
 
 impl RetainingOpenProgressSink {
@@ -101,6 +102,7 @@ impl RetainingOpenProgressSink {
         Self {
             downstream,
             migrated_from: AtomicU32::new(0),
+            initialized: AtomicBool::new(false),
         }
     }
 
@@ -108,6 +110,16 @@ impl RetainingOpenProgressSink {
         match self.migrated_from.load(Ordering::Acquire) {
             0 => None,
             version => Some(version),
+        }
+    }
+
+    fn initialized(&self) -> bool {
+        self.initialized.load(Ordering::Acquire)
+    }
+
+    fn retain_initialized(&self, initialized: bool) {
+        if initialized {
+            self.initialized.store(true, Ordering::Release);
         }
     }
 }
@@ -288,7 +300,7 @@ where
                 total: None,
             },
         );
-        let engine = retry_expired_read(|| {
+        let (engine, _) = retry_expired_read(|| {
             open_or_initialize_engine_with_adapter(
                 admission.adapter.clone(),
                 self.wasm_runtime.clone(),
@@ -356,7 +368,6 @@ where
                 let retained_progress = Arc::new(RetainingOpenProgressSink::new(
                     self.open_progress.clone(),
                 ));
-                let attempt_progress: Arc<dyn OpenProgressSink> = retained_progress.clone();
                 // Opening is one restartable unit. In cross-context storage, a
                 // competing tab may commit during any phase, including sync
                 // bootstrap after the engine and primary session exist.
@@ -366,20 +377,26 @@ where
                         self.wasm_runtime.clone(),
                         self.telemetry.clone(),
                         self.server.clone(),
-                        Some(attempt_progress.clone()),
+                        retained_progress.clone(),
                     )
                 })
                 .await?;
-                if lix.open_report.migration.is_none()
-                    && let Some(from_format) = retained_progress.migrated_from()
+                let initialized = lix.open_report.initialized || retained_progress.initialized();
+                let migration = lix.open_report.migration.or_else(|| {
+                    retained_progress
+                        .migrated_from()
+                        .map(|from_format| OpenMigrationReport {
+                            from_format,
+                            to_format: crate::init::CURRENT_FORMAT_VERSION,
+                        })
+                });
+                if initialized != lix.open_report.initialized
+                    || migration != lix.open_report.migration
                 {
                     lix.open_report = Arc::new(OpenReport {
                         format: lix.open_report.format,
-                        initialized: lix.open_report.initialized,
-                        migration: Some(OpenMigrationReport {
-                            from_format,
-                            to_format: crate::init::CURRENT_FORMAT_VERSION,
-                        }),
+                        initialized,
+                        migration,
                     });
                 }
                 Ok(lix)
@@ -603,18 +620,20 @@ async fn open_lix_inner<StorageImpl>(
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     server: Option<ServerOptions>,
-    open_progress: Option<Arc<dyn OpenProgressSink>>,
+    retained_progress: Arc<RetainingOpenProgressSink>,
 ) -> Result<Lix<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let admission = ensure_current_repository(&storage, open_progress.as_ref()).await?;
-    let open_report = admission.report;
+    let open_progress: Arc<dyn OpenProgressSink> = retained_progress.clone();
+    let admission = ensure_current_repository(&storage, Some(&open_progress)).await?;
+    let mut open_report = admission.report;
+    retained_progress.retain_initialized(open_report.initialized);
     let migrated_from = open_report
         .migration
         .map(|migration| migration.from_format);
     emit_open_progress(
-        open_progress.as_ref(),
+        Some(&open_progress),
         OpenProgress {
             phase: OpenPhase::Opening,
             from_format: migrated_from,
@@ -647,7 +666,7 @@ where
     let initial_sync_branch_id = prepared_sync
         .as_ref()
         .map(|prepared| prepared.default_branch_id.clone());
-    let engine = open_or_initialize_engine_with_adapter(
+    let (engine, engine_initialized) = open_or_initialize_engine_with_adapter(
         admission.adapter,
         wasm_runtime,
         telemetry,
@@ -655,6 +674,10 @@ where
         initial_sync_branch_id.as_deref(),
     )
     .await?;
+    if engine_initialized {
+        open_report.initialized = true;
+        retained_progress.retain_initialized(true);
+    }
     let session = match reopened_sync_account_id {
         Some(account_id) => engine.open_session_with_account(account_id).await?,
         None => engine.open_session().await?,
@@ -673,7 +696,6 @@ where
                 let initial_transport = if let Some(prepared) = prepared_sync.take() {
                     Some(crate::sync::install_sync_bootstrap(
                         &mut lix,
-                        &storage,
                         &server,
                         prepared,
                     )
@@ -694,7 +716,7 @@ where
     }
     lix.bind_session();
     emit_open_progress(
-        open_progress.as_ref(),
+        Some(&open_progress),
         OpenProgress {
             phase: OpenPhase::Complete,
             from_format: migrated_from,
@@ -804,6 +826,13 @@ where
         }
     }
 
+    #[cfg(feature = "storage-benches")]
+    #[doc(hidden)]
+    pub fn storage_adapter(&self) -> crate::storage_adapter::StorageAdapter<StorageImpl> {
+        self.engine.storage()
+    }
+
+    #[cfg(not(feature = "storage-benches"))]
     pub(crate) fn storage_adapter(&self) -> crate::storage_adapter::StorageAdapter<StorageImpl> {
         self.engine.storage()
     }
@@ -1458,7 +1487,7 @@ async fn open_or_initialize_engine_with_adapter<StorageImpl>(
     telemetry: Option<Arc<dyn TelemetrySink>>,
     plugin_resource_limits: Option<(u64, usize)>,
     initial_main_branch_id: Option<&str>,
-) -> Result<Engine<StorageImpl>, LixError>
+) -> Result<(Engine<StorageImpl>, bool), LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -1470,15 +1499,21 @@ where
     )
     .await
     {
-        Ok(engine) => Ok(engine),
+        Ok(engine) => Ok((engine, false)),
         Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
-            match Engine::initialize_with_adapter(adapter.clone(), initial_main_branch_id).await
+            let initialized = match Engine::initialize_with_adapter(
+                adapter.clone(),
+                initial_main_branch_id,
+            )
+            .await
             {
-                Ok(_) => {}
-                Err(error) if error.code == "LIX_ERROR_ALREADY_INITIALIZED" => {}
+                Ok(_) => true,
+                Err(error) if error.code == "LIX_ERROR_ALREADY_INITIALIZED" => false,
                 Err(error) => return Err(error),
-            }
-            new_engine(adapter, wasm_runtime, telemetry, plugin_resource_limits).await
+            };
+            new_engine(adapter, wasm_runtime, telemetry, plugin_resource_limits)
+                .await
+                .map(|engine| (engine, initialized))
         }
         Err(error) => Err(error),
     }
@@ -2080,7 +2115,13 @@ mod assume_send_future_proofs {
         wasm_runtime: Option<Arc<dyn WasmRuntime>>,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) {
-        is_send(&open_lix_inner(storage, wasm_runtime, telemetry, None, None));
+        is_send(&open_lix_inner(
+            storage,
+            wasm_runtime,
+            telemetry,
+            None,
+            Arc::new(RetainingOpenProgressSink::new(None)),
+        ));
     }
 
     // handle.rs -- Lix::switch_branch (body mirrored verbatim)
