@@ -1625,7 +1625,33 @@ where
         Ok(result)
     }
 
+    /// Runs the base refresh under the shared bounded expired-read policy.
+    ///
+    /// The refresh's reads run outside the execute read loop's retry
+    /// protection, and on cross-context stores a concurrent commit can
+    /// invalidate them at any point — during sync churn that made every
+    /// stale-base execute surface `LIX_STORAGE_READ_EXPIRED` on its first
+    /// expiry. The unit is safe to restart: it re-reads the generation and
+    /// branch heads from scratch and stores the generation only on success.
     pub(super) async fn refresh_active_branch_base_if_stale(&self) -> Result<(), LixError> {
+        let mut retry = ExpiredReadRetryState::default();
+        loop {
+            match self.refresh_active_branch_base_if_stale_inner().await {
+                Err(error) => {
+                    let Some(delay) = retry.next_delay(&error) else {
+                        return Err(error);
+                    };
+                    tokio::task::yield_now().await;
+                    if !delay.is_zero() {
+                        crate::sync::sleep(delay).await;
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn refresh_active_branch_base_if_stale_inner(&self) -> Result<(), LixError> {
         let invalidation_generation = self.observe_invalidation.generation();
         if self.base_refresh_generation.load(Ordering::SeqCst) == invalidation_generation {
             return Ok(());
