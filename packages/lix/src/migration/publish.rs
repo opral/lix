@@ -7,7 +7,7 @@ use crate::init::{REPOSITORY_PROTOCOL_KEY, REPOSITORY_PROTOCOL_SPACE, REPOSITORY
 use crate::storage_adapter::{
     PutBatch, PutEntry, Storage, StorageError, StorageKey as Key, StorageKeyRange as KeyRange,
     StoragePrecondition as Precondition, StorageSpace, StorageValue as StoredValue, StorageWrite,
-    StorageWriteOptions as WriteOptions, ValueIntegrity, ValueSemantics,
+    StorageWriteOptions as WriteOptions, ValueSemantics,
 };
 
 /// Fully preflighted physical mutations. Construction stays private so the
@@ -36,22 +36,6 @@ impl PublicationPlan {
         }
     }
 
-    pub(super) fn add_builder_batch(
-        &mut self,
-        space: StorageSpace,
-        entries: PutBatch,
-    ) -> Result<(), LixError> {
-        self.account(&entries)?;
-        if space.value_semantics == ValueSemantics::Immutable
-            && space.value_integrity != ValueIntegrity::ContentAddressed
-        {
-            self.replacements.push((space, entries));
-        } else {
-            self.mutable_puts.push((space, entries));
-        }
-        Ok(())
-    }
-
     pub(super) fn replace_immutable(
         &mut self,
         space: StorageSpace,
@@ -64,28 +48,6 @@ impl PublicationPlan {
         self.account(&batch)?;
         self.replacements.push((space, batch));
         Ok(())
-    }
-
-    pub(super) fn put_mutable(
-        &mut self,
-        space: StorageSpace,
-        entries: Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<(), LixError> {
-        if space.value_semantics != ValueSemantics::Mutable {
-            return Err(plan_error(
-                "mutable migration put targeted an immutable space",
-            ));
-        }
-        let batch = put_batch(entries)?;
-        self.account(&batch)?;
-        self.mutable_puts.push((space, batch));
-        Ok(())
-    }
-
-    pub(super) fn clear_space(&mut self, space: StorageSpace) {
-        if !self.cleared_spaces.contains(&space) {
-            self.cleared_spaces.push(space);
-        }
     }
 
     fn account(&mut self, batch: &PutBatch) -> Result<(), LixError> {

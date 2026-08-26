@@ -16,6 +16,7 @@ mod diff_id;
 mod merge;
 pub(crate) mod mutation_directory;
 pub(crate) mod replacement_part;
+mod row_pk_index;
 mod row_materialization;
 mod scoped_current_state;
 pub(crate) mod scoped_range;
@@ -25,8 +26,7 @@ mod types;
 
 pub(crate) use codec::{encode_key_ref, encode_single_string_key_ref_into};
 pub(crate) use commit_root_rebuild::{
-    load_rebuild_plans_to_nearest_available_root,
-    load_rebuild_plans_to_nearest_available_root_bounded, stage_rebuild_plan_with_writer,
+    load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
     try_stage_collapsed_rebuild_plans_with_writer,
 };
 #[cfg(test)]
@@ -50,14 +50,19 @@ pub(crate) use merge::{
     merge_payload_fallback_ids, plan_merge,
 };
 pub(crate) use mutation_directory::{
-    LAYOUT_BOUNDED_DIRECT, LAYOUT_BOUNDED_INDIRECT, LAYOUT_COMPACT_REPLACEMENT,
-    LAYOUT_DIRECT_ROWS_ONLY, MUTATION_DIRECTORY_NODE_SPACE, MutationDirectoryRoot,
-    collect_mutation_directory_node_ids,
+    MUTATION_DIRECTORY_NODE_SPACE, collect_mutation_directory_node_ids,
 };
 pub(crate) use replacement_part::{
     EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS, REPLACEMENT_PART_TARGET_BYTES,
     ReplacementPartRowRef, encode_replacement_part_with_compressor,
 };
+pub(crate) use row_pk_index::{
+    backfill_row_pk_index_for_commit, decode_row_pk_index_key, row_pk_index_scan_request,
+    stage_row_pk_index_from_deltas, stage_row_pk_index_from_members,
+    with_row_pk_index_mutations,
+};
+pub(crate) use codec::TrackedStateMutationBatchBuilder;
+pub(crate) use tree::TrackedStateTree;
 pub(crate) use row_materialization::{
     MaterializedTrackedStateBatch, MaterializedTrackedStateExactBatch,
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
@@ -66,9 +71,7 @@ pub(crate) use row_materialization::{
 #[cfg(test)]
 pub(crate) use scoped_current_state::attest_scoped_range_root;
 pub(crate) use scoped_current_state::incomplete_touched_scope_filter;
-pub(crate) use scoped_range::{
-    SCOPED_RANGE_NODE_SPACE, ScopedRangeRoot, validate_scoped_range_trees,
-};
+pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
 pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::decode_change_locator;
@@ -89,7 +92,9 @@ pub(crate) use storage::{
     CommitDeltaReplacementScope, EnvelopeCertifiedNativeProjectionBatch,
     EnvelopeCertifiedNativeProjectionSegment, ExclusiveRowSnapshotBatch,
     OrderedAddressableCommitDeltaStage, PublishedCommitStateTopology, StagedCommitStateManifest,
+    TrackedStateChunkOverlay,
     commit_delta_contains_schema, commit_delta_member_scopes, commit_history_is_deferred,
+    deferred_commit_global_scope,
     complete_state_fence_change_owner_commit_ids, direct_change_locator,
     deferred_commit_history_ids,
     encode_commit_state_manifest_replacement_for_migration, load_authoritative_live_change_records,
@@ -108,14 +113,15 @@ pub(crate) use storage::{
     stage_addressable_commit_deltas, stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_history_available,
-    stage_commit_history_deferred, stage_commit_state_manifest_with_handle,
+    stage_commit_history_deferred, stage_commit_history_deferred_with_scope,
+    stage_commit_state_manifest_with_handle,
+    staged_commit_delta_members, staged_commit_delta_segment_bytes,
     stage_current_state_scoped_ranges_from_complete_state_source,
     sync_history_required_for_commits,
     stage_current_state_scoped_ranges_from_published_parent,
     stage_current_state_scoped_ranges_from_published_topology_parent,
     stage_current_state_scoped_ranges_from_staged_parent,
     stage_current_state_scoped_ranges_from_topology, stage_imported_addressable_commit_deltas,
-    stage_imported_addressable_commit_deltas_with_selected_source,
     stage_ordered_addressable_commit_deltas, stage_ordered_addressable_replacement_parts,
     stage_ordered_columnar_mutations, stage_preencoded_ordered_addressable_replacement_parts,
     stage_prefixed_ordered_addressable_replacement_parts,
@@ -159,10 +165,11 @@ pub(crate) use types::TrackedStateRootId;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateManifest,
-    CommitStateMutationInventory, CommitStateReplayDebt, CommitStateTouchedScopeFilter,
+    CommitStateMutationInventory, CommitStateReplayDebt,
     MaterializedTrackedStateRow, RowPkRangeBound, TrackedStateBaseCoordinate,
     TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateCommitRootParent,
-    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
+    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateIndexValueRef,
+    TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
     row_pk_satisfies_bounds,
 };

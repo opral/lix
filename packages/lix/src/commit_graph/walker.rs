@@ -61,16 +61,27 @@ pub(crate) struct ReachableWalk {
     /// Frontier entries carry the generation of the child that discovered them.
     /// Commit generations are strictly increasing away from the roots, so a
     /// parent that fails to sit below its child proves a corrupt cycle.
-    frontier: Vec<(CommitId, u64)>,
+    frontier: Vec<(CommitId, Option<u64>)>,
     depth: u32,
+    include_base_dependencies: bool,
 }
 
 impl ReachableWalk {
     pub(crate) fn new(head_commit_id: CommitId) -> Self {
         Self {
             seen: BTreeSet::from([head_commit_id]),
-            frontier: vec![(head_commit_id, u64::MAX)],
+            frontier: vec![(head_commit_id, Some(u64::MAX))],
             depth: 0,
+            include_base_dependencies: false,
+        }
+    }
+
+    pub(crate) fn new_state_dependencies(head_commit_id: CommitId) -> Self {
+        Self {
+            seen: BTreeSet::from([head_commit_id]),
+            frontier: vec![(head_commit_id, Some(u64::MAX))],
+            depth: 0,
+            include_base_dependencies: true,
         }
     }
 
@@ -98,7 +109,7 @@ impl ReachableWalk {
             let Some(node) = node else {
                 return Err(super::context::missing_commit_graph_error(&commit_id));
             };
-            if node.generation >= *child_generation {
+            if child_generation.is_some_and(|generation| node.generation >= generation) {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
@@ -108,8 +119,14 @@ impl ReachableWalk {
             }
             for parent_commit_id in &node.parent_commit_ids {
                 if self.seen.insert(*parent_commit_id) {
-                    next_frontier.push((*parent_commit_id, node.generation));
+                    next_frontier.push((*parent_commit_id, Some(node.generation)));
                 }
+            }
+            if self.include_base_dependencies
+                && let Some(base_commit_id) = node.base_commit_id
+                && self.seen.insert(base_commit_id)
+            {
+                next_frontier.push((base_commit_id, None));
             }
             commits.push(node);
         }
@@ -364,6 +381,7 @@ mod tests {
             crate::changelog::encode_commit_record(&CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: embedded,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -406,6 +424,7 @@ mod tests {
             let record = CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: current_commit_id,
                 generation: 1,
                 parent_commit_ids: vec![parent_commit_id],
@@ -772,6 +791,7 @@ mod tests {
         let record = |commit_id, parents| CommitRecord {
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
+            base_commit_id: None,
             commit_id,
             generation: 2,
             parent_commit_ids: parents,
@@ -948,6 +968,7 @@ mod tests {
         let record = CommitRecord {
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
+            base_commit_id: None,
             commit_id: child,
             generation: 0,
             parent_commit_ids: commit_ids(["commit-root"]),
@@ -1508,6 +1529,7 @@ mod tests {
             let record = CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: typed_commit_id,
                 generation,
                 parent_commit_ids,
@@ -1551,7 +1573,9 @@ mod tests {
                 },
                 mutations: CommitStateMutationInventory::default(),
                 touched_scope_filter: Default::default(),
+                global_scope: false,
                 current_state_scoped_ranges: None,
+                row_pk_index_root_id: None,
                 snapshot_root: None,
             },
         )

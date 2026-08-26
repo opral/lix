@@ -43,8 +43,11 @@ pub(crate) const SYNC_MATERIALIZED_STATE_ALIAS_SPACE: StorageSpace = StorageSpac
 pub struct SyncCommit {
     pub commit_id: String,
     pub parent_commit_ids: Vec<String>,
+    pub base_commit_id: Option<String>,
     pub account_id: String,
     pub created_at: String,
+    #[serde(default)]
+    pub global_scope: bool,
     pub selected_source_commit_id: Option<String>,
     /// Authenticated O(1) representation of a complete-state checkpoint.
     /// The source is a dependency and `state_root_id` binds the alias to the
@@ -237,6 +240,20 @@ impl SyncCommit {
             if !parents.insert(parent) {
                 return invalid("sync commit parent ids must be unique");
             }
+        }
+        let base_commit_id = self
+            .base_commit_id
+            .as_deref()
+            .map(|base| CommitId::parse_lix(base, "sync base commit id"))
+            .transpose()?;
+        if base_commit_id == Some(commit_id) {
+            return invalid("sync commit cannot use itself as its base");
+        }
+        if self.global_scope && base_commit_id.is_some() {
+            return invalid("global sync commit must not have a base");
+        }
+        if !self.global_scope && base_commit_id.is_none() {
+            return invalid("local sync commit must have a base");
         }
         let selected_source_commit_id = self
             .selected_source_commit_id
@@ -453,8 +470,13 @@ where
             .into_iter()
             .map(|parent| parent.to_string())
             .collect(),
+        base_commit_id: record.base_commit_id.map(|base| base.to_string()),
         account_id: record.account_id,
         created_at: record.created_at.to_string(),
+        global_scope: crate::tracked_state::load_published_commit_state_topology(store, commit_id)
+            .await?
+            .ok_or_else(|| LixError::unknown(format!("sync commit '{commit_id}' has no tracked-state authority")))?
+            .global_scope(),
         selected_source_commit_id: selected_source_commit_id.map(|source| source.to_string()),
         state_alias,
         members,
@@ -822,8 +844,10 @@ mod tests {
         let mut commit = SyncCommit {
             commit_id: commit_id.to_string(),
             parent_commit_ids: Vec::new(),
+            base_commit_id: Some(CommitId::for_test_label("validation-base").to_string()),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             created_at: "2026-08-19T00:00:00Z".to_owned(),
+            global_scope: false,
             selected_source_commit_id: None,
             state_alias: None,
             members: vec![member("b", 1), member("a", 2)],
@@ -884,8 +908,10 @@ mod tests {
         let mut commit = SyncCommit {
             commit_id: commit_id.to_string(),
             parent_commit_ids: vec![parent.to_string()],
+            base_commit_id: Some(CommitId::for_test_label("alias-validation-base").to_string()),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             created_at: "2026-08-19T00:00:00Z".to_owned(),
+            global_scope: false,
             selected_source_commit_id: None,
             state_alias: Some(SyncCommitStateAlias {
                 source_commit_id: source.to_string(),

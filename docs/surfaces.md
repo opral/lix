@@ -41,8 +41,9 @@ other segment text is preserved exactly: the engine does not URL-decode,
 case-fold, or Unicode-normalize paths. Filesystem adapters diagnose names that
 the target host cannot represent.
 
-The checkpoint and diff relations are read-only. `lix_diff()` exposes `row_pk`,
-`diff_type`, `row_count`, and paired `from_<column>` / `to_<column>` relation
+The checkpoint and diff relations are read-only. `lix_diff()` exposes
+`lixcol_row_pk`, `lixcol_diff_type`, `lixcol_row_count`, and paired
+`from_<column>` / `to_<column>` relation
 columns. Pass `(relation, row_pk)` to the `lix_revert`, `lix_apply`, and
 `lix_create_checkpoint` command sinks. See [Checkpoints](./checkpoints.md) and
 [Diff commands](./diff-commands.md).
@@ -51,6 +52,11 @@ For branch-scoped working changes, use `lix_latest_checkpoint_commit_id()` and
 `lix_active_branch_commit_id()` as the commit arguments to `lix_diff()`. The
 latest-checkpoint accessor returns the repository root when the active branch
 has no checkpoint.
+
+The `lixcol_` segment is reserved for engine-made columns on read surfaces.
+Registered user schemas reject column names beginning with `lixcol_` or
+containing `_lixcol_`; this keeps engine columns mechanically distinguishable
+even after `from_`/`to_` side prefixing.
 
 ## The executable column contract
 

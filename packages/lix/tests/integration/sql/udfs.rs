@@ -12,7 +12,7 @@ simulation_test!(
                 .expect("main session should open"),
             &engine,
         );
-        let expected_root = sim.initial_commit_id().to_string();
+        let expected_root = sim.initial_global_commit_id().to_string();
 
         for value in ["one", "two", "three"] {
             session
@@ -169,7 +169,7 @@ simulation_test!(
             .expect("draft should diverge");
         let diff = draft
             .execute(
-                "SELECT row_pk FROM lix_diff(\
+                "SELECT lixcol_row_pk FROM lix_diff(\
                  'lix_key_value', lix_latest_checkpoint_commit_id(), \
                  lix_active_branch_commit_id())",
                 &[],

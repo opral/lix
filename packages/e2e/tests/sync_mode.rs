@@ -103,9 +103,9 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
     let checkpoint = replica
         .execute(
             "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-             SELECT 'lix_file', row_pk \
+             SELECT 'lix_file', lixcol_row_pk \
              FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
-             WHERE row_pk ->> 0 = $1 \
+             WHERE lixcol_row_pk ->> 0 = $1 \
              RETURNING commit_id",
             &[Value::Text(selected_file_id.clone())],
         )
@@ -125,7 +125,7 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
             .execute(
                 "SELECT COUNT(*) AS count \
                  FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-                 WHERE row_pk ->> 0 = $1",
+                 WHERE lixcol_row_pk ->> 0 = $1",
                 &[
                     Value::Text(selected_file_id.clone()),
                     Value::Text(checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
@@ -1649,7 +1649,380 @@ where
     Ok(Response::from_parts(parts, Full::new(body)))
 }
 
+/// Asserts every file row's `directory_id` resolves among the same tree's
+/// directory rows — the filesystem-closure invariant the v75 repair restores.
+fn assert_files_resolve_directories(files: &lix::ExecuteResult, directories: &lix::ExecuteResult) {
+    let directory_ids = directories
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").expect("directory id"))
+        .collect::<std::collections::HashSet<_>>();
+    for file in files.rows() {
+        if let Ok(directory_id) = file.get::<String>("directory_id") {
+            assert!(
+                directory_ids.contains(&directory_id),
+                "file references directory '{directory_id}' missing from the same tree"
+            );
+        }
+    }
+}
+
 async fn stop_server(task: tokio::task::JoinHandle<()>) {
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_replica_reads_point_in_time_filesystem_state() {
+    // Regression: a freshly bootstrapped replica holds hot state plus
+    // deferred history payloads. lix_state_at and lix_diff at an old
+    // checkpoint must hydrate the missing payloads (like lix_history does)
+    // instead of reading a partial tree — which surfaced as
+    // "filesystem descriptor references missing directory" and empty
+    // directory trees on a repository whose server copy is consistent.
+    let (authority_storage, authority) = open_authority().await;
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/sales/playbook.md', CAST('one' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("create /sales/playbook.md");
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/docs/handbook/inside.md', CAST('two' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("create /docs/handbook/inside.md");
+    let first_checkpoint = authority
+        .create_checkpoint()
+        .await
+        .expect("checkpoint seeded filesystem");
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/brand/logo.md', CAST('three' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("create /brand/logo.md");
+    let second_checkpoint = authority
+        .create_checkpoint()
+        .await
+        .expect("checkpoint second filesystem state");
+    // Enough later commits that the checkpoint payloads stay cold on a
+    // fresh bootstrap.
+    for index in 0..105 {
+        put_value(&authority, &format!("state-at-page-{index:03}"), "value").await;
+    }
+    authority.close().await.expect("close authority setup");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+
+    let commit_id = first_checkpoint.commit_id.clone();
+    let files = replica
+        .execute(
+            "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
+            &[Value::Text(commit_id.clone())],
+        )
+        .await
+        .expect("point-in-time file state hydrates on a fresh replica");
+    let file_names = files
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("name").expect("file name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        file_names.len(),
+        2,
+        "first checkpoint holds both seeded files, got {file_names:?}"
+    );
+
+    let directories = replica
+        .execute(
+            "SELECT id, name FROM lix_state_at('lix_directory', $1)",
+            &[Value::Text(commit_id.clone())],
+        )
+        .await
+        .expect("point-in-time directory state hydrates on a fresh replica");
+    let directory_names = directories
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("name").expect("directory name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        directory_names.len(),
+        3,
+        "first checkpoint holds sales, docs, handbook — got {directory_names:?}"
+    );
+    assert_files_resolve_directories(&files, &directories);
+
+    // The product's checkpoint-open read: a root diff with resolved paths.
+    let diff = replica
+        .execute(
+            "SELECT to_path FROM lix_diff('lix_file', lix_root_commit_id(), $1) ORDER BY to_path",
+            &[Value::Text(commit_id)],
+        )
+        .await
+        .expect("root diff with paths hydrates on a fresh replica");
+    let paths = diff
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("to_path").expect("path"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![
+            "/docs/handbook/inside.md".to_string(),
+            "/sales/playbook.md".to_string(),
+        ],
+        "resolved historical paths"
+    );
+
+    // The product's checkpoint click: the span between two checkpoints,
+    // with both sides' paths resolved through their own commit trees.
+    let span = replica
+        .execute(
+            "SELECT lixcol_diff_type, coalesce(to_path, from_path) AS path
+             FROM lix_diff('lix_file', $1, $2)
+             ORDER BY coalesce(to_path, from_path)",
+            &[
+                Value::Text(first_checkpoint.commit_id.clone()),
+                Value::Text(second_checkpoint.commit_id.clone()),
+            ],
+        )
+        .await
+        .expect("checkpoint-span diff hydrates on a fresh replica");
+    let span_rows = span
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("lixcol_diff_type").expect("diff type"),
+                row.get::<String>("path").expect("path"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        span_rows,
+        vec![("added".to_string(), "/brand/logo.md".to_string())],
+        "checkpoint span resolves through both pinned trees"
+    );
+
+    // The newest checkpoint reads completely as well — the tree the
+    // product opens first.
+    let latest_directories = replica
+        .execute(
+            "SELECT name FROM lix_state_at('lix_directory', $1) ORDER BY name",
+            &[Value::Text(second_checkpoint.commit_id.clone())],
+        )
+        .await
+        .expect("latest checkpoint directory state hydrates");
+    let latest_names = latest_directories
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("name").expect("directory name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        latest_names,
+        vec![
+            "brand".to_string(),
+            "docs".to_string(),
+            "handbook".to_string(),
+            "sales".to_string(),
+        ],
+        "latest checkpoint holds every directory"
+    );
+
+    replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partially_hydrated_replica_reads_point_in_time_filesystem_state() {
+    // The live-repository shape behind the "filesystem descriptor references
+    // missing directory" failure: a bounded history read hydrates ONLY the
+    // checkpoint anchor commit, while the content commit that authored the
+    // file and directory rows stays deferred. lix_state_at at the hydrated
+    // anchor must then hydrate the owning commits it resolves rows from —
+    // not silently materialize a partial tree.
+    let (authority_storage, authority) = open_authority().await;
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/sales/playbook.md', CAST('one' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("create /sales/playbook.md");
+    let file_id = authority
+        .execute("SELECT id FROM lix_file WHERE path = '/sales/playbook.md'", &[])
+        .await
+        .expect("read file id")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("file id decodes");
+    let checkpoint = authority
+        .create_checkpoint()
+        .await
+        .expect("checkpoint seeded filesystem")
+        .commit_id;
+    for index in 0..105 {
+        put_value(&authority, &format!("partial-hydration-{index:03}"), "value").await;
+    }
+    authority.close().await.expect("close authority setup");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+
+    // Selective hydration: the bounded point lookup hydrates only the
+    // checkpoint anchor boundary, leaving the authoring commit deferred.
+    replica
+        .execute(
+            "SELECT path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+            &[Value::Text(checkpoint.clone()), Value::Text(file_id.clone())],
+        )
+        .await
+        .expect("bounded anchor lookup hydrates");
+
+    // The point-in-time read at the now-hydrated anchor.
+    let files = replica
+        .execute(
+            "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
+            &[Value::Text(checkpoint.clone())],
+        )
+        .await
+        .expect("file state at the anchor hydrates its owning commits");
+    let directories = replica
+        .execute(
+            "SELECT id, name FROM lix_state_at('lix_directory', $1)",
+            &[Value::Text(checkpoint.clone())],
+        )
+        .await
+        .expect("directory state at the anchor hydrates its owning commits");
+    assert_eq!(directories.rows().len(), 1, "sales directory present");
+    assert_files_resolve_directories(&files, &directories);
+
+    let diff = replica
+        .execute(
+            "SELECT to_path FROM lix_diff('lix_file', lix_root_commit_id(), $1)",
+            &[Value::Text(checkpoint)],
+        )
+        .await
+        .expect("root diff with paths at the anchor hydrates");
+    assert_eq!(
+        diff.rows()[0].get::<String>("to_path").expect("path"),
+        "/sales/playbook.md",
+    );
+
+    replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica() {
+    // Full lineage of the failing live repository: authored on the v71
+    // engine, migrated and partial-checkpointed on the v72 engine
+    // (fixture generated from 4816fdba5, SHA-256
+    // 0841a126e32c939786e152a88be337aefbdfdd6b4d28452bf9419f98517a1b1a),
+    // migrated to the current format here, served, and read from a fresh
+    // sync replica after a bounded history lookup hydrated only the
+    // checkpoint anchor.
+    const V72_PARTIAL_CHECKPOINTS: &[u8] =
+        include_bytes!("fixtures/v72_partial_checkpoints.snapshot");
+    let authority_storage =
+        Memory::from_snapshot(V72_PARTIAL_CHECKPOINTS).expect("decode v72 fixture");
+    lix::migration::migrate_lix(
+        authority_storage.clone(),
+        lix::migration::MigrationOptions::default(),
+    )
+    .await
+    .expect("migrate fixture to the current format");
+    let authority = Arc::new(
+        open_lix()
+            .with_storage(authority_storage.clone())
+            .await
+            .expect("open migrated authority"),
+    );
+    let checkpoints = authority
+        .execute(
+            "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_created_at ASC",
+            &[],
+        )
+        .await
+        .expect("checkpoint listing");
+    // Bootstrap + seed + two partial checkpoints (edited seeded file, new
+    // file in a new directory).
+    let last_checkpoint = checkpoints
+        .rows()
+        .last()
+        .expect("fixture has checkpoints")
+        .get::<String>("commit_id")
+        .expect("commit id");
+    let brand_file_id = authority
+        .execute("SELECT id FROM lix_file WHERE path = '/brand/logo.md'", &[])
+        .await
+        .expect("read brand file id")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("file id decodes");
+    for index in 0..105 {
+        put_value(&authority, &format!("migrated-page-{index:03}"), "value").await;
+    }
+    authority.close().await.expect("close authority setup");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+
+    // Selective hydration of the checkpoint anchor only.
+    replica
+        .execute(
+            "SELECT path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+            &[
+                Value::Text(last_checkpoint.clone()),
+                Value::Text(brand_file_id),
+            ],
+        )
+        .await
+        .expect("bounded anchor lookup hydrates");
+
+    let files = replica
+        .execute(
+            "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
+            &[Value::Text(last_checkpoint.clone())],
+        )
+        .await
+        .expect("file state at the migrated partial checkpoint hydrates");
+    let directories = replica
+        .execute(
+            "SELECT id, name FROM lix_state_at('lix_directory', $1)",
+            &[Value::Text(last_checkpoint.clone())],
+        )
+        .await
+        .expect("directory state at the migrated partial checkpoint hydrates");
+    assert_eq!(
+        directories.rows().len(),
+        4,
+        "brand, docs, handbook, sales all present"
+    );
+    assert_eq!(files.rows().len(), 4, "all four files present");
+    assert_files_resolve_directories(&files, &directories);
+
+    let diff = replica
+        .execute(
+            "SELECT to_path FROM lix_diff('lix_file', lix_root_commit_id(), $1) ORDER BY to_path",
+            &[Value::Text(last_checkpoint)],
+        )
+        .await
+        .expect("root diff with paths at the migrated partial checkpoint hydrates");
+    assert_eq!(diff.rows().len(), 4, "resolved paths for all four files");
+
+    replica.close().await.expect("close replica");
+    stop_server(server_task).await;
 }

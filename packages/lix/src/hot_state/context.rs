@@ -3051,6 +3051,7 @@ mod tests {
             let record = crate::changelog::CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: CommitId::for_test_label(&commit_id_text),
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -3094,7 +3095,9 @@ mod tests {
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: Default::default(),
                     touched_scope_filter: Default::default(),
+                    global_scope: false,
                     current_state_scoped_ranges: None,
+                    row_pk_index_root_id: None,
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
             )
@@ -3290,6 +3293,7 @@ mod tests {
             append.commits.push(crate::changelog::CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id,
                 generation,
                 parent_commit_ids: parents,
@@ -3320,7 +3324,9 @@ mod tests {
                     },
                     mutations: Default::default(),
                     touched_scope_filter: Default::default(),
+                    global_scope: false,
                     current_state_scoped_ranges: None,
+                    row_pk_index_root_id: None,
                     snapshot_root: None,
                 },
             )
@@ -3465,6 +3471,7 @@ mod tests {
             let record = crate::changelog::CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: CommitId::for_test_label(&commit_id),
                 generation,
                 parent_commit_ids: typed_parent_ids,
@@ -3527,7 +3534,9 @@ mod tests {
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: mutation_inventory,
                     touched_scope_filter: Default::default(),
+                    global_scope: false,
                     current_state_scoped_ranges: None,
+                    row_pk_index_root_id: None,
                     snapshot_root: Some(Box::new(snapshot_root)),
                 },
             )?;

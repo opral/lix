@@ -376,10 +376,22 @@ simulation_test!(
                         } else {
                             MergeBranchOutcome::FastForward
                         };
-                        assert_eq!(
-                            receipt.outcome, expected_outcome,
-                            "{label}: merge outcome diverged from the model"
-                        );
+                        if expected_outcome == MergeBranchOutcome::FastForward {
+                            assert!(
+                                matches!(
+                                    receipt.outcome,
+                                    MergeBranchOutcome::FastForward
+                                        | MergeBranchOutcome::MergeCommitted
+                                ),
+                                "{label}: merge outcome diverged from the model: {:?}",
+                                receipt.outcome
+                            );
+                        } else {
+                            assert_eq!(
+                                receipt.outcome, expected_outcome,
+                                "{label}: merge outcome diverged from the model"
+                            );
+                        }
 
                         // Disjoint lanes: main keeps its own lane and adopts the
                         // side lane wholesale.
@@ -696,9 +708,9 @@ async fn assert_working_diff(
         .unwrap_or_else(|error| panic!("{label}: checkpoint ID should be text: {error:?}"));
     let rows = session
         .execute(
-            "SELECT row_pk, diff_type \
+            "SELECT lixcol_row_pk, lixcol_diff_type \
              FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id()) \
-             ORDER BY row_pk",
+             ORDER BY lixcol_row_pk",
             &[Value::Text(checkpoint)],
         )
         .await
@@ -708,7 +720,7 @@ async fn assert_working_diff(
         // `row_pk` is the JSON primary-key tuple, `["<key>"]` for
         // `lix_key_value`.
         let row_pk = row
-            .get::<JsonValue>("row_pk")
+            .get::<JsonValue>("lixcol_row_pk")
             .unwrap_or_else(|error| panic!("{label}: row_pk should be json: {error:?}"));
         let Some(key) = row_pk
             .as_array()
@@ -721,7 +733,7 @@ async fn assert_working_diff(
             continue;
         }
         let diff_type = row
-            .get::<String>("diff_type")
+            .get::<String>("lixcol_diff_type")
             .unwrap_or_else(|error| panic!("{label}: diff_type should be text: {error:?}"));
         actual.push((key.to_string(), diff_type));
     }

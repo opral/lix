@@ -1095,6 +1095,53 @@ impl<S> TrackedStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    /// Enumerates every file-scoped identity that has used one of the exact
+    /// row PKs by this commit. The returned catalog is a monotonic superset;
+    /// callers must point-resolve the identities to filter deleted rows.
+    pub(crate) async fn enumerate_schema_row_pk_keys_at_commit(
+        &mut self,
+        commit_id: CommitId,
+        schema_key: &str,
+        row_pks: &[RowPk],
+    ) -> Result<Vec<TrackedStateKey>, LixError> {
+        if row_pks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let manifest = storage::load_commit_state_manifest(&self.store, commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has no commit-state manifest"),
+                )
+            })?;
+        let Some(root) = manifest.row_pk_index_root_id.as_ref() else {
+            if manifest
+                .snapshot_root
+                .as_ref()
+                .is_some_and(|root| root.row_count_estimate == 0)
+            {
+                return Ok(Vec::new());
+            }
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "commit '{commit_id}' has no row-PK index for point-in-time lookup"
+                ),
+            ));
+        };
+        let request = crate::tracked_state::row_pk_index_scan_request(schema_key, row_pks, false)?;
+        let entries = self.tree.scan(&self.store, root, &request).await?;
+        entries
+            .into_iter()
+            .map(|(key, _)| {
+                crate::tracked_state::decode_row_pk_index_key(
+                    &encode_key(&key),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) async fn scan_batch_at_commit(
         &mut self,
         commit_id: &str,
@@ -1670,6 +1717,18 @@ where
             if state.is_none() {
                 continue;
             }
+            if state.as_ref().is_some_and(|state| {
+                state.mutations.member_count == 0
+                    && state
+                        .snapshot_root
+                        .as_ref()
+                        .is_some_and(|root| root.complete_state_fence)
+            }) {
+                // A materialized sparse boundary authenticates selected rows
+                // through its complete root even when the original authored
+                // delta body is intentionally absent.
+                continue;
+            }
             let mut encoded_keys =
                 TrackedStateKeyBatchBuilder::with_row_capacity(commit_rows.len());
             for row in &commit_rows {
@@ -1980,6 +2039,33 @@ where
             )),
             None => None,
         };
+        let mut observed_base_lineage = None;
+        let omits_global_parent_for_local_overlay = if metadata.parent_roots.is_empty()
+            && let Some((expected_parent_id, _)) = &expected_parent
+        {
+            let commit_id_typed = CommitId::parse_lix(commit_id, "tracked-state commit root")?;
+            let ids = [commit_id_typed, *expected_parent_id];
+            let mut changelog = ChangelogContext::new().reader(&mut self.store);
+            let records = changelog
+                .load_commits(CommitLoadRequest { commit_ids: &ids })
+                .await?;
+            let mut records = records.into_iter().map(|(_, record)| record);
+            let current = records.next().expect("current commit slot exists");
+            let parent = records.next().expect("parent commit slot exists");
+            observed_base_lineage = Some((
+                current.as_ref().and_then(|record| record.base_commit_id),
+                parent.as_ref().and_then(|record| record.base_commit_id),
+            ));
+            // Sync certifies roots in the same atomic write set as the new
+            // changelog node, so `current` can legitimately be absent from
+            // this pre-publication read. A known base-less parent is enough:
+            // producers derive (rather than accept) the physical root shape,
+            // and global children always retain their global parent root.
+            parent.is_some_and(|record| record.base_commit_id.is_none())
+                && current.is_none_or(|record| record.base_commit_id.is_some())
+        } else {
+            false
+        };
         match (expected_parent, metadata.parent_roots.first()) {
             (None, None) => Ok(()),
             (Some((expected_parent_id, expected_root)), Some(parent))
@@ -2005,8 +2091,11 @@ where
             // The changelog parent remains the semantic history edge; it does
             // not require the snapshot to retain that parent's root.
             (Some((_expected_parent_id, _)), None) if metadata.complete_state_fence => Ok(()),
+            (Some((_expected_parent_id, _)), None) if omits_global_parent_for_local_overlay => {
+                Ok(())
+            }
             (Some((expected_parent_id, _)), None) => Err(LixError::unknown(format!(
-                "tracked-state commit-root metadata for commit '{commit_id}' omits first-parent root '{expected_parent_id}' without a complete-state fence"
+                "tracked-state commit-root metadata for commit '{commit_id}' omits first-parent root '{expected_parent_id}' without a complete-state fence (base lineage: {observed_base_lineage:?})"
             ))),
             (None, Some(parent)) => Err(LixError::unknown(format!(
                 "tracked-state commit-root metadata for root commit '{}' references unexpected parent '{}'",
@@ -4408,7 +4497,7 @@ where
                     )
                 })?,
         };
-        let root_id = source.root_id;
+        let root_id = source.root_id.clone();
         self.staged_roots.insert(
             commit_id.to_string(),
             TrackedStateCommitRoot {
@@ -5557,7 +5646,9 @@ mod tests {
             replay_debt: Default::default(),
             mutations: Default::default(),
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
         storage::stage_commit_state_manifest(writes, &manifest)
@@ -7653,6 +7744,7 @@ mod tests {
                 crate::changelog::encode_commit_record(&CommitRecord {
                     touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                     format_version: 3,
+                    base_commit_id: None,
                     commit_id: commit_a,
                     generation: 2,
                     parent_commit_ids: vec![commit_b],

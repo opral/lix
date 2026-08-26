@@ -1291,6 +1291,7 @@ where
             continue;
         };
         pending.extend(node.parent_commit_ids.iter().copied());
+        pending.extend(node.base_commit_id);
     }
     Ok(reachable)
 }
@@ -1739,6 +1740,7 @@ where
             )
         })?;
         pending.extend(commits.parent_commit_ids(commit).iter().copied());
+        pending.extend(commit.base_commit_id);
     }
 
     // GC is destructive, so every live semantic commit must have an immutable
@@ -2185,6 +2187,7 @@ struct GcCommitInventoryEntry {
     change_id: ChangeId,
     parent_start: usize,
     parent_len: usize,
+    base_commit_id: Option<CommitId>,
 }
 
 #[cfg(test)]
@@ -2252,6 +2255,7 @@ where
                 change_id,
                 parent_start,
                 parent_len,
+                base_commit_id: commit.base_commit_id,
             });
         }
         let Some(next) = batch.next_start_after else {
@@ -3825,7 +3829,9 @@ mod tests {
             replay_debt: CommitStateReplayDebt::default(),
             mutations: CommitStateMutationInventory::default(),
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: Some(Box::new(TrackedStateCommitRoot {
                 commit_id,
                 root_id: TrackedStateRootId::new(root_hash),
@@ -3962,7 +3968,9 @@ mod tests {
             replay_debt: CommitStateReplayDebt::default(),
             mutations: CommitStateMutationInventory::default(),
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: Some(Box::new(snapshot_root)),
         };
         let _owner_control = replay_branch_control(owner, retired_ref, timestamp);
@@ -5072,6 +5080,7 @@ mod tests {
             CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: source_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -5083,6 +5092,7 @@ mod tests {
             CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: alias_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -5094,6 +5104,7 @@ mod tests {
             CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: authority_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -5105,6 +5116,7 @@ mod tests {
             CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![alias_commit, authority_commit],
@@ -5323,6 +5335,7 @@ mod tests {
             CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: live_parent,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -5334,6 +5347,7 @@ mod tests {
             CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![live_parent],
@@ -5345,6 +5359,7 @@ mod tests {
             CommitRecord {
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
+                base_commit_id: None,
                 commit_id: dead_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
@@ -5631,6 +5646,7 @@ mod tests {
         CommitRecord {
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
+            base_commit_id: None,
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
@@ -5657,6 +5673,7 @@ mod tests {
         CommitRecord {
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
+            base_commit_id: None,
             commit_id,
             generation,
             parent_commit_ids: parent.into_iter().collect(),
@@ -6041,7 +6058,9 @@ mod tests {
             },
             mutations,
             touched_scope_filter: Default::default(),
+            global_scope: false,
             current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
             snapshot_root: None,
         }
     }

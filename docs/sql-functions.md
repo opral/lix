@@ -63,13 +63,50 @@ no checkpoint, it returns `lix_root_commit_id()`. Use both branch-scoped
 accessors to read working changes in one query:
 
 ```sql
-SELECT row_pk, diff_type
+SELECT lixcol_row_pk, lixcol_diff_type
 FROM lix_diff(
   'lix_file',
   lix_latest_checkpoint_commit_id(),
   lix_active_branch_commit_id()
 );
 ```
+
+`lix_state_at(relation, commit_id)` returns the complete tracked state of a
+relation at one commit. Its columns are identical to the live relation, and
+entities that did not exist at that commit produce no row:
+
+```sql
+SELECT id, path, content
+FROM lix_state_at('lix_file', $1)
+WHERE id IN ($2, $3);
+```
+
+The relation argument must be a text literal. The commit may be a text
+parameter or `lix_root_commit_id()` / `lix_active_branch_commit_id()`. Primary
+key `=` and `IN` predicates are pushed into the point-in-time read, so batched
+entity lookups do not scan unrelated tracked rows. Untracked rows are never
+included.
+
+The supplied commit is a closed snapshot. A local commit records its exact
+global dependency in `lix_commit.base_commit_id`; its physical state is an
+immutable local-overlay root plus that pinned immutable global root.
+`lix_state_at` composes both roots and returns inherited global rows plus local
+values and tombstones, with local intent winning. Global commits have a null
+base. The base is a state dependency, not ancestry, so it is deliberately
+absent from `parent_commit_ids` and `lix_commit_ancestry()`. `lix_history`
+does follow the base dependency so history can explain the complete state.
+
+When global advances, the next live access to a local branch lazily publishes
+one metadata-only local commit pinned to the latest global commit. An actual
+local write performs the same base advance in its own commit, so multiple
+global advances coalesce and global publication remains O(1) rather than
+fanning out over every branch. No global rows are copied into the local
+overlay. The active commit ID and every live row therefore always describe the
+same closed snapshot.
+
+For `lix_history`, depth is the shortest dependency distance using either a
+causal parent edge or a state-base edge. `lix_commit_ancestry()` remains
+strictly causal-parent-only.
 
 `lix_commit_ancestry()` returns the active head at depth `0` and every
 reachable ancestor once at its shortest depth. Pass one commit ID to use an

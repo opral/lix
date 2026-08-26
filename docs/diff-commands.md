@@ -17,7 +17,7 @@ import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
 const changedFiles = await lix.execute(
-  `SELECT row_pk, diff_type, from_path, to_path, row_count
+  `SELECT lixcol_row_pk, lixcol_diff_type, from_path, to_path, lixcol_row_count
    FROM lix_diff(
      'lix_file',
      lix_latest_checkpoint_commit_id(),
@@ -27,20 +27,20 @@ const changedFiles = await lix.execute(
 );
 
 for (const row of changedFiles.rows) {
-  console.log(row.get("diff_type"), row.get("to_path") ?? row.get("from_path"));
+  console.log(row.get("lixcol_diff_type"), row.get("to_path") ?? row.get("from_path"));
 }
 
 const reverted = await lix.execute(
   `INSERT INTO lix_revert (relation, row_pk)
-   SELECT 'lix_file', row_pk
+   SELECT 'lix_file', lixcol_row_pk
    FROM lix_diff(
      'lix_file',
      lix_latest_checkpoint_commit_id(),
      lix_active_branch_commit_id()
    )
-   WHERE row_pk = $1
+   WHERE lixcol_row_pk = $1
    RETURNING commit_id`,
-  [changedFiles.rows[0].get("row_pk")],
+  [changedFiles.rows[0].get("lixcol_row_pk")],
 );
 
 if (reverted.rows.length > 0) {
@@ -57,9 +57,10 @@ for a new branch.
 
 ## Diff rows
 
-Every relation diff exposes `row_pk`, `diff_type`, `row_count`, and a
+Every relation diff exposes `lixcol_row_pk`, `lixcol_diff_type`,
+`lixcol_row_count`, and a
 `from_<column>` / `to_<column>` pair for each column of the compared relation.
-`diff_type` is `added`, `modified`, or `removed`. Added rows have empty `from_`
+`lixcol_diff_type` is `added`, `modified`, or `removed`. Added rows have empty `from_`
 values; removed rows have empty `to_` values. Use
 `coalesce(to_path, from_path)` when displaying a path that also covers removed
 or renamed files.
@@ -69,11 +70,11 @@ reconstructing historical file bytes would turn lightweight diff reads into blob
 materialization. Query `lix_history('lix_file', commit_id)` when file bytes are
 required.
 
-`row_count` is `1` for a changed schema row. For a file it counts the underlying
+`lixcol_row_count` is `1` for a changed schema row. For a file it counts the underlying
 descriptor and content rows contributing to the aggregate:
 
 ```sql
-SELECT count(*) AS changed_files, sum(row_count) AS changed_rows
+SELECT count(*) AS changed_files, sum(lixcol_row_count) AS changed_rows
 FROM lix_diff(
   'lix_file',
   lix_latest_checkpoint_commit_id(),
@@ -98,7 +99,7 @@ added rows. Genesis comparisons of internal bootstrap schema rows are
 unsupported because those metadata rows already exist in the bootstrap root.
 
 ```sql
-SELECT row_pk, to_path
+SELECT lixcol_row_pk, to_path
 FROM lix_diff('lix_file', lix_root_commit_id(), $commit_id);
 ```
 
@@ -108,7 +109,7 @@ The insert-only command sinks consume queries selecting `(relation, row_pk)`:
 
 ```sql
 INSERT INTO lix_revert (relation, row_pk)
-SELECT 'lix_file', row_pk
+SELECT 'lix_file', lixcol_row_pk
 FROM lix_diff(
   'lix_file',
   lix_latest_checkpoint_commit_id(),
@@ -117,12 +118,12 @@ FROM lix_diff(
 WHERE coalesce(to_path, from_path) LIKE '/docs/%';
 
 INSERT INTO lix_apply (relation, row_pk)
-SELECT 'acme_task', row_pk
+SELECT 'acme_task', lixcol_row_pk
 FROM lix_diff('acme_task', $from_commit_id, $to_commit_id)
 WHERE to_done = true;
 
 INSERT INTO lix_create_checkpoint (relation, row_pk)
-SELECT 'lix_file', row_pk
+SELECT 'lix_file', lixcol_row_pk
 FROM lix_diff(
   'lix_file',
   lix_latest_checkpoint_commit_id(),

@@ -18,13 +18,7 @@ pub const fn lix_schema_definition_json() -> &'static str {
 }
 
 pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError> {
-    lix_schema::from_value(schema.clone()).map(|_| ()).map_err(|error| {
-        schema_error(
-            LixError::CODE_SCHEMA_DEFINITION,
-            "Invalid Lix schema definition",
-            error,
-        )
-    })
+    parse_lix_schema(schema).map(|_| ())
 }
 
 pub fn validate_lix_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), LixError> {
@@ -47,13 +41,25 @@ pub(crate) fn compile_lix_schema(
 }
 
 pub(crate) fn parse_lix_schema(schema: &JsonValue) -> Result<lix_schema::Schema, LixError> {
-    lix_schema::from_value(schema.clone()).map_err(|error| {
+    let parsed = lix_schema::from_value(schema.clone()).map_err(|error| {
         schema_error(
             LixError::CODE_SCHEMA_DEFINITION,
             "Invalid Lix schema definition",
             error,
         )
-    })
+    })?;
+    if let Some(column) = parsed.columns.iter().find(|column| {
+        column.name.starts_with("lixcol_") || column.name.contains("_lixcol_")
+    }) {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!(
+                "Invalid Lix schema definition: column '{}' uses the reserved lixcol_ segment",
+                column.name
+            ),
+        ));
+    }
+    Ok(parsed)
 }
 
 pub(crate) fn format_lix_schema_validation_errors(error: lix_schema::Error) -> String {

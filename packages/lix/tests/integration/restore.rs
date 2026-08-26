@@ -73,7 +73,11 @@ simulation_test!(
             })
             .await
             .expect("control branch should still exist");
-        assert_eq!(head(&session).await, other_branch.commit_id);
+        assert_ne!(
+            head(&session).await,
+            other_branch.commit_id,
+            "checking out the control branch refreshes its stale global base"
+        );
         assert_eq!(count(&session, "lix_file").await, 1);
 
         restore(&session, &initial_commit_id)

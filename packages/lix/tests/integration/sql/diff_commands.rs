@@ -32,7 +32,7 @@ simulation_test!(
         let working = select_rows(
             &session,
             &format!(
-                "SELECT row_pk, diff_type FROM lix_diff('lix_key_value', '{baseline}', '{original_head}') ORDER BY row_pk"
+                "SELECT lixcol_row_pk, lixcol_diff_type FROM lix_diff('lix_key_value', '{baseline}', '{original_head}') ORDER BY lixcol_row_pk"
             ),
         )
         .await;
@@ -48,11 +48,11 @@ simulation_test!(
         let reverted = session
             .execute(
                 "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk \
+                 SELECT 'lix_key_value', lixcol_row_pk \
                  FROM lix_diff(\
                    'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
                  ) \
-                 WHERE row_pk ->> 0 IN ('a', 'b') \
+                 WHERE lixcol_row_pk ->> 0 IN ('a', 'b') \
                  RETURNING commit_id",
                 &[],
             )
@@ -73,9 +73,9 @@ simulation_test!(
         let applied = session
             .execute(
                 "INSERT INTO lix_apply (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk \
+                 SELECT 'lix_key_value', lixcol_row_pk \
                  FROM lix_diff('lix_key_value', lix_root_commit_id(), $1) \
-                 WHERE row_pk ->> 0 IN ('a', 'b') \
+                 WHERE lixcol_row_pk ->> 0 IN ('a', 'b') \
                  RETURNING commit_id",
                 &[Value::Text(original_head)],
             )
@@ -88,11 +88,11 @@ simulation_test!(
         let checkpointed = session
             .execute(
                 "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk \
+                 SELECT 'lix_key_value', lixcol_row_pk \
                  FROM lix_diff(\
                    'lix_key_value', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()\
                  ) \
-                 WHERE row_pk = CAST('[\"a\"]' AS JSONB) \
+                 WHERE lixcol_row_pk = CAST('[\"a\"]' AS JSONB) \
                  RETURNING commit_id",
                 &[],
             )
@@ -114,7 +114,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT row_pk FROM lix_diff('lix_key_value', '{checkpoint_commit_id}', '{child_head}')"
+                    "SELECT lixcol_row_pk FROM lix_diff('lix_key_value', '{checkpoint_commit_id}', '{child_head}')"
                 ),
             )
             .await,
@@ -124,7 +124,7 @@ simulation_test!(
         let empty = session
             .execute(
                 "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk \
+                 SELECT 'lix_key_value', lixcol_row_pk \
                  FROM lix_diff('lix_key_value', $1, $2) WHERE 1 = 0 \
                  RETURNING commit_id",
                 &[
@@ -198,7 +198,7 @@ simulation_test!(
         let reverted = session
             .execute(
                 "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk \
+                 SELECT 'lix_key_value', lixcol_row_pk \
                  FROM lix_diff(\
                    'lix_key_value', \
                    lix_latest_checkpoint_commit_id(), \
@@ -223,7 +223,7 @@ simulation_test!(
         let applied = session
             .execute(
                 "INSERT INTO lix_apply (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk \
+                 SELECT 'lix_key_value', lixcol_row_pk \
                  FROM lix_diff(\
                    'lix_key_value', \
                    lix_latest_checkpoint_commit_id(), \
@@ -309,8 +309,8 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT diff_type FROM lix_diff('lix_key_value', '{checkpoint_id}', '{head}') \
-                     WHERE row_pk = CAST('[\"recycled\"]' AS JSONB)"
+                    "SELECT lixcol_diff_type FROM lix_diff('lix_key_value', '{checkpoint_id}', '{head}') \
+                     WHERE lixcol_row_pk = CAST('[\"recycled\"]' AS JSONB)"
                 ),
             )
             .await,
@@ -366,9 +366,9 @@ simulation_test!(
         let checkpointed = session
             .execute(
                 "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_key_value', row_pk \
+                 SELECT 'lix_key_value', lixcol_row_pk \
                  FROM lix_diff('lix_key_value', $1, $2) \
-                 WHERE row_pk ->> 0 IN ('a', 'b', 'c') \
+                 WHERE lixcol_row_pk ->> 0 IN ('a', 'b', 'c') \
                  RETURNING commit_id",
                 &[Value::Text(baseline), Value::Text(head)],
             )
@@ -428,7 +428,7 @@ simulation_test!(
         let checkpoint = session
             .execute(
                 "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_file', row_pk FROM lix_diff('lix_file', $1, $2) \
+                 SELECT 'lix_file', lixcol_row_pk FROM lix_diff('lix_file', $1, $2) \
                  WHERE to_path = '/docs/nested/readme.txt' RETURNING commit_id",
                 &[Value::Text(baseline), Value::Text(head)],
             )

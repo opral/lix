@@ -273,7 +273,7 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
     assert_eq!(healthy.rows().len(), 8, "healthy tracked tree row count");
     let healthy_diff = lix
         .execute(
-            "SELECT 'lix_key_value' AS schema_key, diff_type \
+            "SELECT 'lix_key_value' AS schema_key, lixcol_diff_type \
              FROM lix_diff('lix_key_value', $1, $2)",
             &[
                 Value::Text(checkpoint_head.clone()),
@@ -299,7 +299,7 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         Ok(lix) => {
             let result = lix
                 .execute(
-                    "SELECT 'lix_key_value' AS schema_key, diff_type \
+                    "SELECT 'lix_key_value' AS schema_key, lixcol_diff_type \
                      FROM lix_diff('lix_key_value', $1, $2)",
                     &[Value::Text(checkpoint_head), Value::Text(updated_head)],
                 )

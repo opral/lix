@@ -198,27 +198,6 @@ where
     .await
 }
 
-pub(crate) async fn load_rebuild_plans_to_nearest_available_root_bounded<S>(
-    store: &S,
-    commit_id: &str,
-    force_head: bool,
-    max_members: usize,
-    known_commit_ids: &BTreeSet<CommitId>,
-) -> Result<Vec<CommitRootRebuildPlan>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    load_rebuild_plans_to_nearest_available_root_inner(
-        store,
-        commit_id,
-        force_head,
-        RootAvailabilityProof::Addressable,
-        Some(max_members),
-        known_commit_ids,
-    )
-    .await
-}
-
 pub(crate) async fn load_rebuild_plans_to_nearest_available_root_with_proof<S>(
     store: &S,
     commit_id: &str,
@@ -496,19 +475,18 @@ where
         })
         .collect();
 
+    let parent_commit_id = match manifest.snapshot_root.as_ref() {
+        Some(root) if !root.complete_state_fence => root
+            .parent_roots
+            .first()
+            .map(|parent| parent.commit_id),
+        Some(_) => None,
+        None => commit.as_ref().and_then(first_parent_commit_id),
+    };
+
     Ok(CommitRootRebuildPlan {
         commit_id: typed_commit_id,
-        parent_commit_id: commit
-            .as_ref()
-            .and_then(first_parent_commit_id)
-            .or_else(|| {
-                manifest
-                    .snapshot_root
-                    .as_ref()
-                    .filter(|root| !root.complete_state_fence)
-                    .and_then(|root| root.parent_roots.first())
-                    .map(|parent| parent.commit_id)
-            }),
+        parent_commit_id,
         complete_state_source_commit_id,
         deltas,
     })

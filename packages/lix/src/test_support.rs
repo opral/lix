@@ -571,7 +571,9 @@ fn stage_test_commit_state_manifest(
         replay_debt,
         mutations,
         touched_scope_filter: Default::default(),
+        global_scope: false,
         current_state_scoped_ranges: None,
+        row_pk_index_root_id: None,
         snapshot_root: snapshot_root.map(Box::new),
     };
     crate::tracked_state::stage_commit_state_manifest(writes, &manifest)
@@ -751,6 +753,7 @@ async fn stage_test_changelog_commit(
     let record = CommitRecord {
         touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
         format_version: 4,
+        base_commit_id: None,
         commit_id: typed_commit_id,
         generation,
         parent_commit_ids: typed_parent_ids,

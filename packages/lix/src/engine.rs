@@ -1726,7 +1726,7 @@ mod tests {
         let broad = session
             .execute(
                 &format!(
-                    "SELECT row_pk, diff_type FROM {} ORDER BY row_pk",
+                    "SELECT lixcol_row_pk, lixcol_diff_type FROM {} ORDER BY lixcol_row_pk",
                     json_pointer_diff_relation(&session).await
                 ),
                 &[],
@@ -1742,10 +1742,10 @@ mod tests {
             .iter()
             .map(|row| {
                 (
-                    row.get::<serde_json::Value>("row_pk")
+                    row.get::<serde_json::Value>("lixcol_row_pk")
                         .expect("row_pk should decode")
                         .to_string(),
-                    row.get::<String>("diff_type")
+                    row.get::<String>("lixcol_diff_type")
                         .expect("diff_type should decode"),
                 )
             })
@@ -1777,8 +1777,8 @@ mod tests {
             let finite = session
                 .execute(
                     &format!(
-                        "SELECT row_pk, diff_type FROM {} \
-                         WHERE row_pk = CAST($1 AS JSONB) ORDER BY row_pk",
+                        "SELECT lixcol_row_pk, lixcol_diff_type FROM {} \
+                         WHERE lixcol_row_pk = CAST($1 AS JSONB) ORDER BY lixcol_row_pk",
                         json_pointer_diff_relation(&session).await
                     ),
                     &[crate::Value::Text(requested_row_pk.clone())],
@@ -1794,10 +1794,10 @@ mod tests {
                 .iter()
                 .map(|row| {
                     (
-                        row.get::<serde_json::Value>("row_pk")
+                        row.get::<serde_json::Value>("lixcol_row_pk")
                             .expect("row_pk should decode")
                             .to_string(),
-                        row.get::<String>("diff_type")
+                        row.get::<String>("lixcol_diff_type")
                             .expect("diff_type should decode"),
                     )
                 })
@@ -1946,13 +1946,13 @@ mod tests {
                 .iter()
                 .map(|row| {
                     (
-                        row.get::<serde_json::Value>("row_pk")
+                        row.get::<serde_json::Value>("lixcol_row_pk")
                             .expect("row_pk should decode")
                             .to_string(),
                         // `file_id` is nullable; a NULL surfaces as a decode
                         // error through the typed accessor.
                         row.get::<String>("file_id").ok(),
-                        row.get::<String>("diff_type")
+                        row.get::<String>("lixcol_diff_type")
                             .expect("diff_type should decode"),
                     )
                 })
@@ -1962,8 +1962,8 @@ mod tests {
         }
         let relation = json_pointer_diff_relation(&session).await;
         let columns = format!(
-            "SELECT row_pk, \
-             COALESCE(to_lixcol_file_id, from_lixcol_file_id) AS file_id, diff_type \
+            "SELECT lixcol_row_pk, \
+             COALESCE(to_lixcol_file_id, from_lixcol_file_id) AS file_id, lixcol_diff_type \
              FROM {relation}"
         );
 

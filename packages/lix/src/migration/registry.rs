@@ -10,24 +10,16 @@ pub(crate) struct Migration {
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
-        from_version: 68,
-        to_version: 69,
-    },
-    Migration {
-        from_version: 69,
-        to_version: 70,
-    },
-    Migration {
-        from_version: 70,
-        to_version: 71,
-    },
-    Migration {
-        from_version: 71,
-        to_version: 72,
-    },
-    Migration {
         from_version: 72,
         to_version: 73,
+    },
+    Migration {
+        from_version: 73,
+        to_version: 74,
+    },
+    Migration {
+        from_version: 74,
+        to_version: 75,
     },
 ];
 
@@ -41,40 +33,29 @@ pub(crate) fn migration_from(from_version: u32) -> Option<&'static Migration> {
         .find(|migration| migration.from_version == from_version)
 }
 
+pub(crate) fn has_complete_migration_path(mut from_version: u32, to_version: u32) -> bool {
+    while from_version < to_version {
+        let Some(migration) = migration_from(from_version) else {
+            return false;
+        };
+        if migration.to_version <= from_version || migration.to_version > to_version {
+            return false;
+        }
+        from_version = migration.to_version;
+    }
+    from_version == to_version
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn registry_describes_format_edges() {
-        assert_eq!(
-            migration_from(68),
-            Some(&Migration {
-                from_version: 68,
-                to_version: 69,
-            })
-        );
-        assert_eq!(
-            migration_from(69),
-            Some(&Migration {
-                from_version: 69,
-                to_version: 70,
-            })
-        );
-        assert_eq!(
-            migration_from(70),
-            Some(&Migration {
-                from_version: 70,
-                to_version: 71,
-            })
-        );
-        assert_eq!(
-            migration_from(71),
-            Some(&Migration {
-                from_version: 71,
-                to_version: 72,
-            })
-        );
+        // The v75 chain starts at v72: older repositories carry commit-record
+        // arities the in-place chain cannot traverse (see migrate_lix's gate).
+        assert_eq!(migration_from(68), None);
+        assert_eq!(migration_from(71), None);
         assert_eq!(
             migration_from(72),
             Some(&Migration {
@@ -82,7 +63,29 @@ mod tests {
                 to_version: 73,
             })
         );
-        assert_eq!(registered_migrations().len(), 5);
+        assert_eq!(
+            migration_from(73),
+            Some(&Migration {
+                from_version: 73,
+                to_version: 74,
+            })
+        );
+        assert_eq!(
+            migration_from(74),
+            Some(&Migration {
+                from_version: 74,
+                to_version: 75,
+            })
+        );
+        assert_eq!(registered_migrations().len(), 3);
+        assert!(has_complete_migration_path(
+            72,
+            crate::init::CURRENT_FORMAT_VERSION
+        ));
+        assert!(!has_complete_migration_path(
+            68,
+            crate::init::CURRENT_FORMAT_VERSION
+        ));
         assert_eq!(migration_from(crate::init::CURRENT_FORMAT_VERSION), None);
     }
 }

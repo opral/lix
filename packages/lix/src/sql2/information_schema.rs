@@ -214,7 +214,10 @@ impl LixInformationSchemaProvider {
             .surfaces()
             .filter(|surface| surface.class == PublicSurfaceClass::TableFunction)
         {
-            if surface.kind == PublicSurfaceKind::DiffFunction {
+            if matches!(
+                surface.kind,
+                PublicSurfaceKind::DiffFunction | PublicSurfaceKind::StateAtFunction
+            ) {
                 for relation in self.public_catalog.surfaces().filter(|relation| {
                     matches!(
                         relation.kind,
@@ -223,18 +226,29 @@ impl LixInformationSchemaProvider {
                             | PublicSurfaceKind::SchemaBase { .. }
                     )
                 }) {
-                    let provider_schema = super::providers::relation_diff_schema(
-                        self.public_catalog.as_ref(),
-                        &relation.name,
-                    )?;
+                    let provider_schema = if surface.kind == PublicSurfaceKind::DiffFunction {
+                        super::providers::relation_diff_schema(
+                            self.public_catalog.as_ref(),
+                            &relation.name,
+                        )?
+                    } else {
+                        self.public_catalog.surface_schema(&relation.name).ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "state relation '{}' is missing its result schema",
+                                relation.name
+                            ))
+                        })?
+                    };
                     for (position, field) in provider_schema.fields().iter().enumerate() {
                         function_catalog.push(self.public_catalog_name.clone());
                         function_schema.push(self.public_schema_name.clone());
                         function_name.push(surface.name.clone());
                         source_relation.push(Some(relation.name.clone()));
-                        argument_signature.push(
-                            "(relation TEXT, from_commit_id TEXT, to_commit_id TEXT)".to_string(),
-                        );
+                        argument_signature.push(if surface.kind == PublicSurfaceKind::DiffFunction {
+                            "(relation TEXT, from_commit_id TEXT, to_commit_id TEXT)".to_string()
+                        } else {
+                            "(relation TEXT, commit_id TEXT)".to_string()
+                        });
                         result_column.push(field.name().clone());
                         ordinal_position.push((position + 1) as u64);
                         is_nullable
@@ -254,6 +268,7 @@ impl LixInformationSchemaProvider {
                     super::providers::commit_ancestry_schema(),
                 ),
                 PublicSurfaceKind::DiffFunction => unreachable!("relation-specific diffs handled above"),
+                PublicSurfaceKind::StateAtFunction => unreachable!("relation-specific state handled above"),
                 _ => {
                     return Err(DataFusionError::Execution(format!(
                         "table function '{}' has a non-function semantic kind",

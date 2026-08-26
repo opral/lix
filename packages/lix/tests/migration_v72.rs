@@ -23,7 +23,7 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
             .expect("v72 format inspection should succeed"),
         MigrationStatus::Required {
             from_version: 72,
-            to_version: 73,
+            to_version: 75,
         }
     );
     let Err(open_error) = open_lix().with_storage(storage.clone()).await else {
@@ -35,10 +35,10 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
         .await
         .expect("v72 account schema should migrate");
     assert_eq!(report.from_version, 72);
-    assert_eq!(report.to_version, 73);
+    assert_eq!(report.to_version, 75);
     assert_eq!(
         inspect_lix(&storage).await.unwrap(),
-        MigrationStatus::Current { version: 73 }
+        MigrationStatus::Current { version: 75 }
     );
 
     let lix = open_lix()

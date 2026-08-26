@@ -21,7 +21,7 @@ const SYNC_REQUEST_TOO_LARGE_CODE: &str = "LIX_ERROR_REQUEST_BODY_TOO_LARGE";
 const SYNC_ITEM_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_ITEM_TOO_LARGE";
 const SYNC_SNAPSHOT_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_SNAPSHOT_TOO_LARGE";
 const SYNC_DEMAND_STALLED_CODE: &str = "LIX_ERROR_SYNC_DEMAND_STALLED";
-const SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE: usize = 4;
+const SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE: usize = 16;
 /// Independent sparse heads are safe to fetch concurrently. Keeping the cap
 /// below the HTTP/1 connection fan-out used by browser transports avoids both
 /// serial round-trip latency and unbounded authority pressure.
@@ -960,6 +960,135 @@ struct FetchedHistory {
     boundaries: Vec<super::SyncHistoryBoundary>,
 }
 
+fn validate_history_page_body_budget(
+    response: &super::SyncHistoryResponse,
+    head: &str,
+    limit: usize,
+) -> Result<usize, LixError> {
+    let commits = response
+        .commits
+        .iter()
+        .map(|commit| (commit.commit_id.as_str(), commit))
+        .collect::<BTreeMap<_, _>>();
+    let boundary_ids = response
+        .boundaries
+        .iter()
+        .map(|boundary| boundary.commit_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let dependency_ids = response
+        .commits
+        .iter()
+        .filter(|candidate| {
+            candidate.global_scope
+                && boundary_ids.contains(candidate.commit_id.as_str())
+                && response.commits.iter().any(|commit| {
+                    commit.base_commit_id.as_deref() == Some(candidate.commit_id.as_str())
+                })
+        })
+        .map(|commit| commit.commit_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut causal = BTreeSet::new();
+    let mut cursor = Some(head);
+    while let Some(commit_id) = cursor {
+        if commit_id != head && dependency_ids.contains(commit_id) {
+            break;
+        }
+        let Some(commit) = commits.get(commit_id) else {
+            break;
+        };
+        if !causal.insert(commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync history response contains a causal cycle",
+            ));
+        }
+        cursor = commit.parent_commit_ids.first().map(String::as_str);
+    }
+    if causal.len() > limit {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync history response exceeds the requested page limit",
+        ));
+    }
+    for dependency_id in commits.keys().filter(|commit_id| !causal.contains(**commit_id)) {
+        if !dependency_ids.contains(dependency_id) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "sync history response contains unrelated dependency body '{dependency_id}'"
+                ),
+            ));
+        }
+    }
+    Ok(causal.len())
+}
+
+fn merge_fetched_history_response(
+    head: &str,
+    response: super::SyncHistoryResponse,
+    commits: &mut BTreeMap<String, super::SyncCommit>,
+    commit_headers: &mut BTreeMap<String, super::SyncCommitHeader>,
+    boundaries: &mut BTreeMap<String, super::SyncHistoryBoundary>,
+) -> Result<(), LixError> {
+    for header in response.commit_headers {
+        if let Some(existing) = commit_headers.insert(header.commit_id.clone(), header.clone())
+            && existing != header
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync history returned conflicting commit headers",
+            ));
+        }
+    }
+    let response_commits = response.commits;
+    for commit in &response_commits {
+        commit.validate()?;
+    }
+    let returned = response_commits
+        .iter()
+        .map(|commit| commit.commit_id.clone())
+        .collect::<BTreeSet<_>>();
+    if !returned.contains(head) {
+        return Err(LixError::new(
+            LixError::CODE_COMMIT_NOT_FOUND,
+            format!("sync history response omitted requested head '{head}'"),
+        ));
+    }
+    for boundary in response.boundaries {
+        let is_external_base = response_commits.iter().any(|commit| {
+            commit.base_commit_id.as_deref() == Some(boundary.commit_id.as_str())
+        });
+        if !returned.contains(&boundary.commit_id) && !is_external_base {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "sync history returned boundary '{}' outside its page",
+                    boundary.commit_id
+                ),
+            ));
+        }
+        if let Some(existing) = boundaries.insert(boundary.commit_id.clone(), boundary.clone())
+            && existing != boundary
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync history returned conflicting boundary roots",
+            ));
+        }
+    }
+    for commit in response_commits {
+        if let Some(existing) = commits.insert(commit.commit_id.clone(), commit.clone())
+            && existing != commit
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync history returned conflicting duplicate commits",
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_history_objects<Transport>(
     transport: &Transport,
     pending: BTreeSet<String>,
@@ -989,60 +1118,42 @@ where
         }))
         .await?;
         for (head, response) in pending_batch.iter().zip(responses) {
-            for header in response.commit_headers {
-                if let Some(existing) =
-                    commit_headers.insert(header.commit_id.clone(), header.clone())
-                    && existing != header
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync history returned conflicting commit headers",
-                    ));
-                }
-            }
-            let mut response_commits = response.commits;
-            for commit in &response_commits {
-                commit.validate()?;
-            }
-            let returned = response_commits
-                .iter()
-                .map(|commit| commit.commit_id.clone())
-                .collect::<BTreeSet<_>>();
-            if !returned.contains(head) {
-                return Err(LixError::new(
-                    LixError::CODE_COMMIT_NOT_FOUND,
-                    format!("sync history response omitted requested head '{head}'"),
-                ));
-            }
-            for boundary in response.boundaries {
-                if !returned.contains(&boundary.commit_id) {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "sync history returned boundary '{}' outside its page",
-                            boundary.commit_id
-                        ),
-                    ));
-                }
-                if let Some(existing) =
-                    boundaries.insert(boundary.commit_id.clone(), boundary.clone())
-                    && existing != boundary
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync history returned conflicting boundary roots",
-                    ));
-                }
-            }
-            for commit in response_commits.drain(..) {
-                if let Some(existing) = commits.insert(commit.commit_id.clone(), commit.clone())
-                    && existing != commit
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync history returned conflicting duplicate commits",
-                    ));
-                }
+            merge_fetched_history_response(
+                head,
+                response,
+                &mut commits,
+                &mut commit_headers,
+                &mut boundaries,
+            )?;
+        }
+    }
+
+    // A bounded page may materialize an external global base without spending
+    // one of its causal body slots on that base. Close those boundary bodies
+    // before import so immutable commit authority is published exactly once:
+    // canonical local mutations plus the complete boundary root atomically.
+    loop {
+        let missing = boundaries
+            .keys()
+            .filter(|commit_id| !commits.contains_key(*commit_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            break;
+        }
+        for missing_batch in missing.chunks(SYNC_DEMAND_FETCH_CONCURRENCY) {
+            let responses = futures_util::future::try_join_all(missing_batch.iter().map(|head| {
+                fetch_history_head(transport, head, 1, max_boundaries_per_page)
+            }))
+            .await?;
+            for (head, response) in missing_batch.iter().zip(responses) {
+                merge_fetched_history_response(
+                    head,
+                    response,
+                    &mut commits,
+                    &mut commit_headers,
+                    &mut boundaries,
+                )?;
             }
         }
     }
@@ -1072,9 +1183,11 @@ where
         let Some(max_boundaries) = max_boundaries_per_page else {
             return Ok(response);
         };
+        let returned_causal_commits =
+            validate_history_page_body_budget(&response, head, history_page_limit)?;
         let Some(next_limit) = smaller_history_demand_page_limit(
             history_page_limit,
-            response.commits.len(),
+            returned_causal_commits,
             response.boundaries.len(),
             max_boundaries,
         ) else {
@@ -1111,12 +1224,7 @@ where
         transport.history(head, limit)
     })
     .await?;
-    if response.commits.len() > *limit {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "sync history response exceeds the requested page limit",
-        ));
-    }
+    validate_history_page_body_budget(&response, head, *limit)?;
     Ok(response)
 }
 
@@ -1550,26 +1658,42 @@ mod tests {
                     next = commit.parent_commit_ids.first().cloned();
                     newest_first.push(commit);
                 }
-                let returned = newest_first
+                let body_ids = newest_first
                     .iter()
-                    .map(|commit| commit.commit_id.as_str())
+                    .map(|commit| commit.commit_id.clone())
                     .collect::<BTreeSet<_>>();
-                let boundaries = newest_first
+                let external_base_ids = newest_first
+                    .iter()
+                    .filter_map(|commit| commit.base_commit_id.clone())
+                    .filter(|base| !body_ids.contains(base))
+                    .collect::<BTreeSet<_>>();
+                let mut boundary_ids = newest_first
                     .iter()
                     .filter(|commit| {
                         commit
                             .parent_commit_ids
-                            .first()
-                            .is_some_and(|parent| !returned.contains(parent.as_str()))
+                            .iter()
+                            .any(|parent| !body_ids.contains(parent))
                     })
-                    .map(|commit| {
+                    .map(|commit| commit.commit_id.clone())
+                    .collect::<BTreeSet<_>>();
+                boundary_ids.extend(external_base_ids.iter().cloned());
+                let boundaries = boundary_ids
+                    .into_iter()
+                    .map(|commit_id| {
                         self.history_boundaries
-                            .get(&commit.commit_id)
+                            .get(&commit_id)
                             .cloned()
                             .expect("test boundary has a certified live root")
                     })
                     .collect();
                 newest_first.reverse();
+                newest_first.extend(external_base_ids.into_iter().map(|commit_id| {
+                    self.commits
+                        .get(&commit_id)
+                        .cloned()
+                        .expect("test base dependency has a canonical body")
+                }));
                 Ok(super::super::SyncHistoryResponse {
                     commits: newest_first,
                     commit_headers: self.commit_headers.clone(),
@@ -1735,8 +1859,12 @@ mod tests {
             commit_id: crate::changelog::CommitId::for_test_label("runtime-inline-commit")
                 .to_string(),
             parent_commit_ids: Vec::new(),
+            base_commit_id: Some(
+                crate::changelog::CommitId::for_test_label("runtime-inline-base").to_string(),
+            ),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
+            global_scope: false,
             selected_source_commit_id: None,
             state_alias: None,
             members: vec![super::super::commit::SyncCommitMember {
@@ -2447,7 +2575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deep_history_fetches_one_requested_body_with_bounded_headers() {
+    async fn deep_history_inlines_base_body_without_an_extra_request() {
         let authority = open_lix().await.expect("authority opens");
         for index in 0..32 {
             authority
@@ -2472,7 +2600,23 @@ mod tests {
             .sync_history(&head, 1)
             .await
             .expect("authority exports one deep head");
-        assert_eq!(response.commits.len(), 1);
+        let head_commit = response
+            .commits
+            .iter()
+            .find(|commit| commit.commit_id == head)
+            .expect("response contains the requested head");
+        let base_commit_id = head_commit
+            .base_commit_id
+            .clone()
+            .expect("authored head pins its global base");
+        assert_eq!(response.commits.len(), 2);
+        assert!(
+            response
+                .commits
+                .iter()
+                .any(|commit| commit.commit_id == base_commit_id),
+            "the pinned base body is an inline dependency",
+        );
         assert!(
             response.commit_headers.len() <= 6,
             "header closure must stay bounded independently of history depth",
@@ -2510,7 +2654,19 @@ mod tests {
         )
         .await
         .expect("deep head fetch succeeds");
-        assert_eq!(fetched.commits.len(), 1);
+        assert_eq!(fetched.commits.len(), 2);
+        assert!(
+            fetched
+                .commits
+                .iter()
+                .any(|commit| commit.commit_id == head)
+        );
+        assert!(
+            fetched
+                .commits
+                .iter()
+                .any(|commit| commit.commit_id == base_commit_id)
+        );
         assert!(fetched.commit_headers.len() <= 6);
         assert_eq!(
             *calls.lock().expect("history calls lock"),
@@ -3264,7 +3420,17 @@ mod tests {
         )
         .await
         .expect("precise history fetch succeeds");
-        assert_eq!(fetched.commits.len(), 1);
+        assert_eq!(
+            fetched.commits.len(),
+            2,
+            "the one causal body carries its pinned base dependency inline",
+        );
+        assert!(
+            fetched
+                .commits
+                .iter()
+                .any(|commit| commit.commit_id == parent)
+        );
         assert_eq!(
             *calls.lock().expect("history calls lock"),
             vec![vec![parent]],

@@ -31,7 +31,7 @@ simulation_test!(lix_branch_lists_descriptors_with_refs, |sim| async move {
         Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
         Value::Text("global".to_string()),
         Value::Boolean(true),
-        Value::Text(sim.initial_commit_id().to_string()),
+        Value::Text(sim.initial_global_commit_id().to_string()),
     ]));
     assert!(values.contains(&vec![
         Value::Text(sim.main_branch_id().to_string()),

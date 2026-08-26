@@ -745,7 +745,7 @@ simulation_test!(
 
         for sql in [
             "EXPLAIN SELECT * FROM lix_history('lix_file')",
-            "EXPLAIN SELECT row_pk FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id())",
+            "EXPLAIN SELECT lixcol_row_pk FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id())",
         ] {
             session
                 .execute(sql, &[])
@@ -791,6 +791,7 @@ simulation_test!(history_discovery_has_no_suffix_surfaces, |sim| async move {
             vec![Value::Text("lix_commit_ancestry".to_string())],
             vec![Value::Text("lix_diff".to_string())],
             vec![Value::Text("lix_history".to_string())],
+            vec![Value::Text("lix_state_at".to_string())],
         ],
     );
 });

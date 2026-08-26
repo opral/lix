@@ -1153,6 +1153,7 @@ where
         // through DataFusion for SQL callers; this native surface should keep
         // its specific path errors intact.
         crate::common::LixPath::try_from_file_path(&path)?;
+        self.refresh_active_branch_base_if_stale().await?;
         let write_access = self.begin_session_write_access().await?;
         let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
         self.with_write_transaction_reserved_lending(
@@ -1472,6 +1473,21 @@ where
             }
         }
 
+        // Live rows and lix_active_branch_commit_id() must describe one
+        // state. Refresh a stale local composite handle lazily on access;
+        // global writes stay O(1) instead of fanning out over every branch.
+        //
+        // Never on the observe path (deferred file-view acknowledgement is
+        // its marker): the observation loop runs this execute under its own
+        // waitable-operation guard, and a refresh that needs session write
+        // access would drain operations and self-deadlock on that guard. The
+        // loop refreshes before taking the guard instead, and a bump landing
+        // in between also re-runs the evaluation, so the next iteration
+        // observes the refreshed base.
+        if !defer_file_view_acknowledgement {
+            self.refresh_active_branch_base_if_stale().await?;
+        }
+
         let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
         let exact_schema_point_read = exact_filesystem_read
             .is_none()
@@ -1607,6 +1623,128 @@ where
                 .apply_mutations(result.file_view_mutations().iter().cloned());
         }
         Ok(result)
+    }
+
+    /// Runs the base refresh under the shared bounded expired-read policy.
+    ///
+    /// The refresh's reads run outside the execute read loop's retry
+    /// protection, and on cross-context stores a concurrent commit can
+    /// invalidate them at any point — during sync churn that made every
+    /// stale-base execute surface `LIX_STORAGE_READ_EXPIRED` on its first
+    /// expiry. The unit is safe to restart: it re-reads the generation and
+    /// branch heads from scratch and stores the generation only on success.
+    pub(super) async fn refresh_active_branch_base_if_stale(&self) -> Result<(), LixError> {
+        let mut retry = ExpiredReadRetryState::default();
+        loop {
+            match self.refresh_active_branch_base_if_stale_inner().await {
+                Err(error) => {
+                    let Some(delay) = retry.next_delay(&error) else {
+                        return Err(error);
+                    };
+                    tokio::task::yield_now().await;
+                    if !delay.is_zero() {
+                        crate::sync::sleep(delay).await;
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn refresh_active_branch_base_if_stale_inner(&self) -> Result<(), LixError> {
+        let invalidation_generation = self.observe_invalidation.generation();
+        if self.base_refresh_generation.load(Ordering::SeqCst) == invalidation_generation {
+            return Ok(());
+        }
+        let read = self.storage.begin_read(StorageReadOptions::default()).await?;
+        let active_branch_id = self.active_branch_id_from_reader(&read).await?;
+        if active_branch_id == crate::GLOBAL_BRANCH_ID {
+            if let Some(global_head) = self
+                .branch_ctx
+                .ref_reader(&read)
+                .load_head_commit_id(crate::GLOBAL_BRANCH_ID)
+                .await?
+            {
+                *self.observed_global_head.write().map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "session global-head observation is poisoned",
+                    )
+                })? = Some(global_head);
+            }
+            self.base_refresh_generation
+                .store(invalidation_generation, Ordering::SeqCst);
+            return Ok(());
+        }
+        let branch_reader = self.branch_ctx.ref_reader(&read);
+        let Some(active_head) = branch_reader.load_head_commit_id(&active_branch_id).await? else {
+            self.base_refresh_generation
+                .store(invalidation_generation, Ordering::SeqCst);
+            return Ok(());
+        };
+        let Some(global_head) = branch_reader
+            .load_head_commit_id(crate::GLOBAL_BRANCH_ID)
+            .await?
+        else {
+            self.base_refresh_generation
+                .store(invalidation_generation, Ordering::SeqCst);
+            return Ok(());
+        };
+        drop(branch_reader);
+        let node = crate::commit_graph::CommitGraphContext::new()
+            .reader(&read)
+            .load_node(&active_head)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_COMMIT_NOT_FOUND,
+                    format!("active branch head '{active_head}' does not exist"),
+                )
+            })?;
+        let observed_global_head = {
+            let mut observed = self.observed_global_head.write().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "session global-head observation is poisoned",
+                )
+            })?;
+            let previous = observed.unwrap_or_else(|| node.base_commit_id.unwrap_or(global_head));
+            *observed = Some(previous);
+            previous
+        };
+        if observed_global_head == global_head {
+            self.base_refresh_generation
+                .store(invalidation_generation, Ordering::SeqCst);
+            return Ok(());
+        }
+        drop(read);
+
+        let write_access = self.begin_session_write_access().await?;
+        let result = self.with_write_transaction_reserved_lending(
+            write_access,
+            async move |transaction| {
+                transaction.stage_base_refresh_if_needed().await?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await;
+        if result.is_ok() {
+            *self.observed_global_head.write().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "session global-head observation is poisoned",
+                )
+            })? = Some(global_head);
+            // Store the generation snapshotted before the refresh, never a
+            // completion-time re-read: a bump landing while the refresh
+            // transaction ran describes state it did not see, and marking it
+            // satisfied would let an observation deliver stale rows with no
+            // re-evaluation pending.
+            self.base_refresh_generation
+                .store(invalidation_generation, Ordering::SeqCst);
+        }
+        result
     }
 
     async fn execute_idempotent_write(
@@ -2398,6 +2536,8 @@ where
             is_acknowledgeable_file_content_read(parsed, params)
                 || late_materialized_lix_file_content_read(parsed).is_some()
         });
+
+        self.refresh_active_branch_base_if_stale().await?;
 
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let mut expired_read_retries = ExpiredReadRetryState::default();
@@ -5435,9 +5575,16 @@ mod tests {
             .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
             .await
             .expect("a missing checkpoint cursor should fall back to the repository root");
+        let repository_root = session
+            .execute("SELECT lix_root_commit_id() AS commit_id", &[])
+            .await
+            .expect("repository root should resolve")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
         assert_eq!(
             fallback.rows()[0].get::<String>("commit_id").unwrap(),
-            restore_target
+            repository_root
         );
 
         let restored = session
@@ -5447,13 +5594,14 @@ mod tests {
             )
             .await
             .expect("restore should repair the legacy branch atomically");
+        let restored_commit_id = restored.rows()[0].get::<String>("commit_id").unwrap();
         assert_eq!(
-            restored.rows()[0].get::<String>("commit_id").unwrap(),
-            restore_target
+            restored_commit_id, restore_target,
+            "restore should repoint the branch to the requested complete-state commit"
         );
         let working_diff = session
             .execute(
-                "SELECT row_pk FROM lix_diff(\
+                "SELECT lixcol_row_pk FROM lix_diff(\
                  'lix_key_value', $1, lix_active_branch_commit_id())",
                 &[Value::Text(restore_target.clone())],
             )
@@ -5476,7 +5624,7 @@ mod tests {
             repaired
                 .working_diff_checkpoint_commit_id
                 .map(|commit_id| commit_id.to_string()),
-            Some(restore_target)
+            Some(restored_commit_id)
         );
     }
 
@@ -6727,7 +6875,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('rootless_ordered_insert_probe', $1, $2) \
-                 WHERE diff_type = 'added'",
+                 WHERE lixcol_diff_type = 'added'",
                 &[
                     Value::Text(baseline.commit_id.to_string()),
                     Value::Text(head.commit_id.to_string()),
@@ -6810,7 +6958,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('rootless_ordered_insert_probe', $1, $2) \
-                 WHERE diff_type = 'modified'",
+                 WHERE lixcol_diff_type = 'modified'",
                 &[
                     Value::Text(head.commit_id.to_string()),
                     Value::Text(descendant.commit_id.to_string()),
@@ -6992,7 +7140,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('rootless_ordered_insert_probe', $1, $2) \
-                 WHERE diff_type = 'modified'",
+                 WHERE lixcol_diff_type = 'modified'",
                 &[
                     Value::Text(reseed_head.commit_id.to_string()),
                     Value::Text(rooted_fence.to_string()),
@@ -7244,7 +7392,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('columnar_lifecycle_probe', $1, $2) \
-                 WHERE diff_type = 'added'",
+                 WHERE lixcol_diff_type = 'added'",
                 &[
                     Value::Text(before_insert.to_string()),
                     Value::Text(inserted_head.to_string()),
@@ -7412,7 +7560,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('columnar_lifecycle_probe', $1, $2) \
-                 WHERE diff_type = 'modified'",
+                 WHERE lixcol_diff_type = 'modified'",
                 &[
                     Value::Text(checkpoint.commit_id.to_string()),
                     Value::Text(merged_head.to_string()),
@@ -7555,7 +7703,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('ordered_packed_update_probe', lix_root_commit_id(), lix_active_branch_commit_id()) \
-                 WHERE diff_type = 'added'",
+                 WHERE lixcol_diff_type = 'added'",
                 &[],
             )
             .await
@@ -7706,7 +7854,7 @@ mod tests {
             .execute(
                 "SELECT count(*) AS count \
                  FROM lix_diff('packed_replacement_working_diff_probe', $1, $2) \
-                 WHERE diff_type = 'modified'",
+                 WHERE lixcol_diff_type = 'modified'",
                 &[
                     Value::Text(checkpoint_commit_id.clone()),
                     Value::Text(head_commit_id.clone()),
@@ -9545,7 +9693,7 @@ mod tests {
                 .execute(
                     "SELECT COUNT(*) AS entries \
                      FROM lix_diff('packed_replacement_probe', $1, $2) \
-                     WHERE diff_type = 'modified'",
+                     WHERE lixcol_diff_type = 'modified'",
                     &[Value::Text(before.clone()), Value::Text(after.clone())],
                 )
                 .await
@@ -9713,7 +9861,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('packed_replacement_probe', $1, $2) \
-                 WHERE diff_type = 'modified'",
+                 WHERE lixcol_diff_type = 'modified'",
                 &[
                     Value::Text(second_commit_id.clone()),
                     Value::Text(merged_commit_id.clone()),
