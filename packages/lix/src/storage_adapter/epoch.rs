@@ -272,7 +272,7 @@ mod tests {
     use super::*;
     use crate::storage::{Memory, StorageSpaceRole, ValueIntegrity, ValueSemantics};
     use crate::storage_adapter::{
-        PointReadPlan, StorageAdapter, StorageAdapterRead as _, StorageGetOptions, StorageKey,
+        PointReadPlan, StorageAdapter, StorageGetOptions, StorageKey,
     };
 
     fn logical_space(id: u32) -> StorageSpace {
