@@ -1476,7 +1476,17 @@ where
         // Live rows and lix_active_branch_commit_id() must describe one
         // state. Refresh a stale local composite handle lazily on access;
         // global writes stay O(1) instead of fanning out over every branch.
-        self.refresh_active_branch_base_if_stale().await?;
+        //
+        // Never on the observe path (deferred file-view acknowledgement is
+        // its marker): the observation loop runs this execute under its own
+        // waitable-operation guard, and a refresh that needs session write
+        // access would drain operations and self-deadlock on that guard. The
+        // loop refreshes before taking the guard instead, and a bump landing
+        // in between also re-runs the evaluation, so the next iteration
+        // observes the refreshed base.
+        if !defer_file_view_acknowledgement {
+            self.refresh_active_branch_base_if_stale().await?;
+        }
 
         let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
         let exact_schema_point_read = exact_filesystem_read

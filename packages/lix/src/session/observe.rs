@@ -264,6 +264,11 @@ where
     ) -> Result<ExecuteResult, LixError> {
         let mut retry = crate::sync::SyncDemandRetry::default();
         loop {
+            // Refresh a stale base before entering the operation guard: the
+            // refresh may need session write access, which drains waitable
+            // operations — taking it while holding this observation's own
+            // guard would self-deadlock.
+            session.refresh_active_branch_base_if_stale().await?;
             let operation_guard = session.begin_waitable_session_operation().await?;
             let rows = Box::pin(session.execute_for_observe(sql, params)).await;
             drop(operation_guard);
