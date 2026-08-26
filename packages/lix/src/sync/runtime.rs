@@ -21,7 +21,7 @@ const SYNC_REQUEST_TOO_LARGE_CODE: &str = "LIX_ERROR_REQUEST_BODY_TOO_LARGE";
 const SYNC_ITEM_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_ITEM_TOO_LARGE";
 const SYNC_SNAPSHOT_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_SNAPSHOT_TOO_LARGE";
 const SYNC_DEMAND_STALLED_CODE: &str = "LIX_ERROR_SYNC_DEMAND_STALLED";
-const SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE: usize = 4;
+const SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE: usize = 16;
 /// Independent sparse heads are safe to fetch concurrently. Keeping the cap
 /// below the HTTP/1 connection fan-out used by browser transports avoids both
 /// serial round-trip latency and unbounded authority pressure.
@@ -960,6 +960,69 @@ struct FetchedHistory {
     boundaries: Vec<super::SyncHistoryBoundary>,
 }
 
+fn validate_history_page_body_budget(
+    response: &super::SyncHistoryResponse,
+    head: &str,
+    limit: usize,
+) -> Result<usize, LixError> {
+    let commits = response
+        .commits
+        .iter()
+        .map(|commit| (commit.commit_id.as_str(), commit))
+        .collect::<BTreeMap<_, _>>();
+    let boundary_ids = response
+        .boundaries
+        .iter()
+        .map(|boundary| boundary.commit_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let dependency_ids = response
+        .commits
+        .iter()
+        .filter(|candidate| {
+            candidate.global_scope
+                && boundary_ids.contains(candidate.commit_id.as_str())
+                && response.commits.iter().any(|commit| {
+                    commit.base_commit_id.as_deref() == Some(candidate.commit_id.as_str())
+                })
+        })
+        .map(|commit| commit.commit_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut causal = BTreeSet::new();
+    let mut cursor = Some(head);
+    while let Some(commit_id) = cursor {
+        if commit_id != head && dependency_ids.contains(commit_id) {
+            break;
+        }
+        let Some(commit) = commits.get(commit_id) else {
+            break;
+        };
+        if !causal.insert(commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync history response contains a causal cycle",
+            ));
+        }
+        cursor = commit.parent_commit_ids.first().map(String::as_str);
+    }
+    if causal.len() > limit {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync history response exceeds the requested page limit",
+        ));
+    }
+    for dependency_id in commits.keys().filter(|commit_id| !causal.contains(**commit_id)) {
+        if !dependency_ids.contains(dependency_id) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "sync history response contains unrelated dependency body '{dependency_id}'"
+                ),
+            ));
+        }
+    }
+    Ok(causal.len())
+}
+
 fn merge_fetched_history_response(
     head: &str,
     response: super::SyncHistoryResponse,
@@ -1120,9 +1183,11 @@ where
         let Some(max_boundaries) = max_boundaries_per_page else {
             return Ok(response);
         };
+        let returned_causal_commits =
+            validate_history_page_body_budget(&response, head, history_page_limit)?;
         let Some(next_limit) = smaller_history_demand_page_limit(
             history_page_limit,
-            response.commits.len(),
+            returned_causal_commits,
             response.boundaries.len(),
             max_boundaries,
         ) else {
@@ -1159,12 +1224,7 @@ where
         transport.history(head, limit)
     })
     .await?;
-    if response.commits.len() > *limit {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "sync history response exceeds the requested page limit",
-        ));
-    }
+    validate_history_page_body_budget(&response, head, *limit)?;
     Ok(response)
 }
 

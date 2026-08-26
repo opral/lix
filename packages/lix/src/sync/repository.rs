@@ -5305,10 +5305,9 @@ where
         // A local commit is not a complete state authority without its pinned
         // global base. When that base is outside the bounded body page, ship
         // it as a materialized boundary just like an external causal parent.
-        // The runtime closes the canonical body for this state-only boundary
-        // before handing the response to the atomic importer.
+        // Its canonical body travels as an out-of-page dependency below.
         boundary_ids.extend(external_base_ids.iter().copied());
-        let mut commits = Vec::with_capacity(newest_first.len());
+        let mut commits = Vec::with_capacity(newest_first.len() + external_base_ids.len());
         for record in newest_first.iter().rev() {
             commits.push(
                 load_sync_commit(&read, record.commit_id)
@@ -5319,6 +5318,24 @@ where
                             format!(
                                 "sync history commit '{}' has no complete body",
                                 record.commit_id
+                            ),
+                        )
+                    })?,
+            );
+        }
+        // Dependency bodies do not consume causal history-page slots. Ship
+        // external pinned global bases in the same response so the receiver
+        // can publish each immutable commit authority exactly once without an
+        // additional request per local commit.
+        for commit_id in &external_base_ids {
+            commits.push(
+                load_sync_commit(&read, *commit_id)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "sync history base dependency '{commit_id}' has no complete body"
                             ),
                         )
                     })?,
