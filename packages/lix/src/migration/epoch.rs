@@ -273,6 +273,15 @@ where
 {
     let legacy_status = super::inspect_lix(storage).await?;
     if matches!(legacy_status, super::MigrationStatus::Missing) {
+        let legacy = StorageAdapter::new(storage.clone());
+        if legacy
+            .load_mutation_revision()
+            .await
+            .map_err(storage_error)?
+            .is_some()
+        {
+            return Err(crate::init::unsupported_repository_protocol_error());
+        }
         let target = EpochBank::A;
         let migrating_bytes = encode_pointer(PointerState::Migrating {
             source: EpochBank::Legacy,
@@ -1036,10 +1045,13 @@ where
     let mut write = storage
         .begin_write(WriteOptions {
             await_durable: true,
-            preconditions: vec![Precondition::KeyAbsent {
-                space: REPOSITORY_EPOCH_SPACE,
-                key: Key(Bytes::from_static(REPOSITORY_EPOCH_KEY)),
-            }],
+            preconditions: vec![
+                Precondition::KeyAbsent {
+                    space: REPOSITORY_EPOCH_SPACE,
+                    key: Key(Bytes::from_static(REPOSITORY_EPOCH_KEY)),
+                },
+                StorageAdapter::<S>::mutation_revision_precondition(None),
+            ],
             ..WriteOptions::default()
         })
         .await?;
@@ -1574,6 +1586,43 @@ mod tests {
         assert!(load_pointer(&storage).await.unwrap().is_none());
         let admitted = admit_repository(&storage, None).await.unwrap();
         assert!(admitted.report.initialized);
+    }
+
+    #[tokio::test]
+    async fn missing_legacy_marker_with_repository_state_fails_closed() {
+        let storage = crate::Memory::new();
+        let legacy = StorageAdapter::new(storage.clone());
+        let mut writes = legacy.new_write_set();
+        writes.put(
+            crate::json_store::JSON_SPACE,
+            &b"preserved"[..],
+            &b"repository-state"[..],
+        );
+        legacy
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let error = match admit_repository(&storage, None).await {
+            Ok(_) => panic!("nonempty markerless storage must not become a fresh epoch"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+        assert!(load_pointer(&storage).await.unwrap().is_none());
+        assert!(legacy.load_mutation_revision().await.unwrap().is_some());
+
+        let claim = encode_pointer(PointerState::Migrating {
+            source: EpochBank::Legacy,
+            source_format: 0,
+            target: EpochBank::A,
+            generation: 1,
+            attempt: uuid::Uuid::from_u128(8),
+        });
+        assert!(matches!(
+            publish_migration_claim_absent(&storage, &claim).await,
+            Err(StorageError::PreconditionFailed(_))
+        ));
+        assert!(load_pointer(&storage).await.unwrap().is_none());
     }
 
     #[tokio::test]
