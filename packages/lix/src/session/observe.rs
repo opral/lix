@@ -3,8 +3,8 @@ use std::{future::Future, sync::Arc};
 use tokio::sync::watch;
 
 use crate::observe_coordinator::{
-    ObserveQueryEvaluation, ObserveQueryKey, ObserveQueryState, ObserveSessionScope,
-    ObserveSharedContent,
+    ObserveErrorDisposition, ObserveQueryEvaluation, ObserveQueryKey, ObserveQueryState,
+    ObserveSessionScope, ObserveSharedContent, observe_error_disposition,
 };
 use crate::observe_invalidation::ObserveInvalidationEvent;
 use crate::storage_adapter::Memory;
@@ -12,6 +12,8 @@ use crate::storage_adapter::Storage;
 use crate::{ExecuteResult, LixError, Value, sql2};
 
 use super::SessionContext;
+
+const TRANSIENT_EVALUATION_RETRY_LIMIT: usize = 3;
 
 #[derive(Debug, Clone)]
 struct ObserveQuery {
@@ -56,6 +58,7 @@ where
     last_rows: Option<ExecuteResult>,
     last_shared_content: Option<ObserveSharedContent>,
     sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    terminal_error: Option<(ObserveSessionScope, LixError)>,
     closed: bool,
 }
 
@@ -85,10 +88,21 @@ where
             self.close();
             return Ok(None);
         }
+        if let Some((scope, error)) = &self.terminal_error {
+            if *scope == self.session.observe_scope() {
+                return Err(error.clone());
+            }
+            // Branch scope is part of an observation's query identity. A
+            // terminal SQL error from the previous branch must not poison the
+            // cursor after its existing branch-migration path takes effect.
+            self.terminal_error = None;
+        }
         if self.last_rows.is_none() {
-            let Some((mutation_sequence, evaluation)) =
-                Box::pin(self.evaluate_stable_snapshot()).await?
-            else {
+            let stable_snapshot = Box::pin(self.evaluate_stable_snapshot()).await;
+            let Some((mutation_sequence, evaluation)) = (match stable_snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Err(self.retain_terminal_error(error)),
+            }) else {
                 return Ok(None);
             };
             let rows = evaluation.rows;
@@ -118,9 +132,11 @@ where
                 return Ok(None);
             }
 
-            let Some((mutation_sequence, evaluation)) =
-                Box::pin(self.evaluate_stable_snapshot()).await?
-            else {
+            let stable_snapshot = Box::pin(self.evaluate_stable_snapshot()).await;
+            let Some((mutation_sequence, evaluation)) = (match stable_snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Err(self.retain_terminal_error(error)),
+            }) else {
                 return Ok(None);
             };
             let changed =
@@ -143,6 +159,13 @@ where
     pub fn close(&mut self) {
         self.closed = true;
         self.receiver.take();
+    }
+
+    fn retain_terminal_error(&mut self, error: LixError) -> LixError {
+        if observe_error_disposition(&error) == ObserveErrorDisposition::SemanticTerminal {
+            self.terminal_error = Some((self.session.observe_scope(), error.clone()));
+        }
+        error
     }
 
     fn acknowledge_delivered_file_views(&self, rows: &ExecuteResult) {
@@ -177,12 +200,14 @@ where
     async fn evaluate_stable_snapshot(
         &mut self,
     ) -> Result<Option<(u64, ObserveQueryEvaluation)>, LixError> {
+        let mut transient_retries = 0usize;
         loop {
             let operation_guard = self.session.begin_waitable_session_operation().await?;
             self.session
                 .observe_invalidation
                 .ensure_external_watcher(self.session.storage.clone())
                 .await?;
+            let before_scope = self.session.observe_scope();
             let before = self.invalidation_generation()?;
             drop(operation_guard);
             // Keep shared-query leadership across demand hydration, while the
@@ -206,6 +231,8 @@ where
                 self.close();
                 return Ok(None);
             }
+            let after_scope = self.session.observe_scope();
+            let after = self.invalidation_generation()?;
             let rows = match rows {
                 Ok(rows) => rows,
                 Err(error) if error.code == LixError::CODE_CLOSED => {
@@ -215,26 +242,38 @@ where
                 Err(error)
                     if matches!(
                         error.code.as_str(),
-                        LixError::CODE_STORAGE_READ_EXPIRED
-                            | LixError::CODE_TRANSACTION_CONFLICT
+                        LixError::CODE_STORAGE_READ_EXPIRED | LixError::CODE_TRANSACTION_CONFLICT
                     ) =>
                 {
                     // A concurrent commit invalidated this evaluation — an
                     // expired coherent read past its bounded in-execute
                     // retries, or a conflicting base-refresh write. That
                     // commit also bumps the invalidation generation, so the
-                    // loop's own response is the right one: yield to the
-                    // committing side and re-evaluate on a fresh snapshot.
-                    // A long-lived observation must never surface a
-                    // retryable transient as a stream error.
+                    // loop's own response is the right one when the observed
+                    // generation or branch moved. Some adapters can report a
+                    // transient without publishing an invalidation, so cap
+                    // same-snapshot retries to avoid an unbounded hot loop.
+                    if before == after && before_scope == after_scope {
+                        transient_retries += 1;
+                        if transient_retries > TRANSIENT_EVALUATION_RETRY_LIMIT {
+                            return Err(error);
+                        }
+                    } else {
+                        transient_retries = 0;
+                    }
                     drop(operation_guard);
                     tokio::task::yield_now().await;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if before == after && before_scope == after_scope {
+                        return Err(error);
+                    }
+                    drop(operation_guard);
+                    continue;
+                }
             };
-            let after = self.invalidation_generation()?;
-            if before == after {
+            if before == after && before_scope == after_scope {
                 return Ok(Some((after, rows)));
             }
             drop(operation_guard);
@@ -349,6 +388,7 @@ where
             last_rows: None,
             last_shared_content: None,
             sync_demand_tx: None,
+            terminal_error: None,
             closed: false,
         })
     }
@@ -441,7 +481,10 @@ mod tests {
         // The insert left the base stale; expire the refresh's next read.
         expire_reads.store(1, Ordering::SeqCst);
         let rows = session
-            .execute("SELECT value FROM lix_key_value WHERE key = 'observed'", &[])
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'observed'",
+                &[],
+            )
             .await
             .expect("a transient expired refresh read must not fail the execute");
         assert_eq!(rows.rows().len(), 1);
@@ -463,7 +506,10 @@ mod tests {
             .await
             .expect("open pinned main session");
         let mut events = session
-            .observe("SELECT value FROM lix_key_value WHERE key = 'observed'", &[])
+            .observe(
+                "SELECT value FROM lix_key_value WHERE key = 'observed'",
+                &[],
+            )
             .expect("observation opens");
         events.next().await.expect("initial evaluation");
         session
@@ -482,6 +528,38 @@ mod tests {
             .expect("a retryable expired read must re-evaluate, never error the stream")
             .expect("insert event exists");
         assert_eq!(event.rows.rows().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_expired_reads_surface_after_bounded_observe_retries() {
+        let expire_reads = Arc::new(AtomicU64::new(0));
+        let storage = ExpiringStorage {
+            inner: Memory::new(),
+            expire_reads: Arc::clone(&expire_reads),
+        };
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("initialize storage");
+        let engine = Engine::new(storage).await.expect("open engine");
+        let session = engine
+            .open_session_at(&receipt.main_branch_id)
+            .await
+            .expect("open pinned main session");
+        let mut events = session
+            .observe("SELECT value FROM lix_key_value", &[])
+            .expect("observation opens");
+
+        expire_reads.store(1_000, Ordering::SeqCst);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .expect("persistent adapter failure must not loop forever")
+            .expect_err("persistent expired reads must surface");
+
+        assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+        assert!(
+            expire_reads.load(Ordering::SeqCst) > 900,
+            "observe must use a bounded number of adapter reads"
+        );
     }
 }
 
