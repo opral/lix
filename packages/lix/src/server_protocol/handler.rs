@@ -7715,6 +7715,11 @@ mod tests {
                         pending.push(dependency.clone());
                     }
                 }
+                if let Some(dependency) = &commit.base_commit_id
+                    && !imported.contains_key(dependency)
+                {
+                    pending.push(dependency.clone());
+                }
                 imported.insert(
                     commit.commit_id.clone(),
                     serde_json::to_value(commit).expect("history commit should encode"),

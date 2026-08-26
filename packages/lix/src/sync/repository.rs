@@ -3744,8 +3744,8 @@ where
             .keys()
             .filter(|commit_id| !parsed.contains_key(commit_id))
             .copied()
-            .collect::<Vec<_>>();
-        for commit_id in external_boundary_ids {
+            .collect::<BTreeSet<_>>();
+        for commit_id in external_boundary_ids.iter().copied() {
             let record = load_commit_record(&read, commit_id).await?.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_COMMIT_NOT_FOUND,
@@ -4111,7 +4111,11 @@ where
             )
             .await?;
         }
-        for commit_id in parsed.keys().copied() {
+        for commit_id in parsed
+            .keys()
+            .filter(|commit_id| !external_boundary_ids.contains(commit_id))
+            .copied()
+        {
             stage_commit_history_available(&mut writes, commit_id);
         }
 

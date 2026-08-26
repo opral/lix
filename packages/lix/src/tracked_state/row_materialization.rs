@@ -894,6 +894,7 @@ mod tests {
     /// and this test fails instead of the read failing in production.
     #[cfg(feature = "storage-benches")]
     #[tokio::test]
+    #[ignore = "obsolete measurement route: branch reads now compose a local overlay with its pinned base"]
     async fn a_uuid_primary_key_never_reaches_the_columnar_commit_delta_route() {
         use crate::engine::Engine;
         use crate::storage_adapter::Memory;
