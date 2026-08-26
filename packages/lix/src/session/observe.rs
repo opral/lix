@@ -212,6 +212,25 @@ where
                     self.close();
                     return Ok(None);
                 }
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        LixError::CODE_STORAGE_READ_EXPIRED
+                            | LixError::CODE_TRANSACTION_CONFLICT
+                    ) =>
+                {
+                    // A concurrent commit invalidated this evaluation — an
+                    // expired coherent read past its bounded in-execute
+                    // retries, or a conflicting base-refresh write. That
+                    // commit also bumps the invalidation generation, so the
+                    // loop's own response is the right one: yield to the
+                    // committing side and re-evaluate on a fresh snapshot.
+                    // A long-lived observation must never surface a
+                    // retryable transient as a stream error.
+                    drop(operation_guard);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             let after = self.invalidation_generation()?;
@@ -344,6 +363,94 @@ where
 }
 
 /// See `session::execute::assume_send_future_proofs`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Engine;
+    use crate::storage::{
+        Memory, MemoryRead, MemoryWrite, ReadOptions, StorageError, WriteOptions,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Fails the next `expire_reads` `begin_read` calls with `ReadExpired`,
+    /// the way a cross-context store invalidates a coherent read while a
+    /// concurrent commit lands.
+    #[derive(Clone)]
+    struct ExpiringStorage {
+        inner: Memory,
+        expire_reads: Arc<AtomicU64>,
+    }
+
+    impl Storage for ExpiringStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            if self
+                .expire_reads
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(StorageError::ReadExpired);
+            }
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_expired_read_reevaluates_instead_of_erroring_the_stream() {
+        let expire_reads = Arc::new(AtomicU64::new(0));
+        let storage = ExpiringStorage {
+            inner: Memory::new(),
+            expire_reads: Arc::clone(&expire_reads),
+        };
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("initialize storage");
+        let engine = Engine::new(storage).await.expect("open engine");
+        let session = engine
+            .open_session_at(&receipt.main_branch_id)
+            .await
+            .expect("open pinned main session");
+        let mut events = session
+            .observe("SELECT value FROM lix_key_value WHERE key = 'observed'", &[])
+            .expect("observation opens");
+        events.next().await.expect("initial evaluation");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('observed', 'yes')",
+                &[],
+            )
+            .await
+            .expect("insert commits");
+        // The insert bumped the invalidation generation; make the armed
+        // observation lose its next coherent read to a concurrent commit.
+        expire_reads.store(1, Ordering::SeqCst);
+        let event = events
+            .next()
+            .await
+            .expect("a retryable expired read must re-evaluate, never error the stream")
+            .expect("insert event exists");
+        assert_eq!(event.rows.rows().len(), 1);
+    }
+}
+
 #[cfg(test)]
 mod assume_send_future_proofs {
     use super::*;
