@@ -31,7 +31,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         inspect_lix(&storage).await.expect("inspect fixture"),
         MigrationStatus::Required {
             from_version: 72,
-            to_version: 74,
+            to_version: 75,
         }
     );
 
@@ -39,7 +39,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         .await
         .expect("v72 filesystem fixture should migrate");
     assert_eq!(report.from_version, 72);
-    assert_eq!(report.to_version, 74);
+    assert_eq!(report.to_version, 75);
 
     let lix = open_lix()
         .with_storage(storage)

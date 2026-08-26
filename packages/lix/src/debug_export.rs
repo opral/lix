@@ -12,29 +12,30 @@ use std::ops::Bound;
 
 use bytes::Bytes;
 
-use crate::storage::{
-    BeginScanOptions, Key, KeyRange, Memory, ProjectedValue, ReadOptions, Storage, StorageError,
-    StorageRead as _,
+use crate::Memory;
+use crate::storage_adapter::{
+    Storage, StorageBeginScanOptions, StorageError, StorageKey, StorageKeyRange,
+    StorageProjectedValue, StorageRead as _, StorageReadOptions,
 };
 
 /// Exports every physical entry of `storage` as a deterministic snapshot
 /// decodable by [`Memory::from_snapshot`].
 pub async fn export_storage_snapshot<S: Storage>(storage: &S) -> Result<Vec<u8>, StorageError> {
-    let read = storage.begin_read(ReadOptions::default()).await?;
-    let mut entries = BTreeMap::<Key, Bytes>::new();
+    let read = storage.begin_read(StorageReadOptions::default()).await?;
+    let mut entries = BTreeMap::<StorageKey, Bytes>::new();
     for space in crate::storage_spaces::ALL_STORAGE_SPACES {
         let mut cursor = read
             .begin_scan(
                 *space,
-                KeyRange {
+                StorageKeyRange {
                     lower: Bound::Unbounded,
                     upper: Bound::Unbounded,
                 },
-                BeginScanOptions::default(),
+                StorageBeginScanOptions::default(),
             )
             .await?;
         for entry in cursor.collect_all().await? {
-            let ProjectedValue::FullValue(value) = entry.value else {
+            let StorageProjectedValue::FullValue(value) = entry.value else {
                 return Err(StorageError::Io(format!(
                     "space '{}' returned a key-only row under a full-value scan",
                     space.name
@@ -43,7 +44,7 @@ pub async fn export_storage_snapshot<S: Storage>(storage: &S) -> Result<Vec<u8>,
             let mut physical = Vec::with_capacity(4 + entry.key.0.len());
             physical.extend_from_slice(&space.id.0.to_be_bytes());
             physical.extend_from_slice(&entry.key.0);
-            entries.insert(Key(Bytes::from(physical)), value);
+            entries.insert(StorageKey(Bytes::from(physical)), value);
         }
     }
     Memory::from_physical_entries(entries).export_snapshot()

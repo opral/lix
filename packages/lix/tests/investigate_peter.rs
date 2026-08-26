@@ -11,6 +11,25 @@ async fn investigate_exported_repository() {
     };
     let bytes = std::fs::read(&path).expect("read snapshot");
     let storage = Memory::from_snapshot(&bytes).expect("decode snapshot");
+    if let lix::migration::MigrationStatus::Required {
+        from_version,
+        to_version,
+    } = lix::migration::inspect_lix(&storage)
+        .await
+        .expect("inspect snapshot format")
+    {
+        println!("migrating exported repository v{from_version} -> v{to_version}");
+        let report = lix::migration::migrate_lix(
+            storage.clone(),
+            lix::migration::MigrationOptions::default(),
+        )
+        .await
+        .expect("migrate exported repository");
+        println!(
+            "migrated: changes_rewritten={} commit_members_rewritten={}",
+            report.changes_rewritten, report.commit_members_rewritten
+        );
+    }
     let lix = open_lix()
         .with_storage(storage)
         .await

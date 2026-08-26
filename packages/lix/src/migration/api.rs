@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use bytes::Bytes;
 
@@ -19,7 +20,9 @@ use crate::storage_adapter::{
     SharedStorageAdapterRead, Storage, StorageCoreProjection as CoreProjection, StorageError,
     StorageGetManyRequest as GetManyRequest, StorageGetOptions as GetOptions, StorageKey as Key,
     StoragePrecondition as Precondition, StorageProjectedValue as ProjectedValue, StorageRead,
-    StorageReadOptions as ReadOptions, StorageWrite, StorageWriteOptions as WriteOptions,
+    StorageAdapterRead as _, StorageBeginScanOptions, StorageKeyRange,
+    StorageReadOptions as ReadOptions, StorageWrite,
+    StorageWriteOptions as WriteOptions,
 };
 use crate::storage_adapter::StorageWriteOptions as AdapterWriteOptions;
 use crate::tracked_state::{
@@ -35,6 +38,7 @@ const REPOSITORY_PROTOCOL_V70: &[u8] = b"tracked-default-branch.v70";
 const REPOSITORY_PROTOCOL_V71: &[u8] = b"tracked-default-branch.v71";
 const REPOSITORY_PROTOCOL_V72: &[u8] = b"tracked-default-branch.v72";
 const REPOSITORY_PROTOCOL_V73: &[u8] = b"tracked-default-branch.v73";
+const REPOSITORY_PROTOCOL_V74: &[u8] = b"tracked-default-branch.v74";
 const ACCOUNT_SCHEMA_KEY: &str = "lix_account";
 
 /// Bounds for explicit offline repository migrations.
@@ -154,11 +158,15 @@ where
         .await
         .map_err(storage_error)?;
     let protocol_status = crate::init::repository_protocol_status(&read).await?;
+    // The v75 chain traverses commit records with the v5-arity decoder before
+    // rewriting them to v6. Repositories below v72 still carry older record
+    // arities the chain cannot traverse in place.
     if let RepositoryProtocolStatus::MigrationRequired { found_version } = protocol_status
-        && !crate::migration::registry::has_complete_migration_path(
-            found_version,
-            CURRENT_FORMAT_VERSION,
-        )
+        && (found_version < 72
+            || !crate::migration::registry::has_complete_migration_path(
+                found_version,
+                CURRENT_FORMAT_VERSION,
+            ))
     {
         return Err(migration_error(format!(
             "repository v{found_version} predates the v{CURRENT_FORMAT_VERSION} complete-snapshot commit format; no in-place migration is available"
@@ -166,7 +174,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (68 | 69 | 70 | 71 | 72 | 73),
+            found_version: found_version @ (72 | 73 | 74),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -222,14 +230,22 @@ where
         } else {
             0
         };
+        // Every step from here on loads commit records through the current
+        // v6 decoder, so the v5 records are rewritten first, under whichever
+        // marker the repository currently carries.
+        let commit_records_rewritten =
+            rewrite_commit_records_to_v6(&adapter, &storage, options, from_version).await?;
         if from_version <= 72 {
             migrate_v72_account_profile_uri(&adapter, &storage, options).await?;
         }
-        migrate_v73_row_pk_indexes(&adapter, &storage, options).await?;
+        if from_version <= 73 {
+            migrate_v73_row_pk_indexes(&adapter, &storage, options).await?;
+        }
+        migrate_v74_complete_snapshot_commits(&adapter, &storage, options).await?;
         return Ok(MigrationReport {
             from_version,
             to_version: CURRENT_FORMAT_VERSION,
-            changes_rewritten: 0,
+            changes_rewritten: commit_records_rewritten,
             commit_members_rewritten: 0,
             hot_rows_rewritten,
         });
@@ -323,10 +339,12 @@ where
     let migrated_hot_rows = migrate_v71_working_diff_epochs(&adapter, &storage, options).await?;
     migrate_v72_account_profile_uri(&adapter, &storage, options).await?;
     migrate_v73_row_pk_indexes(&adapter, &storage, options).await?;
+    let commit_records_rewritten =
+        migrate_v74_complete_snapshot_commits(&adapter, &storage, options).await?;
     Ok(MigrationReport {
         from_version: 68,
         to_version: CURRENT_FORMAT_VERSION,
-        changes_rewritten,
+        changes_rewritten: changes_rewritten.saturating_add(commit_records_rewritten),
         commit_members_rewritten: commit_plan.member_count,
         hot_rows_rewritten: hot_rows_rewritten.saturating_add(migrated_hot_rows),
     })
@@ -606,11 +624,287 @@ where
         options,
         73,
         REPOSITORY_PROTOCOL_V73,
-        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        REPOSITORY_PROTOCOL_V74,
         "v73 row-PK-index migration",
         true,
     )
     .await
+}
+
+/// Bumps a fully rewritten v74 repository to the v75 marker.
+///
+/// The commit-record rewrite itself runs earlier in the chain (see
+/// [`rewrite_commit_records_to_v6`]) so that every later step can load
+/// records through the current decoder. This step re-runs the rewrite
+/// idempotently under the v74 marker — resuming an interrupted migration —
+/// and only then publishes v75.
+async fn migrate_v74_complete_snapshot_commits<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+    storage: &S,
+    options: MigrationOptions,
+) -> Result<u64, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let rewritten = rewrite_commit_records_to_v6(adapter, storage, options, 74).await?;
+    let read = SharedStorageAdapterRead::new(
+        adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?,
+    );
+    let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+        .await
+        .map_err(storage_error)?;
+    read.finish().map_err(storage_error)?;
+    crate::migration::publish::publish(
+        storage,
+        expected_revision,
+        REPOSITORY_PROTOCOL_V74,
+        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        crate::migration::publish::PublicationPlan::bounded(0, 0),
+    )
+    .await?;
+    Ok(rewritten)
+}
+
+/// Rewrites every v5 commit record to the v6 complete-snapshot arity.
+///
+/// Repositories before v75 never recorded which global commit a local commit
+/// observed. The recoverable assignment is chronological: each local commit
+/// pins the newest global-lineage commit whose `created_at` does not exceed
+/// its own, so no migrated commit claims to have observed global state that
+/// did not exist when it was authored. Global-lineage commits — the
+/// first-parent chain of the global branch head, the recoverable authored
+/// lineage — pin no base. Rewrites publish under the current marker
+/// precondition without moving the marker; already-v6 records are skipped, so
+/// interrupted runs resume cleanly.
+async fn rewrite_commit_records_to_v6<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+    storage: &S,
+    options: MigrationOptions,
+    expected_version: u32,
+) -> Result<u64, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    /// Byte-for-byte the v5 `CommitRecord` arity, before `base_commit_id`.
+    #[derive(Debug, musli::Decode)]
+    #[musli(packed)]
+    struct CommitRecordV5 {
+        format_version: u32,
+        commit_id: crate::changelog::CommitId,
+        generation: u64,
+        parent_commit_ids: Vec<crate::changelog::CommitId>,
+        first_parent_jump_commit_id: crate::changelog::CommitId,
+        first_parent_jump_span: u64,
+        account_id: String,
+        created_at: crate::common::LixTimestamp,
+        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest,
+    }
+
+    struct CommitChronology {
+        created_at: crate::common::LixTimestamp,
+        generation: u64,
+        first_parent: Option<crate::changelog::CommitId>,
+    }
+
+    let operation = "commit-record v6 rewrite";
+    // The rewrite runs under whichever marker the repository currently
+    // carries — including the transitional v72 row-PK bootstrap marker — as
+    // long as that marker resolves to the expected source version. The
+    // marker's exact bytes fence the publication.
+    let marker = load_repository_protocol_marker(adapter)
+        .await?
+        .ok_or_else(|| migration_error(format!("{operation} found no protocol marker")))?;
+    match parse_repository_protocol(&marker) {
+        RepositoryProtocolStatus::MigrationRequired { found_version }
+            if found_version == expected_version => {}
+        status => {
+            return Err(migration_error(format!(
+                "{operation} observed unexpected repository status {status:?}"
+            )));
+        }
+    }
+    let read = SharedStorageAdapterRead::new(
+        adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?,
+    );
+    let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+        .await
+        .map_err(storage_error)?;
+
+    let mut cursor = read
+        .begin_scan(
+            crate::changelog::COMMIT_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await
+        .map_err(storage_error)?;
+    let mut pending = Vec::new();
+    let mut chronology = BTreeMap::new();
+    while let Some(entries) = cursor.next_chunk().await.map_err(storage_error)? {
+        for entry in entries {
+            if chronology.len() > options.max_changes {
+                return Err(LixError::new(
+                    "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+                    format!(
+                        "{operation} exceeds configured commit bound: {} commits",
+                        chronology.len()
+                    ),
+                ));
+            }
+            let ProjectedValue::FullValue(value) = entry.value else {
+                return Err(migration_error(format!(
+                    "{operation} commit scan omitted a value"
+                )));
+            };
+            // Idempotent resume: a record already carrying the v6 arity was
+            // rewritten by an interrupted earlier run and needs no work. The
+            // packed codec makes the arities mutually undecodable, so a
+            // successful current-decode is authoritative.
+            if let Ok(record) = crate::storage_codec::decode::<crate::changelog::CommitRecord>(
+                "commit record",
+                &value,
+            ) {
+                chronology.insert(
+                    record.commit_id,
+                    CommitChronology {
+                        created_at: record.created_at,
+                        generation: record.generation,
+                        first_parent: record.parent_commit_ids.first().copied(),
+                    },
+                );
+                continue;
+            }
+            let record =
+                crate::storage_codec::decode::<CommitRecordV5>("v5 commit record", &value)
+                    .map_err(|error| {
+                        migration_error(format!(
+                            "{operation} could not decode a commit record as v5: {error}"
+                        ))
+                    })?;
+            if record.format_version != 5 {
+                return Err(migration_error(format!(
+                    "{operation} commit '{}' has unsupported record format v{}",
+                    record.commit_id, record.format_version
+                )));
+            }
+            chronology.insert(
+                record.commit_id,
+                CommitChronology {
+                    created_at: record.created_at,
+                    generation: record.generation,
+                    first_parent: record.parent_commit_ids.first().copied(),
+                },
+            );
+            pending.push((entry.key, record));
+        }
+    }
+    drop(cursor);
+    if pending.is_empty() {
+        read.finish().map_err(storage_error)?;
+        return Ok(0);
+    }
+
+    // Branch-family provenance was not persisted before v74. The first-parent
+    // chain of the global head is the recoverable authored lineage: merge
+    // secondary parents may come from another family and must not become
+    // global merely because the current global head reaches them.
+    let global_head = BranchHeadControlContext::new()
+        .reader(read.clone())
+        .load(crate::GLOBAL_BRANCH_ID)
+        .await?
+        .ok_or_else(|| migration_error(format!("{operation} found no global branch")))?
+        .head_commit_id;
+    let mut global_chronology = Vec::new();
+    let mut global_commits = BTreeSet::new();
+    let mut next_global = Some(global_head);
+    while let Some(commit_id) = next_global {
+        if !global_commits.insert(commit_id) {
+            return Err(migration_error(format!(
+                "{operation} global lineage revisits commit '{commit_id}'"
+            )));
+        }
+        let node = chronology.get(&commit_id).ok_or_else(|| {
+            migration_error(format!(
+                "{operation} global lineage commit '{commit_id}' is missing"
+            ))
+        })?;
+        global_chronology.push((node.created_at, node.generation, commit_id));
+        next_global = node.first_parent;
+    }
+    global_chronology.sort();
+    read.finish().map_err(storage_error)?;
+
+    let mut writes = adapter.new_write_set();
+    let mut rewritten = 0_u64;
+    for (key, record) in pending {
+        let base_commit_id = if global_commits.contains(&record.commit_id) {
+            None
+        } else {
+            let newest_not_after = global_chronology
+                .partition_point(|(created_at, _, _)| *created_at <= record.created_at);
+            let Some((_, _, base)) = newest_not_after
+                .checked_sub(1)
+                .and_then(|index| global_chronology.get(index))
+            else {
+                return Err(migration_error(format!(
+                    "{operation} local commit '{}' predates every global-lineage commit",
+                    record.commit_id
+                )));
+            };
+            Some(*base)
+        };
+        let upgraded = crate::changelog::CommitRecord {
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+            commit_id: record.commit_id,
+            generation: record.generation,
+            parent_commit_ids: record.parent_commit_ids,
+            base_commit_id,
+            first_parent_jump_commit_id: record.first_parent_jump_commit_id,
+            first_parent_jump_span: record.first_parent_jump_span,
+            account_id: record.account_id,
+            created_at: record.created_at,
+            touched_scope_digest: record.touched_scope_digest,
+        };
+        let encoded = crate::storage_codec::encode("commit record", &upgraded)?;
+        writes.put(crate::changelog::COMMIT_SPACE, key.0.to_vec(), encoded);
+        rewritten += 1;
+    }
+
+    let mut write = storage
+        .begin_write(WriteOptions {
+            await_durable: true,
+            preconditions: vec![
+                Precondition::KeyValueEquals {
+                    space: REPOSITORY_PROTOCOL_SPACE,
+                    key: Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY)),
+                    expected: marker,
+                },
+                crate::storage_adapter::repository_mutation_revision_precondition(
+                    expected_revision,
+                ),
+            ],
+            ..WriteOptions::default()
+        })
+        .await
+        .map_err(storage_error)?;
+    if let Err(error) = writes.lower_into(&mut write).await {
+        let _ = write.rollback().await;
+        return Err(error.into());
+    }
+    write.commit().await.map_err(storage_error)?;
+    Ok(rewritten)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1300,7 +1594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v73_repository_is_rejected_before_v74_backfill() {
+    async fn v73_repository_migrates_through_the_v74_backfill() {
         let storage = Memory::new();
         let (_branch_id, _head_commit_id, rootless_commit_id, _) =
             seed_rooted_head_with_rootless_checkpoint_cursor(
@@ -1347,21 +1641,21 @@ mod tests {
             .is_none()
         );
         pre_migration.finish().unwrap();
-        let error = migrate_lix(storage.clone(), MigrationOptions::default())
+        let report = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
-            .expect_err("v75 intentionally has no in-place migration from v73");
-        assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
+            .expect("a v73 repository migrates through the v74 backfill to v75");
+        assert_eq!(report.from_version, 73);
+        assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
         assert_eq!(
             inspect_lix(&storage).await.unwrap(),
-            MigrationStatus::Required {
-                from_version: 73,
-                to_version: CURRENT_FORMAT_VERSION,
+            MigrationStatus::Current {
+                version: CURRENT_FORMAT_VERSION,
             }
         );
     }
 
     #[tokio::test]
-    async fn v72_index_bootstrap_uses_a_resumable_rejected_marker() {
+    async fn v72_index_bootstrap_marker_resumes_through_the_chain() {
         let storage = Memory::new();
         seed_rooted_head_with_rootless_checkpoint_cursor(&storage, REPOSITORY_PROTOCOL_V72).await;
         let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
@@ -1390,10 +1684,17 @@ mod tests {
             crate::engine::Engine::new(storage.clone()).await.is_err(),
             "normal engine open must reject an interrupted bootstrap"
         );
-        let error = migrate_lix(storage.clone(), MigrationOptions::default())
+        let report = migrate_lix(storage.clone(), MigrationOptions::default())
             .await
-            .expect_err("v75 must not resume a legacy transitional migration");
-        assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
+            .expect("an interrupted v72 bootstrap resumes through the chain to v75");
+        assert_eq!(report.from_version, 72);
+        assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(
+            inspect_lix(&storage).await.unwrap(),
+            MigrationStatus::Current {
+                version: CURRENT_FORMAT_VERSION,
+            }
+        );
     }
 
     async fn seed_rooted_head_with_rootless_checkpoint_cursor(
