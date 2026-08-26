@@ -866,6 +866,17 @@ simulation_test!(
             .rollback()
             .await
             .expect("transaction should roll back");
+
+        writer_session
+            .execute(
+                "UPDATE lix_key_value SET value = 'v1' \
+                 WHERE key = 'observe-active-transaction-cache'",
+                &[],
+            )
+            .await
+            .expect("writer update should commit after rollback");
+        let resumed = next_event(&mut blocked_events, "observer after rollback").await;
+        assert_key_value_row(&resumed, "observe-active-transaction-cache", "v1");
     }
 );
 
@@ -883,6 +894,72 @@ simulation_test!(observe_close_makes_next_return_none, |sim| async move {
         .expect("closed observe next should not error");
     assert!(closed.is_none());
 });
+
+simulation_test!(observe_semantic_error_is_sticky, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let (raw_session, _) = open_default_session(&sim, &engine).await;
+    let mut events = raw_session
+        .observe("SELECT missing_column FROM lix_key_value", &[])
+        .expect("semantic planning error should surface from next");
+
+    let first = events
+        .next()
+        .await
+        .expect_err("initial evaluation should reject the missing column");
+    assert_eq!(first.code, lix::LixError::CODE_COLUMN_NOT_FOUND);
+
+    raw_session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('sticky-error', 'invalidate')",
+            &[],
+        )
+        .await
+        .expect("unrelated mutation should commit");
+
+    let second = tokio::time::timeout(NEXT_TIMEOUT, events.next())
+        .await
+        .expect("sticky semantic error should resolve immediately")
+        .expect_err("semantic error should remain terminal after invalidation");
+    assert_eq!(second, first);
+});
+
+simulation_test!(
+    observe_semantic_error_is_scoped_to_branch,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let (raw_session, session) = open_default_session(&sim, &engine).await;
+        let draft = session
+            .create_branch(lix::CreateBranchOptions {
+                id: None,
+                name: "observe-semantic-error-draft".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create draft branch");
+        let mut events = raw_session
+            .observe("SELECT missing_column FROM lix_key_value", &[])
+            .expect("semantic planning error should surface from next");
+
+        let first = events
+            .next()
+            .await
+            .expect_err("main-branch evaluation should fail");
+        assert_eq!(first.code, lix::LixError::CODE_COLUMN_NOT_FOUND);
+
+        session
+            .switch_branch(lix::SwitchBranchOptions {
+                branch_id: draft.id,
+            })
+            .await
+            .expect("switch observed session to draft");
+        let second = events
+            .next()
+            .await
+            .expect_err("draft-branch evaluation should run and fail independently");
+        assert_eq!(second.code, lix::LixError::CODE_COLUMN_NOT_FOUND);
+        assert_eq!(second.message, first.message);
+    }
+);
 
 simulation_test!(observe_rejects_closed_session, |sim| async move {
     let engine = sim.boot_engine().await;

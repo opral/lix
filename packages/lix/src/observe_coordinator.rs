@@ -10,6 +10,46 @@ use crate::{ExecuteResult, LixError, Value};
 const MAX_CACHED_GENERATIONS_PER_QUERY: usize = 4;
 const MAX_WEAK_QUERY_ENTRIES_BEFORE_PRUNE: usize = 1024;
 
+/// Determines whether an observation failure is part of the query's stable
+/// meaning or belongs to a resumable runtime boundary.
+///
+/// Keep this classification conservative: only deterministic SQL shape and
+/// binding failures are terminal. Unknown/internal failures stay transient so
+/// an observation is never permanently poisoned by an implementation or
+/// storage fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObserveErrorDisposition {
+    SemanticTerminal,
+    SessionState,
+    TransportRecoverable,
+    Closed,
+    Transient,
+}
+
+pub(crate) fn observe_error_disposition(error: &LixError) -> ObserveErrorDisposition {
+    match error.code.as_str() {
+        LixError::CODE_PARSE_ERROR
+        | LixError::CODE_UDF_NOT_FOUND
+        | LixError::CODE_TYPE_MISMATCH
+        | LixError::CODE_INVALID_JSON_PATH
+        | LixError::CODE_DIALECT_UNSUPPORTED
+        | LixError::CODE_BINDING_ERROR
+        | LixError::CODE_INVALID_PARAM
+        | LixError::CODE_TABLE_NOT_FOUND
+        | LixError::CODE_COLUMN_NOT_FOUND
+        | LixError::CODE_UNSUPPORTED_SQL
+        | LixError::CODE_UNSUPPORTED_SQL_RUNTIME_PLAN => ObserveErrorDisposition::SemanticTerminal,
+        LixError::CODE_INVALID_SESSION_STATE | "LIX_INVALID_TRANSACTION_STATE" => {
+            ObserveErrorDisposition::SessionState
+        }
+        "LIX_REMOTE_UNAVAILABLE" => ObserveErrorDisposition::TransportRecoverable,
+        LixError::CODE_CLOSED | LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED => {
+            ObserveErrorDisposition::Closed
+        }
+        _ => ObserveErrorDisposition::Transient,
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ObserveSessionScope {
     Branch(String),
@@ -177,7 +217,7 @@ impl ObserveQueryState {
             {
                 let mut inner = self.lock();
                 if let Some(cached) = inner.cached.get(&generation) {
-                    return Ok(cached.evaluation(generation));
+                    return cached.evaluation(generation);
                 }
 
                 if inner.in_flight.insert(generation) {
@@ -195,6 +235,12 @@ impl ObserveQueryState {
         let guard = InFlightGuard::new(self, generation, compare_results);
         match evaluate().await {
             Ok(rows) => Ok(guard.finish_success(rows)),
+            Err(error)
+                if observe_error_disposition(&error)
+                    == ObserveErrorDisposition::SemanticTerminal =>
+            {
+                Err(guard.finish_terminal_error(error))
+            }
             Err(error) => {
                 guard.finish_without_cache();
                 Err(error)
@@ -233,21 +279,38 @@ struct ObserveQueryStateInner {
 }
 
 #[derive(Clone, Debug)]
-struct CachedObserveResult {
-    rows: ExecuteResult,
-    compared_generation: Option<u64>,
-    matches_compared_generation: bool,
+enum CachedObserveResult {
+    Success {
+        rows: ExecuteResult,
+        compared_generation: Option<u64>,
+        matches_compared_generation: bool,
+    },
+    SemanticTerminal(LixError),
 }
 
 impl CachedObserveResult {
-    fn evaluation(&self, generation: u64) -> ObserveQueryEvaluation {
-        ObserveQueryEvaluation {
-            rows: self.rows.clone(),
-            shared_content: Some(ObserveSharedContent {
-                generation,
-                compared_generation: self.compared_generation,
-                matches_compared_generation: self.matches_compared_generation,
+    fn rows(&self) -> Option<&ExecuteResult> {
+        match self {
+            Self::Success { rows, .. } => Some(rows),
+            Self::SemanticTerminal(_) => None,
+        }
+    }
+
+    fn evaluation(&self, generation: u64) -> Result<ObserveQueryEvaluation, LixError> {
+        match self {
+            Self::Success {
+                rows,
+                compared_generation,
+                matches_compared_generation,
+            } => Ok(ObserveQueryEvaluation {
+                rows: rows.clone(),
+                shared_content: Some(ObserveSharedContent {
+                    generation,
+                    compared_generation: *compared_generation,
+                    matches_compared_generation: *matches_compared_generation,
+                }),
             }),
+            Self::SemanticTerminal(error) => Err(error.clone()),
         }
     }
 }
@@ -270,57 +333,90 @@ impl<'a> InFlightGuard<'a> {
     }
 
     fn finish_success(mut self, rows: ExecuteResult) -> ObserveQueryEvaluation {
-        self.finish(Some(rows))
-            .expect("successful observe evaluation must produce a cached result")
-    }
-
-    fn finish_without_cache(mut self) {
-        let _ = self.finish(None);
-    }
-
-    fn finish(&mut self, rows: Option<ExecuteResult>) -> Option<ObserveQueryEvaluation> {
         if !self.active {
-            return None;
+            unreachable!("observe evaluation guard can only finish once");
         }
         self.active = false;
         let mut inner = self.state.lock();
         inner.in_flight.remove(&self.generation);
-        let evaluation = rows.map(|rows| {
-            let (compared_generation, matches_compared_generation) = if self.compare_results {
-                inner
-                    .cached
-                    .range(..self.generation)
-                    .next_back()
-                    .map(|(generation, cached)| (Some(*generation), cached.rows == rows))
-                    .unwrap_or((None, false))
-            } else {
-                (None, false)
-            };
-            let cached = CachedObserveResult {
-                rows,
-                compared_generation,
-                matches_compared_generation,
-            };
-            let evaluation = cached.evaluation(self.generation);
-            inner.cached.insert(self.generation, cached);
-            while inner.cached.len() > MAX_CACHED_GENERATIONS_PER_QUERY {
-                let Some(oldest_generation) = inner.cached.first_key_value().map(|(key, _)| *key)
-                else {
-                    break;
-                };
-                inner.cached.remove(&oldest_generation);
-            }
-            evaluation
-        });
-        inner.change_sequence = inner.change_sequence.saturating_add(1);
+        let (compared_generation, matches_compared_generation) = if self.compare_results {
+            inner
+                .cached
+                .range(..self.generation)
+                .rev()
+                .find_map(|(generation, cached)| {
+                    cached
+                        .rows()
+                        .map(|cached_rows| (Some(*generation), cached_rows == &rows))
+                })
+                .unwrap_or((None, false))
+        } else {
+            (None, false)
+        };
+        let cached = CachedObserveResult::Success {
+            rows,
+            compared_generation,
+            matches_compared_generation,
+        };
+        let evaluation = cached
+            .evaluation(self.generation)
+            .expect("successful observe evaluation must produce rows");
+        Self::insert_cached(&mut inner, self.generation, cached);
         self.state.send_change(inner.change_sequence);
         evaluation
+    }
+
+    fn finish_terminal_error(mut self, error: LixError) -> LixError {
+        if !self.active {
+            return error;
+        }
+        self.active = false;
+        let mut inner = self.state.lock();
+        inner.in_flight.remove(&self.generation);
+        Self::insert_cached(
+            &mut inner,
+            self.generation,
+            CachedObserveResult::SemanticTerminal(error.clone()),
+        );
+        self.state.send_change(inner.change_sequence);
+        error
+    }
+
+    fn finish_without_cache(mut self) {
+        self.finish_in_flight();
+    }
+
+    fn finish_in_flight(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let mut inner = self.state.lock();
+        inner.in_flight.remove(&self.generation);
+        inner.change_sequence = inner.change_sequence.saturating_add(1);
+        self.state.send_change(inner.change_sequence);
+    }
+
+    fn insert_cached(
+        inner: &mut ObserveQueryStateInner,
+        generation: u64,
+        cached: CachedObserveResult,
+    ) {
+        inner.cached.insert(generation, cached);
+        while inner.cached.len() > MAX_CACHED_GENERATIONS_PER_QUERY {
+            let Some(oldest_generation) = inner.cached.first_key_value().map(|(key, _)| *key)
+            else {
+                break;
+            };
+            inner.cached.remove(&oldest_generation);
+        }
+        inner.change_sequence = inner.change_sequence.saturating_add(1);
     }
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.finish(None);
+        self.finish_in_flight();
     }
 }
 
@@ -331,9 +427,12 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use tokio::sync::oneshot;
+    use tokio::sync::{Barrier, oneshot};
 
-    use super::{ObserveQueryEvaluation, ObserveQueryState, ObserveSharedContent};
+    use super::{
+        ObserveErrorDisposition, ObserveQueryEvaluation, ObserveQueryState, ObserveSharedContent,
+        observe_error_disposition,
+    };
     use crate::{ExecuteResult, Value};
 
     fn blob_result(byte: u8) -> ExecuteResult {
@@ -411,6 +510,129 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             2,
             "failed evaluations must not be cached for followers"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_caches_semantic_errors_for_generation() {
+        let state = ObserveQueryState::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let first_attempts = Arc::clone(&attempts);
+        let first = state
+            .evaluate(1, false, || async move {
+                first_attempts.fetch_add(1, Ordering::SeqCst);
+                Err(crate::LixError::new(
+                    crate::LixError::CODE_COLUMN_NOT_FOUND,
+                    "missing column",
+                ))
+            })
+            .await
+            .expect_err("semantic evaluation should fail");
+
+        let second_attempts = Arc::clone(&attempts);
+        let second = state
+            .evaluate(1, false, || async move {
+                second_attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(ExecuteResult::from_rows_affected(0))
+            })
+            .await
+            .expect_err("same generation should reuse the semantic error");
+
+        assert_eq!(first, second);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_followers_share_semantic_error_without_reevaluating() {
+        let state = Arc::new(ObserveQueryState::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let follower_barrier = Arc::new(Barrier::new(2));
+
+        let leader_state = Arc::clone(&state);
+        let leader_attempts = Arc::clone(&attempts);
+        let leader = tokio::spawn(async move {
+            leader_state
+                .evaluate(1, false, || async move {
+                    leader_attempts.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    Err(crate::LixError::new(
+                        crate::LixError::CODE_TABLE_NOT_FOUND,
+                        "missing table",
+                    ))
+                })
+                .await
+        });
+        started_rx.await.expect("leader should start");
+
+        let follower_state = Arc::clone(&state);
+        let follower_attempts = Arc::clone(&attempts);
+        let follower_started = Arc::clone(&follower_barrier);
+        let follower = tokio::spawn(async move {
+            follower_started.wait().await;
+            follower_state
+                .evaluate(1, false, || async move {
+                    follower_attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(ExecuteResult::from_rows_affected(0))
+                })
+                .await
+        });
+        follower_barrier.wait().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !follower.is_finished(),
+            "follower should wait for the leader"
+        );
+        release_tx.send(()).expect("leader should still be waiting");
+
+        let leader_error = leader
+            .await
+            .expect("leader task should finish")
+            .expect_err("leader should surface semantic error");
+        let follower_error = follower
+            .await
+            .expect("follower task should finish")
+            .expect_err("follower should share semantic error");
+        assert_eq!(leader_error, follower_error);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn error_disposition_keeps_runtime_boundaries_resumable() {
+        assert_eq!(
+            observe_error_disposition(&crate::LixError::new(
+                crate::LixError::CODE_COLUMN_NOT_FOUND,
+                "missing column",
+            )),
+            ObserveErrorDisposition::SemanticTerminal
+        );
+        assert_eq!(
+            observe_error_disposition(&crate::LixError::new(
+                "LIX_INVALID_TRANSACTION_STATE",
+                "transaction active",
+            )),
+            ObserveErrorDisposition::SessionState
+        );
+        assert_eq!(
+            observe_error_disposition(&crate::LixError::new("LIX_REMOTE_UNAVAILABLE", "offline",)),
+            ObserveErrorDisposition::TransportRecoverable
+        );
+        assert_eq!(
+            observe_error_disposition(&crate::LixError::new(
+                crate::LixError::CODE_CLOSED,
+                "closed",
+            )),
+            ObserveErrorDisposition::Closed
+        );
+        assert_eq!(
+            observe_error_disposition(&crate::LixError::new(
+                crate::LixError::CODE_UNKNOWN,
+                "unknown",
+            )),
+            ObserveErrorDisposition::Transient
         );
     }
 
