@@ -13,6 +13,5 @@ pub(crate) use fence::stage_json_publication_fence;
 pub(crate) use store::JSON_SPACE;
 pub(crate) use types::{
     JSON_INLINE_MAX_BYTES, JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonWritePlacementRef,
-    LegacyJsonValue, LegacyJsonValueRef, NormalizedJson, NormalizedJsonRef, json_slot_storage,
-    json_slot_storage_ref,
+    LegacyJsonValue, NormalizedJson, NormalizedJsonRef,
 };

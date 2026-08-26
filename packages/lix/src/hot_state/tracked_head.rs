@@ -33,7 +33,7 @@ pub(crate) use hot::{
     FILE_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot,
     INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
-    ROW_SPACE, RootBaseBatchCache, RowColumnarOverlayRow, decode_hot_row_key_for_migration,
+    ROW_SPACE, RootBaseBatchCache, RowColumnarOverlayRow,
     stage_certified_row_batches, stage_hot_index_entries, stage_retire_hot_generation,
 };
 

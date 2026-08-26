@@ -21,16 +21,8 @@
 //! ```
 
 mod api;
-mod commit_plan;
-mod hot_plan;
 mod publish;
-mod retired_spaces;
 mod registry;
-mod row_rewrite;
-mod standalone_plan;
-pub(crate) mod schema_transition;
-pub(crate) mod v68;
-mod v68_to_v69_rows;
 
 pub use api::{
     MigrationOptions, MigrationReport, MigrationStatus, inspect_lix, migrate_lix,

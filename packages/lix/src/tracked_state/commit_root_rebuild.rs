@@ -198,27 +198,6 @@ where
     .await
 }
 
-pub(crate) async fn load_rebuild_plans_to_nearest_available_root_bounded<S>(
-    store: &S,
-    commit_id: &str,
-    force_head: bool,
-    max_members: usize,
-    known_commit_ids: &BTreeSet<CommitId>,
-) -> Result<Vec<CommitRootRebuildPlan>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    load_rebuild_plans_to_nearest_available_root_inner(
-        store,
-        commit_id,
-        force_head,
-        RootAvailabilityProof::Addressable,
-        Some(max_members),
-        known_commit_ids,
-    )
-    .await
-}
-
 pub(crate) async fn load_rebuild_plans_to_nearest_available_root_with_proof<S>(
     store: &S,
     commit_id: &str,

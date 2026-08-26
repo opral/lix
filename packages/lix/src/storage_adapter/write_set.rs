@@ -918,35 +918,6 @@ impl StorageWriteSet {
         self.lower_sorted_into(write).await
     }
 
-    /// Extracts builder-produced point puts for an offline format migration.
-    ///
-    /// Migration publication needs to route immutable puts through
-    /// `StorageWrite::replace_many`; ordinary write-set lowering
-    /// intentionally cannot do that. Only delete-free, non-deferred plans are
-    /// accepted here.
-    pub(crate) fn into_migration_put_batches(
-        mut self,
-    ) -> Result<Vec<(StorageSpace, PutBatch)>, StorageWriteSetError> {
-        self.validate_and_sort()?;
-        if !self.exclusive_range_deletes.is_empty()
-            || !self.deferred_final_puts.is_empty()
-            || self.groups.iter().any(|group| !group.deletes.is_empty())
-        {
-            return Err(StorageWriteSetError::Storage(StorageError::Corruption(
-                "migration builder plan contains deletes or deferred writes".to_string(),
-            )));
-        }
-        Ok(self
-            .groups
-            .into_iter()
-            .filter_map(|group| {
-                let (space, puts, deletes) = group.lower();
-                debug_assert!(deletes.is_empty());
-                (!puts.is_empty()).then_some((space, PutBatch { entries: puts }))
-            })
-            .collect())
-    }
-
     /// Validates the owned write set while putting each storage batch in its
     /// final key order.
     ///
