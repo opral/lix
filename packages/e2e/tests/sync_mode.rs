@@ -1649,6 +1649,24 @@ where
     Ok(Response::from_parts(parts, Full::new(body)))
 }
 
+/// Asserts every file row's `directory_id` resolves among the same tree's
+/// directory rows — the filesystem-closure invariant the v75 repair restores.
+fn assert_files_resolve_directories(files: &lix::ExecuteResult, directories: &lix::ExecuteResult) {
+    let directory_ids = directories
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").expect("directory id"))
+        .collect::<std::collections::HashSet<_>>();
+    for file in files.rows() {
+        if let Ok(directory_id) = file.get::<String>("directory_id") {
+            assert!(
+                directory_ids.contains(&directory_id),
+                "file references directory '{directory_id}' missing from the same tree"
+            );
+        }
+    }
+}
+
 async fn stop_server(task: tokio::task::JoinHandle<()>) {
     task.abort();
     let _ = task.await;
@@ -1740,19 +1758,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         3,
         "first checkpoint holds sales, docs, handbook — got {directory_names:?}"
     );
-    let directory_ids = directories
-        .rows()
-        .iter()
-        .map(|row| row.get::<String>("id").expect("directory id"))
-        .collect::<std::collections::HashSet<_>>();
-    for file in files.rows() {
-        if let Ok(directory_id) = file.get::<String>("directory_id") {
-            assert!(
-                directory_ids.contains(&directory_id),
-                "file references directory '{directory_id}' missing from the same tree"
-            );
-        }
-    }
+    assert_files_resolve_directories(&files, &directories);
 
     // The product's checkpoint-open read: a root diff with resolved paths.
     let diff = replica
@@ -1898,20 +1904,8 @@ async fn partially_hydrated_replica_reads_point_in_time_filesystem_state() {
         )
         .await
         .expect("directory state at the anchor hydrates its owning commits");
-    let directory_ids = directories
-        .rows()
-        .iter()
-        .map(|row| row.get::<String>("id").expect("directory id"))
-        .collect::<std::collections::HashSet<_>>();
     assert_eq!(directories.rows().len(), 1, "sales directory present");
-    for file in files.rows() {
-        if let Ok(directory_id) = file.get::<String>("directory_id") {
-            assert!(
-                directory_ids.contains(&directory_id),
-                "file references directory '{directory_id}' missing from the same tree"
-            );
-        }
-    }
+    assert_files_resolve_directories(&files, &directories);
 
     let diff = replica
         .execute(
@@ -1933,9 +1927,11 @@ async fn partially_hydrated_replica_reads_point_in_time_filesystem_state() {
 async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica() {
     // Full lineage of the failing live repository: authored on the v71
     // engine, migrated and partial-checkpointed on the v72 engine
-    // (fixture generated from 4816fdba5), migrated to the current format
-    // here, served, and read from a fresh sync replica after a bounded
-    // history lookup hydrated only the checkpoint anchor.
+    // (fixture generated from 4816fdba5, SHA-256
+    // 0841a126e32c939786e152a88be337aefbdfdd6b4d28452bf9419f98517a1b1a),
+    // migrated to the current format here, served, and read from a fresh
+    // sync replica after a bounded history lookup hydrated only the
+    // checkpoint anchor.
     const V72_PARTIAL_CHECKPOINTS: &[u8] =
         include_bytes!("fixtures/v72_partial_checkpoints.snapshot");
     let authority_storage =
@@ -2010,25 +2006,13 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
         )
         .await
         .expect("directory state at the migrated partial checkpoint hydrates");
-    let directory_ids = directories
-        .rows()
-        .iter()
-        .map(|row| row.get::<String>("id").expect("directory id"))
-        .collect::<std::collections::HashSet<_>>();
     assert_eq!(
         directories.rows().len(),
         4,
         "brand, docs, handbook, sales all present"
     );
     assert_eq!(files.rows().len(), 4, "all four files present");
-    for file in files.rows() {
-        if let Ok(directory_id) = file.get::<String>("directory_id") {
-            assert!(
-                directory_ids.contains(&directory_id),
-                "file references directory '{directory_id}' missing from the same tree"
-            );
-        }
-    }
+    assert_files_resolve_directories(&files, &directories);
 
     let diff = replica
         .execute(

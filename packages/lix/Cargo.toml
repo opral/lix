@@ -219,7 +219,3 @@ ruzstd = { version = "0.8", default-features = false, features = ["std"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen-futures = "0.4"
-
-[[test]]
-name = "investigate_peter"
-path = "tests/investigate_peter.rs"

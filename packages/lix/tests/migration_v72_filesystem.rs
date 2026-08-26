@@ -10,6 +10,7 @@
 //! v72 engine — that both checkpoint trees contain their directory
 //! descriptors before exporting, so any inconsistency observed after
 //! migration was introduced by the migration itself.
+//! SHA-256: `5ddf20055ae768c57f1926c6398b0a93e5b869955dbbb96dac59b2ace43d5657`.
 //!
 //! Regression: a repository migrated to v74 served checkpoint trees whose
 //! file descriptors referenced directories missing from the same tree
@@ -22,6 +23,30 @@ use std::collections::HashSet;
 
 const V72_FILESYSTEM_SNAPSHOT: &[u8] =
     include_bytes!("fixtures/v72_filesystem_checkpoints.snapshot");
+
+/// Asserts every file row's `directory_id` resolves among the same tree's
+/// directory rows — the closure invariant the v75 migration repairs.
+fn assert_files_resolve_directories(
+    files: &lix::ExecuteResult,
+    directories: &lix::ExecuteResult,
+    context: &str,
+) {
+    let directory_ids: HashSet<String> = directories
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").expect("directory id"))
+        .collect();
+    for file in files.rows() {
+        let name = file.get::<String>("name").expect("file name");
+        if let Ok(directory_id) = file.get::<String>("directory_id") {
+            assert!(
+                directory_ids.contains(&directory_id),
+                "file '{name}' {context} references directory '{directory_id}' \
+                 that is missing from the same tree"
+            );
+        }
+    }
+}
 
 #[tokio::test]
 async fn checkpointed_directories_survive_the_v74_migration() {
@@ -79,21 +104,11 @@ async fn checkpointed_directories_survive_the_v74_migration() {
             .unwrap_or_else(|error| {
                 panic!("lix_state_at('lix_directory') at {commit_id} should read: {error}")
             });
-        let directory_ids: HashSet<String> = directories
-            .rows()
-            .iter()
-            .map(|row| row.get::<String>("id").expect("directory id"))
-            .collect();
-        for file in files.rows() {
-            let name = file.get::<String>("name").expect("file name");
-            if let Ok(directory_id) = file.get::<String>("directory_id") {
-                assert!(
-                    directory_ids.contains(&directory_id),
-                    "file '{name}' at checkpoint {commit_id} references directory \
-                     '{directory_id}' that is missing from the same tree"
-                );
-            }
-        }
+        assert_files_resolve_directories(
+            &files,
+            &directories,
+            &format!("at checkpoint {commit_id}"),
+        );
 
         // The path-projecting read the product runs on every checkpoint open.
         lix.execute(
@@ -174,20 +189,35 @@ async fn checkpointed_directories_survive_the_v74_migration() {
              (got {directory_names:?})"
         );
     }
-    let directory_ids: HashSet<String> = directories
-        .rows()
-        .iter()
-        .map(|row| row.get::<String>("id").expect("directory id"))
-        .collect();
-    for file in files.rows() {
-        if let Ok(directory_id) = file.get::<String>("directory_id") {
-            assert!(
-                directory_ids.contains(&directory_id),
-                "post-migration checkpoint file references directory '{directory_id}' \
-                 missing from the same tree"
-            );
-        }
-    }
+    assert_files_resolve_directories(&files, &directories, "at the post-migration checkpoint");
 
     lix.close().await.expect("close migrated repository");
+}
+
+#[tokio::test]
+async fn bounded_migration_fails_loudly_instead_of_publishing_v75() {
+    // A row budget below the repository's tracked rows must refuse the
+    // migration — whichever chain step's bound fires first — and never
+    // publish v75 over partially processed trees. (The repair step's own
+    // bound is unit-tested in migration::api.)
+    let storage = Memory::from_snapshot(V72_FILESYSTEM_SNAPSHOT)
+        .expect("v72 filesystem fixture should decode");
+    let error = migrate_lix(
+        storage.clone(),
+        MigrationOptions {
+            max_changes: 12,
+            ..MigrationOptions::default()
+        },
+    )
+    .await
+    .expect_err("a bound below the repository's row count must fail the migration");
+    assert_eq!(error.code, "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED");
+    // The refused migration left the marker untouched: still migratable.
+    assert_eq!(
+        inspect_lix(&storage).await.expect("inspect after refusal"),
+        MigrationStatus::Required {
+            from_version: 72,
+            to_version: 75,
+        }
+    );
 }

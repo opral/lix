@@ -230,4 +230,57 @@ mod tests {
             "metadata-only auto-rebase must remain bounded, saw {delta:?}"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn switch_branch_completes_against_an_armed_observation() {
+        // Regression: switch_branch bumps the observer invalidation
+        // generation, so an armed observation re-evaluates under its own
+        // waitable-operation guard while the switch waits for observations
+        // to settle. A lazy base refresh inside that guarded execute needs
+        // session write access, which drains waitable operations — a
+        // deadlock on the observation's own guard. The observe loop
+        // refreshes before taking its guard instead.
+        let storage = Memory::new();
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("initialize storage");
+        let engine = Engine::new(storage).await.expect("open engine");
+        let session = engine
+            .open_session_at(&receipt.main_branch_id)
+            .await
+            .expect("open pinned main session");
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) \
+                 VALUES ('/armed.md', CAST('Hello' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("seed a file");
+        let mut events = session
+            .observe("SELECT content FROM lix_file", &[])
+            .expect("observation opens");
+        events.next().await.expect("initial evaluation");
+        let armed = tokio::spawn(async move { events.next().await });
+
+        let branch = session
+            .create_branch(CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-00000000c002".to_owned()),
+                name: "armed-observation-switch".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create switch target");
+        let switched = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            session.switch_branch(SwitchBranchOptions {
+                branch_id: branch.id.clone(),
+            }),
+        )
+        .await
+        .expect("switch_branch must not deadlock against the armed observation")
+        .expect("switch succeeds");
+        assert_eq!(switched.branch_id, branch.id);
+        armed.abort();
+    }
 }

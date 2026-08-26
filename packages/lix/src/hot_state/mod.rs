@@ -68,7 +68,7 @@ pub(crate) use tracked_head::{
     PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
     PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, ROW_SPACE, RowColumnarOverlayRow,
     TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
-    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, decode_hot_row_key_for_migration,
+    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     stage_certified_row_batches, stage_hot_index_entries, stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
