@@ -960,6 +960,72 @@ struct FetchedHistory {
     boundaries: Vec<super::SyncHistoryBoundary>,
 }
 
+fn merge_fetched_history_response(
+    head: &str,
+    response: super::SyncHistoryResponse,
+    commits: &mut BTreeMap<String, super::SyncCommit>,
+    commit_headers: &mut BTreeMap<String, super::SyncCommitHeader>,
+    boundaries: &mut BTreeMap<String, super::SyncHistoryBoundary>,
+) -> Result<(), LixError> {
+    for header in response.commit_headers {
+        if let Some(existing) = commit_headers.insert(header.commit_id.clone(), header.clone())
+            && existing != header
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync history returned conflicting commit headers",
+            ));
+        }
+    }
+    let response_commits = response.commits;
+    for commit in &response_commits {
+        commit.validate()?;
+    }
+    let returned = response_commits
+        .iter()
+        .map(|commit| commit.commit_id.clone())
+        .collect::<BTreeSet<_>>();
+    if !returned.contains(head) {
+        return Err(LixError::new(
+            LixError::CODE_COMMIT_NOT_FOUND,
+            format!("sync history response omitted requested head '{head}'"),
+        ));
+    }
+    for boundary in response.boundaries {
+        let is_external_base = response_commits.iter().any(|commit| {
+            commit.base_commit_id.as_deref() == Some(boundary.commit_id.as_str())
+        });
+        if !returned.contains(&boundary.commit_id) && !is_external_base {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "sync history returned boundary '{}' outside its page",
+                    boundary.commit_id
+                ),
+            ));
+        }
+        if let Some(existing) = boundaries.insert(boundary.commit_id.clone(), boundary.clone())
+            && existing != boundary
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync history returned conflicting boundary roots",
+            ));
+        }
+    }
+    for commit in response_commits {
+        if let Some(existing) = commits.insert(commit.commit_id.clone(), commit.clone())
+            && existing != commit
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync history returned conflicting duplicate commits",
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_history_objects<Transport>(
     transport: &Transport,
     pending: BTreeSet<String>,
@@ -989,63 +1055,42 @@ where
         }))
         .await?;
         for (head, response) in pending_batch.iter().zip(responses) {
-            for header in response.commit_headers {
-                if let Some(existing) =
-                    commit_headers.insert(header.commit_id.clone(), header.clone())
-                    && existing != header
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync history returned conflicting commit headers",
-                    ));
-                }
-            }
-            let mut response_commits = response.commits;
-            for commit in &response_commits {
-                commit.validate()?;
-            }
-            let returned = response_commits
-                .iter()
-                .map(|commit| commit.commit_id.clone())
-                .collect::<BTreeSet<_>>();
-            if !returned.contains(head) {
-                return Err(LixError::new(
-                    LixError::CODE_COMMIT_NOT_FOUND,
-                    format!("sync history response omitted requested head '{head}'"),
-                ));
-            }
-            for boundary in response.boundaries {
-                let is_external_base = response_commits.iter().any(|commit| {
-                    commit.base_commit_id.as_deref() == Some(boundary.commit_id.as_str())
-                });
-                if !returned.contains(&boundary.commit_id) && !is_external_base {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "sync history returned boundary '{}' outside its page",
-                            boundary.commit_id
-                        ),
-                    ));
-                }
-                if let Some(existing) =
-                    boundaries.insert(boundary.commit_id.clone(), boundary.clone())
-                    && existing != boundary
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync history returned conflicting boundary roots",
-                    ));
-                }
-            }
-            for commit in response_commits.drain(..) {
-                if let Some(existing) = commits.insert(commit.commit_id.clone(), commit.clone())
-                    && existing != commit
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync history returned conflicting duplicate commits",
-                    ));
-                }
+            merge_fetched_history_response(
+                head,
+                response,
+                &mut commits,
+                &mut commit_headers,
+                &mut boundaries,
+            )?;
+        }
+    }
+
+    // A bounded page may materialize an external global base without spending
+    // one of its causal body slots on that base. Close those boundary bodies
+    // before import so immutable commit authority is published exactly once:
+    // canonical local mutations plus the complete boundary root atomically.
+    loop {
+        let missing = boundaries
+            .keys()
+            .filter(|commit_id| !commits.contains_key(*commit_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            break;
+        }
+        for missing_batch in missing.chunks(SYNC_DEMAND_FETCH_CONCURRENCY) {
+            let responses = futures_util::future::try_join_all(missing_batch.iter().map(|head| {
+                fetch_history_head(transport, head, 1, max_boundaries_per_page)
+            }))
+            .await?;
+            for (head, response) in missing_batch.iter().zip(responses) {
+                merge_fetched_history_response(
+                    head,
+                    response,
+                    &mut commits,
+                    &mut commit_headers,
+                    &mut boundaries,
+                )?;
             }
         }
     }

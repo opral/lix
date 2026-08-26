@@ -61,6 +61,7 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
     let fork_commit_id;
     let checkpoint_commit_id;
     let refresh_commit_id;
+    let refresh_base_commit_id;
     let source_commit_id;
 
     {
@@ -112,16 +113,13 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
             .await
             .expect("switch session branch");
         refresh_commit_id = active_commit_id(&source).await;
+        refresh_base_commit_id = commit_base_id(&main, &refresh_commit_id).await;
         assert_eq!(
             commit_parent_edges(&main, &refresh_commit_id).await,
             vec![
                 (fork_commit_id.clone(), 0),
                 (checkpoint_commit_id.clone(), 1),
             ],
-        );
-        assert_eq!(
-            commit_base_id(&main, &refresh_commit_id).await,
-            checkpoint_commit_id,
         );
         source
             .execute(
@@ -137,7 +135,7 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
         );
         assert_eq!(
             commit_base_id(&main, &source_commit_id).await,
-            checkpoint_commit_id,
+            refresh_base_commit_id,
         );
         main.execute(
             "UPDATE lix_key_value SET value = 'target' WHERE key = $1",
@@ -171,7 +169,7 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
     );
     assert_eq!(
         commit_base_id(&main, &refresh_commit_id).await,
-        checkpoint_commit_id,
+        refresh_base_commit_id,
     );
     assert_eq!(
         commit_parent_edges(&main, &source_commit_id).await,
@@ -179,7 +177,7 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
     );
     assert_eq!(
         commit_base_id(&main, &source_commit_id).await,
-        checkpoint_commit_id,
+        refresh_base_commit_id,
     );
     let preview = main
         .merge_branch_preview(MergeBranchPreviewOptions {

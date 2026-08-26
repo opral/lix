@@ -231,47 +231,6 @@ fn stage_imported_commit_body(
     Ok(staged.mutation_inventory().clone())
 }
 
-fn stage_imported_checkpoint_boundary_body(
-    writes: &mut StorageWriteSet,
-    commit_id: CommitId,
-    rows: &[ParsedSnapshotRow],
-    already_authoritative_change_ids: &BTreeSet<ChangeId>,
-    selected_fallbacks: &mut BTreeMap<ChangeId, CommitDeltaChangeLocator>,
-) -> Result<CommitStateMutationInventory, LixError> {
-    let deltas = rows
-        .iter()
-        .filter(|row| !already_authoritative_change_ids.contains(&row.change_id))
-        .map(|row| TrackedStateCommitDeltaRef {
-            delta: TrackedStateDeltaRef {
-                schema_key: &row.schema_key,
-                file_id: row.file_id.as_deref(),
-                row_pk: &row.row_pk,
-                change_id: row.change_id,
-                commit_id,
-                deleted: false,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-            },
-            snapshot: Some(&row.snapshot),
-            metadata: row.metadata.as_ref(),
-            origin_key: row.origin_key.as_deref(),
-            base_coordinate: None,
-            authored: false,
-        })
-        .collect::<Vec<_>>();
-    let staged = stage_imported_addressable_commit_deltas(
-        writes,
-        &deltas,
-        &vec![false; deltas.len()],
-    )?;
-    for locator in staged.locators.iter().cloned() {
-        selected_fallbacks
-            .entry(locator.change_id)
-            .or_insert(locator);
-    }
-    Ok(staged.mutation_inventory().clone())
-}
-
 async fn stage_missing_selected_change_locators(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -3626,13 +3585,12 @@ where
                 }
             }
             for commit_id in boundary_roots.keys() {
-                let is_external_base = parsed
-                    .values()
-                    .any(|commit| commit.base_commit_id == Some(*commit_id));
-                if !parsed.contains_key(commit_id) && !is_external_base {
+                if !parsed.contains_key(commit_id) {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PARAM,
-                        format!("sync history boundary '{commit_id}' is outside its page"),
+                        format!(
+                            "sync history boundary '{commit_id}' has no canonical commit body"
+                        ),
                     ));
                 }
                 boundary_rows.insert(*commit_id, Vec::new());
@@ -3736,47 +3694,6 @@ where
 
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        // A history page may carry a materialized global base boundary without
-        // spending one of its bounded causal body slots on that base. Promote
-        // the already-certified sparse header to an empty synthetic body; the
-        // boundary rows below are the complete state authority.
-        let external_boundary_ids = boundary_roots
-            .keys()
-            .filter(|commit_id| !parsed.contains_key(commit_id))
-            .copied()
-            .collect::<BTreeSet<_>>();
-        for commit_id in external_boundary_ids.iter().copied() {
-            let record = load_commit_record(&read, commit_id).await?.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_COMMIT_NOT_FOUND,
-                    format!("sync history base boundary '{commit_id}' has no header"),
-                )
-            })?;
-            let global_scope = deferred_commit_global_scope(&read, commit_id)
-                .await?
-                .or_else(|| {
-                    boundary_roots
-                        .contains_key(&commit_id)
-                        .then_some(record.base_commit_id.is_none())
-                })
-                .unwrap_or(false);
-            let wire = SyncCommit {
-                commit_id: commit_id.to_string(),
-                parent_commit_ids: record
-                    .parent_commit_ids
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-                base_commit_id: record.base_commit_id.map(|base| base.to_string()),
-                account_id: record.account_id.clone(),
-                created_at: record.created_at.to_string(),
-                global_scope,
-                selected_source_commit_id: None,
-                state_alias: None,
-                members: Vec::new(),
-            };
-            parsed.insert(commit_id, ParsedCommit::parse(&wire)?);
-        }
         let default_branch_id = self.repository_default_branch_id_for_sync(&read).await?;
         if parsed_refs
             .iter()
@@ -4111,11 +4028,7 @@ where
             )
             .await?;
         }
-        for commit_id in parsed
-            .keys()
-            .filter(|commit_id| !external_boundary_ids.contains(commit_id))
-            .copied()
-        {
+        for commit_id in parsed.keys().copied() {
             stage_commit_history_available(&mut writes, commit_id);
         }
 
@@ -4456,40 +4369,6 @@ where
         let mut selected_fallback_locators = BTreeMap::new();
         let mut authored_locators = BTreeMap::new();
         let mut imported_authored_change_ids = BTreeSet::new();
-        let mut already_authoritative_change_ids = parsed
-            .values()
-            .flat_map(|commit| commit.members.iter())
-            .filter(|member| member.authored)
-            .map(|member| member.change_id)
-            .collect::<BTreeSet<_>>();
-        let boundary_change_ids = boundary_rows
-            .values()
-            .flatten()
-            .map(|row| row.change_id)
-            .collect::<BTreeSet<_>>();
-        let boundary_locator_keys = boundary_change_ids
-            .iter()
-            .map(|change_id| {
-                StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()))
-            })
-            .collect::<Vec<_>>();
-        if !boundary_locator_keys.is_empty() {
-            let existing = exact_get_many(
-                &read,
-                &[StorageGetManyRequest {
-                    space: TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-                    keys: &boundary_locator_keys,
-                    opts: StorageGetOptions::default(),
-                }],
-            )
-            .await?;
-            already_authoritative_change_ids.extend(
-                boundary_change_ids
-                    .into_iter()
-                    .zip(existing.values)
-                    .filter_map(|(change_id, value)| value.is_some().then_some(change_id)),
-            );
-        }
         let mut remaining = parsed
             .keys()
             .filter(|commit_id| !existing.contains(commit_id))
@@ -4515,30 +4394,15 @@ where
                 ));
             };
             let commit = &parsed[&commit_id];
-            let mutations = if commit.state_alias.is_some()
-                && let Some(rows) = boundary_rows.get(&commit_id)
-            {
-                // Ordered delta sync keeps checkpoint aliases metadata-only.
-                // History hydration instead carries their complete state as a
-                // paged boundary; retain those selected rows as the commit's
-                // mutation inventory so history queries remain equivalent to
-                // the former expanded checkpoint body.
-                stage_imported_checkpoint_boundary_body(
-                    &mut writes,
-                    commit_id,
-                    rows,
-                    &already_authoritative_change_ids,
-                    &mut selected_fallback_locators,
-                )?
-            } else {
-                stage_imported_commit_body(
-                    &mut writes,
-                    commit,
-                    &mut imported_authored_change_ids,
-                    &mut selected_fallback_locators,
-                    &mut authored_locators,
-                )?
-            };
+            // Commit membership comes only from the canonical body. Boundary
+            // rows certify a complete state root but never redefine a delta.
+            let mutations = stage_imported_commit_body(
+                &mut writes,
+                commit,
+                &mut imported_authored_change_ids,
+                &mut selected_fallback_locators,
+                &mut authored_locators,
+            )?;
             for member in &commit.members {
                 let change = member.change_record();
                 match load_existing_sync_change(&read, change.change_id).await? {
@@ -5441,7 +5305,8 @@ where
         // A local commit is not a complete state authority without its pinned
         // global base. When that base is outside the bounded body page, ship
         // it as a materialized boundary just like an external causal parent.
-        // This keeps every history response independently importable.
+        // The runtime closes the canonical body for this state-only boundary
+        // before handing the response to the atomic importer.
         boundary_ids.extend(external_base_ids.iter().copied());
         let mut commits = Vec::with_capacity(newest_first.len());
         for record in newest_first.iter().rev() {
@@ -9636,10 +9501,36 @@ mod tests {
                 continuation = Some(next);
             }
         }
-        cold.import_sync_history_headers(&page.commit_headers)
+        let mut import_commits = page.commits.clone();
+        let mut import_headers = page
+            .commit_headers
+            .iter()
+            .cloned()
+            .map(|header| (header.commit_id.clone(), header))
+            .collect::<BTreeMap<_, _>>();
+        for boundary in &page.boundaries {
+            if import_commits
+                .iter()
+                .any(|commit| commit.commit_id == boundary.commit_id)
+            {
+                continue;
+            }
+            let dependency = authority
+                .sync_history(&boundary.commit_id, 1)
+                .await
+                .expect("external boundary body should load");
+            import_commits.extend(dependency.commits);
+            import_headers.extend(
+                dependency
+                    .commit_headers
+                    .into_iter()
+                    .map(|header| (header.commit_id.clone(), header)),
+            );
+        }
+        cold.import_sync_history_headers(&import_headers.into_values().collect::<Vec<_>>())
             .await
             .expect("cold replica should accept sparse topology");
-        cold.import_sync_history_boundaries(&page.commits, &page.boundaries, &rows)
+        cold.import_sync_history_boundaries(&import_commits, &page.boundaries, &rows)
             .await
             .expect("cold replica should import a merge page with two boundaries");
         assert_eq!(
