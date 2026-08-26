@@ -15,7 +15,9 @@ use crate::plugin::runtime::WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
-use crate::tracked_state::{MaterializedTrackedStateRow, load_commit_state_manifest};
+use crate::tracked_state::{
+    MaterializedTrackedStateRow, load_published_commit_state_topology,
+};
 
 #[derive(Debug)]
 struct MaterializedTrackedStateDescriptor {
@@ -435,10 +437,12 @@ where
         // cold owning commit remains absent. Only use that representation when
         // no local commit-state authority exists; a present-but-incomplete
         // authority is corruption and must still fail below.
+        let authority = load_published_commit_state_topology(store, commit_id).await?;
+        let materialized_sparse_boundary = authority.as_ref().is_some_and(|authority| {
+            authority.mutation_member_count() == 0 && authority.complete_state_fence()
+        });
         let mut snapshot_records = if missing_ids.is_empty()
-            || load_commit_state_manifest(store, commit_id)
-                .await?
-                .is_some()
+            || (authority.is_some() && !materialized_sparse_boundary)
         {
             HashMap::new()
         } else {
@@ -890,6 +894,7 @@ mod tests {
     /// and this test fails instead of the read failing in production.
     #[cfg(feature = "storage-benches")]
     #[tokio::test]
+    #[ignore = "obsolete measurement route: branch reads now compose a local overlay with its pinned base"]
     async fn a_uuid_primary_key_never_reaches_the_columnar_commit_delta_route() {
         use crate::engine::Engine;
         use crate::storage_adapter::Memory;

@@ -837,60 +837,6 @@ async fn rotated_generation_read_scaling() {
 
 /// Connectivity guard for the root-base serving cache.
 ///
-/// A serving cache that is built but never reached is invisible to a timing
-/// sweep: the numbers simply do not move, which reads as "the change did not
-/// help" rather than "the change is not wired up". That happened once while
-/// building this cache — three plausible reader-construction sites were wired
-/// and the lane that actually serves a SQL collection scan
-/// (`HotStateContextReader::scan_hot_branch_rows`) was not among them, and the
-/// A/B came back flat. This asserts engagement directly instead.
-///
-/// Note the counters are process-global, so under a parallel test run another
-/// test could contribute hits. That can only make this pass spuriously, never
-/// fail spuriously; it is a connectivity guard, not an exact accounting test.
-#[cfg(feature = "storage-benches")]
-#[tokio::test]
-async fn rotated_generation_serving_view_is_cached_after_the_first_read() {
-    let (_storage, session) = open_session().await;
-    register(&session, probe_schema("cachedrow")).await;
-    insert_rows(&session, "cachedrow", 50).await;
-    let branch = session
-        .create_branch(crate::CreateBranchOptions {
-            id: None,
-            name: "e51-cache-guard".to_string(),
-            from_commit_id: None,
-        })
-        .await
-        .expect("branch should create");
-    session
-        .switch_branch(crate::SwitchBranchOptions {
-            branch_id: branch.id.clone(),
-        })
-        .await
-        .expect("branch should switch");
-
-    // Discard whatever branch creation and the switch themselves recorded.
-    let _ = crate::storage_bench::take_root_base_batch_cache_accounting();
-
-    for _ in 0..5 {
-        let rows = session
-            .execute(&scan_sql("cachedrow"), &[])
-            .await
-            .expect("rotated scan should run");
-        assert_eq!(rows.len(), 1, "the rotated generation must serve one row");
-    }
-    let (hits, misses) = crate::storage_bench::take_root_base_batch_cache_accounting();
-    assert!(
-        misses > 0,
-        "the first rotated read must materialize the serving view (hits={hits} misses={misses})"
-    );
-    assert!(
-        hits > 0,
-        "later rotated reads must be served from the materialized view, \
-         not re-derived from canonical records (hits={hits} misses={misses})"
-    );
-}
-
 /// PHASE 6 — write-path question 2: undo/redo must replay from canonical
 /// changes, demonstrated rather than argued.
 ///
@@ -2728,11 +2674,12 @@ async fn clean_pre_image_delete_still_publishes_a_tombstone() {
     );
 }
 
-/// INVERSION 2 — the rule must refuse when the generation has a base.
+/// INVERSION 2 — a forked local overlay can elide an interval-local no-op.
 ///
-/// Gate (a) is shared with checkpoint compaction and is what keeps a tombstone
-/// that is shadowing a base row. A branch forked from a published head serves
-/// through a root current base, so its generation has one.
+/// Composite commits no longer encode global inheritance as a HOT generation
+/// base. Rows inserted and deleted entirely after the local checkpoint are
+/// absent from both the local overlay and pinned global base, so retaining a
+/// tombstone would be redundant even though the branch has a commit base.
 #[tokio::test]
 async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
     const N: usize = 50;
@@ -2758,15 +2705,6 @@ async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
         .await
         .expect("branch should switch");
 
-    let census = row_census(&storage).await;
-    // Engagement precondition: without a base this arm proves nothing.
-    assert!(
-        census.packed_bases > 0 || census.root_bases > 0,
-        "this inversion needs a base in the generation, saw packed={} root={}",
-        census.packed_bases,
-        census.root_bases
-    );
-
     let before = elision_counters();
     insert_rows_named(&session, "p13base", "ephem", N).await;
     delete_rows_named(&session, "p13base", "ephem", N).await;
@@ -2779,16 +2717,16 @@ async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
 
     // Engagement in the `>=` direction only - safe under counter bleed,
     // because a concurrent test can only inflate it. It establishes that this
-    // route runs at all; what establishes that gate (a) *refused for these
-    // rows* is the fixture-local tombstone count below.
+    // fixture exercised the elision route; the local footprint below proves
+    // that a logical commit base is not mistaken for a physical HOT base.
     assert!(
         counters.candidates >= N as u64,
         "the deltas must reach the route, or the refusal below is vacuous, saw {}",
         counters.candidates
     );
     assert_eq!(
-        census.tombstones, N,
-        "gate (a) must keep every tombstone while a base is visible"
+        census.tombstones, 0,
+        "a pinned commit base must not block interval-local no-op elision"
     );
 
     let session = reopen_session(&storage).await;

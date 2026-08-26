@@ -87,12 +87,26 @@ key `=` and `IN` predicates are pushed into the point-in-time read, so batched
 entity lookups do not scan unrelated tracked rows. Untracked rows are never
 included.
 
-The result is scoped to the tree rooted at the supplied commit; a local-branch
-read does not inherit global rows. To reconstruct a full pinned live view,
-overlay the local state on the separately pinned global state. The overlay's
-global arm must be anti-joined against the nearest local `lix_history`
-identities, including deleted identities: a local tombstone shadows a global
-row even though `lix_state_at` itself does not expose tombstones.
+The supplied commit is a closed snapshot. A local commit records its exact
+global dependency in `lix_commit.base_commit_id`; its physical state is an
+immutable local-overlay root plus that pinned immutable global root.
+`lix_state_at` composes both roots and returns inherited global rows plus local
+values and tombstones, with local intent winning. Global commits have a null
+base. The base is a state dependency, not ancestry, so it is deliberately
+absent from `parent_commit_ids` and `lix_commit_ancestry()`. `lix_history`
+does follow the base dependency so history can explain the complete state.
+
+When global advances, the next live access to a local branch lazily publishes
+one metadata-only local commit pinned to the latest global commit. An actual
+local write performs the same base advance in its own commit, so multiple
+global advances coalesce and global publication remains O(1) rather than
+fanning out over every branch. No global rows are copied into the local
+overlay. The active commit ID and every live row therefore always describe the
+same closed snapshot.
+
+For `lix_history`, depth is the shortest dependency distance using either a
+causal parent edge or a state-base edge. `lix_commit_ancestry()` remains
+strictly causal-parent-only.
 
 `lix_commit_ancestry()` returns the active head at depth `0` and every
 reachable ancestor once at its shortest depth. Pass one commit ID to use an

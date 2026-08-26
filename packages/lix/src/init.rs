@@ -28,8 +28,9 @@ use crate::storage_adapter::{
     StorageSpaceId, StorageWriteSet, ValueSemantics,
 };
 use crate::tracked_state::{
-    CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef, stage_commit_deltas_for_commit_state,
+    CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
+    TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef,
+    stage_commit_deltas_for_commit_state,
 };
 use bytes::Bytes;
 use serde_json::json;
@@ -98,9 +99,13 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// state commit authority, including rootless replay commits. The index makes
 /// historical PK reads bounded even when the row's file scope is not known by
 /// the SQL predicate.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 74;
+///
+/// `v75` hard-cuts commit records to complete-snapshot semantics. Global
+/// commits have no base; every local commit names the exact global commit
+/// whose state is composed beneath its immutable local-overlay tracked root.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 75;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v74";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v75";
 pub(crate) const REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP: &[u8] =
     b"tracked-default-branch.v72-row-pk-bootstrap";
 
@@ -200,7 +205,8 @@ pub(crate) fn migration_required_error(found_version: u32) -> LixError {
 /// the direct current-state control plane and retain a standalone immutable
 /// branch-ref ledger change.
 pub(crate) struct InitSeedPlan {
-    commit: InitSeedCommit,
+    global_commit: InitSeedCommit,
+    main_commit: InitSeedCommit,
     changes: Vec<InitSeedChange>,
     branch_controls: Vec<InitBranchHeadControl>,
     pub(crate) receipt: InitReceipt,
@@ -257,6 +263,7 @@ pub struct InitReceipt {
     pub lix_id: String,
     pub global_branch_id: String,
     pub main_branch_id: String,
+    pub initial_global_commit_id: String,
     pub initial_commit_id: String,
 }
 
@@ -285,6 +292,7 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
         functions.call_uuid_v7().to_string()
     };
     let lix_id = functions.call_uuid_v7().to_string();
+    let initial_global_commit_id = CommitId::with_change_address_space(functions.call_uuid_v7());
     let initial_commit_id = CommitId::with_change_address_space(functions.call_uuid_v7());
     let timestamp = functions.call_timestamp();
 
@@ -349,10 +357,17 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
         timestamp,
     )?;
 
-    let initial_commit = InitSeedCommit {
-        id: initial_commit_id,
+    let initial_global_commit = InitSeedCommit {
+        id: initial_global_commit_id,
         change_id: ChangeId::from(functions.call_uuid_v7()),
         parent_ids: Vec::new(),
+        account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
+        created_at: timestamp,
+    };
+    let initial_main_commit = InitSeedCommit {
+        id: initial_commit_id,
+        change_id: ChangeId::from(functions.call_uuid_v7()),
+        parent_ids: vec![initial_global_commit_id],
         account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
         created_at: timestamp,
     };
@@ -362,16 +377,16 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
     let global_branch_ref_change = branch_ref_ledger_change(
         functions.call_uuid_v7(),
         GLOBAL_BRANCH_ID,
-        initial_commit_id,
+        initial_global_commit_id,
         timestamp,
     )?;
     let global_branch_control = InitBranchHeadControl {
         branch_id: GLOBAL_BRANCH_ID.to_string(),
         control: BranchHeadControl {
-            head_commit_id: initial_commit_id,
-            tracked_generation: initial_commit_id,
+            head_commit_id: initial_global_commit_id,
+            tracked_generation: initial_global_commit_id,
             current_state_revision: 0,
-            working_diff_checkpoint_commit_id: Some(initial_commit_id),
+            working_diff_checkpoint_commit_id: Some(initial_global_commit_id),
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: global_branch_ref_change.id,
@@ -408,7 +423,8 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
     )?;
 
     Ok(InitSeedPlan {
-        commit: initial_commit,
+        global_commit: initial_global_commit,
+        main_commit: initial_main_commit,
         changes: registered_schema_changes
             .into_iter()
             .chain([
@@ -426,6 +442,7 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
             lix_id,
             global_branch_id: GLOBAL_BRANCH_ID.to_string(),
             main_branch_id,
+            initial_global_commit_id: initial_global_commit_id.to_string(),
             initial_commit_id: initial_commit_id.to_string(),
         },
     })
@@ -506,7 +523,7 @@ where
                 file_id: change.file_id.as_deref(),
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
-                commit_id: plan.commit.id,
+                commit_id: plan.global_commit.id,
                 deleted: false,
                 created_at: change.created_at,
                 updated_at: change.created_at,
@@ -528,11 +545,11 @@ where
         crate::tracked_state::stage_change_locators(&mut writes, &staged_delta.locators);
         let mut tracked_writer = tracked_state.writer(&read, &mut writes);
         tracked_writer
-            .stage_commit_root(&receipt.initial_commit_id, None, root_deltas)
+            .stage_commit_root(&receipt.initial_global_commit_id, None, root_deltas)
             .await?;
         let snapshot_root = tracked_writer
             .staged_commit_roots()
-            .find(|root| root.commit_id == plan.commit.id)
+            .find(|root| root.commit_id == plan.global_commit.id)
             .cloned()
             .ok_or_else(|| {
                 LixError::new(
@@ -543,13 +560,13 @@ where
         let initial_mutations = staged_delta.mutation_inventory().clone();
         let initial_segments = crate::tracked_state::staged_commit_delta_segment_bytes(
             &writes,
-            plan.commit.id,
+            plan.global_commit.id,
             &initial_mutations,
         )?;
         let initial_members = crate::tracked_state::staged_commit_delta_members(
             &read,
-            plan.commit.id,
-            &plan.commit.account_id,
+            plan.global_commit.id,
+            &plan.global_commit.account_id,
             &initial_mutations,
             initial_segments,
         )
@@ -559,9 +576,9 @@ where
             &read,
             &mut writes,
             &mut row_pk_index_overlay,
-            None,
-            &initial_members,
-            plan.commit.id,
+                None,
+                &initial_members,
+                plan.global_commit.id,
         )
         .await?;
         let physical_publication =
@@ -569,8 +586,8 @@ where
                 &read,
                 &mut writes,
                 None,
-                plan.commit.id,
-                &plan.commit.account_id,
+                plan.global_commit.id,
+                &plan.global_commit.account_id,
                 &initial_mutations,
             )
             .await?;
@@ -578,8 +595,8 @@ where
             crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
                 &mut writes,
                 &CommitStateManifest {
-                    commit_id: plan.commit.id,
-                    change_account_id: plan.commit.account_id.clone(),
+                    commit_id: plan.global_commit.id,
+                    change_account_id: plan.global_commit.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: initial_mutations,
                     touched_scope_filter: physical_publication.touched_scope_filter().clone(),
@@ -591,10 +608,66 @@ where
                 &physical_publication,
             )?;
 
-        // Seed both visible branches with a complete hot current-state generation.
-        // The initial commit is shared, but the branch-scoped marker and
-        // groups are intentionally independent so normal reads never need a
-        // reconstruction path immediately after initialization.
+        // Main starts as an empty immutable overlay pinned to the global
+        // genesis snapshot. Its causal parent is global, but its physical
+        // state root deliberately has no parent: the base edge supplies the
+        // global half of the effective state.
+        let empty_deltas = Vec::<TrackedStateDeltaRef<'_>>::new();
+        let mut tracked_writer = tracked_state.writer(&read, &mut writes);
+        tracked_writer
+            .stage_commit_root(&receipt.initial_commit_id, None, empty_deltas)
+            .await?;
+        let main_snapshot_root = tracked_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == plan.main_commit.id)
+            .cloned()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "repository initialization did not stage the main overlay root",
+                )
+            })?;
+        let main_mutations = CommitStateMutationInventory::default();
+        let main_members = Vec::new();
+        let mut main_row_pk_overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
+        let main_row_pk_index_root_id = crate::tracked_state::stage_row_pk_index_from_members(
+            &read,
+            &mut writes,
+            &mut main_row_pk_overlay,
+            None,
+            &main_members,
+            plan.main_commit.id,
+        )
+        .await?;
+        let main_publication =
+            crate::tracked_state::stage_current_state_scoped_ranges_from_published_parent(
+                &read,
+                &mut writes,
+                None,
+                plan.main_commit.id,
+                &plan.main_commit.account_id,
+                &main_mutations,
+            )
+            .await?;
+        let _main_state = crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
+            &mut writes,
+            &CommitStateManifest {
+                commit_id: plan.main_commit.id,
+                change_account_id: plan.main_commit.account_id.clone(),
+                replay_debt: CommitStateReplayDebt::default(),
+                mutations: main_mutations,
+                touched_scope_filter: main_publication.touched_scope_filter().clone(),
+                global_scope: false,
+                current_state_scoped_ranges: main_publication.root(),
+                row_pk_index_root_id: main_row_pk_index_root_id,
+                snapshot_root: Some(Box::new(main_snapshot_root)),
+            },
+            &main_publication,
+        )?;
+
+        // Seed global with its complete state. Main's physical generation is
+        // only the local overlay plus the registered-schema serving cache;
+        // ordinary values are resolved through its pinned global base.
         let tracked_head_deltas = authored_changes
             .iter()
             .zip(&plan.changes)
@@ -604,7 +677,7 @@ where
                     file_id: change.file_id.as_deref(),
                     row_pk: &change.row_pk,
                     change_id: Some(change.change_id),
-                    commit_id: Some(plan.commit.id),
+                    commit_id: Some(plan.global_commit.id),
                     untracked: false,
                     deleted: false,
                     created_at: change.created_at,
@@ -627,25 +700,26 @@ where
         for branch in &plan.branch_controls {
             let mut head_deltas = tracked_head_deltas.clone();
             // Checkpoints and built-in accounts are global facts. Staging them
-            // onto main would materialize branch-local copies (`lixcol_global =
-            // false`) that shadow inheritance from GLOBAL_BRANCH_ID.
+            // onto main would turn the global snapshot into a local overlay.
             if branch.branch_id != GLOBAL_BRANCH_ID {
-                head_deltas.retain(|delta| {
-                    delta.schema_key != CHECKPOINT_SCHEMA_KEY
-                        && delta.schema_key != ACCOUNT_SCHEMA_KEY
-                });
+                head_deltas.retain(|delta| delta.schema_key == REGISTERED_SCHEMA_KEY);
             }
+            let generation = if branch.branch_id == GLOBAL_BRANCH_ID {
+                plan.global_commit.id
+            } else {
+                plan.main_commit.id
+            };
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             tracked_head
                 .writer(&read, &mut writes)
                 .stage_current_state_with_working_diff(
                     &branch.branch_id,
                     None,
-                    plan.commit.id,
+                    generation,
                     &head_deltas,
                     &absence_guards,
                     None,
-                    Some(plan.commit.id),
+                    Some(generation),
                     &mut working_diff_coverage,
                 )
                 .await?;
@@ -653,8 +727,8 @@ where
                 &mut writes,
                 &branch.branch_id,
                 TrackedWorkingDiffEpoch {
-                    checkpoint_commit_id: plan.commit.id,
-                    generation: plan.commit.id,
+                    checkpoint_commit_id: generation,
+                    generation,
                     coverage: working_diff_coverage,
                 },
             )?;
@@ -755,21 +829,34 @@ async fn stage_init_changelog_commit(
     changes: Vec<ChangeRecord>,
     touched_scopes: &[crate::changelog::CommitScopeKey],
 ) -> Result<(), LixError> {
-    let commit = CommitRecord {
+    let global_commit = CommitRecord {
         touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(touched_scopes),
         format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
-        commit_id: plan.commit.id,
+        commit_id: plan.global_commit.id,
         generation: 0,
-        parent_commit_ids: plan.commit.parent_ids.clone(),
-        first_parent_jump_commit_id: plan.commit.id,
+        parent_commit_ids: plan.global_commit.parent_ids.clone(),
+        base_commit_id: None,
+        first_parent_jump_commit_id: plan.global_commit.id,
         first_parent_jump_span: 0,
-        account_id: plan.commit.account_id.clone(),
-        created_at: plan.commit.created_at,
+        account_id: plan.global_commit.account_id.clone(),
+        created_at: plan.global_commit.created_at,
+    };
+    let main_commit = CommitRecord {
+        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(&[]),
+        format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+        commit_id: plan.main_commit.id,
+        generation: 1,
+        parent_commit_ids: plan.main_commit.parent_ids.clone(),
+        base_commit_id: Some(plan.global_commit.id),
+        first_parent_jump_commit_id: plan.global_commit.id,
+        first_parent_jump_span: 1,
+        account_id: plan.main_commit.account_id.clone(),
+        created_at: plan.main_commit.created_at,
     };
     let mut writer = ChangelogContext::new().writer(read, writes);
     writer
         .stage_append(ChangelogAppend {
-            commits: vec![commit],
+            commits: vec![global_commit, main_commit],
             changes,
         })
         .await
@@ -935,23 +1022,24 @@ mod tests {
         // ordinals like every other commit id, so it is not the raw v7 value.
         assert_eq!(
             plan.receipt.initial_commit_id,
-            "01920000-0000-7000-8000-000300000000"
+            "01920000-0000-7000-8000-000400000000"
         );
+        assert_eq!(plan.global_commit.id, plan.receipt.initial_global_commit_id);
+        assert_eq!(plan.main_commit.id, plan.receipt.initial_commit_id);
     }
 
     #[test]
     fn plan_init_seed_commit_header_tracks_schema_registrations_descriptor_and_lix_id_changes() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.commit.id, plan.receipt.initial_commit_id);
+        assert_eq!(plan.global_commit.id, plan.receipt.initial_global_commit_id);
+        assert_eq!(plan.main_commit.id, plan.receipt.initial_commit_id);
+        assert!(plan.global_commit.parent_ids.is_empty());
+        assert_eq!(plan.main_commit.parent_ids, vec![plan.global_commit.id]);
+        assert_eq!(plan.global_commit.account_id, crate::SYSTEM_ACCOUNT_ID);
+        assert_eq!(plan.main_commit.account_id, crate::SYSTEM_ACCOUNT_ID);
         assert_eq!(
-            plan.commit.change_id.to_string(),
-            test_uuid(seed_schema_definitions().len() + 10)
-        );
-        assert!(plan.commit.parent_ids.is_empty());
-        assert_eq!(plan.commit.account_id, crate::SYSTEM_ACCOUNT_ID);
-        assert_eq!(
-            plan.commit.created_at.to_string(),
+            plan.global_commit.created_at.to_string(),
             "2026-01-01T00:00:00.001Z"
         );
 
@@ -961,9 +1049,10 @@ mod tests {
             .map(|change| change.id.to_string())
             .collect::<Vec<_>>();
         assert_eq!(change_ids.len(), seed_schema_definitions().len() + 7);
-        let first_seed_change_id = test_uuid(4);
+        let first_seed_change_id = test_uuid(5);
         assert!(change_ids.contains(&first_seed_change_id));
-        assert!(!change_ids.contains(&plan.commit.change_id.to_string()));
+        assert!(!change_ids.contains(&plan.global_commit.change_id.to_string()));
+        assert!(!change_ids.contains(&plan.main_commit.change_id.to_string()));
 
         let registered_schema_change_ids = plan
             .changes
@@ -1022,7 +1111,11 @@ mod tests {
             );
             assert_eq!(
                 snapshot.get("commit_id").and_then(JsonValue::as_str),
-                Some(plan.receipt.initial_commit_id.as_str())
+                Some(if branch.branch_id == GLOBAL_BRANCH_ID {
+                    plan.receipt.initial_global_commit_id.as_str()
+                } else {
+                    plan.receipt.initial_commit_id.as_str()
+                })
             );
         }
     }
@@ -1064,7 +1157,7 @@ mod tests {
                 .await
                 .expect("read should open"),
         );
-        let commit_ids = [CommitId::for_test_label(&receipt.initial_commit_id)];
+        let commit_ids = [CommitId::for_test_label(&receipt.initial_global_commit_id)];
         let commits = reader
             .load_commits(crate::changelog::CommitLoadRequest {
                 commit_ids: &commit_ids,
@@ -1075,7 +1168,7 @@ mod tests {
             panic!("initial commit should exist");
         };
 
-        assert_eq!(record.commit_id, receipt.initial_commit_id);
+        assert_eq!(record.commit_id, receipt.initial_global_commit_id);
         let commit_change_id = record.change_id();
         let membership_read = storage
             .begin_read(crate::storage_adapter::StorageReadOptions::default())
@@ -1134,7 +1227,7 @@ mod tests {
             let mut writes = storage.new_write_set();
             tracked_state
                 .root_rebuilder(&read, &mut writes)
-                .rebuild_commit_root_at(&receipt.initial_commit_id)
+                .rebuild_commit_root_at(&receipt.initial_global_commit_id)
                 .await
                 .expect("initial commit root should rebuild from its packed delta");
             drop(read);
@@ -1154,7 +1247,7 @@ mod tests {
         );
         let rows = tracked_reader
             .scan_batch_at_commit(
-                &receipt.initial_commit_id,
+                &receipt.initial_global_commit_id,
                 &crate::tracked_state::TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec!["lix_commit".to_string()],
@@ -1262,8 +1355,12 @@ mod tests {
     #[test]
     fn repository_protocol_parser_distinguishes_versions() {
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v74"),
+            parse_repository_protocol(b"tracked-default-branch.v75"),
             RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v74"),
+            RepositoryProtocolStatus::MigrationRequired { found_version: 74 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v73"),
@@ -1274,8 +1371,8 @@ mod tests {
             RepositoryProtocolStatus::MigrationRequired { found_version: 69 }
         );
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v75"),
-            RepositoryProtocolStatus::TooNew { found_version: 75 }
+            parse_repository_protocol(b"tracked-default-branch.v76"),
+            RepositoryProtocolStatus::TooNew { found_version: 76 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),
@@ -1379,7 +1476,7 @@ mod tests {
         let mut tracked_reader = tracked_state.reader(read);
         let rows = tracked_reader
             .scan_batch_at_commit(
-                &receipt.initial_commit_id,
+                &receipt.initial_global_commit_id,
                 &crate::tracked_state::TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec![ACCOUNT_SCHEMA_KEY.to_string()],
@@ -1399,8 +1496,8 @@ mod tests {
         );
         for row in &account_rows {
             assert_eq!(
-                row.commit_id, receipt.initial_commit_id,
-                "account {:?} should be in the initial commit",
+                row.commit_id, receipt.initial_global_commit_id,
+                "account {:?} should be in the initial global commit",
                 row.row_pk
             );
         }

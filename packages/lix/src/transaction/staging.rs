@@ -2883,6 +2883,29 @@ impl TransactionWriteBuffer {
         Ok(change_refs.commit_id.to_string())
     }
 
+    /// Publishes a metadata-only commit. Composite-base refreshes use this to
+    /// advance the public state handle while structurally sharing the branch's
+    /// unchanged immutable local-overlay root.
+    pub(crate) fn stage_empty_commit(&self, branch_id: String) -> Result<String, LixError> {
+        let functions = self.functions.clone();
+        let mut guard = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged commit change refs lock",
+            )
+        })?;
+        let change_refs = guard.entry(branch_id).or_insert_with(|| {
+            let timestamp = functions.call_timestamp();
+            StagedCommitChangeRefs::new(
+                CommitId::with_change_address_space(functions.call_uuid_v7()),
+                ChangeId::from(functions.call_uuid_v7()),
+                timestamp,
+            )
+        });
+        change_refs.allow_empty();
+        Ok(change_refs.commit_id.to_string())
+    }
+
     pub(crate) fn stage_intermediate_commit(
         &self,
         branch_id: String,

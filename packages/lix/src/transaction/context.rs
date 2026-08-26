@@ -998,6 +998,38 @@ where
         self.opening_read.clone()
     }
 
+    /// Stages an empty local commit only when this coherent transaction opened
+    /// on a head whose pinned global base is stale. The caller uses this as a
+    /// lazy auto-rebase before serving a live read, avoiding O(branches)
+    /// fan-out on every global write.
+    pub(crate) async fn stage_base_refresh_if_needed(&mut self) -> Result<bool, LixError> {
+        if self.active_branch_id == GLOBAL_BRANCH_ID {
+            return Ok(false);
+        }
+        let (Some(active_head), Some(global_head)) = (
+            self.opening_active_branch_head,
+            self.opening_global_branch_head,
+        ) else {
+            return Ok(false);
+        };
+        let node = CommitGraphContext::new()
+            .reader(self.opening_read())
+            .load_node(&active_head)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_COMMIT_NOT_FOUND,
+                    format!("active branch head '{active_head}' does not exist"),
+                )
+            })?;
+        if node.base_commit_id == Some(global_head) {
+            return Ok(false);
+        }
+        self.staged_writes
+            .stage_empty_commit(self.active_branch_id.clone())?;
+        Ok(true)
+    }
+
     async fn reconcile_stale_disjoint_writes<S>(
         &mut self,
         read: &S,
@@ -1614,9 +1646,7 @@ where
             Arc::clone(&tracked_schema_catalog),
         );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
-        Ok((
-            OpenTransaction {
-                transaction: Self {
+        let transaction = Self {
                     write_context_liveness: crate::sql2::WriteContextLiveness::new(),
                     active_branch_id,
                     active_account_id,
@@ -1666,7 +1696,10 @@ where
                     pending_restore_targets: BTreeMap::new(),
                     plugin_generation_read_guard: None,
                     plugin_generation_upgrade_guard: None,
-                },
+                };
+        Ok((
+            OpenTransaction {
+                transaction,
                 runtime_functions,
             },
             runtime_boundary_result,

@@ -45,6 +45,19 @@ pub(crate) fn migration_from(from_version: u32) -> Option<&'static Migration> {
         .find(|migration| migration.from_version == from_version)
 }
 
+pub(crate) fn has_complete_migration_path(mut from_version: u32, to_version: u32) -> bool {
+    while from_version < to_version {
+        let Some(migration) = migration_from(from_version) else {
+            return false;
+        };
+        if migration.to_version <= from_version || migration.to_version > to_version {
+            return false;
+        }
+        from_version = migration.to_version;
+    }
+    from_version == to_version
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +107,10 @@ mod tests {
             })
         );
         assert_eq!(registered_migrations().len(), 6);
+        assert!(!has_complete_migration_path(
+            68,
+            crate::init::CURRENT_FORMAT_VERSION
+        ));
         assert_eq!(migration_from(crate::init::CURRENT_FORMAT_VERSION), None);
     }
 }

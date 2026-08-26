@@ -1766,6 +1766,7 @@ where
             commit_id,
             generation,
             parent_commit_ids: parents,
+            base_commit_id: None,
             first_parent_jump_commit_id,
             first_parent_jump_span,
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),

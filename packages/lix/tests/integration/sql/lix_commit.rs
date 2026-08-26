@@ -46,7 +46,7 @@ simulation_test!(
         let commit_rows = select_rows(
             &session,
             &format!(
-                "SELECT id, parent_commit_ids, parent_commit_ids ->> 0, lixcol_global, lixcol_untracked \
+                "SELECT id, parent_commit_ids, parent_commit_ids ->> 0, base_commit_id, lixcol_global, lixcol_untracked \
                  FROM lix_commit WHERE id = '{second_head}'"
             ),
         )
@@ -57,9 +57,23 @@ simulation_test!(
                 Value::Text(second_head.clone()),
                 Value::Jsonb(json!([first_head]).into()),
                 Value::Text(first_head),
+                Value::Text(sim.initial_global_commit_id().to_string()),
                 Value::Boolean(true),
                 Value::Boolean(false),
             ]]
+        );
+
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!(
+                    "SELECT base_commit_id FROM lix_commit WHERE id = '{}'",
+                    sim.initial_commit_id()
+                ),
+            )
+            .await,
+            vec![vec![Value::Text(sim.initial_global_commit_id().to_string())]],
+            "the initial local commit pins the global initialization commit"
         );
 
         for table in [
@@ -206,6 +220,10 @@ simulation_test!(
                 vec![Value::Text(second_head.clone()), Value::Integer(0)],
                 vec![Value::Text(first_head.clone()), Value::Integer(1)],
                 vec![Value::Text(initial_commit_id.clone()), Value::Integer(2)],
+                vec![
+                    Value::Text(sim.initial_global_commit_id().to_string()),
+                    Value::Integer(3),
+                ],
             ]
         );
 
@@ -225,6 +243,10 @@ simulation_test!(
             vec![
                 vec![Value::Text(first_head.clone()), Value::Integer(0)],
                 vec![Value::Text(initial_commit_id), Value::Integer(1)],
+                vec![
+                    Value::Text(sim.initial_global_commit_id().to_string()),
+                    Value::Integer(2),
+                ],
             ]
         );
 
@@ -384,6 +406,10 @@ simulation_test!(
             vec![
                 vec![Value::Text(draft_parent.clone()), Value::Integer(0)],
                 vec![Value::Text(initial_commit_id.clone()), Value::Integer(1)],
+                vec![
+                    Value::Text(sim.initial_global_commit_id().to_string()),
+                    Value::Integer(2),
+                ],
             ],
             "an explicit anchor may be outside the active branch ancestry"
         );
@@ -424,6 +450,10 @@ simulation_test!(
                 vec![Value::Text(parents[0].clone()), Value::Integer(1)],
                 vec![Value::Text(parents[1].clone()), Value::Integer(1)],
                 vec![Value::Text(initial_commit_id), Value::Integer(2)],
+                vec![
+                    Value::Text(sim.initial_global_commit_id().to_string()),
+                    Value::Integer(3),
+                ],
             ],
             "the shared root must appear once at its shortest merge distance"
         );

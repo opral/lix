@@ -93,6 +93,11 @@ impl Simulation {
         &self.receipt.initial_commit_id
     }
 
+    /// Returns the initial global-branch commit id.
+    pub fn initial_global_commit_id(&self) -> &str {
+        &self.receipt.initial_global_commit_id
+    }
+
     /// Returns the initialized main branch id.
     pub fn main_branch_id(&self) -> &str {
         &self.receipt.main_branch_id

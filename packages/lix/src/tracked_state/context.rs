@@ -1717,6 +1717,18 @@ where
             if state.is_none() {
                 continue;
             }
+            if state.as_ref().is_some_and(|state| {
+                state.mutations.member_count == 0
+                    && state
+                        .snapshot_root
+                        .as_ref()
+                        .is_some_and(|root| root.complete_state_fence)
+            }) {
+                // A materialized sparse boundary authenticates selected rows
+                // through its complete root even when the original authored
+                // delta body is intentionally absent.
+                continue;
+            }
             let mut encoded_keys =
                 TrackedStateKeyBatchBuilder::with_row_capacity(commit_rows.len());
             for row in &commit_rows {
@@ -2027,6 +2039,33 @@ where
             )),
             None => None,
         };
+        let mut observed_base_lineage = None;
+        let omits_global_parent_for_local_overlay = if metadata.parent_roots.is_empty()
+            && let Some((expected_parent_id, _)) = &expected_parent
+        {
+            let commit_id_typed = CommitId::parse_lix(commit_id, "tracked-state commit root")?;
+            let ids = [commit_id_typed, *expected_parent_id];
+            let mut changelog = ChangelogContext::new().reader(&mut self.store);
+            let records = changelog
+                .load_commits(CommitLoadRequest { commit_ids: &ids })
+                .await?;
+            let mut records = records.into_iter().map(|(_, record)| record);
+            let current = records.next().expect("current commit slot exists");
+            let parent = records.next().expect("parent commit slot exists");
+            observed_base_lineage = Some((
+                current.as_ref().and_then(|record| record.base_commit_id),
+                parent.as_ref().and_then(|record| record.base_commit_id),
+            ));
+            // Sync certifies roots in the same atomic write set as the new
+            // changelog node, so `current` can legitimately be absent from
+            // this pre-publication read. A known base-less parent is enough:
+            // producers derive (rather than accept) the physical root shape,
+            // and global children always retain their global parent root.
+            parent.is_some_and(|record| record.base_commit_id.is_none())
+                && current.is_none_or(|record| record.base_commit_id.is_some())
+        } else {
+            false
+        };
         match (expected_parent, metadata.parent_roots.first()) {
             (None, None) => Ok(()),
             (Some((expected_parent_id, expected_root)), Some(parent))
@@ -2052,8 +2091,11 @@ where
             // The changelog parent remains the semantic history edge; it does
             // not require the snapshot to retain that parent's root.
             (Some((_expected_parent_id, _)), None) if metadata.complete_state_fence => Ok(()),
+            (Some((_expected_parent_id, _)), None) if omits_global_parent_for_local_overlay => {
+                Ok(())
+            }
             (Some((expected_parent_id, _)), None) => Err(LixError::unknown(format!(
-                "tracked-state commit-root metadata for commit '{commit_id}' omits first-parent root '{expected_parent_id}' without a complete-state fence"
+                "tracked-state commit-root metadata for commit '{commit_id}' omits first-parent root '{expected_parent_id}' without a complete-state fence (base lineage: {observed_base_lineage:?})"
             ))),
             (None, Some(parent)) => Err(LixError::unknown(format!(
                 "tracked-state commit-root metadata for root commit '{}' references unexpected parent '{}'",
@@ -7702,6 +7744,7 @@ mod tests {
                 crate::changelog::encode_commit_record(&CommitRecord {
                     touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                     format_version: 3,
+                    base_commit_id: None,
                     commit_id: commit_a,
                     generation: 2,
                     parent_commit_ids: vec![commit_b],

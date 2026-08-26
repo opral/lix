@@ -729,8 +729,14 @@ async fn existing_session_ignores_later_default_branch_corruption() {
         .expect("an existing session should retain its valid pinned branch");
 
     let delta = storage.stats().delta_since(&before);
-    assert_eq!(delta.read_opened, 1, "read SQL should open one read tx");
-    assert_eq!(delta.write_opened, 0, "read SQL must not open writes");
+    assert_eq!(
+        delta.read_opened, 4,
+        "an externally invalidated session preflights its pinned branch/global base before SQL"
+    );
+    assert_eq!(
+        delta.write_opened, 1,
+        "the first read after a global commit publishes one metadata-only base refresh"
+    );
     engine
         .open_session()
         .await

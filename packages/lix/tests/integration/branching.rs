@@ -328,7 +328,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    switch_branch_is_session_local_and_does_not_advance_refs,
+    switch_branch_is_session_local_and_refreshes_a_stale_target,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
         let main_head_before = engine
@@ -369,13 +369,13 @@ simulation_test!(
             main_head_before,
             "switching must not mutate the source session branch ref"
         );
-        assert_eq!(
+        assert_ne!(
             engine
                 .load_branch_head_commit_id("01930000-0000-7000-8000-000000000001")
                 .await
                 .expect("draft head should load"),
             draft_head_before,
-            "switching must not mutate the target branch ref"
+            "checking out a stale target must publish its metadata-only base refresh"
         );
         let default_after = sim.wrap_session(
             engine
@@ -474,13 +474,13 @@ simulation_test!(
         );
         assert_key_value(&session_c, "session-draft-only", None).await;
         assert_key_value(&main, "session-draft-only", None).await;
-        assert_eq!(
+        assert_ne!(
             engine
                 .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load"),
             main_head_before,
-            "session switching must not mutate the old branch ref"
+            "the independent main-session read must lazily refresh its stale global base"
         );
         assert_eq!(
             engine

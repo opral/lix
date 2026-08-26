@@ -354,6 +354,7 @@ simulation_test!(state_at_branch_scope_is_session_independent, |sim| async move 
     let [Value::Text(global_commit_id)] = global_commit.rows()[0].values() else {
         panic!("expected global commit id");
     };
+
     local
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('composed', 'local-value')",
@@ -496,6 +497,68 @@ simulation_test!(state_at_branch_scopes_compose_with_local_shadow_history, |sim|
         panic!("expected local commit id");
     };
 
+    let local_base = local
+        .execute(
+            "SELECT base_commit_id FROM lix_commit WHERE id = $1",
+            &[Value::Text(local_commit_id.clone())],
+        )
+        .await
+        .expect("local base should load");
+    assert_rows_eq(
+        local_base,
+        vec![vec![Value::Text(global_commit_id.clone())]],
+    );
+    let complete_local_state = local
+        .execute(
+            "SELECT key, value, lixcol_global \
+             FROM lix_state_at('lix_key_value', $1) \
+             WHERE key IN ('global-only', 'overridden', 'suppressed') ORDER BY key",
+            &[Value::Text(local_commit_id.clone())],
+        )
+        .await
+        .expect("one local commit id should resolve the complete effective state");
+    assert_rows_eq(
+        complete_local_state,
+        vec![
+            vec![
+                Value::Text("global-only".into()),
+                Value::Jsonb(json!("global-only-value").into()),
+                Value::Boolean(true),
+            ],
+            vec![
+                Value::Text("overridden".into()),
+                Value::Jsonb(json!("local-value").into()),
+                Value::Boolean(false),
+            ],
+        ],
+    );
+    let global_history = local
+        .execute(
+            "SELECT key FROM lix_history('lix_key_value', $1) \
+             WHERE key = 'global-only' LIMIT 1",
+            &[Value::Text(local_commit_id.clone())],
+        )
+        .await
+        .expect("history should follow the commit's state dependency");
+    assert_rows_eq(
+        global_history,
+        vec![vec![Value::Text("global-only".into())]],
+    );
+    let ancestry = local
+        .execute(
+            "SELECT commit_id FROM lix_commit_ancestry($1) WHERE commit_id = $2",
+            &[
+                Value::Text(local_commit_id.clone()),
+                Value::Text(global_commit_id.clone()),
+            ],
+        )
+        .await
+        .expect("ancestry should remain chronology-only");
+    assert!(
+        ancestry.rows().is_empty(),
+        "base_commit_id is a state dependency, not a merge/ancestry parent"
+    );
+
     let composed = local
         .execute(
             "WITH ranked_local_history AS ( \
@@ -545,13 +608,312 @@ simulation_test!(state_at_branch_scopes_compose_with_local_shadow_history, |sim|
         ];
     assert_rows_eq(composed, expected.clone());
 
+    global
+        .execute(
+            "UPDATE lix_key_value SET value = 'global-new-value' \
+             WHERE key = 'overridden'",
+            &[],
+        )
+        .await
+        .expect("global head should advance");
+    global
+        .execute(
+            "UPDATE lix_key_value SET value = 'global-new-suppressed-value' \
+             WHERE key = 'suppressed'",
+            &[],
+        )
+        .await
+        .expect("global suppressed row should advance");
+    global
+        .execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_global) \
+             VALUES ('later-global', 'later', true)",
+            &[],
+        )
+        .await
+        .expect("a later global row should insert");
+    let latest_global = global
+        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .await
+        .expect("latest global commit should load");
+    let [Value::Text(latest_global_id)] = latest_global.rows()[0].values() else {
+        panic!("expected latest global commit id");
+    };
+
+    local
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('local-after-global', 'local')",
+            &[],
+        )
+        .await
+        .expect("the next local commit should fold in the latest global base");
+
     let live = local
         .execute(
             "SELECT key, value FROM lix_key_value \
-             WHERE key IN ('global-only', 'overridden', 'suppressed') ORDER BY key",
+             WHERE key IN ('global-only', 'later-global', 'overridden', 'suppressed') ORDER BY key",
             &[],
         )
         .await
         .expect("live composed view should load");
-    assert_rows_eq(live, expected);
+    let mut latest_expected = expected;
+    latest_expected.insert(
+        1,
+        vec![
+            Value::Text("later-global".into()),
+            Value::Jsonb(json!("later").into()),
+        ],
+    );
+    assert_rows_eq(live, latest_expected.clone());
+
+    let refreshed_head = local
+        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .await
+        .expect("refreshed local head should load");
+    let [Value::Text(refreshed_head_id)] = refreshed_head.rows()[0].values() else {
+        panic!("expected refreshed local head id");
+    };
+    assert_ne!(refreshed_head_id, local_commit_id);
+    let effective_diff = local
+        .execute(
+            "SELECT to_key, lixcol_diff_type, to_lixcol_global \
+             FROM lix_diff('lix_key_value', $1, $2) \
+             WHERE COALESCE(to_key, from_key) IN \
+                 ('global-only', 'later-global', 'overridden', 'suppressed') \
+             ORDER BY COALESCE(to_key, from_key)",
+            &[
+                Value::Text(local_commit_id.clone()),
+                Value::Text(refreshed_head_id.clone()),
+            ],
+        )
+        .await
+        .expect("effective diff should include only visible base changes");
+    assert_rows_eq(
+        effective_diff,
+        vec![vec![
+            Value::Text("later-global".into()),
+            Value::Text("added".into()),
+            Value::Boolean(true),
+        ]],
+    );
+    let refreshed_base = local
+        .execute(
+            "SELECT base_commit_id FROM lix_commit WHERE id = $1",
+            &[Value::Text(refreshed_head_id.clone())],
+        )
+        .await
+        .expect("refreshed base should load");
+    assert_rows_eq(
+        refreshed_base,
+        vec![vec![Value::Text(latest_global_id.clone())]],
+    );
+    let refreshed_state = local
+        .execute(
+            "SELECT key, value FROM lix_state_at('lix_key_value', $1) \
+             WHERE key IN ('global-only', 'later-global', 'overridden', 'suppressed') ORDER BY key",
+            &[Value::Text(refreshed_head_id.clone())],
+        )
+        .await
+        .expect("refreshed commit should be a complete state handle");
+    assert_rows_eq(refreshed_state, latest_expected);
+});
+
+simulation_test!(local_overlay_does_not_inherit_a_global_causal_parent, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let main = sim.wrap_session(
+        engine.open_session().await.expect("main session should open"),
+        &engine,
+    );
+    let global = sim.wrap_session(
+        engine
+            .open_session_at(lix::GLOBAL_BRANCH_ID)
+            .await
+            .expect("global session should open"),
+        &engine,
+    );
+    global
+        .execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_global) \
+             VALUES ('branch-base', 'v1', true)",
+            &[],
+        )
+        .await
+        .expect("global base row should insert");
+    let g1 = global
+        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .await
+        .expect("global head should load");
+    let [Value::Text(g1)] = g1.rows()[0].values() else {
+        panic!("expected global commit id");
+    };
+    let branch_id = "73716c2d-6272-816e-8368-2d6f76657200";
+    main.execute(
+        "INSERT INTO lix_branch (id, name, commit_id) VALUES ($1, 'Overlay', $2)",
+        &[Value::Text(branch_id.into()), Value::Text(g1.clone())],
+    )
+    .await
+    .expect("branch should start at the global commit");
+    let local = sim.wrap_session(
+        engine
+            .open_session_at(branch_id)
+            .await
+            .expect("local branch session should open"),
+        &engine,
+    );
+    local
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('local-one', 'one')",
+            &[],
+        )
+        .await
+        .expect("first local overlay row should insert");
+    global
+        .execute(
+            "UPDATE lix_key_value SET value = 'v2' WHERE key = 'branch-base'",
+            &[],
+        )
+        .await
+        .expect("global row should advance");
+    let g2 = global
+        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .await
+        .expect("advanced global head should load");
+    let [Value::Text(g2)] = g2.rows()[0].values() else {
+        panic!("expected global commit id");
+    };
+    let live_after_global = local
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'branch-base'",
+            &[],
+        )
+        .await
+        .expect("live read should lazily refresh the composite handle");
+    assert_rows_eq(
+        live_after_global,
+        vec![vec![Value::Jsonb(json!("v2").into())]],
+    );
+    let refreshed = local
+        .execute(
+            "SELECT base_commit_id FROM lix_commit WHERE id = lix_active_branch_commit_id()",
+            &[],
+        )
+        .await
+        .expect("refreshed base should load");
+    assert_rows_eq(refreshed, vec![vec![Value::Text(g2.clone())]]);
+    local
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('local-two', 'two')",
+            &[],
+        )
+        .await
+        .expect("second local overlay row should insert");
+    let head = local
+        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .await
+        .expect("local head should load");
+    let [Value::Text(head)] = head.rows()[0].values() else {
+        panic!("expected local commit id");
+    };
+    let historical = local
+        .execute(
+            "SELECT key, value FROM lix_state_at('lix_key_value', $1) \
+             WHERE key IN ('branch-base', 'local-one', 'local-two') ORDER BY key",
+            &[Value::Text(head.clone())],
+        )
+        .await
+        .expect("composite state should load");
+    assert_rows_eq(
+        historical,
+        vec![
+            vec![Value::Text("branch-base".into()), Value::Jsonb(json!("v2").into())],
+            vec![Value::Text("local-one".into()), Value::Jsonb(json!("one").into())],
+            vec![Value::Text("local-two".into()), Value::Jsonb(json!("two").into())],
+        ],
+    );
+});
+
+simulation_test!(local_collection_replacement_fences_the_global_base, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let local = sim.wrap_session(
+        engine.open_session().await.expect("local session should open"),
+        &engine,
+    );
+    let global = sim.wrap_session(
+        engine
+            .open_session_at(lix::GLOBAL_BRANCH_ID)
+            .await
+            .expect("global session should open"),
+        &engine,
+    );
+    global
+        .execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_global) VALUES \
+             ('retired-global', 'v1', true), ('also-retired', 'v1', true)",
+            &[],
+        )
+        .await
+        .expect("global rows should insert");
+    local
+        .execute("DELETE FROM lix_key_value", &[])
+        .await
+        .expect("local collection should be replaced with empty state");
+    local
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('local-survivor', 'local')",
+            &[],
+        )
+        .await
+        .expect("sparse local replacement member should insert");
+    let before = local
+        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .await
+        .expect("replacement commit should load");
+    let [Value::Text(before)] = before.rows()[0].values() else {
+        panic!("expected local commit id");
+    };
+    global
+        .execute(
+            "UPDATE lix_key_value SET value = 'v2' WHERE key = 'retired-global'",
+            &[],
+        )
+        .await
+        .expect("retired global row should advance");
+    local
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('local-after-base', 'later')",
+            &[],
+        )
+        .await
+        .expect("local head should pin the advanced base");
+    let head = local
+        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .await
+        .expect("local head should load");
+    let [Value::Text(head)] = head.rows()[0].values() else {
+        panic!("expected local commit id");
+    };
+    let state = local
+        .execute(
+            "SELECT key FROM lix_state_at('lix_key_value', $1) ORDER BY key",
+            &[Value::Text(head.clone())],
+        )
+        .await
+        .expect("replacement state should load");
+    assert_rows_eq(
+        state,
+        vec![
+            vec![Value::Text("local-after-base".into())],
+            vec![Value::Text("local-survivor".into())],
+        ],
+    );
+    let hidden_base_diff = local
+        .execute(
+            "SELECT COALESCE(to_key, from_key) \
+             FROM lix_diff('lix_key_value', $1, $2) \
+             WHERE COALESCE(to_key, from_key) = 'retired-global'",
+            &[Value::Text(before.clone()), Value::Text(head.clone())],
+        )
+        .await
+        .expect("effective diff should respect the replacement fence");
+    assert!(hidden_base_diff.rows().is_empty());
 });

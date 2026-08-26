@@ -449,8 +449,11 @@ simulation_test!(
         .await;
         assert_eq!(
             reachable_history,
-            vec![vec![Value::Text(initial_commit_id)]],
-            "history follows global checkpoint-row authorship; it does not treat a row's commit_id as active-branch graph membership"
+            vec![
+                vec![Value::Text(first_checkpoint.commit_id.clone())],
+                vec![Value::Text(initial_commit_id)],
+            ],
+            "history follows causal parents and the local commit's pinned global state base"
         );
 
         let reachable_checkpoints = select_rows(

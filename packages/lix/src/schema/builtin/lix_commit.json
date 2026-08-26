@@ -15,6 +15,12 @@
       "type": "jsonb",
       "nullable": false,
       "description": "Ordered parent commit IDs; position zero is the first parent and later positions are merge parents."
+    },
+    {
+      "name": "base_commit_id",
+      "type": "uuid",
+      "nullable": true,
+      "description": "Exact global commit composed underneath this commit. Null marks a base-native commit. This is state dependency, not ancestry."
     }
   ],
   "primary_key": [
@@ -23,7 +29,8 @@
   "examples": [
     {
       "id": "commit_01jexample",
-      "parent_commit_ids": []
+      "parent_commit_ids": [],
+      "base_commit_id": null
     }
   ]
 }

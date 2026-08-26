@@ -4,7 +4,7 @@ import type {
 } from "../binding-types.js";
 import type { NativeLixValue } from "../value.js";
 
-export const SERVER_PROTOCOL_VERSION = 3;
+export const SERVER_PROTOCOL_VERSION = 4;
 export const SERVER_PROTOCOL_PATH = "/lix/v1/";
 
 export type WireValue =

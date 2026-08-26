@@ -50,6 +50,10 @@ impl ObserveInvalidation {
         next
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn fail_terminal(&self, error: LixError) {
         self.sender.send_modify(|event| {
             if !matches!(event, ObserveInvalidationEvent::TerminalError(_)) {

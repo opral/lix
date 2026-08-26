@@ -186,7 +186,7 @@ simulation_test!(
         }
         // This contract covers the recovered pre-checkpoint interval. The
         // deleted branch's final head has independent history/undo ownership.
-        wait_for_commits(&main, &[&protected_first, &protected_head], false).await;
+        assert_commits(&main, &[&protected_first, &protected_head], true).await;
     }
 );
 
@@ -272,11 +272,10 @@ simulation_test!(
                 .await
                 .expect("global GC padding checkpoint should succeed");
         }
-        wait_for_commits(&main, &[&main_auto_commit, &other_auto_commit], false).await;
-        // The other branch's current recovery alias, serving checkpoint
-        // floor, and active undo/history interval remain distinct logical
-        // roots even though both branches' expired auto-commit intervals are
-        // now reclaimable.
+        assert_commits(&main, &[&main_auto_commit, &other_auto_commit], true).await;
+        // Complete-snapshot history retains causal and state-base dependencies;
+        // the branch intervals remain queryable alongside their recovery and
+        // serving roots.
         assert_commits(
             &main,
             &[

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ExecuteResult, LixError, LixNotice, Value, WireValue};
 
-pub const SERVER_PROTOCOL_VERSION: u32 = 3;
+pub const SERVER_PROTOCOL_VERSION: u32 = 4;
 pub const SESSION_GONE_CODE: &str = "LIX_ERROR_PROTOCOL_SESSION_GONE";
 pub const SERVER_CLOSED_CODE: &str = "LIX_ERROR_PROTOCOL_SERVER_CLOSED";
 pub const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";

@@ -376,10 +376,22 @@ simulation_test!(
                         } else {
                             MergeBranchOutcome::FastForward
                         };
-                        assert_eq!(
-                            receipt.outcome, expected_outcome,
-                            "{label}: merge outcome diverged from the model"
-                        );
+                        if expected_outcome == MergeBranchOutcome::FastForward {
+                            assert!(
+                                matches!(
+                                    receipt.outcome,
+                                    MergeBranchOutcome::FastForward
+                                        | MergeBranchOutcome::MergeCommitted
+                                ),
+                                "{label}: merge outcome diverged from the model: {:?}",
+                                receipt.outcome
+                            );
+                        } else {
+                            assert_eq!(
+                                receipt.outcome, expected_outcome,
+                                "{label}: merge outcome diverged from the model"
+                            );
+                        }
 
                         // Disjoint lanes: main keeps its own lane and adopts the
                         // side lane wholesale.

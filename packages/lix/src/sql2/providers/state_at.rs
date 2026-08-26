@@ -17,7 +17,8 @@ use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::common::LixTimestamp;
 use crate::hot_state::{
     HotStateProjection, HotStateScanRequest, MaterializedHotStateBatch,
-    MaterializedHotStateBatchBuilder, MaterializedHotStateRow,
+    MaterializedHotStateBatchBuilder, MaterializedHotStateRow, VisibilityBranchScope,
+    VisibilityRequest, resolve_visible_batch,
 };
 use crate::row_pk::{RowPk, RowPkComponentType};
 use crate::sql2::SqlChangelogQuerySource;
@@ -304,104 +305,84 @@ where
                     if root_commit_id.as_deref() == Some(commit_id.as_str()) {
                         return Ok(RecordBatch::new_empty(schema));
                     }
-                    let commit_is_global = commit_root_is_global(store.clone(), &commit_id).await?;
+                    let descriptor = commit_state_descriptor(store.clone(), &commit_id).await?;
+                    // A composite limit applies after overlay resolution. If
+                    // pushed independently into each root, local tombstones
+                    // can consume the prefix and hide later visible base rows.
+                    let root_scan_limit = descriptor
+                        .base_commit_id
+                        .is_none()
+                        .then_some(scan_limit)
+                        .flatten();
                     let mut tracked = TrackedStateContext::new().reader(store.clone());
                     if contradictory {
                         return Ok(RecordBatch::new_empty(schema));
                     }
-                    let (batches, ancestor_rows) = match &kind {
-                        StateRelationKind::Schema { schema_key, .. } => {
-                            if let Some(row_pks) = row_pks.as_ref() {
-                                let rows = load_schema_points_at_commit(
-                                    &mut tracked,
-                                    &commit_id,
-                                    schema_key,
-                                    row_pks,
-                                )
-                                .await?;
-                                (Vec::new(), rows)
-                            } else {
-                                let request = tracked_request(
-                                    vec![schema_key.clone()],
-                                    None,
-                                    None,
-                                    scan_limit,
-                                );
-                                record_state_at_traversal_probe(&commit_id, &request);
-                                (
-                                    vec![tracked.scan_batch_at_commit(&commit_id, &request).await],
-                                    Vec::new(),
-                                )
-                            }
-                        }
-                        StateRelationKind::Directory => {
-                            let request = tracked_request(
-                                vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.into()],
-                                row_pks.clone(),
-                                row_pks
-                                    .as_ref()
-                                    .map(|_| vec![crate::NullableKeyFilter::Null]),
-                                None,
-                            );
-                            record_state_at_traversal_probe(&commit_id, &request);
-                            let batch = tracked.scan_batch_at_commit(&commit_id, &request).await;
-                            let ancestors = if row_pks.is_some() {
-                                match &batch {
-                                    Ok(batch) => load_ancestor_directories(&mut tracked, &commit_id, batch, "parent_id").await,
-                                    Err(_) => Ok(Vec::new()),
-                                }
-                            } else {
-                                Ok(Vec::new())
-                            }?;
-                            (vec![batch], ancestors)
-                        }
-                        StateRelationKind::File => {
-                            let file_ids = row_pks.as_ref().map(|keys| keys.iter().filter_map(single_row_pk_string).map(crate::NullableKeyFilter::Value).collect());
-                            let mut file_schema_keys = vec![FILE_DESCRIPTOR_SCHEMA_KEY.into()];
-                            if ["content", "lixcol_change_id", "lixcol_updated_at"]
-                                .iter()
-                                .any(|column| schema.index_of(column).is_ok())
-                            {
-                                file_schema_keys.push(BLOB_REF_SCHEMA_KEY.into());
-                            }
-                            let file_request = tracked_request(
-                                file_schema_keys,
-                                None,
-                                file_ids,
-                                None,
-                            );
-                            record_state_at_traversal_probe(&commit_id, &file_request);
-                            let file_batch = tracked
-                                .scan_batch_at_commit(&commit_id, &file_request)
-                                .await;
-                            if row_pks.is_some() {
-                                let ancestors = match &file_batch {
-                                    Ok(batch) => load_ancestor_directories(&mut tracked, &commit_id, batch, "directory_id").await,
-                                    Err(_) => Ok(Vec::new()),
-                                }?;
-                                (vec![file_batch], ancestors)
-                            } else {
-                                let directory_request = tracked_request(
-                                    vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.into()],
-                                    None,
-                                    None,
-                                    None,
-                                );
-                                record_state_at_traversal_probe(&commit_id, &directory_request);
-                                (vec![file_batch, tracked.scan_batch_at_commit(
-                                    &commit_id,
-                                    &directory_request,
-                                ).await], Vec::new())
-                            }
-                        }
+                    let (local_batches, local_extra_rows) = load_relation_at_commit(
+                        &mut tracked,
+                        &kind,
+                        &schema,
+                        &commit_id,
+                        row_pks.as_ref(),
+                        root_scan_limit,
+                        true,
+                    )
+                    .await?;
+                    let (base_batches, base_extra_rows) = if let Some(base_commit_id) =
+                        descriptor.base_commit_id
+                    {
+                        load_relation_at_commit(
+                            &mut tracked,
+                            &kind,
+                            &schema,
+                            &base_commit_id.to_string(),
+                            row_pks.as_ref(),
+                            root_scan_limit,
+                            false,
+                        )
+                        .await?
+                    } else {
+                        (Vec::new(), Vec::new())
                     };
-                    let batches = batches.into_iter().collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(lix_error_to_datafusion_error)?;
+                    let local_replacement_scopes = if descriptor.base_commit_id.is_some() {
+                        load_local_replacement_scopes(&mut tracked, &commit_id).await?
+                    } else {
+                        std::collections::BTreeSet::new()
+                    };
+                    let (local_ancestors, base_ancestors) = if row_pks.is_some() {
+                        let parent_field = match kind {
+                            StateRelationKind::Directory => Some("parent_id"),
+                            StateRelationKind::File => Some("directory_id"),
+                            StateRelationKind::Schema { .. } => None,
+                        };
+                        if let Some(parent_field) = parent_field {
+                            load_effective_ancestor_directories(
+                                &mut tracked,
+                                &commit_id,
+                                descriptor.base_commit_id,
+                                &local_batches,
+                                &base_batches,
+                                parent_field,
+                            )
+                            .await?
+                        } else {
+                            (Vec::new(), Vec::new())
+                        }
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    let mut local_extra_rows = local_extra_rows;
+                    local_extra_rows.extend(local_ancestors);
+                    let mut base_extra_rows = base_extra_rows;
+                    base_extra_rows.extend(base_ancestors);
                     let hot = tracked_to_hot(
-                        &batches,
-                        ancestor_rows,
+                        &local_batches,
+                        local_extra_rows,
+                        &base_batches,
+                        base_extra_rows,
                         &active_branch_id,
-                        commit_is_global,
+                        descriptor.global_scope,
+                        &local_replacement_scopes,
                     )?;
                     let mut result = match kind {
                         StateRelationKind::Schema { spec, .. } => {
@@ -426,6 +407,126 @@ where
             ),
         })
     }
+}
+
+async fn load_local_replacement_scopes<S: StorageAdapterRead + Clone>(
+    tracked: &mut crate::tracked_state::TrackedStateStoreReader<S>,
+    commit_id: &str,
+) -> Result<std::collections::BTreeSet<(String, Option<String>)>> {
+    let markers = tracked
+        .scan_batch_at_commit(
+            commit_id,
+            &tracked_request(
+                vec![crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned()],
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+    markers
+        .iter()
+        .filter(|row| !row.deleted())
+        .map(|row| {
+            crate::collection_generation::collection_scope_from_row_pk(row.row_pk())
+                .map_err(lix_error_to_datafusion_error)
+        })
+        .collect()
+}
+
+async fn load_relation_at_commit<S: StorageAdapterRead + Clone>(
+    tracked: &mut crate::tracked_state::TrackedStateStoreReader<S>,
+    kind: &StateRelationKind,
+    schema: &SchemaRef,
+    commit_id: &str,
+    row_pks: Option<&Vec<RowPk>>,
+    scan_limit: Option<usize>,
+    record_probe: bool,
+) -> Result<(Vec<MaterializedTrackedStateBatch>, Vec<MaterializedTrackedStateRow>)> {
+    let (batches, ancestors) = match kind {
+        StateRelationKind::Schema { schema_key, .. } => {
+            if let Some(row_pks) = row_pks {
+                let rows = load_schema_points_at_commit(tracked, commit_id, schema_key, row_pks)
+                    .await?;
+                (Vec::new(), rows)
+            } else {
+                let request = tracked_request(
+                    vec![schema_key.clone()],
+                    None,
+                    None,
+                    scan_limit,
+                );
+                if record_probe {
+                    record_state_at_traversal_probe(commit_id, &request);
+                }
+                (
+                    vec![tracked.scan_batch_at_commit(commit_id, &request).await],
+                    Vec::new(),
+                )
+            }
+        }
+        StateRelationKind::Directory => {
+            let request = tracked_request(
+                vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.into()],
+                row_pks.cloned(),
+                row_pks.map(|_| vec![crate::NullableKeyFilter::Null]),
+                None,
+            );
+            if record_probe {
+                record_state_at_traversal_probe(commit_id, &request);
+            }
+            let batch = tracked.scan_batch_at_commit(commit_id, &request).await;
+            (vec![batch], Vec::new())
+        }
+        StateRelationKind::File => {
+            let file_ids = row_pks.map(|keys| {
+                keys.iter()
+                    .filter_map(single_row_pk_string)
+                    .map(crate::NullableKeyFilter::Value)
+                    .collect()
+            });
+            let mut file_schema_keys = vec![FILE_DESCRIPTOR_SCHEMA_KEY.into()];
+            if ["content", "lixcol_change_id", "lixcol_updated_at"]
+                .iter()
+                .any(|column| schema.index_of(column).is_ok())
+            {
+                file_schema_keys.push(BLOB_REF_SCHEMA_KEY.into());
+            }
+            let file_request = tracked_request(file_schema_keys, None, file_ids, None);
+            if record_probe {
+                record_state_at_traversal_probe(commit_id, &file_request);
+            }
+            let file_batch = tracked.scan_batch_at_commit(commit_id, &file_request).await;
+            if row_pks.is_some() {
+                (vec![file_batch], Vec::new())
+            } else {
+                let directory_request = tracked_request(
+                    vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.into()],
+                    None,
+                    None,
+                    None,
+                );
+                if record_probe {
+                    record_state_at_traversal_probe(commit_id, &directory_request);
+                }
+                (
+                    vec![
+                        file_batch,
+                        tracked
+                            .scan_batch_at_commit(commit_id, &directory_request)
+                            .await,
+                    ],
+                    Vec::new(),
+                )
+            }
+        }
+    };
+    let batches = batches
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(lix_error_to_datafusion_error)?;
+    Ok((batches, ancestors))
 }
 
 async fn load_schema_points_at_commit<S: StorageAdapterRead + Clone>(
@@ -462,7 +563,7 @@ fn tracked_request(
             schema_keys,
             row_pks: row_pks.unwrap_or_default(),
             file_ids: file_ids.unwrap_or_default(),
-            include_tombstones: false,
+            include_tombstones: true,
             ..Default::default()
         },
         read_columns: TrackedStateReadColumns::default(),
@@ -470,14 +571,35 @@ fn tracked_request(
     }
 }
 
-async fn commit_root_is_global<S: StorageAdapterRead + Clone>(store: S, commit_id: &str) -> Result<bool> {
+struct CommitStateDescriptor {
+    base_commit_id: Option<CommitId>,
+    global_scope: bool,
+}
+
+async fn commit_state_descriptor<S: StorageAdapterRead + Clone>(
+    store: S,
+    commit_id: &str,
+) -> Result<CommitStateDescriptor> {
     let commit_id = CommitId::parse_lix(commit_id, "lix_state_at commit ID")
         .map_err(lix_error_to_datafusion_error)?;
     let manifest = crate::tracked_state::load_published_commit_state_topology(&store, commit_id)
         .await
         .map_err(lix_error_to_datafusion_error)?
-        .ok_or_else(|| DataFusionError::Execution(format!("commit '{commit_id}' has no tracked-state authority")))?;
-    Ok(manifest.global_scope())
+        .ok_or_else(|| {
+            lix_error_to_datafusion_error(
+                crate::tracked_state::sync_history_required_for_commits(&[commit_id]),
+            )
+        })?;
+    let node = crate::commit_graph::CommitGraphContext::new()
+        .reader(store)
+        .load_node(&commit_id)
+        .await
+        .map_err(lix_error_to_datafusion_error)?
+        .ok_or_else(|| DataFusionError::Execution(format!("commit '{commit_id}' does not exist")))?;
+    Ok(CommitStateDescriptor {
+        base_commit_id: node.base_commit_id,
+        global_scope: manifest.global_scope(),
+    })
 }
 
 fn uuid_row_pk(id: &str) -> Result<RowPk> {
@@ -497,28 +619,53 @@ fn single_row_pk_string(row_pk: &RowPk) -> Option<String> {
     }
 }
 
-async fn load_ancestor_directories<S: StorageAdapterRead>(
+async fn load_effective_ancestor_directories<S: StorageAdapterRead>(
     tracked: &mut crate::tracked_state::TrackedStateStoreReader<S>,
-    commit_id: &str,
-    initial: &MaterializedTrackedStateBatch,
+    local_commit_id: &str,
+    base_commit_id: Option<CommitId>,
+    local_batches: &[MaterializedTrackedStateBatch],
+    base_batches: &[MaterializedTrackedStateBatch],
     parent_field: &str,
-) -> Result<Vec<MaterializedTrackedStateRow>> {
-    let mut pending = std::collections::BTreeSet::new();
-    for row in initial.iter() {
-        if let Some(parent) =
-            snapshot_text(row.decoded_snapshot(), row.snapshot_content(), parent_field)?
+) -> Result<(Vec<MaterializedTrackedStateRow>, Vec<MaterializedTrackedStateRow>)> {
+    let descriptor_schema = if parent_field == "directory_id" {
+        FILE_DESCRIPTOR_SCHEMA_KEY
+    } else {
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+    };
+    let mut effective_initial = std::collections::BTreeMap::new();
+    for (batches, local) in [(base_batches, false), (local_batches, true)] {
+        for row in batches
+            .iter()
+            .flat_map(MaterializedTrackedStateBatch::iter)
+            .filter(|row| row.schema_key() == descriptor_schema)
         {
-            pending.insert(parent);
+            let key = (row.row_pk().clone(), row.file_id().map(str::to_owned));
+            if local || !effective_initial.contains_key(&key) {
+                effective_initial.insert(
+                    key,
+                    (!row.deleted()).then_some(snapshot_text(
+                        row.decoded_snapshot(),
+                        row.snapshot_content(),
+                        parent_field,
+                    )?),
+                );
+            }
         }
     }
+    let mut pending = effective_initial
+        .into_values()
+        .flatten()
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>();
     let mut seen = std::collections::BTreeSet::new();
-    let mut ancestors = Vec::new();
+    let mut local_ancestors = Vec::new();
+    let mut base_ancestors = Vec::new();
     let load_budget = crate::transaction::MAX_DIRECTORY_PARENT_DEPTH
         + usize::from(parent_field == "directory_id");
     for _ in 0..load_budget {
         let ids = pending.difference(&seen).cloned().collect::<Vec<_>>();
         if ids.is_empty() {
-            return Ok(ancestors);
+            return Ok((local_ancestors, base_ancestors));
         }
         seen.extend(ids.iter().cloned());
         let keys = ids
@@ -531,24 +678,56 @@ async fn load_ancestor_directories<S: StorageAdapterRead>(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let loaded = tracked
-            .load_projected_batch_at_commit(commit_id, &keys, &ChangeRecordProjection::full())
+        let local = tracked
+            .load_projected_batch_at_commit(
+                local_commit_id,
+                &keys,
+                &ChangeRecordProjection::full(),
+            )
             .await
             .map_err(lix_error_to_datafusion_error)?;
+        let base = if let Some(base_commit_id) = base_commit_id {
+            Some(
+                tracked
+                    .load_projected_batch_at_commit(
+                        &base_commit_id.to_string(),
+                        &keys,
+                        &ChangeRecordProjection::full(),
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?,
+            )
+        } else {
+            None
+        };
         pending.clear();
-        for row in loaded.into_rows().into_iter().flatten().filter(|row| !row.deleted) {
+        for index in 0..keys.len() {
+            let (row, global) = match local.row(index) {
+                Some(row) => (Some(row), false),
+                None => (
+                    base.as_ref().and_then(|rows| rows.row(index)),
+                    true,
+                ),
+            };
+            let Some(row) = row.filter(|row| !row.deleted()) else {
+                continue;
+            };
             if let Some(parent) = snapshot_text(
-                row.decoded_snapshot.as_ref(),
-                row.snapshot_content.as_ref(),
+                row.decoded_snapshot(),
+                row.snapshot_content(),
                 "parent_id",
             )? {
                 pending.insert(parent);
             }
-            ancestors.push(row);
+            if global {
+                base_ancestors.push(row.to_owned());
+            } else {
+                local_ancestors.push(row.to_owned());
+            }
         }
     }
     if pending.difference(&seen).next().is_none() {
-        Ok(ancestors)
+        Ok((local_ancestors, base_ancestors))
     } else {
         Err(DataFusionError::Execution(format!(
             "lix_state_at directory tree exceeds {} levels",
@@ -580,56 +759,127 @@ fn snapshot_text(
 }
 
 fn tracked_to_hot(
-    batches: &[MaterializedTrackedStateBatch],
-    extra_rows: Vec<MaterializedTrackedStateRow>,
-    branch_id: &str,
+    local_batches: &[MaterializedTrackedStateBatch],
+    local_extra_rows: Vec<MaterializedTrackedStateRow>,
+    base_batches: &[MaterializedTrackedStateBatch],
+    base_extra_rows: Vec<MaterializedTrackedStateRow>,
+    _session_branch_id: &str,
     commit_is_global: bool,
+    local_replacement_scopes: &std::collections::BTreeSet<(String, Option<String>)>,
 ) -> Result<MaterializedHotStateBatch> {
+    const HISTORICAL_LOCAL_BRANCH_ID: &str = "__lix_state_at_local_overlay__";
+    let branch_id = if commit_is_global {
+        crate::GLOBAL_BRANCH_ID
+    } else {
+        HISTORICAL_LOCAL_BRANCH_ID
+    };
     let mut builder = MaterializedHotStateBatchBuilder::with_capacity(
-        batches.iter().map(MaterializedTrackedStateBatch::len).sum::<usize>() + extra_rows.len(),
+        local_batches
+            .iter()
+            .chain(base_batches)
+            .map(MaterializedTrackedStateBatch::len)
+            .sum::<usize>()
+            + local_extra_rows.len()
+            + base_extra_rows.len(),
     );
-    for row in batches.iter().flat_map(MaterializedTrackedStateBatch::iter).filter(|row| !row.deleted()) {
-        let ordinal = builder.len();
-        builder.push_owned(MaterializedHotStateRow {
-            row_pk: row.row_pk().clone(),
-            schema_key: row.schema_key().to_owned(),
-            file_id: row.file_id().map(str::to_owned),
-            snapshot_content: row.snapshot_content().cloned(),
-            metadata: row.metadata().cloned(),
-            deleted: false,
-            created_at: row.created_at(),
-            updated_at: row.updated_at(),
-            global: commit_is_global,
-            change_id: Some(row.change_id()),
-            commit_id: Some(row.commit_id()),
-            untracked: false,
-            branch_id: Arc::from(branch_id),
-        });
-        builder.set_decoded_snapshot(ordinal, row.decoded_snapshot().cloned());
+    for (batches, extra_rows, global) in [
+        (local_batches, local_extra_rows, commit_is_global),
+        (base_batches, base_extra_rows, true),
+    ] {
+        let storage_branch_id = if global {
+            crate::GLOBAL_BRANCH_ID
+        } else {
+            branch_id
+        };
+        for row in batches
+            .iter()
+            .flat_map(MaterializedTrackedStateBatch::iter)
+        {
+            if global
+                && !commit_is_global
+                && base_row_suppressed_by_local_replacement(
+                    row.schema_key(),
+                    row.file_id(),
+                    local_replacement_scopes,
+                )
+            {
+                continue;
+            }
+            let ordinal = builder.len();
+            builder.push_owned(MaterializedHotStateRow {
+                row_pk: row.row_pk().clone(),
+                schema_key: row.schema_key().to_owned(),
+                file_id: row.file_id().map(str::to_owned),
+                snapshot_content: row.snapshot_content().cloned(),
+                metadata: row.metadata().cloned(),
+                deleted: row.deleted(),
+                created_at: row.created_at(),
+                updated_at: row.updated_at(),
+                global,
+                change_id: Some(row.change_id()),
+                commit_id: Some(row.commit_id()),
+                untracked: false,
+                branch_id: Arc::from(storage_branch_id),
+            });
+            builder.set_decoded_snapshot(ordinal, row.decoded_snapshot().cloned());
+        }
+        for row in extra_rows {
+            if global
+                && !commit_is_global
+                && base_row_suppressed_by_local_replacement(
+                    &row.schema_key,
+                    row.file_id.as_deref(),
+                    local_replacement_scopes,
+                )
+            {
+                continue;
+            }
+            let ordinal = builder.len();
+            let created_at = LixTimestamp::parse(&row.created_at).map_err(|error| {
+                DataFusionError::Execution(format!("invalid created_at: {error}"))
+            })?;
+            let updated_at = LixTimestamp::parse(&row.updated_at).map_err(|error| {
+                DataFusionError::Execution(format!("invalid updated_at: {error}"))
+            })?;
+            let decoded_snapshot = row.decoded_snapshot.clone();
+            builder.push_owned(MaterializedHotStateRow {
+                row_pk: row.row_pk,
+                global,
+                schema_key: row.schema_key,
+                file_id: row.file_id,
+                snapshot_content: row.snapshot_content,
+                metadata: row.metadata,
+                deleted: row.deleted,
+                created_at,
+                updated_at,
+                change_id: Some(row.change_id),
+                commit_id: Some(row.commit_id),
+                untracked: false,
+                branch_id: Arc::from(storage_branch_id),
+            });
+            builder.set_decoded_snapshot(ordinal, decoded_snapshot);
+        }
     }
-    for row in extra_rows.into_iter().filter(|row| !row.deleted) {
-        let ordinal = builder.len();
-        let created_at = LixTimestamp::parse(&row.created_at)
-            .map_err(|error| DataFusionError::Execution(format!("invalid created_at: {error}")))?;
-        let updated_at = LixTimestamp::parse(&row.updated_at)
-            .map_err(|error| DataFusionError::Execution(format!("invalid updated_at: {error}")))?;
-        let decoded_snapshot = row.decoded_snapshot.clone();
-        builder.push_owned(MaterializedHotStateRow {
-            row_pk: row.row_pk,
-            global: commit_is_global,
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            snapshot_content: row.snapshot_content,
-            metadata: row.metadata,
-            deleted: false,
-            created_at,
-            updated_at,
-            change_id: Some(row.change_id),
-            commit_id: Some(row.commit_id),
-            untracked: false,
-            branch_id: Arc::from(branch_id),
-        });
-        builder.set_decoded_snapshot(ordinal, decoded_snapshot);
-    }
-    Ok(builder.finish())
+    Ok(resolve_visible_batch(
+        builder.finish(),
+        MaterializedHotStateBatch::default(),
+        &VisibilityRequest {
+            branch_scope: VisibilityBranchScope::BranchIds {
+                branch_ids: vec![branch_id.to_owned()],
+            },
+            include_tombstones: false,
+            limit: None,
+        },
+    ))
+}
+
+fn base_row_suppressed_by_local_replacement(
+    schema_key: &str,
+    file_id: Option<&str>,
+    scopes: &std::collections::BTreeSet<(String, Option<String>)>,
+) -> bool {
+    scopes.contains(&(schema_key.to_owned(), None))
+        || file_id.is_some_and(|file_id| {
+            scopes.contains(&(schema_key.to_owned(), Some(file_id.to_owned())))
+        })
 }

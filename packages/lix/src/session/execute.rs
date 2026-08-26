@@ -1153,6 +1153,7 @@ where
         // through DataFusion for SQL callers; this native surface should keep
         // its specific path errors intact.
         crate::common::LixPath::try_from_file_path(&path)?;
+        self.refresh_active_branch_base_if_stale().await?;
         let write_access = self.begin_session_write_access().await?;
         let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
         self.with_write_transaction_reserved_lending(
@@ -1472,6 +1473,11 @@ where
             }
         }
 
+        // Live rows and lix_active_branch_commit_id() must describe one
+        // state. Refresh a stale local composite handle lazily on access;
+        // global writes stay O(1) instead of fanning out over every branch.
+        self.refresh_active_branch_base_if_stale().await?;
+
         let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
         let exact_schema_point_read = exact_filesystem_read
             .is_none()
@@ -1607,6 +1613,97 @@ where
                 .apply_mutations(result.file_view_mutations().iter().cloned());
         }
         Ok(result)
+    }
+
+    pub(super) async fn refresh_active_branch_base_if_stale(&self) -> Result<(), LixError> {
+        let invalidation_generation = self.observe_invalidation.generation();
+        if self.base_refresh_generation.load(Ordering::SeqCst) == invalidation_generation {
+            return Ok(());
+        }
+        let read = self.storage.begin_read(StorageReadOptions::default()).await?;
+        let active_branch_id = self.active_branch_id_from_reader(&read).await?;
+        if active_branch_id == crate::GLOBAL_BRANCH_ID {
+            if let Some(global_head) = self
+                .branch_ctx
+                .ref_reader(&read)
+                .load_head_commit_id(crate::GLOBAL_BRANCH_ID)
+                .await?
+            {
+                *self.observed_global_head.write().map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "session global-head observation is poisoned",
+                    )
+                })? = Some(global_head);
+            }
+            self.base_refresh_generation
+                .store(invalidation_generation, Ordering::SeqCst);
+            return Ok(());
+        }
+        let branch_reader = self.branch_ctx.ref_reader(&read);
+        let Some(active_head) = branch_reader.load_head_commit_id(&active_branch_id).await? else {
+            self.base_refresh_generation
+                .store(invalidation_generation, Ordering::SeqCst);
+            return Ok(());
+        };
+        let Some(global_head) = branch_reader
+            .load_head_commit_id(crate::GLOBAL_BRANCH_ID)
+            .await?
+        else {
+            self.base_refresh_generation
+                .store(invalidation_generation, Ordering::SeqCst);
+            return Ok(());
+        };
+        drop(branch_reader);
+        let node = crate::commit_graph::CommitGraphContext::new()
+            .reader(&read)
+            .load_node(&active_head)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_COMMIT_NOT_FOUND,
+                    format!("active branch head '{active_head}' does not exist"),
+                )
+            })?;
+        let observed_global_head = {
+            let mut observed = self.observed_global_head.write().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "session global-head observation is poisoned",
+                )
+            })?;
+            let previous = observed.unwrap_or_else(|| node.base_commit_id.unwrap_or(global_head));
+            *observed = Some(previous);
+            previous
+        };
+        if observed_global_head == global_head {
+            self.base_refresh_generation
+                .store(invalidation_generation, Ordering::SeqCst);
+            return Ok(());
+        }
+        drop(read);
+
+        let write_access = self.begin_session_write_access().await?;
+        let result = self.with_write_transaction_reserved_lending(
+            write_access,
+            async move |transaction| {
+                transaction.stage_base_refresh_if_needed().await?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await;
+        if result.is_ok() {
+            *self.observed_global_head.write().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "session global-head observation is poisoned",
+                )
+            })? = Some(global_head);
+            self.base_refresh_generation
+                .store(self.observe_invalidation.generation(), Ordering::SeqCst);
+        }
+        result
     }
 
     async fn execute_idempotent_write(
@@ -2398,6 +2495,8 @@ where
             is_acknowledgeable_file_content_read(parsed, params)
                 || late_materialized_lix_file_content_read(parsed).is_some()
         });
+
+        self.refresh_active_branch_base_if_stale().await?;
 
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let mut expired_read_retries = ExpiredReadRetryState::default();
@@ -5435,9 +5534,16 @@ mod tests {
             .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
             .await
             .expect("a missing checkpoint cursor should fall back to the repository root");
+        let repository_root = session
+            .execute("SELECT lix_root_commit_id() AS commit_id", &[])
+            .await
+            .expect("repository root should resolve")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
         assert_eq!(
             fallback.rows()[0].get::<String>("commit_id").unwrap(),
-            restore_target
+            repository_root
         );
 
         let restored = session
@@ -5447,9 +5553,10 @@ mod tests {
             )
             .await
             .expect("restore should repair the legacy branch atomically");
+        let restored_commit_id = restored.rows()[0].get::<String>("commit_id").unwrap();
         assert_eq!(
-            restored.rows()[0].get::<String>("commit_id").unwrap(),
-            restore_target
+            restored_commit_id, restore_target,
+            "restore should repoint the branch to the requested complete-state commit"
         );
         let working_diff = session
             .execute(
@@ -5476,7 +5583,7 @@ mod tests {
             repaired
                 .working_diff_checkpoint_commit_id
                 .map(|commit_id| commit_id.to_string()),
-            Some(restore_target)
+            Some(restored_commit_id)
         );
     }
 
