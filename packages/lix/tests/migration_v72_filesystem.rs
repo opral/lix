@@ -24,6 +24,30 @@ use std::collections::HashSet;
 const V72_FILESYSTEM_SNAPSHOT: &[u8] =
     include_bytes!("fixtures/v72_filesystem_checkpoints.snapshot");
 
+/// Asserts every file row's `directory_id` resolves among the same tree's
+/// directory rows — the closure invariant the v75 migration repairs.
+fn assert_files_resolve_directories(
+    files: &lix::ExecuteResult,
+    directories: &lix::ExecuteResult,
+    context: &str,
+) {
+    let directory_ids: HashSet<String> = directories
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").expect("directory id"))
+        .collect();
+    for file in files.rows() {
+        let name = file.get::<String>("name").expect("file name");
+        if let Ok(directory_id) = file.get::<String>("directory_id") {
+            assert!(
+                directory_ids.contains(&directory_id),
+                "file '{name}' {context} references directory '{directory_id}' \
+                 that is missing from the same tree"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn checkpointed_directories_survive_the_v74_migration() {
     let storage = Memory::from_snapshot(V72_FILESYSTEM_SNAPSHOT)
@@ -80,21 +104,11 @@ async fn checkpointed_directories_survive_the_v74_migration() {
             .unwrap_or_else(|error| {
                 panic!("lix_state_at('lix_directory') at {commit_id} should read: {error}")
             });
-        let directory_ids: HashSet<String> = directories
-            .rows()
-            .iter()
-            .map(|row| row.get::<String>("id").expect("directory id"))
-            .collect();
-        for file in files.rows() {
-            let name = file.get::<String>("name").expect("file name");
-            if let Ok(directory_id) = file.get::<String>("directory_id") {
-                assert!(
-                    directory_ids.contains(&directory_id),
-                    "file '{name}' at checkpoint {commit_id} references directory \
-                     '{directory_id}' that is missing from the same tree"
-                );
-            }
-        }
+        assert_files_resolve_directories(
+            &files,
+            &directories,
+            &format!("at checkpoint {commit_id}"),
+        );
 
         // The path-projecting read the product runs on every checkpoint open.
         lix.execute(
@@ -175,20 +189,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
              (got {directory_names:?})"
         );
     }
-    let directory_ids: HashSet<String> = directories
-        .rows()
-        .iter()
-        .map(|row| row.get::<String>("id").expect("directory id"))
-        .collect();
-    for file in files.rows() {
-        if let Ok(directory_id) = file.get::<String>("directory_id") {
-            assert!(
-                directory_ids.contains(&directory_id),
-                "post-migration checkpoint file references directory '{directory_id}' \
-                 missing from the same tree"
-            );
-        }
-    }
+    assert_files_resolve_directories(&files, &directories, "at the post-migration checkpoint");
 
     lix.close().await.expect("close migrated repository");
 }
