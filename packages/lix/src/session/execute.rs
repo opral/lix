@@ -1710,8 +1710,13 @@ where
                     "session global-head observation is poisoned",
                 )
             })? = Some(global_head);
+            // Store the generation snapshotted before the refresh, never a
+            // completion-time re-read: a bump landing while the refresh
+            // transaction ran describes state it did not see, and marking it
+            // satisfied would let an observation deliver stale rows with no
+            // re-evaluation pending.
             self.base_refresh_generation
-                .store(self.observe_invalidation.generation(), Ordering::SeqCst);
+                .store(invalidation_generation, Ordering::SeqCst);
         }
         result
     }
