@@ -8875,8 +8875,8 @@ mod tests {
         let source_commit = source_history
             .commits
             .iter()
-            .cloned()
             .find(|commit| commit.commit_id == source_head)
+            .cloned()
             .expect("source head commit should exist");
         let mut source_commits = source_history.commits.clone();
         if let Some(base) = source_commit.base_commit_id.as_deref() {
