@@ -18,7 +18,7 @@ use http::{
     header::{ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE},
 };
 use http_body::{Body, Frame, SizeHint};
-use lix::storage::Storage;
+use lix::storage::{Storage, StorageSession};
 use lix::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction, ObserveEvent,
@@ -500,7 +500,7 @@ struct ServerInner<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    engine: Arc<Engine<S>>,
+    engine: Arc<Engine<StorageSession<S>>>,
     options: ServerProtocolOptions,
     registry: AsyncMutex<HashMap<String, Arc<SessionRecord<S>>>>,
     request_blob_budget: Arc<RequestBlobCacheBudget>,
@@ -1388,7 +1388,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     fn from_engine(
-        engine: Arc<Engine<S>>,
+        engine: Arc<Engine<StorageSession<S>>>,
         options: ServerProtocolOptions,
     ) -> Self {
         engine.sync_mode().set_role(crate::sync::SyncRole::Authority);
@@ -5039,6 +5039,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.0.acquire_session().await
+        }
+
         async fn begin_read(
             &self,
             mut options: ReadOptions,
@@ -5289,6 +5295,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self
                 .first_reads
@@ -5369,6 +5381,12 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self
@@ -5452,6 +5470,12 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.inner.begin_read(options).await
@@ -5569,6 +5593,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             Ok(BlockingFencedBranchControlRead {
                 inner: self.inner.begin_read(options).await?,
@@ -5660,6 +5690,12 @@ mod tests {
             = PostCommitUnknownWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.inner.begin_read(options).await
@@ -5766,6 +5802,12 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self.fenced.load(Ordering::Acquire) {
@@ -6051,6 +6093,12 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self.gate.pause_next_read.swap(false, Ordering::AcqRel) {

@@ -46,7 +46,7 @@ pub struct ObserveEvent {
     pub rows: ExecuteResult,
 }
 
-#[expect(missing_debug_implementations)]
+#[allow(missing_debug_implementations)]
 pub struct ObserveEvents<StorageImpl = Memory>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -431,6 +431,12 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self

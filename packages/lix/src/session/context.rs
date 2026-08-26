@@ -1199,6 +1199,11 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
         async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.gate.maybe_block();
             self.inner.begin_read(opts).await
@@ -1238,6 +1243,11 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
         async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.inner.begin_read(opts).await
         }

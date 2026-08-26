@@ -1,11 +1,11 @@
 use lix::plugin::runtime::WasmRuntime;
-use lix::storage::Storage;
+use lix::storage::{Storage, StorageSession};
 use lix::telemetry::TelemetrySink;
 use lix::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteBatchStatement,
     ExecuteIdempotency, ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, LixError,
     Memory, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    ObserveEvents, RedoReceipt, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
+    ObserveEvent, RedoReceipt, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
 };
 use std::{
     future::{Future, IntoFuture},
@@ -278,14 +278,17 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub(crate) async fn open_protocol_engine(self) -> Result<Engine<StorageImpl>, LixError> {
+    pub(crate) async fn open_protocol_engine(
+        self,
+    ) -> Result<Engine<StorageSession<StorageImpl>>, LixError> {
         if self.server.is_some() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "a Lix Server Protocol authority cannot also be a sync replica",
             ));
         }
-        let admission = ensure_current_repository(&self.storage, self.open_progress.as_ref()).await?;
+        let storage = StorageSession::acquire(self.storage).await?;
+        let admission = ensure_current_repository(&storage, self.open_progress.as_ref()).await?;
         let migrated_from = admission
             .report
             .migration
@@ -365,6 +368,9 @@ where
         // compiler cannot prove all deeply nested SQL futures are Send.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
+                // Acquire exactly once and retain this fenced generation across
+                // every retry and for the complete lifetime of the returned Lix.
+                let storage = StorageSession::acquire(self.storage).await?;
                 let retained_progress = Arc::new(RetainingOpenProgressSink::new(
                     self.open_progress.clone(),
                 ));
@@ -373,7 +379,7 @@ where
                 // bootstrap after the engine and primary session exist.
                 let mut lix = retry_expired_read(|| {
                     open_lix_inner(
-                        self.storage.clone(),
+                        storage.clone(),
                         self.wasm_runtime.clone(),
                         self.telemetry.clone(),
                         self.server.clone(),
@@ -571,12 +577,40 @@ pub struct Lix<StorageImpl = Memory>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    engine: Arc<Engine<StorageImpl>>,
-    session: Arc<SessionContext<StorageImpl>>,
+    engine: Arc<Engine<StorageSession<StorageImpl>>>,
+    session: Arc<SessionContext<StorageSession<StorageImpl>>>,
     primary_switch_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     sync_lease: Option<Arc<SyncSessionLease>>,
     sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
     open_report: Arc<OpenReport>,
+}
+
+/// A live query observation bound to the storage session owned by its Lix
+/// handle.
+///
+/// The storage fence is intentionally hidden from this public type: callers
+/// parameterize observations by the adapter they supplied to [`open_lix`].
+#[expect(missing_debug_implementations)]
+pub struct ObserveEvents<StorageImpl = Memory>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    inner: crate::session::SessionObserveEvents<StorageSession<StorageImpl>>,
+}
+
+impl<StorageImpl> ObserveEvents<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    pub fn next(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<ObserveEvent>, LixError>> + Send + '_ {
+        self.inner.next()
+    }
+
+    pub fn close(&mut self) {
+        self.inner.close();
+    }
 }
 
 #[derive(Debug)]
@@ -616,7 +650,7 @@ impl SyncSessionLease {
 }
 
 async fn open_lix_inner<StorageImpl>(
-    storage: StorageImpl,
+    storage: StorageSession<StorageImpl>,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     server: Option<ServerOptions>,
@@ -764,7 +798,7 @@ where
 {
     #[cfg(feature = "server-protocol")]
     pub(crate) async fn open_protocol_session(
-        engine: Arc<Engine<StorageImpl>>,
+        engine: Arc<Engine<StorageSession<StorageImpl>>>,
         active_branch_id: Option<String>,
         active_account_id: String,
     ) -> Result<Self, LixError> {
@@ -828,12 +862,16 @@ where
 
     #[cfg(feature = "storage-benches")]
     #[doc(hidden)]
-    pub fn storage_adapter(&self) -> crate::storage_adapter::StorageAdapter<StorageImpl> {
+    pub fn storage_adapter(
+        &self,
+    ) -> crate::storage_adapter::StorageAdapter<StorageSession<StorageImpl>> {
         self.engine.storage()
     }
 
     #[cfg(not(feature = "storage-benches"))]
-    pub(crate) fn storage_adapter(&self) -> crate::storage_adapter::StorageAdapter<StorageImpl> {
+    pub(crate) fn storage_adapter(
+        &self,
+    ) -> crate::storage_adapter::StorageAdapter<StorageSession<StorageImpl>> {
         self.engine.storage()
     }
 
@@ -1178,7 +1216,9 @@ where
     ) -> Result<ObserveEvents<StorageImpl>, LixError> {
         self.session
             .observe(sql, params)
-            .map(|events| events.with_sync_demand_sender(self.sync_demand_tx.clone()))
+            .map(|events| ObserveEvents {
+                inner: events.with_sync_demand_sender(self.sync_demand_tx.clone()),
+            })
     }
 
     pub async fn begin_transaction(&self) -> Result<LixTransaction<StorageImpl>, LixError> {
@@ -1387,7 +1427,7 @@ pub struct LixTransaction<StorageImpl = Memory>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    inner: lix::SessionTransaction<StorageImpl>,
+    inner: lix::SessionTransaction<StorageSession<StorageImpl>>,
 }
 
 /// Configures one SQL statement inside an explicit transaction.
@@ -1648,6 +1688,34 @@ mod tests {
         let lix = open_lix().await.expect("open Lix");
         lix.execute("SELECT 1", &[]).await.expect("execute");
         assert!(lix.telemetry().is_none());
+    }
+
+    #[tokio::test]
+    async fn open_lix_owns_the_storage_session_without_changing_the_public_handle_type() {
+        fn assert_public_type(_: &Lix<Memory>) {}
+
+        let storage = Memory::new();
+        let first = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("open first Lix");
+        assert_public_type(&first);
+
+        assert!(matches!(
+            storage
+                .begin_read(crate::storage::ReadOptions::default())
+                .await,
+            Err(crate::storage::StorageError::Fenced)
+        ));
+
+        let second = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("a second current handle joins the active generation");
+        second
+            .execute("SELECT 1", &[])
+            .await
+            .expect("joined handle remains usable");
     }
 
     #[tokio::test]
@@ -2111,7 +2179,7 @@ mod assume_send_future_proofs {
     // handle.rs -- OpenLixBuilder::into_future
     #[allow(dead_code)]
     fn open_lix_inner_is_send(
-        storage: Memory,
+        storage: StorageSession<Memory>,
         wasm_runtime: Option<Arc<dyn WasmRuntime>>,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) {

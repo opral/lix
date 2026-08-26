@@ -132,7 +132,7 @@ impl EpochRouting {
     pub(super) fn route_write_options(
         &self,
         mut options: WriteOptions,
-    ) -> Result<WriteOptions, StorageError> {
+    ) -> Result<(WriteOptions, Option<usize>), StorageError> {
         if self.force_durable {
             options.await_durable = true;
         }
@@ -141,6 +141,10 @@ impl EpochRouting {
             .into_iter()
             .map(|precondition| self.map_precondition(precondition))
             .collect::<Result<Vec<_>, _>>()?;
+        let fence_precondition_index = self
+            .expected_pointer
+            .as_ref()
+            .map(|_| options.preconditions.len());
         if let Some(expected) = &self.expected_pointer {
             options.preconditions.push(Precondition::KeyValueEquals {
                 space: REPOSITORY_EPOCH_SPACE,
@@ -148,7 +152,7 @@ impl EpochRouting {
                 expected: expected.clone(),
             });
         }
-        Ok(options)
+        Ok((options, fence_precondition_index))
     }
 
     fn map_precondition(&self, precondition: Precondition) -> Result<Precondition, StorageError> {
@@ -212,11 +216,20 @@ impl EpochRouting {
 pub(crate) struct EpochStorageWrite<W> {
     inner: W,
     routing: EpochRouting,
+    fence_precondition_index: Option<usize>,
 }
 
 impl<W> EpochStorageWrite<W> {
-    pub(super) fn new(inner: W, routing: EpochRouting) -> Self {
-        Self { inner, routing }
+    pub(super) fn new(
+        inner: W,
+        routing: EpochRouting,
+        fence_precondition_index: Option<usize>,
+    ) -> Self {
+        Self {
+            inner,
+            routing,
+            fence_precondition_index,
+        }
     }
 }
 
@@ -259,7 +272,18 @@ where
     }
 
     fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
-        self.inner.commit()
+        async move {
+            match self.inner.commit().await {
+                Err(StorageError::PreconditionFailed(failures))
+                    if self.fence_precondition_index.is_some_and(|fence_index| {
+                        failures.iter().any(|failure| failure.index == fence_index)
+                    }) =>
+                {
+                    Err(StorageError::Fenced)
+                }
+                result => result,
+            }
+        }
     }
 
     fn rollback(self) -> impl Future<Output = Result<(), StorageError>> + Send {
@@ -271,9 +295,7 @@ where
 mod tests {
     use super::*;
     use crate::storage::{Memory, StorageSpaceRole, ValueIntegrity, ValueSemantics};
-    use crate::storage_adapter::{
-        PointReadPlan, StorageAdapter, StorageGetOptions, StorageKey,
-    };
+    use crate::storage_adapter::{PointReadPlan, StorageAdapter, StorageGetOptions, StorageKey};
 
     fn logical_space(id: u32) -> StorageSpace {
         StorageSpace {
@@ -325,9 +347,11 @@ mod tests {
     #[test]
     fn exact_pointer_fence_is_unscoped() {
         let expected = Bytes::from_static(b"active-v76-a");
-        let options = EpochRouting::fenced(EpochBank::A, expected.clone())
-            .route_write_options(WriteOptions::default())
-            .unwrap();
+        let (options, fence_precondition_index) =
+            EpochRouting::fenced(EpochBank::A, expected.clone())
+                .route_write_options(WriteOptions::default())
+                .unwrap();
+        assert_eq!(fence_precondition_index, Some(0));
         assert_eq!(
             options.preconditions,
             vec![Precondition::KeyValueEquals {
@@ -380,7 +404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_active_pointer_rejects_an_epoch_bound_write() {
+    async fn prepared_epoch_write_is_fenced_when_active_pointer_changes() {
         let memory = Memory::new();
         let control = StorageAdapter::new(memory.clone());
         let expected = Bytes::from_static(b"active-a-generation-1");
@@ -396,6 +420,13 @@ mod tests {
             .unwrap();
 
         let stale = StorageAdapter::for_epoch(memory.clone(), EpochBank::A, expected);
+        let mut writes = stale.new_write_set();
+        writes.put(logical_space(0x0004_0100), &b"key"[..], &b"late"[..]);
+        let prepared = stale
+            .prepare_write_set(writes, WriteOptions::default())
+            .await
+            .unwrap();
+
         let mut advance = control.new_write_set();
         advance.put(
             REPOSITORY_EPOCH_SPACE,
@@ -407,17 +438,60 @@ mod tests {
             .await
             .unwrap();
 
-        let mut writes = stale.new_write_set();
-        writes.put(logical_space(0x0004_0100), &b"key"[..], &b"late"[..]);
-        let error = stale
-            .commit_write_set(writes, WriteOptions::default())
+        let error = prepared
+            .commit()
             .await
             .expect_err("stale epoch writer must be fenced");
-        assert!(matches!(
+        assert_eq!(error, StorageError::Fenced);
+    }
+
+    #[tokio::test]
+    async fn caller_precondition_failure_is_not_misclassified_as_fencing() {
+        let memory = Memory::new();
+        let control = StorageAdapter::new(memory.clone());
+        let expected = Bytes::from_static(b"active-a-generation-1");
+        let mut seed = control.new_write_set();
+        seed.put(
+            REPOSITORY_EPOCH_SPACE,
+            REPOSITORY_EPOCH_KEY,
+            expected.as_ref(),
+        );
+        control
+            .commit_write_set(seed, WriteOptions::default())
+            .await
+            .unwrap();
+
+        let logical = logical_space(0x0004_0100);
+        let adapter = StorageAdapter::for_epoch(memory, EpochBank::A, expected);
+        let mut seed = adapter.new_write_set();
+        seed.put(logical, &b"occupied"[..], &b"value"[..]);
+        adapter
+            .commit_write_set(seed, WriteOptions::default())
+            .await
+            .unwrap();
+
+        let mut writes = adapter.new_write_set();
+        writes.put(logical, &b"other"[..], &b"value"[..]);
+        let error = adapter
+            .commit_write_set(
+                writes,
+                WriteOptions {
+                    preconditions: vec![Precondition::KeyAbsent {
+                        space: logical,
+                        key: Key(Bytes::from_static(b"occupied")),
+                    }],
+                    ..WriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("caller precondition should fail");
+        assert_eq!(
             error,
             crate::storage_adapter::StorageWriteSetError::Storage(
-                StorageError::PreconditionFailed(_)
+                StorageError::PreconditionFailed(vec![crate::storage::PreconditionFailure {
+                    index: 0,
+                }])
             )
-        ));
+        );
     }
 }

@@ -8,6 +8,7 @@ mod error;
 pub mod immutable;
 mod in_memory;
 mod predicate;
+mod session;
 mod traits;
 mod types;
 
@@ -21,6 +22,9 @@ pub use in_memory::{Memory, MemoryFactory, MemoryFixture, MemoryRead, MemoryWrit
 pub use predicate::{
     HeaderFieldId, HeaderPredicate, KeyPredicate, PredicateExpr, PredicateId,
     PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, StoragePredicate, Support,
+};
+pub use session::{
+    StorageSession, StorageSessionGate, StorageSessionPermit, StorageSessionToken,
 };
 pub use traits::{Storage, StorageRead, StorageWrite};
 pub use types::{

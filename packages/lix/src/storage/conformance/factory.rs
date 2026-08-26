@@ -1,4 +1,6 @@
-use crate::storage::{ReadOptions, Storage, StorageChangeWatch, StorageError, WriteOptions};
+use crate::storage::{
+    ReadOptions, Storage, StorageChangeWatch, StorageError, StorageSessionToken, WriteOptions,
+};
 
 pub trait StorageFactory: Sync {
     type Storage: Storage;
@@ -49,6 +51,12 @@ where
         = <F::Storage as Storage>::Write<'a>
     where
         Self: 'a;
+
+    fn acquire_session(
+        &self,
+    ) -> impl Future<Output = Result<StorageSessionToken, StorageError>> + Send {
+        self.storage.acquire_session()
+    }
 
     fn begin_read(
         &self,

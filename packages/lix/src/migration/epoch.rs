@@ -1481,12 +1481,10 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .unwrap_err();
-        assert!(matches!(
+        assert_eq!(
             error,
-            crate::storage_adapter::StorageWriteSetError::Storage(
-                StorageError::PreconditionFailed(_)
-            )
-        ));
+            crate::storage_adapter::StorageWriteSetError::Storage(StorageError::Fenced)
+        );
     }
 
     #[tokio::test]
@@ -1523,15 +1521,13 @@ mod tests {
         );
         let mut writes = stale.new_write_set();
         writes.put(crate::json_store::JSON_SPACE, &b"stale"[..], &b"write"[..]);
-        assert!(matches!(
+        assert_eq!(
             stale
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
                 .unwrap_err(),
-            crate::storage_adapter::StorageWriteSetError::Storage(
-                StorageError::PreconditionFailed(_)
-            )
-        ));
+            crate::storage_adapter::StorageWriteSetError::Storage(StorageError::Fenced)
+        );
     }
 
     #[tokio::test]

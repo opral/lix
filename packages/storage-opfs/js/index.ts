@@ -30,7 +30,7 @@ export class OpfsStorage implements LixStorage {
 	get lixStorage(): LixStorageProviderRegistration {
 		const shared = ensureOwnerWorker();
 		return {
-			version: 2,
+			version: 3,
 			moduleUrl: shared
 				? new URL("./provider.js", import.meta.url).href
 				: new URL("./direct.js", import.meta.url).href,

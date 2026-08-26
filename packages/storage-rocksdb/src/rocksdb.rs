@@ -20,8 +20,8 @@ use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
     ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, SpaceId, Storage, StorageError,
-    StorageRead, StorageScanSource, StorageSpace, StorageWrite, ValueIntegrity, ValueSemantics,
-    WriteOptions, WriteStats,
+    StorageRead, StorageScanSource, StorageSessionGate, StorageSessionToken, StorageSpace,
+    StorageWrite, ValueIntegrity, ValueSemantics, WriteOptions, WriteStats,
 };
 use rocksdb::{
     BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
@@ -64,6 +64,7 @@ pub struct RocksDB {
 struct RocksDBInner {
     db: DB,
     write_gate: WriteGate,
+    sessions: StorageSessionGate,
 }
 
 const BACKGROUND_MAINTENANCE_MAX_MUTATIONS: u64 = 4_096;
@@ -79,6 +80,7 @@ pub struct RocksDBRead<'a> {
 #[allow(missing_debug_implementations)]
 pub struct RocksDBWrite {
     inner: Arc<RocksDBInner>,
+    session_token: Option<StorageSessionToken>,
     preconditions: Vec<Precondition>,
     background_maintenance: bool,
     batch: WriteBatch,
@@ -182,11 +184,22 @@ impl Storage for RocksDB {
         = RocksDBWrite
     where
         Self: 'a;
+
+    fn acquire_session(
+        &self,
+    ) -> impl Future<Output = Result<StorageSessionToken, StorageError>> + Send {
+        async move {
+            let _writer_permit = self.inner.write_gate.acquire(false).await;
+            self.inner.sessions.acquire()
+        }
+    }
+
     fn begin_read(
         &self,
         opts: ReadOptions,
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
+            let _session_permit = self.inner.sessions.validate(opts.session_token)?;
             // Capture the sequence first, then fence the WAL. A flush-before-
             // snapshot ordering has a race where a concurrent write can land
             // between the fence and snapshot and be returned by a supposedly
@@ -216,8 +229,10 @@ impl Storage for RocksDB {
         opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
+            drop(self.inner.sessions.validate(opts.session_token)?);
             Ok(RocksDBWrite {
                 inner: Arc::clone(&self.inner),
+                session_token: opts.session_token,
                 preconditions: opts.preconditions,
                 background_maintenance: opts.background_maintenance,
                 batch: if opts.batch_capacity_hint_bytes == 0 {
@@ -768,6 +783,7 @@ impl StorageWrite for RocksDBWrite {
                 .write_gate
                 .acquire(self.background_maintenance)
                 .await;
+            let _session_permit = self.inner.sessions.validate(self.session_token)?;
             check_preconditions(&self.inner.db, &self.preconditions)?;
             for (key, expected) in &self.immutable_values {
                 let cf = self
@@ -905,6 +921,7 @@ fn open_shared_rocksdb(path: PathBuf) -> Result<Arc<RocksDBInner>, StorageError>
     let inner = Arc::new(RocksDBInner {
         db,
         write_gate: WriteGate::new(),
+        sessions: StorageSessionGate::default(),
     });
     open_databases.insert(path, Arc::downgrade(&inner));
     Ok(inner)
@@ -1034,9 +1051,83 @@ mod tests {
     };
     use bytes::Bytes;
     use lix::storage::{
-        Key, PutBatch, PutEntry, SpaceId, Storage, StorageError, StorageSpace, StorageWrite,
-        StoredValue, WriteOptions,
+        Key, PutBatch, PutEntry, ReadOptions, SpaceId, Storage, StorageError, StorageSession,
+        StorageSpace, StorageWrite, StoredValue, WriteOptions,
     };
+
+    #[tokio::test]
+    async fn session_acquisition_serializes_with_commits_and_fences_prepared_tokenless_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RocksDB::open(directory.path()).unwrap();
+        let space = StorageSpace::mutable(SpaceId(91), "test.mutable");
+        let mut prepared = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("prepare tokenless write");
+        prepared
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: Key(Bytes::from_static(b"prepared")),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"must-not-commit"),
+                        },
+                    }],
+                },
+            )
+            .await
+            .expect("stage tokenless write");
+
+        let publication = storage.inner.write_gate.acquire(false).await;
+        let acquiring_storage = storage.clone();
+        let acquisition =
+            tokio::spawn(async move { StorageSession::acquire(acquiring_storage).await });
+        while storage
+            .inner
+            .write_gate
+            .foreground_waiters
+            .load(Ordering::Acquire)
+            == 0
+        {
+            assert!(
+                !acquisition.is_finished(),
+                "session acquisition bypassed the publication gate"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !acquisition.is_finished(),
+            "session acquisition must wait for the publication gate"
+        );
+        drop(publication);
+
+        let first = acquisition
+            .await
+            .expect("session acquisition task")
+            .expect("acquire first session");
+        let second = StorageSession::acquire(storage.clone())
+            .await
+            .expect("acquire shared session");
+        assert_eq!(first.token(), second.token());
+        assert_eq!(prepared.commit().await, Err(StorageError::Fenced));
+        assert!(matches!(
+            storage.begin_read(ReadOptions::default()).await,
+            Err(StorageError::Fenced)
+        ));
+        assert!(matches!(
+            storage.begin_write(WriteOptions::default()).await,
+            Err(StorageError::Fenced)
+        ));
+
+        second
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("token-bearing write")
+            .rollback()
+            .await
+            .expect("rollback session write");
+    }
 
     #[tokio::test]
     async fn foreground_writer_overtakes_queued_background_maintenance() {

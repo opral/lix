@@ -1,7 +1,7 @@
 use crate::storage::{
     BeginScanOptions, Capability, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange,
     PutBatch, ReadOptions, ScanCursor, StorageChangeWatch, StorageError, StorageSpace,
-    WriteOptions,
+    StorageSessionToken, WriteOptions,
 };
 
 /// An ordered byte-key entry storage with coherent read views, batched point
@@ -26,6 +26,15 @@ pub trait Storage: Send + Sync {
     type Write<'a>: StorageWrite + 'a
     where
         Self: 'a;
+
+    /// Acquires the storage's current fenced generation.
+    ///
+    /// The first successful acquisition permanently fences tokenless access.
+    /// Further acquisitions of the same open storage share the established
+    /// token rather than displacing one another.
+    fn acquire_session(
+        &self,
+    ) -> impl Future<Output = Result<StorageSessionToken, StorageError>> + Send;
 
     fn begin_read(
         &self,

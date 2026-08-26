@@ -45,6 +45,10 @@ where
         }
     }
 
+    pub(crate) fn storage(&self) -> &StorageImpl {
+        &self.storage
+    }
+
     /// Routes engine storage into one hidden physical epoch bank without
     /// admitting writes. Migration construction and validation use this while
     /// the stable pointer is in a non-active state.
@@ -112,9 +116,13 @@ where
         &self,
         opts: WriteOptions,
     ) -> Result<EpochStorageWrite<StorageImpl::Write<'_>>, StorageError> {
-        let opts = self.routing.route_write_options(opts)?;
+        let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
         let write = self.storage.begin_write(opts).await?;
-        Ok(EpochStorageWrite::new(write, self.routing.clone()))
+        Ok(EpochStorageWrite::new(
+            write,
+            self.routing.clone(),
+            fence_precondition_index,
+        ))
     }
 
     pub async fn begin_read_transaction(
@@ -154,7 +162,7 @@ where
         opts.batch_capacity_hint_bytes = opts
             .batch_capacity_hint_bytes
             .max(write_set.backend_batch_capacity_hint_bytes());
-        let opts = self
+        let (opts, fence_precondition_index) = self
             .routing
             .route_write_options(opts)
             .map_err(StorageWriteSetError::Storage)?;
@@ -167,7 +175,8 @@ where
             ))
             .await
             .map_err(StorageWriteSetError::Storage)?;
-        let mut write = EpochStorageWrite::new(write, self.routing.clone());
+        let mut write =
+            EpochStorageWrite::new(write, self.routing.clone(), fence_precondition_index);
         let lowered = async {
             let stats = write_set.lower_into(&mut write).await?;
             if stats.staged_puts > 0 || stats.staged_deletes > 0 {
@@ -261,9 +270,10 @@ where
         range: KeyRange,
         opts: WriteOptions,
     ) -> Result<CommitResult, StorageError> {
-        let opts = self.routing.route_write_options(opts)?;
+        let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
         let write = self.storage.begin_write(opts).await?;
-        let mut write = EpochStorageWrite::new(write, self.routing.clone());
+        let mut write =
+            EpochStorageWrite::new(write, self.routing.clone(), fence_precondition_index);
         if let Err(error) = write.delete_range(space, range).await {
             let _ = write.rollback().await;
             return Err(error);

@@ -9,10 +9,13 @@ import type {
 import type { OpfsWritePayload } from "./buffered-write.js";
 
 /** Internal protocol shared by the package-owned owner worker and its clients. */
-export const OPFS_RPC_CHANNEL = "lix-js:storage-opfs:v1";
+export const OPFS_RPC_PROTOCOL_VERSION = 2 as const;
+export const OPFS_RPC_CHANNEL =
+	`lix-js:storage-opfs:rpc:v${OPFS_RPC_PROTOCOL_VERSION}`;
 
 export type OpfsRpcRequest = {
 	kind: "request";
+	protocolVersion: 2;
 	requestId: string;
 	clientId: string;
 	storageName: string;
@@ -20,7 +23,9 @@ export type OpfsRpcRequest = {
 		| "open"
 		| "close"
 		| "heartbeat"
+		| "acquireSession"
 		| "beginRead"
+		| "beginWrite"
 		| "readMany"
 		| "scanPage"
 		| "commit";
@@ -41,6 +46,12 @@ export type OpfsRpcResponse = {
 	error: SerializedError;
 };
 
+export type OpfsRpcAccepted = {
+	kind: "accepted";
+	requestId: string;
+	clientId: string;
+};
+
 /** Package-private state used to recover coalesced or missed invalidations. */
 export type OpfsStorageState = {
 	kind: "storageState";
@@ -52,6 +63,7 @@ export type OpfsStorageState = {
 export type OpfsChannelMessage =
 	| OpfsRpcRequest
 	| OpfsRpcResponse
+	| OpfsRpcAccepted
 	| OpfsStorageState;
 
 export type OpfsOpenResult = {
@@ -72,6 +84,7 @@ export type OpfsReadManyPayload = {
 	requests: LixStorageGetManyRequest[];
 	generation: number;
 	ownerEpoch: string;
+	sessionToken?: string;
 };
 export type OpfsScanPagePayload = {
 	space: LixStorageSpace;
@@ -82,6 +95,7 @@ export type OpfsScanPagePayload = {
 	projection: "keyOnly" | "fullValue";
 	generation: number;
 	ownerEpoch: string;
+	sessionToken?: string;
 };
 export type OpfsCommitPayload = OpfsWritePayload;
 

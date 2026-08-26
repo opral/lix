@@ -172,7 +172,7 @@ function routeStorageBinding(root: LixBinding): {
 async function openJsProviderStorage(
 	storage: LixStorage & {
 		readonly lixStorage: {
-			readonly version: 2;
+			readonly version: 3;
 			readonly moduleUrl: string;
 			readonly options: unknown;
 		};

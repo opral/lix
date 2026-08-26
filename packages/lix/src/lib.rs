@@ -142,8 +142,9 @@ pub mod wasm;
 pub use plugin::runtime::default::runtime as default_wasm_runtime;
 pub use handle::{
     CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
-    OpenAnotherSessionBuilder, OpenLixBuilder, OpenMigrationReport, OpenPhase, OpenProgress,
-    OpenProgressSink, OpenReport, ServerMode, ServerOptions, TransactionExecuteBuilder, open_lix,
+    ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenMigrationReport, OpenPhase,
+    OpenProgress, OpenProgressSink, OpenReport, ServerMode, ServerOptions,
+    TransactionExecuteBuilder, open_lix,
 };
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]
@@ -175,7 +176,7 @@ pub use session::{
     RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
 pub use session::{
-    ExecuteBatchStatement, ExecuteResult, ObserveEvent, ObserveEvents, Row, RowRef, TryFromValue,
+    ExecuteBatchStatement, ExecuteResult, ObserveEvent, Row, RowRef, TryFromValue,
 };
 #[doc(hidden)]
 pub use session::CoherentReadBatch;

@@ -113,6 +113,12 @@ impl Storage for ExpiringReadStorage {
     where
         Self: 'a;
 
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
+
     async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         Ok(ExpiringRead {
             inner: self.inner.begin_read(options).await?,

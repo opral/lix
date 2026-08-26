@@ -1793,7 +1793,7 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
 
 	replica.lix.close().await.unwrap();
 	let error = crate::migration::migrate_lix_with_adapter(
-		replica.storage.clone(),
+		migration_adapter.storage().clone(),
 		migration_adapter,
 		crate::migration::MigrationOptions::default(),
 	)

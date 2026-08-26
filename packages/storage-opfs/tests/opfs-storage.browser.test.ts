@@ -6,6 +6,7 @@ import {
 } from "@lix-js/sdk";
 import { OpfsStorage } from "@lix-js/storage-opfs";
 import { expect, test } from "vitest";
+import { OpfsStorageClient } from "../js/client.js";
 import {
 	OPFS_RPC_CHANNEL,
 	type OpfsChannelMessage,
@@ -148,6 +149,122 @@ test("shares a name across Lix workers", async () => {
 		).toEqual({ value: 2 });
 	} finally {
 		await Promise.all([first.close(), second.close()]);
+	}
+});
+
+test("joins one storage session generation across provider clients", async () => {
+	const name = `lix-opfs-session-clients:${crypto.randomUUID()}`;
+	const registration = new OpfsStorage({ name }).lixStorage;
+	const [first, second] = await Promise.all([
+		openProvider(registration),
+		openProvider(registration),
+	]);
+	const space: LixStorageSpace = {
+		id: 44,
+		name: "session-clients",
+		valueSemantics: "mutable",
+		valueIntegrity: "backendVerified",
+	};
+	try {
+		const [firstToken, secondToken] = await Promise.all([
+			first.acquireSession(),
+			second.acquireSession(),
+		]);
+		expect(secondToken).toBe(firstToken);
+
+		const write = await first.beginWrite({
+			awaitDurable: false,
+			preconditions: [],
+			batchCapacityHintBytes: 2,
+			sessionToken: firstToken,
+		});
+		await write.putMany(space, [{ key: new Uint8Array([1]), value: new Uint8Array([2]) }]);
+		await write.commit();
+
+		const read = await second.beginRead({
+			consistency: "latest",
+			durability: "visible",
+			sessionToken: secondToken,
+		});
+		expect(
+			await read.getMany([
+				{ space, keys: [new Uint8Array([1])], options: { projection: "fullValue" } },
+			]),
+		).toEqual([{ kind: "fullValue", value: new Uint8Array([2]) }]);
+	} finally {
+		await Promise.all([first.close(), second.close()]);
+	}
+});
+
+test("fences a tokenless write prepared before session acquisition", async () => {
+	const provider = await openProvider(
+		new OpfsStorage({
+			name: `lix-opfs-prepared-tokenless:${crypto.randomUUID()}`,
+		}).lixStorage,
+	);
+	const space: LixStorageSpace = {
+		id: 45,
+		name: "prepared-tokenless",
+		valueSemantics: "mutable",
+		valueIntegrity: "backendVerified",
+	};
+	try {
+		const prepared = await provider.beginWrite({
+			awaitDurable: false,
+			preconditions: [],
+			batchCapacityHintBytes: 2,
+		});
+		await prepared.putMany(space, [
+			{ key: new Uint8Array([1]), value: new Uint8Array([2]) },
+		]);
+
+		const token = await provider.acquireSession();
+		await expect(prepared.commit()).rejects.toMatchObject({
+			code: "LIX_STORAGE_FENCED",
+		});
+
+		const read = await provider.beginRead({
+			consistency: "latest",
+			durability: "visible",
+			sessionToken: token,
+		});
+		expect(
+			await read.getMany([
+				{ space, keys: [new Uint8Array([1])], options: { projection: "fullValue" } },
+			]),
+		).toEqual([null]);
+	} finally {
+		await provider.close();
+	}
+});
+
+test("fences a commit prepared by a previous owner generation", async () => {
+	const name = `lix-opfs-stale-writer:${crypto.randomUUID()}`;
+	void new OpfsStorage({ name }).lixStorage;
+	const client = await OpfsStorageClient.open(name);
+	try {
+		const sessionToken = await client.acquireSession();
+		await expect(
+			client.commit({
+				deletes: [],
+				puts: [],
+				deleteRanges: [],
+				immutablePuts: [],
+				preconditions: [],
+				strictDurability: false,
+				stats: {
+					putEntries: 0,
+					deletedEntries: 0,
+					deletedRanges: 0,
+					writtenBytes: 0,
+					storageCalls: 0,
+				},
+				sessionToken,
+				ownerEpoch: "previous-owner",
+			}),
+		).rejects.toMatchObject({ code: "LIX_STORAGE_FENCED" });
+	} finally {
+		await client.close();
 	}
 });
 
@@ -309,6 +426,7 @@ test("does not replay a request after its owner response completes", async () =>
 	const channel = new BroadcastChannel(OPFS_RPC_CHANNEL);
 	const request: OpfsRpcRequest = {
 		kind: "request",
+		protocolVersion: 2,
 		requestId: crypto.randomUUID(),
 		clientId: crypto.randomUUID(),
 		storageName,
@@ -446,6 +564,7 @@ test("keeps a complete SQL read coherent during cross-client commit churn", asyn
 	};
 	const lix = await openLix({ storage: new OpfsStorage({ name }) });
 	const writer = await openProvider(new OpfsStorage({ name }).lixStorage);
+	const writerSessionToken = await writer.acquireSession();
 	const churnSpace: LixStorageSpace = {
 		id: 2_000_000_000,
 		name: "cross-client-read-churn",
@@ -463,6 +582,7 @@ test("keeps a complete SQL read coherent during cross-client commit churn", asyn
 					awaitDurable: false,
 					preconditions: [],
 					batchCapacityHintBytes: 8,
+					sessionToken: writerSessionToken,
 				});
 				await write.putMany(churnSpace, [
 					{ key: keyBytes(index), value: new Uint8Array([index & 0xff]) },

@@ -8,7 +8,8 @@ use lix::storage::{
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadConsistency,
     ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, Storage,
     StorageChangeSource, StorageChangeWatch, StorageError, StorageRead, StorageScanSource,
-    StorageSpace, StorageWrite, ValueIntegrity, ValueSemantics, WriteOptions, WriteStats,
+    StorageSessionToken, StorageSpace, StorageWrite, ValueIntegrity, ValueSemantics, WriteOptions,
+    WriteStats,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::{JsCast, prelude::*};
@@ -21,6 +22,9 @@ extern "C" {
 
     #[wasm_bindgen(method, js_name = beginRead)]
     fn begin_read(this: &JsStorageProvider, options: JsValue) -> js_sys::Promise;
+
+    #[wasm_bindgen(method, js_name = acquireSession)]
+    fn acquire_storage_session(this: &JsStorageProvider) -> js_sys::Promise;
 
     #[wasm_bindgen(method, js_name = beginWrite)]
     fn begin_write(this: &JsStorageProvider, options: JsValue) -> js_sys::Promise;
@@ -166,6 +170,8 @@ struct ReadOptionsDto {
     snapshot: Option<ByteDto>,
     consistency: &'static str,
     durability: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -178,6 +184,8 @@ struct WriteOptionsDto {
     await_durable: bool,
     preconditions: Vec<PreconditionDto>,
     batch_capacity_hint_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -339,6 +347,35 @@ impl Storage for JsStorage {
         = JsStorageWrite
     where
         Self: 'a;
+
+    async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
+        let method = js_sys::Reflect::get(
+            self.provider.0.as_ref(),
+            &JsValue::from_str("acquireSession"),
+        )
+        .map_err(storage_error)?;
+        if !method.is_function() {
+            return Err(StorageError::Unsupported(Capability::StorageSessions));
+        }
+        let value = SendJsFuture(JsFuture::from(self.provider.0.acquire_storage_session()))
+            .await
+            .map_err(|error| match storage_error(error) {
+                StorageError::Unsupported(_) => {
+                    StorageError::Unsupported(Capability::StorageSessions)
+                }
+                error => error,
+            })?;
+        let encoded = value.as_string().ok_or_else(|| {
+            StorageError::Corruption(
+                "JS storage acquireSession must return a decimal string".to_string(),
+            )
+        })?;
+        StorageSessionToken::from_decimal_string(&encoded).ok_or_else(|| {
+            StorageError::Corruption(
+                "JS storage acquireSession returned an invalid session token".to_string(),
+            )
+        })
+    }
 
     async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         let options = to_js(&read_options_dto(options), "read options")?;
@@ -621,6 +658,9 @@ fn read_options_dto(options: ReadOptions) -> ReadOptionsDto {
             ReadDurability::Visible => "visible",
             ReadDurability::Durable => "durable",
         },
+        session_token: options
+            .session_token
+            .map(StorageSessionToken::to_decimal_string),
     }
 }
 
@@ -631,6 +671,9 @@ fn write_options_dto(options: WriteOptions) -> WriteOptionsDto {
         await_durable: options.await_durable,
         preconditions: options.preconditions.iter().map(precondition_dto).collect(),
         batch_capacity_hint_bytes: options.batch_capacity_hint_bytes,
+        session_token: options
+            .session_token
+            .map(StorageSessionToken::to_decimal_string),
     }
 }
 
@@ -784,6 +827,7 @@ fn capability_from_error(error: &JsValue) -> Option<Capability> {
         "idempotentCommit" => Some(Capability::IdempotentCommit),
         "predicatePushdown" => Some(Capability::PredicatePushdown),
         "parallelPartitions" => Some(Capability::ParallelPartitions),
+        "storageSessions" => Some(Capability::StorageSessions),
         _ => None,
     }
 }

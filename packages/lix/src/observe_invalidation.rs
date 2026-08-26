@@ -277,6 +277,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self.first_read.swap(false, Ordering::AcqRel) {
                 self.entered.notify_waiters();
@@ -315,6 +321,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
         async fn begin_read(&self, _options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             Err(StorageError::Fenced)
         }
@@ -336,6 +348,12 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.inner.begin_read(options).await

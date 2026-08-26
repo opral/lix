@@ -10,8 +10,8 @@ use crate::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
     ReadEntry, ReadOptions, ScanChunk, ScanCursor, ScanOrder, SpaceId, Storage, StorageError,
-    StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue, ValueSemantics,
-    WriteOptions, WriteStats,
+    StorageRead, StorageScanSource, StorageSessionGate, StorageSessionToken, StorageSpace,
+    StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
 
 type InMemoryMap = PersistentMap<Key, Bytes>;
@@ -52,6 +52,7 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
 #[derive(Clone, Debug, Default)]
 pub struct Memory {
     entries: Arc<Mutex<InMemoryMap>>,
+    sessions: Arc<StorageSessionGate>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,6 +61,7 @@ pub struct MemoryFactory;
 #[derive(Clone, Debug, Default)]
 pub struct MemoryFixture {
     entries: Arc<Mutex<InMemoryMap>>,
+    sessions: Arc<StorageSessionGate>,
 }
 
 #[derive(Clone)]
@@ -71,6 +73,8 @@ pub struct MemoryRead {
 #[expect(missing_debug_implementations)]
 pub struct MemoryWrite {
     parent: Arc<Mutex<InMemoryMap>>,
+    sessions: Arc<StorageSessionGate>,
+    session_token: Option<StorageSessionToken>,
     base: InMemoryMap,
     preconditions: Vec<Precondition>,
     overlay: EntriesOverlay,
@@ -102,6 +106,7 @@ impl Memory {
             entries: Arc::new(Mutex::new(PersistentMap::from_sorted(
                 entries.into_iter().collect(),
             ))),
+            sessions: Arc::new(StorageSessionGate::default()),
         })
     }
 
@@ -115,6 +120,7 @@ impl Memory {
     pub fn fork_snapshot(&self) -> Result<Self, StorageError> {
         Ok(Self {
             entries: Arc::new(Mutex::new(self.snapshot()?)),
+            sessions: Arc::new(StorageSessionGate::default()),
         })
     }
 
@@ -262,6 +268,7 @@ impl StorageFixture for MemoryFixture {
     async fn open(&self) -> Self::Storage {
         Memory {
             entries: Arc::clone(&self.entries),
+            sessions: Arc::clone(&self.sessions),
         }
     }
 }
@@ -276,18 +283,26 @@ impl Storage for Memory {
         = MemoryWrite
     where
         Self: 'a;
+    async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
+        self.sessions.acquire()
+    }
+
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         if opts.durability == ReadDurability::Durable {
             return Err(StorageError::Durability);
         }
+        let _permit = self.sessions.validate(opts.session_token)?;
         Ok(MemoryRead {
             entries: self.snapshot()?,
         })
     }
 
     async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
+        let _permit = self.sessions.validate(opts.session_token)?;
         Ok(MemoryWrite {
             parent: Arc::clone(&self.entries),
+            sessions: Arc::clone(&self.sessions),
+            session_token: opts.session_token,
             base: self.snapshot()?,
             preconditions: opts.preconditions,
             overlay: EntriesOverlay::default(),
@@ -487,6 +502,7 @@ impl StorageWrite for MemoryWrite {
     }
 
     async fn commit(self) -> Result<CommitResult, StorageError> {
+        let _permit = self.sessions.validate(self.session_token)?;
         let mut parent = self
             .parent
             .lock()
@@ -620,7 +636,7 @@ mod tests {
     use crate::storage::{
         BeginScanOptions, GetManyRequest, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Memory,
         ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId, Storage, StorageError,
-        StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
+        StorageRead, StorageSession, StorageSpace, StorageWrite, StoredValue, WriteOptions,
     };
 
     #[tokio::test]
@@ -636,6 +652,77 @@ mod tests {
                 .any(|test| matches!(test.status, ConformanceStatus::Passed)),
             "expected at least one conformance test to run"
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_tokenless_write_is_fenced_by_first_session_acquisition() {
+        let storage = Memory::new();
+        let space = StorageSpace::mutable(SpaceId(91), "test.mutable");
+        let mut prepared = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("prepare tokenless write");
+        prepared
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: Key(Bytes::from_static(b"prepared")),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"must-not-commit"),
+                        },
+                    }],
+                },
+            )
+            .await
+            .expect("stage tokenless write");
+
+        let session = StorageSession::acquire(storage.clone())
+            .await
+            .expect("acquire first session");
+
+        assert_eq!(prepared.commit().await, Err(StorageError::Fenced));
+        let read = session
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("session read");
+        let keys = [Key(Bytes::from_static(b"prepared"))];
+        let values = read
+            .get_many(&[GetManyRequest {
+                space,
+                keys: &keys,
+                opts: GetOptions::default(),
+            }])
+            .await
+            .expect("verify fenced write");
+        assert_eq!(values.values, vec![None]);
+    }
+
+    #[tokio::test]
+    async fn tokenless_access_is_permanently_fenced_after_acquisition() {
+        let storage = Memory::new();
+        let first = StorageSession::acquire(storage.clone())
+            .await
+            .expect("acquire first session");
+        let second = StorageSession::acquire(storage.clone())
+            .await
+            .expect("acquire shared session");
+
+        assert_eq!(first.token(), second.token());
+        assert!(matches!(
+            storage.begin_read(ReadOptions::default()).await,
+            Err(StorageError::Fenced)
+        ));
+        assert!(matches!(
+            storage.begin_write(WriteOptions::default()).await,
+            Err(StorageError::Fenced)
+        ));
+
+        let write = second
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("token-bearing write");
+        write.rollback().await.expect("rollback session write");
     }
 
     #[tokio::test]

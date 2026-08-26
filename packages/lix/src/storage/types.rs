@@ -2,7 +2,7 @@ use std::{fmt, ops::Bound};
 
 use bytes::Bytes;
 
-use crate::storage::{Precondition, StorageError};
+use crate::storage::{Precondition, StorageError, StorageSessionToken};
 
 /// Maximum number of owned rows returned by one storage scan page.
 pub const MAX_SCAN_PAGE_ROWS: usize = 1024;
@@ -544,6 +544,8 @@ pub enum ProjectedValue {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadOptions {
+    /// Fenced storage generation authorizing this operation.
+    pub session_token: Option<StorageSessionToken>,
     pub snapshot: Option<SnapshotRef>,
     pub consistency: ReadConsistency,
     /// Minimum persistence boundary for rows returned by this read.
@@ -583,6 +585,8 @@ pub enum ReadConsistency {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteOptions {
+    /// Fenced storage generation authorizing this operation and its commit.
+    pub session_token: Option<StorageSessionToken>,
     pub base_snapshot: Option<SnapshotRef>,
     pub idempotency_key: Option<Bytes>,
     /// Do not acknowledge the commit until the backend has crossed its

@@ -62,6 +62,8 @@ type BrowserNavigator = {
 };
 
 const SQLITE_VFS_NAME_PREFIX = "lix-opfs-sahpool-";
+const OPFS_LOCK_PREFIX = "lix:opfs-sqlite:";
+const OPFS_PROTOCOL_LOCK_PREFIX = "lix:opfs-owner:rpc-v2:";
 const SQLITE_VFS_DIRECTORY = "/lix/sqlite-sahpool";
 // Keep point reads comfortably below SQLite's conservative 999-variable
 // ceiling while collapsing hundreds of JS/Wasm bind-step-reset crossings into
@@ -82,27 +84,37 @@ CREATE TABLE IF NOT EXISTS lix_entries (
 let sqliteModule: Promise<SqliteInit> | undefined;
 const pools = new Map<string, Promise<SAHPoolUtil>>();
 
+function mintSessionToken(): string {
+	const words = crypto.getRandomValues(new Uint32Array(2));
+	return ((BigInt(words[0]!) << 32n) | BigInt(words[1]!)).toString(10);
+}
+
 /** SQLite Wasm + OPFS implementation of the Rust-shaped storage protocol. */
 export class OpfsBackend implements LixStorageProvider {
 	readonly #database: OpfsSAHPoolDatabase;
 	readonly #pool: SAHPoolUtil;
-	readonly #releaseLock: () => void;
+	readonly #releaseLock: () => Promise<void>;
 	readonly #changes = new StorageChangeNotifier();
 	#generation = 0;
+	#sessionToken: string | undefined;
 	#closed = false;
 
 	private constructor(
 		database: OpfsSAHPoolDatabase,
 		pool: SAHPoolUtil,
-		releaseLock: () => void,
+		releaseLock: () => Promise<void>,
 	) {
 		this.#database = database;
 		this.#pool = pool;
 		this.#releaseLock = releaseLock;
 	}
 
-	static async open(name: string): Promise<OpfsBackend> {
+	static async open(
+		name: string,
+		onOwnershipAcquired?: () => void,
+	): Promise<OpfsBackend> {
 		const releaseLock = await acquireOpfsLock(name);
+		onOwnershipAcquired?.();
 		let pool: SAHPoolUtil | undefined;
 		let database: OpfsSAHPoolDatabase | undefined;
 		try {
@@ -125,21 +137,29 @@ export class OpfsBackend implements LixStorageProvider {
 			} catch {
 				// Preserve the original open/schema error.
 			}
-			releaseLock();
+			await releaseLock();
 			throw error;
 		}
 	}
 
+	async acquireSession(): Promise<string> {
+		this.#assertOpen();
+		this.#sessionToken ??= mintSessionToken();
+		return this.#sessionToken;
+	}
+
 	async beginRead(options: LixStorageReadOptions): Promise<LixStorageRead> {
 		this.#assertOpen();
+		this.assertSession(options.sessionToken);
 		if (options.durability === "durable") {
 			fenceSqliteOpfsDurability(this.#database);
 		}
-		return new OpfsRead(this, this.#generation);
+		return new OpfsRead(this, this.#generation, options.sessionToken);
 	}
 
 	async beginWrite(options: LixStorageWriteOptions): Promise<LixStorageWrite> {
 		this.#assertOpen();
+		this.assertSession(options.sessionToken);
 		return new BufferedOpfsWrite(options, (payload) => {
 			this.commitChanges(payload);
 			return { stats: payload.stats };
@@ -161,7 +181,7 @@ export class OpfsBackend implements LixStorageProvider {
 			this.#database.close();
 			if (!this.#pool.isPaused()) this.#pool.pauseVfs();
 		} finally {
-			this.#releaseLock();
+			await this.#releaseLock();
 		}
 	}
 
@@ -173,7 +193,9 @@ export class OpfsBackend implements LixStorageProvider {
 	readMany(
 		requests: LixStorageGetManyRequest[],
 		generation: number,
+		sessionToken?: string,
 	): Array<LixStorageProjectedValue | null> {
+		this.assertSession(sessionToken);
 		this.#assertGeneration(generation);
 		const entries = requests.flatMap((request) =>
 			request.keys.map((key) => ({
@@ -228,6 +250,7 @@ export class OpfsBackend implements LixStorageProvider {
 			}
 		}
 		this.#assertGeneration(generation);
+		this.assertSession(sessionToken);
 		return values;
 	}
 
@@ -239,10 +262,12 @@ export class OpfsBackend implements LixStorageProvider {
 		order: LixStorageScanOrder;
 		projection: "keyOnly" | "fullValue";
 		generation: number;
+		sessionToken?: string;
 	}): {
 		entries: Array<{ key: Uint8Array; value: LixStorageProjectedValue }>;
 		hasMore: boolean;
 	} {
+		this.assertSession(request.sessionToken);
 		this.#assertGeneration(request.generation);
 		const predicates = ["space = ?"];
 		const bindings: SqliteValue[] = [request.space.id];
@@ -272,11 +297,13 @@ export class OpfsBackend implements LixStorageProvider {
 					: ({ kind: "fullValue", value: copyBlob(value) } as const),
 		}));
 		this.#assertGeneration(request.generation);
+		this.assertSession(request.sessionToken);
 		return { entries, hasMore };
 	}
 
 	commitChanges(changes: OpfsWritePayload): void {
 		this.#assertOpen();
+		this.assertSession(changes.sessionToken);
 		const previousSynchronous = this.#database.selectValue(
 			"PRAGMA synchronous",
 		) as number;
@@ -373,6 +400,16 @@ export class OpfsBackend implements LixStorageProvider {
 		}
 	}
 
+	assertSession(sessionToken: string | undefined): void {
+		this.#assertOpen();
+		if (this.#sessionToken !== sessionToken) {
+			throw storageError(
+				"LIX_STORAGE_FENCED",
+				"storage operation does not belong to the active session",
+			);
+		}
+	}
+
 	#assertGeneration(generation: number): void {
 		this.#assertOpen();
 		if (generation !== this.#generation) {
@@ -403,10 +440,16 @@ export async function createLixStorageProvider(
 class OpfsRead implements LixStorageRead {
 	readonly #backend: OpfsBackend;
 	readonly #generation: number;
+	readonly #sessionToken: string | undefined;
 
-	constructor(backend: OpfsBackend, generation: number) {
+	constructor(
+		backend: OpfsBackend,
+		generation: number,
+		sessionToken: string | undefined,
+	) {
 		this.#backend = backend;
 		this.#generation = generation;
+		this.#sessionToken = sessionToken;
 	}
 
 	snapshotCacheKey(): string {
@@ -416,7 +459,11 @@ class OpfsRead implements LixStorageRead {
 	async getMany(
 		requests: LixStorageGetManyRequest[],
 	): Promise<Array<LixStorageProjectedValue | null>> {
-		return this.#backend.readMany(requests, this.#generation);
+		return this.#backend.readMany(
+			requests,
+			this.#generation,
+			this.#sessionToken,
+		);
 	}
 
 	async beginScan(
@@ -430,6 +477,7 @@ class OpfsRead implements LixStorageRead {
 		return new OpfsScan(
 			this.#backend,
 			this.#generation,
+			this.#sessionToken,
 			space,
 			range,
 			options,
@@ -443,6 +491,7 @@ class OpfsScan implements LixStorageScanSource {
 	constructor(
 		private readonly backend: OpfsBackend,
 		private readonly generation: number,
+		private readonly sessionToken: string | undefined,
 		private readonly space: LixStorageSpace,
 		private readonly range: LixStorageKeyRange,
 		private readonly options: {
@@ -460,6 +509,7 @@ class OpfsScan implements LixStorageScanSource {
 			order: this.options.order,
 			projection: this.options.projection,
 			generation: this.generation,
+			sessionToken: this.sessionToken,
 		});
 		this.#after = page.entries.at(-1)?.key;
 		return page;
@@ -525,36 +575,78 @@ async function getPool(
 	return resolved;
 }
 
-function acquireOpfsLock(name: string): Promise<() => void> {
+async function acquireOpfsLock(name: string): Promise<() => Promise<void>> {
 	const locks = getBrowserNavigator().locks;
 	if (!locks) {
 		throw new Error("OPFS storage requires Web Locks for safe ownership");
 	}
-	let release!: () => void;
+	const releaseElection = await acquireExclusiveLock(
+		locks,
+		`${OPFS_PROTOCOL_LOCK_PREFIX}${name}`,
+		storageError(
+			"LIX_STORAGE_FENCED",
+			`OPFS storage '${name}' has a compatible owner`,
+		),
+	);
+	let releaseData: (() => Promise<void>) | undefined;
+	try {
+		releaseData = await acquireExclusiveLock(
+			locks,
+			`${OPFS_LOCK_PREFIX}${name}`,
+			storageError(
+				"LIX_STORAGE_UNSUPPORTED",
+				`OPFS storage '${name}' is owned by an incompatible worker; close older tabs and retry`,
+			),
+		);
+	} catch (error) {
+		await releaseElection();
+		throw error;
+	}
+	return async () => {
+		await releaseData?.();
+		await releaseElection();
+	};
+}
+
+/**
+ * The election lock is versioned; the data lock deliberately is not. Acquiring
+ * election first makes a failed data-lock acquisition authoritative evidence
+ * of an incompatible owner, while compatible workers remain silent relays.
+ */
+function acquireExclusiveLock(
+	locks: LockManager,
+	lockName: string,
+	unavailableError: Error,
+): Promise<() => Promise<void>> {
+	let signalRelease!: () => void;
 	const released = new Promise<void>((resolve) => {
-		release = resolve;
+		signalRelease = resolve;
 	});
-	return new Promise<() => void>((resolve, reject) => {
-		void locks
+	let resolveAcquired!: (release: () => Promise<void>) => void;
+	let rejectAcquired!: (error: unknown) => void;
+	const acquired = new Promise<() => Promise<void>>((resolve, reject) => {
+		resolveAcquired = resolve;
+		rejectAcquired = reject;
+	});
+	let requestFinished!: Promise<void>;
+	requestFinished = locks
 			.request(
-				`lix:opfs-sqlite:${name}`,
+				lockName,
 				{ ifAvailable: true, mode: "exclusive" },
 				async (lock) => {
 					if (!lock) {
-						reject(
-							storageError(
-								"LIX_STORAGE_FENCED",
-								`OPFS storage '${name}' is already open`,
-							),
-						);
+						rejectAcquired(unavailableError);
 						return;
 					}
-					resolve(release);
+					resolveAcquired(async () => {
+						signalRelease();
+						await requestFinished;
+					});
 					await released;
 				},
 			)
-			.catch(reject);
-	});
+			.catch(rejectAcquired);
+	return acquired;
 }
 
 function getBrowserNavigator(): BrowserNavigator {

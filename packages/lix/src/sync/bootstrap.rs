@@ -267,6 +267,14 @@ mod tests {
         type Read<'a> = MemoryRead;
         type Write<'a> = MemoryWrite;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            Err(StorageError::Unsupported(
+                crate::storage::Capability::StorageSessions,
+            ))
+        }
+
         async fn begin_read(
             &self,
             options: StorageReadOptions,

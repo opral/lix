@@ -1717,7 +1717,7 @@ mod tests {
         );
         pre_migration.finish().unwrap();
         let report = migrate_lix_with_adapter(
-            storage.clone(),
+            adapter.storage().clone(),
             adapter.clone(),
             MigrationOptions::default(),
         )
@@ -1742,7 +1742,7 @@ mod tests {
 
         backfill_missing_row_pk_indexes(
             &adapter,
-            &storage,
+            adapter.storage(),
             MigrationOptions::default(),
             72,
             REPOSITORY_PROTOCOL_V72,
@@ -1765,7 +1765,7 @@ mod tests {
             "normal engine open must reject an interrupted bootstrap"
         );
         let report = migrate_lix_with_adapter(
-            storage.clone(),
+            adapter.storage().clone(),
             adapter.clone(),
             MigrationOptions::default(),
         )
@@ -1797,7 +1797,7 @@ mod tests {
             "normal engine open must reject an interrupted rewrite"
         );
         let report = migrate_lix_with_adapter(
-            storage.clone(),
+            adapter.storage().clone(),
             adapter.clone(),
             MigrationOptions::default(),
         )
@@ -1822,7 +1822,7 @@ mod tests {
         )
         .await;
         let report = migrate_lix_with_adapter(
-            storage.clone(),
+            adapter.storage().clone(),
             adapter.clone(),
             MigrationOptions::default(),
         )
@@ -1942,7 +1942,7 @@ mod tests {
                 .await;
         let error = repair_filesystem_closure(
             &adapter,
-            &storage,
+            adapter.storage(),
             MigrationOptions {
                 max_changes: 1,
                 ..MigrationOptions::default()
@@ -1958,7 +1958,7 @@ mod tests {
         storage: &Memory,
         protocol: &'static [u8],
     ) -> (
-        crate::storage_adapter::StorageAdapter<Memory>,
+        crate::storage_adapter::StorageAdapter<crate::storage::StorageSession<Memory>>,
         String,
         CommitId,
         CommitId,
