@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use lix::storage::{Storage, StorageSpace, ValueSemantics};
+use lix::storage::{Storage, StorageSession, StorageSpace, ValueSemantics};
 use lix::storage_adapter::{
     StorageAdapter, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
 };
@@ -31,7 +31,7 @@ trait DurableBackend: Storage + Clone + Send + Sync + 'static {
     async fn corrupt_binary_chunk(
         &self,
         path: &Path,
-        storage: &StorageAdapter<Self>,
+        storage: &StorageAdapter<StorageSession<Self>>,
         target_key: &[u8],
         target_value: &[u8],
         offset: usize,
@@ -52,7 +52,7 @@ impl DurableBackend for RocksDB {
     async fn corrupt_binary_chunk(
         &self,
         _path: &Path,
-        storage: &StorageAdapter<Self>,
+        storage: &StorageAdapter<StorageSession<Self>>,
         target_key: &[u8],
         _target_value: &[u8],
         offset: usize,
@@ -78,7 +78,7 @@ impl DurableBackend for SlateDB {
     async fn corrupt_binary_chunk(
         &self,
         path: &Path,
-        _storage: &StorageAdapter<Self>,
+        _storage: &StorageAdapter<StorageSession<Self>>,
         _target_key: &[u8],
         target_value: &[u8],
         offset: usize,
