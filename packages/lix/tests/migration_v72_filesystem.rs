@@ -10,6 +10,7 @@
 //! v72 engine — that both checkpoint trees contain their directory
 //! descriptors before exporting, so any inconsistency observed after
 //! migration was introduced by the migration itself.
+//! SHA-256: `5ddf20055ae768c57f1926c6398b0a93e5b869955dbbb96dac59b2ace43d5657`.
 //!
 //! Regression: a repository migrated to v74 served checkpoint trees whose
 //! file descriptors referenced directories missing from the same tree
@@ -190,4 +191,32 @@ async fn checkpointed_directories_survive_the_v74_migration() {
     }
 
     lix.close().await.expect("close migrated repository");
+}
+
+#[tokio::test]
+async fn bounded_migration_fails_loudly_instead_of_publishing_v75() {
+    // A row budget below the repository's tracked rows must refuse the
+    // migration — whichever chain step's bound fires first — and never
+    // publish v75 over partially processed trees. (The repair step's own
+    // bound is unit-tested in migration::api.)
+    let storage = Memory::from_snapshot(V72_FILESYSTEM_SNAPSHOT)
+        .expect("v72 filesystem fixture should decode");
+    let error = migrate_lix(
+        storage.clone(),
+        MigrationOptions {
+            max_changes: 12,
+            ..MigrationOptions::default()
+        },
+    )
+    .await
+    .expect_err("a bound below the repository's row count must fail the migration");
+    assert_eq!(error.code, "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED");
+    // The refused migration left the marker untouched: still migratable.
+    assert_eq!(
+        inspect_lix(&storage).await.expect("inspect after refusal"),
+        MigrationStatus::Required {
+            from_version: 72,
+            to_version: 75,
+        }
+    );
 }

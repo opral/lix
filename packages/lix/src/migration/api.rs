@@ -420,13 +420,15 @@ where
     .await
 }
 
-/// Bumps a fully rewritten v74 repository to the v75 marker.
+/// Repairs filesystem closure in every commit tree (see
+/// [`repair_filesystem_closure`]) and publishes the repaired manifests
+/// atomically with the v75 marker.
 ///
-/// The commit-record rewrite itself runs earlier in the chain (see
-/// [`rewrite_commit_records_to_v6`]) so that every later step can load
-/// records through the current decoder. This step re-runs the rewrite
-/// idempotently under the v74 marker — resuming an interrupted migration —
-/// and only then publishes v75.
+/// The commit-record rewrite runs earlier in the chain (see
+/// [`rewrite_commit_records_to_v6`]) so every step from there on — including
+/// the repair's replay reads — loads records through the current decoder;
+/// re-entering `migrate_lix` after an interruption repeats that rewrite
+/// idempotently before reaching this step.
 async fn migrate_v74_complete_snapshot_commits<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
     storage: &S,
@@ -435,7 +437,6 @@ async fn migrate_v74_complete_snapshot_commits<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let rewritten = rewrite_commit_records_to_v6(adapter, storage, options, 74).await?;
     let (members_injected, repaired_manifests) =
         repair_filesystem_closure(adapter, storage, options).await?;
     let read = SharedStorageAdapterRead::new(
@@ -467,7 +468,7 @@ where
         publication,
     )
     .await?;
-    Ok(rewritten.saturating_add(members_injected))
+    Ok(members_injected)
 }
 
 /// Repairs filesystem closure inside every commit tree before v75 publishes.
@@ -477,10 +478,15 @@ where
 /// files reference directories absent from the same tree. Every strict v75
 /// read of such a tree fails. The repair injects the missing directory rows
 /// as tree index entries referencing the directory's existing authoritative
-/// change record, resolved from the branch heads' trees — the recoverable
-/// descriptor. No new change records are created and commit deltas stay
-/// untouched, so touched-scope digests remain valid; the referenced owning
-/// commits are already retained by the branches that reach them.
+/// change record, resolved from the branch heads' trees or from any commit
+/// tree that still carries the descriptor — the recoverable sources. No new
+/// change records are created and commit deltas stay untouched, so
+/// touched-scope digests remain valid; the referenced owning commits are
+/// already retained by the commits whose trees carry them.
+///
+/// Tree-chunk writes commit here — content-addressed, safe if orphaned by a
+/// crash — while the returned manifests must be published by the caller
+/// atomically with the v75 marker replacement.
 async fn repair_filesystem_closure<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
     storage: &S,
@@ -518,6 +524,56 @@ where
         })
     }
 
+    /// Expands the missing set to its full ancestor closure through `source`,
+    /// or reports the first directory id no recoverable source resolves.
+    fn missing_directory_closure(
+        present: &BTreeSet<String>,
+        referenced: &BTreeSet<String>,
+        source: &BTreeMap<String, crate::tracked_state::MaterializedTrackedStateRow>,
+    ) -> Result<Vec<String>, String> {
+        let mut missing = Vec::new();
+        let mut worklist = referenced
+            .difference(present)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        while let Some(id) = worklist.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(row) = source.get(&id) else {
+                return Err(id);
+            };
+            if let Some(parent) = snapshot_text(row, "parent_id")
+                && !present.contains(&parent)
+            {
+                worklist.push(parent);
+            }
+            missing.push(id);
+        }
+        missing.sort();
+        Ok(missing)
+    }
+
+    fn push_missing_directories(
+        builder: &mut crate::tracked_state::TrackedStateMutationBatchBuilder,
+        missing: &[String],
+        source: &BTreeMap<String, crate::tracked_state::MaterializedTrackedStateRow>,
+    ) -> Result<(), LixError> {
+        for id in missing {
+            let row = source.get(id).expect("resolved above");
+            builder.push(
+                TrackedStateKeyRef {
+                    schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+                    file_id: row.file_id.as_deref(),
+                    row_pk: &row.row_pk,
+                },
+                index_value_ref(row)?,
+            );
+        }
+        Ok(())
+    }
+
     let operation = "v74 filesystem-closure repair";
     let read = SharedStorageAdapterRead::new(
         adapter
@@ -530,8 +586,11 @@ where
         .map_err(storage_error)?;
     let commit_ids = crate::tracked_state::scan_commit_state_manifest_commit_ids(&read).await?;
 
-    // The recoverable descriptor source: directory rows visible at any
-    // branch head's tree.
+    // The recoverable descriptor sources: directory rows visible at any
+    // branch head's tree, extended below with every audited commit tree so a
+    // directory later deleted from all heads still resolves. First writer
+    // wins — the repair needs any resolvable authoritative change record for
+    // the id, not the newest revision.
     let heads = BranchHeadControlContext::new()
         .reader(read.clone())
         .scan()
@@ -551,11 +610,20 @@ where
                         ..TrackedStateFilter::default()
                     },
                     read_columns: TrackedStateReadColumns::default(),
-                    limit: Some(options.max_changes),
+                    // Scans truncate silently at their limit; request one row
+                    // beyond the bound so truncation is detected, never
+                    // mistaken for a complete result.
+                    limit: Some(options.max_changes.saturating_add(1)),
                 },
             )
             .await?
             .into_rows();
+        if rows.len() > options.max_changes {
+            return Err(LixError::new(
+                "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+                format!("{operation} head tree exceeds configured row bound"),
+            ));
+        }
         for row in rows {
             let Some(id) = snapshot_text(&row, "id") else {
                 continue;
@@ -564,12 +632,14 @@ where
         }
     }
 
-    let mut chunk_writes = adapter.new_write_set();
-    let mut replacements = Vec::new();
-    let mut injected_total = 0_u64;
+    // First pass: audit every commit tree. An incomplete tree defers to the
+    // second pass so its closure resolves against directory rows from every
+    // tree, not only those audited before it.
+    let mut audits = Vec::new();
     let mut visited_rows = 0_usize;
     for commit_id in commit_ids {
         let commit_key = commit_id.to_string();
+        let budget = options.max_changes.saturating_sub(visited_rows);
         let rows = reader
             .scan_batch_at_commit(
                 &commit_key,
@@ -582,18 +652,18 @@ where
                         ..TrackedStateFilter::default()
                     },
                     read_columns: TrackedStateReadColumns::default(),
-                    limit: Some(options.max_changes.saturating_sub(visited_rows)),
+                    limit: Some(budget.saturating_add(1)),
                 },
             )
             .await?
             .into_rows();
-        visited_rows = visited_rows.saturating_add(rows.len());
-        if visited_rows > options.max_changes {
+        if rows.len() > budget {
             return Err(LixError::new(
                 "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
                 format!("{operation} exceeds configured row bound"),
             ));
         }
+        visited_rows = visited_rows.saturating_add(rows.len());
 
         let mut present = BTreeSet::new();
         let mut referenced = BTreeSet::new();
@@ -615,33 +685,31 @@ where
                 _ => {}
             }
         }
-        let mut missing = Vec::new();
-        let mut worklist = referenced
-            .difference(&present)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut seen = BTreeSet::new();
-        while let Some(id) = worklist.pop() {
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            let Some(row) = source.get(&id) else {
-                return Err(migration_error(format!(
-                    "{operation} cannot resolve directory '{id}' referenced by commit \
-                     '{commit_id}' from any branch head"
-                )));
-            };
-            if let Some(parent) = snapshot_text(row, "parent_id")
-                && !present.contains(&parent)
+        for row in rows {
+            if row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                && let Some(id) = snapshot_text(&row, "id")
             {
-                worklist.push(parent);
+                source.entry(id).or_insert(row);
             }
-            missing.push(id);
         }
-        if missing.is_empty() {
-            continue;
+        if referenced.difference(&present).next().is_some() {
+            audits.push((commit_id, present, referenced));
         }
-        missing.sort();
+    }
+
+    // Second pass: repair every incomplete tree against the complete sources.
+    let mut chunk_writes = adapter.new_write_set();
+    let mut replacements = Vec::new();
+    let mut injected_total = 0_u64;
+    for (commit_id, present, referenced) in audits {
+        let commit_key = commit_id.to_string();
+        let missing = missing_directory_closure(&present, &referenced, &source)
+            .map_err(|id| {
+                migration_error(format!(
+                    "{operation} cannot resolve directory '{id}' referenced by commit \
+                     '{commit_id}' from any branch head or commit tree"
+                ))
+            })?;
 
         let mut manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
             .await?
@@ -654,17 +722,7 @@ where
             crate::tracked_state::TrackedStateMutationBatchBuilder::with_row_capacity(
                 missing.len(),
             );
-        for id in &missing {
-            let row = source.get(id).expect("resolved above");
-            injected.push(
-                TrackedStateKeyRef {
-                    schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-                    file_id: row.file_id.as_deref(),
-                    row_pk: &row.row_pk,
-                },
-                index_value_ref(row)?,
-            );
-        }
+        push_missing_directories(&mut injected, &missing, &source)?;
         let (primary, secondary) =
             crate::tracked_state::with_row_pk_index_mutations(injected.finish())?;
 
@@ -696,16 +754,28 @@ where
             // injected entries would never appear. Materialize a complete
             // fenced root from the commit's full resolved state plus the
             // injected directories.
+            let budget = options.max_changes.saturating_sub(visited_rows);
             let full_rows = reader
                 .scan_batch_at_commit(
                     &commit_key,
                     &TrackedStateScanRequest {
-                        limit: Some(options.max_changes),
+                        limit: Some(budget.saturating_add(1)),
                         ..TrackedStateScanRequest::default()
                     },
                 )
                 .await?
                 .into_rows();
+            // A truncated state would silently become the commit's fenced
+            // root — permanent row loss. Error out instead.
+            if full_rows.len() > budget {
+                return Err(LixError::new(
+                    "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+                    format!(
+                        "{operation} rootless commit '{commit_id}' exceeds configured row bound"
+                    ),
+                ));
+            }
+            visited_rows = visited_rows.saturating_add(full_rows.len());
             let mut full = crate::tracked_state::TrackedStateMutationBatchBuilder::with_row_capacity(
                 full_rows.len() + missing.len(),
             );
@@ -719,17 +789,7 @@ where
                     index_value_ref(row)?,
                 );
             }
-            for id in &missing {
-                let row = source.get(id).expect("resolved above");
-                full.push(
-                    TrackedStateKeyRef {
-                        schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-                        file_id: row.file_id.as_deref(),
-                        row_pk: &row.row_pk,
-                    },
-                    index_value_ref(row)?,
-                );
-            }
+            push_missing_directories(&mut full, &missing, &source)?;
             let result = tree
                 .apply_mutations_with_overlay(
                     &read,
@@ -911,12 +971,15 @@ where
             };
             // Idempotent resume: a record already carrying the v6 arity was
             // rewritten by an interrupted earlier run and needs no work. The
-            // packed codec makes the arities mutually undecodable, so a
-            // successful current-decode is authoritative.
+            // packed codec makes the arities mutually undecodable in all but
+            // a narrow coincidence of bytes, so the format_version check
+            // closes that window: a v5 record that happens to parse as v6
+            // still reads 5 there and must be rewritten, not skipped.
             if let Ok(record) = crate::storage_codec::decode::<crate::changelog::CommitRecord>(
                 "commit record",
                 &value,
-            ) {
+            ) && record.format_version == crate::changelog::COMMIT_RECORD_FORMAT_VERSION
+            {
                 chronology.insert(
                     record.commit_id,
                     CommitChronology {
@@ -995,15 +1058,16 @@ where
         } else {
             let newest_not_after = global_chronology
                 .partition_point(|(created_at, _, _)| *created_at <= record.created_at);
-            let Some((_, _, base)) = newest_not_after
-                .checked_sub(1)
-                .and_then(|index| global_chronology.get(index))
-            else {
-                return Err(migration_error(format!(
-                    "{operation} local commit '{}' predates every global-lineage commit",
-                    record.commit_id
-                )));
-            };
+            // Clock skew across devices can stamp a local commit earlier
+            // than every global-lineage commit — the lineage root carries
+            // the creating device's clock. Clamp to the oldest lineage
+            // commit instead of failing the migration forever: a synced
+            // local commit observed at least the state the lineage began
+            // with.
+            let index = newest_not_after.saturating_sub(1);
+            let (_, _, base) = global_chronology
+                .get(index)
+                .expect("the global lineage walk pushed at least the head");
             Some(*base)
         };
         let upgraded = crate::changelog::CommitRecord {
@@ -1499,6 +1563,29 @@ mod tests {
                 version: CURRENT_FORMAT_VERSION,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn filesystem_repair_surfaces_its_row_bound_instead_of_truncating() {
+        // Regression: tracked-state scans truncate silently at their limit.
+        // A budget below the repository's tracked filesystem rows once made
+        // the closure audit see empty trees and pass unrepaired; it must
+        // surface the bound instead.
+        let storage = Memory::new();
+        seed_rooted_head_with_rootless_checkpoint_cursor(&storage, REPOSITORY_PROTOCOL_V74)
+            .await;
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        let error = repair_filesystem_closure(
+            &adapter,
+            &storage,
+            MigrationOptions {
+                max_changes: 1,
+                ..MigrationOptions::default()
+            },
+        )
+        .await
+        .expect_err("a bound below the tracked filesystem rows must error, not truncate");
+        assert_eq!(error.code, "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED");
     }
 
     async fn seed_rooted_head_with_rootless_checkpoint_cursor(
