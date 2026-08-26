@@ -231,24 +231,33 @@ where
     // marker. Keeping the marker unchanged makes interruption retryable and
     // lets the amendment commits inherit the index normally.
     let marker = load_repository_protocol_marker(adapter).await?;
-    if marker.as_deref() == Some(REPOSITORY_PROTOCOL_V72) {
+    // The commit-record rewrite may already have fenced the marker; the
+    // backfill then publishes from that fence. A bootstrap marker means the
+    // backfill completed (it publishes atomically with its index work).
+    let backfill_source = match marker.as_deref() {
+        Some(value) if value == REPOSITORY_PROTOCOL_V72 => Some(REPOSITORY_PROTOCOL_V72),
+        Some(value) if value == crate::init::REPOSITORY_PROTOCOL_V72_COMMIT_REWRITE => {
+            Some(crate::init::REPOSITORY_PROTOCOL_V72_COMMIT_REWRITE)
+        }
+        Some(value) if value == crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP => None,
+        _ => {
+            return Err(migration_error(
+                "v72 row-PK-index bootstrap observed an unexpected protocol marker",
+            ));
+        }
+    };
+    if let Some(source_protocol) = backfill_source {
         backfill_missing_row_pk_indexes(
             adapter,
             storage,
             options,
             72,
-            REPOSITORY_PROTOCOL_V72,
+            source_protocol,
             crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP,
             "v72 row-PK-index bootstrap",
             false,
         )
         .await?;
-    } else if marker.as_deref()
-        != Some(crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP)
-    {
-        return Err(migration_error(
-            "v72 row-PK-index bootstrap observed an unexpected protocol marker",
-        ));
     }
 
     let read = SharedStorageAdapterRead::new(
@@ -407,12 +416,27 @@ async fn migrate_v73_row_pk_indexes<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    // A v73 repository normally arrives here under its rewrite fence; only a
+    // repository whose records were already v6 (nothing pending) keeps the
+    // plain marker.
+    let marker = load_repository_protocol_marker(adapter).await?;
+    let source_protocol = match marker.as_deref() {
+        Some(value) if value == REPOSITORY_PROTOCOL_V73 => REPOSITORY_PROTOCOL_V73,
+        Some(value) if value == crate::init::REPOSITORY_PROTOCOL_V73_COMMIT_REWRITE => {
+            crate::init::REPOSITORY_PROTOCOL_V73_COMMIT_REWRITE
+        }
+        _ => {
+            return Err(migration_error(
+                "v73 row-PK-index migration observed an unexpected protocol marker",
+            ));
+        }
+    };
     backfill_missing_row_pk_indexes(
         adapter,
         storage,
         options,
         73,
-        REPOSITORY_PROTOCOL_V73,
+        source_protocol,
         REPOSITORY_PROTOCOL_V74,
         "v73 row-PK-index migration",
         true,
@@ -437,8 +461,23 @@ async fn migrate_v74_complete_snapshot_commits<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    // A v74 repository normally arrives here under its rewrite fence; only a
+    // repository whose records were already v6, or one migrated up from a
+    // lower version (earlier edges publish the plain marker), carries v74.
+    let marker = load_repository_protocol_marker(adapter).await?;
+    let source_protocol = match marker.as_deref() {
+        Some(value) if value == REPOSITORY_PROTOCOL_V74 => REPOSITORY_PROTOCOL_V74,
+        Some(value) if value == crate::init::REPOSITORY_PROTOCOL_V74_COMMIT_REWRITE => {
+            crate::init::REPOSITORY_PROTOCOL_V74_COMMIT_REWRITE
+        }
+        _ => {
+            return Err(migration_error(
+                "v74 complete-snapshot migration observed an unexpected protocol marker",
+            ));
+        }
+    };
     let (members_injected, repaired_manifests) =
-        repair_filesystem_closure(adapter, storage, options).await?;
+        repair_filesystem_closure(adapter, storage, options, source_protocol).await?;
     let read = SharedStorageAdapterRead::new(
         adapter
             .begin_read(ReadOptions::default())
@@ -463,7 +502,7 @@ where
     crate::migration::publish::publish(
         storage,
         expected_revision,
-        REPOSITORY_PROTOCOL_V74,
+        source_protocol,
         crate::init::REPOSITORY_PROTOCOL_VALUE,
         publication,
     )
@@ -491,6 +530,7 @@ async fn repair_filesystem_closure<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
     storage: &S,
     options: MigrationOptions,
+    source_protocol: &'static [u8],
 ) -> Result<(u64, Vec<crate::tracked_state::CommitStateManifest>), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -850,7 +890,7 @@ where
                     Precondition::KeyValueEquals {
                         space: REPOSITORY_PROTOCOL_SPACE,
                         key: Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY)),
-                        expected: Bytes::from_static(REPOSITORY_PROTOCOL_V74),
+                        expected: Bytes::from_static(source_protocol),
                     },
                     crate::storage_adapter::repository_mutation_revision_precondition(
                         expected_revision,
@@ -1050,7 +1090,23 @@ where
     global_chronology.sort();
     read.finish().map_err(storage_error)?;
 
+    // Crash fence: the v6 records land atomically with a rewrite marker so
+    // an interruption before the next edge's publish leaves no store whose
+    // marker promises decodable records — an old engine refuses the unknown
+    // marker instead of failing on record bytes, and this engine resumes at
+    // the same source version (the parse maps each fence to it).
+    let fence = match expected_version {
+        72 => crate::init::REPOSITORY_PROTOCOL_V72_COMMIT_REWRITE,
+        73 => crate::init::REPOSITORY_PROTOCOL_V73_COMMIT_REWRITE,
+        74 => crate::init::REPOSITORY_PROTOCOL_V74_COMMIT_REWRITE,
+        other => {
+            return Err(migration_error(format!(
+                "{operation} has no rewrite fence for source version v{other}"
+            )));
+        }
+    };
     let mut writes = adapter.new_write_set();
+    writes.put(REPOSITORY_PROTOCOL_SPACE, REPOSITORY_PROTOCOL_KEY, fence);
     let mut rewritten = 0_u64;
     for (key, record) in pending {
         let base_commit_id = if global_commits.contains(&record.commit_id) {
@@ -1566,6 +1622,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v74_commit_rewrite_fence_resumes_to_v75() {
+        // A crash between the fenced record rewrite and the v75 publish
+        // leaves the v74 rewrite marker: normal opens must refuse it, and
+        // migration must resume from it to v75.
+        let storage = Memory::new();
+        seed_rooted_head_with_rootless_checkpoint_cursor(
+            &storage,
+            crate::init::REPOSITORY_PROTOCOL_V74_COMMIT_REWRITE,
+        )
+        .await;
+        assert!(
+            crate::engine::Engine::new(storage.clone()).await.is_err(),
+            "normal engine open must reject an interrupted rewrite"
+        );
+        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+            .await
+            .expect("an interrupted v74 rewrite resumes to v75");
+        assert_eq!(report.from_version, 74);
+        assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(
+            inspect_lix(&storage).await.unwrap(),
+            MigrationStatus::Current {
+                version: CURRENT_FORMAT_VERSION,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn v72_commit_rewrite_fence_resumes_through_the_chain() {
+        let storage = Memory::new();
+        seed_rooted_head_with_rootless_checkpoint_cursor(
+            &storage,
+            crate::init::REPOSITORY_PROTOCOL_V72_COMMIT_REWRITE,
+        )
+        .await;
+        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+            .await
+            .expect("an interrupted v72 rewrite resumes through the chain to v75");
+        assert_eq!(report.from_version, 72);
+        assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(
+            inspect_lix(&storage).await.unwrap(),
+            MigrationStatus::Current {
+                version: CURRENT_FORMAT_VERSION,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn filesystem_repair_surfaces_its_row_bound_instead_of_truncating() {
         // Regression: tracked-state scans truncate silently at their limit.
         // A budget below the repository's tracked filesystem rows once made
@@ -1582,6 +1687,7 @@ mod tests {
                 max_changes: 1,
                 ..MigrationOptions::default()
             },
+            REPOSITORY_PROTOCOL_V74,
         )
         .await
         .expect_err("a bound below the tracked filesystem rows must error, not truncate");

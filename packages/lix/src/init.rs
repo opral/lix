@@ -108,6 +108,16 @@ const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
 pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v75";
 pub(crate) const REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP: &[u8] =
     b"tracked-default-branch.v72-row-pk-bootstrap";
+/// Offline-migration fences for the v6 commit-record rewrite. The rewrite
+/// publishes atomically with one of these markers so no engine — old or
+/// current — ever reads v6 records under a marker it trusts as fully
+/// readable; each resumes as its source version's migration edge.
+pub(crate) const REPOSITORY_PROTOCOL_V72_COMMIT_REWRITE: &[u8] =
+    b"tracked-default-branch.v72-commit-rewrite";
+pub(crate) const REPOSITORY_PROTOCOL_V73_COMMIT_REWRITE: &[u8] =
+    b"tracked-default-branch.v73-commit-rewrite";
+pub(crate) const REPOSITORY_PROTOCOL_V74_COMMIT_REWRITE: &[u8] =
+    b"tracked-default-branch.v74-commit-rewrite";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -132,6 +142,15 @@ pub(crate) fn parse_repository_protocol(value: &[u8]) -> RepositoryProtocolStatu
     // this engine resumes it as the v72 migration edge.
     if value == REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP {
         return RepositoryProtocolStatus::MigrationRequired { found_version: 72 };
+    }
+    for (marker, found_version) in [
+        (REPOSITORY_PROTOCOL_V72_COMMIT_REWRITE, 72),
+        (REPOSITORY_PROTOCOL_V73_COMMIT_REWRITE, 73),
+        (REPOSITORY_PROTOCOL_V74_COMMIT_REWRITE, 74),
+    ] {
+        if value == marker {
+            return RepositoryProtocolStatus::MigrationRequired { found_version };
+        }
     }
     let Some(version_bytes) = value.strip_prefix(REPOSITORY_PROTOCOL_PREFIX) else {
         return RepositoryProtocolStatus::Malformed;
@@ -1357,6 +1376,18 @@ mod tests {
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v75"),
             RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v74-commit-rewrite"),
+            RepositoryProtocolStatus::MigrationRequired { found_version: 74 }
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v73-commit-rewrite"),
+            RepositoryProtocolStatus::MigrationRequired { found_version: 73 }
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v72-commit-rewrite"),
+            RepositoryProtocolStatus::MigrationRequired { found_version: 72 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v74"),
