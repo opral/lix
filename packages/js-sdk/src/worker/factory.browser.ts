@@ -21,6 +21,7 @@ export const openDirectLixBinding: undefined | ((
 	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
 	openProgress?: OpenProgressDispatch,
+	snapshot?: ReadableStream<Uint8Array>,
 ) => Promise<LixBinding>) = undefined;
 
 export function createWorkerConnection(): WorkerConnection {

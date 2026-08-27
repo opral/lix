@@ -4,7 +4,13 @@ import type {
 	WorkerInput,
 	WorkerResponse,
 } from "./protocol.js";
-import { BindingLease, LixWorkerClient, workerBinding } from "./client.js";
+import { SNAPSHOT_RESTORE_CHUNK_BYTES } from "../snapshot-restore.js";
+import {
+	BindingLease,
+	LixWorkerClient,
+	pumpSnapshotToWorker,
+	workerBinding,
+} from "./client.js";
 import { responseFromSyncFetch } from "./host.js";
 
 function fakeConnection(options: { terminate?: () => Promise<void> } = {}) {
@@ -126,6 +132,151 @@ function deferred<T>() {
 	});
 	return { promise, resolve, reject };
 }
+
+test("worker restore posts bounded owned chunks with request backpressure", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease();
+	const callerChunk = new Uint8Array(SNAPSHOT_RESTORE_CHUNK_BYTES * 2 + 11);
+	for (let index = 0; index < callerChunk.byteLength; index++) {
+		callerChunk[index] = index % 239;
+	}
+	const source = new ReadableStream<Uint8Array>(
+		{
+			start(controller) {
+				controller.enqueue(callerChunk);
+				controller.close();
+			},
+		},
+		{ highWaterMark: 0 },
+	);
+	const open = deferred<unknown>();
+	const pumping = pumpSnapshotToWorker(client, source.getReader(), 73, open.promise);
+	const postedChunks: Uint8Array[] = [];
+
+	for (let index = 0; index < 3; index++) {
+		await vi.waitFor(() => {
+			expect(
+				transport.sent.filter(
+					(message) =>
+						"id" in message &&
+						message.operation.kind === "openSnapshot.write",
+				).length,
+			).toBe(index + 1);
+		});
+		const request = transport.sent.at(-1);
+		if (
+			!request ||
+			!("id" in request) ||
+			request.operation.kind !== "openSnapshot.write"
+		) {
+			throw new Error("expected a snapshot write request");
+		}
+		postedChunks.push(request.operation.chunk);
+		expect(request.operation.chunk.byteLength).toBeLessThanOrEqual(
+			SNAPSHOT_RESTORE_CHUNK_BYTES,
+		);
+		expect(request.operation.chunk.buffer).not.toBe(callerChunk.buffer);
+		transport.emit({ id: request.id, ok: true });
+	}
+	await vi.waitFor(() => {
+		expect(
+			transport.sent.some(
+				(message) =>
+					"id" in message &&
+					message.operation.kind === "openSnapshot.finish",
+			),
+		).toBe(true);
+	});
+	const finish = transport.sent.at(-1);
+	if (
+		!finish ||
+		!("id" in finish) ||
+		finish.operation.kind !== "openSnapshot.finish"
+	) {
+		throw new Error("expected a snapshot finish request");
+	}
+	transport.emit({ id: finish.id, ok: true });
+	open.resolve(undefined);
+	await pumping;
+
+	expect(postedChunks.map((chunk) => chunk.byteLength)).toEqual([
+		SNAPSHOT_RESTORE_CHUNK_BYTES,
+		SNAPSHOT_RESTORE_CHUNK_BYTES,
+		11,
+	]);
+	const restored = new Uint8Array(callerChunk.byteLength);
+	let offset = 0;
+	for (const chunk of postedChunks) {
+		restored.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	expect(restored).toEqual(callerChunk);
+	await client.terminate();
+});
+
+test("worker open rejection interrupts a stalled source tail", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease();
+	let sent = false;
+	let canceled = false;
+	const source = new ReadableStream<Uint8Array>(
+		{
+			pull(controller) {
+				if (sent) return;
+				sent = true;
+				controller.enqueue(new TextEncoder().encode("not a snapshot"));
+			},
+			cancel() {
+				canceled = true;
+			},
+		},
+		{ highWaterMark: 0 },
+	);
+	const open = deferred<unknown>();
+	const pumping = pumpSnapshotToWorker(
+		client,
+		source.getReader(),
+		91,
+		open.promise,
+	);
+	await vi.waitFor(() => {
+		expect(
+			transport.sent.some(
+				(message) =>
+					"id" in message &&
+					message.operation.kind === "openSnapshot.write",
+			),
+		).toBe(true);
+	});
+	const write = transport.sent.at(-1);
+	if (
+		!write ||
+		!("id" in write) ||
+		write.operation.kind !== "openSnapshot.write"
+	) {
+		throw new Error("expected a snapshot write request");
+	}
+	transport.emit({ id: write.id, ok: true });
+	const semanticError = Object.assign(new Error("invalid snapshot header"), {
+		name: "LixError",
+		code: "LIX_INVALID_SNAPSHOT",
+	});
+	open.reject(semanticError);
+
+	await expect(pumping).rejects.toBe(semanticError);
+	expect(canceled).toBe(true);
+	expect(
+		transport.sent.some(
+			(message) =>
+				"kind" in message &&
+				message.kind === "openSnapshot.cancel" &&
+				message.snapshotId === 91,
+		),
+	).toBe(true);
+	await client.terminate();
+});
 
 test("browser sync resolves fresh headers for reconnect requests", async () => {
 	const transport = fakeConnection();

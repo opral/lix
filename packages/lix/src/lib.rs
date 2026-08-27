@@ -84,6 +84,7 @@ pub(crate) mod hot_state;
 pub(crate) mod init;
 pub(crate) mod json_store;
 mod migration;
+mod open_types;
 /// The declared module layer order and the test that enforces it. Test-only:
 /// it contains no engine code, just the layering artifact and its guard.
 #[cfg(test)]
@@ -100,6 +101,7 @@ mod prepared_dml;
 #[cfg(any(test, feature = "storage-benches"))]
 pub mod registered_spaces;
 mod schema;
+pub mod snapshot;
 #[cfg(any(feature = "server-protocol", feature = "server-protocol-client"))]
 pub mod server_protocol;
 mod session;
@@ -142,9 +144,12 @@ pub mod wasm;
 pub use plugin::runtime::default::runtime as default_wasm_runtime;
 pub use handle::{
     CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
-    ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenMigrationReport, OpenPhase,
-    OpenProgress, OpenProgressSink, OpenReport, ServerMode, ServerOptions,
+    ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder,
+    ServerMode, ServerOptions,
     TransactionExecuteBuilder, open_lix,
+};
+pub use open_types::{
+    OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
 };
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]

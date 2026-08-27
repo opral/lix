@@ -1,8 +1,8 @@
 //! Golden repository-format fixture coverage for filesystem commit membership
 //! across the v72 -> v74 migration.
 //!
-//! `fixtures/v72_filesystem_checkpoints.snapshot` is the raw
-//! `Memory::export_snapshot` output generated from revision
+//! `fixtures/v72_filesystem_checkpoints.lixsnap` is a `LIXSNAP` artifact
+//! converted from state generated at revision
 //! `4816fdba591d7165ff1b0195e74471aa8fc73660` by a generator that creates
 //! `/sales/playbook.md` and `/docs/handbook/inside.md`, takes a full
 //! checkpoint, creates `/brand/logo.md`, takes a partial (file-selected)
@@ -10,18 +10,19 @@
 //! v72 engine — that both checkpoint trees contain their directory
 //! descriptors before exporting, so any inconsistency observed after
 //! migration was introduced by the migration itself.
-//! SHA-256: `5ddf20055ae768c57f1926c6398b0a93e5b869955dbbb96dac59b2ace43d5657`.
+//! SHA-256: `76cd929c48a41f5e6cfcb9bc01bd134b50cbc767e5c5eca72b4d03dcb6c1e193`.
 //!
 //! Regression: a repository migrated to v74 served checkpoint trees whose
 //! file descriptors referenced directories missing from the same tree
 //! ("filesystem descriptor references missing directory"), which fails every
 //! `lix_diff` / `lix_state_at` read touching the relation at that commit.
 
-use lix::{Memory, Value, open_lix};
+use futures_lite::io::Cursor;
+use lix::{Value, open_lix};
 use std::collections::HashSet;
 
 const V72_FILESYSTEM_SNAPSHOT: &[u8] =
-    include_bytes!("fixtures/v72_filesystem_checkpoints.snapshot");
+    include_bytes!("fixtures/v72_filesystem_checkpoints.lixsnap");
 
 /// Asserts every file row's `directory_id` resolves among the same tree's
 /// directory rows — the closure invariant the v75 migration repairs.
@@ -49,10 +50,8 @@ fn assert_files_resolve_directories(
 
 #[tokio::test]
 async fn checkpointed_directories_survive_the_v74_migration() {
-    let storage = Memory::from_snapshot(V72_FILESYSTEM_SNAPSHOT)
-        .expect("v72 filesystem fixture should decode");
     let lix = open_lix()
-        .with_storage(storage)
+        .from_snapshot(Cursor::new(V72_FILESYSTEM_SNAPSHOT))
         .await
         .expect("opening the v72 filesystem fixture should migrate it automatically");
     let migration = lix

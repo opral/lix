@@ -1,19 +1,18 @@
 //! Golden repository-format fixture coverage for the v72 account schema.
 //!
-//! `fixtures/v72_account_without_profile_uri.snapshot` is the raw
-//! `Memory::export_snapshot` output generated from parent revision
+//! `fixtures/v72_account_without_profile_uri.lixsnap` is a `LIXSNAP` artifact
+//! converted from state generated at parent revision
 //! `4816fdba591d7165ff1b0195e74471aa8fc73660`, before `profile_uri` was added.
 //! It contains the v72 bootstrap account rows and persisted account schema.
-//! SHA-256: `05503801b91c41d821897e76ee64c476851336932e3b9c9a6618210e66b60b29`.
+//! SHA-256: `92456923e13bdd5d171e68cd3cb0f1860cd06d8275aad133269598178ed0ed94`.
 
 use std::sync::{Arc, Mutex};
 
-use lix::{
-    ANONYMOUS_ACCOUNT_ID, Memory, OpenPhase, OpenProgress, OpenProgressSink, Value, open_lix,
-};
+use futures_lite::io::Cursor;
+use lix::{ANONYMOUS_ACCOUNT_ID, OpenPhase, OpenProgress, OpenProgressSink, Value, open_lix};
 
 const V72_ACCOUNT_SNAPSHOT: &[u8] =
-    include_bytes!("fixtures/v72_account_without_profile_uri.snapshot");
+    include_bytes!("fixtures/v72_account_without_profile_uri.lixsnap");
 
 #[derive(Default)]
 struct RecordingProgress {
@@ -66,12 +65,10 @@ async fn fresh_open_reports_initialization_without_migration() {
 
 #[tokio::test]
 async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
-    let storage =
-        Memory::from_snapshot(V72_ACCOUNT_SNAPSHOT).expect("v72 account fixture should decode");
     let progress = Arc::new(RecordingProgress::default());
     let lix = open_lix()
-        .with_storage(storage.clone())
         .with_open_progress_sink(progress.clone())
+        .from_snapshot(Cursor::new(V72_ACCOUNT_SNAPSHOT))
         .await
         .expect("opening a v72 repository should migrate it automatically");
     assert_eq!(lix.open_report().format, 76);
@@ -131,17 +128,14 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
         .await
         .expect("profile_uri update should succeed");
     assert_eq!(updated.rows_affected(), 1);
-    lix.close().await.expect("migrated repository should close");
-    drop(lix);
-
-    let migrated = storage
-        .export_snapshot()
-        .expect("migrated repository should export");
-    drop(storage);
-    let reopened = Memory::from_snapshot(&migrated)
-        .expect("migrated repository should import into a fresh backend");
+    let mut migrated = Vec::new();
+    lix.export_snapshot()
+        .write_to(&mut migrated)
+        .await
+        .expect("migrated Lix should export");
+    lix.close().await.expect("migrated Lix should close");
     let lix = open_lix()
-        .with_storage(reopened)
+        .from_snapshot(Cursor::new(migrated))
         .await
         .expect("migrated repository should cold-open");
     assert_eq!(lix.open_report().format, 76);

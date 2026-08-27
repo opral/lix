@@ -12,6 +12,7 @@ import type {
 	RemoteLixFetch,
 	SyncLixServerOptions,
 } from "../types.js";
+import { ownedSnapshotRestoreChunks } from "../snapshot-restore.js";
 import {
 	deserializeWorkerError,
 	serializeWorkerError,
@@ -43,26 +44,109 @@ export async function openLixWorker(
 	telemetry?: LixTelemetryOptions,
 	server?: SyncServerRuntimeOptions,
 	onProgress?: (progress: LixOpenProgress) => void,
+	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixWorkerClient> {
 	let client = idleWorkers.pop();
 	while (client?.isDisposed) client = idleWorkers.pop();
 	client ??= new LixWorkerClient();
 	client.beginLease(onDisposed, telemetry, server, onProgress);
+	let snapshotReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+	let snapshotPumpStarted = false;
 	try {
-		client.openReport = await client.request<LixOpenReport | undefined>(
+		// Lock the source before telling the worker to start a restore. A locked or
+		// otherwise unusable stream therefore cannot leave a worker open pending input.
+		snapshotReader = snapshot?.getReader();
+		const snapshotId = snapshotReader
+			? client.allocateSnapshotInputId()
+			: undefined;
+		const open = client.request<LixOpenReport | undefined>(
 			{
 				kind: "open",
 				storage,
 				telemetryEnabled: telemetry !== undefined,
 				progressEnabled: onProgress !== undefined,
+				snapshotId,
 				server: serializeSyncServer(server),
 			},
 			0,
 		);
+		if (snapshotReader && snapshotId !== undefined) {
+			snapshotPumpStarted = true;
+			await pumpSnapshotToWorker(client, snapshotReader, snapshotId, open);
+		}
+		client.openReport = await open;
 		return client;
 	} catch (error) {
+		if (snapshotReader && !snapshotPumpStarted) {
+			await snapshotReader.cancel(error).catch(() => undefined);
+			snapshotReader.releaseLock();
+		}
 		await client.terminate();
 		throw error;
+	}
+}
+
+export async function pumpSnapshotToWorker(
+	client: LixWorkerClient,
+	reader: ReadableStreamDefaultReader<Uint8Array>,
+	snapshotId: number,
+	open: Promise<unknown>,
+): Promise<void> {
+	let producerError = false;
+	// Convert rejection into data immediately so an early worker-open failure is
+	// always observed, even while or after a source read is pending.
+	const openCompletion = open.then(
+		(value) => ({ kind: "open-complete", value }) as const,
+		(error: unknown) => ({ kind: "open-error", error }) as const,
+	);
+	try {
+		while (true) {
+			const outcome = await Promise.race([
+				reader.read().then(
+					(result) => ({ kind: "source", result }) as const,
+					(error: unknown) => ({ kind: "source-error", error }) as const,
+				),
+				openCompletion,
+			]);
+			if (outcome.kind === "open-error") throw outcome.error;
+			if (outcome.kind === "open-complete") {
+				// Success cannot normally precede EOF, but if a binding completes early,
+				// stop consuming the now-unneeded producer without reporting an error.
+				await reader.cancel().catch(() => undefined);
+				return;
+			}
+			if (outcome.kind === "source-error") {
+				producerError = true;
+				throw outcome.error;
+			}
+			const read = outcome.result;
+			if (read.done) break;
+			if (!(read.value instanceof Uint8Array)) {
+				producerError = true;
+				throw new TypeError("snapshot stream chunks must be Uint8Array values");
+			}
+			for (const chunk of ownedSnapshotRestoreChunks(read.value)) {
+				await client.request({
+					kind: "openSnapshot.write",
+					snapshotId,
+					chunk,
+				});
+			}
+		}
+		await client.request({ kind: "openSnapshot.finish", snapshotId });
+	} catch (error) {
+		await reader.cancel(error).catch(() => undefined);
+		client.notify({ kind: "openSnapshot.cancel", snapshotId });
+		try {
+			await open;
+		} catch (openError) {
+			// Decoder errors are more useful than the restore-lane write/close
+			// rejection. Producer errors remain authoritative.
+			if (!producerError) throw openError;
+		}
+		throw error;
+	} finally {
+		reader.releaseLock();
 	}
 }
 
@@ -73,6 +157,7 @@ export async function openLixWorkerBinding(
 	telemetry?: LixTelemetryOptions,
 	server?: SyncServerRuntimeOptions,
 	onProgress?: (progress: LixOpenProgress) => void,
+	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
 	if (openDirectLixBinding) {
 		const telemetryDispatch = telemetry
@@ -90,6 +175,7 @@ export async function openLixWorkerBinding(
 			telemetry?.parentContext?.(),
 			await resolveDirectSyncServer(server),
 			onProgress,
+			snapshot,
 		);
 		if (binding) {
 			const operationAwareBinding = telemetry?.parentContext
@@ -108,6 +194,7 @@ export async function openLixWorkerBinding(
 		telemetry,
 		server,
 		onProgress,
+		snapshot,
 	);
 	return workerBinding(
 		client,
@@ -308,6 +395,27 @@ export function workerBinding(
 			request({ kind: "mergeBranchPreview", options }),
 		mergeBranch: (options) => request({ kind: "mergeBranch", options }),
 		syncDiskToLix: () => request({ kind: "syncDiskToLix" }),
+		exportSnapshot: () => {
+			const exportId = request<number>({ kind: "exportSnapshot" });
+			let canceled = false;
+			return {
+				next: async () => {
+					if (canceled) return undefined;
+					return request<Uint8Array | undefined>({
+						kind: "exportSnapshot.next",
+						exportId: await exportId,
+					});
+				},
+				cancel: async () => {
+					if (canceled) return;
+					canceled = true;
+					await request({
+						kind: "exportSnapshot.cancel",
+						exportId: await exportId,
+					});
+				},
+			};
+		},
 		close: async () => {
 			if (closed) return;
 			try {
@@ -367,6 +475,7 @@ async function releaseWorker(client: LixWorkerClient): Promise<void> {
 
 export class LixWorkerClient {
 	private nextRequestId = 1;
+	private nextSnapshotInputId = 1;
 	private readonly pending = new Map<number, PendingRequest>();
 	private disposed = false;
 	private leased = false;
@@ -386,6 +495,10 @@ export class LixWorkerClient {
 
 	get isDisposed(): boolean {
 		return this.disposed;
+	}
+
+	allocateSnapshotInputId(): number {
+		return this.nextSnapshotInputId++;
 	}
 
 	beginLease(

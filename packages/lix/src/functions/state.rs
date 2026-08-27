@@ -419,14 +419,12 @@ mod tests {
             .await
             .expect("sequence should publish");
 
-        let snapshot = memory
-            .export_snapshot()
-            .expect("published sequence storage should snapshot");
+        let reopened = memory
+            .fork()
+            .expect("published sequence storage should fork");
         drop(storage);
         drop(memory);
-        let storage = StorageAdapter::new(
-            Memory::from_snapshot(&snapshot).expect("published sequence storage should reopen"),
-        );
+        let storage = StorageAdapter::new(reopened);
 
         let read = storage
             .begin_read(StorageReadOptions::default())

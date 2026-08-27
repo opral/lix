@@ -1,5 +1,5 @@
 import { Worker } from "node:worker_threads";
-import { openNativeLixBinding } from "../binding.node.js";
+import { openLixBinding } from "../binding.node.js";
 import type {
 	LixBinding,
 	LixStorageConfig,
@@ -71,18 +71,14 @@ export const openDirectLixBinding = async (
 	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
 	openProgress?: OpenProgressDispatch,
+	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding | undefined> => {
-	try {
-		return await openNativeLixBinding(
-			storage,
-			telemetry,
-			telemetryParent,
-			server,
-			openProgress,
-		);
-	} catch (error) {
-		if (server !== undefined) throw error;
-		if (storage.kind === "memory") return undefined;
-		throw error;
-	}
+	return openLixBinding(
+		storage,
+		telemetry,
+		telemetryParent,
+		server,
+		openProgress,
+		snapshot,
+	);
 };

@@ -13595,7 +13595,7 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("base closure fixture should publish");
-        let snapshot = memory.export_snapshot().expect("base fixture snapshot");
+        let base = memory.fork().expect("base fixture fork");
         drop(storage);
         drop(memory);
         let missing_row_pk = RowPk::single("missing-member");
@@ -13608,7 +13608,7 @@ mod tests {
             ("forged", "identity digest"),
         ] {
             let storage = StorageAdapter::new(
-                Memory::from_snapshot(&snapshot).expect("reopen base closure fixture"),
+                base.fork().expect("fork base closure fixture"),
             );
             let control_key = StorageKey(Bytes::from(hot_collection_control_key(
                 BRANCH_ID, generation, scope,

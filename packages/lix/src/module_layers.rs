@@ -29,7 +29,13 @@
 /// allowances. See [`UNLAYERED_MODULES`] for what is not covered yet and why.
 const MODULE_LAYERS: &[&[&str]] = &[
     // Pure encodings with no repository semantics.
-    &["compression", "plugin_wire", "storage_codec", "wasm"],
+    &[
+        "compression",
+        "open_types",
+        "plugin_wire",
+        "storage_codec",
+        "wasm",
+    ],
     // The physical key space and write-set mechanism everything above records
     // its bytes through.
     &["storage_adapter"],
@@ -132,6 +138,10 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ),
     ("registered_spaces", "cfg-gated harness"),
     ("schema", "not yet analysed"),
+    (
+        "snapshot",
+        "portable repository export and restore orchestration spans storage and migration",
+    ),
     (
         "server_protocol",
         "optional public HTTP facade; orchestrates sessions and engine APIs",

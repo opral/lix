@@ -8,6 +8,10 @@ Lix has pluggable storage. A storage adapter decides where local bytes live. The
 Lix API stays the same: `execute`, `createBranch`, and `mergeBranch` do not
 change with the adapter.
 
+To export or restore a complete Lix as a portable artifact,
+see [Snapshots](./snapshots.md). Snapshot export is separate from the
+incremental persistence performed by an adapter during normal operation.
+
 Storage and server mode are separate choices:
 
 | Setup  | Storage                                     | Server           | Reads and writes                       |

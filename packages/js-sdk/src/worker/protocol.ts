@@ -52,8 +52,11 @@ export type WorkerOperation =
 			storage: LixStorageConfig;
 			telemetryEnabled: boolean;
 			progressEnabled: boolean;
+			snapshotId?: number;
 			server?: WorkerSyncServerOptions;
 	  }
+	| { kind: "openSnapshot.write"; snapshotId: number; chunk: Uint8Array }
+	| { kind: "openSnapshot.finish"; snapshotId: number }
 	| { kind: "openAnotherSession"; options: OpenAnotherSessionOptions }
 	| {
 			kind: "execute";
@@ -87,6 +90,9 @@ export type WorkerOperation =
 	| { kind: "mergeBranch"; options: MergeBranchOptions }
 	| { kind: "importFilesystemPaths"; paths: string[] }
 	| { kind: "syncDiskToLix" }
+	| { kind: "exportSnapshot" }
+	| { kind: "exportSnapshot.next"; exportId: number }
+	| { kind: "exportSnapshot.cancel"; exportId: number }
 	| { kind: "observe"; sql: string; params: BindingParam[] }
 	| { kind: "observe.next"; observeId: number }
 	| { kind: "close" };
@@ -94,6 +100,7 @@ export type WorkerOperation =
 export type WorkerNotification =
 	| { kind: "transaction.abandon"; transactionId: number }
 	| { kind: "observe.close"; observeId: number }
+	| { kind: "openSnapshot.cancel"; snapshotId: number }
 	| {
 			kind: "sync.headers.result";
 			requestId: number;

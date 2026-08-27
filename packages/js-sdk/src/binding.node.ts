@@ -9,7 +9,9 @@ import type {
 	TelemetryDispatch,
 	TelemetryParentContext,
 	OpenProgressDispatch,
+	SnapshotRestoreBinding,
 } from "./binding-types.js";
+import { restoreSnapshot } from "./snapshot-restore.js";
 
 type NativeAddon = {
 	Lix: {
@@ -20,6 +22,11 @@ type NativeAddon = {
 			serverHeaders?: [string, string][],
 			openProgress?: (progressJson: string) => void,
 		): Promise<NativeLixBinding>;
+		openMemoryFromSnapshot(
+			telemetry?: (spanJson: string) => void,
+			telemetryParentJson?: string,
+			openProgress?: (progressJson: string) => void,
+		): SnapshotRestoreBinding<NativeLixBinding>;
 		openFilesystemStorage(
 			path: string,
 			syncAllFiles: boolean,
@@ -29,6 +36,13 @@ type NativeAddon = {
 			serverHeaders?: [string, string][],
 			openProgress?: (progressJson: string) => void,
 		): Promise<NativeLixBinding>;
+		openFilesystemStorageFromSnapshot(
+			path: string,
+			syncAllFiles: boolean,
+			telemetry?: (spanJson: string) => void,
+			telemetryParentJson?: string,
+			openProgress?: (progressJson: string) => void,
+		): SnapshotRestoreBinding<NativeLixBinding>;
 	};
 };
 
@@ -117,7 +131,14 @@ function resolveNativePath() {
 }
 
 let addon: NativeAddon | undefined;
-let addonLoadError: Error | undefined;
+let addonLoadError: NativeAddonUnavailableError | undefined;
+
+class NativeAddonUnavailableError extends Error {
+	constructor(message: string, options: ErrorOptions) {
+		super(message, options);
+		this.name = "NativeAddonUnavailableError";
+	}
+}
 
 function loadNativeAddon(): NativeAddon {
 	if (addon) return addon;
@@ -126,7 +147,7 @@ function loadNativeAddon(): NativeAddon {
 		addon = require(resolveNativePath()) as NativeAddon;
 		return addon;
 	} catch (cause) {
-		const error = new Error(
+		const error = new NativeAddonUnavailableError(
 			`Failed to load @lix-js/sdk native addon for ${process.platform}-${process.arch}. ` +
 				"This package requires the matching optional native binary package. " +
 				"Run `npm run build` from packages/js-sdk for local development, or install a release that includes your platform binary.",
@@ -143,6 +164,7 @@ export async function openLixBinding(
 	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
 	openProgress?: OpenProgressDispatch,
+	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
 	try {
 		return await openNativeLixBinding(
@@ -151,9 +173,16 @@ export async function openLixBinding(
 			telemetryParent,
 			server,
 			openProgress,
+			snapshot,
 		);
 	} catch (nativeError) {
-		if (storage.kind !== "memory" || server !== undefined) throw nativeError;
+		if (
+			!(nativeError instanceof NativeAddonUnavailableError) ||
+			storage.kind !== "memory" ||
+			server !== undefined
+		) {
+			throw nativeError;
+		}
 		try {
 			const { openMemoryWasmBinding } = await import(
 				"./binding.node-wasm.js"
@@ -162,6 +191,7 @@ export async function openLixBinding(
 				telemetry,
 				telemetryParent,
 				openProgress,
+				snapshot,
 			);
 		} catch (wasmError) {
 			throw new AggregateError(
@@ -178,6 +208,7 @@ export async function openNativeLixBinding(
 	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
 	openProgress?: OpenProgressDispatch,
+	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
 	if (server?.fetch) {
 		throw new TypeError("Custom sync fetch is only supported by the browser worker");
@@ -197,6 +228,16 @@ export async function openNativeLixBinding(
 			const nativeTelemetry = telemetry
 				? (spanJson: string) => telemetry(JSON.parse(spanJson))
 				: undefined;
+			if (snapshot) {
+				const restore = nativeAddon.Lix.openMemoryFromSnapshot(
+					nativeTelemetry,
+					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
+					nativeOpenProgress,
+				);
+				return normalizeNativeBinding(
+					await restoreSnapshot(snapshot, restore),
+				);
+			}
 			if (nativeTelemetry) {
 				return normalizeNativeBinding(await nativeAddon.Lix.openMemory(
 					nativeTelemetry,
@@ -221,6 +262,18 @@ export async function openNativeLixBinding(
 			const nativeTelemetry = telemetry
 				? (spanJson: string) => telemetry(JSON.parse(spanJson))
 				: undefined;
+			if (snapshot) {
+				const restore = nativeAddon.Lix.openFilesystemStorageFromSnapshot(
+					storage.path,
+					storage.syncAllFiles,
+					nativeTelemetry,
+					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
+					nativeOpenProgress,
+				);
+				return normalizeNativeBinding(
+					await restoreSnapshot(snapshot, restore),
+				);
+			}
 			if (nativeTelemetry) {
 				return normalizeNativeBinding(await nativeAddon.Lix.openFilesystemStorage(
 					storage.path,
