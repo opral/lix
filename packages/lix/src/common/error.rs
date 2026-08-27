@@ -266,6 +266,70 @@ impl LixError {
         }))
     }
 
+    /// A row could not be normalized because its schema is outside the
+    /// transaction's visible commit graph and durability scope.
+    pub fn schema_not_visible(
+        schema_key: impl Into<String>,
+        entity_commit_id: Option<impl Into<String>>,
+        base_commit_id: Option<impl Into<String>>,
+        branch_id: impl Into<String>,
+        untracked: bool,
+    ) -> Self {
+        let schema_key = schema_key.into();
+        let entity_commit_id = entity_commit_id.map(Into::into);
+        let base_commit_id = base_commit_id.map(Into::into);
+        let branch_id = branch_id.into();
+        let scope = format!("branch:{branch_id}");
+        let hint = match (entity_commit_id.as_deref(), base_commit_id.as_deref()) {
+            (Some(entity_commit_id), Some(base_commit_id)) if entity_commit_id != base_commit_id => {
+                format!(
+                    "The entity comes from commit {entity_commit_id}, but schema '{schema_key}' is not visible from this transaction's base commit {base_commit_id} in {scope} ({} lane). This usually indicates that the entity commit is not an ancestor of the transaction base, or that the schema was registered in a different branch or durability scope.",
+                    if untracked { "untracked" } else { "tracked" }
+                )
+            }
+            (_, Some(base_commit_id)) => format!(
+                "Schema '{schema_key}' is not visible from this transaction's base commit {base_commit_id} in {scope} ({} lane). This usually indicates that the schema was registered in a different branch or durability scope.",
+                if untracked { "untracked" } else { "tracked" }
+            ),
+            _ => format!(
+                "Schema '{schema_key}' is not visible in {scope} ({} lane). This usually indicates that the schema was registered in a different branch or durability scope.",
+                if untracked { "untracked" } else { "tracked" }
+            ),
+        };
+        let mut details = serde_json::Map::from_iter([
+            ("schema_key".to_string(), JsonValue::String(schema_key.clone())),
+            ("scope".to_string(), JsonValue::String(scope)),
+            (
+                "durability".to_string(),
+                JsonValue::String(if untracked { "untracked" } else { "tracked" }.to_string()),
+            ),
+        ]);
+        if let Some(entity_commit_id) = entity_commit_id {
+            details.insert(
+                "entity_commit_id".to_string(),
+                JsonValue::String(entity_commit_id),
+            );
+        }
+        if let Some(base_commit_id) = base_commit_id {
+            details.insert(
+                "base_commit_id".to_string(),
+                JsonValue::String(base_commit_id),
+            );
+        }
+        Self::new(
+            Self::CODE_SCHEMA_DEFINITION,
+            format!("schema '{schema_key}' is not visible to this transaction"),
+        )
+        .with_details(JsonValue::Object(details))
+        .with_hint(hint)
+    }
+
+    /// Construct an internal invariant failure with the entity coordinates
+    /// needed to turn the surfaced error into an actionable bug report.
+    pub fn internal_invariant(message: impl Into<String>, entities: JsonValue) -> Self {
+        Self::new(Self::CODE_INTERNAL_ERROR, message).with_details(entities)
+    }
+
     pub fn ambiguous_merge_base(
         left_commit_id: impl Into<String>,
         right_commit_id: impl Into<String>,

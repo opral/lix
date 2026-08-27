@@ -600,12 +600,18 @@ where
 }
 
 fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixError {
-    LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
+    LixError::internal_invariant(
         format!(
             "current-state commit contains duplicate mutation for schema '{}' row_pk '{:?}' file_id '{:?}'",
             delta.schema_key, delta.row_pk, delta.file_id
         ),
+        serde_json::json!({
+            "schema_key": delta.schema_key,
+            "row_pk": delta.row_pk.as_typed_json_array_value().ok(),
+            "file_id": delta.file_id,
+            "change_id": delta.change_id.map(|value| value.to_string()),
+            "commit_id": delta.commit_id.map(|value| value.to_string()),
+        }),
     )
 }
 

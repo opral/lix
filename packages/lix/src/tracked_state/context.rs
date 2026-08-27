@@ -1832,13 +1832,19 @@ where
                 {
                     continue;
                 }
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
+                return Err(LixError::internal_invariant(
                     format!(
                         "tracked-state diff row '{}' does not match commit '{}' delta index",
                         row.change_id(),
                         commit_id
                     ),
+                    serde_json::json!({
+                        "change_id": row.change_id().to_string(),
+                        "commit_id": commit_id.to_string(),
+                        "schema_key": row.schema_key(),
+                        "row_pk": row.row_pk().as_typed_json_array_value().ok(),
+                        "file_id": row.file_id(),
+                    }),
                 ));
             }
         }
@@ -5100,11 +5106,13 @@ pub(crate) struct TrackedStateWriteReport {
 }
 
 fn missing_commit_root_error(commit_id: &str) -> LixError {
-    LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
+    LixError::internal_invariant(
         format!(
             "tracked_state rooted commit authority is missing snapshot metadata for commit '{commit_id}'"
         ),
+        serde_json::json!({
+            "commit_id": commit_id,
+        }),
     )
 }
 
@@ -8527,6 +8535,19 @@ mod tests {
         assert!(
             error.message.contains("missing from owning commit"),
             "unexpected error: {error}"
+        );
+        let details = error
+            .details
+            .as_ref()
+            .expect("internal invariant should retain entity coordinates");
+        assert_eq!(details["change_id"], row.change_id.to_string());
+        assert_eq!(details["commit_id"], commit_id.to_string());
+        assert_eq!(details["schema_key"], row.schema_key);
+        assert_eq!(
+            details["row_pk"],
+            row.row_pk
+                .as_typed_json_array_value()
+                .expect("test row PK should encode")
         );
     }
 
