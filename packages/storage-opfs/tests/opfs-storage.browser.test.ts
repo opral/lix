@@ -9,6 +9,7 @@ import { expect, test } from "vitest";
 import { OpfsStorageClient } from "../js/client.js";
 import {
 	OPFS_RPC_CHANNEL,
+	OPFS_RPC_PROTOCOL_VERSION,
 	type OpfsChannelMessage,
 	type OpfsRpcRequest,
 	type OpfsRpcResponse,
@@ -195,6 +196,106 @@ test("joins one storage session generation across provider clients", async () =>
 		await Promise.all([first.close(), second.close()]);
 	}
 });
+
+test("preserves the storage session across an owner handoff", async () => {
+	const name = `lix-opfs-session-handoff:${crypto.randomUUID()}`;
+	const first = await runSessionHandoffWorker({ name, phase: "acquire" });
+	const second = await runSessionHandoffWorker({
+		name,
+		phase: "reopen",
+		expectedToken: first.token,
+	});
+	expect(second).toEqual({
+		token: first.token,
+		tokenlessFenced: true,
+		writeCommitted: true,
+	});
+});
+
+test("keeps a live client writable after its owner worker is replaced", async () => {
+	const name = `lix-opfs-live-session-handoff:${crypto.randomUUID()}`;
+	const channelName = `lix-opfs-live-session-channel:${crypto.randomUUID()}`;
+	const ownerUrl = new URL("../dist/owner.js", import.meta.url);
+	ownerUrl.searchParams.set("rpcChannel", channelName);
+	let owner = new Worker(ownerUrl, { type: "module" });
+	const client = await OpfsStorageClient.open(name, channelName);
+	const space: LixStorageSpace = {
+		id: 47,
+		name: "live-session-handoff",
+		valueSemantics: "mutable",
+		valueIntegrity: "backendVerified",
+	};
+	try {
+		const token = await client.acquireSession();
+		owner.terminate();
+		await expect
+			.poll(async () => {
+				const locks = await navigator.locks.query();
+				return locks.held?.some((lock) => lock.name?.endsWith(name)) ?? false;
+			})
+			.toBe(false);
+
+		owner = new Worker(ownerUrl, { type: "module" });
+		const write = await client.beginWrite({
+			awaitDurable: false,
+			preconditions: [],
+			batchCapacityHintBytes: 2,
+			sessionToken: token,
+		});
+		await write.putMany(space, [
+			{ key: new Uint8Array([1]), value: new Uint8Array([2]) },
+		]);
+		await write.commit();
+
+		const read = await client.beginRead({
+			consistency: "latest",
+			durability: "visible",
+			sessionToken: token,
+		});
+		expect(
+			await read.getMany([
+				{
+					space,
+					keys: [new Uint8Array([1])],
+					options: { projection: "fullValue" },
+				},
+			]),
+		).toEqual([{ kind: "fullValue", value: new Uint8Array([2]) }]);
+	} finally {
+		await client.close();
+		owner.terminate();
+	}
+});
+
+async function runSessionHandoffWorker(request: {
+	name: string;
+	phase: "acquire" | "reopen";
+	expectedToken?: string;
+}): Promise<{
+	token: string;
+	tokenlessFenced?: boolean;
+	writeCommitted?: boolean;
+}> {
+	const worker = new Worker(
+		new URL("./opfs-session-handoff.worker.ts", import.meta.url),
+		{ type: "module" },
+	);
+	try {
+		return await new Promise((resolve, reject) => {
+			worker.onmessage = (event) => {
+				const response = event.data as
+					| { ok: true; result: Awaited<ReturnType<typeof runSessionHandoffWorker>> }
+					| { ok: false; message: string };
+				if (response.ok) resolve(response.result);
+				else reject(new Error(response.message));
+			};
+			worker.onerror = (event) => reject(new Error(event.message));
+			worker.postMessage(request);
+		});
+	} finally {
+		worker.terminate();
+	}
+}
 
 test("fences a tokenless write prepared before session acquisition", async () => {
 	const provider = await openProvider(
@@ -426,7 +527,7 @@ test("does not replay a request after its owner response completes", async () =>
 	const channel = new BroadcastChannel(OPFS_RPC_CHANNEL);
 	const request: OpfsRpcRequest = {
 		kind: "request",
-		protocolVersion: 2,
+		protocolVersion: OPFS_RPC_PROTOCOL_VERSION,
 		requestId: crypto.randomUUID(),
 		clientId: crypto.randomUUID(),
 		storageName,

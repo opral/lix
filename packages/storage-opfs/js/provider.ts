@@ -34,6 +34,7 @@ import {
 	configureSqliteOpfsDurability,
 	fenceSqliteOpfsDurability,
 } from "./sqlite-durability.js";
+import { OPFS_RPC_PROTOCOL_VERSION } from "./rpc.js";
 
 type SqliteValue =
 	| string
@@ -63,7 +64,8 @@ type BrowserNavigator = {
 
 const SQLITE_VFS_NAME_PREFIX = "lix-opfs-sahpool-";
 const OPFS_LOCK_PREFIX = "lix:opfs-sqlite:";
-const OPFS_PROTOCOL_LOCK_PREFIX = "lix:opfs-owner:rpc-v2:";
+const OPFS_PROTOCOL_LOCK_PREFIX =
+	`lix:opfs-owner:rpc-v${OPFS_RPC_PROTOCOL_VERSION}:`;
 const SQLITE_VFS_DIRECTORY = "/lix/sqlite-sahpool";
 // Keep point reads comfortably below SQLite's conservative 999-variable
 // ceiling while collapsing hundreds of JS/Wasm bind-step-reset crossings into
@@ -79,7 +81,13 @@ CREATE TABLE IF NOT EXISTS lix_entries (
   value BLOB NOT NULL,
   PRIMARY KEY (space, key)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS lix_storage_metadata (
+  key TEXT NOT NULL PRIMARY KEY,
+  value TEXT NOT NULL
+) WITHOUT ROWID;
 `;
+
+const STORAGE_SESSION_METADATA_KEY = "session-token";
 
 let sqliteModule: Promise<SqliteInit> | undefined;
 const pools = new Map<string, Promise<SAHPoolUtil>>();
@@ -103,10 +111,12 @@ export class OpfsBackend implements LixStorageProvider {
 		database: OpfsSAHPoolDatabase,
 		pool: SAHPoolUtil,
 		releaseLock: () => Promise<void>,
+		sessionToken: string | undefined,
 	) {
 		this.#database = database;
 		this.#pool = pool;
 		this.#releaseLock = releaseLock;
+		this.#sessionToken = sessionToken;
 	}
 
 	static async open(
@@ -129,7 +139,11 @@ export class OpfsBackend implements LixStorageProvider {
 			database = new pool.OpfsSAHPoolDb("/repository.sqlite3");
 			configureSqliteOpfsDurability(database);
 			database.exec(SQLITE_SCHEMA);
-			return new OpfsBackend(database, pool, releaseLock);
+			const sessionToken = database.selectValue(
+				"SELECT value FROM lix_storage_metadata WHERE key = ?",
+				[STORAGE_SESSION_METADATA_KEY],
+			) as string | undefined;
+			return new OpfsBackend(database, pool, releaseLock, sessionToken);
 		} catch (error) {
 			try {
 				database?.close();
@@ -144,7 +158,14 @@ export class OpfsBackend implements LixStorageProvider {
 
 	async acquireSession(): Promise<string> {
 		this.#assertOpen();
-		this.#sessionToken ??= mintSessionToken();
+		if (this.#sessionToken === undefined) {
+			const token = mintSessionToken();
+			this.#database.exec({
+				sql: "INSERT INTO lix_storage_metadata(key, value) VALUES (?, ?)",
+				bind: [STORAGE_SESSION_METADATA_KEY, token],
+			});
+			this.#sessionToken = token;
+		}
 		return this.#sessionToken;
 	}
 
