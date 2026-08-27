@@ -29,7 +29,8 @@ mod conformance;
 pub(crate) use crate::storage::StorageWrite;
 pub use crate::storage::{
     BeginScanOptions as StorageBeginScanOptions, BufferRange,
-    CoreProjection as StorageCoreProjection, EncodedMutationBatch, EncodedPut,
+    CommitResult as StorageCommitResult, CoreProjection as StorageCoreProjection,
+    EncodedMutationBatch, EncodedPut,
     GetManyRequest as StorageGetManyRequest, GetManyResult as StorageGetManyResult,
     GetOptions as StorageGetOptions, Key as StorageKey, KeyRange as StorageKeyRange,
     MAX_SCAN_PAGE_ROWS, Memory, MemoryRead, MemoryWrite, Precondition as StoragePrecondition,
@@ -37,7 +38,8 @@ pub use crate::storage::{
     ReadDurability as StorageReadDurability, ReadEntry as StorageReadEntry,
     ReadOptions as StorageReadOptions, ScanChunk as StorageScanChunk,
     ScanCursor as StorageScanCursor, ScanOrder as StorageScanOrder, SpaceId as StorageSpaceId,
-    Storage, StorageError, StorageRead, StorageSpace, StorageSpaceRole,
+    Storage, StorageError, StorageRead, StorageScanSource, StorageSessionToken, StorageSpace,
+    StorageSpaceRole,
     StoredValue as StorageValue, ValueIntegrity, ValueSemantics,
     WriteOptions as StorageWriteOptions,
 };

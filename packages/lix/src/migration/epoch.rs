@@ -6,12 +6,16 @@ use futures_util::{FutureExt as _, select_biased};
 
 use crate::engine::{Engine, EngineOptions};
 use crate::storage_adapter::{
-    EpochBank, PutBatch, PutEntry, REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE, Storage,
-    StorageAdapter, StorageAdapterRead as _, StorageBeginScanOptions as BeginScanOptions,
-    StorageCoreProjection as CoreProjection, StorageError, StorageGetManyRequest as GetManyRequest,
+    EpochBank, MAX_SCAN_PAGE_ROWS, MemoryRead, MemoryWrite, PutBatch, PutEntry,
+    REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE, Storage, StorageAdapter,
+    StorageAdapterRead as _, StorageBeginScanOptions as BeginScanOptions,
+    StorageCommitResult as CommitResult, StorageCoreProjection as CoreProjection, StorageError,
+    StorageGetManyRequest as GetManyRequest, StorageGetManyResult as GetManyResult,
     StorageGetOptions as GetOptions, StorageKey as Key, StorageKeyRange as KeyRange,
     StoragePrecondition as Precondition, StorageProjectedValue as ProjectedValue, StorageRead,
-    StorageReadOptions as ReadOptions, StorageValue as StoredValue, StorageWrite,
+    StorageReadEntry as ReadEntry, StorageReadOptions as ReadOptions,
+    StorageScanChunk as ScanChunk, StorageScanCursor as ScanCursor, StorageScanSource,
+    StorageSessionToken, StorageSpace, StorageValue as StoredValue, StorageWrite,
     StorageWriteOptions as WriteOptions,
 };
 use crate::{LixError, OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport};
@@ -772,10 +776,10 @@ where
 
 async fn read_copy_page<S>(
     source: &StorageAdapter<S>,
-    space: crate::storage::StorageSpace,
+    space: StorageSpace,
     lower: &Bound<Key>,
     expected_revision: &Option<Bytes>,
-) -> Result<(Vec<crate::storage::ReadEntry>, bool), LixError>
+) -> Result<(Vec<ReadEntry>, bool), LixError>
 where
     S: Storage,
 {
@@ -809,10 +813,10 @@ where
                 .await
                 .map_err(storage_error)?;
             cursor
-                .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
+                .next_page(MAX_SCAN_PAGE_ROWS)
                 .await
                 .map_err(storage_error)
-                .map(crate::storage::ScanChunk::into_parts)
+                .map(ScanChunk::into_parts)
         }
         .await;
         match result {
@@ -877,7 +881,7 @@ where
 
 async fn load_storage_value<S>(
     storage: &S,
-    space: crate::storage_adapter::StorageSpace,
+    space: StorageSpace,
     key: &'static [u8],
 ) -> Result<Option<Bytes>, LixError>
 where
@@ -1486,7 +1490,7 @@ mod tests {
     }
 
     struct CommitExpiringRead {
-        inner: crate::storage::MemoryRead,
+        inner: MemoryRead,
         generation: Arc<AtomicU64>,
         observed_generation: u64,
         expire_next_page: Arc<AtomicBool>,
@@ -1503,19 +1507,19 @@ mod tests {
     }
 
     struct CommitExpiringScan<'a> {
-        inner: crate::storage::ScanCursor<'a>,
+        inner: ScanCursor<'a>,
         generation: Arc<AtomicU64>,
         observed_generation: u64,
         expire_next_page: Arc<AtomicBool>,
     }
 
-    impl crate::storage::StorageScanSource for CommitExpiringScan<'_> {
+    impl StorageScanSource for CommitExpiringScan<'_> {
         fn next_page(
             &mut self,
             limit_rows: usize,
         ) -> std::pin::Pin<
             Box<
-                dyn Future<Output = Result<crate::storage::ScanChunk, StorageError>> + Send
+                dyn Future<Output = Result<ScanChunk, StorageError>> + Send
                     + '_,
             >,
         > {
@@ -1540,21 +1544,21 @@ mod tests {
         async fn get_many(
             &self,
             requests: &[GetManyRequest<'_>],
-        ) -> Result<crate::storage::GetManyResult, StorageError> {
+        ) -> Result<GetManyResult, StorageError> {
             self.validate()?;
             self.inner.get_many(requests).await
         }
 
         async fn begin_scan(
             &self,
-            space: crate::storage::StorageSpace,
+            space: StorageSpace,
             range: KeyRange,
             opts: BeginScanOptions,
-        ) -> Result<crate::storage::ScanCursor<'_>, StorageError> {
+        ) -> Result<ScanCursor<'_>, StorageError> {
             self.validate()?;
             let checked_range = range.clone();
             let inner = self.inner.begin_scan(space, range, opts).await?;
-            crate::storage::ScanCursor::from_source(
+            ScanCursor::from_source(
                 checked_range,
                 opts.order,
                 CommitExpiringScan {
@@ -1568,14 +1572,14 @@ mod tests {
     }
 
     struct CommitExpiringWrite {
-        inner: crate::storage::MemoryWrite,
+        inner: MemoryWrite,
         generation: Arc<AtomicU64>,
     }
 
     impl StorageWrite for CommitExpiringWrite {
         async fn put_many(
             &mut self,
-            space: crate::storage::StorageSpace,
+            space: StorageSpace,
             entries: PutBatch,
         ) -> Result<(), StorageError> {
             self.inner.put_many(space, entries).await
@@ -1583,7 +1587,7 @@ mod tests {
 
         async fn replace_many(
             &mut self,
-            space: crate::storage::StorageSpace,
+            space: StorageSpace,
             entries: PutBatch,
         ) -> Result<(), StorageError> {
             self.inner.replace_many(space, entries).await
@@ -1591,7 +1595,7 @@ mod tests {
 
         async fn delete_many(
             &mut self,
-            space: crate::storage::StorageSpace,
+            space: StorageSpace,
             keys: &[Key],
         ) -> Result<(), StorageError> {
             self.inner.delete_many(space, keys).await
@@ -1599,13 +1603,13 @@ mod tests {
 
         async fn delete_range(
             &mut self,
-            space: crate::storage::StorageSpace,
+            space: StorageSpace,
             range: KeyRange,
         ) -> Result<(), StorageError> {
             self.inner.delete_range(space, range).await
         }
 
-        async fn commit(self) -> Result<crate::storage::CommitResult, StorageError> {
+        async fn commit(self) -> Result<CommitResult, StorageError> {
             let result = self.inner.commit().await?;
             self.generation.fetch_add(1, Ordering::AcqRel);
             Ok(result)
@@ -1622,7 +1626,7 @@ mod tests {
 
         async fn acquire_session(
             &self,
-        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+        ) -> Result<StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -1709,7 +1713,7 @@ mod tests {
     async fn copy_reopens_source_pages_after_target_commits_expire_reads() {
         let storage = CommitExpiringStorage::new();
         let source_seed = StorageAdapter::for_epoch_unfenced(storage.clone(), EpochBank::A);
-        let row_count = crate::storage::MAX_SCAN_PAGE_ROWS + 17;
+        let row_count = MAX_SCAN_PAGE_ROWS + 17;
         let mut writes = source_seed.new_write_set();
         for index in 0..row_count {
             let key = u64::try_from(index).unwrap().to_be_bytes();
