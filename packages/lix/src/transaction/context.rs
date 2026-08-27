@@ -7015,12 +7015,20 @@ where
             return error;
         };
         let mut graph = CommitGraphContext::new().reader(opening_read);
-        let registration_is_ancestor = match graph.reachable_nodes(&base_commit_id).await {
-            Ok(nodes) => Some(
-                nodes
+        const DIAGNOSTIC_ANCESTRY_LIMIT: usize = 1_024;
+        let registration_is_ancestor = match graph
+            .reachable_nodes_limited(&base_commit_id, DIAGNOSTIC_ANCESTRY_LIMIT)
+            .await
+        {
+            Ok(nodes)
+                if nodes
                     .iter()
-                    .any(|node| node.commit.commit_id == registration_commit_id),
-            ),
+                    .any(|node| node.commit.commit_id == registration_commit_id) =>
+            {
+                Some(true)
+            }
+            Ok(nodes) if nodes.len() < DIAGNOSTIC_ANCESTRY_LIMIT => Some(false),
+            Ok(_) => None,
             Err(_) => None,
         };
         error.hint = Some(if registration_is_ancestor == Some(true) {
