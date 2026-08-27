@@ -18,7 +18,10 @@ use lix::server_protocol::{
     LixServerProtocol, ServerProtocolBody, ServerProtocolContext, ServerProtocolPrincipal,
 };
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, Lix, Memory, ServerOptions, Value, WireValue, open_lix};
+use lix::{
+    CreateBranchOptions, ExecuteBatchStatement, Lix, Memory, MergeBranchOptions, ServerOptions,
+    SwitchBranchOptions, Value, WireValue, open_lix,
+};
 use lix_storage_filesystem::FilesystemStorage;
 use serde_json::{Value as JsonValue, json};
 use tempfile::TempDir;
@@ -1994,6 +1997,128 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
     );
 
     replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sparse_replica_observer_hydrates_root_history_past_a_merge_frontier() {
+    // A bounded bootstrap can retain a recent linear head and a merge in its
+    // jump/base closure while deferring the merge's direct first parent. Root
+    // resolution must expose that absence as a sparse graph demand so observe
+    // hydrates and retries.
+    let (authority_storage, authority) = open_authority().await;
+    let root_commit_id = authority
+        .execute("SELECT lix_root_commit_id() AS commit_id", &[])
+        .await
+        .expect("authority root should resolve")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("authority root id decodes");
+    let main_branch_id = authority
+        .active_branch_id()
+        .await
+        .expect("main branch id should load");
+    let source = authority
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "sparse-root-source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("source branch should be created");
+
+    put_value(&authority, "main-only", "main").await;
+    authority
+        .switch_branch(SwitchBranchOptions {
+            branch_id: source.id.clone(),
+        })
+        .await
+        .expect("source branch should become active");
+    put_value(&authority, "source-only", "source").await;
+    authority
+        .switch_branch(SwitchBranchOptions {
+            branch_id: main_branch_id,
+        })
+        .await
+        .expect("main branch should become active again");
+    let merge = authority
+        .merge_branch(MergeBranchOptions {
+            source_branch_id: source.id,
+        })
+        .await
+        .expect("diverged source should merge");
+    assert!(
+        merge.created_merge_commit_id.is_some(),
+        "fixture requires a merge commit at the authority head"
+    );
+    for index in 0..3 {
+        put_value(
+            &authority,
+            &format!("after-merge-{index}"),
+            "after-merge",
+        )
+        .await;
+    }
+    authority.close().await.expect("close authority setup");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage, Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+    let bootstrap_history_gets = probe.history_gets.load(Ordering::Acquire);
+
+    let mut roots = replica
+        .observe("SELECT lix_root_commit_id() AS commit_id", &[])
+        .expect("root observer should open");
+    let first = tokio::time::timeout(WAIT_TIMEOUT, roots.next())
+        .await
+        .expect("timed out waiting for hydrated root")
+        .expect("root observer should hydrate sparse history")
+        .expect("root observer should yield a first event");
+    assert_eq!(
+        first.rows.rows()[0]
+            .get::<String>("commit_id")
+            .expect("replica root id decodes"),
+        root_commit_id,
+    );
+    assert_eq!(
+        probe.history_gets.load(Ordering::Acquire),
+        bootstrap_history_gets + 1,
+        "root traversal past the merge frontier should demand one bounded history page"
+    );
+
+    roots.close();
+    replica.close().await.expect("close replica");
+
+    // Write diff commands resolve their source commits in a transaction-local
+    // walker. A separate sparse replica ensures the read observer above has
+    // not already hydrated the missing merge parent for this code path.
+    let command_replica_dir = TempDir::new().expect("command replica tempdir");
+    let command_replica = open_replica(command_replica_dir.path(), &url).await;
+    let command_bootstrap_history_gets = probe.history_gets.load(Ordering::Acquire);
+    let applied = command_replica
+        .execute(
+            "INSERT INTO lix_apply (relation, row_pk) \
+             SELECT 'lix_key_value', lixcol_row_pk \
+             FROM lix_diff(\
+               'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
+             ) \
+             WHERE false",
+            &[],
+        )
+        .await
+        .expect("root-based write diff should hydrate sparse history");
+    assert_eq!(applied.rows_affected(), 0, "empty apply should not mutate");
+    assert_eq!(
+        probe.history_gets.load(Ordering::Acquire),
+        command_bootstrap_history_gets + 1,
+        "write diff root traversal should demand one bounded history page"
+    );
+
+    command_replica
+        .close()
+        .await
+        .expect("close command replica");
     stop_server(server_task).await;
 }
 

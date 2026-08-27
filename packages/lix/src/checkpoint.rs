@@ -147,10 +147,7 @@ where
         }
 
         let node = commit_graph.load_node(&candidate).await?.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("cannot resolve latest checkpoint: commit '{candidate}' is missing"),
-            )
+            crate::commit_graph::missing_commit_graph_error(&candidate)
         })?;
         let Some(first_parent) = node.parent_commit_ids.first().copied() else {
             return Ok(None);

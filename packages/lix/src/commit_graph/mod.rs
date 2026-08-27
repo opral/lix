@@ -4,7 +4,10 @@ pub(crate) mod scope_digest_census;
 mod types;
 mod walker;
 
-pub(crate) use context::{CommitGraphContext, CommitGraphStoreReader, canonical_commit_change};
+pub(crate) use context::{
+    CommitGraphContext, CommitGraphStoreReader, canonical_commit_change,
+    missing_commit_graph_error,
+};
 #[cfg(test)]
 pub(crate) use scope_digest_census::scope_digest_census;
 #[cfg(test)]

@@ -881,7 +881,7 @@ fn validate_first_parent_jump(
     Ok(())
 }
 
-pub(super) fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
+pub(crate) fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
     LixError::commit_not_found(commit_id.to_string(), "walk_commit_graph", "graph_node")
 }
 

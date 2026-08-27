@@ -6018,6 +6018,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_checkpoint_reports_a_sparse_graph_miss_for_a_missing_cursor_commit() {
+        let session = open_session().await;
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should load");
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch control read should open");
+        let mut control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("branch control should read")
+            .expect("active branch control should exist");
+        let missing = crate::changelog::CommitId::for_test_label("missing-checkpoint-cursor");
+        control.working_diff_checkpoint_commit_id = Some(missing);
+        drop(read);
+        let mut corrupt = session.storage.new_write_set();
+        crate::branch::stage_branch_head_control(&mut corrupt, &branch_id, control)
+            .expect("missing cursor fixture should stage");
+        session
+            .storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("missing cursor fixture should commit");
+
+        let error = session
+            .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
+            .await
+            .expect_err("missing cursor commit should surface a graph miss");
+        assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
+        assert_eq!(
+            error.details.as_ref().expect("graph miss details")["commit_id"],
+            missing.to_string()
+        );
+        assert_eq!(
+            error.details.as_ref().expect("graph miss details")["operation"],
+            "walk_commit_graph"
+        );
+        assert_eq!(
+            error.details.as_ref().expect("graph miss details")["role"],
+            "graph_node"
+        );
+    }
+
+    #[tokio::test]
     async fn exact_registered_schema_point_preserves_typed_public_projection() {
         let session = open_session().await;
         let schema = serde_json::json!({
