@@ -1513,6 +1513,7 @@ async fn spawn_http_server(
         .await
         .expect("bind HTTP protocol listener");
     let address = listener.local_addr().expect("HTTP protocol address");
+    let locator = format!("http://{address}/lix/{}", protocol.lix_id());
     let task = tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.expect("accept HTTP client");
@@ -1534,7 +1535,7 @@ async fn spawn_http_server(
             });
         }
     });
-    (format!("http://{address}"), task)
+    (locator, task)
 }
 
 async fn handle_http<S>(

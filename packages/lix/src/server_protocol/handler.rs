@@ -509,20 +509,15 @@ where
                         "serving requires with_lix_id() or with_embedded_lix_id()",
                     )
                 })?;
+                if let ServeLixIdentity::Host(lix_id) = &identity {
+                    validate_server_lix_id(lix_id)?;
+                }
                 let engine = self.open.open_protocol_engine().await?;
                 let lix_id = match identity {
                     ServeLixIdentity::Host(lix_id) => lix_id,
                     ServeLixIdentity::Embedded => engine.lix_id().to_owned(),
                 };
-                let canonical_lix_id = uuid::Uuid::parse_str(&lix_id)
-                    .ok()
-                    .map(|id| id.hyphenated().to_string());
-                if canonical_lix_id.as_deref() != Some(lix_id.as_str()) {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "Lix Server Protocol resource ID must be a canonical UUID",
-                    ));
-                }
+                validate_server_lix_id(&lix_id)?;
                 Ok(LixServerProtocol::from_engine(
                     Arc::new(engine),
                     self.options,
@@ -531,6 +526,19 @@ where
             })
         })
     }
+}
+
+fn validate_server_lix_id(lix_id: &str) -> Result<(), LixError> {
+    let canonical_lix_id = uuid::Uuid::parse_str(lix_id)
+        .ok()
+        .map(|id| id.hyphenated().to_string());
+    if canonical_lix_id.as_deref() != Some(lix_id) {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "Lix Server Protocol resource ID must be a canonical UUID",
+        ));
+    }
+    Ok(())
 }
 
 /// Persistent canonical protocol server for one Lix repository.
@@ -1567,7 +1575,10 @@ fn targeted_protocol_request(
     Ok(request)
 }
 
-async fn export_snapshot_response<S>(server: LixServerProtocol<S>) -> Response
+async fn export_snapshot_response<S>(
+    server: LixServerProtocol<S>,
+    durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
+) -> Response
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -1594,6 +1605,9 @@ where
         };
         if let Err(error) = &result {
             terminal_sender.signal_if_terminal(error);
+            if let Some(notifier) = &durable_terminal_storage_notifier {
+                notifier.signal_if_terminal(error);
+            }
         }
         drop(writer);
         let _ = completion_tx.send(result);
@@ -1611,6 +1625,12 @@ where
     let first = match first {
         Ok(first) => first,
         Err(error) => {
+            if let Some(error) = error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<LixError>())
+            {
+                return ApiError::from(error.clone()).into_response();
+            }
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 LixError::CODE_INTERNAL_ERROR,
@@ -1645,7 +1665,7 @@ fn snapshot_body_stream(
         }
         match completion.await {
             Ok(Ok(_)) => {}
-            Ok(Err(error)) => yield Err(io::Error::other(error.to_string())),
+            Ok(Err(error)) => yield Err(io::Error::other(error)),
             Err(_) => yield Err(io::Error::other("snapshot export task stopped unexpectedly")),
         }
     }
@@ -1751,7 +1771,11 @@ where
                 )
                 .into_response();
             }
-            return export_snapshot_response(self).await;
+            return export_snapshot_response(
+                self,
+                context.durable_terminal_storage_notifier.clone(),
+            )
+            .await;
         }
 
         if path == "/lix/v1/session" {
@@ -1955,7 +1979,7 @@ where
     ///
     /// The export shares the server's existing storage session, so hosts do
     /// not need to open a second engine behind a live protocol runtime.
-    pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<S> {
+    pub(crate) fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<S> {
         crate::snapshot::SnapshotExportBuilder::new(self.inner.engine.storage())
     }
 
@@ -8618,6 +8642,40 @@ mod tests {
             .await
             .expect("direct snapshot export");
         assert_eq!(streamed.as_ref(), direct);
+    }
+
+    #[tokio::test]
+    async fn snapshot_failure_before_headers_preserves_terminal_storage_metadata() {
+        let storage = FencedReadStorage::new();
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .expect("serve snapshot source");
+        storage.fence_reads();
+        let (notifier, signal) = durable_terminal_storage_signal();
+        let uri = format!("/lix/v1/{}/snapshot", server.lix_id());
+        let response = server
+            .handle(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("snapshot request"),
+                ServerProtocolContext {
+                    principal: ServerProtocolPrincipal::Authenticated {
+                        account_id: lix::SYSTEM_ACCOUNT_ID.to_owned(),
+                        idempotency_scope: "snapshot-terminal-test".to_owned(),
+                    },
+                    durable_terminal_storage_notifier: Some(notifier),
+                },
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(is_terminal_storage_response(&response));
+        assert_eq!(error_code(response).await, LixError::CODE_STORAGE_FENCED);
+        assert!(signal.wait_for_terminal_storage().await);
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ export type RemoteLixFetch = (
 
 export type RemoteLixServerOptions = {
 	mode: "remote";
-	/** Complete stable Lix locator, ending in `/lix/{uuid}`. */
+	/** Stable HTTPS locator whose path is exactly `/lix/{uuid}`. HTTP is loopback-only. */
 	url: string | URL;
 	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
 	fetch?: RemoteLixFetch;
@@ -18,7 +18,7 @@ export type RemoteLixServerOptions = {
  */
 export type SyncLixServerOptions = {
 	mode: "sync";
-	/** Complete stable Lix locator, ending in `/lix/{uuid}`. */
+	/** Stable HTTPS locator whose path is exactly `/lix/{uuid}`. HTTP is loopback-only. */
 	url: string | URL;
 	/** Resolved for every browser sync request, including reconnect handshakes. */
 	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);

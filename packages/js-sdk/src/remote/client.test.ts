@@ -18,6 +18,24 @@ test.each([
 	).rejects.toBeInstanceOf(TypeError);
 });
 
+test.each([
+	"http://localhost:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+	"http://127.0.0.1:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+	"http://[::1]:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+])("remote mode permits loopback HTTP locator %s", async (url) => {
+	const fetch = vi.fn(async () =>
+		Response.json({
+			protocolVersion: 5,
+			activeBranchId: "01920000-0000-7000-8000-000000000601",
+			activeAccountId: "01920000-0000-7000-8000-000000000602",
+			sessionId: "session-1",
+		}),
+	);
+	const binding = await openRemoteLixBinding({ mode: "remote", url, fetch });
+	expect(fetch).toHaveBeenCalledOnce();
+	await binding.close();
+});
+
 test("Lix Server Protocol handshake requests a restored initial active branch", async () => {
 	const accountId = "01920000-0000-7000-8000-000000000601";
 	const requests: Request[] = [];

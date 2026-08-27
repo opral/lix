@@ -999,12 +999,12 @@ fn normalize_protocol_base_url(value: &str) -> Result<String, LixError> {
 }
 
 fn is_loopback_host(url: &url::Url) -> bool {
-    url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    })
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 fn invalid_lix_locator() -> LixError {

@@ -47,6 +47,10 @@ fn connection_locator_rejects_raw_protocol_and_noncanonical_ids() {
         "http://127.0.0.1:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
     )
     .is_ok());
+    assert!(super::normalize_protocol_base_url(
+        "http://[::1]:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+    )
+    .is_ok());
 }
 
 #[derive(Clone, Default)]

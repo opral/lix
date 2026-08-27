@@ -161,12 +161,12 @@ fn protocol_url_from_locator(locator: &str) -> Result<String, LixError> {
 }
 
 fn is_loopback_host(url: &url::Url) -> bool {
-    url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    })
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 fn invalid_lix_locator() -> LixError {
@@ -456,6 +456,14 @@ mod tests {
         }
         assert!(protocol_url_from_locator(
             "http://localhost:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        )
+        .is_ok());
+        assert!(protocol_url_from_locator(
+            "http://127.0.0.1:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        )
+        .is_ok());
+        assert!(protocol_url_from_locator(
+            "http://[::1]:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
         )
         .is_ok());
     }

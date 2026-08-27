@@ -70,9 +70,10 @@ const lix = await openLix({
 });
 ```
 
-The Lix connection URL identifies the hosted Lix. It ends in `/lix/{uuid}`.
-The OPFS name identifies its local working copy within the current browser
-origin. Use a stable OPFS name for each Lix.
+The Lix connection URL identifies the hosted Lix. It is an absolute HTTPS URL
+whose path is exactly `/lix/{uuid}`; HTTP is accepted only on loopback. The OPFS
+name identifies its local working copy within the current browser origin. Use a
+stable OPFS name for each Lix.
 
 Reads and writes execute locally. They do not wait for a server round trip,
 which makes sync mode suitable for responsive editors and interactive apps.

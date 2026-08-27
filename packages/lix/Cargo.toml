@@ -32,14 +32,12 @@ server-protocol = [
   "dep:getrandom",
   "dep:http-body",
   "dep:serde_urlencoded",
-  "dep:url",
   "tokio/time",
 ]
 server-protocol-client = [
   "dep:async-stream",
   "dep:flate2",
   "dep:futures-core",
-  "dep:url",
   "tokio/sync",
 ]
 
@@ -192,7 +190,7 @@ getrandom = { version = "0.3", optional = true }
 http = "1"
 http-body = { version = "1", optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
-url = { version = "2", optional = true }
+url = "2"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 wasmparser = { version = "0.247", features = ["component-model"] }
 wasmtime = { version = "45", default-features = false, features = ["cache", "component-model", "cranelift", "runtime", "std"], optional = true }

@@ -57,9 +57,11 @@ const lix = await openLix({
 });
 ```
 
-The connection URL ends in `/lix/{uuid}`. It is stable, absolute, and carries
-no query or fragment. Human-readable namespace and project URLs are separate
-web-page addresses, not Lix connection URLs.
+The connection URL is an absolute HTTPS URL whose path is exactly
+`/lix/{uuid}`. HTTP is accepted only for loopback development. It carries no
+query, fragment, credentials, or deployment-path prefix. Human-readable
+namespace and project URLs are separate web-page addresses, not Lix connection
+URLs.
 
 Files, SQL, branches, history, and `observe()` work the same way they do
 locally. See [Collaboration and Sync](./collaboration-and-sync.md).
