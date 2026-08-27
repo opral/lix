@@ -23,7 +23,7 @@ use crate::branch::BranchHeadControlContext;
 use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::hot_state::TrackedHeadContext;
 use crate::plugin::runtime::WasmTypedRow;
-use crate::row_pk::{RowPk, RowPkComponentType};
+use crate::row_pk::{RowPk, RowPkComponent, RowPkComponentType};
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
 use crate::sql2::error::lix_error_to_datafusion_error;
@@ -1480,11 +1480,12 @@ fn diff_column_array(field: &Field, rows: &[DiffSqlRow], relation: &DiffRelation
             rows.iter().map(|row| row.row_count),
         ))),
         name if relation.primary_key_columns.iter().any(|column| column == name) => {
-            let values = rows
+            let component_index = relation
+                .primary_key_columns
                 .iter()
-                .map(|row| side_value(row.to.as_ref().or(row.from.as_ref()), name))
-                .collect::<Result<Vec<_>>>()?;
-            values_array(field, &values)
+                .position(|column| column == name)
+                .expect("the primary-key column guard found this column");
+            primary_key_array(field, rows, component_index)
         }
         name => {
             let (after, column) = side_column(name).ok_or_else(|| {
@@ -1504,6 +1505,64 @@ fn diff_column_array(field: &Field, rows: &[DiffSqlRow], relation: &DiffRelation
             values_array(field, &values)
         }
     }
+}
+
+/// Materializes a typed primary-key column from the stable diff identity.
+///
+/// A key is neither a before-side nor an after-side payload property: it is
+/// the identity joining those sides. Reading it from a snapshot made projected
+/// key-only diffs NULL for additions/removals because no side payload needed
+/// to be hydrated. The canonical RowPk is always present for every diff kind.
+fn primary_key_array(
+    field: &Field,
+    rows: &[DiffSqlRow],
+    component_index: usize,
+) -> Result<ArrayRef> {
+    match field.data_type() {
+        DataType::Utf8 => Ok(Arc::new(StringArray::from_iter_values(
+            rows.iter()
+                .map(|row| match row.row_pk.components.as_slice().get(component_index) {
+                    Some(RowPkComponent::Uuid(value)) => {
+                        Ok(uuid::Uuid::from_bytes(*value).to_string())
+                    }
+                    Some(RowPkComponent::String(value)) => Ok(value.to_string()),
+                    component => Err(primary_key_component_error(field, component)),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ))),
+        DataType::Int64 => Ok(Arc::new(Int64Array::from_iter_values(
+            rows.iter()
+                .map(|row| match row.row_pk.components.as_slice().get(component_index) {
+                    Some(RowPkComponent::Integer(value)) => Ok(*value),
+                    component => Err(primary_key_component_error(field, component)),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ))),
+        DataType::LargeBinary => {
+            let values = rows
+                .iter()
+                .map(|row| match row.row_pk.components.as_slice().get(component_index) {
+                    Some(RowPkComponent::Bytes(value)) => Ok(value.as_ref()),
+                    component => Err(primary_key_component_error(field, component)),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(LargeBinaryArray::from_iter_values(values)))
+        }
+        data_type => Err(DataFusionError::Execution(format!(
+            "lix_diff primary-key column '{}' has unsupported type {data_type}",
+            field.name()
+        ))),
+    }
+}
+
+fn primary_key_component_error(
+    field: &Field,
+    component: Option<&RowPkComponent>,
+) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "lix_diff primary-key column '{}' does not match canonical identity component {component:?}",
+        field.name()
+    ))
 }
 
 fn side_value(side: Option<&DiffSide>, column: &str) -> Result<Option<lix_schema::Value>> {

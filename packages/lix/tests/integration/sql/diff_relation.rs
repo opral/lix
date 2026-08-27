@@ -47,12 +47,13 @@ simulation_test!(relation_diff_pairs_schema_columns_and_inverts_sides, |sim| asy
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_value, to_value \
+                "SELECT key, diff_type, from_value, to_value \
                  FROM lix_diff('lix_key_value', '{inserted}', '{baseline}')"
             ),
         )
         .await,
         vec![vec![
+            Value::Text("note".to_string()),
             Value::Text("removed".to_string()),
             Value::Jsonb(json!("first").into()),
             Value::Null,

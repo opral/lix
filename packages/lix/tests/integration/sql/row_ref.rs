@@ -185,6 +185,22 @@ async fn assert_diff(
     from_value: Value,
     to_value: Value,
 ) {
+    let identity_only = session
+        .execute(
+            "SELECT row_ref, parent_id, key, diff_type \
+             FROM lix_diff('row_ref_composite_member', $1, $2) \
+             WHERE parent_id = 'parent' AND key = 7",
+            &[Value::Text(from.into()), Value::Text(to.into())],
+        )
+        .await
+        .expect("key-only composite diff should not require either side payload");
+    assert_eq!(identity_only.rows().len(), 1);
+    assert!(matches!(
+        identity_only.rows()[0].values(),
+        [Value::RowRef(_), Value::Text(parent), Value::Integer(7), Value::Text(actual_kind)]
+            if parent == "parent" && actual_kind == kind
+    ));
+
     let result = session
         .execute(
             "SELECT row_ref, parent_id, key, diff_type, from_value, to_value \
