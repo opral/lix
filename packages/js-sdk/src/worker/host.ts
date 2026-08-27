@@ -253,8 +253,6 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return requiredLix(sessionId).activeAccountId();
 			case "createBranch":
 				return requiredLix(sessionId).createBranch(operation.options);
-			case "createCheckpoint":
-				return requiredLix(sessionId).createCheckpoint();
 			case "undo":
 				return requiredLix(sessionId).undo();
 			case "redo":

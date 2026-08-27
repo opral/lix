@@ -548,7 +548,7 @@ where
                 );
                 if let Some(checkpoint_sequence) = outcome.checkpoint_gc_sequence {
                     self.schedule_checkpoint_gc_after_commit(checkpoint_sequence)
-                        .await?;
+                        .await;
                 }
                 if self.branch.get()?.as_str() != GLOBAL_BRANCH_ID {
                     self.base_refresh_generation.store(

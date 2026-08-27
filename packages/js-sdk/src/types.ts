@@ -227,10 +227,6 @@ export type CreateBranchReceipt = {
 	commitId: string;
 };
 
-export type CreateCheckpointReceipt = {
-	commitId: string;
-};
-
 export type UndoReceipt = {
 	branchId: string;
 	targetCommitId: string;

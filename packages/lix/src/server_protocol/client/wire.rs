@@ -175,12 +175,6 @@ pub struct CreateBranchResponseBody {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateCheckpointResponseBody {
-    pub commit_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UndoResponseBody {
     pub branch_id: String,
     pub target_commit_id: String,

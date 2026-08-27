@@ -1,7 +1,6 @@
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
-	CreateCheckpointReceipt,
 	UndoReceipt,
 	RedoReceipt,
 	ExecuteOptions,
@@ -85,7 +84,6 @@ export type LixBinding = {
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
-	createCheckpoint(): Promise<CreateCheckpointReceipt>;
 	undo(): Promise<UndoReceipt>;
 	redo(): Promise<RedoReceipt>;
 	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchReceipt>;

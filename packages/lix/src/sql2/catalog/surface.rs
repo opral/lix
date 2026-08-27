@@ -86,11 +86,11 @@ pub(crate) enum PublicSurfaceKind {
     Branch,
     HistoryFunction,
     DiffFunction,
+    CheckpointFunction,
     StateAtFunction,
     CommitAncestryFunction,
     Revert,
     Apply,
-    CreateCheckpoint,
     Restore,
     Change,
 }
@@ -105,9 +105,10 @@ impl PublicSurfaceKind {
             | Self::Change => matches!(class, PublicSurfaceClass::Relation(_)),
             Self::HistoryFunction
             | Self::DiffFunction
+            | Self::CheckpointFunction
             | Self::StateAtFunction
             | Self::CommitAncestryFunction => class == PublicSurfaceClass::TableFunction,
-            Self::Revert | Self::Apply | Self::CreateCheckpoint | Self::Restore => {
+            Self::Revert | Self::Apply | Self::Restore => {
                 class == PublicSurfaceClass::CommandSink
             }
         }

@@ -1304,6 +1304,14 @@ where
             .await
     }
 
+    /// Crate-internal test/support sugar. Public callers use the canonical SQL
+    /// `lix_create_checkpoint(...)` function.
+    pub(crate) async fn create_checkpoint(
+        &self,
+    ) -> Result<crate::session::CreateCheckpointReceipt, LixError> {
+        self.session.create_checkpoint().await
+    }
+
     /// Reverses the latest undoable tracked commit on this handle's active branch.
     pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
         self.retry_sync_demands(|| self.session.undo()).await

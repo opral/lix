@@ -159,7 +159,7 @@ test("keeps browser worker sessions independent", async () => {
 	await review.close();
 });
 
-test("createCheckpoint returns the new active head through browser WASM", async () => {
+test("checkpoint SQL returns the new active head through browser WASM", async () => {
 	const { openLix } = await import("@lix-js/sdk");
 	const lix = await openLix();
 	try {
@@ -171,14 +171,17 @@ test("createCheckpoint returns the new active head through browser WASM", async 
 			await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
 		).rows[0]?.commit_id;
 
-		const checkpoint = await lix.createCheckpoint();
+		const checkpoint = await lix.execute(
+			"SELECT commit_id FROM lix_create_checkpoint()",
+		);
+		const checkpointId = checkpoint.rows[0]?.commit_id;
 
-		expect(checkpoint.commitId).not.toBe(before);
+		expect(checkpointId).not.toBe(before);
 		expect(
 			(
 				await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
 			).rows[0]?.commit_id,
-		).toBe(checkpoint.commitId);
+		).toBe(checkpointId);
 	} finally {
 		await lix.close();
 	}
@@ -198,8 +201,10 @@ test("checkpoint GC starts without requiring a browser Tokio runtime", async () 
 				 ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
 				["checkpoint-gc-browser-test", sequence],
 			);
-			const checkpoint = await lix.createCheckpoint();
-			expect(checkpoint.commitId).toEqual(expect.any(String));
+			const checkpoint = await lix.execute(
+				"SELECT commit_id FROM lix_create_checkpoint()",
+			);
+			expect(checkpoint.rows[0]?.commit_id).toEqual(expect.any(String));
 		}
 
 		expect((await lix.execute("SELECT 1 AS value")).rows[0]?.value).toBe(

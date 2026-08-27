@@ -114,7 +114,8 @@ where
     pub(super) async fn schedule_checkpoint_gc_after_commit(
         &self,
         checkpoint_sequence: u64,
-    ) -> Result<(), LixError> {
+    ) {
+        let result = async {
         let read = SharedStorageAdapterRead::new(
             self.storage.begin_read(StorageReadOptions::default()).await?,
         );
@@ -149,7 +150,15 @@ where
                 return Err(error);
             }
         }
-        Ok(())
+        Ok::<_, LixError>(())
+        }
+        .await;
+        if let Err(error) = result {
+            // The checkpoint is already durable. GC debt is stored with that
+            // commit and a later checkpoint can retry it, so never turn a
+            // maintenance failure into a false mutation failure.
+            tracing::warn!(error = %error, checkpoint_sequence, "post-commit checkpoint GC scheduling failed");
+        }
     }
 }
 

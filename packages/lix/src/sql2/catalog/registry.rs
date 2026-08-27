@@ -153,13 +153,12 @@ impl PublicCatalog {
             ])),
             PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::CheckpointFunction
             | PublicSurfaceKind::StateAtFunction
             | PublicSurfaceKind::CommitAncestryFunction => {
                 return None;
             }
-            PublicSurfaceKind::Revert
-            | PublicSurfaceKind::Apply
-            | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![
+            PublicSurfaceKind::Revert | PublicSurfaceKind::Apply => Arc::new(Schema::new(vec![
                 row_ref_field("row_ref", false),
             ])),
             PublicSurfaceKind::Restore => Arc::new(Schema::new(vec![Field::new(
@@ -285,6 +284,13 @@ impl PublicCatalog {
             PublicSurfaceClass::TableFunction,
             PublicSurfaceKind::DiffFunction,
             Vec::new(),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_create_checkpoint",
+            PublicSurfaceClass::TableFunction,
+            PublicSurfaceKind::CheckpointFunction,
+            vec![PublicColumn::public_read_only("commit_id", false)],
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(

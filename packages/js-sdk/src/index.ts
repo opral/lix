@@ -31,7 +31,6 @@ export { Value } from "./value.js";
 export type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
-	CreateCheckpointReceipt,
 	RedoReceipt,
 	ExecuteOptions,
 	ExecuteResult,

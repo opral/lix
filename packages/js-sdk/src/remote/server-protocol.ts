@@ -130,10 +130,6 @@ export type ServerProtocolCreateBranchResponse = {
 	commitId: string;
 };
 
-export type ServerProtocolCreateCheckpointResponse = {
-	commitId: string;
-};
-
 export type ServerProtocolUndoResponse = {
 	branchId: string;
 	targetCommitId: string;

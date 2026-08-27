@@ -369,15 +369,6 @@ paths:
       responses:
         "200": { description: Branch created. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/{lix_id}/checkpoint/create:
-    parameters:
-      - $ref: "#/components/parameters/LixId"
-    post:
-      operationId: createCheckpoint
-      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
-      responses:
-        "200": { description: Checkpoint created. }
-        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/undo:
     parameters:
       - $ref: "#/components/parameters/LixId"

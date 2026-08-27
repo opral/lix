@@ -219,7 +219,7 @@ where
         if let Some(checkpoint_sequence) = outcome.checkpoint_gc_sequence {
             self.session
                 .schedule_checkpoint_gc_after_commit(checkpoint_sequence)
-                .await?;
+                .await;
         }
         Ok(())
     }

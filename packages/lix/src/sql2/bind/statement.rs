@@ -97,7 +97,7 @@ pub(super) fn bind_insert_bound(
     // implicit public column list is deliberately unsupported.
     let default_values = matches!(
         table.surface.kind,
-        PublicSurfaceKind::SchemaBase { .. } | PublicSurfaceKind::CreateCheckpoint
+        PublicSurfaceKind::SchemaBase { .. }
     )
         && insert.columns.is_empty()
         && insert.source.is_none();
@@ -313,7 +313,6 @@ fn bind_insert_returning(
         table.surface.kind,
         PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
-            | PublicSurfaceKind::CreateCheckpoint
             | PublicSurfaceKind::Restore
     ) {
         return bind_returning(table, Some(returning), params, "INSERT");
@@ -604,7 +603,7 @@ fn bind_insert_input(
     }
     if matches!(
         surface_kind,
-        PublicSurfaceKind::Revert | PublicSurfaceKind::Apply | PublicSurfaceKind::CreateCheckpoint
+        PublicSurfaceKind::Revert | PublicSurfaceKind::Apply
     ) && matches!(source.body.as_ref(), SetExpr::Values(_))
     {
         return Err(super::error::unsupported(
@@ -1354,12 +1353,10 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
             BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Revert)
         }
         PublicSurfaceKind::Apply => BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Apply),
-        PublicSurfaceKind::CreateCheckpoint => {
-            BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint)
-        }
         PublicSurfaceKind::Change
         | PublicSurfaceKind::HistoryFunction
         | PublicSurfaceKind::DiffFunction
+        | PublicSurfaceKind::CheckpointFunction
         | PublicSurfaceKind::StateAtFunction
         | PublicSurfaceKind::Restore
         | PublicSurfaceKind::CommitAncestryFunction => {

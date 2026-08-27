@@ -27,8 +27,8 @@ use crate::branch::{
     BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
 };
 use crate::catalog::{
-    CatalogContext, CatalogFingerprint, CatalogRevision, CatalogSnapshot, SchemaPlanId,
-    load_catalog_revision, stage_catalog_revision,
+    CatalogContext, CatalogFingerprint, CatalogRevision, CatalogSnapshot, ForeignKeyPlan,
+    SchemaPlan, SchemaPlanId, load_catalog_revision, stage_catalog_revision,
 };
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangelogReader, CommitId, CommitLoadRequest,
@@ -8163,7 +8163,7 @@ where
     pub(crate) fn plugin_schema_plan(
         &self,
         schema_key: &str,
-    ) -> Option<&crate::catalog::SchemaPlan> {
+    ) -> Option<&SchemaPlan> {
         self.sql_schema_snapshot
             .plan_for_key(schema_key)
             .map(|(_, plan)| plan)
@@ -8788,7 +8788,9 @@ where
         let catalog = self.sql_public_catalog()?;
         let mut schema_selections = BTreeMap::<&str, BTreeMap<RowPk, usize>>::new();
         let mut file_selections = BTreeMap::new();
+        let mut directory_selections = BTreeMap::new();
         let mut file_descriptor_row_pks = Vec::new();
+        let mut directory_descriptor_row_pks = Vec::new();
         for (index, selection) in selections.iter().enumerate() {
             match selection.relation.as_str() {
                 "lix_file" => {
@@ -8813,10 +8815,27 @@ where
                     file_selections.insert(file_id, index);
                 }
                 "lix_directory" => {
-                    return Err(LixError::new(
-                        LixError::CODE_UNSUPPORTED_SQL,
-                        "lix_directory command selections require recursive foreign-key closure and are not supported yet",
-                    ));
+                    let directory_id = selection.row_pk.as_single_string_owned().map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            "lix_directory selections require a single directory-id primary key",
+                        )
+                    })?;
+                    let JsonValue::Array(parts) = selection.row_pk.as_json_array_value()? else {
+                        unreachable!("RowPk always serializes as a JSON array")
+                    };
+                    let descriptor_row_pk =
+                        RowPk::from_json_values(&parts, &[crate::row_pk::RowPkComponentType::Uuid])
+                            .map_err(|error| {
+                                LixError::new(
+                                    LixError::CODE_TYPE_MISMATCH,
+                                    format!(
+                                        "lix_directory row reference must contain a UUID directory id: {error}"
+                                    ),
+                                )
+                            })?;
+                    directory_descriptor_row_pks.push(descriptor_row_pk);
+                    directory_selections.insert(directory_id, index);
                 }
                 relation => {
                     let spec = catalog.schema_spec(relation).ok_or_else(|| {
@@ -8843,33 +8862,19 @@ where
                 }
             }
         }
-        if !schema_selections.is_empty() && !file_selections.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "diff commands do not support mixing lix_file and schema relation selections",
-            ));
-        }
-
         let mut requests = Vec::new();
-        if file_selections.is_empty() {
-            let schema_keys = schema_selections
-                .keys()
-                .map(|relation| (*relation).to_string())
-                .collect();
-            let row_pks = schema_selections
-                .values()
-                .flat_map(|rows| rows.keys().cloned())
-                .collect();
+        for (relation, rows) in &schema_selections {
             requests.push(TrackedStateDiffRequest {
                 filter: TrackedStateFilter {
-                    schema_keys,
-                    row_pks,
+                    schema_keys: vec![(*relation).to_string()],
+                    row_pks: rows.keys().cloned().collect(),
                     include_tombstones: true,
                     ..TrackedStateFilter::default()
                 },
                 retain_payloads: false,
             });
-        } else {
+        }
+        if !file_selections.is_empty() {
             requests.push(TrackedStateDiffRequest {
                 filter: TrackedStateFilter {
                     file_ids: file_selections
@@ -8891,16 +8896,29 @@ where
                 },
                 retain_payloads: false,
             });
-            if command == DiffCommand::CreateCheckpoint {
-                requests.push(TrackedStateDiffRequest {
-                    filter: TrackedStateFilter {
-                        schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
-                        include_tombstones: true,
-                        ..TrackedStateFilter::default()
-                    },
-                    retain_payloads: false,
-                });
-            }
+        }
+        if !directory_selections.is_empty() {
+            requests.push(TrackedStateDiffRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+                    row_pks: directory_descriptor_row_pks,
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                },
+                retain_payloads: false,
+            });
+        }
+        if command == DiffCommand::CreateCheckpoint
+            && (!file_selections.is_empty() || !directory_selections.is_empty())
+        {
+            requests.push(TrackedStateDiffRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                },
+                retain_payloads: false,
+            });
         }
 
         let source = selections
@@ -8969,8 +8987,14 @@ where
         }
 
         let selected_directory_ids =
-            if command == DiffCommand::CreateCheckpoint && !file_selections.is_empty() {
-                self.selected_file_directory_closure(&entries, &file_selections)
+            if command == DiffCommand::CreateCheckpoint
+                && (!file_selections.is_empty() || !directory_selections.is_empty())
+            {
+                self.selected_directory_closure(
+                    &entries,
+                    &file_selections,
+                    &directory_selections,
+                )
                     .await?
             } else {
                 BTreeSet::new()
@@ -9005,13 +9029,14 @@ where
                 selected = true;
             }
             if entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-                && entry
-                    .identity
-                    .row_pk()
-                    .as_single_string_owned()
-                    .is_ok_and(|directory_id| selected_directory_ids.contains(&directory_id))
             {
-                selected = true;
+                if let Ok(directory_id) = entry.identity.row_pk().as_single_string_owned() {
+                    if let Some(index) = directory_selections.get(directory_id.as_str()) {
+                        matched.insert(*index);
+                        selected = true;
+                    }
+                    selected |= selected_directory_ids.contains(&directory_id);
+                }
             }
             if selected {
                 resolved.push(entry.diff_id()?);
@@ -9027,10 +9052,11 @@ where
 
     /// Includes only changed, live ancestors of selected file descriptors.
     /// Unrelated dirty directories remain in the unselected working interval.
-    async fn selected_file_directory_closure(
+    async fn selected_directory_closure(
         &mut self,
         entries: &[TrackedStateDiffEntry],
         file_selections: &BTreeMap<String, usize>,
+        directory_selections: &BTreeMap<String, usize>,
     ) -> Result<BTreeSet<String>, LixError> {
         if !entries.iter().any(|entry| {
             entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
@@ -9049,7 +9075,14 @@ where
                     .is_ok_and(|file_id| file_selections.contains_key(&file_id));
             let live_directory = entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
                 && entry.kind != TrackedStateDiffKind::Removed;
-            if (selected_file_descriptor || live_directory)
+            let selected_directory_descriptor = entry.identity.schema_key()
+                == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                && entry
+                    .identity
+                    .row_pk()
+                    .as_single_string_owned()
+                    .is_ok_and(|directory_id| directory_selections.contains_key(&directory_id));
+            if (selected_file_descriptor || selected_directory_descriptor || live_directory)
                 && let Some(after) = entry.after.as_ref().filter(|after| !after.deleted)
             {
                 change_ids.insert(after.change_id);
@@ -9125,6 +9158,7 @@ where
             }
         }
         let mut selected = BTreeSet::new();
+        file_parents.extend(directory_selections.keys().cloned());
         for mut directory_id in file_parents {
             while selected.insert(directory_id.clone()) {
                 let Some(Some(parent_id)) = directory_parents.get(&directory_id) else {
@@ -9134,12 +9168,6 @@ where
             }
         }
         Ok(selected)
-    }
-
-    pub(crate) async fn execute_full_checkpoint_command(
-        &mut self,
-    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-        self.execute_checkpoint_plan(None).await
     }
 
     pub(crate) async fn execute_checkpoint_function(
@@ -9256,7 +9284,16 @@ where
                         "scoped checkpoint selection cannot be empty",
                     ));
                 }
-                let closed = close_and_validate_checkpoint_selection(&diff.entries, requested)?;
+                let (before_snapshots, after_snapshots) = self
+                    .checkpoint_dependency_snapshots(&diff.entries)
+                    .await?;
+                let closed = close_and_validate_checkpoint_selection(
+                    &diff.entries,
+                    requested,
+                    self.tracked_schema_snapshot.as_ref(),
+                    &before_snapshots,
+                    &after_snapshots,
+                )?;
                 let rows_affected = u64::try_from(requested_count).map_err(|_| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -9383,6 +9420,84 @@ where
         diff_ids: Vec<String>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         self.execute_checkpoint_plan(Some(diff_ids)).await
+    }
+
+    async fn checkpoint_dependency_snapshots(
+        &mut self,
+        entries: &[TrackedStateDiffEntry],
+    ) -> Result<(BTreeMap<String, JsonValue>, BTreeMap<String, JsonValue>), LixError> {
+        let changes = entries
+            .iter()
+            .map(|entry| {
+                Ok((
+                    entry.diff_id()?,
+                    entry
+                        .before
+                        .as_ref()
+                        .filter(|before| !before.deleted)
+                        .map(|before| before.change_id),
+                    entry
+                        .after
+                        .as_ref()
+                        .filter(|after| !after.deleted)
+                        .map(|after| after.change_id),
+                ))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        if changes.is_empty() {
+            return Ok((BTreeMap::new(), BTreeMap::new()));
+        }
+        let read = SharedStorageAdapterRead::new(
+            self.storage.begin_read(StorageReadOptions::default()).await?,
+        );
+        let change_ids = changes
+            .iter()
+            .flat_map(|(_, before, after)| [*before, *after])
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let mut records = load_change_records(&read, change_ids.into_iter()).await?;
+        let payloads = materialize_known_change_payloads(
+            records.drain().map(|(_, record)| record),
+            ChangeRecordProjection {
+                snapshot_content: true,
+                metadata: false,
+                snapshot: false,
+                raw_snapshot: false,
+            },
+        )?;
+        let snapshots_by_change_id = payloads
+            .into_iter()
+            .filter_map(|(change_id, payload)| payload.snapshot_content.map(|value| (change_id, value)))
+            .map(|(change_id, snapshot)| {
+                serde_json::from_str(snapshot.as_ref())
+                    .map(|snapshot| (change_id, snapshot))
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("checkpoint dependency snapshot is invalid JSON: {error}"),
+                        )
+                    })
+            })
+            .collect::<Result<HashMap<_, JsonValue>, LixError>>()?;
+        let load = |change_id: ChangeId| {
+            snapshots_by_change_id.get(&change_id).cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("checkpoint dependency row '{change_id}' has no snapshot"),
+                )
+            })
+        };
+        let mut before_snapshots = BTreeMap::new();
+        let mut after_snapshots = BTreeMap::new();
+        for (diff_id, before, after) in changes {
+            if let Some(change_id) = before {
+                before_snapshots.insert(diff_id.clone(), load(change_id)?);
+            }
+            if let Some(change_id) = after {
+                after_snapshots.insert(diff_id, load(change_id)?);
+            }
+        }
+        Ok((before_snapshots, after_snapshots))
     }
 
     pub(crate) async fn execute_diff_command_query_owned(
@@ -9901,6 +10016,9 @@ fn parse_materialized_diff_json(
 fn close_and_validate_checkpoint_selection(
     entries: &[TrackedStateDiffEntry],
     requested: BTreeSet<String>,
+    catalog: &CatalogSnapshot,
+    before_snapshots: &BTreeMap<String, JsonValue>,
+    after_snapshots: &BTreeMap<String, JsonValue>,
 ) -> Result<BTreeSet<String>, LixError> {
     let mut by_diff_id = BTreeMap::new();
     let mut registration_by_schema_key = BTreeMap::new();
@@ -9930,9 +10048,30 @@ fn close_and_validate_checkpoint_selection(
 
     let mut closed = requested;
     loop {
+        for diff_id in &closed {
+            let entry = by_diff_id
+                .get(diff_id)
+                .expect("closed checkpoint identity is indexed");
+            if entry.identity.schema_key() == REGISTERED_SCHEMA_KEY
+                && entry.after.as_ref().is_none_or(|after| after.deleted)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    "a scoped checkpoint cannot remove a schema registration; checkpoint the complete working set",
+                )
+                .with_details(serde_json::json!({
+                    "operation": "lix_create_checkpoint",
+                    "rowRef": crate::row_ref::encode(
+                        REGISTERED_SCHEMA_KEY,
+                        entry.identity.row_pk(),
+                    )?.as_str(),
+                })));
+            }
+        }
         let required_schema_keys = closed
             .iter()
             .filter_map(|diff_id| by_diff_id.get(diff_id))
+            .filter(|entry| entry.after.as_ref().is_some_and(|after| !after.deleted))
             .map(|entry| entry.identity.schema_key().to_string())
             .collect::<BTreeSet<_>>();
         let mut changed = false;
@@ -9957,12 +10096,206 @@ fn close_and_validate_checkpoint_selection(
                     ),
                 )
                 .with_details(serde_json::json!({
-                    "operation": "createCheckpoint",
+                    "operation": "lix_create_checkpoint",
+                    "rowRef": crate::row_ref::encode(schema_key.as_str(), registration.identity.row_pk())?.as_str(),
                     "schemaKey": schema_key,
-                    "dependency": REGISTERED_SCHEMA_KEY,
                 })));
             }
             changed |= closed.insert(registration_diff_id.clone());
+        }
+
+        // Follow declared foreign keys when the referenced row also changed
+        // in this working interval. An unchanged target is already present in
+        // the checkpoint baseline; a changed target must cross the boundary
+        // with the selected child.
+        let selected_now = closed.iter().cloned().collect::<Vec<_>>();
+        for selected_diff_id in selected_now {
+            let Some(snapshot) = after_snapshots.get(&selected_diff_id) else {
+                continue;
+            };
+            let entry = by_diff_id
+                .get(&selected_diff_id)
+                .expect("closed diff identity is indexed");
+            let Some((_, source_plan)) = catalog.plan_for_key(entry.identity.schema_key()) else {
+                continue;
+            };
+            for foreign_key in &source_plan.foreign_keys {
+                let Some((_, target_plan)) =
+                    catalog.plan_for_key(&foreign_key.referenced_schema.schema_key)
+                else {
+                    return Err(LixError::new(
+                        LixError::CODE_CONSTRAINT_VIOLATION,
+                        format!(
+                            "checkpoint dependency target schema '{}' is not visible",
+                            foreign_key.referenced_schema.schema_key
+                        ),
+                    ));
+                };
+                if target_plan.primary_key.as_ref() != Some(&foreign_key.referenced_properties) {
+                    // Non-primary unique references are valid Lix schemas, but
+                    // resolving them requires a value-index lookup rather than
+                    // row identity. The complete working diff still lets us
+                    // close over a changed live target by comparing its
+                    // projected unique tuple.
+                    let Some(local_values) = checkpoint_json_pointer_values(
+                        snapshot,
+                        &foreign_key.local_properties,
+                    ) else {
+                        continue;
+                    };
+                    for (target_diff_id, target_entry) in &by_diff_id {
+                        if target_entry.identity.schema_key()
+                            != foreign_key.referenced_schema.schema_key
+                        {
+                            continue;
+                        }
+                        let Some(target_snapshot) = after_snapshots.get(target_diff_id) else {
+                            continue;
+                        };
+                        if checkpoint_json_pointer_values(
+                            target_snapshot,
+                            &foreign_key.referenced_properties,
+                        ) == Some(local_values.clone())
+                        {
+                            changed |= closed.insert(target_diff_id.clone());
+                        }
+                    }
+                    continue;
+                }
+                let Some(local_values) = checkpoint_json_pointer_values(
+                    snapshot,
+                    &foreign_key.local_properties,
+                ) else {
+                    continue;
+                };
+                let Some(component_types) = target_plan.primary_key_component_types.as_ref() else {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "foreign-key target has no primary-key component types",
+                    ));
+                };
+                let target_row_pk = RowPk::from_json_values(&local_values, component_types)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_CONSTRAINT_VIOLATION,
+                            format!("checkpoint foreign-key value is invalid: {error}"),
+                        )
+                    })?;
+                if let Some((target_diff_id, target_entry)) = by_diff_id.iter().find(|(_, target)| {
+                    target.identity.schema_key() == foreign_key.referenced_schema.schema_key
+                        && target.identity.row_pk() == &target_row_pk
+                }) {
+                    if target_entry
+                        .after
+                        .as_ref()
+                        .is_none_or(|after| after.deleted)
+                    {
+                        return Err(LixError::new(
+                            LixError::CODE_CONSTRAINT_VIOLATION,
+                            format!(
+                                "checkpoint selection references removed row '{} {:?}'",
+                                foreign_key.referenced_schema.schema_key,
+                                target_row_pk
+                            ),
+                        ));
+                    }
+                    changed |= closed.insert(target_diff_id.clone());
+                }
+            }
+        }
+
+        // Closing only outbound references is insufficient for deletes and
+        // referenced-unique-key changes. If a selected target stops satisfying
+        // a foreign key, every changed child that used the old target must
+        // cross the checkpoint boundary as well so the baseline never retains
+        // the old child beside the new target state.
+        let selected_targets = closed.iter().cloned().collect::<Vec<_>>();
+        for target_diff_id in selected_targets {
+            let target_entry = by_diff_id
+                .get(&target_diff_id)
+                .expect("closed checkpoint identity is indexed");
+            let target_before = before_snapshots.get(&target_diff_id);
+            for (child_diff_id, child_entry) in &by_diff_id {
+                let Some((_, child_plan)) = catalog.plan_for_key(child_entry.identity.schema_key())
+                else {
+                    continue;
+                };
+                for foreign_key in &child_plan.foreign_keys {
+                    if foreign_key.referenced_schema.schema_key
+                        != target_entry.identity.schema_key()
+                    {
+                        continue;
+                    }
+                    let Some((_, target_plan)) =
+                        catalog.plan_for_key(target_entry.identity.schema_key())
+                    else {
+                        continue;
+                    };
+                    let target_removed = target_entry
+                        .after
+                        .as_ref()
+                        .is_none_or(|after| after.deleted);
+                    let target_key_changed = if target_plan.primary_key.as_ref()
+                        == Some(&foreign_key.referenced_properties)
+                    {
+                        false
+                    } else {
+                        match (target_before, after_snapshots.get(&target_diff_id)) {
+                            (Some(before), Some(after)) => {
+                                checkpoint_json_pointer_values(
+                                    before,
+                                    &foreign_key.referenced_properties,
+                                ) != checkpoint_json_pointer_values(
+                                    after,
+                                    &foreign_key.referenced_properties,
+                                )
+                            }
+                            _ => target_removed,
+                        }
+                    };
+                    if !target_removed && !target_key_changed {
+                        continue;
+                    }
+                    let Some(child_before) = before_snapshots.get(child_diff_id) else {
+                        continue;
+                    };
+                    if !checkpoint_foreign_key_references_target(
+                        child_before,
+                        foreign_key,
+                        target_entry,
+                        target_plan,
+                        target_before,
+                    )? {
+                        continue;
+                    }
+                    if let Some(child_after) = after_snapshots.get(child_diff_id)
+                        && checkpoint_foreign_key_references_target(
+                            child_after,
+                            foreign_key,
+                            target_entry,
+                            target_plan,
+                            target_before,
+                        )?
+                    {
+                        return Err(LixError::new(
+                            LixError::CODE_CONSTRAINT_VIOLATION,
+                            "checkpoint selection would retain a row that references a removed dependency",
+                        )
+                        .with_details(serde_json::json!({
+                            "operation": "lix_create_checkpoint",
+                            "rowRef": crate::row_ref::encode(
+                                child_entry.identity.schema_key(),
+                                child_entry.identity.row_pk(),
+                            )?.as_str(),
+                            "dependencyRowRef": crate::row_ref::encode(
+                                target_entry.identity.schema_key(),
+                                target_entry.identity.row_pk(),
+                            )?.as_str(),
+                        })));
+                    }
+                    changed |= closed.insert(child_diff_id.clone());
+                }
+            }
         }
         if !changed {
             break;
@@ -9986,13 +10319,64 @@ fn close_and_validate_checkpoint_selection(
                 ),
             )
             .with_details(serde_json::json!({
-                "operation": "createCheckpoint",
+                "operation": "lix_create_checkpoint",
+                "rowRef": crate::row_ref::encode(schema_key, entry.identity.row_pk())?.as_str(),
                 "schemaKey": schema_key,
-                "dependency": REGISTERED_SCHEMA_KEY,
             })));
         }
     }
     Ok(closed)
+}
+
+fn checkpoint_foreign_key_references_target(
+    child_snapshot: &JsonValue,
+    foreign_key: &ForeignKeyPlan,
+    target_entry: &TrackedStateDiffEntry,
+    target_plan: &SchemaPlan,
+    target_snapshot: Option<&JsonValue>,
+) -> Result<bool, LixError> {
+    let Some(local_values) =
+        checkpoint_json_pointer_values(child_snapshot, &foreign_key.local_properties)
+    else {
+        return Ok(false);
+    };
+    if target_plan.primary_key.as_ref() == Some(&foreign_key.referenced_properties) {
+        let component_types = target_plan.primary_key_component_types.as_ref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "foreign-key target has no primary-key component types",
+            )
+        })?;
+        let row_pk = RowPk::from_json_values(&local_values, component_types).map_err(|error| {
+            LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!("checkpoint foreign-key value is invalid: {error}"),
+            )
+        })?;
+        return Ok(&row_pk == target_entry.identity.row_pk());
+    }
+    Ok(target_snapshot.is_some_and(|target_snapshot| {
+        checkpoint_json_pointer_values(target_snapshot, &foreign_key.referenced_properties)
+            == Some(local_values)
+    }))
+}
+
+fn checkpoint_json_pointer_values(
+    snapshot: &JsonValue,
+    pointers: &[Vec<String>],
+) -> Option<Vec<JsonValue>> {
+    let mut values = Vec::with_capacity(pointers.len());
+    for pointer in pointers {
+        let mut value = snapshot;
+        for segment in pointer {
+            value = value.get(segment)?;
+        }
+        if value.is_null() {
+            return None;
+        }
+        values.push(value.clone());
+    }
+    Some(values)
 }
 
 fn push_checkpoint_selected_change(
@@ -11960,7 +12344,7 @@ fn v2_host_changes_from_prepared_rows(
 }
 
 fn typed_key_from_row_pk(
-    plan: &crate::catalog::SchemaPlan,
+    plan: &SchemaPlan,
     schema_key: &str,
     row_pk: &RowPk,
 ) -> Result<(WasmRowKey, Vec<lix_schema::Value>), LixError> {

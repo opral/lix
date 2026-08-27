@@ -336,6 +336,310 @@ simulation_test!(
 );
 
 simulation_test!(
+    scoped_checkpoint_closes_schema_and_foreign_key_dependencies,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        let parent_schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "checkpoint_parent",
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"]
+        });
+        let child_schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "checkpoint_child",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "parent_id", "type": "text", "nullable": false }
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [{
+                "columns": ["parent_id"],
+                "references": { "schema_key": "checkpoint_parent", "columns": ["id"] }
+            }]
+        });
+        for schema in [parent_schema, child_schema] {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (schema_key, value) \
+                     VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                    &[Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema registration should succeed");
+        }
+        session
+            .execute("INSERT INTO checkpoint_parent (id) VALUES ('parent-a')", &[])
+            .await
+            .expect("parent insert should succeed");
+        session
+            .execute(
+                "INSERT INTO checkpoint_child (id, parent_id) VALUES ('child-a', 'parent-a')",
+                &[],
+            )
+            .await
+            .expect("child insert should succeed");
+
+        let checkpoint = session
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
+                    lix_row_ref('checkpoint_child', 'child-a')\
+                 ])",
+                &[],
+            )
+            .await
+            .expect("scoped checkpoint should close dependencies");
+        assert_eq!(checkpoint.len(), 1);
+        for relation in ["checkpoint_child", "checkpoint_parent"] {
+            assert_eq!(
+                select_rows(
+                    &session,
+                    &format!("SELECT COUNT(*) FROM lix_diff('{relation}')"),
+                )
+                .await,
+                vec![vec![Value::Integer(0)]],
+                "selected child and its changed parent must cross together"
+            );
+        }
+        session
+            .execute(
+                "INSERT INTO checkpoint_child (id, parent_id) VALUES ('child-b', 'parent-a')",
+                &[],
+            )
+            .await
+            .expect("schema registrations must remain visible after partial checkpoint");
+    }
+);
+
+simulation_test!(
+    scoped_checkpoint_accepts_directory_and_mixed_relation_row_refs,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, parent_id, name) VALUES \
+                 ('01950000-0000-7000-8000-000000000010', NULL, 'parent'), \
+                 ('01950000-0000-7000-8000-000000000011', \
+                  '01950000-0000-7000-8000-000000000010', 'child')",
+                &[],
+            )
+            .await
+            .expect("directories should insert");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('mixed-row', 'value')",
+                &[],
+            )
+            .await
+            .expect("custom row should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) VALUES \
+                 ('01950000-0000-7000-8000-000000000012', '/unselected.txt', CAST('x' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("unselected file should insert");
+
+        session
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
+                    lix_row_ref('lix_directory', '01950000-0000-7000-8000-000000000011'),\
+                    lix_row_ref('lix_key_value', 'mixed-row')\
+                 ])",
+                &[],
+            )
+            .await
+            .expect("mixed relation checkpoint should succeed");
+        assert_eq!(
+            select_rows(&session, "SELECT COUNT(*) FROM lix_diff('lix_directory')").await,
+            vec![vec![Value::Integer(0)]],
+            "direct directory selection includes its changed ancestor"
+        );
+        assert_eq!(
+            select_rows(&session, "SELECT COUNT(*) FROM lix_diff('lix_key_value')").await,
+            vec![vec![Value::Integer(0)]]
+        );
+        assert_eq!(
+            select_rows(&session, "SELECT COUNT(*) FROM lix_diff('lix_file')").await,
+            vec![vec![Value::Integer(1)]],
+            "unselected relation rows remain in the working interval"
+        );
+    }
+);
+
+simulation_test!(
+    scoped_checkpoint_closes_reverse_foreign_keys_for_deleted_targets,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        for schema in [
+            json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "checkpoint_delete_parent",
+                "columns": [{ "name": "id", "type": "text", "nullable": false }],
+                "primary_key": ["id"]
+            }),
+            json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "checkpoint_delete_child",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "parent_id", "type": "text", "nullable": false }
+                ],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "columns": ["parent_id"],
+                    "references": {
+                        "schema_key": "checkpoint_delete_parent",
+                        "columns": ["id"]
+                    }
+                }]
+            }),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (schema_key, value) \
+                     VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                    &[Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("schema registration should succeed");
+        }
+        session
+            .execute(
+                "INSERT INTO checkpoint_delete_parent (id) VALUES ('parent-a')",
+                &[],
+            )
+            .await
+            .expect("parent should insert");
+        session
+            .execute(
+                "INSERT INTO checkpoint_delete_child (id, parent_id) \
+                 VALUES ('child-a', 'parent-a')",
+                &[],
+            )
+            .await
+            .expect("child should insert");
+        session
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("baseline checkpoint should succeed");
+
+        session
+            .execute(
+                "DELETE FROM checkpoint_delete_child WHERE id = 'child-a'",
+                &[],
+            )
+            .await
+            .expect("child should delete first");
+        session
+            .execute(
+                "DELETE FROM checkpoint_delete_parent WHERE id = 'parent-a'",
+                &[],
+            )
+            .await
+            .expect("parent should delete after child");
+        session
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
+                    lix_row_ref('checkpoint_delete_parent', 'parent-a')\
+                 ])",
+                &[],
+            )
+            .await
+            .expect("parent deletion must close over the changed child deletion");
+
+        for relation in ["checkpoint_delete_parent", "checkpoint_delete_child"] {
+            assert_eq!(
+                select_rows(
+                    &session,
+                    &format!("SELECT COUNT(*) FROM lix_diff('{relation}')"),
+                )
+                .await,
+                vec![vec![Value::Integer(0)]],
+                "parent and child deletions must cross the checkpoint together"
+            );
+        }
+    }
+);
+
+simulation_test!(
+    checkpoint_function_obeys_outer_transaction_and_empty_scope,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('transaction-row', 'value')",
+                &[],
+            )
+            .await
+            .expect("working row should insert");
+        let head_before_empty = select_rows(
+            &session,
+            "SELECT lix_active_branch_commit_id()",
+        )
+        .await;
+        assert!(session
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[])",
+                &[],
+            )
+            .await
+            .expect("empty scoped checkpoint is a no-op")
+            .is_empty());
+        assert_eq!(
+            select_rows(&session, "SELECT lix_active_branch_commit_id()").await,
+            head_before_empty,
+            "empty scope must never alias full checkpoint"
+        );
+
+        let mut rolled_back = session.begin_transaction().await.expect("transaction opens");
+        rolled_back
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("checkpoint may stage in transaction");
+        rolled_back.rollback().await.expect("rollback succeeds");
+        assert_eq!(
+            select_rows(&session, "SELECT COUNT(*) FROM lix_diff('lix_key_value')").await,
+            vec![vec![Value::Integer(1)]],
+            "rollback publishes neither checkpoint nor post-commit effects"
+        );
+
+        let mut committed = session.begin_transaction().await.expect("transaction opens");
+        committed
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("first checkpoint stages");
+        let duplicate = committed
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect_err("one transaction cannot publish two checkpoints");
+        assert_eq!(duplicate.code, "LIX_INVALID_TRANSACTION_STATE");
+        committed.commit().await.expect("first checkpoint commits");
+        assert_eq!(
+            select_rows(&session, "SELECT COUNT(*) FROM lix_diff('lix_key_value')").await,
+            vec![vec![Value::Integer(0)]]
+        );
+    }
+);
+
+simulation_test!(
     checkpoint_surface_is_global_row_and_read_only,
     |sim| async move {
         let engine = sim.boot_engine().await;

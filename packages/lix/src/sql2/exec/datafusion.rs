@@ -2660,9 +2660,12 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
         BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Apply) => {
             Ok("lix_apply".to_string())
         }
-        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => {
-            Ok("lix_create_checkpoint".to_string())
-        }
+        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => Err(
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "checkpoint function reached the writable-table executor",
+            ),
+        ),
         BoundWriteTarget::Restore { .. } => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "lix_restore reached the DataFusion write executor",
@@ -4447,7 +4450,6 @@ mod tests {
             vec![
                 "lix_apply",
                 "lix_branch",
-                "lix_create_checkpoint",
                 "lix_directory",
                 "lix_file",
                 "lix_revert",

@@ -14,7 +14,6 @@ import { normalizeParam, toNativeValue } from "./value.js";
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
-	CreateCheckpointReceipt,
 	RedoReceipt,
 	ExecuteOptions,
 	ExecuteResult,
@@ -211,10 +210,6 @@ export class Lix {
 		options: CreateBranchOptions,
 	): Promise<CreateBranchReceipt> {
 		return this.#runOperation(() => this.binding.createBranch(options));
-	}
-
-	async createCheckpoint(): Promise<CreateCheckpointReceipt> {
-		return this.#runOperation(() => this.binding.createCheckpoint());
 	}
 
 	/** Streams a deterministic snapshot of the complete Lix. */

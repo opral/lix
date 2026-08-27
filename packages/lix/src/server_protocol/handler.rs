@@ -294,7 +294,6 @@ pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
     ("POST", "/lix/v1/{lix_id}/file/upsert"),
     ("POST", "/lix/v1/{lix_id}/file/upsert-batch"),
     ("POST", "/lix/v1/{lix_id}/branch/create"),
-    ("POST", "/lix/v1/{lix_id}/checkpoint/create"),
     ("POST", "/lix/v1/{lix_id}/undo"),
     ("POST", "/lix/v1/{lix_id}/redo"),
     ("POST", "/lix/v1/{lix_id}/branch/switch"),
@@ -1968,9 +1967,6 @@ where
             (&Method::POST, "/lix/v1/branch/create") => {
                 result_response(create_branch(lease, json_request!(CreateBranchRequest)).await)
             }
-            (&Method::POST, "/lix/v1/checkpoint/create") => {
-                result_response(create_checkpoint(lease).await)
-            }
             (&Method::POST, "/lix/v1/undo") => result_response(undo(lease).await),
             (&Method::POST, "/lix/v1/redo") => result_response(redo(lease).await),
             (&Method::POST, "/lix/v1/branch/switch") => {
@@ -3496,20 +3492,6 @@ where
     }))
 }
 
-async fn create_checkpoint<S>(
-    lease: SessionLease<S>,
-) -> Result<Json<CreateCheckpointResponse>, ApiError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    let receipt = lease
-        .run_durable(move |lix| async move { lix.create_checkpoint().await })
-        .await?;
-    Ok(Json(CreateCheckpointResponse {
-        commit_id: receipt.commit_id,
-    }))
-}
-
 async fn undo<S>(lease: SessionLease<S>) -> Result<Json<UndoResponse>, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -4799,12 +4781,6 @@ struct CreateBranchResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateCheckpointResponse {
-    commit_id: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct UndoResponse {
     branch_id: String,
     target_commit_id: String,
@@ -5314,7 +5290,6 @@ mod tests {
                 ("POST", "/lix/v1/{lix_id}/file/upsert") => "upsertFile",
                 ("POST", "/lix/v1/{lix_id}/file/upsert-batch") => "upsertFileBatch",
                 ("POST", "/lix/v1/{lix_id}/branch/create") => "createBranch",
-                ("POST", "/lix/v1/{lix_id}/checkpoint/create") => "createCheckpoint",
                 ("POST", "/lix/v1/{lix_id}/undo") => "undo",
                 ("POST", "/lix/v1/{lix_id}/redo") => "redo",
                 ("POST", "/lix/v1/{lix_id}/branch/switch") => "switchBranch",
@@ -10009,13 +9984,15 @@ mod tests {
         let created = request(
             &app.router,
             "POST",
-            "/lix/v1/checkpoint/create",
+            "/lix/v1/execute",
             Some(&session_id),
-            None,
+            Some(json!({
+                "sql": "SELECT commit_id FROM lix_create_checkpoint()"
+            })),
         )
         .await;
         assert_eq!(created.status(), StatusCode::OK);
-        let checkpoint_id = response_json(created).await["commitId"]
+        let checkpoint_id = response_json(created).await["rows"][0][0]["value"]
             .as_str()
             .expect("checkpoint commit id")
             .to_string();
@@ -11931,13 +11908,15 @@ mod tests {
         let response = request(
             &app.router,
             "POST",
-            "/lix/v1/checkpoint/create",
+            "/lix/v1/execute",
             Some(&session_id),
-            None,
+            Some(json!({
+                "sql": "SELECT commit_id FROM lix_create_checkpoint()"
+            })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let commit_id = response_json(response).await["commitId"]
+        let commit_id = response_json(response).await["rows"][0][0]["value"]
             .as_str()
             .expect("commitId")
             .to_string();

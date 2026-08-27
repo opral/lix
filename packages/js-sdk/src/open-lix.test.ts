@@ -53,7 +53,7 @@ test("snapshot streams restore a complete Lix deterministically", async () => {
 	await source.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ('snapshot-js', 'complete')",
 	);
-	await source.createCheckpoint();
+	await source.execute("SELECT commit_id FROM lix_create_checkpoint()");
 
 	const bytes = new Uint8Array(
 		await new Response(source.exportSnapshot()).arrayBuffer(),
@@ -792,7 +792,7 @@ test("openLix exposes the lix-sdk e2e flow", async () => {
 	).rejects.toThrow(/closed/);
 });
 
-test("createCheckpoint returns the new active head through the local worker", async () => {
+test("checkpoint SQL returns the new active head through the local worker", async () => {
 	const lix = await openLix();
 	await lix.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
@@ -800,10 +800,13 @@ test("createCheckpoint returns the new active head through the local worker", as
 	);
 	const before = await activeHeadCommitId(lix);
 
-	const checkpoint = await lix.createCheckpoint();
+	const checkpoint = await lix.execute(
+		"SELECT commit_id FROM lix_create_checkpoint()",
+	);
+	const checkpointId = checkpoint.rows[0]?.commit_id;
 
-	expect(checkpoint.commitId).not.toBe(before);
-	expect(checkpoint.commitId).toBe(await activeHeadCommitId(lix));
+	expect(checkpointId).not.toBe(before);
+	expect(checkpointId).toBe(await activeHeadCommitId(lix));
 	await lix.close();
 });
 

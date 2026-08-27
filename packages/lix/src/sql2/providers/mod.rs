@@ -603,10 +603,10 @@ where
             PublicSurfaceKind::SchemaBase { .. }
             | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::CheckpointFunction
             | PublicSurfaceKind::StateAtFunction
             | PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
-            | PublicSurfaceKind::CreateCheckpoint
             | PublicSurfaceKind::Restore => {}
         }
     }
@@ -813,18 +813,10 @@ async fn register_write_from_catalog(
                 )
                 .await?;
             }
-            PublicSurfaceKind::CreateCheckpoint => {
-                diff_command::register_diff_command_provider(
-                    session,
-                    &surface.name,
-                    crate::sql2::DiffCommand::CreateCheckpoint,
-                    write_ctx.clone(),
-                )
-                .await?;
-            }
             PublicSurfaceKind::Change
             | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::CheckpointFunction
             | PublicSurfaceKind::StateAtFunction
             | PublicSurfaceKind::CommitAncestryFunction
             | PublicSurfaceKind::Restore => {}

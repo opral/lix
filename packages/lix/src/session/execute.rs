@@ -18,7 +18,7 @@ use crate::storage_adapter::{
     StorageReadDurability, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
-use crate::{Blob, LixError, LixNotice, ResultColumnType, SqlQueryResult, Value};
+use crate::{Blob, LixError, LixNotice, ResultColumnType, RowRef, SqlQueryResult, Value};
 use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -631,6 +631,15 @@ impl TryFromValue for String {
         match value {
             Value::Text(value) => Ok(value.clone()),
             other => Err(value_type_error("text", other)),
+        }
+    }
+}
+
+impl TryFromValue for RowRef {
+    fn try_from_value(value: &Value) -> Result<Self, LixError> {
+        match value {
+            Value::RowRef(value) => Ok(value.clone()),
+            other => Err(value_type_error("lix_row_ref", other)),
         }
     }
 }
@@ -4167,10 +4176,6 @@ where
             .execute_checkpoint_function(checkpoint, params.to_vec())
             .await?;
         return sql2::SqlWriteResult::checkpoint_function(outcome);
-    }
-    if let Some(returning) = sql2::full_checkpoint_command(&plan) {
-        let outcome = transaction.execute_full_checkpoint_command().await?;
-        return sql2::SqlWriteResult::diff_command(outcome, returning.as_ref());
     }
     if let Some((command, query_sql, returning)) = sql2::diff_command_query(&plan) {
         let outcome = transaction

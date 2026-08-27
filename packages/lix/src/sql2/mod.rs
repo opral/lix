@@ -77,7 +77,7 @@ pub(crate) use exec::{
     execute_write_logical_plan_prepared_dml_batch, execute_write_logical_plan_result_with_metadata,
     execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
     prepare_path_value_replacement_program, prepare_path_value_replacement_row,
-    full_checkpoint_command, prepare_read_session, prepare_read_session_at_head, query_result_from_batches,
+    prepare_read_session, prepare_read_session_at_head, query_result_from_batches,
     query_values_from_batches, write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]
