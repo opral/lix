@@ -10,7 +10,8 @@ use super::{
     MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT, SyncBlobManifest,
     SyncBlobRegistration, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
     SyncRepositoryPullResponse, SyncSnapshotRowPage, SyncTransport, SyncTransportBounds,
-    SyncTransportFuture, validate_sync_remote_id,
+    SyncTransportFuture, SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION_HEADER,
+    sync_server_protocol_mismatch, validate_sync_remote_id,
 };
 use crate::LixError;
 
@@ -44,6 +45,8 @@ pub(crate) trait RawHttpClient: SyncTransportBounds {
 #[serde(rename_all = "camelCase")]
 struct HandshakeResponse {
     protocol_version: u32,
+    #[serde(default)]
+    sync_protocol_version: Option<u32>,
     session_id: String,
     active_account_id: String,
 }
@@ -98,11 +101,20 @@ where
         })
     }
 
+    pub(super) fn is_reserved_header(name: &str) -> bool {
+        name.eq_ignore_ascii_case(SESSION_HEADER)
+            || name.eq_ignore_ascii_case(SYNC_PROTOCOL_VERSION_HEADER)
+    }
+
     fn request(&self, method: Method, path: &str, operation: &'static str) -> RawHttpRequest {
         let mut request = raw_request(method, format!("{}{path}", self.protocol_url), operation);
         request
             .headers
             .push((SESSION_HEADER.to_owned(), self.session_id.clone()));
+        request.headers.push((
+            SYNC_PROTOCOL_VERSION_HEADER.to_owned(),
+            SYNC_PROTOCOL_VERSION.to_string(),
+        ));
         request
     }
 
@@ -123,6 +135,11 @@ fn validate_handshake(handshake: &HandshakeResponse) -> Result<(), LixError> {
                 "unsupported Lix Server Protocol version: {}",
                 handshake.protocol_version
             ),
+        ));
+    }
+    if handshake.sync_protocol_version != Some(SYNC_PROTOCOL_VERSION) {
+        return Err(sync_server_protocol_mismatch(
+            handshake.sync_protocol_version,
         ));
     }
     if handshake.session_id.is_empty() || handshake.session_id.len() > 4096 {
@@ -457,9 +474,10 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandshakeResponse, RawHttpResponse, encode_query, normalize_sync_locator,
-        response_error, validate_handshake,
+        HandshakeResponse, HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse,
+        encode_query, normalize_sync_locator, response_error, validate_handshake,
     };
+    use crate::sync::SyncTransportFuture;
 
     #[test]
     fn sync_connection_locator_maps_to_the_targeted_protocol_root() {
@@ -514,12 +532,105 @@ mod tests {
     fn sync_handshake_rejects_an_incompatible_protocol_before_bootstrap() {
         let error = validate_handshake(&HandshakeResponse {
             protocol_version: crate::SERVER_PROTOCOL_VERSION + 1,
+            sync_protocol_version: Some(crate::sync::SYNC_PROTOCOL_VERSION),
             session_id: "session-1".to_owned(),
             active_account_id: "01920000-0000-7000-8000-000000000602".to_owned(),
         })
         .expect_err("incompatible protocol must fail");
         assert_eq!(error.code, "LIX_SERVER_PROTOCOL_ERROR");
         assert!(error.message.contains("unsupported"));
+    }
+
+    #[derive(Debug)]
+    struct VersionMismatchClient;
+
+    impl RawHttpClient for VersionMismatchClient {
+        fn send(&self, _request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async {
+                Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": 999,
+                        "sessionId": "session-from-incompatible-server",
+                        "activeBranchId": "01920000-0000-7000-8000-000000001234",
+                        "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
+                    }))
+                    .expect("encode mismatched handshake"),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct MissingVersionClient;
+
+    impl RawHttpClient for MissingVersionClient {
+        fn send(&self, _request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async {
+                Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "sessionId": "session-from-legacy-server",
+                        "activeBranchId": "01920000-0000-7000-8000-000000001234",
+                        "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
+                    }))
+                    .expect("encode legacy handshake"),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_handshake_rejects_a_mismatched_sync_protocol_version() {
+        let error = HttpSyncTransport::connect_with(
+            VersionMismatchClient,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        )
+        .await
+        .expect_err("an incompatible sync protocol must fail before transfer");
+        assert_eq!(error.code, crate::sync::SYNC_PROTOCOL_MISMATCH_CODE);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({
+                "clientSyncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                "serverSyncProtocolVersion": 999,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_handshake_rejects_a_missing_sync_protocol_version() {
+        let error = HttpSyncTransport::connect_with(
+            MissingVersionClient,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        )
+        .await
+        .expect_err("a legacy server must fail before transfer");
+        assert_eq!(error.code, crate::sync::SYNC_PROTOCOL_MISMATCH_CODE);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({
+                "clientSyncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                "serverSyncProtocolVersion": null,
+            }))
+        );
+    }
+
+    #[test]
+    fn session_and_protocol_headers_are_reserved_for_the_transport() {
+        assert!(HttpSyncTransport::<VersionMismatchClient>::is_reserved_header(
+            "Lix-Session-Id"
+        ));
+        assert!(HttpSyncTransport::<VersionMismatchClient>::is_reserved_header(
+            "LIX-SYNC-PROTOCOL-VERSION"
+        ));
+        assert!(!HttpSyncTransport::<VersionMismatchClient>::is_reserved_header(
+            "Authorization"
+        ));
     }
 
     #[test]

@@ -29,6 +29,7 @@ const OFFLINE_COMMIT_COUNT: usize = 513;
 
 #[derive(Debug, Default)]
 struct HttpProbe {
+    handshakes: AtomicU64,
     pushes: AtomicU64,
     push_conflicts: AtomicU64,
     delta_pulls: AtomicU64,
@@ -42,6 +43,7 @@ struct HttpProbe {
     drop_next_push_ack: AtomicBool,
     reject_requests: AtomicBool,
     reject_pushes: AtomicBool,
+    mismatch_handshake_protocol: AtomicBool,
     one_way_delay_millis: AtomicU64,
     gated_pushes: AtomicU64,
     push_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -236,6 +238,38 @@ async fn sync_runtime_outlives_the_primary_session() {
     wait_for_value(&child, "from-authority", "child-still-live").await;
 
     child.close().await.expect("close final session");
+    stop_server(server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warm_runtime_protocol_mismatch_is_terminal_without_reconnect() {
+    let (authority_storage, authority) = open_authority().await;
+    put_value(&authority, "protocol-seed", "authority").await;
+    authority.close().await.expect("close authority setup");
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage, Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+
+    let initial = open_replica(replica_dir.path(), &url).await;
+    initial.close().await.expect("close initial replica");
+    let initial_handshakes = probe.handshakes.load(Ordering::Acquire);
+    probe
+        .mismatch_handshake_protocol
+        .store(true, Ordering::Release);
+
+    let reopened = open_replica(replica_dir.path(), &url).await;
+    wait_for_counter(&probe.handshakes, initial_handshakes + 1).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        probe.handshakes.load(Ordering::Acquire),
+        initial_handshakes + 1,
+        "a terminal protocol mismatch must not enter the reconnect loop"
+    );
+    let error = reopened
+        .close()
+        .await
+        .expect_err("close should surface the worker's terminal mismatch");
+    assert_eq!(error.code, "LIX_SYNC_PROTOCOL_MISMATCH");
     stop_server(server_task).await;
 }
 
@@ -833,6 +867,104 @@ async fn more_than_one_offline_push_window_drains_after_reconnect() {
     );
 
     replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_restore_survives_reopen_and_resets_the_authority() {
+    let (authority_storage, authority) = open_authority().await;
+    put_value(&authority, "restore-reopen", "target").await;
+    let restore_target = active_head(&authority).await;
+    put_value(&authority, "restore-reopen", "later").await;
+    let authority_head_before_restore = active_head(&authority).await;
+    authority.close().await.expect("close authority setup");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+    assert_eq!(
+        read_value(&replica, "restore-reopen").await.as_deref(),
+        Some("later"),
+    );
+    let historical = replica
+        .execute(
+            "SELECT value FROM lix_state_at('lix_key_value', $1) WHERE key = 'restore-reopen'",
+            &[Value::Text(restore_target.clone())],
+        )
+        .await
+        .expect("hydrate the historical restore target before going offline");
+    assert_eq!(historical.len(), 1);
+
+    // Keep the restore in the durable local outbox across close/reopen. This
+    // models a browser losing connectivity (or being terminated) immediately
+    // after the local-first restore commits.
+    probe.set_offline(true);
+    replica
+        .execute(
+            "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+            &[Value::Text(restore_target.clone())],
+        )
+        .await
+        .expect("restore local replica to an authority ancestor");
+    assert_eq!(active_head(&replica).await, restore_target);
+    assert_eq!(
+        read_value(&replica, "restore-reopen").await.as_deref(),
+        Some("target"),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    replica
+        .close()
+        .await
+        .expect("close replica with an offline restore in its durable outbox");
+    drop(replica);
+
+    let reopened = tokio::time::timeout(
+        Duration::from_secs(2),
+        open_replica(replica_dir.path(), &url),
+    )
+    .await
+    .expect("warm restore reopen must not await the unavailable authority");
+    assert_eq!(active_head(&reopened).await, restore_target);
+    assert_eq!(
+        read_value(&reopened, "restore-reopen").await.as_deref(),
+        Some("target"),
+    );
+    assert_eq!(
+        protocol_authority
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await[0][0],
+        Value::Text(authority_head_before_restore),
+        "the rejected push must leave the authority at its later head",
+    );
+
+    probe.set_offline(false);
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        loop {
+            let head = protocol_authority
+                .execute("SELECT lix_active_branch_commit_id()", &[])
+                .await;
+            if head[0][0] == Value::Text(restore_target.clone()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reopened replica should push the historical ref reset");
+    assert_eq!(
+        read_value(&reopened, "restore-reopen").await.as_deref(),
+        Some("target"),
+        "the authority lineage must not overwrite the local restore",
+    );
+    assert_eq!(
+        protocol_authority.read_value("restore-reopen").await.as_deref(),
+        Some("target"),
+        "the local restore should reset the authority through a ref CAS",
+    );
+
+    reopened.close().await.expect("close reopened replica");
     stop_server(server_task).await;
 }
 
@@ -1560,6 +1692,28 @@ where
     let one_way_delay = Duration::from_millis(probe.one_way_delay_millis.load(Ordering::Acquire));
     tokio::time::sleep(one_way_delay).await;
     let path = parts.uri.path();
+    let is_handshake = parts.method == Method::GET
+        && path
+            .strip_prefix("/lix/v1/")
+            .is_some_and(|lix_id| !lix_id.is_empty() && !lix_id.contains('/'));
+    if is_handshake {
+        probe.handshakes.fetch_add(1, Ordering::Release);
+        if probe.mismatch_handshake_protocol.load(Ordering::Acquire) {
+            let body = serde_json::to_vec(&json!({
+                "protocolVersion": lix::server_protocol::PROTOCOL_VERSION,
+                "syncProtocolVersion": 999,
+                "sessionId": "incompatible-test-session",
+                "activeBranchId": "01920000-0000-7000-8000-000000001234",
+                "activeAccountId": lix::ANONYMOUS_ACCOUNT_ID,
+            }))
+            .expect("encode mismatched handshake");
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from(body)))
+                .expect("build mismatched handshake"));
+        }
+    }
     let is_push = parts.method == Method::POST && path.ends_with("/sync/push");
     if is_push && probe.reject_pushes.load(Ordering::Acquire) {
         return Ok(Response::builder()

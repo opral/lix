@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use crate::LixError;
+use parking_lot::RwLock;
 
 #[cfg(feature = "server-protocol")]
 pub(crate) use blob::validate_sync_blob_manifest;
@@ -57,7 +58,7 @@ pub(crate) use commit::{
 pub(crate) use repository::{
     SYNC_REPLICA_STATE_SPACE, SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE,
     load_pending_sync_export_commit_ids, load_replayable_repository_event_commit_ids,
-    stage_repository_transaction_event,
+    stage_repository_transaction_event, stage_sync_restore_intents,
     validate_repository_transaction_event_transfer,
 };
 #[cfg(feature = "server-protocol")]
@@ -71,7 +72,45 @@ pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
+pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
+pub(crate) const SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE: &str =
+    "LIX_SYNC_IMMUTABLE_OBJECT_MISMATCH";
 const MAX_SYNC_REMOTE_ID_BYTES: usize = 4 * 1024;
+
+pub(crate) fn sync_server_protocol_mismatch(server_version: Option<u32>) -> LixError {
+    let server = server_version
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "missing".to_owned());
+    LixError::new(
+        SYNC_PROTOCOL_MISMATCH_CODE,
+        format!(
+            "incompatible sync protocol: client version {SYNC_PROTOCOL_VERSION}, server version {server}"
+        ),
+    )
+    .with_details(serde_json::json!({
+        "clientSyncProtocolVersion": SYNC_PROTOCOL_VERSION,
+        "serverSyncProtocolVersion": server_version,
+    }))
+}
+
+#[cfg(feature = "server-protocol")]
+pub(crate) fn sync_client_protocol_mismatch(client_version: Option<u32>) -> LixError {
+    let client = client_version
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "invalid".to_owned());
+    LixError::new(
+        SYNC_PROTOCOL_MISMATCH_CODE,
+        format!(
+            "incompatible sync protocol: client version {client}, server version {SYNC_PROTOCOL_VERSION}"
+        ),
+    )
+    .with_details(serde_json::json!({
+        "clientSyncProtocolVersion": client_version,
+        "serverSyncProtocolVersion": SYNC_PROTOCOL_VERSION,
+    }))
+}
 
 pub(crate) fn validate_blake3_id(value: &str, context: &str) -> Result<(), LixError> {
     if value.len() == 64
@@ -127,6 +166,7 @@ pub(crate) enum SyncRole {
 #[derive(Clone, Debug)]
 pub(crate) struct SyncModeState {
     role: Arc<AtomicU8>,
+    replica_remote_id: Arc<RwLock<Option<Arc<str>>>>,
     change_watch: tokio::sync::watch::Sender<u64>,
 }
 
@@ -134,6 +174,7 @@ impl Default for SyncModeState {
     fn default() -> Self {
         Self {
             role: Arc::new(AtomicU8::new(SyncRole::Disabled as u8)),
+            replica_remote_id: Arc::new(RwLock::new(None)),
             change_watch: tokio::sync::watch::channel(0).0,
         }
     }
@@ -151,6 +192,14 @@ impl SyncModeState {
 
     pub(crate) fn set_role(&self, role: SyncRole) {
         self.role.store(role as u8, Ordering::Release);
+    }
+
+    pub(crate) fn replica_remote_id(&self) -> Option<Arc<str>> {
+        self.replica_remote_id.read().clone()
+    }
+
+    pub(crate) fn set_replica_remote_id(&self, remote_id: impl Into<Arc<str>>) {
+        *self.replica_remote_id.write() = Some(remote_id.into());
     }
 
     pub(crate) fn change_watcher(&self) -> tokio::sync::watch::Receiver<u64> {

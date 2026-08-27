@@ -95,7 +95,13 @@ where
                 }
             };
         self.ensure_open()?;
-        opened.transaction.set_sync_role(self.sync_mode.role());
+        let sync_role = self.sync_mode.role();
+        let replica_remote_id = (sync_role == crate::sync::SyncRole::Replica)
+            .then(|| self.sync_mode.replica_remote_id())
+            .flatten();
+        opened
+            .transaction
+            .set_sync_mode(sync_role, replica_remote_id);
         if self.sync_outbox_suppressed {
             opened.transaction.suppress_ordinary_sync_event();
         }

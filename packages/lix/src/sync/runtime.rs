@@ -304,6 +304,7 @@ where
 {
     let remote_id = server.url.clone();
     let headers = server.headers.clone();
+    lix.set_sync_replica_remote_id(&remote_id)?;
     lix.set_sync_role(crate::sync::SyncRole::Replica)?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(SyncShutdown::Running);
@@ -379,6 +380,12 @@ where
                     transport = Some(connected);
                 }
                 Err(error) => {
+                    if is_terminal_sync_error(&error) {
+                        tracing::error!(error = ?error, "sync repository cannot connect");
+                        lix.fail_observers_for_sync(error.clone());
+                        terminal_error = Some(error);
+                        break;
+                    }
                     tracing::warn!(error = ?error, "sync reconnect failed");
                     if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
                         break;
@@ -845,7 +852,11 @@ fn snapshot_pull_error(error: LixError) -> LixError {
 fn is_terminal_sync_error(error: &LixError) -> bool {
     matches!(
         error.code.as_str(),
-        SYNC_ITEM_TOO_LARGE_CODE | SYNC_SNAPSHOT_TOO_LARGE_CODE | SYNC_DEMAND_STALLED_CODE
+        SYNC_ITEM_TOO_LARGE_CODE
+            | SYNC_SNAPSHOT_TOO_LARGE_CODE
+            | SYNC_DEMAND_STALLED_CODE
+            | super::SYNC_PROTOCOL_MISMATCH_CODE
+            | super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
     )
 }
 
@@ -2845,6 +2856,16 @@ mod tests {
         ));
         assert_eq!(error.code, SYNC_SNAPSHOT_TOO_LARGE_CODE);
         assert!(is_terminal_sync_error(&error));
+    }
+
+    #[test]
+    fn protocol_and_immutable_identity_mismatches_are_terminal() {
+        for code in [
+            super::super::SYNC_PROTOCOL_MISMATCH_CODE,
+            super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
+        ] {
+            assert!(is_terminal_sync_error(&LixError::new(code, "terminal sync mismatch")));
+        }
     }
 
     #[test]
