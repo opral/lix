@@ -727,25 +727,29 @@ where
     let revision = StorageAdapter::<S>::load_mutation_revision_from_read(&read)
         .await
         .map_err(storage_error)?;
+    drop(read);
     for &space in crate::storage_spaces::ALL_STORAGE_SPACES {
         if space.id == REPOSITORY_EPOCH_SPACE.id {
             continue;
         }
-        let mut cursor = read
-            .begin_scan(
-                space,
-                KeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-                BeginScanOptions {
-                    projection: CoreProjection::FullValue,
-                    ..BeginScanOptions::default()
-                },
-            )
-            .await
-            .map_err(storage_error)?;
-        while let Some(entries) = cursor.next_chunk().await.map_err(storage_error)? {
+        let mut lower = Bound::Unbounded;
+        loop {
+            // The migration claim makes the source bank immutable. Reopen a
+            // bounded read for every page so backends whose read generations
+            // expire after any commit (notably OPFS) can publish the previous
+            // page to the target bank without invalidating the next source
+            // page. The exclusive key bound is the durable continuation.
+            let (entries, has_more) = read_copy_page(source, space, &lower, &revision).await?;
+            if entries.is_empty() {
+                break;
+            }
+            let next_lower = Bound::Excluded(
+                entries
+                    .last()
+                    .expect("a storage scan chunk cannot be empty")
+                    .key
+                    .clone(),
+            );
             let mut writes = target.new_write_set();
             for entry in entries {
                 let ProjectedValue::FullValue(value) = entry.value else {
@@ -757,9 +761,73 @@ where
                 .commit_write_set(writes, WriteOptions::default())
                 .await
                 .map_err(|error| epoch_error(format!("copy target write failed: {error}")))?;
+            if !has_more {
+                break;
+            }
+            lower = next_lower;
         }
     }
     Ok(revision)
+}
+
+async fn read_copy_page<S>(
+    source: &StorageAdapter<S>,
+    space: crate::storage::StorageSpace,
+    lower: &Bound<Key>,
+    expected_revision: &Option<Bytes>,
+) -> Result<(Vec<crate::storage::ReadEntry>, bool), LixError>
+where
+    S: Storage,
+{
+    let mut retry = crate::common::ExpiredReadRetryState::default();
+    loop {
+        let result = async {
+            let read = source
+                .begin_read(ReadOptions::default())
+                .await
+                .map_err(storage_error)?;
+            let observed_revision = StorageAdapter::<S>::load_mutation_revision_from_read(&read)
+                .await
+                .map_err(storage_error)?;
+            if &observed_revision != expected_revision {
+                return Err(epoch_error(
+                    "source repository changed while its epoch was being copied",
+                ));
+            }
+            let mut cursor = read
+                .begin_scan(
+                    space,
+                    KeyRange {
+                        lower: lower.clone(),
+                        upper: Bound::Unbounded,
+                    },
+                    BeginScanOptions {
+                        projection: CoreProjection::FullValue,
+                        ..BeginScanOptions::default()
+                    },
+                )
+                .await
+                .map_err(storage_error)?;
+            cursor
+                .next_page(crate::storage::MAX_SCAN_PAGE_ROWS)
+                .await
+                .map_err(storage_error)
+                .map(crate::storage::ScanChunk::into_parts)
+        }
+        .await;
+        match result {
+            Ok(page) => return Ok(page),
+            Err(error) => {
+                let Some(delay) = retry.next_delay(&error) else {
+                    return Err(error);
+                };
+                tokio::task::yield_now().await;
+                if !delay.is_zero() {
+                    crate::sync::sleep(delay).await;
+                }
+            }
+        }
+    }
 }
 
 async fn load_pointer<S>(storage: &S) -> Result<Option<(PointerState, Bytes)>, LixError>
@@ -1393,6 +1461,188 @@ fn is_admission_race(error: &StorageError) -> bool {
 mod tests {
     use super::*;
     use crate::storage_adapter::StorageWriteOptions;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    #[derive(Clone, Debug)]
+    struct CommitExpiringStorage {
+        inner: crate::Memory,
+        generation: Arc<AtomicU64>,
+        expire_next_page: Arc<AtomicBool>,
+    }
+
+    impl CommitExpiringStorage {
+        fn new() -> Self {
+            Self {
+                inner: crate::Memory::new(),
+                generation: Arc::new(AtomicU64::new(0)),
+                expire_next_page: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn expire_next_page(&self) {
+            self.expire_next_page.store(true, Ordering::Release);
+        }
+    }
+
+    struct CommitExpiringRead {
+        inner: crate::storage::MemoryRead,
+        generation: Arc<AtomicU64>,
+        observed_generation: u64,
+        expire_next_page: Arc<AtomicBool>,
+    }
+
+    impl CommitExpiringRead {
+        fn validate(&self) -> Result<(), StorageError> {
+            if self.generation.load(Ordering::Acquire) == self.observed_generation {
+                Ok(())
+            } else {
+                Err(StorageError::ReadExpired)
+            }
+        }
+    }
+
+    struct CommitExpiringScan<'a> {
+        inner: crate::storage::ScanCursor<'a>,
+        generation: Arc<AtomicU64>,
+        observed_generation: u64,
+        expire_next_page: Arc<AtomicBool>,
+    }
+
+    impl crate::storage::StorageScanSource for CommitExpiringScan<'_> {
+        fn next_page(
+            &mut self,
+            limit_rows: usize,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<crate::storage::ScanChunk, StorageError>> + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if self.expire_next_page.swap(false, Ordering::AcqRel) {
+                    self.generation.fetch_add(1, Ordering::AcqRel);
+                    return Err(StorageError::ReadExpired);
+                }
+                if self.generation.load(Ordering::Acquire) != self.observed_generation {
+                    return Err(StorageError::ReadExpired);
+                }
+                self.inner.next_page(limit_rows).await
+            })
+        }
+    }
+
+    impl StorageRead for CommitExpiringRead {
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        async fn get_many(
+            &self,
+            requests: &[GetManyRequest<'_>],
+        ) -> Result<crate::storage::GetManyResult, StorageError> {
+            self.validate()?;
+            self.inner.get_many(requests).await
+        }
+
+        async fn begin_scan(
+            &self,
+            space: crate::storage::StorageSpace,
+            range: KeyRange,
+            opts: BeginScanOptions,
+        ) -> Result<crate::storage::ScanCursor<'_>, StorageError> {
+            self.validate()?;
+            let checked_range = range.clone();
+            let inner = self.inner.begin_scan(space, range, opts).await?;
+            crate::storage::ScanCursor::from_source(
+                checked_range,
+                opts.order,
+                CommitExpiringScan {
+                    inner,
+                    generation: Arc::clone(&self.generation),
+                    observed_generation: self.observed_generation,
+                    expire_next_page: Arc::clone(&self.expire_next_page),
+                },
+            )
+        }
+    }
+
+    struct CommitExpiringWrite {
+        inner: crate::storage::MemoryWrite,
+        generation: Arc<AtomicU64>,
+    }
+
+    impl StorageWrite for CommitExpiringWrite {
+        async fn put_many(
+            &mut self,
+            space: crate::storage::StorageSpace,
+            entries: PutBatch,
+        ) -> Result<(), StorageError> {
+            self.inner.put_many(space, entries).await
+        }
+
+        async fn replace_many(
+            &mut self,
+            space: crate::storage::StorageSpace,
+            entries: PutBatch,
+        ) -> Result<(), StorageError> {
+            self.inner.replace_many(space, entries).await
+        }
+
+        async fn delete_many(
+            &mut self,
+            space: crate::storage::StorageSpace,
+            keys: &[Key],
+        ) -> Result<(), StorageError> {
+            self.inner.delete_many(space, keys).await
+        }
+
+        async fn delete_range(
+            &mut self,
+            space: crate::storage::StorageSpace,
+            range: KeyRange,
+        ) -> Result<(), StorageError> {
+            self.inner.delete_range(space, range).await
+        }
+
+        async fn commit(self) -> Result<crate::storage::CommitResult, StorageError> {
+            let result = self.inner.commit().await?;
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            Ok(result)
+        }
+
+        async fn rollback(self) -> Result<(), StorageError> {
+            self.inner.rollback().await
+        }
+    }
+
+    impl Storage for CommitExpiringStorage {
+        type Read<'a> = CommitExpiringRead;
+        type Write<'a> = CommitExpiringWrite;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            let inner = self.inner.begin_read(opts).await?;
+            Ok(CommitExpiringRead {
+                inner,
+                generation: Arc::clone(&self.generation),
+                observed_generation: self.generation.load(Ordering::Acquire),
+                expire_next_page: Arc::clone(&self.expire_next_page),
+            })
+        }
+
+        async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
+            Ok(CommitExpiringWrite {
+                inner: self.inner.begin_write(opts).await?,
+                generation: Arc::clone(&self.generation),
+            })
+        }
+    }
 
     async fn seed_active_v75(storage: &crate::Memory, bank: EpochBank, generation: u64) -> Bytes {
         let adapter = StorageAdapter::for_epoch_unfenced(storage.clone(), bank);
@@ -1453,6 +1703,71 @@ mod tests {
             attempt: uuid::Uuid::from_u128(11),
         });
         assert_ne!(first, retry, "migration retries must not reuse a fence");
+    }
+
+    #[tokio::test]
+    async fn copy_reopens_source_pages_after_target_commits_expire_reads() {
+        let storage = CommitExpiringStorage::new();
+        let source_seed = StorageAdapter::for_epoch_unfenced(storage.clone(), EpochBank::A);
+        let row_count = crate::storage::MAX_SCAN_PAGE_ROWS + 17;
+        let mut writes = source_seed.new_write_set();
+        for index in 0..row_count {
+            let key = u64::try_from(index).unwrap().to_be_bytes();
+            let value = [u8::try_from(index % 251).unwrap()];
+            writes.put(
+                crate::json_store::JSON_SPACE,
+                key.as_slice(),
+                value.as_slice(),
+            );
+        }
+        source_seed
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let migrating = encode_pointer(PointerState::Migrating {
+            source: EpochBank::A,
+            source_format: crate::init::CURRENT_FORMAT_VERSION,
+            target: EpochBank::B,
+            generation: 2,
+            attempt: uuid::Uuid::from_u128(30),
+        });
+        publish_migration_claim_absent(&storage, &migrating)
+            .await
+            .unwrap();
+        let source =
+            StorageAdapter::for_epoch_migration(storage.clone(), EpochBank::A, migrating.clone());
+        let target =
+            StorageAdapter::for_epoch_migration(storage, EpochBank::B, migrating.clone());
+
+        source.storage().expire_next_page();
+        copy_repository(&source, &target)
+            .await
+            .expect("copy must reopen an expired source generation between target pages");
+
+        let read = target.begin_read(ReadOptions::default()).await.unwrap();
+        let mut cursor = read
+            .begin_scan(
+                crate::json_store::JSON_SPACE,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions::default(),
+            )
+            .await
+            .unwrap();
+        let copied = cursor.collect_all().await.unwrap();
+        assert_eq!(copied.len(), row_count);
+        for (index, entry) in copied.into_iter().enumerate() {
+            assert_eq!(entry.key.0.as_ref(), u64::try_from(index).unwrap().to_be_bytes());
+            assert_eq!(
+                entry.value,
+                ProjectedValue::FullValue(Bytes::from(vec![
+                    u8::try_from(index % 251).unwrap(),
+                ])),
+            );
+        }
     }
 
     #[tokio::test]
