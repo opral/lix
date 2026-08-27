@@ -718,6 +718,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     atomic_metadata_preconditions: Vec<StoragePrecondition>,
     suppress_ordinary_sync_event: bool,
     sync_role: crate::sync::SyncRole,
+    sync_replica_remote_id: Option<Arc<str>>,
     await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
@@ -1688,6 +1689,7 @@ where
                     atomic_metadata_preconditions: Vec::new(),
                     suppress_ordinary_sync_event: false,
                     sync_role: crate::sync::SyncRole::Disabled,
+                    sync_replica_remote_id: None,
                     await_durable_commit: false,
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
@@ -1953,6 +1955,38 @@ where
             } else {
                 None
             };
+            if transaction.sync_role == crate::sync::SyncRole::Replica
+                && !restore_targets.is_empty()
+            {
+                let targets = restore_targets
+                    .iter()
+                    .map(|(branch_id, intent)| (branch_id.clone(), intent.target_commit_id))
+                    .collect();
+                let Some(remote_id) = transaction.sync_replica_remote_id.as_deref() else {
+                    transaction
+                        .discard_pending_plugin_actor_publications()
+                        .await;
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "sync replica restore has no active remote identity",
+                    ));
+                };
+                if let Err(error) = crate::sync::stage_sync_restore_intents(
+                    &read,
+                    &mut automatic_sync_writes,
+                    &mut automatic_sync_preconditions,
+                    remote_id,
+                    &targets,
+                )
+                .await
+                {
+                    transaction
+                        .discard_pending_plugin_actor_publications()
+                        .await;
+                    return Err(error);
+                }
+                transaction.await_durable_commit = true;
+            }
             if staged_sync_event.is_some() {
                 transaction.await_durable_commit = true;
             }
@@ -2200,8 +2234,13 @@ where
         self.commit_boundary = Some(boundary);
     }
 
-    pub(crate) fn set_sync_role(&mut self, role: crate::sync::SyncRole) {
+    pub(crate) fn set_sync_mode(
+        &mut self,
+        role: crate::sync::SyncRole,
+        replica_remote_id: Option<Arc<str>>,
+    ) {
         self.sync_role = role;
+        self.sync_replica_remote_id = replica_remote_id;
     }
 
     pub(crate) fn trust_serialized_filesystem_planner(&mut self) {

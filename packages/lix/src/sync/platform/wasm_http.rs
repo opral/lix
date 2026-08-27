@@ -89,7 +89,10 @@ impl HttpSyncTransport<BrowserHttpClient> {
         let client = BrowserHttpClient {
             headers: headers
                 .iter()
-                .filter(|(name, _)| !name.eq_ignore_ascii_case(BROWSER_TRANSPORT_CONFIG_HEADER))
+                .filter(|(name, _)| {
+                    !name.eq_ignore_ascii_case(BROWSER_TRANSPORT_CONFIG_HEADER)
+                        && !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name)
+                })
                 .cloned()
                 .collect(),
             header_provider: config
@@ -106,6 +109,9 @@ impl RawHttpClient for BrowserHttpClient {
         Box::pin(async move {
             let mut headers =
                 resolve_request_headers(&self.headers, self.header_provider.as_ref()).await?;
+            headers.retain(|(name, _)| {
+                !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name)
+            });
             headers.extend(request.headers);
             fetch(
                 &request.url,

@@ -15,6 +15,9 @@ impl HttpSyncTransport<reqwest::Client> {
     ) -> Result<Self, LixError> {
         let mut default_headers = reqwest::header::HeaderMap::new();
         for (name, value) in headers {
+            if HttpSyncTransport::<reqwest::Client>::is_reserved_header(name) {
+                continue;
+            }
             let name =
                 reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
                     LixError::new(

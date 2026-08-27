@@ -92,6 +92,7 @@ paths:
       description: Atomically stores at most 512 total immutable commits plus compare-and-swap branch-ref updates. Commit identity makes retries idempotent; oversized batches must be split on dependency-complete boundaries.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
       requestBody:
         required: true
         content:
@@ -112,6 +113,7 @@ paths:
       description: Returns a hot-state snapshot when after is omitted. Otherwise long-polls complete repository commit/ref events after a repository cursor.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
         - name: after
           in: query
           schema: { type: integer, minimum: 0 }
@@ -151,6 +153,7 @@ paths:
       description: Fetches one bounded first-parent history page without changing live sync state.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
         - name: head
           in: query
           required: true
@@ -175,6 +178,7 @@ paths:
       description: Loads up to 16 canonical FastCDC manifests by their BLAKE3-derived blob identities.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
         - $ref: "#/components/parameters/BlobIds"
       responses:
         "200":
@@ -193,6 +197,7 @@ paths:
       description: Reports missing chunks, or atomically registers a complete verified manifest.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
       requestBody:
         required: true
         content:
@@ -210,6 +215,7 @@ paths:
       description: Loads one authenticated raw BLAKE3-addressed chunk.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
         - $ref: "#/components/parameters/ChunkId"
       responses:
         "200":
@@ -226,6 +232,7 @@ paths:
       description: Stores raw bytes only when their BLAKE3 digest equals chunkId.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
         - $ref: "#/components/parameters/ChunkId"
       requestBody:
         required: true
@@ -489,6 +496,12 @@ components:
       in: header
       required: true
       schema: { type: string }
+    SyncProtocolVersion:
+      name: lix-sync-protocol-version
+      in: header
+      required: true
+      description: Exact sync wire-protocol version advertised by the handshake.
+      schema: { type: integer, const: 1 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -543,9 +556,10 @@ components:
   schemas:
     Handshake:
       type: object
-      required: [protocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
+      required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 5 }
+        syncProtocolVersion: { type: integer, const: 1 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }

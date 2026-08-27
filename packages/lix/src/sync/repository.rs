@@ -6,7 +6,7 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -66,6 +66,18 @@ use super::protocol::{
     SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRefUpdate,
     SyncRepositoryPullResponse, SyncSnapshotRow, SyncSnapshotRowPage,
 };
+
+fn immutable_object_mismatch(kind: &str, id: impl ToString) -> LixError {
+    let id = id.to_string();
+    LixError::new(
+        super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
+        format!("sync {kind} '{id}' already exists with different content"),
+    )
+    .with_details(serde_json::json!({
+        "objectKind": kind,
+        "objectId": id,
+    }))
+}
 
 pub(super) fn sync_commit_blob_ids(commits: &[SyncCommit]) -> Result<BTreeSet<String>, LixError> {
     let mut ids = BTreeSet::new();
@@ -408,6 +420,12 @@ struct SyncReplicaState {
     active_account_id: String,
     cursor: u64,
     authoritative_branches: BTreeMap<String, AuthoritativeBranchCoordinate>,
+    /// Restore operations are branch intent, not graph-shape inference. They
+    /// are recorded in the same atomic commit as `lix_restore` so reconnect,
+    /// crash recovery, and post-restore local commits preserve the exact CAS
+    /// coordinate that the user intended to reset.
+    #[serde(default)]
+    pending_resets: BTreeMap<String, PendingSyncReset>,
     /// Commit objects observed from the authority but not yet made reachable
     /// from a fully converged set of authority refs.
     ///
@@ -416,6 +434,29 @@ struct SyncReplicaState {
     /// next batch advance instead of rebuilding the same first 512 commits.
     authority_known_commit_ids: BTreeSet<String>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingSyncReset {
+    expected_authority_head_commit_id: String,
+    expected_authority_checkpoint_commit_id: String,
+    restore_target_commit_id: String,
+    /// A commit on the restored local chain that the authority is already
+    /// known to have. This is computed once, when restore is rare, rather than
+    /// rescanning history on every ordinary sync push.
+    authority_known_ancestor_commit_id: Option<String>,
+    /// The actual ref head included in the latest prepared reset request. It
+    /// can differ from the restore target when local commits follow restore.
+    #[serde(default)]
+    prepared_reset_head_commit_id: Option<String>,
+    /// Reset request heads prepared before a newer restore replaced them. An
+    /// acknowledgement for one of these rebases, rather than erases, the
+    /// newest local restore intent.
+    #[serde(default)]
+    superseded_prepared_reset_head_commit_ids: BTreeSet<String>,
+}
+
+const MAX_SUPERSEDED_RESET_HEADS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SyncReplicaBinding {
@@ -491,6 +532,7 @@ impl AuthoritativeBranchCoordinate {
 struct ReplicaStatePublication<'a> {
     remote_id: &'a str,
     expected_cursor: u64,
+    expected_state_raw: &'a Bytes,
     state: &'a SyncReplicaState,
 }
 
@@ -779,6 +821,190 @@ fn stage_replica_state(
         },
     });
     Ok(())
+}
+
+/// Records the active replica's exact authority coordinate for an ancestor restore.
+/// The caller commits these writes atomically with the restored branch ref.
+pub(crate) async fn stage_sync_restore_intents(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+    remote_id: &str,
+    restore_targets: &BTreeMap<String, CommitId>,
+) -> Result<(), LixError> {
+    if restore_targets.is_empty() {
+        return Ok(());
+    }
+    let (state, previous) = load_replica_state(read, remote_id).await?;
+    let Some(mut state) = state else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("sync replica restore has no state for remote '{remote_id}'"),
+        ));
+    };
+    let mut changed = false;
+    for (branch_id, restore_target) in restore_targets {
+        let Some(AuthoritativeBranchCoordinate::Headed {
+            head_commit_id,
+            checkpoint_commit_id,
+        }) = state.authoritative_branches.get(branch_id).cloned()
+        else {
+            continue;
+        };
+        let restore_target = restore_target.to_string();
+        let previous_intent = state.pending_resets.get(branch_id).cloned().filter(|pending| {
+            pending.expected_authority_head_commit_id == head_commit_id
+                && pending.expected_authority_checkpoint_commit_id == checkpoint_commit_id
+        });
+        let target = CommitId::parse_lix(&restore_target, "pending sync restore target")?;
+        let authority_known_ancestor_commit_id = find_restore_authority_boundary(
+            read,
+            &state,
+            previous_intent.as_ref(),
+            &head_commit_id,
+            &checkpoint_commit_id,
+            target,
+        )
+        .await?
+        .map(|commit_id| commit_id.to_string());
+        let mut superseded_prepared_reset_head_commit_ids = previous_intent
+            .as_ref()
+            .map(|pending| pending.superseded_prepared_reset_head_commit_ids.clone())
+            .unwrap_or_default();
+        if let Some(prepared_head) = previous_intent
+            .as_ref()
+            .and_then(|pending| pending.prepared_reset_head_commit_id.as_ref())
+            .filter(|prepared_head| *prepared_head != &restore_target)
+            && superseded_prepared_reset_head_commit_ids.len() < MAX_SUPERSEDED_RESET_HEADS
+        {
+            superseded_prepared_reset_head_commit_ids.insert(prepared_head.clone());
+        }
+        let intent = PendingSyncReset {
+            expected_authority_head_commit_id: head_commit_id,
+            expected_authority_checkpoint_commit_id: checkpoint_commit_id,
+            restore_target_commit_id: restore_target,
+            authority_known_ancestor_commit_id,
+            prepared_reset_head_commit_id: None,
+            superseded_prepared_reset_head_commit_ids,
+        };
+        if state.pending_resets.get(branch_id) != Some(&intent) {
+            state.pending_resets.insert(branch_id.clone(), intent);
+            changed = true;
+        }
+    }
+    if changed {
+        stage_replica_state(writes, preconditions, remote_id, &state, previous)?;
+    }
+    Ok(())
+}
+
+async fn find_restore_authority_boundary(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state: &SyncReplicaState,
+    previous_intent: Option<&PendingSyncReset>,
+    current_authority_head: &str,
+    current_authority_checkpoint: &str,
+    target: CommitId,
+) -> Result<Option<CommitId>, LixError> {
+    let mut authority_seen = BTreeSet::new();
+    let mut primary_authority_pending = VecDeque::new();
+    let mut fallback_authority_pending = VecDeque::new();
+    {
+        let mut enqueue_primary_authority = |commit_id: CommitId| {
+            if authority_seen.insert(commit_id) {
+                primary_authority_pending.push_back(commit_id);
+            }
+        };
+        enqueue_primary_authority(CommitId::parse_lix(
+            current_authority_head,
+            "sync authoritative head",
+        )?);
+        enqueue_primary_authority(CommitId::parse_lix(
+            current_authority_checkpoint,
+            "sync authoritative checkpoint",
+        )?);
+        if let Some(previous_boundary) = previous_intent
+            .and_then(|pending| pending.authority_known_ancestor_commit_id.as_deref())
+        {
+            enqueue_primary_authority(CommitId::parse_lix(
+                previous_boundary,
+                "pending sync restore authority-known ancestor",
+            )?);
+        }
+    }
+    {
+        let mut enqueue_fallback_authority = |commit_id: CommitId| {
+            if authority_seen.insert(commit_id) {
+                fallback_authority_pending.push_back(commit_id);
+            }
+        };
+        for coordinate in state.authoritative_branches.values() {
+            if let AuthoritativeBranchCoordinate::Headed {
+                head_commit_id,
+                checkpoint_commit_id,
+            } = coordinate
+            {
+                enqueue_fallback_authority(CommitId::parse_lix(
+                    head_commit_id,
+                    "sync authoritative head",
+                )?);
+                enqueue_fallback_authority(CommitId::parse_lix(
+                    checkpoint_commit_id,
+                    "sync authoritative checkpoint",
+                )?);
+            }
+        }
+        for commit_id in &state.authority_known_commit_ids {
+            enqueue_fallback_authority(CommitId::parse_lix(
+                commit_id,
+                "sync authority-known commit",
+            )?);
+        }
+    }
+
+    if authority_seen.contains(&target) {
+        return Ok(Some(target));
+    }
+    let mut target_seen = BTreeSet::from([target]);
+    let mut target_pending = VecDeque::from([target]);
+    while !target_pending.is_empty()
+        || !primary_authority_pending.is_empty()
+        || !fallback_authority_pending.is_empty()
+    {
+        let (authority_commit_id, primary) = primary_authority_pending
+            .pop_front()
+            .map(|commit_id| (Some(commit_id), true))
+            .unwrap_or_else(|| (fallback_authority_pending.pop_front(), false));
+        if let Some(commit_id) = authority_commit_id
+            && let Some(record) = load_commit_record(read, commit_id).await?
+        {
+            for parent in record.parent_commit_ids {
+                if target_seen.contains(&parent) {
+                    return Ok(Some(parent));
+                }
+                if authority_seen.insert(parent) {
+                    if primary {
+                        primary_authority_pending.push_back(parent);
+                    } else {
+                        fallback_authority_pending.push_back(parent);
+                    }
+                }
+            }
+        }
+        if let Some(commit_id) = target_pending.pop_front()
+            && let Some(record) = load_commit_record(read, commit_id).await?
+        {
+            for parent in record.parent_commit_ids {
+                if authority_seen.contains(&parent) {
+                    return Ok(Some(parent));
+                }
+                if target_seen.insert(parent) {
+                    target_pending.push_back(parent);
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn sequence_key() -> StorageKey {
@@ -1956,6 +2182,7 @@ where
                 )?);
             }
             let mut commit_ids = BTreeSet::new();
+            let mut reset_known_commit_ids = BTreeSet::new();
             let mut ref_updates = Vec::new();
             let mut ref_updates_without_payload = BTreeSet::new();
             let branch_ids = local_controls
@@ -1994,13 +2221,49 @@ where
                         CommitId::parse_lix(checkpoint, "sync authoritative checkpoint")
                     })
                     .transpose()?;
+                let active_reset = match (
+                    state.pending_resets.get(&branch_id),
+                    local,
+                    authoritative,
+                    authoritative_checkpoint,
+                ) {
+                    (Some(intent), Some(_local), Some(authority), Some(checkpoint))
+                        if intent.expected_authority_head_commit_id == authority
+                            && intent.expected_authority_checkpoint_commit_id == checkpoint =>
+                    {
+                        let target = CommitId::parse_lix(
+                            &intent.restore_target_commit_id,
+                            "pending sync restore target",
+                        )?;
+                        let boundary = intent
+                            .authority_known_ancestor_commit_id
+                            .as_deref()
+                            .map(|boundary| {
+                                CommitId::parse_lix(
+                                    boundary,
+                                    "pending sync restore authority-known ancestor",
+                                )
+                            })
+                            .transpose()?;
+                        Some((target, boundary))
+                    }
+                    _ => None,
+                };
+                let active_reset_target = active_reset.map(|(target, _)| target);
+                let active_reset_boundary = active_reset.and_then(|(_, boundary)| boundary);
+                if let Some(boundary) = active_reset_boundary {
+                    reset_known_commit_ids.insert(boundary);
+                }
                 if local == authoritative && local_checkpoint == authoritative_checkpoint {
                     continue;
                 }
                 // Authority-known ancestry is enough to make a commit payload
                 // dependency-complete, but it does not make a stale ref update
                 // safe. Reconciliation owns every truly divergent ref.
-                let authority_reaches_local = match (local, authoritative) {
+                let authority_reaches_local = if active_reset_target.is_some() {
+                    false
+                } else {
+                    match (local, authoritative) {
                     (Some(local), Some(authoritative)) if local == authoritative => true,
                     (Some(local), Some(authoritative)) => {
                         let local_reaches_authority =
@@ -2037,35 +2300,30 @@ where
                         authority_reaches_local
                     }
                     _ => false,
+                    }
                 };
                 if let Some(local_head) = local {
                     if let Some(authority_head) = authoritative
                         && authority_reaches_local
                     {
-                        // A deliberate reset to a historical authority commit has
-                        // no commit payload to upload; the ref CAS itself is the
-                        // complete operation.
-                        ref_updates.push(SyncRefUpdate {
-                            branch_id: branch_id.clone(),
-                            expected_head_commit_id: Some(authority_head.to_string()),
-                            expected_checkpoint_commit_id: authoritative_coordinate
-                                .and_then(AuthoritativeBranchCoordinate::checkpoint_commit_id)
-                                .map(str::to_owned),
-                            head_commit_id: Some(local_head.to_string()),
-                            checkpoint_commit_id: Some(
-                                local_checkpoint
-                                    .expect("headed local control has a checkpoint")
-                                    .to_string(),
-                            ),
-                        });
-                        ref_updates_without_payload.insert(branch_id);
+                        // A local ancestor without a matching durable restore
+                        // intent is merely behind. Never infer destructive
+                        // branch intent from graph shape.
+                        if pending_reconciliation.is_none() {
+                            pending_reconciliation =
+                                Some((branch_id.clone(), local_head, authority_head));
+                        }
                         continue;
                     }
-                    let mut reached_authority = authoritative.is_none();
+                    let mut reached_authority = authoritative.is_none()
+                        || (active_reset.is_some() && active_reset_boundary.is_none());
                     let mut pending = vec![local_head];
                     let mut branch_commit_ids = BTreeSet::new();
                     while let Some(cursor) = pending.pop() {
-                        if Some(cursor) == authoritative || known.contains(&cursor) {
+                        if Some(cursor) == authoritative
+                            || Some(cursor) == active_reset_boundary
+                            || known.contains(&cursor)
+                        {
                             reached_authority = true;
                             continue;
                         }
@@ -2093,7 +2351,12 @@ where
                         // One divergent branch must not stall independent refs.
                         continue;
                     }
+                    let reset_has_no_payload =
+                        branch_commit_ids.is_empty() && active_reset_target.is_some();
                     commit_ids.extend(branch_commit_ids);
+                    if reset_has_no_payload {
+                        ref_updates_without_payload.insert(branch_id.clone());
+                    }
                 }
                 ref_updates.push(SyncRefUpdate {
                     branch_id: branch_id.clone(),
@@ -2163,6 +2426,7 @@ where
                 remaining.insert(commit_id, commit);
             }
             let mut included = known.clone();
+            included.extend(reset_known_commit_ids);
             let mut commits = Vec::with_capacity(max_items.min(remaining.len()));
             while commits.len() < max_items && !remaining.is_empty() {
                 let ready = remaining
@@ -2221,6 +2485,15 @@ where
                 ref_updates: selected_ref_updates,
                 inline_blobs: Vec::new(),
             };
+            let prepared_reset_heads = request
+                .ref_updates
+                .iter()
+                .filter_map(|update| {
+                    let intent = state.pending_resets.get(&update.branch_id)?;
+                    let head = update.head_commit_id.as_ref()?;
+                    Some((update.branch_id.clone(), (intent.clone(), head.clone())))
+                })
+                .collect::<BTreeMap<_, _>>();
             let blob_ids = sync_commit_blob_ids(&request.commits)?;
             drop(read);
             let commit_refs = request.commits.iter().collect::<Vec<_>>();
@@ -2242,8 +2515,67 @@ where
                     }
                 }
             }
+            if !prepared_reset_heads.is_empty()
+                && !self
+                    .mark_pending_reset_heads(remote_id, &prepared_reset_heads)
+                    .await?
+            {
+                // A restore or pull changed the durable intent while this
+                // request was being built. Rebuild from its new coordinate.
+                continue;
+            }
             return Ok(Some(request));
         }
+    }
+
+    async fn mark_pending_reset_heads(
+        &self,
+        remote_id: &str,
+        prepared: &BTreeMap<String, (PendingSyncReset, String)>,
+    ) -> Result<bool, LixError> {
+        let _collaboration_guard = self.lock_collaboration_writes().await;
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        let (Some(mut state), previous) = load_replica_state(&read, remote_id).await? else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        for (branch_id, (expected, prepared_head)) in prepared {
+            let Some(current) = state.pending_resets.get_mut(branch_id) else {
+                return Ok(false);
+            };
+            if current != expected {
+                return Ok(false);
+            }
+            if current.prepared_reset_head_commit_id.as_deref() != Some(prepared_head) {
+                current.prepared_reset_head_commit_id = Some(prepared_head.clone());
+                changed = true;
+            }
+            if current
+                .superseded_prepared_reset_head_commit_ids
+                .remove(prepared_head)
+            {
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(true);
+        }
+        let mut writes = adapter.new_write_set();
+        let mut preconditions = Vec::new();
+        stage_replica_state(&mut writes, &mut preconditions, remote_id, &state, previous)?;
+        drop(read);
+        adapter
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    await_durable: true,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await?;
+        Ok(true)
     }
 
     pub(crate) async fn apply_sync_repository_pull(
@@ -2257,18 +2589,18 @@ where
                 "sync snapshot metadata must be completed with commit bodies, headers, and row pages",
             )),
             SyncRepositoryPullResponse::Delta { cursor, events } => {
-                let mut state = {
+                let (mut state, expected_state_raw) = {
                     let adapter = self.storage_adapter();
                     let read = adapter.begin_read(StorageReadOptions::default()).await?;
-                    load_replica_state(&read, remote_id)
-                        .await?
-                        .0
-                        .ok_or_else(|| {
+                    let (state, raw) = load_replica_state(&read, remote_id).await?;
+                    let state = state.ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INVALID_PARAM,
                                 "sync delta requires an initialized replica cursor",
                             )
-                        })?
+                        })?;
+                    let raw = raw.expect("decoded sync replica state has source bytes");
+                    (state, raw)
                 };
                 // A long-poll timeout carries no new repository state. The
                 // persisted cursor already proves this heartbeat was applied,
@@ -2317,6 +2649,7 @@ where
                 let mut inline_blobs = BTreeMap::new();
                 let mut branch_chains =
                     BTreeMap::<String, (Option<String>, Option<String>, bool)>::new();
+                let mut preserved_reset_branches = BTreeSet::new();
                 for event in events {
                     let next_cursor = state
                         .cursor
@@ -2333,12 +2666,9 @@ where
                             commits.insert(commit.commit_id.clone(), commit.clone())
                             && existing != *commit
                         {
-                            return Err(LixError::new(
-                                LixError::CODE_INVALID_PARAM,
-                                format!(
-                                    "sync delta repeats commit '{}' with different content",
-                                    commit.commit_id
-                                ),
+                            return Err(immutable_object_mismatch(
+                                "commit",
+                                &commit.commit_id,
                             ));
                         }
                     }
@@ -2347,12 +2677,9 @@ where
                             inline_blobs.insert(manifest.blob_id.clone(), manifest.clone())
                             && existing != *manifest
                         {
-                            return Err(LixError::new(
-                                LixError::CODE_INVALID_PARAM,
-                                format!(
-                                    "sync delta repeats inline blob '{}' with different content",
-                                    manifest.blob_id
-                                ),
+                            return Err(immutable_object_mismatch(
+                                "blob manifest",
+                                &manifest.blob_id,
                             ));
                         }
                     }
@@ -2432,6 +2759,45 @@ where
                                 update.head_commit_id.as_deref(),
                                 update.checkpoint_commit_id.as_deref(),
                             );
+                        // An older reset can already be in flight when the
+                        // user restores again. Its acknowledgement advances
+                        // the CAS coordinate but must preserve the newer
+                        // intent. Any unrelated authority movement still wins
+                        // and cancels the local reset.
+                        let preserve_newer_reset = state
+                            .pending_resets
+                            .get_mut(&update.branch_id)
+                            .is_some_and(|intent| {
+                                let acknowledged_superseded_reset = update
+                                    .head_commit_id
+                                    .as_ref()
+                                    .is_some_and(|head| {
+                                        intent
+                                            .superseded_prepared_reset_head_commit_ids
+                                            .contains(head)
+                                    });
+                                if acknowledged_superseded_reset {
+                                    intent.expected_authority_head_commit_id = update
+                                        .head_commit_id
+                                        .clone()
+                                        .expect("superseded reset acknowledgement has a head");
+                                    intent.expected_authority_checkpoint_commit_id = update
+                                        .checkpoint_commit_id
+                                        .clone()
+                                        .expect("headed authority coordinate has a checkpoint");
+                                    intent.prepared_reset_head_commit_id = None;
+                                    intent
+                                        .superseded_prepared_reset_head_commit_ids
+                                        .clear();
+                                }
+                                acknowledged_superseded_reset
+                            });
+                        if !preserve_newer_reset {
+                            state.pending_resets.remove(&update.branch_id);
+                            preserved_reset_branches.remove(&update.branch_id);
+                        } else {
+                            preserved_reset_branches.insert(update.branch_id.clone());
+                        }
                         state
                             .authoritative_branches
                             .insert(update.branch_id.clone(), next_authoritative);
@@ -2454,7 +2820,12 @@ where
                     let local = local_coordinates
                         .get(&branch_id)
                         .expect("folded delta branch was loaded once");
-                    if joins_authority {
+                    if preserved_reset_branches.contains(&branch_id) {
+                        // Keep the newer restored local ref in place. Only
+                        // the authority coordinate/cursor moves forward so
+                        // the next push can issue the rebased reset CAS.
+                        continue;
+                    } else if joins_authority {
                         applicable_refs.push(SyncRefUpdate {
                             branch_id,
                             expected_head_commit_id: local.0.clone(),
@@ -2498,6 +2869,7 @@ where
                         Some(ReplicaStatePublication {
                             remote_id,
                             expected_cursor,
+                            expected_state_raw: &expected_state_raw,
                             state: &state,
                         }),
                     ))
@@ -2540,6 +2912,7 @@ where
                         Some(ReplicaStatePublication {
                             remote_id,
                             expected_cursor,
+                            expected_state_raw: &expected_state_raw,
                             state: &state,
                         }),
                     ))
@@ -2560,6 +2933,7 @@ where
         rows: &[SyncSnapshotRow],
         checkpoint_roots: &BTreeMap<String, String>,
     ) -> Result<InitialSyncSnapshotInstall, LixError> {
+        self.set_sync_replica_remote_id(remote_id)?;
         let _collaboration_guard = self.lock_collaboration_writes().await;
         let SyncRepositoryPullResponse::Snapshot {
             cursor,
@@ -2650,6 +3024,7 @@ where
         remote_id: &str,
         state: SyncReplicaState,
     ) -> Result<(), LixError> {
+        self.set_sync_replica_remote_id(remote_id)?;
         let _collaboration_guard = self.lock_collaboration_writes().await;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
@@ -2863,13 +3238,7 @@ where
         for header in header_by_id.values() {
             if let Some(existing) = load_commit_record(&read, header.commit_id).await? {
                 if existing != header.record() {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "sync header '{}' conflicts with an existing commit",
-                            header.commit_id
-                        ),
-                    ));
+                    return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
                 let existing_scope = match load_published_commit_state_topology(
                     &read,
@@ -2881,13 +3250,7 @@ where
                     None => deferred_commit_global_scope(&read, header.commit_id).await?,
                 };
                 if existing_scope.is_some_and(|scope| scope != header.global_scope) {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "sync header '{}' conflicts with its existing branch scope",
-                            header.commit_id
-                        ),
-                    ));
+                    return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
                 records.insert(header.commit_id, existing);
             } else {
@@ -3099,10 +3462,7 @@ where
                 .insert(change.change_id, change.clone())
                 .is_some_and(|existing| existing != change)
             {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync snapshot repeats a change id with different content",
-                ));
+                return Err(immutable_object_mismatch("change", change.change_id));
             }
         }
         for branch in branches {
@@ -3121,9 +3481,9 @@ where
                 .insert(change.change_id, change.clone())
                 .is_some_and(|existing| existing != change)
             {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync snapshot branch ref change id collides with different content",
+                return Err(immutable_object_mismatch(
+                    "branch ref change",
+                    change.change_id,
                 ));
             }
         }
@@ -3155,10 +3515,7 @@ where
                     .insert(change.change_id, change.clone())
                     .is_some_and(|existing| existing != change)
                 {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync snapshot head change conflicts with its current row",
-                    ));
+                    return Err(immutable_object_mismatch("change", change.change_id));
                 }
             }
             head_mutations.insert(commit.commit_id, mutations);
@@ -3373,6 +3730,7 @@ where
                 active_account_id: active_account_id.to_owned(),
                 cursor,
                 authoritative_branches,
+                pending_resets: BTreeMap::new(),
                 authority_known_commit_ids: BTreeSet::new(),
             },
             None,
@@ -3452,13 +3810,7 @@ where
         for header in parsed.values() {
             if let Some(existing) = load_commit_record(&read, header.commit_id).await? {
                 if existing != header.record() {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "sync history header '{}' conflicts with an existing commit",
-                            header.commit_id
-                        ),
-                    ));
+                    return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
                 let existing_scope = match load_published_commit_state_topology(
                     &read,
@@ -3470,13 +3822,7 @@ where
                     None => deferred_commit_global_scope(&read, header.commit_id).await?,
                 };
                 if existing_scope.is_some_and(|scope| scope != header.global_scope) {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "sync history header '{}' conflicts with its existing branch scope",
-                            header.commit_id
-                        ),
-                    ));
+                    return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
             } else {
                 new_records.push(header.record());
@@ -3803,12 +4149,7 @@ where
                     let materialized_external_boundary = boundary_rows.contains_key(commit_id)
                         && commit.members.is_empty();
                     if stored != commit.wire && !materialized_external_boundary {
-                        return Err(LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            format!(
-                                "sync commit id '{commit_id}' already exists with different content"
-                            ),
-                        ));
+                        return Err(immutable_object_mismatch("commit", commit_id));
                     }
                     existing.insert(*commit_id);
                     records.insert(
@@ -4348,13 +4689,7 @@ where
             let change = row.change_record();
             match load_existing_sync_change(&read, change.change_id).await? {
                 Some(existing) if existing != change => {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "sync history boundary change '{}' conflicts with an existing change",
-                            change.change_id
-                        ),
-                    ));
+                    return Err(immutable_object_mismatch("change", change.change_id));
                 }
                 Some(_) => {}
                 None => match appended_changes.entry(change.change_id) {
@@ -4364,13 +4699,7 @@ where
                     std::collections::btree_map::Entry::Occupied(entry)
                         if entry.get() == &change => {}
                     std::collections::btree_map::Entry::Occupied(_) => {
-                        return Err(LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            format!(
-                                "sync history boundary repeats change '{}' with different content",
-                                change.change_id
-                            ),
-                        ));
+                        return Err(immutable_object_mismatch("change", change.change_id));
                     }
                 },
             }
@@ -4417,13 +4746,7 @@ where
                 let change = member.change_record();
                 match load_existing_sync_change(&read, change.change_id).await? {
                     Some(existing) if !sync_change_records_equal(&existing, &change)? => {
-                        return Err(LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            format!(
-                                "sync change '{}' already exists with different content",
-                                change.change_id
-                            ),
-                        ));
+                        return Err(immutable_object_mismatch("change", change.change_id));
                     }
                     Some(_) => {}
                     None => match appended_changes.entry(change.change_id) {
@@ -4433,13 +4756,7 @@ where
                         std::collections::btree_map::Entry::Occupied(entry)
                             if entry.get() == &change => {}
                         std::collections::btree_map::Entry::Occupied(_) => {
-                            return Err(LixError::new(
-                                LixError::CODE_INVALID_PARAM,
-                                format!(
-                                    "sync change '{}' appears with conflicting content",
-                                    change.change_id
-                                ),
-                            ));
+                            return Err(immutable_object_mismatch("change", change.change_id));
                         }
                     },
                 }
@@ -4741,9 +5058,9 @@ where
             )?;
             match load_existing_sync_change(&read, change.change_id).await? {
                 Some(existing) if !sync_change_records_equal(&existing, &change)? => {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "sync branch ref change id collides with different content",
+                    return Err(immutable_object_mismatch(
+                        "branch ref change",
+                        change.change_id,
                     ));
                 }
                 Some(_) => {}
@@ -5078,12 +5395,12 @@ where
                     "sync replica publication must advance its event cursor",
                 ));
             }
-            let (stored_state, previous) = load_replica_state(&read, publication.remote_id).await?;
-            if stored_state.as_ref().map(|state| state.cursor) != Some(publication.expected_cursor)
-            {
+            let (_stored_state, previous) =
+                load_replica_state(&read, publication.remote_id).await?;
+            if previous.as_ref() != Some(publication.expected_state_raw) {
                 return Err(LixError::new(
                     LixError::CODE_TRANSACTION_CONFLICT,
-                    "sync replica cursor changed while its repository event was admitted",
+                    "sync replica state changed while its repository event was admitted",
                 ));
             }
             stage_replica_state(
@@ -5682,8 +5999,8 @@ mod tests {
     };
     use crate::storage_adapter::SharedStorageAdapterRead;
     use crate::{
-        CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, NullableKeyFilter, SwitchBranchOptions, Value,
-        open_lix,
+        CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, MergeBranchOptions, NullableKeyFilter,
+        SwitchBranchOptions, Value, open_lix,
     };
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -6213,6 +6530,7 @@ mod tests {
                             checkpoint_commit_id: receipt.initial_commit_id,
                         },
                     )]),
+                    pending_resets: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -7568,38 +7886,6 @@ mod tests {
         .expect("key-value write should commit");
     }
 
-    async fn force_branch_head_for_sync_test(lix: &Lix<Memory>, branch_id: &str, head: CommitId) {
-        let adapter = lix.storage_adapter();
-        let read = adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("test read should open");
-        let mut control = BranchHeadControlContext::new()
-            .reader(&read)
-            .load(branch_id)
-            .await
-            .expect("branch control should load")
-            .expect("branch control should exist");
-        let record = load_commit_record(&read, head)
-            .await
-            .expect("head record should load")
-            .expect("head record should exist");
-        control.head_commit_id = head;
-        control.tracked_generation = head;
-        control.working_diff_checkpoint_commit_id = Some(head);
-        control.current_state_revision += 1;
-        control.updated_at = record.created_at;
-        control.ref_change_id = sync_ref_change_id(branch_id, Some(head));
-        let mut writes = adapter.new_write_set();
-        stage_branch_head_control(&mut writes, branch_id, control)
-            .expect("reset control should stage");
-        drop(read);
-        adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("reset control should commit");
-    }
-
     async fn read_key_value<StorageImpl>(lix: &Lix<StorageImpl>, key: &str) -> String
     where
         StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -7623,6 +7909,18 @@ mod tests {
             Value::Text(value) => value,
             other => panic!("unexpected key-value representation: {other:?}"),
         }
+    }
+
+    async fn current_branch_head<StorageImpl>(lix: &Lix<StorageImpl>) -> String
+    where
+        StorageImpl: Storage + Clone + Send + Sync + 'static,
+    {
+        lix.execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .await
+            .expect("active branch head should load")
+            .rows()[0]
+            .get::<String>("id")
+            .expect("active branch head should decode")
     }
 
     async fn working_diff_count(lix: &Lix<Memory>) -> i64 {
@@ -7693,6 +7991,39 @@ mod tests {
             .await
             .expect("authority should accept pending work");
         request
+    }
+
+    async fn hydrate_history_commit(
+        authority: &Lix<Memory>,
+        replica: &Lix<Memory>,
+        commit_id: &str,
+    ) {
+        let page = authority
+            .sync_history(commit_id, 1)
+            .await
+            .expect("history page should load");
+        let mut boundary_rows = Vec::new();
+        for boundary in &page.boundaries {
+            let rows = authority
+                .pull_sync_snapshot_rows(
+                    &boundary.commit_id,
+                    &boundary.commit_id,
+                    None,
+                    super::super::MAX_SYNC_REQUEST_ITEMS,
+                )
+                .await
+                .expect("history boundary rows should load");
+            assert_eq!(rows.continuation, None);
+            boundary_rows.extend(rows.rows);
+        }
+        replica
+            .import_sync_history_headers(&page.commit_headers)
+            .await
+            .expect("history headers should import");
+        replica
+            .import_sync_history_boundaries(&page.commits, &page.boundaries, &boundary_rows)
+            .await
+            .expect("history bodies should import");
     }
 
     async fn transfer_commit_blobs(
@@ -8818,13 +9149,14 @@ mod tests {
     #[tokio::test]
     async fn exact_push_is_atomic_idempotent_and_creates_a_writable_checkpoint_epoch() {
         let source = open_lix().await.expect("source should open");
+        write_key_value(&source, "immutable-collision", "original").await;
         let source_snapshot = source
             .pull_sync_repository(None, 1)
             .await
             .expect("source snapshot should load");
         let (_, source_head) = default_head(&source_snapshot);
         let source_history = source
-            .sync_history(&source_head, 1)
+            .sync_history(&source_head, 100)
             .await
             .expect("source history should load");
         let source_commit = source_history
@@ -8869,14 +9201,22 @@ mod tests {
         conflicting
             .commits
             .iter_mut()
-            .find(|commit| !commit.members.is_empty())
-            .expect("dependency closure contains authored bootstrap members")
-            .members[0]
-            .snapshot = Some(serde_json::json!({"different": true}));
+            .flat_map(|commit| &mut commit.members)
+            .find(|member| member.schema_key == "lix_key_value")
+            .expect("dependency closure contains the key-value member")
+            .snapshot
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("key-value snapshot is an object")
+            .insert("value".to_owned(), serde_json::json!("different"));
         let error = target
             .push_sync_repository(&conflicting)
             .await
             .expect_err("same commit id with different content must fail");
+        assert_eq!(
+            error.code,
+            super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
+        );
         assert!(error.message.contains("different content"));
         assert_eq!(
             target
@@ -9766,7 +10106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_ref_reset_does_not_stall_an_unrelated_branch_push() {
+    async fn durable_restore_with_a_local_child_does_not_stall_an_unrelated_branch_push() {
         let authority = open_lix().await.expect("authority should open");
         write_key_value(&authority, "base", "one").await;
         write_key_value(&authority, "tip", "two").await;
@@ -9796,13 +10136,49 @@ mod tests {
             })
             .await
             .expect("unrelated branch should be created");
-        force_branch_head_for_sync_test(
-            &replica,
-            &main_branch_id,
-            CommitId::parse_lix(&historical_head, "historical reset head")
-                .expect("historical head should parse"),
-        )
-        .await;
+        replica
+            .switch_branch(SwitchBranchOptions {
+                branch_id: main_branch_id.clone(),
+            })
+            .await
+            .expect("fixture should restore the synchronized main branch");
+        let historical = authority
+            .sync_history(&historical_head, 1)
+            .await
+            .expect("restore target history should load");
+        let mut boundary_rows = Vec::new();
+        for boundary in &historical.boundaries {
+            let rows = authority
+                .pull_sync_snapshot_rows(
+                    &boundary.commit_id,
+                    &boundary.commit_id,
+                    None,
+                    super::super::MAX_SYNC_REQUEST_ITEMS,
+                )
+                .await
+                .expect("restore boundary rows should load");
+            boundary_rows.extend(rows.rows);
+        }
+        replica
+            .import_sync_history_headers(&historical.commit_headers)
+            .await
+            .expect("restore history headers should import");
+        replica
+            .import_sync_history_boundaries(
+                &historical.commits,
+                &historical.boundaries,
+                &boundary_rows,
+            )
+            .await
+            .expect("restore history should import");
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(historical_head.clone())],
+            )
+            .await
+            .expect("historical restore should succeed");
+        write_key_value(&replica, "after-restore", "local-child").await;
 
         let push = replica
             .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
@@ -9818,15 +10194,540 @@ mod tests {
             reset.expected_head_commit_id.as_deref(),
             Some(authority_head.as_str())
         );
-        assert_eq!(
+        assert_ne!(reset.head_commit_id.as_deref(), Some(authority_head.as_str()));
+        assert_ne!(
             reset.head_commit_id.as_deref(),
-            Some(historical_head.as_str())
+            Some(historical_head.as_str()),
+            "the post-restore local child must be published with the reset"
+        );
+        assert!(
+            !push.commits.is_empty(),
+            "post-restore local commits must accompany the ref reset"
         );
         assert!(
             push.ref_updates
                 .iter()
                 .any(|update| update.branch_id == unrelated_branch_id),
             "one reset branch must not stall an independent new branch",
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_to_an_unpublished_local_ancestor_exports_the_target() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "published-base", "authority").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+
+        write_key_value(&replica, "offline-target", "kept").await;
+        let unpublished_target = current_branch_head(&replica).await;
+        write_key_value(&replica, "offline-abandoned", "removed").await;
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(unpublished_target.clone())],
+            )
+            .await
+            .expect("restore to the first offline commit should succeed");
+
+        let request = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("reset push should build")
+            .expect("unpublished reset should have pending work");
+        assert!(
+            request
+                .commits
+                .iter()
+                .any(|commit| commit.commit_id == unpublished_target),
+            "the authority cannot accept the reset until its target is exported"
+        );
+        authority
+            .push_sync_repository(&request)
+            .await
+            .expect("authority should accept a dependency-complete reset");
+        assert_eq!(current_branch_head(&authority).await, unpublished_target);
+        assert_eq!(read_key_value(&authority, "offline-target").await, "kept");
+    }
+
+    #[tokio::test]
+    async fn restore_losing_a_ref_cas_adopts_the_advanced_authority_without_retry() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "restore-race", "target").await;
+        write_key_value(&authority, "restore-race", "abandoned").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (_, authority_before) = default_head(&snapshot);
+        let target = authority
+            .sync_history(&authority_before, 1)
+            .await
+            .expect("authority history should load")
+            .commits[0]
+            .parent_commit_ids[0]
+            .clone();
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        let remote_writer = replica_from_snapshot(&authority, &snapshot).await;
+        hydrate_history_commit(&authority, &replica, &target).await;
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(target)],
+            )
+            .await
+            .expect("offline restore should succeed");
+
+        write_key_value(&remote_writer, "restore-race", "authority-wins").await;
+        let published = publish_pending(&remote_writer, &authority).await;
+        let authority_after = published.ref_updates[0]
+            .head_commit_id
+            .clone()
+            .expect("authority should advance");
+        let delta = authority
+            .pull_sync_repository(Some(0), 128)
+            .await
+            .expect("authority delta should load");
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("the failed reset coordinate should reconcile");
+
+        assert_eq!(read_key_value(&replica, "restore-race").await, "authority-wins");
+        assert_eq!(
+            current_branch_head(&replica).await,
+            authority_after,
+            "a pure restored ancestor adopts the authority without a merge"
+        );
+        assert!(
+            replica
+                .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                .await
+                .expect("post-race outbox should inspect")
+                .is_none(),
+            "the superseded reset must not be retried against the new authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_restore_survives_an_older_reset_acknowledgement() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "restore-chain", "oldest").await;
+        write_key_value(&authority, "restore-chain", "middle").await;
+        write_key_value(&authority, "restore-chain", "tip").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (_, authority_head) = default_head(&snapshot);
+        let middle = authority
+            .sync_history(&authority_head, 1)
+            .await
+            .expect("tip history should load")
+            .commits[0]
+            .parent_commit_ids[0]
+            .clone();
+        let oldest = authority
+            .sync_history(&middle, 1)
+            .await
+            .expect("middle history should load")
+            .commits[0]
+            .parent_commit_ids[0]
+            .clone();
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        hydrate_history_commit(&authority, &replica, &middle).await;
+        hydrate_history_commit(&authority, &replica, &oldest).await;
+
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(middle.clone())],
+            )
+            .await
+            .expect("first restore should succeed");
+        write_key_value(&replica, "after-first-restore", "local-child").await;
+        let first_prepared_head = current_branch_head(&replica).await;
+        let first = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("first reset should build")
+            .expect("first reset should be pending");
+        authority
+            .push_sync_repository(&first)
+            .await
+            .expect("authority should accept the first reset");
+
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(oldest.clone())],
+            )
+            .await
+            .expect("newer restore should replace the in-flight intent");
+        let acknowledgement = authority
+            .pull_sync_repository(Some(0), 128)
+            .await
+            .expect("first reset acknowledgement should load");
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &acknowledgement)
+            .await
+            .expect("older acknowledgement should preserve the newer restore");
+
+        let second = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("rebased reset should build")
+            .expect("newer restore must remain pending");
+        assert_eq!(second.ref_updates.len(), 1);
+        assert_eq!(
+            second.ref_updates[0].expected_head_commit_id.as_deref(),
+            Some(first_prepared_head.as_str())
+        );
+        assert_eq!(
+            second.ref_updates[0].head_commit_id.as_deref(),
+            Some(oldest.as_str())
+        );
+        authority
+            .push_sync_repository(&second)
+            .await
+            .expect("authority should accept the rebased newer reset");
+        assert_eq!(current_branch_head(&authority).await, oldest);
+    }
+
+    #[tokio::test]
+    async fn newer_restore_to_unpublished_descendant_reuses_known_boundary() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "restore-boundary", "ancestor").await;
+        write_key_value(&authority, "restore-boundary", "authority-tip").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (_, authority_head) = default_head(&snapshot);
+        let ancestor = authority
+            .sync_history(&authority_head, 1)
+            .await
+            .expect("authority history should load")
+            .commits[0]
+            .parent_commit_ids[0]
+            .clone();
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        hydrate_history_commit(&authority, &replica, &ancestor).await;
+
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(ancestor)],
+            )
+            .await
+            .expect("first restore should succeed");
+        write_key_value(&replica, "offline-chain", "keep").await;
+        let desired_descendant = current_branch_head(&replica).await;
+        write_key_value(&replica, "offline-chain", "discard").await;
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(desired_descendant.clone())],
+            )
+            .await
+            .expect("second restore should succeed");
+
+        let push = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("descendant reset should build")
+            .expect("descendant reset should remain publishable");
+        assert_eq!(push.ref_updates.len(), 1);
+        assert_eq!(
+            push.ref_updates[0].expected_head_commit_id.as_deref(),
+            Some(authority_head.as_str())
+        );
+        assert_eq!(
+            push.ref_updates[0].head_commit_id.as_deref(),
+            Some(desired_descendant.as_str())
+        );
+        assert!(
+            push.commits
+                .iter()
+                .any(|commit| commit.commit_id == desired_descendant),
+            "the unpublished descendant must be included"
+        );
+        authority
+            .push_sync_repository(&push)
+            .await
+            .expect("authority should accept the descendant reset");
+        assert_eq!(current_branch_head(&authority).await, desired_descendant);
+    }
+
+    #[tokio::test]
+    async fn newer_restore_to_authority_ancestor_recomputes_known_boundary() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "restore-reboundary", "ancestor").await;
+        write_key_value(&authority, "restore-reboundary", "authority-tip").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (_, authority_head) = default_head(&snapshot);
+        let authority_ancestor = authority
+            .sync_history(&authority_head, 1)
+            .await
+            .expect("authority history should load")
+            .commits[0]
+            .parent_commit_ids[0]
+            .clone();
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        hydrate_history_commit(&authority, &replica, &authority_ancestor).await;
+
+        write_key_value(&replica, "unpublished-chain", "first").await;
+        let unpublished_ancestor = current_branch_head(&replica).await;
+        write_key_value(&replica, "unpublished-chain", "second").await;
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(unpublished_ancestor)],
+            )
+            .await
+            .expect("first restore should succeed");
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(authority_ancestor.clone())],
+            )
+            .await
+            .expect("second restore should succeed");
+
+        let push = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("rebased ancestor reset should build")
+            .expect("authority ancestor reset should remain publishable");
+        assert!(push.commits.is_empty());
+        assert_eq!(push.ref_updates.len(), 1);
+        assert_eq!(
+            push.ref_updates[0].expected_head_commit_id.as_deref(),
+            Some(authority_head.as_str())
+        );
+        assert_eq!(
+            push.ref_updates[0].head_commit_id.as_deref(),
+            Some(authority_ancestor.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_to_second_parent_lineage_uses_common_authority_boundary() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "restore-merge-base", "shared").await;
+        let shared_ancestor = current_branch_head(&authority).await;
+        write_key_value(&authority, "authority-lineage", "tip").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (main_branch_id, authority_head) = default_head(&snapshot);
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        hydrate_history_commit(&authority, &replica, &shared_ancestor).await;
+
+        let side = replica
+            .create_branch(CreateBranchOptions {
+                id: Some("01920000-0000-7000-8000-000000001991".to_owned()),
+                name: "restore-side-lineage".to_owned(),
+                from_commit_id: Some(shared_ancestor),
+            })
+            .await
+            .expect("side branch should fork from the shared ancestor");
+        replica
+            .switch_branch(SwitchBranchOptions {
+                branch_id: side.id.clone(),
+            })
+            .await
+            .expect("side branch should become active");
+        write_key_value(&replica, "side-lineage", "target").await;
+        let side_target = current_branch_head(&replica).await;
+        replica
+            .switch_branch(SwitchBranchOptions {
+                branch_id: main_branch_id.clone(),
+            })
+            .await
+            .expect("main branch should become active");
+        replica
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: side.id,
+            })
+            .await
+            .expect("side lineage should merge into main");
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(side_target.clone())],
+            )
+            .await
+            .expect("restore to the second-parent lineage should succeed");
+
+        let push = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("second-parent reset should build")
+            .expect("second-parent reset should remain publishable");
+        let main_update = push
+            .ref_updates
+            .iter()
+            .find(|update| update.branch_id == main_branch_id)
+            .expect("main reset ref should be included");
+        assert_eq!(
+            main_update.expected_head_commit_id.as_deref(),
+            Some(authority_head.as_str())
+        );
+        assert_eq!(
+            main_update.head_commit_id.as_deref(),
+            Some(side_target.as_str())
+        );
+        assert!(
+            push.commits
+                .iter()
+                .any(|commit| commit.commit_id == side_target),
+            "the second-parent target must be exported from the shared boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_publication_rejects_same_cursor_replica_state_change() {
+        let replica = open_lix().await.expect("replica should open");
+        let original = SyncReplicaState {
+            active_account_id: "account-a".to_owned(),
+            cursor: 7,
+            authoritative_branches: BTreeMap::new(),
+            pending_resets: BTreeMap::new(),
+            authority_known_commit_ids: BTreeSet::new(),
+        };
+        replica
+            .store_replica_state(TEST_REMOTE, original.clone())
+            .await
+            .expect("initial replica state should store");
+        let adapter = replica.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replica state read should open");
+        let (_, expected_state_raw) = load_replica_state(&read, TEST_REMOTE)
+            .await
+            .expect("replica state should load");
+        let expected_state_raw = expected_state_raw.expect("replica state should have bytes");
+        drop(read);
+
+        let mut folded = original.clone();
+        folded.cursor = 8;
+        let mut concurrent = original;
+        concurrent.authority_known_commit_ids.insert(
+            CommitId::with_change_address_space(uuid::Uuid::now_v7()).to_string(),
+        );
+        replica
+            .store_replica_state(TEST_REMOTE, concurrent.clone())
+            .await
+            .expect("same-cursor metadata update should store");
+
+        let error = replica
+            .import_sync_repository(
+                &SyncPushRequest {
+                    commits: Vec::new(),
+                    ref_updates: Vec::new(),
+                    inline_blobs: Vec::new(),
+                },
+                SyncImportPurpose::ReplicaDelta,
+                None,
+                Some(ReplicaStatePublication {
+                    remote_id: TEST_REMOTE,
+                    expected_cursor: 7,
+                    expected_state_raw: &expected_state_raw,
+                    state: &folded,
+                }),
+            )
+            .await
+            .expect_err("stale full-state admission must conflict");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replica state read should reopen");
+        assert_eq!(
+            load_replica_state(&read, TEST_REMOTE)
+                .await
+                .expect("replica state should load")
+                .0,
+            Some(concurrent),
+            "the concurrent same-cursor state must remain intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_child_racing_authority_keeps_local_first_parent() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "restore-base", "target").await;
+        write_key_value(&authority, "restore-base", "abandoned").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (_, authority_before) = default_head(&snapshot);
+        let target = authority
+            .sync_history(&authority_before, 1)
+            .await
+            .expect("authority history should load")
+            .commits[0]
+            .parent_commit_ids[0]
+            .clone();
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        let remote_writer = replica_from_snapshot(&authority, &snapshot).await;
+        hydrate_history_commit(&authority, &replica, &target).await;
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(target)],
+            )
+            .await
+            .expect("offline restore should succeed");
+        write_key_value(&replica, "local-only", "survives").await;
+        let local_head = current_branch_head(&replica).await;
+
+        write_key_value(&remote_writer, "authority-only", "survives").await;
+        let published = publish_pending(&remote_writer, &authority).await;
+        let authority_head = published.ref_updates[0]
+            .head_commit_id
+            .clone()
+            .expect("authority should advance");
+        let delta = authority
+            .pull_sync_repository(Some(0), 128)
+            .await
+            .expect("authority delta should load");
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("restore-child divergence should reconcile");
+        assert_eq!(read_key_value(&replica, "local-only").await, "survives");
+        assert_eq!(read_key_value(&replica, "authority-only").await, "survives");
+
+        let push = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("merge push should build")
+            .expect("server-winning merge should be pending");
+        let merge_head = push.ref_updates[0]
+            .head_commit_id
+            .as_deref()
+            .expect("merge ref should have a head");
+        let merge = push
+            .commits
+            .iter()
+            .find(|commit| commit.commit_id == merge_head)
+            .expect("merge commit should be exported");
+        assert_eq!(
+            merge.parent_commit_ids,
+            vec![local_head, authority_head],
+            "the local state parent stays first and authority history stays as the merge parent"
         );
     }
 
@@ -9886,6 +10787,7 @@ mod tests {
                     active_account_id: local.active_account_id().to_owned(),
                     cursor: 1,
                     authoritative_branches,
+                    pending_resets: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -9997,6 +10899,7 @@ mod tests {
                     active_account_id: local.active_account_id().to_owned(),
                     cursor: 1,
                     authoritative_branches,
+                    pending_resets: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -10100,6 +11003,7 @@ mod tests {
                     active_account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
                     cursor: 7,
                     authoritative_branches: BTreeMap::new(),
+                    pending_resets: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
             )
@@ -11142,7 +12046,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn divergent_same_row_deterministically_keeps_local_pending_value() {
+    async fn divergent_same_row_deterministically_keeps_authority_value() {
         let authority = open_lix().await.expect("authority should open");
         write_key_value(&authority, "base", "non-root").await;
         let snapshot = authority
@@ -11152,7 +12056,7 @@ mod tests {
         let left = replica_from_snapshot(&authority, &snapshot).await;
         let right = replica_from_snapshot(&authority, &snapshot).await;
 
-        write_key_value(&left, "shared", "authority-first").await;
+        write_key_value(&left, "shared", "authority-wins").await;
         write_key_value(&right, "shared", "local-pending").await;
         let right_pending = right
             .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
@@ -11173,11 +12077,30 @@ mod tests {
             .expect("same-row divergence should reconcile");
         assert_eq!(
             read_key_value(&right, "shared").await,
-            "local-pending",
-            "pending overlay wins an unresolved same-row conflict",
+            "authority-wins",
+            "the authority wins an unresolved same-row conflict",
         );
 
+        {
+            let read = right
+                .storage_adapter()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("reconciled controls should load");
+            for (branch_id, control) in BranchHeadControlContext::new()
+                .reader(&read)
+                .scan()
+                .await
+                .expect("reconciled controls should scan")
+            {
+                assert!(
+                    control.working_diff_checkpoint_commit_id.is_some(),
+                    "reconciled branch '{branch_id}' must retain its checkpoint"
+                );
+            }
+        }
+
         publish_pending(&right, &authority).await;
-        assert_eq!(read_key_value(&authority, "shared").await, "local-pending",);
+        assert_eq!(read_key_value(&authority, "shared").await, "authority-wins",);
     }
 }

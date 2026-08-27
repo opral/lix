@@ -1364,6 +1364,14 @@ where
         Ok(())
     }
 
+    pub(crate) fn set_sync_replica_remote_id(&self, remote_id: &str) -> Result<(), LixError> {
+        crate::sync::validate_sync_remote_id(remote_id)?;
+        self.engine
+            .sync_mode()
+            .set_replica_remote_id(Arc::<str>::from(remote_id));
+        Ok(())
+    }
+
     pub(crate) async fn align_primary_account_for_sync(
         &mut self,
         active_account_id: &str,

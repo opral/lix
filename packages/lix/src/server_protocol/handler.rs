@@ -304,6 +304,8 @@ pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
 ];
 /// Header carrying the opaque server-issued session capability.
 pub const SESSION_ID_HEADER: &str = "lix-session-id";
+/// Sync wire version required on repository synchronization endpoints.
+pub const SYNC_PROTOCOL_VERSION_HEADER: &str = crate::sync::SYNC_PROTOCOL_VERSION_HEADER;
 /// Standard request identity for replay-safe SQL mutations.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 /// Internal capability binding requests to one remote transaction lifecycle.
@@ -1792,6 +1794,12 @@ where
             return result_response(delete_session(self, parts.headers, context).await);
         }
 
+        if path.starts_with("/lix/v1/sync/")
+            && let Err(error) = require_sync_protocol_version(&parts.headers)
+        {
+            return error.into_response();
+        }
+
         let session_id = match required_session_id(&parts.headers) {
             Ok(session_id) => session_id,
             Err(error) => return error.into_response(),
@@ -2380,6 +2388,28 @@ fn required_session_id(headers: &HeaderMap) -> Result<String, ApiError> {
     optional_session_id(headers)?.ok_or_else(ApiError::session_required)
 }
 
+fn require_sync_protocol_version(headers: &HeaderMap) -> Result<(), ApiError> {
+    let mut values = headers.get_all(SYNC_PROTOCOL_VERSION_HEADER).iter();
+    let Some(first) = values.next() else {
+        // Protocol v1 predates the request header. Treat omission as v1 so a
+        // v1 server can be deployed before browser/client updates. A future
+        // server version will reject this implicit v1 before transfer.
+        return if crate::sync::SYNC_PROTOCOL_VERSION == 1 {
+            Ok(())
+        } else {
+            Err(crate::sync::sync_client_protocol_mismatch(Some(1)).into())
+        };
+    };
+    let version = first
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    if values.next().is_some() || version != Some(crate::sync::SYNC_PROTOCOL_VERSION) {
+        return Err(crate::sync::sync_client_protocol_mismatch(version).into());
+    }
+    Ok(())
+}
+
 fn required_transaction_id(headers: &HeaderMap) -> Result<String, ApiError> {
     let mut values = headers.get_all(TRANSACTION_ID_HEADER).iter();
     let value = values.next().ok_or_else(|| {
@@ -2461,6 +2491,7 @@ where
     let active_account_id = lease.record.principal.account_id().to_owned();
     Ok(Json(HandshakeResponse {
         protocol_version: PROTOCOL_VERSION,
+        sync_protocol_version: crate::sync::SYNC_PROTOCOL_VERSION,
         active_branch_id,
         active_account_id,
         session_id: lease.session_id.clone(),
@@ -4367,6 +4398,8 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         LixError::CODE_IDEMPOTENCY_KEY_REUSED | LixError::CODE_TRANSACTION_CONFLICT => {
             StatusCode::CONFLICT
         }
+        crate::sync::SYNC_PROTOCOL_MISMATCH_CODE
+        | crate::sync::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE => StatusCode::CONFLICT,
         LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
         | LixError::CODE_STORAGE_DURABILITY_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
         LixError::CODE_IDEMPOTENCY_RESPONSE_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
@@ -4386,6 +4419,7 @@ struct HandshakeRequest {
 #[serde(rename_all = "camelCase")]
 struct HandshakeResponse {
     protocol_version: u32,
+    sync_protocol_version: u32,
     active_branch_id: String,
     active_account_id: String,
     session_id: String,
@@ -5292,6 +5326,51 @@ mod tests {
             assert!(
                 openapi.contains(&format!("operationId: {operation_id}")),
                 "OpenAPI is missing {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn openapi_declares_sync_protocol_negotiation() {
+        let openapi = include_str!("../../server-protocol.openapi.yaml");
+        assert!(openapi.contains(
+            "required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]"
+        ));
+        assert!(openapi.contains(&format!(
+            "syncProtocolVersion: {{ type: integer, const: {} }}",
+            crate::sync::SYNC_PROTOCOL_VERSION
+        )));
+        assert!(openapi.contains("name: lix-sync-protocol-version"));
+        assert!(openapi.contains(&format!(
+            "schema: {{ type: integer, const: {} }}",
+            crate::sync::SYNC_PROTOCOL_VERSION
+        )));
+        assert_eq!(
+            openapi
+                .matches("$ref: \"#/components/parameters/SyncProtocolVersion\"")
+                .count(),
+            7,
+            "every sync HTTP operation must declare the required version header",
+        );
+        for operation_id in [
+            "syncPush",
+            "syncPull",
+            "syncHistory",
+            "syncGetBlobs",
+            "syncRegisterBlob",
+            "syncGetChunk",
+            "syncPutChunk",
+        ] {
+            let marker = format!("operationId: {operation_id}");
+            let operation = openapi
+                .split_once(&marker)
+                .unwrap_or_else(|| panic!("OpenAPI is missing {operation_id}"))
+                .1
+                .split_once("operationId:")
+                .map_or_else(|| openapi.split_once(&marker).unwrap().1, |(operation, _)| operation);
+            assert!(
+                operation.contains("$ref: \"#/components/parameters/SyncProtocolVersion\""),
+                "OpenAPI operation {operation_id} is missing the sync protocol header",
             );
         }
     }
@@ -7459,6 +7538,12 @@ mod tests {
         if let Some(session_id) = session_id {
             builder = builder.header(SESSION_ID_HEADER, session_id);
         }
+        if uri.starts_with("/lix/v1/sync/") {
+            builder = builder.header(
+                SYNC_PROTOCOL_VERSION_HEADER,
+                crate::sync::SYNC_PROTOCOL_VERSION,
+            );
+        }
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
@@ -7905,6 +7990,10 @@ mod tests {
         let app = app().await;
         let (session_id, first) = new_session(&app.router).await;
         assert_eq!(first["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(
+            first["syncProtocolVersion"],
+            crate::sync::SYNC_PROTOCOL_VERSION
+        );
         assert_eq!(first["activeAccountId"], lix::ANONYMOUS_ACCOUNT_ID);
         assert!(first["capabilities"].get("requestBlobSplice").is_none());
         assert_eq!(first["capabilities"]["binaryFileUpsert"], true);
@@ -7927,6 +8016,58 @@ mod tests {
         let resumed = response_json(resumed).await;
         assert_eq!(resumed["sessionId"], session_id);
         assert_eq!(resumed["activeBranchId"], first["activeBranchId"]);
+    }
+
+    #[tokio::test]
+    async fn sync_endpoint_requires_the_exact_sync_protocol_version() {
+        let app = app().await;
+        for version in ["999", "not-a-number"] {
+            let builder = Request::builder()
+                .uri("/lix/v1/sync/pull")
+                .header(SYNC_PROTOCOL_VERSION_HEADER, version);
+            let response = app
+                .router
+                .clone()
+                .oneshot(builder.body(Body::empty()).expect("sync request"))
+                .await
+                .expect("sync response");
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                error_code(response).await,
+                crate::sync::SYNC_PROTOCOL_MISMATCH_CODE
+            );
+        }
+
+        let missing = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/lix/v1/sync/pull")
+                    .body(Body::empty())
+                    .expect("legacy v1 sync request"),
+            )
+            .await
+            .expect("legacy v1 sync response");
+        assert_ne!(missing.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn server_protocol_mismatch_labels_client_and_server_versions() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SYNC_PROTOCOL_VERSION_HEADER,
+            http::HeaderValue::from_static("999"),
+        );
+        let error = require_sync_protocol_version(&headers)
+            .expect_err("mismatched client version must be rejected");
+        assert_eq!(
+            error.body.error.details,
+            Some(serde_json::json!({
+                "clientSyncProtocolVersion": 999,
+                "serverSyncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+            }))
+        );
     }
 
     #[test]
@@ -8382,6 +8523,10 @@ mod tests {
             .method("POST")
             .uri("/lix/v1/sync/blob")
             .header(SESSION_ID_HEADER, &session_id)
+            .header(
+                SYNC_PROTOCOL_VERSION_HEADER,
+                crate::sync::SYNC_PROTOCOL_VERSION,
+            )
             .header(CONTENT_TYPE, "text/plain")
             .body(Body::from("{}"))
             .expect("wrong manifest media request");
@@ -8397,6 +8542,10 @@ mod tests {
             .method("PUT")
             .uri(format!("/lix/v1/sync/chunk?chunkId={digest}"))
             .header(SESSION_ID_HEADER, &session_id)
+            .header(
+                SYNC_PROTOCOL_VERSION_HEADER,
+                crate::sync::SYNC_PROTOCOL_VERSION,
+            )
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from("x"))
             .expect("wrong chunk media request");
@@ -8412,6 +8561,10 @@ mod tests {
             .method("PUT")
             .uri(format!("/lix/v1/sync/chunk?chunkId={digest}"))
             .header(SESSION_ID_HEADER, &session_id)
+            .header(
+                SYNC_PROTOCOL_VERSION_HEADER,
+                crate::sync::SYNC_PROTOCOL_VERSION,
+            )
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(Body::empty())
             .expect("empty chunk request");
@@ -8427,6 +8580,10 @@ mod tests {
             .method("PUT")
             .uri(format!("/lix/v1/sync/chunk?chunkId={digest}"))
             .header(SESSION_ID_HEADER, &session_id)
+            .header(
+                SYNC_PROTOCOL_VERSION_HEADER,
+                crate::sync::SYNC_PROTOCOL_VERSION,
+            )
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(Body::from(vec![0; MAX_SYNC_CHUNK_BYTES + 1]))
             .expect("oversized chunk request");
@@ -8502,6 +8659,10 @@ mod tests {
             .method("PUT")
             .uri(format!("/lix/v1/sync/chunk?chunkId={chunk_id}"))
             .header(SESSION_ID_HEADER, &session_id)
+            .header(
+                SYNC_PROTOCOL_VERSION_HEADER,
+                crate::sync::SYNC_PROTOCOL_VERSION,
+            )
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(Body::from(bytes.to_vec()))
             .expect("put chunk request");
@@ -8867,6 +9028,10 @@ mod tests {
             .method(Method::POST)
             .uri(format!("/lix/v1/{}/sync/push", app.server.lix_id()))
             .header(SESSION_ID_HEADER, session_id)
+            .header(
+                SYNC_PROTOCOL_VERSION_HEADER,
+                crate::sync::SYNC_PROTOCOL_VERSION,
+            )
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::to_vec(&json!({
