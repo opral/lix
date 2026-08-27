@@ -274,22 +274,19 @@ const unsubscribe = lix.subscribeActiveBranch(listener);
 Subscribes to successful branch switches made through this Lix handle. The
 `listener` is a function with no arguments. Returns an unsubscribe function.
 
-### createCheckpoint()
+### Checkpoints
+
+Checkpointing uses the canonical SQL surface rather than a separate typed SDK
+method:
 
 ```ts
-const checkpoint = await lix.createCheckpoint();
+const result = await lix.execute(
+  "SELECT commit_id FROM lix_create_checkpoint()",
+);
+const commitId = result.rows[0].commit_id;
 ```
 
-Creates a checkpoint from the pending working changes on the active branch. See
-[Checkpoints](./checkpoints.md).
-
-Result:
-
-```ts
-type CreateCheckpointReceipt = {
-  commitId: string;
-};
-```
+See [Checkpoints](./checkpoints.md) for scoped row-reference selections.
 
 ### undo() / redo()
 
@@ -425,8 +422,7 @@ type MergeChangeStats = {
 ```ts
 type MergeConflict = {
   kind: "sameRowChanged";
-  schemaKey: string;
-  rowPk: unknown;
+  rowRef: string;
   fileId: string | null;
   target: MergeConflictSide;
   source: MergeConflictSide;

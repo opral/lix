@@ -10,15 +10,17 @@ branch head to inspect subsequent changes at the relation level your interface
 uses.
 
 ```ts
-const checkpoint = await lix.createCheckpoint();
-console.log("created checkpoint", checkpoint.commitId);
+const checkpoint = await lix.execute(
+  "SELECT commit_id FROM lix_create_checkpoint()",
+);
+console.log("created checkpoint", checkpoint.rows[0].commit_id);
 ```
 
-`createCheckpoint()` checkpoints the active branch and returns the new checkpoint
-commit ID. The equivalent full SQL checkpoint is a metadata-only operation:
+`lix_create_checkpoint()` checkpoints the active branch and returns the new
+checkpoint commit ID. A full checkpoint is a metadata-only operation:
 
 ```sql
-INSERT INTO lix_create_checkpoint DEFAULT VALUES RETURNING commit_id;
+SELECT commit_id FROM lix_create_checkpoint();
 ```
 
 ## Complete example
@@ -27,7 +29,7 @@ INSERT INTO lix_create_checkpoint DEFAULT VALUES RETURNING commit_id;
 import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
-await lix.createCheckpoint();
+await lix.execute("SELECT commit_id FROM lix_create_checkpoint()");
 
 await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
   "checkpoint-demo",
@@ -35,26 +37,18 @@ await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
 ]);
 
 const working = await lix.execute(
-  `SELECT lixcol_row_pk, diff_type, from_value, to_value
-   FROM lix_diff(
-     'lix_key_value',
-     lix_latest_checkpoint_commit_id(),
-     lix_active_branch_commit_id()
-   )`,
+  `SELECT row_ref, key, diff_type, from_value, to_value
+   FROM lix_diff('lix_key_value')`,
 );
 
 for (const row of working.rows) {
-  console.log(row.diff_type, row.lixcol_row_pk);
+  console.log(row.diff_type, row.key, row.row_ref);
 }
 
-await lix.createCheckpoint();
+await lix.execute("SELECT commit_id FROM lix_create_checkpoint()");
 const remaining = await lix.execute(
   `SELECT count(*) AS count
-   FROM lix_diff(
-     'lix_key_value',
-     lix_latest_checkpoint_commit_id(),
-     lix_active_branch_commit_id()
-   )`,
+   FROM lix_diff('lix_key_value')`,
 );
 console.assert(remaining.rows[0].count === 0);
 
@@ -68,7 +62,7 @@ A runnable Rust version lives at
 
 | Surface | Scope | Columns |
 | :-- | :-- | :-- |
-| `lix_diff(relation, from_commit_id, to_commit_id)` | One relation across two explicit commits | `lixcol_row_pk`, `diff_type`, `row_count`, and paired `from_<column>` / `to_<column>` relation columns |
+| `lix_diff(relation[, from_commit_id, to_commit_id])` | One relation, defaulting to latest checkpoint → active head | `row_ref`, typed primary-key columns, `diff_type`, `row_count`, and paired `from_<column>` / `to_<column>` relation columns |
 | `lix_checkpoint` | Repository-global checkpoint markers | `id`, `commit_id`, and standard `lixcol_*` columns |
 | `lix_commit` | Repository-global commit graph | `id`, `parent_commit_ids`, and standard `lixcol_*` columns |
 | `lix_history('lix_checkpoint'[, commit_id])` | Global checkpoint-row authorship history | Checkpoint columns and standard history `lixcol_*` columns |
@@ -91,12 +85,8 @@ when the branch has no checkpoint. Pair it with the active head to inspect
 working changes in one query, including before the first checkpoint:
 
 ```sql
-SELECT lixcol_row_pk, diff_type
-FROM lix_diff(
-  'lix_file',
-  lix_latest_checkpoint_commit_id(),
-  lix_active_branch_commit_id()
-);
+SELECT row_ref, id, diff_type
+FROM lix_diff('lix_file');
 ```
 
 Checkpoint markers in `lix_checkpoint` are repository-global. Querying the
@@ -124,7 +114,6 @@ ORDER BY ancestry.depth, checkpoint.commit_id;
 The anchor has `depth = 0`; direct parents have depth `1`. A commit reachable
 through several merge paths appears once at its shortest depth.
 
-Create a checkpoint for every tracked change through `lix.createCheckpoint()`
-or `INSERT INTO lix_create_checkpoint DEFAULT VALUES`. Select a subset through
-the `(relation, row_pk)` command form described in
-[Diff commands](./diff-commands.md).
+Create a checkpoint for every tracked change through
+`SELECT commit_id FROM lix_create_checkpoint()`. Select a subset by passing an
+array of `row_ref` values as described in [Diff commands](./diff-commands.md).

@@ -52,7 +52,7 @@ columns:
 
 | Column | What it is |
 | :-- | :-- |
-| `lixcol_row_pk` | JSON array of primary-key values in Schema v1 `primary_key` order. |
+| `lixcol_row_ref` | Relation-qualified `lix_row_ref` for the logical row. |
 | `lixcol_schema_key` | The registered schema key. |
 | `lixcol_file_id` | The owning file, or `NULL`. |
 | `lixcol_metadata` | JSON change metadata. |
@@ -136,7 +136,8 @@ Filesystem history describes a composed projection. Renaming, moving,
 deleting, or restoring an ancestor directory creates a revision for every
 affected descendant even when the descendant's own descriptor did not change.
 Each row records all same-commit causes in the structured
-`lixcol_source_changes` JSON array. It deliberately does not expose singular
+`lixcol_source_changes` JSON array. Each source object carries a `row_ref`
+instead of a JSON primary-key tuple. It deliberately does not expose singular
 `lixcol_change_id`, `lixcol_schema_key`, or `lixcol_origin_key` columns.
 
 Lix reconstructs rows through the anchor commit's ancestry. It does not treat
@@ -152,7 +153,7 @@ branch reachability. Ordinary untracked writes do not create change rows.
 | Column | What it is |
 | :-- | :-- |
 | `id` | Unique change ID. |
-| `row_pk` | JSON array of primary-key values in schema order. |
+| `row_ref` | Relation-qualified row reference, or `NULL` for private engine rows. |
 | `schema_key` | Changed Schema v1 key. |
 | `file_id` | Owning file, or `NULL`. |
 | `metadata` | JSON change metadata. |
@@ -161,15 +162,13 @@ branch reachability. Ordinary untracked writes do not create change rows.
 | `origin_key` | Optional origin key attached to the change. |
 | `created_at` | Change timestamp. |
 
-`row_pk` is an ordered JSON array even for a singleton key. Use numeric path
-segments for array indexes:
+Use `lix_row_ref()` to address a public logical row without reconstructing its
+primary-key encoding:
 
 ```sql
 SELECT created_at, id, snapshot_content
 FROM lix_change
-WHERE schema_key = 'acme_issue'
-  AND row_pk ->> 0 = 'launch'
-  AND row_pk ->> 1 = '7'
+WHERE row_ref = lix_row_ref('acme_issue', 'launch', '7')
 ORDER BY created_at, id;
 ```
 

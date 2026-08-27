@@ -652,7 +652,7 @@ test("remote observe reconnects after a gone protocol session instead of failing
 					}
 					nextSession += 1;
 					return Response.json({
-						protocolVersion: 5,
+						protocolVersion: 6,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: `session-${nextSession}`,
@@ -720,7 +720,7 @@ test("remote observe recovers multiple expired shards with one handshake", async
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					handshakeCalls += 1;
 					return Response.json({
-						protocolVersion: 5,
+						protocolVersion: 6,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: `session-${handshakeCalls}`,
@@ -813,7 +813,7 @@ test("remote observe fails if the recovered protocol session is also gone", asyn
 						handshakeCalls += 1;
 						expect(request.headers.has("lix-session-id")).toBe(false);
 						return Response.json({
-							protocolVersion: 5,
+							protocolVersion: 6,
 							activeBranchId: "main-id",
 							activeAccountId: "00000000-0000-7000-8000-000000000002",
 							sessionId: `session-${handshakeCalls}`,
@@ -979,7 +979,7 @@ test("closing Lix stops observations before an earlier finite request settles", 
 
 function handshake(): Response {
 	return Response.json({
-		protocolVersion: 5,
+		protocolVersion: 6,
 		activeBranchId: "main-id",
 		activeAccountId: "00000000-0000-7000-8000-000000000002",
 		sessionId: "session-1",

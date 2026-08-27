@@ -408,9 +408,9 @@ mod tests {
         match probe {
             DifferentialProbe::RegisteredSchemaActive => ProbeQuery {
                 name: "lix_registered_schema".to_string(),
-                sql: "SELECT lixcol_row_pk, value, lixcol_metadata, lixcol_global, lixcol_untracked \
+                sql: "SELECT schema_key, value, lixcol_metadata, lixcol_global, lixcol_untracked \
                  FROM lix_registered_schema \
-                 ORDER BY lixcol_row_pk"
+                 ORDER BY schema_key"
                     .to_string(),
                 params: Vec::new(),
             },

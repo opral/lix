@@ -1739,7 +1739,7 @@ mod tests {
         let broad = session
             .execute(
                 &format!(
-                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT path, diff_type FROM {} ORDER BY path",
                     json_pointer_diff_relation(&session).await
                 ),
                 &[],
@@ -1755,9 +1755,7 @@ mod tests {
             .iter()
             .map(|row| {
                 (
-                    row.get::<serde_json::Value>("lixcol_row_pk")
-                        .expect("row_pk should decode")
-                        .to_string(),
+                    row.get::<String>("path").expect("path should decode"),
                     row.get::<String>("diff_type")
                         .expect("diff_type should decode"),
                 )
@@ -1766,10 +1764,10 @@ mod tests {
         assert_eq!(
             broad_rows,
             vec![
-                ("[\"/added\"]".to_string(), "added".to_string()),
-                ("[\"/modified\"]".to_string(), "modified".to_string()),
-                ("[\"/recycled\"]".to_string(), "added".to_string()),
-                ("[\"/removed\"]".to_string(), "removed".to_string()),
+                ("/added".to_string(), "added".to_string()),
+                ("/modified".to_string(), "modified".to_string()),
+                ("/recycled".to_string(), "added".to_string()),
+                ("/removed".to_string(), "removed".to_string()),
             ],
             "the index-driven working diff must classify every reachable shape"
         );
@@ -1785,16 +1783,15 @@ mod tests {
             "/recycled-source",
             "/never-existed",
         ] {
-            let requested_row_pk = format!("[\"{path}\"]");
             let primary_before = hits.primary_scan.load(Ordering::Relaxed);
             let finite = session
                 .execute(
                     &format!(
-                        "SELECT lixcol_row_pk, diff_type FROM {} \
-                         WHERE lixcol_row_pk = CAST($1 AS JSONB) ORDER BY lixcol_row_pk",
+                        "SELECT path, diff_type FROM {} \
+                         WHERE path = $1 ORDER BY path",
                         json_pointer_diff_relation(&session).await
                     ),
-                    &[crate::Value::Text(requested_row_pk.clone())],
+                    &[crate::Value::Text(path.to_string())],
                 )
                 .await
                 .expect("finite working-diff read should execute");
@@ -1807,9 +1804,7 @@ mod tests {
                 .iter()
                 .map(|row| {
                     (
-                        row.get::<serde_json::Value>("lixcol_row_pk")
-                            .expect("row_pk should decode")
-                            .to_string(),
+                        row.get::<String>("path").expect("path should decode"),
                         row.get::<String>("diff_type")
                             .expect("diff_type should decode"),
                     )
@@ -1817,7 +1812,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let expected = broad_rows
                 .iter()
-                .filter(|(row_pk, _)| row_pk == &requested_row_pk)
+                .filter(|(row_path, _)| row_path == path)
                 .cloned()
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -1959,9 +1954,7 @@ mod tests {
                 .iter()
                 .map(|row| {
                     (
-                        row.get::<serde_json::Value>("lixcol_row_pk")
-                            .expect("row_pk should decode")
-                            .to_string(),
+                        row.get::<String>("path").expect("path should decode"),
                         // `file_id` is nullable; a NULL surfaces as a decode
                         // error through the typed accessor.
                         row.get::<String>("file_id").ok(),
@@ -1975,7 +1968,7 @@ mod tests {
         }
         let relation = json_pointer_diff_relation(&session).await;
         let columns = format!(
-            "SELECT lixcol_row_pk, \
+            "SELECT path, \
              COALESCE(to_lixcol_file_id, from_lixcol_file_id) AS file_id, diff_type \
              FROM {relation}"
         );

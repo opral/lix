@@ -30,6 +30,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
+use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -830,7 +831,10 @@ where
 {
     ALLOCATION_CALLS.with(|calls| calls.set(0));
     ALLOCATED_BYTES.with(|bytes| bytes.set(0));
-    let (result, storage) = measure_checkpoint_foreground(lix.create_checkpoint()).await;
+    let checkpoint = IntoFuture::into_future(
+        lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[]),
+    );
+    let (result, storage) = measure_checkpoint_foreground(checkpoint).await;
     result.expect("create benchmark checkpoint");
     let accounting = ForegroundAccounting {
         storage,

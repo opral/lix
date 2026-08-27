@@ -56,9 +56,17 @@ async fn repository_gc_keeps_graph_reachable_file_history_content() {
         .rows()[0]
         .get::<String>("id")
         .unwrap();
-    let historical_checkpoint = lix.create_checkpoint().await.unwrap().commit_id;
+    let historical_checkpoint = lix
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
     write_file(&lix, "/history.txt", b"after gc").await;
-    lix.create_checkpoint().await.unwrap();
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap();
 
     let storage = lix.storage_adapter();
     let orphan_hash = write_binary_cas_for_bench(&storage, b"history-gc-orphan")
@@ -114,7 +122,9 @@ async fn repository_gc_reclaims_plugin_wasm_after_final_registry_root_releases()
     )
     .await
     .unwrap();
-    lix.create_checkpoint().await.unwrap();
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap();
     collect_repository_gc_for_bench(&storage).await.unwrap();
     assert!(
         read_binary_cas_for_bench(&storage, &wasm_hash)

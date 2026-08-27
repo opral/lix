@@ -11,6 +11,7 @@ use crate::SqlQueryResult;
 pub(crate) struct SqlWriteResult {
     pub(crate) rows_affected: u64,
     pub(crate) returning: Option<SqlQueryResult>,
+    pub(crate) checkpoint_telemetry: Option<(String, String)>,
 }
 
 impl SqlWriteResult {
@@ -18,6 +19,7 @@ impl SqlWriteResult {
         Self {
             rows_affected,
             returning: None,
+            checkpoint_telemetry: None,
         }
     }
 
@@ -25,7 +27,41 @@ impl SqlWriteResult {
         Self {
             rows_affected,
             returning: Some(returning),
+            checkpoint_telemetry: None,
         }
+    }
+
+    pub(crate) fn checkpoint_function(
+        outcome: crate::sql2::DiffCommandOutcome,
+    ) -> Result<Self, crate::LixError> {
+        let checkpoint_telemetry = outcome
+            .commit_id
+            .as_ref()
+            .zip(outcome.parent_commit_id.as_ref())
+            .map(|(commit_id, parent_commit_id)| {
+                (commit_id.clone(), parent_commit_id.clone())
+            });
+        let rows = match outcome.commit_id {
+            Some(commit_id) => vec![vec![crate::Value::Text(commit_id)]],
+            None if outcome.rows_affected == 0 => Vec::new(),
+            None => {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    "checkpoint function staged rows without a commit ID",
+                ));
+            }
+        };
+        let mut result = Self::returning(
+            outcome.rows_affected,
+            SqlQueryResult {
+                columns: vec!["commit_id".to_string()],
+                column_types: vec![crate::ResultColumnType::Text],
+                rows,
+                notices: Vec::new(),
+            },
+        );
+        result.checkpoint_telemetry = checkpoint_telemetry;
+        Ok(result)
     }
 
     pub(crate) fn diff_command(
@@ -87,13 +123,14 @@ pub(crate) use write::{
 };
 pub(crate) use write::{
     WriteLogicalPlan as SqlWriteLogicalPlan, create_write_logical_plan_from_template,
-    create_write_plan_template_from_parsed, diff_command_query, full_checkpoint_command,
+    create_write_plan_template_from_parsed, diff_command_query,
     execute_write_logical_plan_parameter_batch, execute_write_logical_plan_prepared_dml_batch,
     execute_write_logical_plan_result_with_metadata, execute_write_logical_plan_value_batch,
     parameter_record_batch, parameter_row, write_plan_requires_post_stage_returning_checkpoint,
 };
 
 pub(crate) enum SqlLogicalPlan {
+    Checkpoint(crate::sql2::CheckpointFunctionPlan),
     DataFusion(SqlDataFusionLogicalPlan),
     Write(SqlWriteLogicalPlan),
 }

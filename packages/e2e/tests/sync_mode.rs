@@ -64,7 +64,7 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
         .await;
     }
     authority
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("checkpoint cold snapshot baseline");
     authority.close().await.expect("close authority setup");
@@ -108,11 +108,10 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
     let history_before_checkpoint = probe.history_gets.load(Ordering::Acquire);
     let checkpoint = replica
         .execute(
-            "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-             SELECT 'lix_file', lixcol_row_pk \
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+             SELECT row_ref \
              FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
-             WHERE lixcol_row_pk ->> 0 = $1 \
-             RETURNING commit_id",
+             WHERE id = $1))",
             &[Value::Text(selected_file_id.clone())],
         )
         .await
@@ -131,7 +130,7 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
             .execute(
                 "SELECT COUNT(*) AS count \
                  FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-                 WHERE lixcol_row_pk ->> 0 = $1",
+                 WHERE id = $1",
                 &[
                     Value::Text(selected_file_id.clone()),
                     Value::Text(checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
@@ -369,7 +368,7 @@ async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
         .await
         .expect("the first file creation after bootstrap has a checkpoint cursor");
     replica
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("the first checkpoint after sync bootstrap succeeds");
     assert_eq!(
@@ -422,7 +421,7 @@ async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_p
         .get::<String>("id")
         .expect("file id decodes");
     authority
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("checkpoint first file version");
     authority
@@ -433,7 +432,7 @@ async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_p
         .await
         .expect("update historical file");
     authority
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("checkpoint second file version");
     authority
@@ -451,7 +450,7 @@ async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_p
         .await
         .expect("create surviving file");
     authority
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("checkpoint deletion and surviving file");
     for index in 0..105 {
@@ -540,10 +539,12 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
             .await
             .expect("update checkpointed file");
         let checkpoint = authority
-            .create_checkpoint()
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
             .expect("create file checkpoint")
-            .commit_id;
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("checkpoint commit id decodes");
         if index == 31 {
             target_checkpoint = Some(checkpoint);
         }
@@ -633,10 +634,12 @@ async fn sparse_checkpoint_history_hydrates_missing_bodies_concurrently() {
             .expect("update checkpointed file");
         latest_checkpoint = Some(
             authority
-                .create_checkpoint()
+                .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
                 .await
                 .expect("create file checkpoint")
-                .commit_id,
+                .rows()[0]
+                .get::<String>("commit_id")
+                .expect("checkpoint commit id decodes"),
         );
     }
     let latest_checkpoint = latest_checkpoint.expect("latest checkpoint captured");
@@ -1855,9 +1858,12 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .await
         .expect("create /docs/handbook/inside.md");
     let first_checkpoint = authority
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
-        .expect("checkpoint seeded filesystem");
+        .expect("checkpoint seeded filesystem")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("checkpoint commit id decodes");
     authority
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/brand/logo.md', CAST('three' AS BYTEA))",
@@ -1866,9 +1872,12 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .await
         .expect("create /brand/logo.md");
     let second_checkpoint = authority
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
-        .expect("checkpoint second filesystem state");
+        .expect("checkpoint second filesystem state")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("checkpoint commit id decodes");
     // Enough later commits that the checkpoint payloads stay cold on a
     // fresh bootstrap.
     for index in 0..105 {
@@ -1881,7 +1890,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
 
-    let commit_id = first_checkpoint.commit_id.clone();
+    let commit_id = first_checkpoint.clone();
     let files = replica
         .execute(
             "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
@@ -1949,8 +1958,8 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
              FROM lix_diff('lix_file', $1, $2)
              ORDER BY coalesce(to_path, from_path)",
             &[
-                Value::Text(first_checkpoint.commit_id.clone()),
-                Value::Text(second_checkpoint.commit_id.clone()),
+                Value::Text(first_checkpoint.clone()),
+                Value::Text(second_checkpoint.clone()),
             ],
         )
         .await
@@ -1976,7 +1985,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
     let latest_directories = replica
         .execute(
             "SELECT name FROM lix_state_at('lix_directory', $1) ORDER BY name",
-            &[Value::Text(second_checkpoint.commit_id.clone())],
+            &[Value::Text(second_checkpoint.clone())],
         )
         .await
         .expect("latest checkpoint directory state hydrates");
@@ -2098,8 +2107,8 @@ async fn sparse_replica_observer_hydrates_root_history_past_a_merge_frontier() {
     let command_bootstrap_history_gets = probe.history_gets.load(Ordering::Acquire);
     let applied = command_replica
         .execute(
-            "INSERT INTO lix_apply (relation, row_pk) \
-             SELECT 'lix_key_value', lixcol_row_pk \
+            "INSERT INTO lix_apply (row_ref) \
+             SELECT row_ref \
              FROM lix_diff(\
                'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
              ) \
@@ -2146,10 +2155,12 @@ async fn partially_hydrated_replica_reads_point_in_time_filesystem_state() {
         .get::<String>("id")
         .expect("file id decodes");
     let checkpoint = authority
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("checkpoint seeded filesystem")
-        .commit_id;
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("checkpoint commit id decodes");
     for index in 0..105 {
         put_value(&authority, &format!("partial-hydration-{index:03}"), "value").await;
     }
@@ -2261,7 +2272,7 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
             "SELECT path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
             &[
                 Value::Text(last_checkpoint.clone()),
-                Value::Text(brand_file_id),
+                Value::Text(brand_file_id.clone()),
             ],
         )
         .await
@@ -2297,6 +2308,28 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
         .await
         .expect("root diff with paths at the migrated partial checkpoint hydrates");
     assert_eq!(diff.rows().len(), 4, "resolved paths for all four files");
+
+    replica
+        .execute(
+            "UPDATE lix_file SET name = 'logo-working.md' WHERE id = $1",
+            &[Value::Text(brand_file_id.clone())],
+        )
+        .await
+        .expect("working edit on a checkpoint-selected row succeeds");
+    replica
+        .execute(
+            "INSERT INTO lix_revert (row_ref) \
+             SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1 \
+             RETURNING commit_id",
+            &[Value::Text(brand_file_id)],
+        )
+        .await
+        .expect("sparse replica reverts a working edit against the migrated checkpoint");
+    let reverted = replica
+        .execute("SELECT path FROM lix_file WHERE path = '/brand/logo.md'", &[])
+        .await
+        .expect("reverted file resolves");
+    assert_eq!(reverted.rows().len(), 1, "working edit was reverted");
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;

@@ -57,7 +57,8 @@ use crate::sql2::predicate_typecheck::{
 };
 use crate::sql2::providers::ProviderSelection;
 use crate::sql2::result_metadata::{
-    LIX_VALUE_TYPE_JSONB, LIX_VALUE_TYPE_METADATA_KEY, field_is_json,
+    LIX_VALUE_TYPE_JSONB, LIX_VALUE_TYPE_METADATA_KEY, LIX_VALUE_TYPE_ROW_REF, field_is_json,
+    field_is_row_ref,
 };
 use crate::sql2::session::{
     SqlWriteSessionOptions, build_read_session, build_read_session_at_head,
@@ -1781,6 +1782,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
             } else {
                 ctx.staged_commit_id(ctx.active_branch_id())?
             },
+            parent_commit_id: None,
         };
         return SqlWriteResult::diff_command(outcome, plan.bound.returning.as_ref());
     }
@@ -2659,9 +2661,12 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
         BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Apply) => {
             Ok("lix_apply".to_string())
         }
-        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => {
-            Ok("lix_create_checkpoint".to_string())
-        }
+        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => Err(
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "checkpoint function reached the writable-table executor",
+            ),
+        ),
         BoundWriteTarget::Restore { .. } => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "lix_restore reached the DataFusion write executor",
@@ -3055,6 +3060,10 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
             ScalarValue::Utf8(Some(value.to_string())),
             Some(json_field_metadata()),
         ),
+        Value::RowRef(value) => ScalarAndMetadata::new(
+            ScalarValue::Utf8(Some(value.as_str().to_owned())),
+            Some(row_ref_field_metadata()),
+        ),
         Value::Timestamptz(value) => {
             ScalarValue::TimestampMicrosecond(Some(*value), Some("UTC".into())).into()
         }
@@ -3066,6 +3075,13 @@ fn json_field_metadata() -> FieldMetadata {
     FieldMetadata::new(BTreeMap::from([(
         LIX_VALUE_TYPE_METADATA_KEY.to_string(),
         LIX_VALUE_TYPE_JSONB.to_string(),
+    )]))
+}
+
+fn row_ref_field_metadata() -> FieldMetadata {
+    FieldMetadata::new(BTreeMap::from([(
+        LIX_VALUE_TYPE_METADATA_KEY.to_string(),
+        LIX_VALUE_TYPE_ROW_REF.to_string(),
     )]))
 }
 
@@ -3242,13 +3258,16 @@ enum ColumnCursor<'a> {
 enum TextKind {
     Text,
     Jsonb,
+    RowRef,
 }
 
 fn column_cursor<'a>(
     field: Option<&Field>,
     array: &'a dyn Array,
 ) -> Result<ColumnCursor<'a>, LixError> {
-    let text_kind = if field.is_some_and(field_is_json) {
+    let text_kind = if field.is_some_and(field_is_row_ref) {
+        TextKind::RowRef
+    } else if field.is_some_and(field_is_json) {
         TextKind::Jsonb
     } else {
         TextKind::Text
@@ -3547,6 +3566,7 @@ fn text_value(value: &str, kind: TextKind) -> Value {
         // verbatim. Re-parsing here only rebuilt a DOM that was immediately
         // re-serialized, so the bytes are retained directly instead.
         TextKind::Jsonb => Value::Jsonb(crate::Json::from_canonical_text(value)),
+        TextKind::RowRef => Value::RowRef(crate::RowRef(value.to_owned())),
         TextKind::Text => Value::Text(value.to_owned()),
     }
 }
@@ -4225,6 +4245,7 @@ mod tests {
             Ok(crate::sql2::DiffCommandOutcome {
                 rows_affected: selections.len() as u64,
                 commit_id: (!selections.is_empty()).then(|| "commit-diff-command".to_string()),
+                parent_commit_id: None,
             })
         }
 
@@ -4431,7 +4452,6 @@ mod tests {
             vec![
                 "lix_apply",
                 "lix_branch",
-                "lix_create_checkpoint",
                 "lix_directory",
                 "lix_file",
                 "lix_revert",
@@ -4497,9 +4517,8 @@ mod tests {
         };
         let plan = create_write_logical_plan(
             &mut ctx,
-            "INSERT INTO lix_revert (relation, row_pk) \
-             SELECT relation, CAST(row_pk AS JSONB) \
-             FROM (VALUES ('lix_key_value', '[\"test\"]')) AS selected(relation, row_pk) \
+            "INSERT INTO lix_revert (row_ref) \
+             SELECT lix_row_ref('lix_file', '01920000-0000-7000-8000-0000000000d2') \
              RETURNING commit_id",
         )
         .await
@@ -5466,8 +5485,8 @@ mod tests {
         session
             .execute(
                 "INSERT INTO test_state_schema \
-             (lixcol_row_pk, id, value, count, lixcol_metadata, lixcol_untracked) \
-             VALUES (CAST('[\"row-history\"]' AS JSONB), 'row-history', 'A', 7, '{\"source\":\"history\"}', false)",
+             (id, value, count, lixcol_metadata, lixcol_untracked) \
+             VALUES ('row-history', 'A', 7, '{\"source\":\"history\"}', false)",
                 &[],
             )
             .await?;
@@ -6055,9 +6074,9 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, count, lixcol_row_pk, lixcol_depth \
+                    "SELECT value, count, lixcol_row_ref, lixcol_depth \
 	             FROM lix_history('test_state_schema', '{head_commit_id}') \
-	             WHERE lixcol_row_pk = CAST('[\"row-history\"]' AS JSONB)"
+	             WHERE lixcol_row_ref = lix_row_ref('test_state_schema', 'row-history')"
                 ),
                 &[],
             )
@@ -6067,12 +6086,12 @@ mod tests {
 
         assert_eq!(
             columns,
-            vec!["value", "count", "lixcol_row_pk", "lixcol_depth",]
+            vec!["value", "count", "lixcol_row_ref", "lixcol_depth",]
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Text("A".to_string()));
         assert_eq!(rows[0][1], Value::Integer(7));
-        assert_eq!(rows[0][2], Value::Jsonb(json!(["row-history"]).into()));
+        assert!(matches!(rows[0][2], Value::RowRef(_)));
         assert!(matches!(rows[0][3], Value::Integer(_)));
     }
 
@@ -6969,8 +6988,7 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_row_pk, id, value) \
-	     VALUES (CAST('[\"row-c\"]' AS JSONB), 'row-c', 'C')",
+            "INSERT INTO test_state_schema (id, value) VALUES ('row-c', 'C')",
             &[],
         )
         .await
@@ -7076,8 +7094,7 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_row_pk, id, value) \
-             VALUES (CAST('[\"row-c\"]' AS JSONB), 'row-c', 'C')",
+            "INSERT INTO test_state_schema (id, value) VALUES ('row-c', 'C')",
             &[],
         )
         .await
@@ -9292,17 +9309,17 @@ mod tests {
 
         let result = execute_sql(
             &ctx,
-            "SELECT value, lixcol_row_pk \
+            "SELECT value, id \
                      FROM test_state_schema",
             &[],
         )
         .await
         .expect("sql2 execute should read row view");
 
-        assert_eq!(result.columns, vec!["value", "lixcol_row_pk"]);
+        assert_eq!(result.columns, vec!["value", "id"]);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
-        assert_eq!(result.rows[0][1], Value::Jsonb(json!(["row-a"]).into()));
+        assert_eq!(result.rows[0][1], Value::Text("row-a".to_string()));
     }
 
     #[tokio::test]

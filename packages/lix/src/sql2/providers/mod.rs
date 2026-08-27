@@ -79,14 +79,12 @@ pub(crate) async fn register_read<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    if selection.is_empty() {
-        return Ok(());
-    }
     let catalog = if selection.requires_visible_schemas() {
         ctx.public_catalog().await?
     } else {
         Arc::clone(PublicCatalog::fixed_system_shared())
     };
+    crate::sql2::udfs::register_row_ref_function(session, Arc::clone(&catalog));
     if catalog
         .surface("lix_diff")
         .is_some_and(|surface| selection.includes(surface))
@@ -165,10 +163,6 @@ pub(crate) enum ProviderSelection {
 }
 
 impl ProviderSelection {
-    fn is_empty(&self) -> bool {
-        matches!(self, Self::Only { names, history_relations } if names.is_empty() && history_relations.is_empty())
-    }
-
     fn includes(&self, surface: &PublicSurfaceContract) -> bool {
         match self {
             Self::All | Self::AllWithHistory(_) => true,
@@ -349,6 +343,32 @@ fn collect_dynamic_relation_literals(
 
     impl Visitor for DiffRelationVisitor<'_> {
         type Break = ();
+
+        fn pre_visit_expr(&mut self, expression: &SqlExpr) -> ControlFlow<Self::Break> {
+            let SqlExpr::Function(function) = expression else {
+                return ControlFlow::Continue(());
+            };
+            if !crate::sql2::parse::object_name_is_public_function(
+                &function.name,
+                "lix_row_ref",
+            ) {
+                return ControlFlow::Continue(());
+            }
+            let datafusion::sql::sqlparser::ast::FunctionArguments::List(arguments) =
+                &function.args
+            else {
+                return ControlFlow::Continue(());
+            };
+            let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value)))) =
+                arguments.args.first()
+            else {
+                return ControlFlow::Continue(());
+            };
+            if let SqlValue::SingleQuotedString(relation_name) = &value.value {
+                self.0.insert(relation_name.clone());
+            }
+            ControlFlow::Continue(())
+        }
 
         fn pre_visit_table_factor(
             &mut self,
@@ -579,10 +599,10 @@ where
             PublicSurfaceKind::SchemaBase { .. }
             | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::CheckpointFunction
             | PublicSurfaceKind::StateAtFunction
             | PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
-            | PublicSurfaceKind::CreateCheckpoint
             | PublicSurfaceKind::Restore => {}
         }
     }
@@ -662,6 +682,7 @@ pub(crate) async fn register_write(
     selection: &ProviderSelection,
 ) -> Result<(), LixError> {
     let catalog = write_ctx.public_catalog()?;
+    crate::sql2::udfs::register_row_ref_function(session, Arc::clone(&catalog));
     register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection)
         .await?;
     register_information_schema(session, selection, catalog)
@@ -684,6 +705,7 @@ where
     // Reuse that immutable metadata, then install read-only providers from the
     // committed read capability and writable providers from the overlay.
     let catalog = write_ctx.public_catalog()?;
+    crate::sql2::udfs::register_row_ref_function(session, Arc::clone(&catalog));
     if catalog
         .surface("lix_diff")
         .is_some_and(|surface| selection.includes(surface))
@@ -787,18 +809,10 @@ async fn register_write_from_catalog(
                 )
                 .await?;
             }
-            PublicSurfaceKind::CreateCheckpoint => {
-                diff_command::register_diff_command_provider(
-                    session,
-                    &surface.name,
-                    crate::sql2::DiffCommand::CreateCheckpoint,
-                    write_ctx.clone(),
-                )
-                .await?;
-            }
             PublicSurfaceKind::Change
             | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::CheckpointFunction
             | PublicSurfaceKind::StateAtFunction
             | PublicSurfaceKind::CommitAncestryFunction
             | PublicSurfaceKind::Restore => {}
@@ -856,11 +870,11 @@ mod tests {
              SELECT left_side.id \
              FROM shadowed AS left_side \
              JOIN (\
-                 SELECT row_pk FROM lix_change \
+                 SELECT row_ref FROM lix_change \
                  UNION ALL \
-                 SELECT row_pk FROM lix_change\
-             ) AS right_side \
-               ON left_side.id = right_side.row_pk \
+                 SELECT row_ref FROM lix_change\
+               ) AS right_side \
+               ON false \
              JOIN public.\"lix_directory\" AS directory_a ON true \
              JOIN public.\"lix_directory\" AS directory_b ON true"]);
 
@@ -1057,6 +1071,7 @@ mod tests {
             vec![
                 "lix_change",
                 "lix_commit_ancestry",
+                "lix_create_checkpoint",
                 "lix_diff",
                 "lix_history",
                 "lix_state_at",
@@ -1067,7 +1082,6 @@ mod tests {
             vec![
                 "lix_apply",
                 "lix_branch",
-                "lix_create_checkpoint",
                 "lix_directory",
                 "lix_file",
                 "lix_restore",
@@ -1076,7 +1090,7 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 21, "construction count");
+        assert_eq!(all_read + writable.len(), 20, "construction count");
         assert_eq!(read_only.len() + writable.len(), 13, "surface count");
     }
 
@@ -1094,7 +1108,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(all_writable, 7, "standalone write count");
+        assert_eq!(all_writable, 6, "standalone write count");
         assert_eq!(selected_writable, vec!["lix_file"]);
     }
 

@@ -1557,13 +1557,27 @@ async fn claim_fresh_import<S>(storage: &S, migrating: &Bytes) -> Result<(), Lix
 where
     S: Storage + Clone,
 {
+    let mut retried_cancelled_handoff = false;
     loop {
         match try_claim_fresh_import(storage, migrating).await {
             Ok(()) => return Ok(()),
-            Err(StorageError::PreconditionFailed(_)) => {
+            Err(StorageError::PreconditionFailed(failures)) => {
                 let Some((state, bytes)) = load_pointer(storage).await? else {
+                    // A cancelled importer may release its exact claim between
+                    // our failed claim commit and this resolving read. The
+                    // control-space precondition is then the only failed item.
+                    // Retry the full atomic emptiness check once; a persistent
+                    // failure is real pointerless destination state.
+                    if !retried_cancelled_handoff
+                        && !failures.is_empty()
+                        && failures.iter().all(|failure| failure.index == 0)
+                    {
+                        retried_cancelled_handoff = true;
+                        continue;
+                    }
                     return Err(nonempty_snapshot_destination());
                 };
+                retried_cancelled_handoff = false;
                 if !matches!(
                     state,
                     PointerState::Migrating {

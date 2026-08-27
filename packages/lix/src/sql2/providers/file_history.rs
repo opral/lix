@@ -41,7 +41,8 @@ use crate::sql2::history_route::{
     HISTORY_COL_IS_DELETED, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ROW_PK,
     HISTORY_COL_SOURCE_CHANGES, HistoryEntry, HistoryMetadataProjection, HistoryRoute,
     HistoryViewDescriptor, load_history_entries, parse_history_filter,
-    serialize_history_source_changes, validate_history_anchor_filter,
+    history_filter_references_row_ref, serialize_history_source_changes,
+    validate_history_anchor_filter,
 };
 use crate::sql2::providers::filesystem_history_path::{
     DirectoryPathRecord, HistoryDirectoryTree, load_history_commit_parents,
@@ -107,7 +108,9 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
-        if parse_history_filter(filter).is_some()
+        if history_filter_references_row_ref(filter) && parse_history_filter(filter).is_some() {
+            TableProviderFilterPushDown::Inexact
+        } else if parse_history_filter(filter).is_some()
             || FileHistoryPublicPredicate::parse_exact(filter).is_some()
         {
             TableProviderFilterPushDown::Exact
@@ -2753,7 +2756,11 @@ static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
         ("content", Col::Binary(|row| row.data.clone())),
         (
             HISTORY_COL_ROW_PK,
-            Col::Utf8Fallible(|row| row_pk_json_array(&row.descriptor().id).map(Some)),
+            Col::Utf8Fallible(|row| {
+                let row_pk = RowPk::uuid_from_canonical(&row.descriptor().id)
+                    .map_err(|error| LixError::new(LixError::CODE_TYPE_MISMATCH, error.to_string()))?;
+                crate::row_ref::encode("lix_file", &row_pk).map(|value| Some(value.to_string()))
+            }),
         ),
         (
             HISTORY_COL_SOURCE_CHANGES,
@@ -2811,7 +2818,7 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
         Field::new("content", DataType::LargeBinary, true),
-        json_field(HISTORY_COL_ROW_PK, false),
+        crate::sql2::result_metadata::row_ref_field(HISTORY_COL_ROW_PK, false),
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),

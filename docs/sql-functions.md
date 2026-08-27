@@ -14,8 +14,15 @@ operators; there are no public `lix_json_*` functions.
 | `lix_active_branch_commit_id()` | text | Active branch head pinned for the statement. |
 | `lix_latest_checkpoint_commit_id()` | text | Active branch's latest checkpoint, or the repository root if it has none. |
 | `lix_root_commit_id()` | text | Repository bootstrap root. |
+| `lix_row_ref(relation, primary_key...)` | row_ref | Opaque address of one relation row, including composite keys. |
 | `uuidv7()` | uuid | Generate a UUIDv7 value. |
 | `CURRENT_TIMESTAMP` | timestamptz | Transaction-start instant at microsecond precision. |
+
+`lix_row_ref` takes the relation's typed primary-key values in declared order:
+
+```sql
+SELECT lix_row_ref('json_object_member', $1, $2) AS row_ref;
+```
 
 ## JSONB
 
@@ -63,7 +70,7 @@ no checkpoint, it returns `lix_root_commit_id()`. Use both branch-scoped
 accessors to read working changes in one query:
 
 ```sql
-SELECT lixcol_row_pk, diff_type
+SELECT row_ref, id, diff_type
 FROM lix_diff(
   'lix_file',
   lix_latest_checkpoint_commit_id(),

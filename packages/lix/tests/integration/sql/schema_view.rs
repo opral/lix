@@ -1,6 +1,5 @@
 use lix::ExecuteResult;
 use lix::Value;
-use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -55,13 +54,13 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT lixcol_row_pk FROM pushdown_note WHERE kind = 'todo'",
+                "SELECT id FROM pushdown_note WHERE kind = 'todo'",
                 &[],
             )
             .await
             .expect("filter-only payload query should succeed");
 
-        assert_rows_eq(result, vec![vec![Value::Jsonb(json!(["n1"]).into())]]);
+        assert_rows_eq(result, vec![vec![Value::Text("n1".to_string())]]);
     }
 );
 

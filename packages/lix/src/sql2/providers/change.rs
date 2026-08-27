@@ -17,10 +17,10 @@ use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::{
     ChangePayloadProjection, MaterializedChange, materialize_changelog_change_record,
-    materialize_commit_graph_change,
+    materialize_commit_graph_change, public_change_row_ref,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
-use crate::sql2::result_metadata::json_field;
+use crate::sql2::result_metadata::{json_field, row_ref_field};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
@@ -304,7 +304,7 @@ pub(super) fn lix_change_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("account_id", DataType::Utf8, false),
-        json_field("row_pk", false),
+        row_ref_field("row_ref", true),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("metadata", true),
@@ -319,14 +319,8 @@ static LIX_CHANGE_COLS: ColumnTable<MaterializedChange> = ColumnTable {
         ("id", Col::Utf8(|row| Some(row.id.as_str()))),
         ("account_id", Col::Utf8(|row| Some(row.account_id.as_str()))),
         (
-            "row_pk",
-            Col::Utf8Owned(|row| {
-                Some(
-                    row.row_pk
-                        .as_json_array_text()
-                        .expect("canonical change row primary key should project"),
-                )
-            }),
+            "row_ref",
+            Col::Utf8Fallible(change_public_row_ref),
         ),
         ("schema_key", Col::Utf8(|row| Some(row.schema_key.as_str()))),
         ("file_id", Col::Utf8(|row| row.file_id.as_deref())),
@@ -342,6 +336,10 @@ static LIX_CHANGE_COLS: ColumnTable<MaterializedChange> = ColumnTable {
         ),
     ],
 };
+
+fn change_public_row_ref(row: &MaterializedChange) -> Result<Option<String>, LixError> {
+    public_change_row_ref(row).map(|row_ref| row_ref.map(|value| value.to_string()))
+}
 
 fn change_batch_error(error: ColumnTableError) -> DataFusionError {
     match error {

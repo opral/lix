@@ -385,7 +385,6 @@ export function workerBinding(
 		activeBranchId: () => request({ kind: "activeBranchId" }),
 		activeAccountId: () => request({ kind: "activeAccountId" }),
 		createBranch: (options) => request({ kind: "createBranch", options }),
-		createCheckpoint: () => request({ kind: "createCheckpoint" }),
 		undo: () => request({ kind: "undo" }),
 		redo: () => request({ kind: "redo" }),
 		switchBranch: (options) => request({ kind: "switchBranch", options }),

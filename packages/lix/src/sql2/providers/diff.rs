@@ -23,11 +23,14 @@ use crate::branch::BranchHeadControlContext;
 use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::hot_state::TrackedHeadContext;
 use crate::plugin::runtime::WasmTypedRow;
-use crate::row_pk::{RowPk, RowPkComponentType};
+use crate::row_pk::{RowPk, RowPkComponent, RowPkComponentType};
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
+use crate::sql2::catalog::schema_surface::SchemaSurfaceSpec;
 use crate::sql2::error::lix_error_to_datafusion_error;
-use crate::sql2::result_metadata::{field_is_json, json_field};
+use crate::sql2::result_metadata::{field_is_json, row_ref_field};
+#[cfg(test)]
+use crate::sql2::result_metadata::field_is_row_ref;
 use crate::sql2::udfs::{ExecutionSlots, execution_slots};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -79,14 +82,26 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        let [relation, from_commit_id, to_commit_id] = args else {
-            return Err(DataFusionError::Plan(
-                "lix_diff requires a relation and exactly two commit ID arguments".to_string(),
-            ));
+        let (relation, from_commit_id, to_commit_id) = match args {
+            [relation] => (
+                relation,
+                self.slots.latest_checkpoint_commit_id().ok_or_else(|| {
+                    DataFusionError::Plan("lix_diff default range requires an active checkpoint".to_string())
+                })?,
+                self.slots.active_branch_commit_id().ok_or_else(|| {
+                    DataFusionError::Plan("lix_diff default range requires an active branch head".to_string())
+                })?,
+            ),
+            [relation, from_commit_id, to_commit_id] => (
+                relation,
+                text_argument(from_commit_id, 2, "commit ID", Some(&self.slots))?,
+                text_argument(to_commit_id, 3, "commit ID", Some(&self.slots))?,
+            ),
+            _ => return Err(DataFusionError::Plan(
+                "lix_diff requires a relation and either zero or two commit ID arguments".to_string(),
+            )),
         };
         let relation_name = text_argument(relation, 1, "relation name", None)?;
-        let from_commit_id = text_argument(from_commit_id, 2, "commit ID", Some(&self.slots))?;
-        let to_commit_id = text_argument(to_commit_id, 3, "commit ID", Some(&self.slots))?;
         let relation = DiffRelation::from_catalog(&self.catalog, &relation_name)?;
         Ok(Arc::new(SpecTableProvider::new(Arc::new(DiffSpec {
             store: self.store.clone(),
@@ -135,9 +150,11 @@ fn text_argument(
 
 #[derive(Clone)]
 struct DiffRelation {
+    name: String,
     kind: DiffRelationKind,
     schema: SchemaRef,
-    primary_key_component_types: Vec<RowPkComponentType>,
+    primary_key_columns: Vec<String>,
+    schema_spec: Option<SchemaSurfaceSpec>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -164,23 +181,47 @@ impl DiffRelation {
                 )));
             }
         };
-        let primary_key_component_types = match &kind {
-            DiffRelationKind::Schema { schema_key } => catalog
-                .schema_spec(schema_key)
-                .map(|spec| spec.primary_key_component_types.clone())
-                .unwrap_or_default(),
-            DiffRelationKind::File | DiffRelationKind::Directory => {
-                vec![RowPkComponentType::Uuid]
-            }
-        };
         let source_schema = catalog.surface_schema(name).ok_or_else(|| {
             DataFusionError::Plan(format!("lix_diff does not support relation '{name}'"))
         })?;
-        let mut fields = vec![
-            json_field("lixcol_row_pk", false),
-            Field::new("diff_type", DataType::Utf8, false),
-        ];
-        for column in surface.columns.iter().filter(|column| column.is_public()) {
+        let schema_spec = match &kind {
+            DiffRelationKind::Schema { schema_key } => catalog.schema_spec(schema_key).cloned(),
+            DiffRelationKind::File | DiffRelationKind::Directory => None,
+        };
+        let primary_key_columns = match &kind {
+            DiffRelationKind::File | DiffRelationKind::Directory => vec!["id".to_owned()],
+            DiffRelationKind::Schema { schema_key } => catalog
+                .schema_spec(schema_key)
+                .map(|spec| {
+                    spec.primary_key_paths
+                        .iter()
+                        .map(|path| match path.as_slice() {
+                            [column] => Ok(column.clone()),
+                            _ => Err(DataFusionError::Plan(format!(
+                                "lix_diff relation '{name}' has a non-column primary-key path"
+                            ))),
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        let mut fields = vec![row_ref_field("row_ref", false)];
+        for column in &primary_key_columns {
+            let field = source_schema.field_with_name(column).map_err(|error| {
+                DataFusionError::Plan(format!(
+                    "lix_diff relation '{name}' is missing primary-key column '{column}': {error}"
+                ))
+            })?;
+            fields.push(Field::new(column, field.data_type().clone(), false)
+                .with_metadata(field.metadata().clone()));
+        }
+        fields.push(Field::new("diff_type", DataType::Utf8, false));
+        for column in surface.columns.iter().filter(|column| {
+            column.is_public()
+                && column.name != "lixcol_row_pk"
+                && !primary_key_columns.contains(&column.name)
+        }) {
             let field = source_schema
                 .field_with_name(&column.name)
                 .map_err(|error| {
@@ -202,9 +243,11 @@ impl DiffRelation {
         }
         fields.push(Field::new("row_count", DataType::Int64, false));
         Ok(Self {
+            name: name.to_owned(),
             kind,
             schema: Arc::new(Schema::new(fields)),
-            primary_key_component_types,
+            primary_key_columns,
+            schema_spec,
         })
     }
 }
@@ -236,7 +279,8 @@ where
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         if filter.column_refs().iter().any(|column| {
-            matches!(column.name.as_str(), "lixcol_row_pk" | "from_id" | "to_id")
+            column.name == "row_ref"
+                || self.relation.primary_key_columns.contains(&column.name)
                 || matches!(
                     column.name.as_str(),
                     "from_lixcol_file_id" | "to_lixcol_file_id"
@@ -292,7 +336,7 @@ where
                     active_branch_id,
                 )| async move {
                     if limit == Some(0) || route.contradictory || from_commit_id == to_commit_id {
-                        return diff_record_batch(schema, &[]);
+                        return diff_record_batch(schema, &[], &relation);
                     }
                     let mut tracked = TrackedStateContext::new().reader(store.clone());
                     let from_descriptor =
@@ -360,7 +404,7 @@ where
                     } else {
                         (HashSet::new(), HashSet::new())
                     };
-                    let mut rows = match relation.kind {
+                    let mut rows = match &relation.kind {
                         DiffRelationKind::Schema { .. } => {
                             schema_diff_rows(
                                 diff,
@@ -399,7 +443,7 @@ where
                     if let Some(limit) = limit {
                         rows.truncate(limit);
                     }
-                    diff_record_batch(schema, &rows)
+                    diff_record_batch(schema, &rows, &relation)
                 },
             ),
         })
@@ -433,50 +477,39 @@ struct DiffRoute {
 impl DiffRoute {
     fn from_filters(filters: &[Expr], relation: &DiffRelation, projection: &Schema) -> Self {
         let conjuncts = filter_conjuncts(filters);
-        let row_pk_values = optional_values(&conjuncts, "lixcol_row_pk");
-        let extracted_row_pk_values = extracted_first_row_pk_values(&conjuncts);
-        let id_values =
-            optional_values(&conjuncts, "from_id").or_else(|| optional_values(&conjuncts, "to_id"));
-        let explicit_row_filter = row_pk_values.is_some();
-        let mut contradictory = row_pk_values.as_ref().is_some_and(Vec::is_empty)
+        let row_ref_values = optional_values(&conjuncts, "row_ref");
+        let id_values = optional_values(&conjuncts, "id");
+        let typed_row_pks = relation.schema_spec.as_ref().and_then(|spec| {
+            super::schema::row_pks_from_primary_key_filters(spec, filters)
+                .ok()
+                .flatten()
+        });
+        let explicit_row_filter = row_ref_values.is_some() || typed_row_pks.is_some();
+        let mut contradictory = row_ref_values.as_ref().is_some_and(Vec::is_empty)
             || id_values.as_ref().is_some_and(Vec::is_empty)
-            || extracted_row_pk_values.as_ref().is_some_and(Vec::is_empty);
-        let mut row_pks = row_pk_values
+            || typed_row_pks.as_ref().is_some_and(Vec::is_empty);
+        let row_ref_pks = row_ref_values
             .unwrap_or_default()
             .into_iter()
             .filter_map(|value| {
-                let JsonValue::Array(values) = serde_json::from_str(&value).ok()? else {
-                    return None;
-                };
-                RowPk::from_json_values(&values, &relation.primary_key_component_types).ok()
+                let resolved = crate::row_ref::decode_str(&value).ok()?;
+                (resolved.relation == relation.name).then_some(resolved.row_pk)
             })
             .collect::<Vec<_>>();
+        let mut row_pks = match typed_row_pks {
+            Some(typed) if !row_ref_pks.is_empty() => typed
+                .into_iter()
+                .filter(|row_pk| row_ref_pks.contains(row_pk))
+                .collect(),
+            Some(typed) => typed,
+            None => row_ref_pks,
+        };
         contradictory |= explicit_row_filter && row_pks.is_empty();
         let mut schema_keys = Vec::new();
         let mut file_ids = Vec::new();
         match &relation.kind {
             DiffRelationKind::Schema { schema_key } => {
                 schema_keys.push(schema_key.clone());
-                if relation.primary_key_component_types.len() == 1
-                    && let Some(values) = extracted_row_pk_values.as_ref()
-                {
-                    let extracted_keys = values
-                        .iter()
-                        .filter_map(|value| {
-                            RowPk::from_json_values(
-                                &[JsonValue::String(value.clone())],
-                                &relation.primary_key_component_types,
-                            )
-                            .ok()
-                        })
-                        .collect::<Vec<_>>();
-                    if row_pks.is_empty() {
-                        row_pks = extracted_keys;
-                    } else {
-                        row_pks.retain(|row_pk| extracted_keys.contains(row_pk));
-                    }
-                    contradictory |= row_pks.is_empty();
-                }
                 if let Some(ids) = optional_values(&conjuncts, "from_lixcol_file_id")
                     .or_else(|| optional_values(&conjuncts, "to_lixcol_file_id"))
                 {
@@ -485,16 +518,10 @@ impl DiffRoute {
             }
             DiffRelationKind::File => {
                 let mut ids = id_values.unwrap_or_default();
-                if let Some(values) = extracted_row_pk_values {
-                    ids.extend(values);
-                }
                 for row_pk in row_pks.drain(..) {
-                    if let Ok(JsonValue::Array(values)) = row_pk.as_json_array_value()
-                        && let [JsonValue::String(id)] = values.as_slice()
-                    {
-                        ids.push(id.clone());
-                    } else {
-                        contradictory = true;
+                    match row_pk.as_single_string_owned() {
+                        Ok(id) => ids.push(id),
+                        Err(_) => contradictory = true,
                     }
                 }
                 file_ids.extend(ids.into_iter().map(NullableKeyFilter::Value));
@@ -541,61 +568,6 @@ impl DiffRoute {
             contradictory,
         }
     }
-}
-
-fn extracted_first_row_pk_values(conjuncts: &[Expr]) -> Option<Vec<String>> {
-    let mut values: Option<Vec<String>> = None;
-    for conjunct in conjuncts {
-        let Expr::BinaryExpr(binary) = conjunct else {
-            continue;
-        };
-        if binary.op != Operator::Eq {
-            continue;
-        }
-        let extracted = [
-            (binary.left.as_ref(), binary.right.as_ref()),
-            (binary.right.as_ref(), binary.left.as_ref()),
-        ]
-        .into_iter()
-        .find_map(|(expression, expected)| {
-            let Expr::ScalarFunction(function) = strip_cast(expression) else {
-                return None;
-            };
-            if function.func.name() != "__lix_json_get_text" || function.args.len() != 2 {
-                return None;
-            }
-            let Expr::Column(column) = strip_cast(&function.args[0]) else {
-                return None;
-            };
-            if column.name != "lixcol_row_pk" {
-                return None;
-            }
-            let Expr::Literal(index, _) = strip_cast(&function.args[1]) else {
-                return None;
-            };
-            if index.to_string() != "0" {
-                return None;
-            }
-            let Expr::Literal(value, _) = strip_cast(expected) else {
-                return None;
-            };
-            value.try_as_str().flatten().map(str::to_string)
-        });
-        if let Some(value) = extracted {
-            match values.as_mut() {
-                None => values = Some(vec![value]),
-                Some(existing) => existing.retain(|existing| existing == &value),
-            }
-        }
-    }
-    values
-}
-
-fn strip_cast(mut expression: &Expr) -> &Expr {
-    while let Expr::Cast(cast) = expression {
-        expression = cast.expr.as_ref();
-    }
-    expression
 }
 
 fn optional_values(conjuncts: &[Expr], column: &'static str) -> Option<Vec<String>> {
@@ -1492,7 +1464,11 @@ fn side_column(name: &str) -> Option<(bool, &str)> {
         .or_else(|| name.strip_prefix("to_").map(|column| (true, column)))
 }
 
-fn diff_record_batch(schema: SchemaRef, rows: &[DiffSqlRow]) -> Result<RecordBatch> {
+fn diff_record_batch(
+    schema: SchemaRef,
+    rows: &[DiffSqlRow],
+    relation: &DiffRelation,
+) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         return RecordBatch::try_new_with_options(
             schema,
@@ -1504,20 +1480,18 @@ fn diff_record_batch(schema: SchemaRef, rows: &[DiffSqlRow]) -> Result<RecordBat
     let arrays = schema
         .fields()
         .iter()
-        .map(|field| diff_column_array(field, rows))
+        .map(|field| diff_column_array(field, rows, relation))
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(schema, arrays).map_err(DataFusionError::from)
 }
 
-fn diff_column_array(field: &Field, rows: &[DiffSqlRow]) -> Result<ArrayRef> {
+fn diff_column_array(field: &Field, rows: &[DiffSqlRow], relation: &DiffRelation) -> Result<ArrayRef> {
     match field.name().as_str() {
-        "lixcol_row_pk" => Ok(Arc::new(StringArray::from(
+        "row_ref" => Ok(Arc::new(StringArray::from(
             rows.iter()
-                .map(|row| {
-                    row.row_pk
-                        .as_json_array_text()
-                        .map_err(lix_error_to_datafusion_error)
-                })
+                .map(|row| crate::row_ref::encode(&relation.name, &row.row_pk)
+                    .map(|value| value.as_str().to_owned())
+                    .map_err(lix_error_to_datafusion_error))
                 .collect::<Result<Vec<_>>>()?,
         ))),
         "diff_type" => Ok(Arc::new(StringArray::from_iter_values(
@@ -1526,6 +1500,14 @@ fn diff_column_array(field: &Field, rows: &[DiffSqlRow]) -> Result<ArrayRef> {
         "row_count" => Ok(Arc::new(Int64Array::from_iter_values(
             rows.iter().map(|row| row.row_count),
         ))),
+        name if relation.primary_key_columns.iter().any(|column| column == name) => {
+            let component_index = relation
+                .primary_key_columns
+                .iter()
+                .position(|column| column == name)
+                .expect("the primary-key column guard found this column");
+            primary_key_array(field, rows, component_index)
+        }
         name => {
             let (after, column) = side_column(name).ok_or_else(|| {
                 DataFusionError::Execution(format!("unsupported diff column '{name}'"))
@@ -1544,6 +1526,64 @@ fn diff_column_array(field: &Field, rows: &[DiffSqlRow]) -> Result<ArrayRef> {
             values_array(field, &values)
         }
     }
+}
+
+/// Materializes a typed primary-key column from the stable diff identity.
+///
+/// A key is neither a before-side nor an after-side payload property: it is
+/// the identity joining those sides. Reading it from a snapshot made projected
+/// key-only diffs NULL for additions/removals because no side payload needed
+/// to be hydrated. The canonical RowPk is always present for every diff kind.
+fn primary_key_array(
+    field: &Field,
+    rows: &[DiffSqlRow],
+    component_index: usize,
+) -> Result<ArrayRef> {
+    match field.data_type() {
+        DataType::Utf8 => Ok(Arc::new(StringArray::from_iter_values(
+            rows.iter()
+                .map(|row| match row.row_pk.components.as_slice().get(component_index) {
+                    Some(RowPkComponent::Uuid(value)) => {
+                        Ok(uuid::Uuid::from_bytes(*value).to_string())
+                    }
+                    Some(RowPkComponent::String(value)) => Ok(value.to_string()),
+                    component => Err(primary_key_component_error(field, component)),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ))),
+        DataType::Int64 => Ok(Arc::new(Int64Array::from_iter_values(
+            rows.iter()
+                .map(|row| match row.row_pk.components.as_slice().get(component_index) {
+                    Some(RowPkComponent::Integer(value)) => Ok(*value),
+                    component => Err(primary_key_component_error(field, component)),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ))),
+        DataType::LargeBinary => {
+            let values = rows
+                .iter()
+                .map(|row| match row.row_pk.components.as_slice().get(component_index) {
+                    Some(RowPkComponent::Bytes(value)) => Ok(value.as_ref()),
+                    component => Err(primary_key_component_error(field, component)),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(LargeBinaryArray::from_iter_values(values)))
+        }
+        data_type => Err(DataFusionError::Execution(format!(
+            "lix_diff primary-key column '{}' has unsupported type {data_type}",
+            field.name()
+        ))),
+    }
+}
+
+fn primary_key_component_error(
+    field: &Field,
+    component: Option<&RowPkComponent>,
+) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "lix_diff primary-key column '{}' does not match canonical identity component {component:?}",
+        field.name()
+    ))
 }
 
 fn side_value(side: Option<&DiffSide>, column: &str) -> Result<Option<lix_schema::Value>> {
@@ -1679,16 +1719,15 @@ mod tests {
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
         assert_eq!(
-            &names[..6],
-            &[
-                "lixcol_row_pk",
-                "diff_type",
-                "from_key",
-                "to_key",
-                "from_value",
-                "to_value"
-            ]
+            &names[..5],
+            &["row_ref", "key", "diff_type", "from_value", "to_value"]
         );
+        assert!(field_is_row_ref(
+            relation.schema.field_with_name("row_ref").unwrap()
+        ));
+        assert!(!names.contains(&"lixcol_row_pk"));
+        assert!(!names.contains(&"from_key"));
+        assert!(!names.contains(&"to_key"));
         assert_eq!(names.last(), Some(&"row_count"));
         assert!(!names.contains(&"lixcol_diff_type"));
         assert!(!names.contains(&"lixcol_row_count"));
@@ -1744,12 +1783,12 @@ mod tests {
     }
 
     #[test]
-    fn relation_diff_pushes_file_id_without_filtering_content_row_primary_keys() {
+    fn relation_diff_pushes_typed_file_id_without_filtering_content_row_primary_keys() {
         let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_file")
             .expect("file relation is registered");
         let projection = Schema::empty();
         let route = DiffRoute::from_filters(
-            &[col("to_id").eq(lit("0193182b-2a72-7ed5-9015-76bf271af333"))],
+            &[col("id").eq(lit("0193182b-2a72-7ed5-9015-76bf271af333"))],
             &relation,
             &projection,
         );

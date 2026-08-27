@@ -2,6 +2,7 @@ mod bind;
 mod branch_ref;
 mod branch_scope;
 mod catalog;
+mod checkpoint_function;
 mod change_materialization;
 mod context;
 mod dialect;
@@ -51,6 +52,7 @@ pub(crate) use catalog::{
     PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec,
     derive_schema_surface_spec_from_schema, row_visible_fields,
 };
+pub(crate) use checkpoint_function::{CheckpointFunctionPlan, checkpoint_function_plan};
 pub(crate) use context::WriteContextLiveness;
 pub(crate) use context::{
     ChangelogQuerySource, DiffCommand, DiffCommandOutcome, DiffCommandSelection, HistoryQuerySource,
@@ -75,7 +77,7 @@ pub(crate) use exec::{
     execute_write_logical_plan_prepared_dml_batch, execute_write_logical_plan_result_with_metadata,
     execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
     prepare_path_value_replacement_program, prepare_path_value_replacement_row,
-    full_checkpoint_command, prepare_read_session, prepare_read_session_at_head, query_result_from_batches,
+    prepare_read_session, prepare_read_session_at_head, query_result_from_batches,
     query_values_from_batches, write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]
@@ -92,7 +94,7 @@ pub(crate) use exec::{
 pub(crate) use file_view::{
     SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,
 };
-pub(crate) use parse::parse_statement;
+pub(crate) use parse::{object_name_is_public_function, parse_statement};
 pub(crate) use plan::plan_write;
 pub(crate) use planning_cache::{
     CachedPhysicalRead, CachedReadPlan, CachedScanRequest, CachedUpdateLiteralShape,

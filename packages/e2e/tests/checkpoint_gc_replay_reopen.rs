@@ -103,12 +103,14 @@ async fn checkpoint_gc_retains_replay_and_selected_owners_after_reopen<S: Reopen
         assert_generation(&lix, 2, true).await;
 
         let compacted_owner = lix
-            .create_checkpoint()
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
             .expect("create compacting checkpoint")
-            .commit_id;
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("checkpoint commit id decodes");
         for _ in 1..CHECKPOINT_GC_INTERVAL {
-            lix.create_checkpoint()
+            lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
                 .await
                 .expect("advance production checkpoint-GC cadence");
         }

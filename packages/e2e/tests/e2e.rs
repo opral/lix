@@ -1749,7 +1749,7 @@ where
         .await
         .expect("main Markdown branch should reactivate");
     }
-    lix.create_checkpoint()
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("Markdown checkpoint should commit");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1882,7 +1882,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_runtime_stack_guard() {
         Some(expected.clone())
     );
     qualify_markdown_server_style_branch(&lix, &expected).await;
-    lix.create_checkpoint()
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("server-style SlateDB branch checkpoint");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1914,7 +1914,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_checkpoint_guard() {
     write_file(&lix, "/company/competitors.md", expected.clone())
         .await
         .expect("server-style SlateDB Markdown write");
-    lix.create_checkpoint()
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("server-style SlateDB Markdown checkpoint");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5525,7 +5525,13 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     )
     .await
     .unwrap();
-    let baseline_checkpoint = lix.create_checkpoint().await.unwrap();
+    let baseline_checkpoint = lix
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
     let selected_file_id = file_id_at_path(&lix, "/selected.csv").await;
     let remaining_file_id = file_id_at_path(&lix, "/remaining.csv").await;
 
@@ -5547,10 +5553,10 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
         .execute(
             "SELECT coalesce(sum(row_count), 0) AS count \
              FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-             WHERE lixcol_row_pk ->> 0 = $1",
+             WHERE id = $1",
             &[
                 Value::Text(selected_file_id.clone()),
-                Value::Text(baseline_checkpoint.commit_id),
+                Value::Text(baseline_checkpoint),
             ],
         )
         .await
@@ -5560,11 +5566,10 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
         .unwrap();
     assert!(selected_diff_count > 1, "CSV must fan out beyond lix_file");
     let selected_checkpoint = lix.execute(
-        "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-         SELECT 'lix_file', lixcol_row_pk \
+        "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+         SELECT row_ref \
          FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
-         WHERE lixcol_row_pk ->> 0 = $1 \
-         RETURNING commit_id",
+         WHERE id = $1))",
         &[Value::Text(selected_file_id.clone())],
     )
     .await
@@ -5574,7 +5579,7 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
         lix.execute(
             "SELECT COUNT(*) AS count \
              FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-             WHERE lixcol_row_pk ->> 0 = $1",
+             WHERE id = $1",
             &[
                 Value::Text(selected_file_id.clone()),
                 Value::Text(selected_checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
@@ -5591,7 +5596,7 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
         lix.execute(
             "SELECT COUNT(*) AS count \
              FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-             WHERE lixcol_row_pk ->> 0 = $1",
+             WHERE id = $1",
             &[
                 Value::Text(remaining_file_id),
                 Value::Text(selected_checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
@@ -6353,7 +6358,7 @@ where
 {
     let rows = lix
         .execute(
-            "SELECT lixcol_row_pk, id, order_key, cells FROM csv_row \
+            "SELECT id, order_key, cells FROM csv_row \
              WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.to_string())],
         )
@@ -6363,18 +6368,7 @@ where
         .rows()
         .iter()
         .map(|row| {
-            let row_pk = row
-                .get::<serde_json::Value>("lixcol_row_pk")
-                .unwrap()
-                .as_array()
-                .cloned()
-                .expect("csv_row row_pk must be an array");
             let id = row.get::<String>("id").unwrap();
-            assert_eq!(
-                row_pk,
-                vec![serde_json::Value::String(id.clone())],
-                "csv_row typed identity must equal its durable primary key"
-            );
             CsvV2Row {
                 id,
                 order_key: row.get::<String>("order_key").unwrap(),

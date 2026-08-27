@@ -19,10 +19,10 @@
       ]
     },
     {
-      "name": "row_pk",
-      "type": "jsonb",
-      "nullable": false,
-      "description": "Canonical JSON primary-key tuple for the row this change applies to, scoped by (`schema_key`, `file_id`). Values are ordered according to the target schema's `x-lix-primary-key`."
+      "name": "row_ref",
+      "type": "text",
+      "nullable": true,
+      "description": "Opaque reference to the public relation row this change applies to; NULL for private engine rows."
     },
     {
       "name": "file_id",

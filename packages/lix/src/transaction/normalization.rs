@@ -327,7 +327,10 @@ pub(crate) fn normalize_raw_write_row_in_place(
         let schema_key = rows.row(row_index).schema_key.clone();
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
-            format!("tombstone for schema '{}' requires row_pk", schema_key),
+            format!(
+                "tombstone for schema '{}' requires a primary-key identity",
+                schema_key
+            ),
         ));
     } else {
         None
@@ -581,7 +584,7 @@ fn resolve_row_pk(
             LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "write for schema '{}' requires row_pk because the schema has no primary_key",
+                    "write for schema '{}' requires an explicit primary-key identity because the schema has no primary_key",
                     row.schema_key
                 ),
             )
@@ -598,9 +601,7 @@ fn resolve_row_pk(
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "row_pk '{}' does not match primary_key-derived row_pk '{}' for schema '{}'",
-                    row_pk.as_json_array_text()?,
-                    derived.as_json_array_text()?,
+                    "the explicit identity does not match the primary-key columns for schema '{}'",
                     row.schema_key
                 ),
             ));
@@ -636,7 +637,7 @@ fn row_pk_derivation_error(
     LixError::new(
         LixError::CODE_SCHEMA_VALIDATION,
         format!(
-            "failed to derive row_pk for schema '{}': {detail}",
+            "failed to derive the primary-key identity for schema '{}': {detail}",
             row.schema_key
         ),
     )
@@ -883,7 +884,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("does not match primary_key-derived row_pk")
+                .contains("does not match the primary-key columns")
         );
     }
 

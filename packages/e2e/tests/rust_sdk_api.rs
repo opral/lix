@@ -53,7 +53,7 @@ async fn rs_sdk_telemetry_is_explicit_and_redacts_sql_literals() {
 }
 
 #[tokio::test]
-async fn rs_sdk_create_checkpoint_returns_the_new_active_head() {
+async fn rs_sdk_sql_checkpoint_returns_the_new_active_head() {
     let lix = open_lix().await.unwrap();
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-test', 'working')",
@@ -63,10 +63,16 @@ async fn rs_sdk_create_checkpoint_returns_the_new_active_head() {
     .unwrap();
     let before = active_head_commit_id(&lix).await;
 
-    let checkpoint = lix.create_checkpoint().await.unwrap();
+    let checkpoint = lix
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
 
-    assert_ne!(checkpoint.commit_id, before);
-    assert_eq!(checkpoint.commit_id, active_head_commit_id(&lix).await);
+    assert_ne!(checkpoint, before);
+    assert_eq!(checkpoint, active_head_commit_id(&lix).await);
     lix.close().await.unwrap();
 }
 

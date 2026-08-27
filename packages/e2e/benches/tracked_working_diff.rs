@@ -51,9 +51,9 @@ const DEFAULT_UNRELATED_HISTORY_WIDTH: usize = 1;
 const UNRELATED_HISTORY_STORAGE_BATCH: usize = 100_000;
 const INSERT_BATCH_SIZE: usize = 500;
 const MERGE_PREVIEW_SOURCE_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000901";
-const WORKING_DIFF_SQL: &str = "SELECT lixcol_row_pk, diff_type, row_count \
+const WORKING_DIFF_SQL: &str = "SELECT row_ref, key, diff_type, row_count \
     FROM lix_diff('working_diff_row', $1, lix_active_branch_commit_id()) \
-    ORDER BY lixcol_row_pk";
+    ORDER BY key";
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -418,9 +418,12 @@ async fn setup<StorageImpl>(
     let seed_elapsed = seed_start.elapsed();
     let initial_checkpoint_start = Instant::now();
     let initial_checkpoint = session
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
-        .expect("create tracked-working-diff initial checkpoint");
+        .expect("create tracked-working-diff initial checkpoint")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("checkpoint commit id decodes");
     let initial_checkpoint_elapsed = initial_checkpoint_start.elapsed();
 
     let writes_start = Instant::now();
@@ -458,7 +461,7 @@ async fn setup<StorageImpl>(
          base_commit_id={} head_commit_id={} seed_ms={:.3} initial_checkpoint_ms={:.3} writes_ms={:.3}",
         backend.name(),
         shape_name(shape),
-        initial_checkpoint.commit_id,
+        initial_checkpoint,
         head_commit_id,
         millis(seed_elapsed),
         millis(initial_checkpoint_elapsed),
@@ -594,7 +597,7 @@ where
     assert!(before > 0, "fixture has no populated working diffs");
     let start = Instant::now();
     session
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("checkpoint populated working-diff fixture");
     let elapsed = start.elapsed();
@@ -639,7 +642,7 @@ async fn measure_merge_preview<StorageImpl>(
     register_schema(&target).await;
     seed_rows(&target, row_count).await;
     target
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("checkpoint merge-preview base");
     target
@@ -739,7 +742,7 @@ async fn measure_merge_commit<StorageImpl>(
     register_schema(&target).await;
     seed_rows(&target, row_count).await;
     target
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("checkpoint merge-commit base");
 

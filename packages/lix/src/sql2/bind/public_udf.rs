@@ -56,6 +56,10 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
 
     match name {
         "current_timestamp" => expect_exact_arity(name, arity, 0),
+        "lix_row_ref" if arity >= 2 => Ok(()),
+        "lix_row_ref" => Err(invalid_param(
+            "lix_row_ref requires a relation and at least one primary-key value",
+        )),
         name if PUBLIC_SCALAR_FUNCTION_NAMES.contains(&name) => expect_exact_arity(name, arity, 0),
         _ => Ok(()),
     }

@@ -28,14 +28,14 @@ and authentication and forwards requests to it. See [Hosting](./hosting.md).
 
 | Group       | Paths                                                                                         |
 | :---------- | :-------------------------------------------------------------------------------------------- |
-| Handshake   | `/lix/v1/{lix_id}`, `/lix/v1/{lix_id}/session`                                                                  |
-| SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                                                    |
-| Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                                         |
-| Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert`, `/lix/v1/{lix_id}/file/upsert-batch`                            |
-| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,blob,chunk}`                                                 |
-| Versioning  | `/lix/v1/{lix_id}/branch/{create,switch}`, `/lix/v1/{lix_id}/checkpoint/create`, `/lix/v1/{lix_id}/undo`, `/lix/v1/{lix_id}/redo` |
-| Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                                                |
-| Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                                         |
+| Handshake   | `/lix/v1/{lix_id}`, `/lix/v1/{lix_id}/session`                                  |
+| SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                    |
+| Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                  |
+| Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`               |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,blob,chunk}`                          |
+| Versioning  | `/lix/v1/{lix_id}/branch/{create,switch}`, `/lix/v1/{lix_id}/{undo,redo}`       |
+| Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                |
+| Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                     |
 
 SDK users pass the complete stable locator `https://host/lix/{lix_id}`.
 `openLix()` rewrites that terminal locator to `/lix/v1/{lix_id}`, opens a
@@ -92,8 +92,11 @@ being embedded in commit JSON. Upload is one retryable loop: register the
 manifest, PUT only the returned missing chunks, then register the same manifest
 again. There is no separate presence request.
 
-Every commit member and snapshot row encodes `rowPk` losslessly as an ordered
-array of typed components. Each component is an object with `type` equal to
+Every commit member and snapshot row encodes its physical replication identity
+as `(schemaKey, fileId, rowPk)`. This is deliberately not the public SQL/SDK
+`lix_row_ref`: one logical file reference may aggregate several physical rows.
+The sync-only `rowPk` is an ordered array of typed components. Each component is
+an object with `type` equal to
 `uuid`, `integer`, `string`, or `bytes`; `value` is respectively a canonical
 UUID string, a JSON integer, a string, or a base64 string. For example:
 

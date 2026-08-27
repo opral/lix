@@ -32,7 +32,7 @@
     )
 )]
 
-pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 5;
+pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 6;
 
 // Let implementation modules use the same `lix::...` paths as external
 // consumers now that the former engine and SDK share one crate.
@@ -68,6 +68,7 @@ pub(crate) mod domain;
 mod engine;
 pub(crate) mod row_columnar;
 pub(crate) mod row_pk;
+pub(crate) mod row_ref;
 pub(crate) mod filesystem;
 pub(crate) mod functions;
 pub(crate) mod gc;
@@ -171,21 +172,22 @@ pub use lix_schema as schema_v1;
 
 pub use common::LixError;
 pub use common::{
-    Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, SharedStr, SqlQueryResult, Value,
+    Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, RowRef, SharedStr, SqlQueryResult,
+    Value,
 };
-pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
+pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, FileId};
 pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata_value, serialize_row_metadata};
 pub(crate) use prepared_dml::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 pub use session::{
-    CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, MergeBranchOptions,
+    CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
 pub use session::{
-    ExecuteBatchStatement, ExecuteResult, ObserveEvent, Row, RowRef, TryFromValue,
+    ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row, TryFromValue,
 };
 #[doc(hidden)]
 pub use session::CoherentReadBatch;

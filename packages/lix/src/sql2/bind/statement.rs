@@ -97,7 +97,7 @@ pub(super) fn bind_insert_bound(
     // implicit public column list is deliberately unsupported.
     let default_values = matches!(
         table.surface.kind,
-        PublicSurfaceKind::SchemaBase { .. } | PublicSurfaceKind::CreateCheckpoint
+        PublicSurfaceKind::SchemaBase { .. }
     )
         && insert.columns.is_empty()
         && insert.source.is_none();
@@ -313,7 +313,6 @@ fn bind_insert_returning(
         table.surface.kind,
         PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
-            | PublicSurfaceKind::CreateCheckpoint
             | PublicSurfaceKind::Restore
     ) {
         return bind_returning(table, Some(returning), params, "INSERT");
@@ -604,7 +603,7 @@ fn bind_insert_input(
     }
     if matches!(
         surface_kind,
-        PublicSurfaceKind::Revert | PublicSurfaceKind::Apply | PublicSurfaceKind::CreateCheckpoint
+        PublicSurfaceKind::Revert | PublicSurfaceKind::Apply
     ) && matches!(source.body.as_ref(), SetExpr::Values(_))
     {
         return Err(super::error::unsupported(
@@ -1354,12 +1353,10 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
             BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Revert)
         }
         PublicSurfaceKind::Apply => BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Apply),
-        PublicSurfaceKind::CreateCheckpoint => {
-            BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint)
-        }
         PublicSurfaceKind::Change
         | PublicSurfaceKind::HistoryFunction
         | PublicSurfaceKind::DiffFunction
+        | PublicSurfaceKind::CheckpointFunction
         | PublicSurfaceKind::StateAtFunction
         | PublicSurfaceKind::Restore
         | PublicSurfaceKind::CommitAncestryFunction => {
@@ -1584,7 +1581,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_row_insert_select() {
         let statement = parse_statement(
-            "INSERT INTO test_state_schema (lixcol_row_pk, value) SELECT '[\"a\"]'::jsonb, 'A'",
+            "INSERT INTO test_state_schema (value) SELECT 'A'",
         );
         let error = bind_statement(
             &statement,
@@ -1975,8 +1972,8 @@ mod tests {
     fn bind_statement_allows_only_commit_id_for_diff_command_insert_returning() {
         let bound = bind_statement(
             &parse_statement(
-                "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', CAST('[\"test\"]' AS JSONB) \
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT lix_row_ref('lix_key_value', 'test') \
                  RETURNING commit_id AS created_commit_id",
             ),
             &[],
@@ -1996,8 +1993,8 @@ mod tests {
         ));
 
         for sql in [
-            "INSERT INTO lix_revert (relation, row_pk) SELECT 'lix_key_value', CAST('[\"test\"]' AS JSONB) RETURNING row_pk",
-            "INSERT INTO lix_revert (relation, row_pk) SELECT 'lix_key_value', CAST('[\"test\"]' AS JSONB) RETURNING *",
+            "INSERT INTO lix_revert (row_ref) SELECT lix_row_ref('lix_key_value', 'test') RETURNING row_ref",
+            "INSERT INTO lix_revert (row_ref) SELECT lix_row_ref('lix_key_value', 'test') RETURNING *",
         ] {
             let error = bind_statement(&parse_statement(sql), &[], "branch1")
                 .expect_err("unsupported INSERT RETURNING shape should fail");

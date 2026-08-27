@@ -1,6 +1,6 @@
 use lix::telemetry::{CallbackTelemetrySink, SpanContext, TelemetrySink, instrument_remote_parent};
 use lix::{
-    CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt,
+    CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
     Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
@@ -258,7 +258,6 @@ type NativeTransactionDeferred = NativeDeferred<NativeLixTransaction>;
 type NativeLixDeferred = NativeDeferred<NativeLix>;
 type NativeStringDeferred = NativeDeferred<String>;
 type NativeCreateBranchDeferred = NativeDeferred<CreateBranchReceiptDto>;
-type NativeCreateCheckpointDeferred = NativeDeferred<CreateCheckpointReceiptDto>;
 type NativeUndoDeferred = NativeDeferred<UndoReceiptDto>;
 type NativeRedoDeferred = NativeDeferred<RedoReceiptDto>;
 type NativeSwitchBranchDeferred = NativeDeferred<SwitchBranchReceiptDto>;
@@ -295,7 +294,6 @@ enum LixCommand {
         options: RsCreateBranchOptions,
         deferred: NativeCreateBranchDeferred,
     },
-    CreateCheckpoint(NativeCreateCheckpointDeferred),
     Undo(NativeUndoDeferred),
     Redo(NativeRedoDeferred),
     SwitchBranch {
@@ -910,7 +908,6 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveAccountId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
-            LixCommand::CreateCheckpoint(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::Undo(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::Redo(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::SwitchBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
@@ -1013,12 +1010,6 @@ fn handle_lix_command(
         LixCommand::CreateBranch { options, deferred } => {
             let result =
                 block_on!(state.lix.create_branch(options)).map(CreateBranchReceiptDto::from);
-            settle_deferred(deferred, result);
-            false
-        }
-        LixCommand::CreateCheckpoint(deferred) => {
-            let result =
-                block_on!(state.lix.create_checkpoint()).map(CreateCheckpointReceiptDto::from);
             settle_deferred(deferred, result);
             false
         }
@@ -1259,9 +1250,6 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::CreateBranch { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
-        LixCommand::CreateCheckpoint(deferred) => {
-            settle_deferred(deferred, Err(lix_closed_error()));
-        }
         LixCommand::Undo(deferred) => settle_deferred(deferred, Err(lix_closed_error())),
         LixCommand::Redo(deferred) => settle_deferred(deferred, Err(lix_closed_error())),
         LixCommand::SwitchBranch { deferred, .. } => {
@@ -1408,13 +1396,6 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.create_branch(options).await,
             Self::FilesystemStorage(lix, _, _) => lix.create_branch(options).await,
-        }
-    }
-
-    async fn create_checkpoint(&self) -> std::result::Result<CreateCheckpointReceipt, LixError> {
-        match self {
-            Self::Memory(lix) => lix.create_checkpoint().await,
-            Self::FilesystemStorage(lix, _, _) => lix.create_checkpoint().await,
         }
     }
 
@@ -2072,15 +2053,6 @@ impl NativeLix {
         Ok(promise)
     }
 
-    #[napi(js_name = "createCheckpoint")]
-    pub fn create_checkpoint<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
-        let (deferred, promise): (NativeCreateCheckpointDeferred, Object<'env>) =
-            env.create_deferred()?;
-        self.actor
-            .send_with_deferred(deferred, LixCommand::CreateCheckpoint);
-        Ok(promise)
-    }
-
     #[napi(js_name = "undo")]
     pub fn undo<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
         let (deferred, promise): (NativeUndoDeferred, Object<'env>) = env.create_deferred()?;
@@ -2614,19 +2586,6 @@ impl From<CreateBranchReceipt> for CreateBranchReceiptDto {
 }
 
 #[napi(object)]
-pub struct CreateCheckpointReceiptDto {
-    pub commit_id: String,
-}
-
-impl From<CreateCheckpointReceipt> for CreateCheckpointReceiptDto {
-    fn from(receipt: CreateCheckpointReceipt) -> Self {
-        Self {
-            commit_id: receipt.commit_id,
-        }
-    }
-}
-
-#[napi(object)]
 pub struct UndoReceiptDto {
     pub branch_id: String,
     pub target_commit_id: String,
@@ -2797,8 +2756,7 @@ impl From<MergeChangeStats> for MergeChangeStatsDto {
 #[napi(object)]
 pub struct MergeConflictDto {
     pub kind: String,
-    pub schema_key: String,
-    pub row_pk: serde_json::Value,
+    pub row_ref: String,
     pub file_id: Option<String>,
     pub target: MergeConflictSideDto,
     pub source: MergeConflictSideDto,
@@ -2808,8 +2766,7 @@ impl From<MergeConflict> for MergeConflictDto {
     fn from(conflict: MergeConflict) -> Self {
         Self {
             kind: merge_conflict_kind_to_string(conflict.kind),
-            schema_key: conflict.schema_key,
-            row_pk: conflict.row_pk,
+            row_ref: conflict.row_ref.to_string(),
             file_id: conflict.file_id,
             target: conflict.target.into(),
             source: conflict.source.into(),
@@ -2903,6 +2860,18 @@ impl TryFrom<LixValue> for Value {
             "jsonb" => Ok(Self::Jsonb(
                 value.value.unwrap_or(serde_json::Value::Null).into(),
             )),
+            "row_ref" => {
+                let encoded = value
+                    .value
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "row_ref value must be a string",
+                        )
+                    })?;
+                Ok(Self::RowRef(lix::RowRef::from_encoded(encoded)?))
+            }
             "timestamptz" => {
                 let raw = value
                     .value
@@ -2981,6 +2950,11 @@ impl TryFrom<&Value> for LixValue {
                 value: Some(value.to_value()),
                 blob: None,
             }),
+            Value::RowRef(value) => Ok(Self {
+                kind: "row_ref".to_string(),
+                value: Some(serde_json::json!(value.as_str())),
+                blob: None,
+            }),
             Value::Timestamptz(value) => {
                 let value = chrono::DateTime::from_timestamp_micros(*value).ok_or_else(|| {
                     LixError::new("LIX_ERROR_JS_SDK_NATIVE", "timestamptz is out of range")
@@ -3027,6 +3001,7 @@ fn result_column_type_name(column_type: lix::ResultColumnType) -> &'static str {
         lix::ResultColumnType::Real => "real",
         lix::ResultColumnType::Text => "text",
         lix::ResultColumnType::Jsonb => "jsonb",
+        lix::ResultColumnType::RowRef => "row_ref",
         lix::ResultColumnType::Timestamptz => "timestamptz",
         lix::ResultColumnType::Blob => "blob",
     }

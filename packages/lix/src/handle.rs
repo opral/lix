@@ -2,7 +2,7 @@ use lix::plugin::runtime::WasmRuntime;
 use lix::storage::{Storage, StorageSession};
 use lix::telemetry::TelemetrySink;
 use lix::{
-    Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteBatchStatement,
+    Blob, CreateBranchOptions, CreateBranchReceipt, ExecuteBatchStatement,
     ExecuteIdempotency, ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, LixError,
     Memory, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     ObserveEvent, RedoReceipt, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
@@ -1304,7 +1304,11 @@ where
             .await
     }
 
-    pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
+    /// Crate-internal test/support sugar. Public callers use the canonical SQL
+    /// `lix_create_checkpoint(...)` function.
+    pub(crate) async fn create_checkpoint(
+        &self,
+    ) -> Result<crate::session::CreateCheckpointReceipt, LixError> {
         self.session.create_checkpoint().await
     }
 

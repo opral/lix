@@ -92,8 +92,7 @@ pub struct MergeBranchPreview {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeConflict {
     pub kind: MergeConflictKind,
-    pub schema_key: String,
-    pub row_pk: JsonValue,
+    pub row_ref: crate::RowRef,
     pub file_id: Option<String>,
     pub target: MergeConflictSide,
     pub source: MergeConflictSide,
@@ -2014,8 +2013,14 @@ fn merge_conflict_from_analysis(
         kind: match conflict.kind() {
             AnalysisMergeConflictKind::SameRowChanged => MergeConflictKind::SameRowChanged,
         },
-        schema_key: conflict.schema_key().to_owned(),
-        row_pk: conflict.row_pk().as_json_array_value()?,
+        row_ref: crate::row_ref::encode(
+            match conflict.schema_key() {
+                FILE_DESCRIPTOR_SCHEMA_KEY => "lix_file",
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY => "lix_directory",
+                relation => relation,
+            },
+            conflict.row_pk(),
+        )?,
         file_id: conflict.file_id().map(str::to_owned),
         target: merge_conflict_side_from_analysis(conflict.target()),
         source: merge_conflict_side_from_analysis(conflict.source()),

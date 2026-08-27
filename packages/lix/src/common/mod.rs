@@ -16,7 +16,7 @@ pub(crate) use exact_batch::{ExactBatch, ExactValue};
 pub use execution_metadata::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
 #[cfg(feature = "server-protocol")]
 pub(crate) use execution_metadata::VerifiedRequestBlob;
-pub use identity::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
+pub use identity::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, FileId};
 pub(crate) use identity::{json_pointer_get, validate_non_empty_identity_value};
 pub(crate) use json_pointer::format_json_pointer;
 #[cfg(test)]
@@ -32,7 +32,8 @@ pub(crate) use string_dictionary::{
 };
 pub(crate) use timestamp::LixTimestamp;
 pub use types::{
-    Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, SharedStr, SqlQueryResult, Value,
+    Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, RowRef, SharedStr, SqlQueryResult,
+    Value,
 };
 pub use wire::{WireQueryResult, WireValue};
 

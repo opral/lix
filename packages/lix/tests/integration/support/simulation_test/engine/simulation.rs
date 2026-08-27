@@ -1,11 +1,12 @@
 use lix::storage::Memory;
 use lix::{
-    CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteResult,
+    CreateBranchOptions, CreateBranchReceipt, ExecuteResult,
     MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
 use lix::{LixError, Value};
 use lix::{engine::Engine, init::InitReceipt, session::SessionContext};
+use lix::session::CreateCheckpointReceipt;
 
 use super::expect_same::SimulationAssertions;
 use super::mode::{SimulationMode, SimulationOptions};

@@ -219,19 +219,41 @@ simulation_test!(state_at_matches_live_columns_and_unchanged_row_metadata, |sim|
         .await
         .expect("unrelated row should insert");
 
+    let columns = "key, value, lixcol_schema_key, lixcol_file_id, lixcol_metadata, \
+                   lixcol_created_at, lixcol_updated_at, lixcol_global, lixcol_change_id, \
+                   lixcol_commit_id, lixcol_untracked";
     let live = session
-        .execute("SELECT * FROM lix_key_value WHERE key = 'stable'", &[])
+        .execute(
+            &format!("SELECT {columns} FROM lix_key_value WHERE key = 'stable'"),
+            &[],
+        )
         .await
         .expect("live row should load");
     let historical = session
         .execute(
-            "SELECT * FROM lix_state_at('lix_key_value', $1) WHERE key = 'stable'",
+            &format!(
+                "SELECT {columns} FROM lix_state_at('lix_key_value', $1) WHERE key = 'stable'"
+            ),
             &[Value::Text(commit_id.clone())],
         )
         .await
         .expect("historical row should load");
     assert_eq!(historical.columns(), live.columns());
     assert_eq!(historical.rows(), live.rows());
+    let historical_star = session
+        .execute(
+            "SELECT * FROM lix_state_at('lix_key_value', $1) WHERE key = 'stable'",
+            &[Value::Text(commit_id.clone())],
+        )
+        .await
+        .expect("historical wildcard should load");
+    assert!(
+        historical_star
+            .columns()
+            .iter()
+            .all(|column| column != "lixcol_row_pk"),
+        "lix_state_at must not expose the durable JSON row key"
+    );
 });
 
 simulation_test!(state_at_omits_deleted_and_untracked_rows, |sim| async move {
@@ -390,7 +412,7 @@ simulation_test!(state_at_branch_scope_is_session_independent, |sim| async move 
         .execute(
             "SELECT to_lixcol_global \
              FROM lix_diff('lix_key_value', $1, $2) \
-             WHERE to_key = 'composed'",
+             WHERE key = 'composed'",
             &[
                 Value::Text(global_before_id.clone()),
                 Value::Text(global_commit_id.clone()),
@@ -562,14 +584,14 @@ simulation_test!(state_at_branch_scopes_compose_with_local_shadow_history, |sim|
     let composed = local
         .execute(
             "WITH ranked_local_history AS ( \
-                 SELECT lixcol_row_pk, lixcol_file_id, \
+                 SELECT key, lixcol_file_id, \
                         row_number() OVER ( \
-                            PARTITION BY lixcol_row_pk, lixcol_file_id \
+                            PARTITION BY key, lixcol_file_id \
                             ORDER BY lixcol_depth, lixcol_observed_commit_id, lixcol_change_id \
                         ) AS rn \
                  FROM lix_history('lix_key_value', $1) \
              ), local_shadow AS ( \
-                 SELECT lixcol_row_pk, lixcol_file_id \
+                 SELECT key, lixcol_file_id \
                  FROM ranked_local_history WHERE rn = 1 \
              ), local_state AS ( \
                  SELECT * FROM lix_state_at('lix_key_value', $1) \
@@ -584,7 +606,7 @@ simulation_test!(state_at_branch_scopes_compose_with_local_shadow_history, |sim|
              FROM global_state \
              WHERE NOT EXISTS ( \
                  SELECT 1 FROM local_shadow \
-                 WHERE local_shadow.lixcol_row_pk = global_state.lixcol_row_pk \
+                 WHERE local_shadow.key = global_state.key \
                    AND local_shadow.lixcol_file_id \
                        IS NOT DISTINCT FROM global_state.lixcol_file_id \
              ) \
@@ -676,11 +698,11 @@ simulation_test!(state_at_branch_scopes_compose_with_local_shadow_history, |sim|
     assert_ne!(refreshed_head_id, local_commit_id);
     let effective_diff = local
         .execute(
-            "SELECT to_key, diff_type, to_lixcol_global \
+            "SELECT key, diff_type, to_lixcol_global \
              FROM lix_diff('lix_key_value', $1, $2) \
-             WHERE COALESCE(to_key, from_key) IN \
+             WHERE key IN \
                  ('global-only', 'later-global', 'overridden', 'suppressed') \
-             ORDER BY COALESCE(to_key, from_key)",
+             ORDER BY key",
             &[
                 Value::Text(local_commit_id.clone()),
                 Value::Text(refreshed_head_id.clone()),
@@ -908,9 +930,9 @@ simulation_test!(local_collection_replacement_fences_the_global_base, |sim| asyn
     );
     let hidden_base_diff = local
         .execute(
-            "SELECT COALESCE(to_key, from_key) \
+            "SELECT key \
              FROM lix_diff('lix_key_value', $1, $2) \
-             WHERE COALESCE(to_key, from_key) = 'retired-global'",
+             WHERE key = 'retired-global'",
             &[Value::Text(before.clone()), Value::Text(head.clone())],
         )
         .await

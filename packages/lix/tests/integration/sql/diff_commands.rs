@@ -1,5 +1,4 @@
 use lix::{LixError, Value};
-use serde_json::json;
 
 use super::select_rows;
 
@@ -32,7 +31,7 @@ simulation_test!(
         let working = select_rows(
             &session,
             &format!(
-                "SELECT lixcol_row_pk, diff_type FROM lix_diff('lix_key_value', '{baseline}', '{original_head}') ORDER BY lixcol_row_pk"
+                "SELECT key, diff_type FROM lix_diff('lix_key_value', '{baseline}', '{original_head}') ORDER BY key"
             ),
         )
         .await;
@@ -47,12 +46,12 @@ simulation_test!(
 
         let reverted = session
             .execute(
-                "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk \
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref \
                  FROM lix_diff(\
                    'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
                  ) \
-                 WHERE lixcol_row_pk ->> 0 IN ('a', 'b') \
+                 WHERE key IN ('a', 'b') \
                  RETURNING commit_id",
                 &[],
             )
@@ -72,10 +71,10 @@ simulation_test!(
 
         let applied = session
             .execute(
-                "INSERT INTO lix_apply (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk \
+                "INSERT INTO lix_apply (row_ref) \
+                 SELECT row_ref \
                  FROM lix_diff('lix_key_value', lix_root_commit_id(), $1) \
-                 WHERE lixcol_row_pk ->> 0 IN ('a', 'b') \
+                 WHERE key IN ('a', 'b') \
                  RETURNING commit_id",
                 &[Value::Text(original_head)],
             )
@@ -87,18 +86,16 @@ simulation_test!(
 
         let checkpointed = session
             .execute(
-                "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk \
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+                 SELECT row_ref \
                  FROM lix_diff(\
                    'lix_key_value', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()\
                  ) \
-                 WHERE lixcol_row_pk = CAST('[\"a\"]' AS JSONB) \
-                 RETURNING commit_id",
+                 WHERE key = 'a'))",
                 &[],
             )
             .await
             .expect("partial relation-row checkpoint should succeed");
-        assert_eq!(checkpointed.rows_affected(), 1);
         let checkpoint_commit_id = match checkpointed.get(&checkpointed.rows()[0], "commit_id") {
             Some(Value::Text(commit_id)) => commit_id.clone(),
             value => panic!("checkpoint RETURNING should contain a commit ID, got {value:?}"),
@@ -114,17 +111,17 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_row_pk FROM lix_diff('lix_key_value', '{checkpoint_commit_id}', '{child_head}')"
+                    "SELECT key FROM lix_diff('lix_key_value', '{checkpoint_commit_id}', '{child_head}')"
                 ),
             )
             .await,
-            vec![vec![Value::Jsonb(json!(["b"]).into())]]
+            vec![vec![Value::Text("b".to_string())]]
         );
 
         let empty = session
             .execute(
-                "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk \
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref \
                  FROM lix_diff('lix_key_value', $1, $2) WHERE 1 = 0 \
                  RETURNING commit_id",
                 &[
@@ -148,10 +145,10 @@ simulation_test!(
 
         let duplicate = session
             .execute(
-                "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT relation, CAST(row_pk AS JSONB) FROM \
-                 (VALUES ('lix_key_value', '[\"b\"]'), ('lix_key_value', '[\"b\"]')) \
-                 AS selected(relation, row_pk)",
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT lix_row_ref('lix_key_value', 'b') \
+                 UNION ALL \
+                 SELECT lix_row_ref('lix_key_value', 'b')",
                 &[],
             )
             .await
@@ -197,8 +194,8 @@ simulation_test!(
 
         let reverted = session
             .execute(
-                "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk \
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref \
                  FROM lix_diff(\
                    'lix_key_value', \
                    lix_latest_checkpoint_commit_id(), \
@@ -222,8 +219,8 @@ simulation_test!(
 
         let applied = session
             .execute(
-                "INSERT INTO lix_apply (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk \
+                "INSERT INTO lix_apply (row_ref) \
+                 SELECT row_ref \
                  FROM lix_diff(\
                    'lix_key_value', \
                    lix_latest_checkpoint_commit_id(), \
@@ -268,12 +265,11 @@ simulation_test!(
             .expect("first insert should succeed");
         let first = session
             .execute(
-                "INSERT INTO lix_create_checkpoint DEFAULT VALUES RETURNING commit_id",
+                "SELECT commit_id FROM lix_create_checkpoint()",
                 &[],
             )
             .await
             .expect("full metadata-only SQL checkpoint should succeed");
-        assert_eq!(first.rows_affected(), 1);
         assert_eq!(first.columns(), &["commit_id"]);
 
         session
@@ -282,7 +278,7 @@ simulation_test!(
             .expect("delete should succeed");
         let deleted_checkpoint = session
             .execute(
-                "INSERT INTO lix_create_checkpoint DEFAULT VALUES RETURNING commit_id",
+                "SELECT commit_id FROM lix_create_checkpoint()",
                 &[],
             )
             .await
@@ -310,7 +306,7 @@ simulation_test!(
                 &session,
                 &format!(
                     "SELECT diff_type FROM lix_diff('lix_key_value', '{checkpoint_id}', '{head}') \
-                     WHERE lixcol_row_pk = CAST('[\"recycled\"]' AS JSONB)"
+                     WHERE key = 'recycled'"
                 ),
             )
             .await,
@@ -319,8 +315,8 @@ simulation_test!(
 
         let reverted = session
             .execute(
-                "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', CAST('[\"recycled\"]' AS JSONB) \
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT lix_row_ref('lix_key_value', 'recycled') \
                  RETURNING commit_id",
                 &[],
             )
@@ -365,17 +361,15 @@ simulation_test!(
 
         let checkpointed = session
             .execute(
-                "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk \
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+                 SELECT row_ref \
                  FROM lix_diff('lix_key_value', $1, $2) \
-                 WHERE lixcol_row_pk ->> 0 IN ('a', 'b', 'c') \
-                 RETURNING commit_id",
+                 WHERE key IN ('a', 'b', 'c')))",
                 &[Value::Text(baseline), Value::Text(head)],
             )
             .await
             .expect("multi-selection checkpoint should succeed");
 
-        assert_eq!(checkpointed.rows_affected(), 3);
         assert_eq!(checkpointed.columns(), &["commit_id"]);
         assert_eq!(
             checkpointed.rows().len(),
@@ -427,14 +421,13 @@ simulation_test!(
             .to_string();
         let checkpoint = session
             .execute(
-                "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_file', lixcol_row_pk FROM lix_diff('lix_file', $1, $2) \
-                 WHERE to_path = '/docs/nested/readme.txt' RETURNING commit_id",
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+                 SELECT row_ref FROM lix_diff('lix_file', $1, $2) \
+                 WHERE to_path = '/docs/nested/readme.txt'))",
                 &[Value::Text(baseline), Value::Text(head)],
             )
             .await
             .expect("file selection must include its changed parent-directory descriptors");
-        assert_eq!(checkpoint.rows_affected(), 1);
         assert_eq!(
             select_rows(
                 &session,
@@ -463,6 +456,168 @@ simulation_test!(
             .await,
             vec![vec![Value::Text("/unrelated".to_string())]],
             "an unrelated changed directory must remain outside a selected file checkpoint",
+        );
+    }
+);
+
+simulation_test!(
+    scoped_file_revert_restores_removed_parent_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        let directory_id = "01950000-0000-7000-8000-000000000001";
+        let file_id = "01950000-0000-7000-8000-000000000002";
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ($1, '/docs')",
+                &[Value::Text(directory_id.to_owned())],
+            )
+            .await
+            .expect("parent directory should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ($1, '/docs/a.md', CAST('hello' AS BYTEA))",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("child file should insert");
+        session
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("baseline checkpoint should succeed");
+
+        session
+            .execute(
+                "DELETE FROM lix_directory WHERE id = $1",
+                &[Value::Text(directory_id.to_owned())],
+            )
+            .await
+            .expect("recursive directory delete should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1 \
+                 RETURNING commit_id",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("file revert should close over its removed parent directory");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path FROM lix_directory WHERE id = '01950000-0000-7000-8000-000000000001'",
+            )
+            .await,
+            vec![vec![Value::Text("/docs".to_owned())]],
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path FROM lix_file WHERE id = '01950000-0000-7000-8000-000000000002'",
+            )
+            .await,
+            vec![vec![Value::Text("/docs/a.md".to_owned())]],
+        );
+    }
+);
+
+simulation_test!(
+    scoped_file_apply_creates_changed_parent_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        let baseline = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("baseline head should load")
+            .expect("baseline head should exist")
+            .to_string();
+        let directory_id = "01950000-0000-7000-8000-000000000011";
+        let file_id = "01950000-0000-7000-8000-000000000012";
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ($1, '/apply-docs')",
+                &[Value::Text(directory_id.to_owned())],
+            )
+            .await
+            .expect("parent directory should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ($1, '/apply-docs/a.md', CAST('hello' AS BYTEA))",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("child file should insert");
+        let target = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("target head should load")
+            .expect("target head should exist")
+            .to_string();
+
+        session
+            .execute(
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("precondition revert should remove the file");
+        session
+            .execute(
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref FROM lix_diff('lix_directory') WHERE id = $1",
+                &[Value::Text(directory_id.to_owned())],
+            )
+            .await
+            .expect("precondition revert should remove the parent directory");
+        assert!(
+            select_rows(
+                &session,
+                "SELECT id FROM lix_directory WHERE id = '01950000-0000-7000-8000-000000000011'",
+            )
+            .await
+            .is_empty(),
+            "the apply dependency must actually be absent before the command",
+        );
+        session
+            .execute(
+                "INSERT INTO lix_apply (row_ref) \
+                 SELECT row_ref FROM lix_diff('lix_file', $1, $2) WHERE id = $3 \
+                 RETURNING commit_id",
+                &[
+                    Value::Text(baseline),
+                    Value::Text(target),
+                    Value::Text(file_id.to_owned()),
+                ],
+            )
+            .await
+            .expect("file apply should close over its changed parent directory");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path FROM lix_directory WHERE id = '01950000-0000-7000-8000-000000000011'",
+            )
+            .await,
+            vec![vec![Value::Text("/apply-docs".to_owned())]],
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path FROM lix_file WHERE id = '01950000-0000-7000-8000-000000000012'",
+            )
+            .await,
+            vec![vec![Value::Text("/apply-docs/a.md".to_owned())]],
         );
     }
 );

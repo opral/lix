@@ -82,36 +82,6 @@ simulation_test!(timestamptz_is_native_and_current_timestamp_is_stable, |sim| as
     assert_eq!(row.rows()[0].values()[1], row.rows()[0].values()[2]);
 });
 
-simulation_test!(jsonb_identity_write_filters_use_one_canonicalizer, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
-    let schema = serde_json::json!({
-        "$schema": "https://lix.dev/schema-v1.json",
-        "key": "jsonb_identity_probe",
-        "columns": [
-            {"name": "id", "type": "int8", "nullable": false},
-            {"name": "value", "type": "text", "nullable": false}
-        ],
-        "primary_key": ["id"]
-    });
-    session.execute(
-        "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1, CAST($2 AS JSONB))",
-        &[Value::Text("jsonb_identity_probe".into()), Value::Text(schema.to_string())],
-    ).await.unwrap();
-    session.execute(
-        "INSERT INTO jsonb_identity_probe (id, value) VALUES (42, 'before')",
-        &[],
-    ).await.unwrap();
-
-    for spelling in ["[ 42 ]", "[42.0]", "[4.2e1]"] {
-        let result = session.execute(
-            "UPDATE jsonb_identity_probe SET value = 'after' WHERE lixcol_row_pk = $1",
-            &[Value::Text(spelling.into())],
-        ).await.unwrap();
-        assert_eq!(result.rows_affected(), 1, "identity spelling {spelling}");
-    }
-});
-
 simulation_test!(text_primary_keys_reject_jsonb_nul, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
@@ -223,7 +193,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "SELECT row_pk FROM lix_change WHERE row_pk = 'state-latest'",
+                "SELECT snapshot_content FROM lix_change WHERE snapshot_content = 'state-latest'",
                 &[],
             )
             .await
@@ -234,56 +204,6 @@ simulation_test!(
             error.hint().is_some_and(|hint| hint.contains("::jsonb")),
             "expected PostgreSQL JSONB hint: {error}"
         );
-    }
-);
-
-simulation_test!(
-    json_identity_read_predicates_reject_parseable_bare_text_literals,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        for sql in [
-            "SELECT row_pk FROM lix_change WHERE row_pk = '[ \"state-latest\" ]'",
-            "SELECT id FROM lix_file WHERE lixcol_row_pk = '[ \"file-readme\" ]'",
-            "SELECT id FROM lix_directory WHERE lixcol_row_pk = '[ \"directory-root\" ]'",
-        ] {
-            let error = session
-                .execute(sql, &[])
-                .await
-                .expect_err("read predicates should not silently compare raw identity JSON text");
-
-            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-            assert!(
-                error.hint().is_some_and(|hint| hint.contains("::jsonb")),
-                "expected PostgreSQL JSONB hint: {error}"
-            );
-        }
-
-        for sql in [
-            "SELECT row_pk FROM lix_change WHERE row_pk = $1",
-            "SELECT id FROM lix_file WHERE lixcol_row_pk = $1",
-            "SELECT id FROM lix_directory WHERE lixcol_row_pk = $1",
-        ] {
-            let error = session
-                .execute(sql, &[Value::Text("[\"state-latest\"]".to_string())])
-                .await
-                .expect_err("read predicates should reject bare text identity JSON parameters");
-
-            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-            assert!(
-                error
-                    .hint()
-                    .is_some_and(|hint| hint.contains("JSON parameter")),
-                "expected JSON parameter hint: {error}"
-            );
-        }
     }
 );
 
@@ -301,7 +221,8 @@ simulation_test!(
 
         session
             .execute(
-                "SELECT row_pk FROM lix_change WHERE row_pk = CAST('[\"state-latest\"]' AS JSONB)",
+                "SELECT snapshot_content FROM lix_change \
+                 WHERE snapshot_content = CAST('[\"state-latest\"]' AS JSONB)",
                 &[],
             )
             .await
@@ -365,42 +286,5 @@ simulation_test!(
             result,
             vec![vec![Value::Text("json-predicate-1".to_string())]],
         );
-    }
-);
-
-simulation_test!(
-    registered_schema_dml_rejects_bare_lixcol_row_pk_text,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-
-        let error = session
-            .execute(
-                "UPDATE lix_registered_schema \
-                 SET value = CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_schema_update_history\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB) \
-                 WHERE lixcol_row_pk = 'engine_schema_update_history'",
-                &[],
-            )
-            .await
-            .expect_err("bare text lixcol_row_pk update should fail before matching rows");
-
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-
-        let error = session
-            .execute(
-                "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = 'engine_schema_update_history'",
-                &[],
-            )
-            .await
-            .expect_err("bare text lixcol_row_pk delete should fail before matching rows");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
     }
 );

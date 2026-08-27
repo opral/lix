@@ -7180,8 +7180,8 @@ where
                         return Err(LixError::new(
                             LixError::CODE_UNIQUE,
                             format!(
-                                "cannot insert untracked row in schema '{}' row_pk {:?}: a tracked row with this identity exists in canonical history; retention is immutable for an identity",
-                                key.schema_key, key.row_pk,
+                                "cannot insert untracked row in schema '{}': a tracked row with the same primary key exists in canonical history; retention is immutable for an identity",
+                                key.schema_key,
                             ),
                         ));
                     }

@@ -335,7 +335,7 @@ mod tests {
             history
                 .columns
                 .iter()
-                .any(|column| { column.name == "lixcol_row_pk" && column.is_public() })
+                .any(|column| { column.name == "lixcol_row_ref" && column.is_public() })
         );
         assert!(
             !history

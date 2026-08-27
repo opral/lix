@@ -73,6 +73,7 @@ fn value_to_text(value: &Value) -> String {
         Value::Real(v) => v.to_string(),
         Value::Text(v) => v.clone(),
         Value::Jsonb(v) => v.to_string(),
+        Value::RowRef(v) => v.as_str().to_string(),
         Value::Timestamptz(v) => timestamp_text(*v),
         Value::Blob(bytes) => bytes_to_hex(bytes),
     }
@@ -88,6 +89,7 @@ fn value_to_json(value: &Value) -> JsonValue {
             .unwrap_or(JsonValue::Null),
         Value::Text(v) => JsonValue::String(v.clone()),
         Value::Jsonb(v) => v.to_value(),
+        Value::RowRef(v) => JsonValue::String(v.as_str().to_string()),
         Value::Timestamptz(v) => JsonValue::String(timestamp_text(*v)),
         Value::Blob(bytes) => serde_json::json!({
             "$blob": base64::engine::general_purpose::STANDARD.encode(bytes),

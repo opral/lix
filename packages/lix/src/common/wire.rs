@@ -11,6 +11,8 @@ pub enum WireValue {
     Float { value: f64 },
     Text { value: String },
     Jsonb { value: Json },
+    #[serde(rename = "row_ref")]
+    RowRef { value: String },
     Timestamptz { value: String },
     Blob { base64: String },
 }
@@ -49,6 +51,9 @@ impl WireValue {
             Value::Jsonb(value) => Ok(Self::Jsonb {
                 value: value.clone(),
             }),
+            Value::RowRef(value) => Ok(Self::RowRef {
+                value: value.as_str().to_owned(),
+            }),
             Value::Timestamptz(value) => Ok(Self::Timestamptz {
                 value: format_timestamptz(*value)?,
             }),
@@ -77,6 +82,8 @@ impl WireValue {
             }
             Self::Text { value } => Ok(Value::Text(value)),
             Self::Jsonb { value } => Ok(Value::Jsonb(value)),
+            Self::RowRef { value } => crate::row_ref::decode_str(&value)
+                .map(|_| Value::RowRef(crate::RowRef(value))),
             Self::Timestamptz { value } => parse_timestamptz(&value).map(Value::Timestamptz),
             Self::Blob { base64 } => {
                 let decoded = base64::engine::general_purpose::STANDARD
@@ -163,6 +170,10 @@ mod tests {
             Value::Real(1.5),
             Value::Text("hello".to_string()),
             Value::Jsonb(json!({"hello": "world"}).into()),
+            Value::RowRef(
+                crate::row_ref::encode("lix_key_value", &crate::row_pk::RowPk::single("hello"))
+                    .expect("test row reference should encode"),
+            ),
             Value::Timestamptz(1_700_000_000_000_000),
             Value::Blob(vec![1, 2, 3].into()),
         ];
@@ -221,6 +232,10 @@ mod tests {
                 WireValue::Jsonb {
                     value: json!({"hello": "world"}).into(),
                 },
+                WireValue::RowRef {
+                    value: "lix_row_ref:v1:AAAADWxpeF9rZXlfdmFsdWUAAQMAAAAFaGVsbG8"
+                        .to_string(),
+                },
                 WireValue::Timestamptz {
                     value: "2023-11-14T22:13:20.000000Z".to_string(),
                 },
@@ -241,6 +256,7 @@ mod tests {
         assert!(serialized.contains("\"kind\":\"float\""));
         assert!(serialized.contains("\"kind\":\"text\""));
         assert!(serialized.contains("\"kind\":\"jsonb\""));
+        assert!(serialized.contains("\"kind\":\"row_ref\""));
         assert!(serialized.contains("\"kind\":\"timestamptz\""));
         assert!(serialized.contains("\"kind\":\"blob\""));
         assert!(!serialized.contains("\"kind\":\"Null\""));

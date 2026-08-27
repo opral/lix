@@ -470,8 +470,8 @@ async fn try_execute_row_insert_batch(
                 LixError::new(
                     LixError::CODE_UNIQUE,
                     format!(
-                        "cannot insert {requested} row for schema '{}' row_pk {:?}: a canonical {existing} row already exists; delete it first",
-                        row.schema_key, row_pk,
+                        "cannot insert {requested} row for schema '{}': a canonical {existing} row with the same primary key already exists; delete it first",
+                        row.schema_key,
                     ),
                 )
             } else {
@@ -3534,6 +3534,7 @@ fn returning_column_types(
                         Value::Real(_) => crate::ResultColumnType::Real,
                         Value::Text(_) => crate::ResultColumnType::Text,
                         Value::Jsonb(_) => crate::ResultColumnType::Jsonb,
+                        Value::RowRef(_) => crate::ResultColumnType::RowRef,
                         Value::Timestamptz(_) => crate::ResultColumnType::Timestamptz,
                         Value::Blob(_) => crate::ResultColumnType::Blob,
                     })
@@ -3617,6 +3618,7 @@ fn returning_expr_column_type(
                 Value::Real(_) => crate::ResultColumnType::Real,
                 Value::Text(_) => crate::ResultColumnType::Text,
                 Value::Jsonb(_) => crate::ResultColumnType::Jsonb,
+                Value::RowRef(_) => crate::ResultColumnType::RowRef,
                 Value::Timestamptz(_) => crate::ResultColumnType::Timestamptz,
                 Value::Blob(_) => crate::ResultColumnType::Blob,
             }),
@@ -5480,7 +5482,7 @@ fn certified_row_insert_rows<'a>(
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "INSERT into {} has lixcol_row_pk that does not match its public primary-key columns",
+                        "INSERT into {} has an internal identity that does not match its public primary-key columns",
                         layout.schema_key
                     ),
                 ));
@@ -5764,7 +5766,7 @@ fn append_row_insert_row(
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "INSERT into {} has lixcol_row_pk that does not match its public primary-key columns",
+                    "INSERT into {} has an internal identity that does not match its public primary-key columns",
                     layout.schema_key
                 ),
             ));
@@ -5817,7 +5819,7 @@ fn append_row_insert_row(
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "INSERT into {} has lixcol_row_pk that does not match its public primary-key columns",
+                    "INSERT into {} has an internal identity that does not match its public primary-key columns",
                     layout.schema_key
                 ),
             ));
@@ -7485,6 +7487,7 @@ fn value_json(value: &Value) -> JsonValue {
             .unwrap_or(JsonValue::Null),
         Value::Text(value) => JsonValue::String(value.clone()),
         Value::Jsonb(value) => value.to_value(),
+        Value::RowRef(value) => JsonValue::String(value.as_str().to_owned()),
         Value::Timestamptz(value) => JsonValue::from(*value),
         Value::Blob(value) => {
             JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())

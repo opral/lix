@@ -970,7 +970,7 @@ simulation_test!(
         assert!(
             error
                 .message
-                .contains("a canonical untracked row already exists; delete it first"),
+                .contains("a canonical untracked row with the same primary key already exists; delete it first"),
             "durability collision should have a targeted error: {error:?}"
         );
 

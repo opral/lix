@@ -369,15 +369,6 @@ paths:
       responses:
         "200": { description: Branch created. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/{lix_id}/checkpoint/create:
-    parameters:
-      - $ref: "#/components/parameters/LixId"
-    post:
-      operationId: createCheckpoint
-      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
-      responses:
-        "200": { description: Checkpoint created. }
-        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/undo:
     parameters:
       - $ref: "#/components/parameters/LixId"
@@ -558,7 +549,7 @@ components:
       type: object
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
-        protocolVersion: { type: integer, const: 5 }
+        protocolVersion: { type: integer, const: 6 }
         syncProtocolVersion: { type: integer, const: 1 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
@@ -631,7 +622,7 @@ components:
       type: array
       minItems: 1
       items: { $ref: "#/components/schemas/SyncRowPkPart" }
-      description: Lossless typed primary-key components in declared primary-key order.
+      description: Sync-only physical row identity components in declared primary-key order; this is not the public SQL/SDK lix_row_ref.
     SyncCommitMember:
       type: object
       required: [changeId, authored, schemaKey, rowPk, deleted, rowCreatedAt, rowUpdatedAt, changeAccountId, changeCreatedAt]

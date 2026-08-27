@@ -42,10 +42,10 @@ case-fold, or Unicode-normalize paths. Filesystem adapters diagnose names that
 the target host cannot represent.
 
 The checkpoint and diff relations are read-only. `lix_diff()` exposes
-`lixcol_row_pk`, `diff_type`, `row_count`, and paired
-`from_<column>` / `to_<column>` relation
-columns. Pass `(relation, row_pk)` to the `lix_revert`, `lix_apply`, and
-`lix_create_checkpoint` command sinks. See [Checkpoints](./checkpoints.md) and
+`row_ref`, the relation's typed primary-key columns, `diff_type`, `row_count`,
+and paired `from_<column>` / `to_<column>` relation columns. Pass `row_ref` to
+the `lix_revert` and `lix_apply` command sinks or to the
+`lix_create_checkpoint()` function. See [Checkpoints](./checkpoints.md) and
 [Diff commands](./diff-commands.md).
 
 For branch-scoped working changes, use `lix_latest_checkpoint_commit_id()` and
@@ -109,9 +109,9 @@ schema contributes another `RELATION` / `BASE` surface.
 | --- | --- |
 | Relation / base | `lix_account`, `lix_checkpoint`, `lix_commit`, `lix_key_value`, `lix_registered_schema` |
 | Relation / view | `lix_branch`, `lix_change`, `lix_directory`, `lix_file` |
-| Table function | `lix_commit_ancestry`, `lix_diff`, `lix_history` |
-| Command sink | `lix_apply`, `lix_create_checkpoint`, `lix_restore`, `lix_revert` |
-| Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `lix_latest_checkpoint_commit_id`, `lix_root_commit_id`, `uuidv7` |
+| Table function | `lix_commit_ancestry`, `lix_create_checkpoint` (mutating), `lix_diff`, `lix_history` |
+| Command sink | `lix_apply`, `lix_restore`, `lix_revert` |
+| Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `lix_latest_checkpoint_commit_id`, `lix_root_commit_id`, `lix_row_ref`, `uuidv7` |
 
 Standard SQL value expressions such as `CURRENT_TIMESTAMP` are supported SQL
 syntax, not Lix-owned scalar-function surfaces, and are therefore omitted from
@@ -119,10 +119,9 @@ syntax, not Lix-owned scalar-function surfaces, and are therefore omitted from
 
 Classify by SQL shape, not merely by whether data is computed dynamically.
 Unparameterized, table-shaped projections are views. Row producers invoked in
-the `FROM` clause with function syntax are table functions. Side-effecting
-operations are command sinks and use `INSERT`; they are not table functions.
-This keeps commands out of relation and function discovery even when a command
-supports `RETURNING`.
+the `FROM` clause with function syntax are table functions. Apply, restore, and
+revert are command sinks and use `INSERT`. Checkpoint creation is the one narrow
+mutating table function so full and scoped checkpoints share one SQL surface.
 
 JSON-backed columns are SQL `TEXT` and are marked with
 `lix_value_kind = 'JSONB'`. `is_nullable` describes values returned by reads;
@@ -141,8 +140,8 @@ omitted on insert, and rejects an explicit `NULL`.
 | `CONDITIONAL` | Whether the column is required depends on the row's other inputs. |
 
 `CONDITIONAL` covers deliberate alternative forms: filesystem rows can use a
-`path` or their directory/name fields, and typed rows can derive
-`lixcol_row_pk` from their public primary-key columns. These policies
+`path` or their directory/name fields, and typed rows derive identity from
+their public primary-key columns. These policies
 describe omission only; `is_nullable` still describes read values.
 
 ## Typed schema surfaces

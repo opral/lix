@@ -216,6 +216,11 @@ where
                 notify.finish(Status::Unset, Vec::new());
             }
         }
+        if let Some(checkpoint_sequence) = outcome.checkpoint_gc_sequence {
+            self.session
+                .schedule_checkpoint_gc_after_commit(checkpoint_sequence)
+                .await;
+        }
         Ok(())
     }
 

@@ -12,7 +12,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY,
     HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY,
 };
-use crate::sql2::result_metadata::{json_field, mark_json_field};
+use crate::sql2::result_metadata::{json_field, mark_json_field, row_ref_field};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaSurfaceShape {
@@ -166,6 +166,27 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
                 column.name
             ),
         ));
+    }
+    for primary_key in &parsed.primary_key {
+        let collides_with_envelope = matches!(
+            primary_key.as_str(),
+            "row_ref" | "diff_type" | "row_count"
+        );
+        let collides_with_side_column = ["from_", "to_"].iter().any(|prefix| {
+            primary_key.strip_prefix(prefix).is_some_and(|unprefixed| {
+                parsed.columns.iter().any(|column| {
+                    column.name == unprefixed && !parsed.primary_key.contains(&column.name)
+                })
+            })
+        });
+        if collides_with_envelope || collides_with_side_column {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!(
+                    "schema '{schema_key}' primary-key column '{primary_key}' collides with the lix_diff result envelope"
+                ),
+            ));
+        }
     }
     let schema_fingerprint = *parsed
         .wire_fingerprint()
@@ -425,7 +446,7 @@ pub(crate) fn row_visible_fields(spec: &SchemaSurfaceSpec) -> Vec<Field> {
 pub(crate) fn row_system_fields(shape: SchemaSurfaceShape) -> Vec<Field> {
     if shape == SchemaSurfaceShape::History {
         return vec![
-            json_field(HISTORY_COL_ROW_PK, false),
+            row_ref_field(HISTORY_COL_ROW_PK, false),
             Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
             Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
             json_field(HISTORY_COL_METADATA, true),
@@ -521,6 +542,34 @@ mod tests {
         let error = derive_schema_surface_spec_from_schema(&prefixed_reserved)
             .expect_err("embedded reserved segment must be rejected");
         assert!(error.message.contains("reserved lixcol_ segment"));
+    }
+
+    #[test]
+    fn rejects_primary_keys_that_collide_with_diff_columns() {
+        for primary_key in ["row_ref", "diff_type", "row_count"] {
+            let schema = json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": format!("reserved_{primary_key}"),
+                "columns": [{ "name": primary_key, "type": "text", "nullable": false }],
+                "primary_key": [primary_key]
+            });
+            let error = derive_schema_surface_spec_from_schema(&schema)
+                .expect_err("diff envelope collision must be rejected");
+            assert!(error.message.contains("lix_diff result envelope"));
+        }
+
+        let side_collision = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "reserved_side_column",
+            "columns": [
+                { "name": "from_value", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false }
+            ],
+            "primary_key": ["from_value"]
+        });
+        let error = derive_schema_surface_spec_from_schema(&side_collision)
+            .expect_err("generated side-column collision must be rejected");
+        assert!(error.message.contains("lix_diff result envelope"));
     }
 
     #[test]

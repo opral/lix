@@ -216,7 +216,7 @@ async fn working_diff_rows(session: &SessionContext<Memory>, schema_key: &str) -
     session
         .execute(
             &format!(
-                "SELECT lixcol_row_pk FROM lix_diff('{schema_key}', $1, lix_active_branch_commit_id())"
+                "SELECT row_ref FROM lix_diff('{schema_key}', $1, lix_active_branch_commit_id())"
             ),
             &[crate::Value::Text(checkpoint)],
         )

@@ -18,10 +18,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use super::{
-    CreateBranchOptionsDto, CreateBranchReceiptDto, CreateCheckpointReceiptDto,
-    OpenAnotherSessionOptionsDto, RedoReceiptDto, SwitchBranchOptionsDto, SwitchBranchReceiptDto,
-    UndoReceiptDto, batch_statements_from_js, execute_result_to_js, from_js, lix_error_to_js,
-    to_js, values_from_js,
+    CreateBranchOptionsDto, CreateBranchReceiptDto, OpenAnotherSessionOptionsDto, RedoReceiptDto,
+    SwitchBranchOptionsDto, SwitchBranchReceiptDto, UndoReceiptDto, batch_statements_from_js,
+    execute_result_to_js, from_js, lix_error_to_js, to_js, values_from_js,
 };
 
 #[wasm_bindgen]
@@ -262,18 +261,6 @@ impl WasmRemoteLix {
             id: receipt.id,
             name: receipt.name,
             hidden: receipt.hidden,
-            commit_id: receipt.commit_id,
-        })
-    }
-
-    #[wasm_bindgen(js_name = createCheckpoint)]
-    pub async fn create_checkpoint(&self) -> Result<JsValue, JsValue> {
-        let receipt = self
-            .inner
-            .create_checkpoint()
-            .await
-            .map_err(lix_error_to_js)?;
-        to_js(&CreateCheckpointReceiptDto {
             commit_id: receipt.commit_id,
         })
     }

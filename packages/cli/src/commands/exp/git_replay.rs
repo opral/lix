@@ -444,11 +444,12 @@ where
         let checkpoint_ms = if checkpoint_every.is_some_and(|interval| (index + 1) % interval == 0)
         {
             let checkpoint_started = Instant::now();
-            db::block_on(lix.create_checkpoint()).map_err(|error| {
-                CliError::msg(format!(
-                    "failed to checkpoint after replay commit {commit_sha}: {error}"
-                ))
-            })?;
+            db::block_on(lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[]))
+                .map_err(|error| {
+                    CliError::msg(format!(
+                        "failed to checkpoint after replay commit {commit_sha}: {error}"
+                    ))
+                })?;
             let elapsed_ms = duration_to_ms(checkpoint_started.elapsed());
             phase_totals.checkpoint_ms += elapsed_ms;
             Some(elapsed_ms)
@@ -3370,7 +3371,7 @@ mod tests {
             "initialization plus four replayed commits should publish five checkpoints"
         );
         let text_rows = db::block_on(lix.execute(
-            "SELECT lixcol_row_pk FROM text_line WHERE lixcol_file_id = $1",
+            "SELECT id FROM text_line WHERE lixcol_file_id = $1",
             &[Value::Text(stable_file_id(&git_path(b"docs/renamed.txt")))],
         ))
         .expect("Git text rows should be queryable after replay");
@@ -3379,7 +3380,7 @@ mod tests {
             "renamed text file must derive Git-text semantic rows at its new path"
         );
         let csv_rows = db::block_on(lix.execute(
-            "SELECT lixcol_row_pk FROM csv_row WHERE lixcol_file_id = $1",
+            "SELECT id FROM csv_row WHERE lixcol_file_id = $1",
             &[Value::Text(stable_file_id(&git_path(b"table.csv")))],
         ))
         .expect("CSV rows should be queryable after replay");
@@ -3389,7 +3390,7 @@ mod tests {
             "CSV replay must eagerly materialize both records"
         );
         let binary_rows = db::block_on(lix.execute(
-            "SELECT lixcol_row_pk FROM text_line WHERE lixcol_file_id = $1",
+            "SELECT id FROM text_line WHERE lixcol_file_id = $1",
             &[Value::Text(stable_file_id(&git_path(b"binary.bin")))],
         ))
         .expect("Git text rows should query for binary fixture");
@@ -3478,7 +3479,7 @@ mod tests {
         let lix = db::block_on(open_lix().with_storage(storage))
             .expect("replay Lix should reopen cleanly");
         let rows = db::block_on(lix.execute(
-            "SELECT lixcol_row_pk FROM csv_row WHERE lixcol_file_id = $1",
+            "SELECT id FROM csv_row WHERE lixcol_file_id = $1",
             &[Value::Text(stable_file_id(&git_path(b"table.csv")))],
         ))
         .expect("CSV rows should be queryable after replay");
@@ -3657,7 +3658,7 @@ mod tests {
             );
 
             let semantic_rows = db::block_on(lix.execute(
-                "SELECT lixcol_row_pk FROM text_line WHERE lixcol_file_id = $1",
+                "SELECT id FROM text_line WHERE lixcol_file_id = $1",
                 &[Value::Text(stable_file_id(&git_path(
                     path.trim_start_matches('/').as_bytes(),
                 )))],
@@ -3754,7 +3755,7 @@ mod tests {
         assert_eq!(rendered, Some(b"a\na\n".as_slice()));
 
         let semantic_rows = db::block_on(lix.execute(
-            "SELECT lixcol_row_pk FROM text_line WHERE lixcol_file_id = $1",
+            "SELECT id FROM text_line WHERE lixcol_file_id = $1",
             &[Value::Text(stable_file_id(&git_path(b"src/index.ts")))],
         ))
         .expect("replayed Git-text rows should query");

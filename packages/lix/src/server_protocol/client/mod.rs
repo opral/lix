@@ -20,14 +20,14 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::{
-    CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteBatchStatement,
-    ExecuteResult, LixError, RedoReceipt, SwitchBranchReceipt, UndoReceipt, Value,
+    CreateBranchOptions, CreateBranchReceipt, ExecuteBatchStatement, ExecuteResult, LixError,
+    RedoReceipt, SwitchBranchReceipt, UndoReceipt, Value,
 };
 
 use blobs::{BlobCache, PreparedRequestParams, request_blob_slot};
 use wire::{
     BLOB_BASE_MISSING_CODE, BeginTransactionResponse, CreateBranchRequestBody,
-    CreateBranchResponseBody, CreateCheckpointResponseBody, EmptyBody, ErrorEnvelope,
+    CreateBranchResponseBody, EmptyBody, ErrorEnvelope,
     ExecuteBatchRequestBody, ExecuteBatchStatementBody, ExecuteOptionsBody, ExecuteRequestBody,
     ExecuteResponseBody, HandshakeResponse, IDEMPOTENCY_KEY_HEADER, RedoResponseBody,
     SESSION_HEADER, SERVER_PROTOCOL_VERSION, SwitchBranchRequestBody,
@@ -605,32 +605,6 @@ impl<H: ProtocolHttp> ClientCore<H> {
                     name: value.name,
                     hidden: value.hidden,
                     commit_id: value.commit_id,
-                })
-            })
-            .await
-        })
-        .await
-    }
-
-    pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
-        self.enqueue(|| async {
-            self.with_session_recovery(|| async {
-                let value = self
-                    .request_json::<CreateCheckpointResponseBody, EmptyBody>(
-                        "POST",
-                        self.join_path("checkpoint/create")?,
-                        true,
-                        None,
-                        Some(EmptyBody {}),
-                        "json",
-                    )
-                    .await?;
-                if value.commit_id.is_empty() {
-                    return Err(protocol_error("create checkpoint response is invalid"));
-                }
-                Ok(CreateCheckpointReceipt {
-                    commit_id: value.commit_id,
-                    change_id: String::new(),
                 })
             })
             .await

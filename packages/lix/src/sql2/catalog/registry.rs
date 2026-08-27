@@ -23,7 +23,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY,
     HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
 };
-use crate::sql2::result_metadata::json_field;
+use crate::sql2::result_metadata::{json_field, row_ref_field};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PublicCatalog {
@@ -153,15 +153,13 @@ impl PublicCatalog {
             ])),
             PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
+            | PublicSurfaceKind::CheckpointFunction
             | PublicSurfaceKind::StateAtFunction
             | PublicSurfaceKind::CommitAncestryFunction => {
                 return None;
             }
-            PublicSurfaceKind::Revert
-            | PublicSurfaceKind::Apply
-            | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![
-                Field::new("relation", DataType::Utf8, false),
-                json_field("row_pk", false),
+            PublicSurfaceKind::Revert | PublicSurfaceKind::Apply => Arc::new(Schema::new(vec![
+                row_ref_field("row_ref", false),
             ])),
             PublicSurfaceKind::Restore => Arc::new(Schema::new(vec![Field::new(
                 "commit_id",
@@ -171,7 +169,7 @@ impl PublicCatalog {
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("account_id", DataType::Utf8, false),
-                json_field("row_pk", false),
+                row_ref_field("row_ref", true),
                 Field::new("schema_key", DataType::Utf8, false),
                 Field::new("file_id", DataType::Utf8, true),
                 json_field("metadata", true),
@@ -264,7 +262,7 @@ impl PublicCatalog {
             public_columns([
                 ("id", false),
                 ("account_id", false),
-                ("row_pk", false),
+                ("row_ref", true),
                 ("schema_key", false),
                 ("file_id", true),
                 ("metadata", true),
@@ -289,6 +287,13 @@ impl PublicCatalog {
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
+            "lix_create_checkpoint",
+            PublicSurfaceClass::TableFunction,
+            PublicSurfaceKind::CheckpointFunction,
+            vec![PublicColumn::public_read_only("commit_id", false)],
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
             "lix_state_at",
             PublicSurfaceClass::TableFunction,
             PublicSurfaceKind::StateAtFunction,
@@ -305,15 +310,13 @@ impl PublicCatalog {
         for (name, kind) in [
             ("lix_revert", PublicSurfaceKind::Revert),
             ("lix_apply", PublicSurfaceKind::Apply),
-            ("lix_create_checkpoint", PublicSurfaceKind::CreateCheckpoint),
         ] {
             self.insert(surface(
                 name,
                 PublicSurfaceClass::CommandSink,
                 kind,
                 vec![
-                    PublicColumn::public_insert_only("relation", false),
-                    PublicColumn::public_insert_only("row_pk", false),
+                    PublicColumn::public_insert_only("row_ref", false),
                     PublicColumn::public_read_only("commit_id", false),
                 ],
                 SurfaceCapabilities {
@@ -478,7 +481,7 @@ fn history_filesystem_schema(include_data: bool) -> SchemaRef {
         ]
     };
     fields.extend([
-        json_field(HISTORY_COL_ROW_PK, false),
+        row_ref_field(HISTORY_COL_ROW_PK, false),
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
@@ -590,14 +593,9 @@ fn filesystem_system_columns() -> Vec<PublicColumn> {
     ]
 }
 
-fn row_system_columns(spec: &SchemaSurfaceSpec, variant: SchemaSurfaceShape) -> Vec<PublicColumn> {
+fn row_system_columns(_spec: &SchemaSurfaceSpec, variant: SchemaSurfaceShape) -> Vec<PublicColumn> {
     debug_assert_ne!(variant, SchemaSurfaceShape::History);
-    let row_pk = PublicColumn::public_insert_only("lixcol_row_pk", false);
-    let row_pk = if spec.primary_key_paths.is_empty() {
-        row_pk
-    } else {
-        row_pk.conditional_on_insert()
-    };
+    let row_pk = PublicColumn::hidden("lixcol_row_pk", false);
     vec![
         row_pk,
         PublicColumn::public_read_only("lixcol_schema_key", false),

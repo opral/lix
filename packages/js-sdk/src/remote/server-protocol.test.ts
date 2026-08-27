@@ -44,6 +44,23 @@ test("remote timestamps preserve their RFC 3339 representation", () => {
 	).toEqual({ kind: "timestamptz", value });
 });
 
+test("remote row refs preserve their opaque identity kind", () => {
+	const value =
+		"lix_row_ref:v1:AAAADWxpeF9rZXlfdmFsdWUAAQMAAAAFaGVsbG8";
+	expect(encodeWireValue({ kind: "row_ref", value })).toEqual({
+		kind: "row_ref",
+		value,
+	});
+	expect(
+		decodeExecuteResult({
+			columns: [{ name: "row_ref", type: "row_ref" }],
+			rows: [[{ kind: "row_ref", value }]],
+			rowsAffected: 0,
+			notices: [],
+		}).rows[0]?.[0],
+	).toEqual({ kind: "row_ref", value });
+});
+
 test("remote decoding rejects legacy json and timestamp wire kinds", () => {
 	for (const value of [
 		{ kind: "json", value: { ok: true } },

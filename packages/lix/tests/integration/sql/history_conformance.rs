@@ -124,8 +124,8 @@ simulation_test!(typed_row_history_exposes_tombstones, |sim| async move {
     session
             .execute(
                 "INSERT INTO engine_history_conformance \
-                 (lixcol_row_pk, id, value, lixcol_untracked) \
-                 VALUES (CAST('[\"history-conformance-row\"]' AS JSONB), 'history-conformance-row', 'one', false)",
+                 (id, value, lixcol_untracked) \
+                 VALUES ('history-conformance-row', 'one', false)",
                 &[],
             )
             .await
@@ -134,7 +134,7 @@ simulation_test!(typed_row_history_exposes_tombstones, |sim| async move {
         .execute(
             "UPDATE engine_history_conformance \
                  SET value = 'two' \
-                 WHERE lixcol_row_pk = CAST('[\"history-conformance-row\"]' AS JSONB)",
+                 WHERE id = 'history-conformance-row'",
             &[],
         )
         .await
@@ -142,7 +142,7 @@ simulation_test!(typed_row_history_exposes_tombstones, |sim| async move {
     session
         .execute(
             "DELETE FROM engine_history_conformance \
-                 WHERE lixcol_row_pk = CAST('[\"history-conformance-row\"]' AS JSONB)",
+                 WHERE id = 'history-conformance-row'",
             &[],
         )
         .await
@@ -150,9 +150,9 @@ simulation_test!(typed_row_history_exposes_tombstones, |sim| async move {
 
     let typed_rows = select_rows(
         &session,
-        "SELECT id, value, lixcol_row_pk, lixcol_depth \
+        "SELECT id, value, lixcol_depth \
              FROM lix_history('engine_history_conformance') \
-               WHERE lixcol_row_pk = CAST('[\"history-conformance-row\"]' AS JSONB) \
+               WHERE id = 'history-conformance-row' \
              ORDER BY lixcol_depth",
     )
     .await;
@@ -162,7 +162,6 @@ simulation_test!(typed_row_history_exposes_tombstones, |sim| async move {
         vec![
             Value::Text("history-conformance-row".to_string()),
             Value::Null,
-            Value::Jsonb(serde_json::json!(["history-conformance-row"]).into()),
             Value::Integer(0),
         ]
     );
@@ -198,7 +197,7 @@ simulation_test!(
 
         let rows = select_rows(
             &session,
-            "SELECT key, value, lixcol_row_pk, lixcol_depth \
+            "SELECT key, value, lixcol_depth \
              FROM lix_history('lix_key_value') \
                WHERE key = 'history-pk-backfill' \
              ORDER BY lixcol_depth",
@@ -211,13 +210,11 @@ simulation_test!(
                 vec![
                     Value::Text("history-pk-backfill".to_string()),
                     Value::Null,
-                    Value::Jsonb(serde_json::json!(["history-pk-backfill"]).into()),
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Text("history-pk-backfill".to_string()),
                     Value::Jsonb(serde_json::json!("one").into()),
-                    Value::Jsonb(serde_json::json!(["history-pk-backfill"]).into()),
                     Value::Integer(1),
                 ],
             ]
@@ -335,7 +332,7 @@ simulation_test!(
         session
             .execute(
                 "DELETE FROM engine_history_nested_pk \
-                 WHERE lixcol_row_pk = CAST('[\"acme\",\"7\"]' AS JSONB)",
+                 WHERE tenant = 'acme' AND id = '7'",
                 &[],
             )
             .await
@@ -418,7 +415,7 @@ simulation_test!(
 
         let file_rows = select_rows(
             &session,
-            "SELECT id, path, name, content, lixcol_row_pk, lixcol_is_deleted, lixcol_depth \
+            "SELECT id, path, name, content, lixcol_is_deleted, lixcol_depth \
              FROM lix_history('lix_file') \
                WHERE id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",
@@ -431,7 +428,6 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Jsonb(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"]).into()),
                 Value::Boolean(true),
                 Value::Integer(0),
             ]]
@@ -477,7 +473,7 @@ simulation_test!(
 
         let directory_rows = select_rows(
             &session,
-            "SELECT id, path, parent_id, name, lixcol_row_pk, lixcol_is_deleted, lixcol_depth \
+            "SELECT id, path, parent_id, name, lixcol_is_deleted, lixcol_depth \
              FROM lix_history('lix_directory') \
                WHERE id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",
@@ -490,7 +486,6 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Jsonb(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"]).into()),
                 Value::Boolean(true),
                 Value::Integer(0),
             ]]
@@ -745,7 +740,7 @@ simulation_test!(
 
         for sql in [
             "EXPLAIN SELECT * FROM lix_history('lix_file')",
-            "EXPLAIN SELECT lixcol_row_pk FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id())",
+            "EXPLAIN SELECT row_ref FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id())",
         ] {
             session
                 .execute(sql, &[])
@@ -789,6 +784,7 @@ simulation_test!(history_discovery_has_no_suffix_surfaces, |sim| async move {
         .await,
         vec![
             vec![Value::Text("lix_commit_ancestry".to_string())],
+            vec![Value::Text("lix_create_checkpoint".to_string())],
             vec![Value::Text("lix_diff".to_string())],
             vec![Value::Text("lix_history".to_string())],
             vec![Value::Text("lix_state_at".to_string())],

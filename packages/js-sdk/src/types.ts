@@ -134,6 +134,7 @@ export type LixValue =
 	| { kind: "real"; value: number }
 	| { kind: "text"; value: string }
 	| { kind: "jsonb"; value: JsonValue }
+	| { kind: "row_ref"; value: string }
 	| { kind: "timestamptz"; value: string }
 	| { kind: "blob"; value: Uint8Array };
 
@@ -226,10 +227,6 @@ export type CreateBranchReceipt = {
 	commitId: string;
 };
 
-export type CreateCheckpointReceipt = {
-	commitId: string;
-};
-
 export type UndoReceipt = {
 	branchId: string;
 	targetCommitId: string;
@@ -291,8 +288,7 @@ export type MergeChangeStats = {
 
 export type MergeConflict = {
 	kind: "sameRowChanged";
-	schemaKey: string;
-	rowPk: unknown;
+	rowRef: string;
 	fileId: string | null;
 	target: MergeConflictSide;
 	source: MergeConflictSide;

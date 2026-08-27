@@ -366,7 +366,7 @@ where
         .expect("open checkpoint-query setup session");
     for _ in 0..additional_checkpoints {
         session
-            .create_checkpoint()
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
             .expect("create checkpoint-query fixture checkpoint");
     }

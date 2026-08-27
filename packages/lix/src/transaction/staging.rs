@@ -4275,32 +4275,24 @@ fn retain_earliest_batch_identity_violation<'a>(
 }
 
 fn mixed_durability_error(row: PreparedStateRowRef<'_>) -> LixError {
-    let row_pk = row
-        .row_pk
-        .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     LixError::new(
         LixError::CODE_INVALID_PARAM,
         format!(
-            "cannot mix tracked and untracked writes for schema '{}' row_pk '{}' in branch '{}' within one transaction; commit or roll back before changing durability",
-            row.schema_key, row_pk, row.branch_id
+            "cannot mix tracked and untracked writes for the same '{}' primary key in branch '{}' within one transaction; commit or roll back before changing durability",
+            row.schema_key, row.branch_id
         ),
     )
 }
 
 fn duplicate_staged_present_row_error(
     row: PreparedStateRowRef<'_>,
-    previous: PreparedStateRowRef<'_>,
+    _previous: PreparedStateRowRef<'_>,
 ) -> LixError {
     let message = logical_primary_key_violation_message(row.origin)
         .unwrap_or_else(|| {
             format!(
-                "primary-key constraint violation on schema '{}': duplicate staged rows for row_pk '{}' in branch '{}'",
+                "primary-key constraint violation on schema '{}': duplicate staged primary key in branch '{}'",
                 row.schema_key,
-                previous
-                    .row_pk
-                    .as_json_array_text()
-                    .unwrap_or_else(|_| "<invalid row_pk>".to_string()),
                 row.branch_id
             )
         });
@@ -4309,22 +4301,19 @@ fn duplicate_staged_present_row_error(
 
 pub(crate) fn duplicate_insert_identity_message(
     schema_key: &str,
-    row_pk: &RowPk,
+    _row_pk: &RowPk,
     branch_id: Option<&str>,
     origin: Option<&TransactionWriteOrigin>,
 ) -> String {
     if let Some(message) = logical_primary_key_violation_message(origin) {
         return message;
     }
-    let row_pk = row_pk
-        .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     match branch_id {
         Some(branch_id) => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate row_pk '{row_pk}' in branch '{branch_id}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate a primary key in branch '{branch_id}'"
         ),
         None => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate row_pk '{row_pk}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate a primary key"
         ),
     }
 }

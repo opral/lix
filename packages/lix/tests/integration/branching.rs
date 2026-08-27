@@ -38,7 +38,9 @@ simulation_test!(create_branch_rejects_existing_id, |sim| async move {
 
     assert_eq!(error.code, "LIX_ERROR_UNIQUE");
     assert!(
-        error.to_string().contains("INSERT would duplicate row_pk"),
+        error
+            .to_string()
+            .contains("INSERT would duplicate a primary key"),
         "error should explain the duplicate branch id: {error:?}"
     );
     assert_branch_descriptor(&main, "01930000-0000-7000-8000-000000000001", "Draft").await;
@@ -810,7 +812,7 @@ simulation_test!(
         let working_diffs = main
             .execute(
                 &format!(
-                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT key, diff_type FROM {} ORDER BY key",
                     key_value_diff_relation(&main).await
                 ),
                 &[],
@@ -821,10 +823,7 @@ simulation_test!(
         assert_eq!(
             working_diffs.rows()[0].values(),
             &[
-                Value::Jsonb(
-                    JsonValue::Array(vec![JsonValue::String("draft-merge-source".to_string())])
-                        .into()
-                ),
+                Value::Text("draft-merge-source".to_string()),
                 Value::Text("added".to_string()),
             ],
             "the selected source delta must remain visible against the target checkpoint"
@@ -832,10 +831,7 @@ simulation_test!(
         assert_eq!(
             working_diffs.rows()[1].values(),
             &[
-                Value::Jsonb(
-                    JsonValue::Array(vec![JsonValue::String("main-merge-target".to_string())])
-                        .into()
-                ),
+                Value::Text("main-merge-target".to_string()),
                 Value::Text("added".to_string()),
             ],
             "the target delta must remain visible against the target checkpoint"
@@ -1239,7 +1235,7 @@ simulation_test!(
             "SELECT count(*) \
 	     FROM lix_change \
 	     WHERE schema_key = 'lix_key_value' \
-	       AND row_pk = CAST('[\"merge-select-change\"]' AS JSONB) \
+	       AND row_ref = lix_row_ref('lix_key_value', 'merge-select-change') \
 	       AND snapshot_content = CAST('{\"key\":\"merge-select-change\",\"value\":\"source\"}' AS JSONB)",
         )
         .await;
@@ -2014,7 +2010,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT diff_type, from_value, to_value FROM {} \
-                     WHERE lixcol_row_pk = CAST('[\"branch-baseline\"]' AS JSONB)",
+                     WHERE key = 'branch-baseline'",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],
@@ -2072,9 +2068,9 @@ simulation_test!(
         draft
             .execute(
                 &format!(
-                    "INSERT INTO lix_revert (relation, row_pk) \
-                     SELECT 'lix_key_value', lixcol_row_pk FROM {} \
-                     WHERE lixcol_row_pk = CAST('[\"branch-revert\"]' AS JSONB)",
+                    "INSERT INTO lix_revert (row_ref) \
+                     SELECT row_ref FROM {} \
+                     WHERE key = 'branch-revert'",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],
@@ -2133,7 +2129,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT diff_type, from_value FROM {} \
-                     WHERE lixcol_row_pk = CAST('[\"merge-baseline\"]' AS JSONB)",
+                     WHERE key = 'merge-baseline'",
                     key_value_diff_relation(&main).await
                 ),
                 &[],
@@ -2186,7 +2182,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT diff_type, from_value FROM {} \
-                     WHERE lixcol_row_pk = CAST('[\"branch-delete\"]' AS JSONB)",
+                     WHERE key = 'branch-delete'",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],
@@ -2208,7 +2204,7 @@ simulation_test!(
         let broad = draft
             .execute(
                 &format!(
-                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT key, diff_type FROM {} ORDER BY key",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],
@@ -2288,7 +2284,7 @@ simulation_test!(
         let rows = draft
             .execute(
                 &format!(
-                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT key, diff_type FROM {} ORDER BY key",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],
@@ -2304,24 +2300,15 @@ simulation_test!(
             actual,
             vec![
                 vec![
-                    Value::Jsonb(
-                        JsonValue::Array(vec![JsonValue::String("branch-broad-a".to_string())])
-                            .into()
-                    ),
+                    Value::Text("branch-broad-a".to_string()),
                     Value::Text("modified".to_string()),
                 ],
                 vec![
-                    Value::Jsonb(
-                        JsonValue::Array(vec![JsonValue::String("branch-broad-b".to_string())])
-                            .into()
-                    ),
+                    Value::Text("branch-broad-b".to_string()),
                     Value::Text("modified".to_string()),
                 ],
                 vec![
-                    Value::Jsonb(
-                        JsonValue::Array(vec![JsonValue::String("branch-broad-new".to_string())])
-                            .into()
-                    ),
+                    Value::Text("branch-broad-new".to_string()),
                     Value::Text("added".to_string()),
                 ],
             ],
@@ -2370,7 +2357,7 @@ simulation_test!(
         let rows = draft
             .execute(
                 &format!(
-                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT key, diff_type FROM {} ORDER BY key",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],
@@ -2433,7 +2420,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT diff_type, from_value FROM {} \
-                     WHERE lixcol_row_pk = CAST('[\"switch-baseline\"]' AS JSONB)",
+                     WHERE key = 'switch-baseline'",
                     key_value_diff_relation(&main).await
                 ),
                 &[],
@@ -2488,7 +2475,7 @@ simulation_test!(
         let rows = draft
             .execute(
                 &format!(
-                    "SELECT lixcol_row_pk FROM {}",
+                    "SELECT key FROM {}",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],

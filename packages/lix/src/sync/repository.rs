@@ -11646,7 +11646,7 @@ mod tests {
         );
         let peer_diff = peer
             .execute(
-                "SELECT lixcol_row_pk, diff_type \
+                "SELECT id, diff_type \
                  FROM lix_diff('lix_file', $1, lix_active_branch_commit_id())",
                 &[Value::Text(pushed_checkpoint.to_owned())],
             )
@@ -11921,7 +11921,7 @@ mod tests {
         let diff = loop {
             match replica
                 .execute(
-                    "SELECT lixcol_row_pk ->> 0 AS file_id FROM lix_diff('lix_file', $1, $2)",
+                    "SELECT id AS file_id FROM lix_diff('lix_file', $1, $2)",
                     &[
                         Value::Text(previous_checkpoint.clone()),
                         Value::Text(latest_checkpoint.clone()),

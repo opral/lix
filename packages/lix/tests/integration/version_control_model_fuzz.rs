@@ -708,34 +708,25 @@ async fn assert_working_diff(
         .unwrap_or_else(|error| panic!("{label}: checkpoint ID should be text: {error:?}"));
     let rows = session
         .execute(
-            "SELECT lixcol_row_pk, diff_type \
+            "SELECT key, diff_type \
              FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id()) \
-             ORDER BY lixcol_row_pk",
+             ORDER BY key",
             &[Value::Text(checkpoint)],
         )
         .await
         .unwrap_or_else(|error| panic!("{label}: working diff read failed: {error:?}"));
     let mut actual = Vec::new();
     for row in rows.rows() {
-        // `row_pk` is the JSON primary-key tuple, `["<key>"]` for
-        // `lix_key_value`.
-        let row_pk = row
-            .get::<JsonValue>("lixcol_row_pk")
-            .unwrap_or_else(|error| panic!("{label}: row_pk should be json: {error:?}"));
-        let Some(key) = row_pk
-            .as_array()
-            .and_then(|components| components.first())
-            .and_then(JsonValue::as_str)
-        else {
-            panic!("{label}: unexpected row_pk shape {row_pk:?}");
-        };
+        let key = row
+            .get::<String>("key")
+            .unwrap_or_else(|error| panic!("{label}: key should be text: {error:?}"));
         if !key.starts_with(prefix) {
             continue;
         }
         let diff_type = row
             .get::<String>("diff_type")
             .unwrap_or_else(|error| panic!("{label}: diff_type should be text: {error:?}"));
-        actual.push((key.to_string(), diff_type));
+        actual.push((key, diff_type));
     }
     actual.sort();
     let expected = expected

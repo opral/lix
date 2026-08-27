@@ -2191,15 +2191,6 @@ async fn stage_tracked_commit_delta_index(
             } else {
                 None
             };
-        let authored_change_ids = state_row_indices
-            .iter()
-            .filter_map(|&row_index| {
-                let row = state_rows.row(row_index);
-                (!row.addressable_change_id)
-                    .then_some(row.change_id)
-                    .flatten()
-            })
-            .collect::<std::collections::HashSet<_>>();
         let staged = if let Some(source_commit_id) = selected_source_alias {
             deltas.truncate(state_row_indices.len());
             addressable.truncate(state_row_indices.len());
@@ -2214,12 +2205,6 @@ async fn stage_tracked_commit_delta_index(
         };
         inventories.insert(root.commit_id, staged.mutation_inventory().clone());
         drop(deltas);
-        let assigned_change_ids = staged
-            .assigned_change_ids
-            .iter()
-            .copied()
-            .filter(|change_id| *change_id != ChangeId::default())
-            .collect::<std::collections::HashSet<_>>();
         for (source_index, &row_index) in state_row_indices.iter().enumerate() {
             if !state_rows.row(row_index).addressable_change_id {
                 continue;
@@ -2233,15 +2218,7 @@ async fn stage_tracked_commit_delta_index(
             }
             state_rows.set_change_id(row_index, Some(change_id));
         }
-        let authored_locators = staged
-            .locators
-            .into_iter()
-            .filter(|locator| {
-                authored_change_ids.contains(&locator.change_id)
-                    || assigned_change_ids.contains(&locator.change_id)
-            })
-            .collect::<Vec<_>>();
-        stage_change_locators(writes, &authored_locators);
+        stage_change_locators(writes, &staged.authored_locators);
     }
     Ok(StagedCommitDeltaIndex {
         ordered_addressable_commits,
@@ -3444,14 +3421,10 @@ fn apply_lifecycle_tracked_snapshot_row(
 }
 
 fn lifecycle_duplicate_tracked_row_error(key: &TrackedStateKey) -> LixError {
-    let row_pk = key
-        .row_pk
-        .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
-            "primary-key constraint violation on schema '{}': INSERT would duplicate row_pk '{row_pk}'",
+            "primary-key constraint violation on schema '{}': INSERT would duplicate a primary key",
             key.schema_key
         ),
     )
@@ -5159,19 +5132,18 @@ fn selected_tracked_ref_untracked_collision_error(
     branch_id: &str,
     identity: &TrackedStateKey,
 ) -> LixError {
+    let row_ref = crate::row_ref::schema_identity_detail(&identity.schema_key, &identity.row_pk);
     LixError::new(
         LixError::CODE_MERGE_CONFLICT,
         format!(
-            "cannot publish selected tracked change on branch '{branch_id}': it conflicts with an untracked current row for schema '{}' row_pk {:?}",
-            identity.schema_key, identity.row_pk
+            "cannot publish selected tracked change on branch '{branch_id}': row_ref {row_ref} conflicts with an untracked current row"
         ),
     )
     .with_hint("Resolve the tracked and untracked identity conflict before retrying.")
     .with_details(serde_json::json!({
         "kind": "trackedUntrackedIdentityCollision",
         "branchId": branch_id,
-        "schemaKey": &identity.schema_key,
-        "rowPk": &identity.row_pk,
+        "rowRef": row_ref,
         "fileId": &identity.file_id,
     }))
 }

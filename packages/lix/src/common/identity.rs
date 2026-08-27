@@ -106,7 +106,6 @@ macro_rules! canonical_identity_type {
     };
 }
 
-canonical_identity_type!(RowPk, "row_pk");
 canonical_identity_type!(FileId, "file_id");
 canonical_identity_type!(BranchId, "branch_id");
 canonical_identity_type!(CanonicalSchemaKey, "schema_key");

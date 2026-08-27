@@ -3,7 +3,11 @@ use lix::{LixError, Value, open_lix};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), LixError> {
     let lix = open_lix().await?;
-    let initial_checkpoint = lix.create_checkpoint().await?;
+    let initial_checkpoint = lix
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await?
+        .rows()[0]
+        .get::<String>("commit_id")?;
 
     // Writes to a tracked SQL surface create ordinary working diffs.
     lix.execute(
@@ -17,21 +21,26 @@ async fn main() -> Result<(), LixError> {
 
     let working_diffs = lix
         .execute(
-            "SELECT lixcol_row_pk, diff_type, from_value, to_value
+            "SELECT row_ref, key, diff_type, from_value, to_value
              FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id())
-             ORDER BY lixcol_row_pk",
-            &[Value::Text(initial_checkpoint.commit_id)],
+             ORDER BY key",
+            &[Value::Text(initial_checkpoint)],
         )
         .await?;
 
     for row in working_diffs.rows() {
         // Row::get<T> performs typed extraction from ExecuteResult.
-        let row_pk = row.get::<serde_json::Value>("lixcol_row_pk")?;
+        let row_ref = row.get::<lix::RowRef>("row_ref")?;
+        let key = row.get::<String>("key")?;
         let diff_type = row.get::<String>("diff_type")?;
-        println!("{diff_type} lix_key_value {row_pk}");
+        println!("{diff_type} lix_key_value {key} ({row_ref})");
     }
-    let checkpoint = lix.create_checkpoint().await?;
-    println!("created checkpoint {}", checkpoint.commit_id);
+    let checkpoint = lix
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await?
+        .rows()[0]
+        .get::<String>("commit_id")?;
+    println!("created checkpoint {checkpoint}");
 
     // `lix_checkpoint` holds the checkpoint rows and carries no ordering column.
     // `lix_history('lix_checkpoint')` exposes `lixcol_depth`, so ascending depth is
@@ -54,7 +63,7 @@ async fn main() -> Result<(), LixError> {
         .execute(
             "SELECT COUNT(*) AS count
              FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id())",
-            &[Value::Text(checkpoint.commit_id)],
+            &[Value::Text(checkpoint)],
         )
         .await?;
     let remaining_count = remaining.rows()[0].get::<i64>("count")?;
