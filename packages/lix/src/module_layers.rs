@@ -129,6 +129,10 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("observe_invalidation", "not yet analysed"),
     ("prepared_dml", "leaf utility, no layer semantics"),
     (
+        "row_ref",
+        "public identity encoding depends on the compiled SQL relation catalog",
+    ),
+    (
         "plugin",
         "target-selecting plugin facade and guest authoring API",
     ),

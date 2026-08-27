@@ -28,6 +28,8 @@ use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::{field_is_json, row_ref_field};
+#[cfg(test)]
+use crate::sql2::result_metadata::field_is_row_ref;
 use crate::sql2::udfs::{ExecutionSlots, execution_slots};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -1637,16 +1639,15 @@ mod tests {
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
         assert_eq!(
-            &names[..6],
-            &[
-                "lixcol_row_pk",
-                "diff_type",
-                "from_key",
-                "to_key",
-                "from_value",
-                "to_value"
-            ]
+            &names[..5],
+            &["row_ref", "key", "diff_type", "from_value", "to_value"]
         );
+        assert!(field_is_row_ref(
+            relation.schema.field_with_name("row_ref").unwrap()
+        ));
+        assert!(!names.contains(&"lixcol_row_pk"));
+        assert!(!names.contains(&"from_key"));
+        assert!(!names.contains(&"to_key"));
         assert_eq!(names.last(), Some(&"row_count"));
         assert!(!names.contains(&"lixcol_diff_type"));
         assert!(!names.contains(&"lixcol_row_count"));

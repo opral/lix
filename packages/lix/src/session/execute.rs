@@ -639,7 +639,7 @@ impl TryFromValue for RowRef {
     fn try_from_value(value: &Value) -> Result<Self, LixError> {
         match value {
             Value::RowRef(value) => Ok(value.clone()),
-            other => Err(value_type_error("lix_row_ref", other)),
+            other => Err(value_type_error("row_ref", other)),
         }
     }
 }
@@ -8521,7 +8521,7 @@ mod tests {
         transaction
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_row_pk = CAST('[\"amended_parameter_insert_probe\"]' AS JSONB)",
+                 WHERE schema_key = 'amended_parameter_insert_probe'",
                 &[Value::Jsonb(amended_schema.into())],
             )
             .await
@@ -8682,7 +8682,7 @@ mod tests {
         transaction
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_row_pk = CAST('[\"amended_parameter_update_probe\"]' AS JSONB)",
+                 WHERE schema_key = 'amended_parameter_update_probe'",
                 &[Value::Jsonb(amended_schema.into())],
             )
             .await

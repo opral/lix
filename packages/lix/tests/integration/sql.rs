@@ -112,6 +112,7 @@ mod lix_key_value;
 mod lix_registered_schema;
 mod metadata;
 mod read_only;
+mod row_ref;
 mod subquery_reads;
 mod subquery_writes;
 mod udfs;

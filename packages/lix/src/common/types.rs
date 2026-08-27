@@ -530,7 +530,7 @@ impl ResultColumnType {
 
 /// Opaque address of one logical row in one Lix relation.
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize,
 )]
 #[serde(transparent)]
 pub struct RowRef(pub(crate) String);
@@ -554,6 +554,16 @@ impl RowRef {
 impl fmt::Display for RowRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RowRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_encoded(encoded).map_err(serde::de::Error::custom)
     }
 }
 

@@ -78,6 +78,32 @@ pub(crate) fn encode(relation: &str, row_pk: &RowPk) -> Result<RowRef, LixError>
     Ok(RowRef(format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))))
 }
 
+/// Encodes a durable schema identity for public diagnostics.
+///
+/// Filesystem descriptor schema keys are implementation details of the two
+/// logical filesystem relations. Registered relation schema keys already are
+/// their public relation names. Other engine-only identities retain their
+/// schema key as the relation qualifier so details remain lossless without
+/// exposing the old JSON row-key representation.
+pub(crate) fn encode_schema_identity(
+    schema_key: &str,
+    row_pk: &RowPk,
+) -> Result<RowRef, LixError> {
+    let relation = match schema_key {
+        "lix_file_descriptor" => "lix_file",
+        "lix_directory_descriptor" => "lix_directory",
+        relation => relation,
+    };
+    encode(relation, row_pk)
+}
+
+pub(crate) fn schema_identity_detail(schema_key: &str, row_pk: &RowPk) -> serde_json::Value {
+    match encode_schema_identity(schema_key, row_pk) {
+        Ok(row_ref) => serde_json::Value::String(row_ref.as_str().to_owned()),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
 pub(crate) fn decode(row_ref: &RowRef) -> Result<ResolvedRowRef, LixError> {
     decode_str(row_ref.as_str())
 }
@@ -197,8 +223,24 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_every_supported_primary_key_component_type() {
+        let row_pk = RowPk::from_components(smallvec::smallvec![
+            RowPkComponent::Uuid([7; 16]),
+            RowPkComponent::Integer(-42),
+            RowPkComponent::String("member".into()),
+            RowPkComponent::Bytes(Bytes::from_static(b"\0binary\xff")),
+        ])
+        .unwrap();
+        let encoded = encode("typed_identity", &row_pk).unwrap();
+        assert_eq!(decode(&encoded).unwrap().row_pk, row_pk);
+        assert_eq!(serde_json::from_value::<RowRef>(serde_json::json!(encoded.as_str())).unwrap(), encoded);
+    }
+
+    #[test]
     fn rejects_malformed_or_noncanonical_values() {
         assert!(decode_str("[\"row\"]").is_err());
         assert!(decode_str("lix_row_ref:v1:not-base64!").is_err());
+        assert!(serde_json::from_str::<RowRef>(r#""[\"row\"]""#).is_err());
+        assert!(serde_json::from_str::<RowRef>(r#""lix_row_ref:v1:not-base64!""#).is_err());
     }
 }

@@ -347,7 +347,7 @@ where
         let result = session
             .execute(
                 "SELECT value FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = CAST('[\"lix_account\"]' AS JSONB)",
+                 WHERE schema_key = 'lix_account'",
                 &[],
             )
             .await?;
@@ -383,7 +383,7 @@ where
                 let updated = session
                     .execute(
                         "UPDATE lix_registered_schema SET value = $1 \
-                         WHERE lixcol_row_pk = CAST('[\"lix_account\"]' AS JSONB)",
+                         WHERE schema_key = 'lix_account'",
                         &[crate::Value::Jsonb(target.clone().into())],
                     )
                     .await?;

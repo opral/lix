@@ -219,19 +219,41 @@ simulation_test!(state_at_matches_live_columns_and_unchanged_row_metadata, |sim|
         .await
         .expect("unrelated row should insert");
 
+    let columns = "key, value, lixcol_schema_key, lixcol_file_id, lixcol_metadata, \
+                   lixcol_created_at, lixcol_updated_at, lixcol_global, lixcol_change_id, \
+                   lixcol_commit_id, lixcol_untracked";
     let live = session
-        .execute("SELECT * FROM lix_key_value WHERE key = 'stable'", &[])
+        .execute(
+            &format!("SELECT {columns} FROM lix_key_value WHERE key = 'stable'"),
+            &[],
+        )
         .await
         .expect("live row should load");
     let historical = session
         .execute(
-            "SELECT * FROM lix_state_at('lix_key_value', $1) WHERE key = 'stable'",
+            &format!(
+                "SELECT {columns} FROM lix_state_at('lix_key_value', $1) WHERE key = 'stable'"
+            ),
             &[Value::Text(commit_id.clone())],
         )
         .await
         .expect("historical row should load");
     assert_eq!(historical.columns(), live.columns());
     assert_eq!(historical.rows(), live.rows());
+    let historical_star = session
+        .execute(
+            "SELECT * FROM lix_state_at('lix_key_value', $1) WHERE key = 'stable'",
+            &[Value::Text(commit_id.clone())],
+        )
+        .await
+        .expect("historical wildcard should load");
+    assert!(
+        historical_star
+            .columns()
+            .iter()
+            .all(|column| column != "lixcol_row_pk"),
+        "lix_state_at must not expose the durable JSON row key"
+    );
 });
 
 simulation_test!(state_at_omits_deleted_and_untracked_rows, |sim| async move {

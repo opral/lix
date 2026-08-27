@@ -1841,8 +1841,7 @@ where
                     serde_json::json!({
                         "change_id": row.change_id().to_string(),
                         "commit_id": commit_id.to_string(),
-                        "schema_key": row.schema_key(),
-                        "row_pk": row.row_pk().as_typed_json_array_value().ok(),
+                        "row_ref": crate::row_ref::schema_identity_detail(row.schema_key(), row.row_pk()),
                         "file_id": row.file_id(),
                     }),
                 ));
@@ -8542,12 +8541,9 @@ mod tests {
             .expect("internal invariant should retain entity coordinates");
         assert_eq!(details["change_id"], row.change_id.to_string());
         assert_eq!(details["commit_id"], commit_id.to_string());
-        assert_eq!(details["schema_key"], row.schema_key);
         assert_eq!(
-            details["row_pk"],
-            row.row_pk
-                .as_typed_json_array_value()
-                .expect("test row PK should encode")
+            details["row_ref"],
+            crate::row_ref::schema_identity_detail(&row.schema_key, &row.row_pk)
         );
     }
 

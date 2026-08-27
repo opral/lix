@@ -5159,19 +5159,18 @@ fn selected_tracked_ref_untracked_collision_error(
     branch_id: &str,
     identity: &TrackedStateKey,
 ) -> LixError {
+    let row_ref = crate::row_ref::schema_identity_detail(&identity.schema_key, &identity.row_pk);
     LixError::new(
         LixError::CODE_MERGE_CONFLICT,
         format!(
-            "cannot publish selected tracked change on branch '{branch_id}': it conflicts with an untracked current row for schema '{}' row_pk {:?}",
-            identity.schema_key, identity.row_pk
+            "cannot publish selected tracked change on branch '{branch_id}': row_ref {row_ref} conflicts with an untracked current row"
         ),
     )
     .with_hint("Resolve the tracked and untracked identity conflict before retrying.")
     .with_details(serde_json::json!({
         "kind": "trackedUntrackedIdentityCollision",
         "branchId": branch_id,
-        "schemaKey": &identity.schema_key,
-        "rowPk": &identity.row_pk,
+        "rowRef": row_ref,
         "fileId": &identity.file_id,
     }))
 }

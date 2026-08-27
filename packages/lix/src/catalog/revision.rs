@@ -129,7 +129,7 @@ mod tests {
         let no_op = session
             .execute(
                 "UPDATE lix_registered_schema SET value = value \
-                 WHERE lixcol_row_pk = CAST('[\"missing-schema\"]' AS JSONB)",
+                 WHERE schema_key = 'missing-schema'",
                 &[],
             )
             .await
@@ -179,7 +179,7 @@ mod tests {
         let amended = session
             .execute(
                 "UPDATE lix_registered_schema SET value = $1 \
-                 WHERE lixcol_row_pk = CAST('[\"tracked_revision_probe\"]' AS JSONB)",
+                 WHERE schema_key = 'tracked_revision_probe'",
                 &[Value::Jsonb(
                     test_schema("tracked_revision_probe", true).into(),
                 )],
@@ -193,7 +193,7 @@ mod tests {
         let delete_error = session
             .execute(
                 "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = CAST('[\"tracked_revision_probe\"]' AS JSONB)",
+                 WHERE schema_key = 'tracked_revision_probe'",
                 &[],
             )
             .await
