@@ -144,7 +144,7 @@ where
                 }
 
                 let (target_head, source_head) = async {
-                    let reader = transaction.branch_ref_reader().await;
+                    let reader = transaction.branch_ref_reader().await?;
                     let lifecycle = BranchLifecycle::new(&reader);
                     let target_head = lifecycle
                         .require_existing_commit_id(
@@ -166,14 +166,14 @@ where
                 .await?;
 
                 let merge_base = async {
-                    let mut reader = transaction.commit_graph_reader().await;
+                    let mut reader = transaction.commit_graph_reader().await?;
                     reader.merge_base(&target_head, &source_head).await
                 }
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_base"))
                 .await?;
 
                 let analysis = async {
-                    let mut reader = transaction.tracked_state_reader().await;
+                    let mut reader = transaction.tracked_state_reader().await?;
                     analyze(
                         &mut reader,
                         MergeCommits {
@@ -187,7 +187,7 @@ where
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_analysis"))
                 .await?;
                 let derived_blob_files = async {
-                    let mut reader = transaction.tracked_state_reader().await;
+                    let mut reader = transaction.tracked_state_reader().await?;
                     derived_plugin_blob_conflicts(&mut reader, &analysis).await
                 }
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_derived_blob_detection"))
@@ -204,7 +204,7 @@ where
                     .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_conflict_resolve"))
                     .await?;
                     async {
-                        let mut reader = transaction.tracked_state_reader().await;
+                        let mut reader = transaction.tracked_state_reader().await?;
                         plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows).await
                     }
                     .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_resolution_stats"))
@@ -244,7 +244,7 @@ where
             }
 
             let (target_head, source_head) = async {
-                let reader = transaction.branch_ref_reader().await;
+                let reader = transaction.branch_ref_reader().await?;
                 let lifecycle = BranchLifecycle::new(&reader);
                 let target_head = lifecycle
                     .require_existing_commit_id(
@@ -269,7 +269,7 @@ where
             .await?;
 
             let merge_base = async {
-                let mut reader = transaction.commit_graph_reader().await;
+                let mut reader = transaction.commit_graph_reader().await?;
                 reader.merge_base(&target_head, &source_head).await
             }
             .instrument(tracing::debug_span!(
@@ -279,7 +279,7 @@ where
             .await?;
             let base_commit_id = merge_base;
             let analysis = async {
-                let mut reader = transaction.tracked_state_reader().await;
+                let mut reader = transaction.tracked_state_reader().await?;
                 analyze(
                     &mut reader,
                     MergeCommits {
@@ -296,7 +296,7 @@ where
             ))
             .await?;
             let derived_blob_files = async {
-                let mut reader = transaction.tracked_state_reader().await;
+                let mut reader = transaction.tracked_state_reader().await?;
                 derived_plugin_blob_conflicts(&mut reader, &analysis).await
             }
             .instrument(tracing::debug_span!(
@@ -354,7 +354,7 @@ where
             ))
             .await?;
             let plugin_resolution_stats = async {
-                let mut reader = transaction.tracked_state_reader().await;
+                let mut reader = transaction.tracked_state_reader().await?;
                 plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows).await
             }
             .instrument(tracing::debug_span!(
@@ -364,7 +364,7 @@ where
             .await?;
 
             let semantic_rows = async {
-                let mut reader = transaction.tracked_state_reader().await;
+                let mut reader = transaction.tracked_state_reader().await?;
                 materialized_plugin_merge_rows(
                     &mut reader,
                     &analysis,
@@ -454,7 +454,7 @@ where
         self.with_write_transaction_lending(async move |transaction| {
             let active_branch_id = transaction.active_branch_id().to_string();
             let target_head = {
-                let reader = transaction.branch_ref_reader().await;
+                let reader = transaction.branch_ref_reader().await?;
                 BranchLifecycle::new(&reader)
                     .require_existing_commit_id(
                         &active_branch_id,
@@ -468,11 +468,11 @@ where
             }
 
             let base_commit_id = {
-                let mut reader = transaction.commit_graph_reader().await;
+                let mut reader = transaction.commit_graph_reader().await?;
                 reader.merge_base(&target_head, &source_head).await?
             };
             let analysis = {
-                let mut reader = transaction.tracked_state_reader().await;
+                let mut reader = transaction.tracked_state_reader().await?;
                 analyze(
                     &mut reader,
                     MergeCommits {
@@ -834,7 +834,7 @@ where
     // Historical reads finish before any Component is instantiated. All
     // merge input below owns or shares immutable buffers.
     let inputs = {
-        let mut reader = transaction.tracked_state_reader().await;
+        let mut reader = transaction.tracked_state_reader().await?;
         let base_rows = reader
             .load_projected_batch_at_commit(
                 &analysis.commits.base_commit_id.to_string(),

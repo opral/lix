@@ -8256,27 +8256,32 @@ where
     }
 
     /// Creates a branch-ref reader scoped to this write transaction.
-    pub(crate) async fn branch_ref_reader(&mut self) -> impl BranchRefReader + '_ {
+    pub(crate) async fn branch_ref_reader(
+        &mut self,
+    ) -> Result<impl BranchRefReader + '_, LixError> {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        self.branch_ctx
-            .ref_reader(SharedStorageAdapterRead::new(read))
+            .await?;
+        Ok(self
+            .branch_ctx
+            .ref_reader(SharedStorageAdapterRead::new(read)))
     }
 
     /// Creates a tracked-state reader scoped to this write transaction.
     pub(crate) async fn tracked_state_reader(
         &mut self,
-    ) -> TrackedStateStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
+    ) -> Result<
+        TrackedStateStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>>,
+        LixError,
+    > {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        self.tracked_state
-            .reader(SharedStorageAdapterRead::new(read))
+            .await?;
+        Ok(self
+            .tracked_state
+            .reader(SharedStorageAdapterRead::new(read)))
     }
 
     /// Returns the private compaction cursor bound to this transaction's
@@ -8307,13 +8312,15 @@ where
     /// Creates a commit-graph reader scoped to this write transaction.
     pub(crate) async fn commit_graph_reader(
         &mut self,
-    ) -> CommitGraphStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
+    ) -> Result<
+        CommitGraphStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>>,
+        LixError,
+    > {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open transaction read scope");
-        CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read))
+            .await?;
+        Ok(CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read)))
     }
 
     /// Applies a tracked-state transition resolved from two immutable commits.
@@ -8358,7 +8365,7 @@ where
         }
 
         let (current_rows, desired_rows) = {
-            let mut tracked = self.tracked_state_reader().await;
+            let mut tracked = self.tracked_state_reader().await?;
             let current_rows = tracked
                 .load_projected_batch_at_commit(
                     &current_commit_id.to_string(),
@@ -8864,7 +8871,7 @@ where
                     "lix_apply requires a selection from exactly one lix_diff(relation, from_commit_id, to_commit_id)",
                 )
             })?;
-            let mut tracked = self.tracked_state_reader().await;
+            let mut tracked = self.tracked_state_reader().await?;
             for request in &requests {
                 entries.extend(
                     tracked
@@ -8896,7 +8903,7 @@ where
                 if let Some(direct) = direct {
                     entries.extend(direct.diff.entries);
                 } else {
-                    let mut tracked = self.tracked_state_reader().await;
+                    let mut tracked = self.tracked_state_reader().await?;
                     entries.extend(
                         tracked
                             .diff_commits(
@@ -9164,7 +9171,7 @@ where
         let diff = match direct_diff {
             Some(direct) => direct.diff,
             None => {
-                let mut tracked = self.tracked_state_reader().await;
+                let mut tracked = self.tracked_state_reader().await?;
                 tracked
                     .diff_commits(
                         &previous_checkpoint_commit_id.to_string(),
@@ -11058,7 +11065,7 @@ where
             BranchReferenceRole::Target,
         )?;
         let head_commit_id = {
-            let reader = self.branch_ref_reader().await;
+            let reader = self.branch_ref_reader().await?;
             BranchLifecycle::new(&reader)
                 .require_existing_commit_id(
                     &branch_id,
@@ -11068,7 +11075,7 @@ where
                 .await?
         };
 
-        let mut commit_graph = self.commit_graph_reader().await;
+        let mut commit_graph = self.commit_graph_reader().await?;
         BranchLifecycle::require_existing_commit(
             &mut commit_graph,
             target_commit_id,
@@ -13455,7 +13462,7 @@ fn catalog_revision_is_current(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
     use serde_json::json;
@@ -13466,7 +13473,10 @@ mod tests {
     use crate::branch::BranchContext;
     use crate::engine::Engine;
     use crate::functions::{DeterministicFunctionProvider, FunctionProvider};
-    use crate::storage_adapter::{Memory, StorageReadOptions};
+    use crate::storage_adapter::{
+        Memory, MemoryRead, MemoryWrite, Storage, StorageError, StorageReadOptions,
+        StorageSessionToken, StorageWriteOptions,
+    };
     use crate::tracked_state::{
         TrackedStateDiffIdentity, TrackedStateKey, TrackedStateScanRequest,
     };
@@ -13493,7 +13503,93 @@ mod tests {
         HotStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
     }
 
+    #[derive(Clone)]
+    struct OneShotExpiringStorage {
+        inner: Memory,
+        expire_next_read: Arc<AtomicBool>,
+    }
+
+    impl Storage for OneShotExpiringStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(
+            &self,
+            options: StorageReadOptions,
+        ) -> Result<Self::Read<'_>, StorageError> {
+            if self.expire_next_read.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::ReadExpired);
+            }
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: StorageWriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    #[tokio::test]
+    async fn transaction_reader_open_expiry_is_returned_instead_of_panicking() {
+        let inner = Memory::new();
+        seed_visible_schema_rows(StorageAdapter::new(inner.clone())).await;
+        let expire_next_read = Arc::new(AtomicBool::new(false));
+        let storage = StorageAdapter::new(OneShotExpiringStorage {
+            inner,
+            expire_next_read: Arc::clone(&expire_next_read),
+        });
+        let opened = open_transaction(
+            &SessionBranch::new(GLOBAL_BRANCH_ID.to_string()),
+            crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            storage,
+            Arc::new(hot_state_context()),
+            Arc::new(TrackedStateContext::new()),
+            Arc::new(BinaryCasContext::new()),
+            PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
+            Arc::new(BranchContext::new()),
+            Arc::new(CatalogContext::new()),
+            Arc::new(SqlPlanningCache::default()),
+            SessionFileViews::default(),
+        )
+        .await
+        .expect("transaction should open");
+        let mut transaction = opened.transaction;
+
+        expire_next_read.store(true, Ordering::SeqCst);
+        let error = match transaction.tracked_state_reader().await {
+            Ok(_) => panic!("tracked-state reader should return the expired read"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+
+        expire_next_read.store(true, Ordering::SeqCst);
+        let error = match transaction.branch_ref_reader().await {
+            Ok(_) => panic!("branch-ref reader should return the expired read"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+
+        expire_next_read.store(true, Ordering::SeqCst);
+        let error = match transaction.commit_graph_reader().await {
+            Ok(_) => panic!("commit-graph reader should return the expired read"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+    }
 
     #[test]
     fn semantic_conflict_limits_scale_host_owned_records_but_not_bytes_or_deadline() {

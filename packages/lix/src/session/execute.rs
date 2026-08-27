@@ -1476,7 +1476,8 @@ where
             }
             let sql_for_error = sql.to_string();
             let params = params.to_vec();
-            let mut auto_commit_retries = 0;
+            let mut transaction_conflict_retries = 0;
+            let mut expired_read_retries = ExpiredReadRetryState::default();
             loop {
                 let write_access = self.begin_session_write_access().await?;
                 let sql_for_planning = sql_for_error.clone();
@@ -1514,10 +1515,18 @@ where
                     .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
                 match result {
                     Ok(result) => return Ok(result),
-                    Err(error) if consume_auto_commit_retry(&mut auto_commit_retries, &error) => {
-                        continue;
+                    Err(error) => {
+                        if retry_auto_commit(
+                            &mut transaction_conflict_retries,
+                            &mut expired_read_retries,
+                            &error,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    Err(error) => return Err(error),
                 }
             }
         }
@@ -1805,79 +1814,107 @@ where
         metadata: ExecuteStatementMetadata,
         idempotency: ExecuteIdempotency,
     ) -> Result<ExecuteResult, LixError> {
+        let mut expired_read_retries = ExpiredReadRetryState::default();
         if let IdempotencyReceiptResolution::Replay(receipt) =
-            self.resolve_idempotency_receipt(&idempotency).await?
+            self.resolve_idempotency_receipt_with_expired_read_retry(
+                &idempotency,
+                &mut expired_read_retries,
+            )
+            .await?
         {
             return receipt.into_single_result();
         }
 
-        let write_access = self.begin_session_write_access().await?;
         let sql_for_error = sql.to_string();
-        let sql_for_planning = sql_for_error.clone();
         let params = params.to_vec();
-        // The original identity is retained for post-commit recovery. The
-        // transaction closure owns its own copy because its future may outlive
-        // this call's immediate stack frame while the write lease is held.
-        let idempotency_for_commit = idempotency.clone();
-        let result = self
-            .with_write_transaction_reserved_lending(
-                write_access,
-                async move |transaction| {
-                    let previous_origin_key = transaction.replace_origin_key(options.origin_key);
-                    let result = async {
-                        let tx_plan = transaction
-                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                        let result = execute_prepared_transaction_write(
-                            transaction,
-                            tx_plan,
-                            &params,
-                            &metadata,
-                        )
-                        .await?;
-                        let result = ExecuteResult::from_sql_write_result(result);
-                        let receipt =
-                            ExecuteIdempotencyReceipt::single(&idempotency_for_commit, &result)?;
-                        transaction
-                            .stage_execute_idempotency_receipt(&idempotency_for_commit, &receipt)?;
-                        Ok(result)
-                    }
-                    .await;
-                    transaction.replace_origin_key(previous_origin_key);
-                    result
-                },
-                |_| Ok(()),
-            )
-            .await
-            .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
+        loop {
+            let write_access = self.begin_session_write_access().await?;
+            let sql_for_planning = sql_for_error.clone();
+            let statement = statement.clone();
+            let params = params.clone();
+            let options = options.clone();
+            let metadata = metadata.clone();
+            // Every retry retains the original identity. A transaction closure
+            // owns its copy because its future may outlive this call's immediate
+            // stack frame while the write lease is held.
+            let idempotency_for_commit = idempotency.clone();
+            let result = self
+                .with_write_transaction_reserved_lending(
+                    write_access,
+                    async move |transaction| {
+                        let previous_origin_key =
+                            transaction.replace_origin_key(options.origin_key);
+                        let result = async {
+                            let tx_plan = transaction
+                                .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                            let result = execute_prepared_transaction_write(
+                                transaction,
+                                tx_plan,
+                                &params,
+                                &metadata,
+                            )
+                            .await?;
+                            let result = ExecuteResult::from_sql_write_result(result);
+                            let receipt = ExecuteIdempotencyReceipt::single(
+                                &idempotency_for_commit,
+                                &result,
+                            )?;
+                            transaction.stage_execute_idempotency_receipt(
+                                &idempotency_for_commit,
+                                &receipt,
+                            )?;
+                            Ok(result)
+                        }
+                        .await;
+                        transaction.replace_origin_key(previous_origin_key);
+                        result
+                    },
+                    |_| Ok(()),
+                )
+                .await
+                .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
 
-        match result {
-            Ok(result) => Ok(result),
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    LixError::CODE_TRANSACTION_CONFLICT
-                        | LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
-                ) =>
-            {
-                match self.resolve_idempotency_receipt(&idempotency).await {
-                    Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
-                        // `Transaction::commit` did not return normally, so
-                        // its usual invalidation path was skipped. A remote
-                        // receipt proves that this transaction did publish;
-                        // wake local observers before acknowledging recovery.
-                        self.observe_invalidation.bump();
-                        // Post-commit plugin actor publication is also
-                        // skipped on the ambiguous path. Drop private views
-                        // rather than let a stale acknowledgement poison the
-                        // next plugin-backed edit.
-                        self.file_views.clear();
-                        receipt.into_single_result()
-                    }
-                    Ok(IdempotencyReceiptResolution::Absent) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
+            match result {
+                Ok(result) => return Ok(result),
+                Err(error)
+                    if error.code == LixError::CODE_STORAGE_READ_EXPIRED
+                        && retry_expired_auto_commit(&mut expired_read_retries, &error).await =>
+                {
+                    continue;
                 }
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        LixError::CODE_TRANSACTION_CONFLICT
+                            | LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+                    ) =>
+                {
+                    return match self
+                        .resolve_idempotency_receipt_with_expired_read_retry(
+                            &idempotency,
+                            &mut expired_read_retries,
+                        )
+                        .await
+                    {
+                        Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
+                            // `Transaction::commit` did not return normally, so
+                            // its usual invalidation path was skipped. A remote
+                            // receipt proves that this transaction did publish;
+                            // wake local observers before acknowledging recovery.
+                            self.observe_invalidation.bump();
+                            // Post-commit plugin actor publication is also
+                            // skipped on the ambiguous path. Drop private views
+                            // rather than let a stale acknowledgement poison the
+                            // next plugin-backed edit.
+                            self.file_views.clear();
+                            receipt.into_single_result()
+                        }
+                        Ok(IdempotencyReceiptResolution::Absent) => Err(error),
+                        Err(recovery_error) => Err(recovery_error),
+                    };
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -1911,6 +1948,24 @@ where
         };
         Self::require_matching_idempotency_receipt(&durable, idempotency)?;
         Ok(IdempotencyReceiptResolution::Replay(durable))
+    }
+
+    async fn resolve_idempotency_receipt_with_expired_read_retry(
+        &self,
+        idempotency: &ExecuteIdempotency,
+        expired_read_retries: &mut ExpiredReadRetryState,
+    ) -> Result<IdempotencyReceiptResolution, LixError> {
+        loop {
+            match self.resolve_idempotency_receipt(idempotency).await {
+                Err(error)
+                    if error.code == LixError::CODE_STORAGE_READ_EXPIRED
+                        && retry_expired_auto_commit(expired_read_retries, &error).await =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn load_idempotency_receipt(
@@ -2189,30 +2244,52 @@ where
                         )
                         .await;
                 };
-                if let IdempotencyReceiptResolution::Replay(receipt) =
-                    self.resolve_idempotency_receipt(&idempotency).await?
+                let mut expired_read_retries = ExpiredReadRetryState::default();
+                if let IdempotencyReceiptResolution::Replay(receipt) = self
+                    .resolve_idempotency_receipt_with_expired_read_retry(
+                        &idempotency,
+                        &mut expired_read_retries,
+                    )
+                    .await?
                 {
                     return receipt.into_results();
                 }
-                let result = self
-                    .execute_transaction_batch(
-                        statements,
-                        parsed,
-                        options,
-                        statement_metadata,
-                        Some(idempotency.clone()),
-                    )
-                    .await;
-                match result {
-                    Ok(results) => Ok(results),
-                    Err(error)
-                        if matches!(
-                            error.code.as_str(),
-                            LixError::CODE_TRANSACTION_CONFLICT
-                                | LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
-                        ) =>
-                    {
-                        match self.resolve_idempotency_receipt(&idempotency).await {
+                loop {
+                    let result = self
+                        .execute_transaction_batch(
+                            statements,
+                            parsed.clone(),
+                            options.clone(),
+                            statement_metadata.clone(),
+                            Some(idempotency.clone()),
+                        )
+                        .await;
+                    match result {
+                        Ok(results) => return Ok(results),
+                        Err(error)
+                            if error.code == LixError::CODE_STORAGE_READ_EXPIRED
+                                && retry_expired_auto_commit(
+                                    &mut expired_read_retries,
+                                    &error,
+                                )
+                                .await =>
+                        {
+                            continue;
+                        }
+                        Err(error)
+                            if matches!(
+                                error.code.as_str(),
+                                LixError::CODE_TRANSACTION_CONFLICT
+                                    | LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+                            ) =>
+                        {
+                            return match self
+                                .resolve_idempotency_receipt_with_expired_read_retry(
+                                    &idempotency,
+                                    &mut expired_read_retries,
+                                )
+                                .await
+                            {
                             Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
                                 // See the single-statement recovery path:
                                 // positive receipt proof means a commit
@@ -2224,9 +2301,10 @@ where
                             }
                             Ok(IdempotencyReceiptResolution::Absent) => Err(error),
                             Err(recovery_error) => Err(recovery_error),
+                            };
                         }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => Err(error),
                 }
             }
         }
@@ -2239,7 +2317,8 @@ where
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let mut auto_commit_retries = 0;
+        let mut transaction_conflict_retries = 0;
+        let mut expired_read_retries = ExpiredReadRetryState::default();
         loop {
             let result = self
                 .execute_transaction_batch(
@@ -2252,10 +2331,18 @@ where
                 .await;
             match result {
                 Ok(results) => return Ok(results),
-                Err(error) if consume_auto_commit_retry(&mut auto_commit_retries, &error) => {
-                    continue;
+                Err(error) => {
+                    if retry_auto_commit(
+                        &mut transaction_conflict_retries,
+                        &mut expired_read_retries,
+                        &error,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             }
         }
     }
@@ -5544,15 +5631,37 @@ async fn retry_expired_read_with_write_quiescence(
     true
 }
 
-fn consume_auto_commit_retry(retries: &mut usize, error: &LixError) -> bool {
-    if !matches!(
-        error.code.as_str(),
-        LixError::CODE_STORAGE_READ_EXPIRED | LixError::CODE_TRANSACTION_CONFLICT
-    ) || *retries >= MAX_AUTO_COMMIT_RETRIES
+async fn retry_auto_commit(
+    conflict_retries: &mut usize,
+    expired_read_retries: &mut ExpiredReadRetryState,
+    error: &LixError,
+) -> bool {
+    if retry_expired_auto_commit(expired_read_retries, error).await {
+        return true;
+    }
+
+    if error.code != LixError::CODE_TRANSACTION_CONFLICT
+        || *conflict_retries >= MAX_AUTO_COMMIT_RETRIES
     {
         return false;
     }
-    *retries += 1;
+    *conflict_retries += 1;
+    true
+}
+
+async fn retry_expired_auto_commit(
+    expired_read_retries: &mut ExpiredReadRetryState,
+    error: &LixError,
+) -> bool {
+    let Some(delay) = expired_read_retries.next_delay(error) else {
+        return false;
+    };
+    // A cross-context owner transfer cannot finish while one WASM event-loop
+    // turn continuously tears down and reopens transactions.
+    tokio::task::yield_now().await;
+    if !delay.is_zero() {
+        crate::sync::sleep(delay).await;
+    }
     true
 }
 
@@ -5566,6 +5675,9 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
     use crate::row_pk::RowPk;
+    use crate::storage_adapter::{
+        MemoryRead, MemoryWrite, StorageError, StorageSessionToken,
+    };
     use crate::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, TelemetryValue};
     use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
     use crate::{
@@ -5582,6 +5694,226 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         engine.open_session().await.expect("session should open")
+    }
+
+    #[derive(Clone)]
+    struct RepeatedExpiringStorage {
+        inner: Memory,
+        schedule: Arc<StdMutex<Option<ExpirySchedule>>>,
+    }
+
+    struct ExpirySchedule {
+        reads_until_expiry: usize,
+        remaining_expiries: usize,
+    }
+
+    impl RepeatedExpiringStorage {
+        fn new() -> Self {
+            Self {
+                inner: Memory::new(),
+                schedule: Arc::new(StdMutex::new(None)),
+            }
+        }
+
+        fn expire_after_each_transaction_open(&self, count: usize) {
+            self.expire_after_reads(1, count);
+        }
+
+        fn expire_after_reads(&self, reads_until_expiry: usize, count: usize) {
+            assert!(count > 0);
+            *self.schedule.lock().expect("expiry schedule should lock") =
+                Some(ExpirySchedule {
+                    reads_until_expiry,
+                    remaining_expiries: count,
+                });
+        }
+
+        fn remaining_expiries(&self) -> usize {
+            self.schedule
+                .lock()
+                .expect("expiry schedule should lock")
+                .as_ref()
+                .map_or(0, |schedule| schedule.remaining_expiries)
+        }
+    }
+
+    impl Storage for RepeatedExpiringStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(
+            &self,
+            options: StorageReadOptions,
+        ) -> Result<Self::Read<'_>, StorageError> {
+            let should_expire = {
+                let mut state = self.schedule.lock().expect("expiry schedule should lock");
+                match state.as_mut() {
+                    None => false,
+                    Some(schedule) if schedule.reads_until_expiry > 0 => {
+                        schedule.reads_until_expiry -= 1;
+                        false
+                    }
+                    Some(schedule) => {
+                        schedule.remaining_expiries -= 1;
+                        if schedule.remaining_expiries == 0 {
+                            *state = None;
+                        } else {
+                            schedule.reads_until_expiry = 1;
+                        }
+                        true
+                    }
+                }
+            };
+            if should_expire {
+                Err(StorageError::ReadExpired)
+            } else {
+                self.inner.begin_read(options).await
+            }
+        }
+
+        async fn begin_write(
+            &self,
+            options: StorageWriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_commit_retries_repeated_expired_transaction_reader_opens() {
+        let storage = RepeatedExpiringStorage::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized storage should create engine");
+        let session = engine.open_session().await.expect("session should open");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('retry-revert', 'value')",
+                &[],
+            )
+            .await
+            .expect("seed row should commit");
+
+        // Every attempt opens its coherent transaction read first; the next
+        // read is the tracked-state reader used to resolve lix_revert.
+        storage.expire_after_each_transaction_open(3);
+        let reverted = session
+            .execute(
+                "INSERT INTO lix_revert (relation, row_pk) \
+                 SELECT 'lix_key_value', lixcol_row_pk \
+                 FROM lix_diff(\
+                   'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
+                 ) \
+                 WHERE lixcol_row_pk = CAST('[\"retry-revert\"]' AS JSONB)",
+                &[],
+            )
+            .await
+            .expect("revert should outlast transient transaction-reader expiry");
+
+        assert_eq!(reverted.rows_affected(), 1);
+        assert_eq!(storage.remaining_expiries(), 0);
+        let live = session
+            .execute(
+                "SELECT key FROM lix_key_value WHERE key = 'retry-revert'",
+                &[],
+            )
+            .await
+            .expect("live row should read");
+        assert!(live.rows().is_empty(), "revert should remove the live row");
+        let history = session
+            .execute(
+                "SELECT COUNT(*) AS count \
+                 FROM lix_history('lix_key_value') \
+                 WHERE key = 'retry-revert'",
+                &[],
+            )
+            .await
+            .expect("history should read");
+        assert_eq!(
+            history.rows()[0].get::<i64>("count"),
+            Ok(2),
+            "three failed attempts must still publish exactly one revert"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_auto_commit_retries_expired_transaction_reader_opens() {
+        let storage = RepeatedExpiringStorage::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized storage should create engine");
+        let session = engine.open_session().await.expect("session should open");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('idempotent-revert', 'value')",
+                &[],
+            )
+            .await
+            .expect("seed row should commit");
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should load");
+        let idempotency = ExecuteIdempotency::new(
+            Some("retry-test".to_string()),
+            "idempotent-revert-key".to_string(),
+            [7; 32],
+        )
+        .with_branch(branch_id);
+        let sql = "INSERT INTO lix_revert (relation, row_pk) \
+                   SELECT 'lix_key_value', lixcol_row_pk \
+                   FROM lix_diff(\
+                     'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
+                   ) \
+                   WHERE lixcol_row_pk = CAST('[\"idempotent-revert\"]' AS JSONB)";
+
+        // The first read checks for a pre-existing receipt, then every attempt
+        // opens its coherent transaction read before the tracked-state reader.
+        storage.expire_after_reads(2, 3);
+        let reverted = session
+            .execute_with_kind(
+                sql,
+                &[],
+                ExecuteOptions::default(),
+                ExecuteStatementMetadata::default(),
+                "execute",
+                Some(idempotency.clone()),
+                true,
+            )
+            .await
+            .expect("idempotent revert should retry transient reader expiry");
+        assert_eq!(reverted.rows_affected(), 1);
+        assert_eq!(storage.remaining_expiries(), 0);
+        let history = session
+            .execute(
+                "SELECT COUNT(*) AS count \
+                 FROM lix_history('lix_key_value') \
+                 WHERE key = 'idempotent-revert'",
+                &[],
+            )
+            .await
+            .expect("history should read");
+        assert_eq!(
+            history.rows()[0].get::<i64>("count"),
+            Ok(2),
+            "idempotent retries must publish one revert"
+        );
     }
 
     #[tokio::test]
