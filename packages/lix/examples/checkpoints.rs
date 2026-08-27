@@ -21,18 +21,19 @@ async fn main() -> Result<(), LixError> {
 
     let working_diffs = lix
         .execute(
-            "SELECT lixcol_row_pk, diff_type, from_value, to_value
+            "SELECT row_ref, key, diff_type, from_value, to_value
              FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id())
-             ORDER BY lixcol_row_pk",
+             ORDER BY key",
             &[Value::Text(initial_checkpoint)],
         )
         .await?;
 
     for row in working_diffs.rows() {
         // Row::get<T> performs typed extraction from ExecuteResult.
-        let row_pk = row.get::<serde_json::Value>("lixcol_row_pk")?;
+        let row_ref = row.get::<lix::RowRef>("row_ref")?;
+        let key = row.get::<String>("key")?;
         let diff_type = row.get::<String>("diff_type")?;
-        println!("{diff_type} lix_key_value {row_pk}");
+        println!("{diff_type} lix_key_value {key} ({row_ref})");
     }
     let checkpoint = lix
         .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
