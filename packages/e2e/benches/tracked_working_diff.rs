@@ -51,9 +51,9 @@ const DEFAULT_UNRELATED_HISTORY_WIDTH: usize = 1;
 const UNRELATED_HISTORY_STORAGE_BATCH: usize = 100_000;
 const INSERT_BATCH_SIZE: usize = 500;
 const MERGE_PREVIEW_SOURCE_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000901";
-const WORKING_DIFF_SQL: &str = "SELECT lixcol_row_pk, diff_type, row_count \
+const WORKING_DIFF_SQL: &str = "SELECT row_ref, key, diff_type, row_count \
     FROM lix_diff('working_diff_row', $1, lix_active_branch_commit_id()) \
-    ORDER BY lixcol_row_pk";
+    ORDER BY key";
 
 #[derive(Clone, Copy)]
 enum Shape {

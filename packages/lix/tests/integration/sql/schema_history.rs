@@ -31,8 +31,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_history_schema \
-                 (lixcol_row_pk, id, count, active, meta, lixcol_untracked) \
-                 VALUES (CAST('[\"history-row\"]' AS JSONB), 'history-row', 1, true, CAST('{\"source\":\"insert\"}' AS JSONB), false)",
+                 (id, count, active, meta, lixcol_untracked) \
+                 VALUES ('history-row', 1, true, CAST('{\"source\":\"insert\"}' AS JSONB), false)",
                 &[],
             )
             .await
@@ -47,7 +47,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_history_schema \
                  SET count = 2, active = false, meta = CAST('{\"source\":\"update\"}' AS JSONB) \
-                 WHERE lixcol_row_pk = CAST('[\"history-row\"]' AS JSONB)",
+                 WHERE id = 'history-row'",
                 &[],
             )
             .await
@@ -62,9 +62,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, count, active, meta, lixcol_row_pk, lixcol_observed_commit_id, lixcol_is_deleted, lixcol_depth \
+                    "SELECT id, count, active, meta, lixcol_observed_commit_id, lixcol_is_deleted, lixcol_depth \
                      FROM lix_history('engine_history_schema', '{second_commit_id}') \
-                     WHERE lixcol_row_pk = CAST('[\"history-row\"]' AS JSONB) \
+                     WHERE id = 'history-row' \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -80,7 +80,6 @@ simulation_test!(
                     Value::Integer(2),
                     Value::Boolean(false),
                     Value::Jsonb(json!({"source": "update"}).into()),
-                    Value::Jsonb(json!(["history-row"]).into()),
                     Value::Text(second_commit_id.clone()),
                     Value::Boolean(false),
                     Value::Integer(0),
@@ -90,7 +89,6 @@ simulation_test!(
                     Value::Integer(1),
                     Value::Boolean(true),
                     Value::Jsonb(json!({"source": "insert"}).into()),
-                    Value::Jsonb(json!(["history-row"]).into()),
                     Value::Text(first_commit_id),
                     Value::Boolean(false),
                     Value::Integer(1),
@@ -126,8 +124,8 @@ simulation_test!(row_history_defaults_to_active_head, |sim| async move {
     session
         .execute(
             "INSERT INTO engine_history_error_schema \
-                 (lixcol_row_pk, id, lixcol_untracked) \
-                 VALUES (CAST('[\"history-default\"]' AS JSONB), 'history-default', false)",
+                 (id, lixcol_untracked) \
+                 VALUES ('history-default', false)",
             &[],
         )
         .await

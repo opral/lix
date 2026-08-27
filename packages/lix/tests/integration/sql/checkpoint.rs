@@ -33,9 +33,9 @@ async fn checkpoints_example_sql_contract() {
         .expect("active head commit ID should decode");
     let working_diffs = lix
         .execute(
-            "SELECT lixcol_row_pk, diff_type
+            "SELECT key, diff_type
              FROM lix_diff('lix_key_value', $1, $2)
-             ORDER BY lixcol_row_pk",
+             ORDER BY key",
             &[Value::Text(root_commit_id), Value::Text(head_commit_id)],
         )
         .await
@@ -43,9 +43,9 @@ async fn checkpoints_example_sql_contract() {
     assert_eq!(working_diffs.len(), 1);
     assert_eq!(
         working_diffs.rows()[0]
-            .get::<serde_json::Value>("lixcol_row_pk")
-            .expect("row_pk is JSON"),
-        json!(["checkpoint-demo"])
+            .get::<String>("key")
+            .expect("key is text"),
+        "checkpoint-demo"
     );
     assert_eq!(
         working_diffs.rows()[0]
@@ -152,7 +152,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT key, diff_type FROM {} ORDER BY key",
                     key_value_diff_relation(&session).await
                 ),
             )
@@ -166,8 +166,8 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_row_pk, diff_type FROM {} \
-                     WHERE lixcol_row_pk = CAST('[\"checkpoint-key\"]' AS JSONB)",
+                    "SELECT key, diff_type FROM {} \
+                     WHERE key = 'checkpoint-key'",
                     key_value_diff_relation(&session).await
                 ),
             )
@@ -181,8 +181,8 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_row_pk FROM {} \
-                     WHERE lixcol_row_pk = CAST('[\"other-key\"]' AS JSONB)",
+                    "SELECT key FROM {} \
+                     WHERE key = 'other-key'",
                     key_value_diff_relation(&session).await
                 ),
             )
@@ -518,7 +518,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT key, diff_type FROM {} ORDER BY key",
                     key_value_diff_relation(&session).await
                 ),
             )
@@ -540,7 +540,7 @@ simulation_test!(
                 &session,
                 &format!(
                     "SELECT diff_type FROM {} \
-                     WHERE lixcol_row_pk = CAST('[\"working-removed\"]' AS JSONB)",
+                     WHERE key = 'working-removed'",
                     key_value_diff_relation(&session).await
                 ),
             )

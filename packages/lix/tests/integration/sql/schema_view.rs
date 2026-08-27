@@ -55,7 +55,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT lixcol_row_pk FROM pushdown_note WHERE kind = 'todo'",
+                "SELECT id FROM pushdown_note WHERE kind = 'todo'",
                 &[],
             )
             .await

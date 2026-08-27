@@ -562,14 +562,14 @@ simulation_test!(state_at_branch_scopes_compose_with_local_shadow_history, |sim|
     let composed = local
         .execute(
             "WITH ranked_local_history AS ( \
-                 SELECT lixcol_row_pk, lixcol_file_id, \
+                 SELECT lixcol_row_ref, lixcol_file_id, \
                         row_number() OVER ( \
-                            PARTITION BY lixcol_row_pk, lixcol_file_id \
+                            PARTITION BY lixcol_row_ref, lixcol_file_id \
                             ORDER BY lixcol_depth, lixcol_observed_commit_id, lixcol_change_id \
                         ) AS rn \
                  FROM lix_history('lix_key_value', $1) \
              ), local_shadow AS ( \
-                 SELECT lixcol_row_pk, lixcol_file_id \
+                 SELECT lixcol_row_ref, lixcol_file_id \
                  FROM ranked_local_history WHERE rn = 1 \
              ), local_state AS ( \
                  SELECT * FROM lix_state_at('lix_key_value', $1) \
@@ -584,7 +584,7 @@ simulation_test!(state_at_branch_scopes_compose_with_local_shadow_history, |sim|
              FROM global_state \
              WHERE NOT EXISTS ( \
                  SELECT 1 FROM local_shadow \
-                 WHERE local_shadow.lixcol_row_pk = global_state.lixcol_row_pk \
+                 WHERE local_shadow.lixcol_row_ref = global_state.lixcol_row_ref \
                    AND local_shadow.lixcol_file_id \
                        IS NOT DISTINCT FROM global_state.lixcol_file_id \
              ) \

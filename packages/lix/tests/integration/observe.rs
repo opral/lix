@@ -98,13 +98,13 @@ simulation_test!(
         let (raw_session, session) = open_default_session(&sim, &engine).await;
         let mut events = raw_session
             .observe(
-                "SELECT lixcol_row_pk, diff_type \
+                "SELECT key, diff_type \
                  FROM lix_diff(\
                    'lix_key_value', \
                    lix_latest_checkpoint_commit_id(), \
                    lix_active_branch_commit_id()\
                  ) \
-                 ORDER BY lixcol_row_pk",
+                 ORDER BY key",
                 &[],
             )
             .expect("checkpoint-to-head diff should open as one observed query");

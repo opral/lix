@@ -363,7 +363,7 @@ where
 {
     let result = lix
         .execute(
-            "SELECT lixcol_row_pk, id, order_key, content_base64 \
+            "SELECT id, order_key, content_base64 \
              FROM text_line WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.to_owned())],
         )
@@ -374,12 +374,6 @@ where
         .iter()
         .map(|row| {
             let id = row.get::<String>("id").expect("line id should be text");
-            assert_eq!(
-                row.get::<serde_json::Value>("lixcol_row_pk")
-                    .expect("line primary key should be JSON"),
-                serde_json::json!([id.clone()]),
-                "line snapshot identity must equal its durable primary key"
-            );
             GitTextLine {
                 id,
                 order_key: row

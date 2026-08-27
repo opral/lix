@@ -29,16 +29,14 @@ simulation_test!(relation_diff_pairs_schema_columns_and_inverts_sides, |sim| asy
         select_rows(
             &session,
             &format!(
-                "SELECT lixcol_row_pk, diff_type, from_key, to_key, from_value, to_value, row_count \
+                "SELECT key, diff_type, from_value, to_value, row_count \
                  FROM lix_diff('lix_key_value', '{baseline}', '{inserted}')"
             ),
         )
         .await,
         vec![vec![
-            Value::Jsonb(json!(["note"]).into()),
-            Value::Text("added".to_string()),
-            Value::Null,
             Value::Text("note".to_string()),
+            Value::Text("added".to_string()),
             Value::Null,
             Value::Jsonb(json!("first").into()),
             Value::Integer(1),
@@ -49,15 +47,13 @@ simulation_test!(relation_diff_pairs_schema_columns_and_inverts_sides, |sim| asy
         select_rows(
             &session,
             &format!(
-                "SELECT diff_type, from_key, to_key, from_value, to_value \
+                "SELECT diff_type, from_value, to_value \
                  FROM lix_diff('lix_key_value', '{inserted}', '{baseline}')"
             ),
         )
         .await,
         vec![vec![
             Value::Text("removed".to_string()),
-            Value::Text("note".to_string()),
-            Value::Null,
             Value::Jsonb(json!("first").into()),
             Value::Null,
         ]]
@@ -79,7 +75,7 @@ simulation_test!(relation_diff_pairs_schema_columns_and_inverts_sides, |sim| asy
             &session,
             "SELECT count(*) FROM lix_diff(\
                  'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
-             ) WHERE lixcol_row_pk = CAST('[\"note\"]' AS JSONB)",
+             ) WHERE key = 'note'",
         )
         .await,
         vec![vec![Value::Integer(1)]],
@@ -105,7 +101,7 @@ simulation_test!(relation_diff_pairs_schema_columns_and_inverts_sides, |sim| asy
             &format!(
                 "SELECT diff_type, from_value, to_value, row_count \
                  FROM lix_diff('lix_key_value', '{inserted}', '{updated}') \
-                 WHERE lixcol_row_pk = CAST('[\"note\"]' AS JSONB)"
+                 WHERE key = 'note'"
             ),
         )
         .await,
@@ -230,7 +226,7 @@ simulation_test!(working_diff_span_reports_global_provenance, |sim| async move {
             &session,
             "SELECT from_lixcol_global, to_lixcol_global \
              FROM lix_diff('lix_key_value', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()) \
-             WHERE lixcol_row_pk = CAST('[\"shadowed\"]' AS JSONB)",
+             WHERE key = 'shadowed'",
         )
         .await,
         vec![vec![Value::Boolean(true), Value::Boolean(false)]],
@@ -262,7 +258,7 @@ simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |si
     let added = select_rows(
         &session,
         &format!(
-            "SELECT lixcol_row_pk, diff_type, from_path, to_path, row_count \
+            "SELECT id, diff_type, from_path, to_path, row_count \
              FROM lix_diff('lix_file', '{baseline}', '{inserted}')"
         ),
     )
@@ -290,23 +286,20 @@ simulation_test!(relation_diff_aggregates_files_and_preserves_removed_paths, |si
         "reversing a file addition swaps sides and inverts its classification",
     );
     let file_id = match &added[0][0] {
-        Value::Jsonb(row_pk) => row_pk.to_value()[0]
-            .as_str()
-            .expect("file row identity is a UUID")
-            .to_string(),
-        other => panic!("file row identity should be JSONB, got {other:?}"),
+        Value::Text(id) => id.clone(),
+        other => panic!("file row identity should be text, got {other:?}"),
     };
     assert_eq!(
         select_rows(
             &session,
             &format!(
                 "SELECT count(*) FROM lix_diff('lix_file', '{baseline}', '{inserted}') \
-                 WHERE lixcol_row_pk ->> 0 = '{file_id}'"
+                 WHERE id = '{file_id}'"
             ),
         )
         .await,
         vec![vec![Value::Integer(1)]],
-        "JSON row-identity extraction remains a pushed file-scoped filter",
+        "typed primary-key equality remains a pushed file-scoped filter",
     );
     assert_eq!(
         select_rows(
@@ -562,7 +555,7 @@ simulation_test!(relation_diff_fences_machinery_from_user_column_names, |sim| as
         select_rows(
             &session,
             &format!(
-                "SELECT lixcol_row_pk, diff_type, row_count, \
+                "SELECT id, diff_type, row_count, \
                  from_diff_type, to_diff_type, from_row_count, to_row_count, \
                  from_depth, to_depth, from_from_path, to_from_path \
                  FROM lix_diff('diff_name_collision', '{baseline}', '{head}')"
@@ -570,7 +563,7 @@ simulation_test!(relation_diff_fences_machinery_from_user_column_names, |sim| as
         )
         .await,
         vec![vec![
-            Value::Jsonb(json!(["row-1"]).into()),
+            Value::Text("row-1".to_string()),
             Value::Text("added".to_string()),
             Value::Integer(1),
             Value::Null,

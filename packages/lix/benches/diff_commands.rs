@@ -127,9 +127,9 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk FROM {WORKING_SOURCE} \
-                 ORDER BY lixcol_row_pk LIMIT {selected}"
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref FROM {WORKING_SOURCE} \
+                 ORDER BY key LIMIT {selected}"
             ),
         )
         .await;
@@ -141,10 +141,10 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "INSERT INTO lix_apply (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk \
+                "INSERT INTO lix_apply (row_ref) \
+                 SELECT row_ref \
                  FROM lix_diff('lix_key_value', '{baseline}', '{head}') \
-                 ORDER BY lixcol_row_pk LIMIT {selected}"
+                 ORDER BY key LIMIT {selected}"
             ),
         )
         .await;
@@ -157,9 +157,9 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk FROM {WORKING_SOURCE} \
-                 ORDER BY lixcol_row_pk LIMIT {checkpoint_selected}"
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+                 SELECT row_ref FROM {WORKING_SOURCE} \
+                 ORDER BY key LIMIT {checkpoint_selected}))"
             ),
         )
         .await;
@@ -230,11 +230,19 @@ async fn apply_fixture(rows: usize, selected: usize) -> (Lix<Memory>, String) {
 }
 
 fn command_sql(command: &str, source: &str, extra_predicate: &str, selected: usize) -> String {
+    if command == "lix_create_checkpoint" {
+        return format!(
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+             SELECT row_ref FROM {source} \
+             WHERE true {extra_predicate} \
+             ORDER BY key LIMIT {selected}))"
+        );
+    }
     format!(
-        "INSERT INTO {command} (relation, row_pk) \
-         SELECT 'lix_key_value', lixcol_row_pk FROM {source} \
+        "INSERT INTO {command} (row_ref) \
+         SELECT row_ref FROM {source} \
          WHERE true {extra_predicate} \
-         ORDER BY lixcol_row_pk LIMIT {selected}"
+         ORDER BY key LIMIT {selected}"
     )
 }
 

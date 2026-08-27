@@ -125,8 +125,7 @@ simulation_test!(
                 "id",
                 "metadata",
                 "origin_key",
-                "row_pk",
-                "schema_key",
+                "row_ref",
                 "snapshot_content",
             ]
         );
@@ -329,9 +328,9 @@ simulation_test!(
                 &format!(
 					"SELECT id, path, name, lixcol_is_deleted, lixcol_source_changes, lixcol_depth \
 	                 FROM lix_history('lix_directory', '{delete_commit_id}') \
-	                   WHERE lixcol_row_pk IN (CAST('[\"01940000-0000-7000-8000-000000000001\"]' AS JSONB), CAST('[\"01940000-0000-7000-8000-000000000002\"]' AS JSONB)) \
+	                   WHERE lixcol_row_ref IN (lix_row_ref('lix_directory', '01940000-0000-7000-8000-000000000001'), lix_row_ref('lix_directory', '01940000-0000-7000-8000-000000000002')) \
 	                   AND lixcol_depth = 0 \
-	                 ORDER BY lixcol_row_pk"
+	                 ORDER BY id"
 				),
                 &[],
             )
@@ -359,25 +358,23 @@ simulation_test!(
             let source_changes = source_changes
                 .as_array()
                 .expect("delete source changes should be an array");
-            let expected_source_ids = if expected_id == "01940000-0000-7000-8000-000000000001" {
-                BTreeSet::from(["01940000-0000-7000-8000-000000000001"])
+            let expected_source_count = if expected_id
+                == "01940000-0000-7000-8000-000000000001"
+            {
+                1
             } else {
-                BTreeSet::from([
-                    "01940000-0000-7000-8000-000000000001",
-                    "01940000-0000-7000-8000-000000000002",
-                ])
+                2
             };
-            let actual_source_ids = source_changes
+            let actual_source_refs = source_changes
                 .iter()
                 .map(|source| {
-                    assert_eq!(source["schema_key"], json!("lix_directory_descriptor"));
                     assert_eq!(source["snapshot_content"], serde_json::Value::Null);
-                    source["row_pk"][0]
+                    source["row_ref"]
                         .as_str()
-                        .expect("directory source identity should be text")
+                        .expect("directory source row_ref should be text")
                 })
                 .collect::<BTreeSet<_>>();
-            assert_eq!(actual_source_ids, expected_source_ids);
+            assert_eq!(actual_source_refs.len(), expected_source_count);
             assert_eq!(row.values()[5], Value::Integer(0));
         }
     }

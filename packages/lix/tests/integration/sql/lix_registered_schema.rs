@@ -34,36 +34,13 @@ simulation_test!(
 
         let registered_schema_row = session
             .execute(
-                "SELECT lixcol_row_pk, value \
-                 FROM lix_registered_schema",
+                "SELECT schema_key FROM lix_registered_schema \
+                 WHERE schema_key = 'engine_dummy_schema'",
                 &[],
             )
             .await
             .expect("registered schema read should succeed");
-        let registered_schema_rows = registered_schema_row;
-        let registered_schema_row_pk = registered_schema_rows
-            .rows()
-            .iter()
-            .find_map(|row| match row.values() {
-                [Value::Jsonb(row_pk), Value::Jsonb(value)]
-                    if value
-                        .to_value()
-                        .get("key")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("engine_dummy_schema") =>
-                {
-                    Some(row_pk)
-                }
-                [Value::Jsonb(row_pk), Value::Text(value)] => {
-                    let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
-                    (value.get("key").and_then(serde_json::Value::as_str)
-                        == Some("engine_dummy_schema"))
-                    .then_some(row_pk)
-                }
-                _ => None,
-            })
-            .expect("registered schema row should be visible");
-        assert_eq!(registered_schema_row_pk, &json!(["engine_dummy_schema"]));
+        assert_eq!(registered_schema_row.len(), 1);
 
         let insert_state_result = session
             .execute(
@@ -527,42 +504,11 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
             .await
             .expect("schema should register before delete attempt");
 
-    let registered_schema_rows = session
-        .execute(
-            "SELECT lixcol_row_pk, value \
-                 FROM lix_registered_schema",
-            &[],
-        )
-        .await
-        .expect("registered schema read should succeed");
-    let delete_schema_row_pk = registered_schema_rows
-        .rows()
-        .iter()
-        .find_map(|row| match row.values() {
-            [Value::Jsonb(row_pk), Value::Jsonb(value)]
-                if value
-                    .to_value()
-                    .get("key")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("engine_delete_schema") =>
-            {
-                Some(row_pk.clone())
-            }
-            [Value::Jsonb(row_pk), Value::Text(value)] => {
-                let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
-                (value.get("key").and_then(serde_json::Value::as_str)
-                    == Some("engine_delete_schema"))
-                .then_some(row_pk.clone())
-            }
-            _ => None,
-        })
-        .expect("registered schema row pk should be discoverable");
-
     let error = session
         .execute(
             "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = $1",
-            &[Value::Jsonb(delete_schema_row_pk)],
+                 WHERE schema_key = 'engine_delete_schema'",
+            &[],
         )
         .await
         .expect_err("schema deletion is not supported yet");
@@ -643,7 +589,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_row_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB)",
+                 WHERE schema_key = 'engine_schema_update_history'",
                 &[Value::Jsonb(amended_schema.clone().into())],
             )
             .await
@@ -658,9 +604,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, lixcol_row_pk, lixcol_observed_commit_id, lixcol_depth \
+                    "SELECT value, schema_key, lixcol_observed_commit_id, lixcol_depth \
                      FROM lix_history('lix_registered_schema', '{second_commit_id}') \
-                       WHERE lixcol_row_pk = CAST('[\"engine_schema_update_history\"]' AS JSONB) \
+                       WHERE schema_key = 'engine_schema_update_history' \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -673,13 +619,13 @@ simulation_test!(
             vec![
                 vec![
                     Value::Jsonb(amended_schema.into()),
-                    Value::Jsonb(json!(["engine_schema_update_history"]).into()),
+                    Value::Text("engine_schema_update_history".to_string()),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Jsonb(initial_schema.into()),
-                    Value::Jsonb(json!(["engine_schema_update_history"]).into()),
+                    Value::Text("engine_schema_update_history".to_string()),
                     Value::Text(first_commit_id),
                     Value::Integer(1),
                 ],
@@ -832,7 +778,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = CAST('[\"engine_divergent_schema\"]' AS JSONB)",
+                 WHERE schema_key = 'engine_divergent_schema'",
                 &[],
             )
             .await
@@ -843,7 +789,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = CAST('[\"engine_divergent_schema\"]' AS JSONB)",
+                 WHERE schema_key = 'engine_divergent_schema'",
                 &[],
             )
             .await
@@ -925,7 +871,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
+                 WHERE schema_key = 'engine_branch_schema_amendment'",
                 &[Value::Jsonb(main_schema.clone().into())],
             )
             .await
@@ -936,7 +882,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
+                 WHERE schema_key = 'engine_branch_schema_amendment'",
                 &[Value::Jsonb(draft_schema.clone().into())],
             )
             .await
@@ -947,7 +893,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
+                 WHERE schema_key = 'engine_branch_schema_amendment'",
                 &[],
             )
             .await
@@ -958,7 +904,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_row_pk = CAST('[\"engine_branch_schema_amendment\"]' AS JSONB)",
+                 WHERE schema_key = 'engine_branch_schema_amendment'",
                 &[],
             )
             .await
@@ -1003,7 +949,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT lixcol_row_pk, id, name \
+                "SELECT id, name \
                  FROM engine_default_id_schema \
                  WHERE name = 'Generated'",
                 &[],
@@ -1013,10 +959,9 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Jsonb(row_pk), Value::Text(id), Value::Text(name)] = values else {
+        let [Value::Text(id), Value::Text(name)] = values else {
             panic!("expected generated id row, got {values:?}");
         };
-        assert_eq!(row_pk, &json!([id]));
         assert!(!id.is_empty(), "defaulted id should be non-empty");
         assert_eq!(name, "Generated");
     }
@@ -1169,7 +1114,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, name, count, lixcol_row_pk \
+                "SELECT id, name, count \
                  FROM engine_typed_row_schema \
                  WHERE id = 'typed-row-1'",
                 &[],
@@ -1182,7 +1127,6 @@ simulation_test!(
                 Value::Text("typed-row-1".to_string()),
                 Value::Text("Typed Row".to_string()),
                 Value::Real(7.0),
-                Value::Jsonb(json!(["typed-row-1"]).into()),
             ]],
         );
     }
@@ -1371,7 +1315,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_identity_literal_schema \
                  SET name = 'after' \
-                 WHERE lixcol_row_pk = '[\"row-1\"]'",
+                 WHERE id = 'row-1'",
                 &[],
             )
             .await
@@ -1428,7 +1372,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_identity_in_literal_schema \
                  SET name = 'after' \
-                 WHERE lixcol_row_pk IN ('[\"row-1\"]')",
+                 WHERE id IN ('row-1')",
                 &[],
             )
             .await
@@ -1500,7 +1444,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_base_branch_filter_schema \
                  SET name = 'main-updated-draft' \
-                 WHERE lixcol_row_pk = '[\"row-1\"]' \
+                 WHERE id = 'row-1' \
                    AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000d'",
                 &[],
             )
@@ -1511,7 +1455,7 @@ simulation_test!(
         let result = draft
             .execute(
                 "SELECT name FROM engine_base_branch_filter_schema \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB)",
+                 WHERE id = 'row-1'",
                 &[],
             )
             .await
@@ -1573,7 +1517,7 @@ simulation_test!(
         let result = draft
             .execute(
                 "SELECT name FROM engine_base_insert_branch_schema \
-                 WHERE lixcol_row_pk = CAST('[\"row-1\"]' AS JSONB)",
+                 WHERE id = 'row-1'",
                 &[],
             )
             .await
@@ -1853,10 +1797,9 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_propertyless_update_schema \
-                 (id, lixcol_row_pk, lixcol_metadata, lixcol_global, lixcol_untracked) \
+                 (id, lixcol_metadata, lixcol_global, lixcol_untracked) \
                  VALUES (\
                    'propertyless-row',\
-                   CAST('[\"propertyless-row\"]' AS JSONB),\
                    CAST('{\"phase\":\"before\"}' AS JSONB),\
                    false,\
                    false\
@@ -1870,7 +1813,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_propertyless_update_schema \
                  SET lixcol_metadata = CAST('{\"phase\":\"after\"}' AS JSONB) \
-                 WHERE lixcol_row_pk = CAST('[\"propertyless-row\"]' AS JSONB)",
+                 WHERE id = 'propertyless-row'",
                 &[],
             )
             .await
@@ -1881,7 +1824,7 @@ simulation_test!(
                 .execute(
                     "SELECT lixcol_metadata \
                      FROM engine_propertyless_update_schema \
-                     WHERE lixcol_row_pk = CAST('[\"propertyless-row\"]' AS JSONB)",
+                     WHERE id = 'propertyless-row'",
                     &[],
                 )
                 .await

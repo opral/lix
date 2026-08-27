@@ -894,8 +894,8 @@ where
     let expected_diff = map_diff_oracle(&base, &target_before_preview);
     let diff_measure = measure_async(|| async {
         lix.execute(
-            "SELECT lixcol_row_pk, diff_type, from_id, to_id \
-             FROM lix_diff('branch_bench_row', $1, $2) ORDER BY lixcol_row_pk",
+            "SELECT id, diff_type \
+             FROM lix_diff('branch_bench_row', $1, $2) ORDER BY id",
             &[
                 Value::Text(preview.base_commit_id.clone()),
                 Value::Text(preview.target_head_commit_id.clone()),
@@ -910,36 +910,11 @@ where
         .rows()
         .iter()
         .map(|row| {
-            let row_pk = row
-                .get::<serde_json::Value>("lixcol_row_pk")
-                .expect("diff row identity");
-            let id = row_pk
-                .as_array()
-                .and_then(|parts| parts.first())
-                .and_then(serde_json::Value::as_str)
-                .expect("single-string diff identity")
-                .to_owned();
+            let id = row.get::<String>("id").expect("diff row identity");
             let kind = row
                 .get::<String>("diff_type")
                 .expect("diff type");
-            let side_id = |column| match row.value(column).expect("diff side identity column") {
-                Value::Null => None,
-                Value::Text(id) => Some(id.clone()),
-                other => panic!("unexpected {column} value {other:?}"),
-            };
-            let before = side_id("from_id");
-            let after = side_id("to_id");
-            match kind.as_str() {
-                "added" => assert!(before.is_none() && after.is_some()),
-                "modified" => assert!(before.is_some() && after.is_some()),
-                "removed" => assert!(before.is_some() && after.is_none()),
-                other => panic!("unexpected diff kind {other:?}"),
-            }
-            assert!(
-                before.as_deref().is_none_or(|id| !id.is_empty())
-                    && after.as_deref().is_none_or(|id| !id.is_empty()),
-                "diff row identities must be non-empty"
-            );
+            assert!(!id.is_empty(), "diff row identities must be non-empty");
             (id, kind)
         })
         .collect::<Vec<_>>();

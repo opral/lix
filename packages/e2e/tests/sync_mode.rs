@@ -108,11 +108,10 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
     let history_before_checkpoint = probe.history_gets.load(Ordering::Acquire);
     let checkpoint = replica
         .execute(
-            "INSERT INTO lix_create_checkpoint (relation, row_pk) \
-             SELECT 'lix_file', lixcol_row_pk \
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+             SELECT row_ref \
              FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
-             WHERE lixcol_row_pk ->> 0 = $1 \
-             RETURNING commit_id",
+             WHERE id = $1))",
             &[Value::Text(selected_file_id.clone())],
         )
         .await
@@ -131,7 +130,7 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
             .execute(
                 "SELECT COUNT(*) AS count \
                  FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-                 WHERE lixcol_row_pk ->> 0 = $1",
+                 WHERE id = $1",
                 &[
                     Value::Text(selected_file_id.clone()),
                     Value::Text(checkpoint.rows()[0].get::<String>("commit_id").unwrap()),

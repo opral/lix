@@ -141,7 +141,7 @@ simulation_test!(
              WHERE function_name = 'lix_diff' \
                AND source_relation IN ('lix_file', 'lix_key_value') \
                AND result_column IN (\
-                 'lixcol_row_pk', 'diff_type', 'from_path', 'to_path', \
+                 'row_ref', 'id', 'key', 'diff_type', 'from_path', 'to_path', \
                  'from_value', 'to_value', 'row_count'\
                ) \
              ORDER BY source_relation, ordinal_position",
@@ -155,10 +155,17 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("lix_file".to_string()),
-                    Value::Text("lixcol_row_pk".to_string()),
+                    Value::Text("row_ref".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Text("JSONB".to_string()),
+                    Value::Text("ROW_REF".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_file".to_string()),
+                    Value::Text("id".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
                 ],
                 vec![
                     Value::Text("lix_file".to_string()),
@@ -190,10 +197,17 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("lix_key_value".to_string()),
-                    Value::Text("lixcol_row_pk".to_string()),
+                    Value::Text("row_ref".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Text("JSONB".to_string()),
+                    Value::Text("ROW_REF".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("key".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
                 ],
                 vec![
                     Value::Text("lix_key_value".to_string()),
@@ -661,12 +675,9 @@ simulation_test!(
                    table_name = 'engine_column_contract' \
                    AND column_name IN (\
                      'lixcol_change_id', 'lixcol_commit_id', 'lixcol_created_at', \
-                     'lixcol_row_pk', 'lixcol_global', 'lixcol_schema_key', \
+                     'lixcol_global', 'lixcol_schema_key', \
                      'lixcol_untracked', 'lixcol_updated_at'\
                    )\
-                 ) OR (\
-                   table_name = 'engine_no_pk_contract' \
-                   AND column_name = 'lixcol_row_pk'\
                  ) \
                  ORDER BY table_name, column_name",
                 &[],
@@ -706,13 +717,6 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
-                    Value::Text("lixcol_row_pk".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Null,
-                    Value::Text("CONDITIONAL".to_string()),
-                ],
-                vec![
-                    Value::Text("engine_column_contract".to_string()),
                     Value::Text("lixcol_schema_key".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
@@ -731,13 +735,6 @@ simulation_test!(
                     Value::Text("NO".to_string()),
                     Value::Null,
                     Value::Text("READ_ONLY".to_string()),
-                ],
-                vec![
-                    Value::Text("engine_no_pk_contract".to_string()),
-                    Value::Text("lixcol_row_pk".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Null,
-                    Value::Text("CONDITIONAL".to_string()),
                 ],
             ],
         );
@@ -1547,10 +1544,10 @@ simulation_test!(
             .expect("seed insert should succeed");
         session
             .execute(
-                "INSERT INTO engine_excluded_typed_default (id) VALUES ('same') \
+                 "INSERT INTO engine_excluded_typed_default (id) VALUES ('same') \
                  ON CONFLICT (id) DO UPDATE \
                  SET mirror = excluded.status, \
-                     identity_copy = excluded.lixcol_row_pk",
+                     identity_copy = CAST(excluded.id AS JSONB)",
                 &[],
             )
             .await
@@ -1567,21 +1564,9 @@ simulation_test!(
                 .expect("updated row should be readable"),
             vec![vec![
                 Value::Text("fresh".to_string()),
-                Value::Jsonb(serde_json::json!(["same"]).into()),
+                Value::Jsonb(serde_json::json!("same").into()),
             ]],
         );
-
-        let mismatched_identity = session
-            .execute(
-                "INSERT INTO engine_excluded_typed_default \
-                 (id, status, lixcol_row_pk) \
-                 VALUES ('different', 'corrupted', CAST('[\"same\"]' AS JSONB)) \
-                 ON CONFLICT (id) DO UPDATE SET status = excluded.status",
-                &[],
-            )
-            .await
-            .expect_err("opaque and public typed identities must agree before conflict routing");
-        assert_eq!(mismatched_identity.code, LixError::CODE_SCHEMA_VALIDATION);
         assert_rows_eq(
             session
                 .execute(
@@ -1807,7 +1792,7 @@ simulation_test!(
             session
                 .execute(
                     "SELECT count FROM lix_history('engine_bigint_contract') \
-                       WHERE lixcol_row_pk = CAST('[\"integral-real\"]' AS JSONB)",
+                       WHERE id = 'integral-real'",
                     &[],
                 )
                 .await

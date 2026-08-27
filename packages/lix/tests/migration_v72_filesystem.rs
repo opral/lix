@@ -106,7 +106,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
 
         // The path-projecting read the product runs on every checkpoint open.
         lix.execute(
-            "SELECT lixcol_row_pk, to_path FROM lix_diff('lix_file', lix_root_commit_id(), $1)",
+            "SELECT row_ref, id, to_path FROM lix_diff('lix_file', lix_root_commit_id(), $1)",
             &[Value::Text(commit_id.clone())],
         )
         .await
@@ -133,11 +133,10 @@ async fn checkpointed_directories_survive_the_v74_migration() {
     let new_file_id = new_file.rows()[0].get::<String>("id").expect("file id");
     let partial = lix
         .execute(
-            "INSERT INTO lix_create_checkpoint (relation, row_pk)
-             SELECT 'lix_file', lixcol_row_pk
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(
+             SELECT row_ref
              FROM lix_diff('lix_file', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id())
-             WHERE lixcol_row_pk ->> 0 = $1
-             RETURNING commit_id",
+             WHERE id = $1))",
             &[Value::Text(new_file_id)],
         )
         .await
