@@ -254,7 +254,7 @@ impl LixInformationSchemaProvider {
                         function_name.push(surface.name.clone());
                         source_relation.push(Some(relation.name.clone()));
                         argument_signature.push(if surface.kind == PublicSurfaceKind::DiffFunction {
-                            "(relation TEXT, from_commit_id TEXT, to_commit_id TEXT)".to_string()
+                            "(relation TEXT) | (relation TEXT, from_commit_id TEXT, to_commit_id TEXT)".to_string()
                         } else {
                             "(relation TEXT, commit_id TEXT)".to_string()
                         });
@@ -275,6 +275,14 @@ impl LixInformationSchemaProvider {
                 PublicSurfaceKind::CommitAncestryFunction => (
                     "() | (commit_id TEXT)",
                     super::providers::commit_ancestry_schema(),
+                ),
+                PublicSurfaceKind::CheckpointFunction => (
+                    "() | (row_refs ROW_REF[])",
+                    Arc::new(Schema::new(vec![Field::new(
+                        "commit_id",
+                        DataType::Utf8,
+                        false,
+                    )])),
                 ),
                 PublicSurfaceKind::DiffFunction => unreachable!("relation-specific diffs handled above"),
                 PublicSurfaceKind::StateAtFunction => unreachable!("relation-specific state handled above"),
@@ -348,7 +356,10 @@ impl LixInformationSchemaProvider {
             can_insert.push(surface.capabilities.insert);
             can_update.push(surface.capabilities.update);
             can_delete.push(surface.capabilities.delete);
-            is_side_effecting.push(matches!(surface.class, PublicSurfaceClass::CommandSink));
+            is_side_effecting.push(
+                matches!(surface.class, PublicSurfaceClass::CommandSink)
+                    || surface.kind == PublicSurfaceKind::CheckpointFunction,
+            );
         }
         for function in self.public_catalog.scalar_functions() {
             surface_catalog.push(self.public_catalog_name.clone());

@@ -42,10 +42,10 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("lix_create_checkpoint".to_string()),
-                    Value::Text("COMMAND_SINK".to_string()),
+                    Value::Text("TABLE_FUNCTION".to_string()),
                     Value::Null,
-                    Value::Boolean(false),
                     Value::Boolean(true),
+                    Value::Boolean(false),
                     Value::Boolean(true),
                 ],
                 vec![
@@ -118,6 +118,40 @@ simulation_test!(
                     Value::Text("BASE TABLE".to_string()),
                 ],
             ],
+        );
+    }
+);
+
+simulation_test!(
+    checkpoint_table_function_advertises_its_mutating_signature,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let columns = session
+            .execute(
+                "SELECT argument_signature, result_column, data_type, is_nullable \
+                 FROM information_schema.table_functions \
+                 WHERE function_name = 'lix_create_checkpoint'",
+                &[],
+            )
+            .await
+            .expect("checkpoint function metadata should be readable");
+
+        assert_rows_eq(
+            columns,
+            vec![vec![
+                Value::Text("() | (row_refs ROW_REF[])".to_string()),
+                Value::Text("commit_id".to_string()),
+                Value::Text("TEXT".to_string()),
+                Value::Text("NO".to_string()),
+            ]],
         );
     }
 );
