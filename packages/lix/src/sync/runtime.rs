@@ -304,6 +304,9 @@ where
 {
     let remote_id = server.url.clone();
     let headers = server.headers.clone();
+    if let Some(transport) = initial_transport.as_ref() {
+        validate_connected_authority(lix, &remote_id, transport).await?;
+    }
     lix.set_sync_replica_remote_id(&remote_id)?;
     lix.set_sync_role(crate::sync::SyncRole::Replica)?;
 
@@ -369,12 +372,12 @@ where
             };
             match connected {
                 Ok(connected) => {
-                    if let Err(error) = lix
-                        .validate_sync_repository_account(&remote_id, connected.active_account_id())
-                        .await
+                    if let Err(error) =
+                        validate_connected_authority(&lix, &remote_id, &connected).await
                     {
-                        tracing::error!(error = ?error, "sync authority account changed");
-                        lix.fail_observers_for_sync(error);
+                        tracing::error!(error = ?error, "sync authority identity changed");
+                        lix.fail_observers_for_sync(error.clone());
+                        terminal_error = Some(error);
                         break;
                     }
                     transport = Some(connected);
@@ -499,6 +502,26 @@ where
     drop(demand_rx);
     let close_result = lix.close().await;
     result.and(close_result)
+}
+
+async fn validate_connected_authority<StorageImpl>(
+    lix: &Lix<StorageImpl>,
+    remote_id: &str,
+    transport: &HttpSyncTransport,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    validate_authority_lix_id(lix.lix_id(), transport.lix_id())?;
+    lix.validate_sync_repository_account(remote_id, transport.active_account_id())
+        .await
+}
+
+fn validate_authority_lix_id(local: &str, authority: &str) -> Result<(), LixError> {
+    if local == authority {
+        return Ok(());
+    }
+    Err(super::sync_repository_id_mismatch(local, authority))
 }
 
 async fn drain_sync_outbox<StorageImpl>(
@@ -856,6 +879,7 @@ fn is_terminal_sync_error(error: &LixError) -> bool {
             | SYNC_SNAPSHOT_TOO_LARGE_CODE
             | SYNC_DEMAND_STALLED_CODE
             | super::SYNC_PROTOCOL_MISMATCH_CODE
+            | super::SYNC_REPOSITORY_ID_MISMATCH_CODE
             | super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
     )
 }
@@ -1568,6 +1592,21 @@ mod tests {
     use crate::engine::Engine;
     use crate::storage::Memory;
     use crate::{Value, open_lix};
+
+    #[test]
+    fn authority_lix_id_must_match_before_sync_iteration() {
+        validate_authority_lix_id("local", "local").expect("same lixId should pass");
+        let error = validate_authority_lix_id("local", "other")
+            .expect_err("different lixId must stop before sync iteration");
+        assert_eq!(error.code, super::super::SYNC_REPOSITORY_ID_MISMATCH_CODE);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({
+                "localLixId": "local",
+                "authorityLixId": "other",
+            }))
+        );
+    }
 
     #[derive(Debug)]
     struct HistoryTransport {

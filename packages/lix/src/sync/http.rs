@@ -11,7 +11,8 @@ use super::{
     SyncBlobRegistration, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
     SyncRepositoryPullResponse, SyncSnapshotRowPage, SyncTransport, SyncTransportBounds,
     SyncTransportFuture, SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION_HEADER,
-    sync_server_protocol_mismatch, validate_sync_remote_id,
+    sync_server_protocol_mismatch, sync_server_protocol_missing_field,
+    validate_sync_remote_id,
 };
 use crate::LixError;
 
@@ -47,6 +48,7 @@ struct HandshakeResponse {
     protocol_version: u32,
     #[serde(default)]
     sync_protocol_version: Option<u32>,
+    lix_id: Option<String>,
     session_id: String,
     active_account_id: String,
 }
@@ -70,6 +72,7 @@ struct ErrorBody {
 pub(crate) struct HttpSyncTransport<Client> {
     client: Client,
     protocol_url: String,
+    lix_id: String,
     session_id: String,
     active_account_id: String,
 }
@@ -92,10 +95,11 @@ where
             ))
             .await?;
         let handshake: HandshakeResponse = decode_response(response, "open sync session")?;
-        validate_handshake(&handshake)?;
+        let lix_id = validate_handshake(&handshake)?.to_owned();
         Ok(Self {
             client,
             protocol_url,
+            lix_id,
             session_id: handshake.session_id,
             active_account_id: handshake.active_account_id,
         })
@@ -104,6 +108,10 @@ where
     pub(super) fn is_reserved_header(name: &str) -> bool {
         name.eq_ignore_ascii_case(SESSION_HEADER)
             || name.eq_ignore_ascii_case(SYNC_PROTOCOL_VERSION_HEADER)
+    }
+
+    pub(super) fn lix_id(&self) -> &str {
+        &self.lix_id
     }
 
     fn request(&self, method: Method, path: &str, operation: &'static str) -> RawHttpRequest {
@@ -127,7 +135,7 @@ where
     }
 }
 
-fn validate_handshake(handshake: &HandshakeResponse) -> Result<(), LixError> {
+fn validate_handshake(handshake: &HandshakeResponse) -> Result<&str, LixError> {
     if handshake.protocol_version != crate::SERVER_PROTOCOL_VERSION {
         return Err(LixError::new(
             "LIX_SERVER_PROTOCOL_ERROR",
@@ -142,6 +150,16 @@ fn validate_handshake(handshake: &HandshakeResponse) -> Result<(), LixError> {
             handshake.sync_protocol_version,
         ));
     }
+    let lix_id = handshake
+        .lix_id
+        .as_deref()
+        .ok_or_else(|| sync_server_protocol_missing_field("lixId"))?;
+    crate::row_pk::RowPk::uuid_from_canonical(lix_id).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync handshake returned an invalid lixId",
+        )
+    })?;
     if handshake.session_id.is_empty() || handshake.session_id.len() > 4096 {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -154,7 +172,7 @@ fn validate_handshake(handshake: &HandshakeResponse) -> Result<(), LixError> {
             "sync handshake returned an invalid active account identity",
         )
     })?;
-    Ok(())
+    Ok(lix_id)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -533,6 +551,7 @@ mod tests {
         let error = validate_handshake(&HandshakeResponse {
             protocol_version: crate::SERVER_PROTOCOL_VERSION + 1,
             sync_protocol_version: Some(crate::sync::SYNC_PROTOCOL_VERSION),
+            lix_id: Some("01936f4e-7b6c-7c3d-8f9a-123456789abc".to_owned()),
             session_id: "session-1".to_owned(),
             active_account_id: "01920000-0000-7000-8000-000000000602".to_owned(),
         })
@@ -553,6 +572,7 @@ mod tests {
                     body: serde_json::to_vec(&serde_json::json!({
                         "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
                         "syncProtocolVersion": 999,
+                        "lixId": "01936f4e-7b6c-7c3d-8f9a-123456789abc",
                         "sessionId": "session-from-incompatible-server",
                         "activeBranchId": "01920000-0000-7000-8000-000000001234",
                         "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
@@ -561,6 +581,43 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct MatchingClient;
+
+    impl RawHttpClient for MatchingClient {
+        fn send(&self, _request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async {
+                Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                        "lixId": "01936f4e-7b6c-7c3d-8f9a-123456789abc",
+                        "sessionId": "session-from-server",
+                        "activeBranchId": "01920000-0000-7000-8000-000000001234",
+                        "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
+                    }))
+                    .expect("encode handshake"),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_transport_retains_the_authority_lix_id() {
+        let transport = HttpSyncTransport::connect_with(
+            MatchingClient,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        )
+        .await
+        .expect("matching handshake should connect");
+        assert_eq!(
+            transport.lix_id(),
+            "01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        );
     }
 
     #[derive(Debug)]
@@ -574,6 +631,29 @@ mod tests {
                     status_text: "OK".to_owned(),
                     body: serde_json::to_vec(&serde_json::json!({
                         "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "lixId": "01936f4e-7b6c-7c3d-8f9a-123456789abc",
+                        "sessionId": "session-from-legacy-server",
+                        "activeBranchId": "01920000-0000-7000-8000-000000001234",
+                        "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
+                    }))
+                    .expect("encode legacy handshake"),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct MissingIdentityClient;
+
+    impl RawHttpClient for MissingIdentityClient {
+        fn send(&self, _request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async {
+                Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
                         "sessionId": "session-from-legacy-server",
                         "activeBranchId": "01920000-0000-7000-8000-000000001234",
                         "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
@@ -617,6 +697,21 @@ mod tests {
                 "clientSyncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
                 "serverSyncProtocolVersion": null,
             }))
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_handshake_rejects_a_missing_repository_identity_as_terminal() {
+        let error = HttpSyncTransport::connect_with(
+            MissingIdentityClient,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        )
+        .await
+        .expect_err("a legacy server must fail before transfer");
+        assert_eq!(error.code, crate::sync::SYNC_PROTOCOL_MISMATCH_CODE);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({ "missingField": "lixId" }))
         );
     }
 

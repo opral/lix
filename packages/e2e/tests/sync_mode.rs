@@ -1708,6 +1708,7 @@ where
             let body = serde_json::to_vec(&json!({
                 "protocolVersion": lix::server_protocol::PROTOCOL_VERSION,
                 "syncProtocolVersion": 999,
+                "lixId": "01920000-0000-7000-8000-000000001234",
                 "sessionId": "incompatible-test-session",
                 "activeBranchId": "01920000-0000-7000-8000-000000001234",
                 "activeAccountId": lix::ANONYMOUS_ACCOUNT_ID,

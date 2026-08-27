@@ -30,7 +30,7 @@ use crate::hot_state::{
 };
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{
-    Storage, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
+    Storage, StorageAdapter, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
     StorageGetManyRequest, StorageGetOptions, StorageKey, StoragePrecondition, StoragePrefix,
     StorageProjectedValue, StorageReadOptions, StorageSpace, StorageSpaceId, StorageWriteOptions,
     StorageWriteSet, ValueSemantics, exact_get_many,
@@ -406,6 +406,8 @@ pub(crate) const SYNC_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::declare(
 );
 
 const SEQUENCE_KEY: &[u8] = b"repository";
+const REPLICA_STATE_KEY: &[u8] = b"repository";
+const AMBIGUOUS_REPLICA_STATE_CODE: &str = "LIX_ERROR_SYNC_REPLICA_STATE_AMBIGUOUS";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RepositoryEventRecord {
@@ -461,15 +463,15 @@ const MAX_SUPERSEDED_RESET_HEADS: usize = 16;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SyncReplicaBinding {
     Unbound,
-    Exact { account_id: String },
-    Other,
+    Bound { account_id: String },
+    Ambiguous,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InitialSyncSnapshotInstall {
     Installed,
-    ExistingExact,
-    ExistingOther,
+    ExistingRepository,
+    Ambiguous,
 }
 
 /// The authority's complete coordinate for one known branch.
@@ -530,22 +532,19 @@ impl AuthoritativeBranchCoordinate {
 }
 
 struct ReplicaStatePublication<'a> {
-    remote_id: &'a str,
     expected_cursor: u64,
     expected_state_raw: &'a Bytes,
     state: &'a SyncReplicaState,
 }
 
-fn replica_state_key(remote_id: &str) -> StorageKey {
-    StorageKey(Bytes::copy_from_slice(remote_id.as_bytes()))
+fn replica_state_key() -> StorageKey {
+    StorageKey(Bytes::from_static(REPLICA_STATE_KEY))
 }
 
 async fn load_replica_state(
     read: &(impl StorageAdapterRead + ?Sized),
-    remote_id: &str,
 ) -> Result<(Option<SyncReplicaState>, Option<Bytes>), LixError> {
-    super::validate_sync_remote_id(remote_id)?;
-    let key = replica_state_key(remote_id);
+    let key = replica_state_key();
     let values = exact_get_many(
         read,
         &[StorageGetManyRequest {
@@ -584,9 +583,8 @@ async fn load_replica_state(
 
 pub(crate) async fn load_sync_replica_account(
     read: &(impl StorageAdapterRead + ?Sized),
-    remote_id: &str,
 ) -> Result<Option<String>, LixError> {
-    Ok(load_replica_state(read, remote_id)
+    Ok(load_replica_state(read)
         .await?
         .0
         .map(|state| state.active_account_id))
@@ -594,9 +592,8 @@ pub(crate) async fn load_sync_replica_account(
 
 pub(super) async fn inspect_sync_replica_binding(
     read: &(impl StorageAdapterRead + ?Sized),
-    remote_id: &str,
 ) -> Result<SyncReplicaBinding, LixError> {
-    let exact = load_replica_state(read, remote_id).await?.0;
+    let exact = load_replica_state(read).await?.0;
     let range = StoragePrefix {
         bytes: Bytes::new(),
     }
@@ -614,12 +611,117 @@ pub(super) async fn inspect_sync_replica_binding(
     let keys = cursor.next_page(2).await?;
     match (exact, keys.len()) {
         (None, 0) => Ok(SyncReplicaBinding::Unbound),
-        (None, _) => Ok(SyncReplicaBinding::Other),
-        (Some(state), 1) => Ok(SyncReplicaBinding::Exact {
+        (None, _) => Ok(SyncReplicaBinding::Ambiguous),
+        (Some(state), 1) => Ok(SyncReplicaBinding::Bound {
             account_id: state.active_account_id,
         }),
-        (Some(_), _) => Ok(SyncReplicaBinding::Other),
+        (Some(_), _) => Ok(SyncReplicaBinding::Ambiguous),
     }
+}
+
+/// Moves the one legacy URL-keyed sync receipt to the repository-scoped key.
+///
+/// The raw bytes are preserved so repository admission cannot alter cursor or
+/// outbox acknowledgement state. Lix supports exactly one sync authority per
+/// local store, so more than one receipt is ambiguous and must fail closed.
+pub(crate) async fn migrate_legacy_sync_replica_state<StorageImpl>(
+    adapter: &StorageAdapter<StorageImpl>,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let read = adapter.begin_read(StorageReadOptions::default()).await?;
+    let range = StoragePrefix {
+        bytes: Bytes::new(),
+    }
+    .to_range()?;
+    let mut cursor = read
+        .begin_scan(
+            SYNC_REPLICA_STATE_SPACE,
+            range,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..StorageBeginScanOptions::default()
+            },
+        )
+        .await?;
+    let (entries, _) = cursor.next_page(2).await?.into_parts();
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if entries.len() != 1 {
+        return Err(ambiguous_replica_state_error());
+    }
+    let entry = entries.into_iter().next().expect("one replica-state row");
+    drop(cursor);
+    if entry.key == replica_state_key() {
+        return Ok(());
+    }
+    let StorageProjectedValue::FullValue(raw) = entry.value else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "legacy sync replica-state scan omitted its value",
+        ));
+    };
+    serde_json::from_slice::<SyncReplicaState>(&raw).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("decode sync replica state: {error}"),
+        )
+    })?;
+
+    let canonical_key = replica_state_key();
+    let mut writes = adapter.new_write_set();
+    writes.put(
+        SYNC_REPLICA_STATE_SPACE,
+        canonical_key.clone(),
+        raw.to_vec(),
+    );
+    writes.delete(SYNC_REPLICA_STATE_SPACE, entry.key.clone());
+    drop(read);
+    let commit = adapter
+        .commit_write_set(
+            writes,
+            StorageWriteOptions {
+                preconditions: vec![
+                    StoragePrecondition::KeyAbsent {
+                        space: SYNC_REPLICA_STATE_SPACE,
+                        key: canonical_key,
+                    },
+                    StoragePrecondition::KeyValueEquals {
+                        space: SYNC_REPLICA_STATE_SPACE,
+                        key: entry.key,
+                        expected: raw,
+                    },
+                ],
+                await_durable: true,
+                ..StorageWriteOptions::default()
+            },
+        )
+        .await;
+    match commit {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let error = LixError::from(error);
+            if error.code != LixError::CODE_TRANSACTION_CONFLICT
+                && error.code != LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+            {
+                return Err(error);
+            }
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            match inspect_sync_replica_binding(&read).await? {
+                SyncReplicaBinding::Bound { .. } => Ok(()),
+                SyncReplicaBinding::Unbound | SyncReplicaBinding::Ambiguous => Err(error),
+            }
+        }
+    }
+}
+
+fn ambiguous_replica_state_error() -> LixError {
+    LixError::new(
+        AMBIGUOUS_REPLICA_STATE_CODE,
+        "sync replica contains multiple durable authority receipts",
+    )
 }
 
 pub(crate) async fn has_any_sync_replica_state(
@@ -794,11 +896,10 @@ pub(crate) async fn load_pending_sync_export_commit_ids(
 fn stage_replica_state(
     writes: &mut StorageWriteSet,
     preconditions: &mut Vec<StoragePrecondition>,
-    remote_id: &str,
     state: &SyncReplicaState,
     previous: Option<Bytes>,
 ) -> Result<(), LixError> {
-    let key = replica_state_key(remote_id);
+    let key = replica_state_key();
     writes.put(
         SYNC_REPLICA_STATE_SPACE,
         key.clone(),
@@ -835,7 +936,7 @@ pub(crate) async fn stage_sync_restore_intents(
     if restore_targets.is_empty() {
         return Ok(());
     }
-    let (state, previous) = load_replica_state(read, remote_id).await?;
+    let (state, previous) = load_replica_state(read).await?;
     let Some(mut state) = state else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -893,7 +994,7 @@ pub(crate) async fn stage_sync_restore_intents(
         }
     }
     if changed {
-        stage_replica_state(writes, preconditions, remote_id, &state, previous)?;
+        stage_replica_state(writes, preconditions, &state, previous)?;
     }
     Ok(())
 }
@@ -2100,11 +2201,11 @@ where
 {
     pub(crate) async fn load_sync_repository_cursor(
         &self,
-        remote_id: &str,
+        _remote_id: &str,
     ) -> Result<Option<u64>, LixError> {
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        Ok(load_replica_state(&read, remote_id)
+        Ok(load_replica_state(&read)
             .await?
             .0
             .map(|state| state.cursor))
@@ -2112,12 +2213,12 @@ where
 
     pub(crate) async fn validate_sync_repository_account(
         &self,
-        remote_id: &str,
+        _remote_id: &str,
         active_account_id: &str,
     ) -> Result<(), LixError> {
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let expected = load_sync_replica_account(&read, remote_id).await?;
+        let expected = load_sync_replica_account(&read).await?;
         if expected
             .as_deref()
             .is_some_and(|expected| expected != active_account_id)
@@ -2149,7 +2250,7 @@ where
         let mut remaining_reconciliations = None;
         loop {
             let read = adapter.begin_read(StorageReadOptions::default()).await?;
-            let Some(state) = load_replica_state(&read, remote_id).await?.0 else {
+            let Some(state) = load_replica_state(&read).await?.0 else {
                 return Ok(None);
             };
             let local_controls = BranchHeadControlContext::new()
@@ -2530,13 +2631,13 @@ where
 
     async fn mark_pending_reset_heads(
         &self,
-        remote_id: &str,
+        _remote_id: &str,
         prepared: &BTreeMap<String, (PendingSyncReset, String)>,
     ) -> Result<bool, LixError> {
         let _collaboration_guard = self.lock_collaboration_writes().await;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let (Some(mut state), previous) = load_replica_state(&read, remote_id).await? else {
+        let (Some(mut state), previous) = load_replica_state(&read).await? else {
             return Ok(false);
         };
         let mut changed = false;
@@ -2563,7 +2664,7 @@ where
         }
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
-        stage_replica_state(&mut writes, &mut preconditions, remote_id, &state, previous)?;
+        stage_replica_state(&mut writes, &mut preconditions, &state, previous)?;
         drop(read);
         adapter
             .commit_write_set(
@@ -2580,7 +2681,7 @@ where
 
     pub(crate) async fn apply_sync_repository_pull(
         &self,
-        remote_id: &str,
+        _remote_id: &str,
         response: &SyncRepositoryPullResponse,
     ) -> Result<(), LixError> {
         match response {
@@ -2592,7 +2693,7 @@ where
                 let (mut state, expected_state_raw) = {
                     let adapter = self.storage_adapter();
                     let read = adapter.begin_read(StorageReadOptions::default()).await?;
-                    let (state, raw) = load_replica_state(&read, remote_id).await?;
+                    let (state, raw) = load_replica_state(&read).await?;
                     let state = state.ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INVALID_PARAM,
@@ -2867,7 +2968,6 @@ where
                         SyncImportPurpose::ReplicaDelta,
                         None,
                         Some(ReplicaStatePublication {
-                            remote_id,
                             expected_cursor,
                             expected_state_raw: &expected_state_raw,
                             state: &state,
@@ -2910,7 +3010,6 @@ where
                         SyncImportPurpose::ReplicaDelta,
                         None,
                         Some(ReplicaStatePublication {
-                            remote_id,
                             expected_cursor,
                             expected_state_raw: &expected_state_raw,
                             state: &state,
@@ -3028,10 +3127,10 @@ where
         let _collaboration_guard = self.lock_collaboration_writes().await;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let (_, previous) = load_replica_state(&read, remote_id).await?;
+        let (_, previous) = load_replica_state(&read).await?;
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
-        stage_replica_state(&mut writes, &mut preconditions, remote_id, &state, previous)?;
+        stage_replica_state(&mut writes, &mut preconditions, &state, previous)?;
         drop(read);
         adapter
             .commit_write_set(
@@ -3130,13 +3229,13 @@ where
         }
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        match inspect_sync_replica_binding(&read, remote_id).await? {
+        match inspect_sync_replica_binding(&read).await? {
             SyncReplicaBinding::Unbound => {}
-            SyncReplicaBinding::Exact { .. } => {
-                return Ok(InitialSyncSnapshotInstall::ExistingExact);
+            SyncReplicaBinding::Bound { .. } => {
+                return Ok(InitialSyncSnapshotInstall::ExistingRepository);
             }
-            SyncReplicaBinding::Other => {
-                return Ok(InitialSyncSnapshotInstall::ExistingOther);
+            SyncReplicaBinding::Ambiguous => {
+                return Ok(InitialSyncSnapshotInstall::Ambiguous);
             }
         }
         let branch_ids = branches
@@ -3725,7 +3824,6 @@ where
         stage_replica_state(
             &mut writes,
             &mut preconditions,
-            remote_id,
             &SyncReplicaState {
                 active_account_id: active_account_id.to_owned(),
                 cursor,
@@ -5395,8 +5493,7 @@ where
                     "sync replica publication must advance its event cursor",
                 ));
             }
-            let (_stored_state, previous) =
-                load_replica_state(&read, publication.remote_id).await?;
+            let (_stored_state, previous) = load_replica_state(&read).await?;
             if previous.as_ref() != Some(publication.expected_state_raw) {
                 return Err(LixError::new(
                     LixError::CODE_TRANSACTION_CONFLICT,
@@ -5406,7 +5503,6 @@ where
             stage_replica_state(
                 &mut writes,
                 &mut preconditions,
-                publication.remote_id,
                 publication.state,
                 previous,
             )?;
@@ -6667,7 +6763,7 @@ mod tests {
             .await
             .expect("published branch should load")
             .expect("published branch should exist");
-        let stored_state = load_replica_state(&read, TEST_REMOTE)
+        let stored_state = load_replica_state(&read)
             .await
             .expect("published receipt should load")
             .0
@@ -7679,7 +7775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_initial_snapshots_cannot_publish_two_remote_bindings() {
+    async fn concurrent_initial_snapshots_publish_one_repository_binding() {
         let authority = open_lix().await.expect("authority should open");
         let snapshot = authority
             .pull_sync_repository(None, 1)
@@ -7734,12 +7830,12 @@ mod tests {
                 .filter(|result| matches!(result, Ok(InitialSyncSnapshotInstall::Installed)))
                 .count(),
             1,
-            "exactly one remote may claim an unbound replica"
+            "exactly one bootstrap may claim an unbound replica"
         );
         let loser = results
             .iter()
             .find_map(|result| result.as_ref().err())
-            .expect("the competing remote should lose atomically");
+            .expect("the competing bootstrap should lose atomically");
         assert_eq!(loser.code, LixError::CODE_TRANSACTION_CONFLICT);
 
         let serialized_loser = if matches!(
@@ -7770,10 +7866,10 @@ mod tests {
                 )
                 .await
         }
-        .expect("the coherent binding scan should classify a later alias");
+        .expect("the coherent binding scan should recognize the same repository");
         assert_eq!(
             serialized_loser,
-            InitialSyncSnapshotInstall::ExistingOther
+            InitialSyncSnapshotInstall::ExistingRepository
         );
 
         let adapter = first.storage_adapter();
@@ -9323,7 +9419,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("acknowledgement state read should open");
-            let acknowledged = load_replica_state(&read, TEST_REMOTE)
+            let acknowledged = load_replica_state(&read)
                 .await
                 .expect("acknowledgement state should load")
                 .0
@@ -10612,7 +10708,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("replica state read should open");
-        let (_, expected_state_raw) = load_replica_state(&read, TEST_REMOTE)
+        let (_, expected_state_raw) = load_replica_state(&read)
             .await
             .expect("replica state should load");
         let expected_state_raw = expected_state_raw.expect("replica state should have bytes");
@@ -10639,7 +10735,6 @@ mod tests {
                 SyncImportPurpose::ReplicaDelta,
                 None,
                 Some(ReplicaStatePublication {
-                    remote_id: TEST_REMOTE,
                     expected_cursor: 7,
                     expected_state_raw: &expected_state_raw,
                     state: &folded,
@@ -10654,7 +10749,7 @@ mod tests {
             .await
             .expect("replica state read should reopen");
         assert_eq!(
-            load_replica_state(&read, TEST_REMOTE)
+            load_replica_state(&read)
                 .await
                 .expect("replica state should load")
                 .0,
@@ -11015,7 +11110,7 @@ mod tests {
             .await
             .expect("replica state read should open");
         assert_eq!(
-            load_sync_replica_account(&read, TEST_REMOTE)
+            load_sync_replica_account(&read)
                 .await
                 .expect("replica account should decode")
                 .as_deref(),

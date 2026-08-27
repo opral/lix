@@ -2484,10 +2484,14 @@ where
     let active_branch_id = lease
         .run_cancellable_read(|lix| async move { lix.active_branch_id().await })
         .await?;
+    let lix_id = lease
+        .run_cancellable_read(|lix| async move { Ok(lix.lix_id().to_owned()) })
+        .await?;
     let active_account_id = lease.record.principal.account_id().to_owned();
     Ok(Json(HandshakeResponse {
         protocol_version: PROTOCOL_VERSION,
         sync_protocol_version: crate::sync::SYNC_PROTOCOL_VERSION,
+        lix_id,
         active_branch_id,
         active_account_id,
         session_id: lease.session_id.clone(),
@@ -4402,6 +4406,7 @@ struct HandshakeRequest {
 struct HandshakeResponse {
     protocol_version: u32,
     sync_protocol_version: u32,
+    lix_id: String,
     active_branch_id: String,
     active_account_id: String,
     session_id: String,
@@ -7969,6 +7974,7 @@ mod tests {
             first["syncProtocolVersion"],
             crate::sync::SYNC_PROTOCOL_VERSION
         );
+        assert_eq!(first["lixId"], app.server.inner.engine.lix_id());
         assert_eq!(first["activeAccountId"], lix::ANONYMOUS_ACCOUNT_ID);
         assert!(first["capabilities"].get("requestBlobSplice").is_none());
         assert_eq!(first["capabilities"]["binaryFileUpsert"], true);
