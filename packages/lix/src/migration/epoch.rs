@@ -291,7 +291,7 @@ where
             attempt: uuid::Uuid::now_v7(),
         });
         if let Err(error) = publish_migration_claim_absent(storage, &migrating_bytes).await {
-            if is_claim_conflict(&error) {
+            if is_admission_race(&error) {
                 return Box::pin(admit_repository(storage, progress)).await;
             }
             return Err(storage_error(error));
@@ -381,10 +381,13 @@ where
     emit_migrating(progress, from_format);
     let source = StorageAdapter::new(storage.clone());
     let target_bank = EpochBank::A;
-    let source_revision = source
-        .load_mutation_revision()
-        .await
-        .map_err(storage_error)?;
+    let source_revision = match source.load_mutation_revision().await {
+        Ok(revision) => revision,
+        Err(error) if is_admission_race(&error) => {
+            return Box::pin(admit_repository(storage, progress)).await;
+        }
+        Err(error) => return Err(storage_error(error)),
+    };
     let migrating = PointerState::Migrating {
         source: EpochBank::Legacy,
         source_format: from_format,
@@ -396,10 +399,7 @@ where
     if let Err(error) =
         claim_legacy(storage, source_revision, &original_marker, &migrating_bytes).await
     {
-        if matches!(
-            error,
-            StorageError::PreconditionFailed(_) | StorageError::WriteConflict
-        ) {
+        if is_admission_race(&error) {
             return Box::pin(admit_repository(storage, progress)).await;
         }
         return Err(storage_error(error));
@@ -519,10 +519,13 @@ where
         StorageAdapter::for_epoch(storage.clone(), source_bank, active_source_bytes.clone());
     emit_migrating(progress, from_format);
     let target_bank = source_bank.alternate();
-    let source_revision = source
-        .load_mutation_revision()
-        .await
-        .map_err(storage_error)?;
+    let source_revision = match source.load_mutation_revision().await {
+        Ok(revision) => revision,
+        Err(error) if is_admission_race(&error) => {
+            return Box::pin(admit_repository(storage, progress)).await;
+        }
+        Err(error) => return Err(storage_error(error)),
+    };
     let migrating = PointerState::Migrating {
         source: source_bank,
         source_format: from_format,
@@ -542,7 +545,7 @@ where
         .await
     {
         Ok(claim) => claim,
-        Err(error) if is_claim_conflict(&error) => {
+        Err(error) if is_admission_race(&error) => {
             return Box::pin(admit_repository(storage, progress)).await;
         }
         Err(error) => return Err(storage_error(error)),
@@ -554,7 +557,7 @@ where
         .await
         .map_err(storage_error)?;
     if let Err(error) = claim.commit().await {
-        if is_claim_conflict(&error) {
+        if is_admission_race(&error) {
             return Box::pin(admit_repository(storage, progress)).await;
         }
         return Err(storage_error(error));
@@ -1379,10 +1382,10 @@ fn storage_error(error: StorageError) -> LixError {
     )
 }
 
-fn is_claim_conflict(error: &StorageError) -> bool {
+fn is_admission_race(error: &StorageError) -> bool {
     matches!(
         error,
-        StorageError::PreconditionFailed(_) | StorageError::WriteConflict
+        StorageError::PreconditionFailed(_) | StorageError::WriteConflict | StorageError::Fenced
     )
 }
 
@@ -1710,6 +1713,41 @@ mod tests {
         assert_eq!(first.adapter.epoch_bank(), EpochBank::A);
         assert_eq!(second.adapter.epoch_bank(), EpochBank::A);
         assert_ne!(first.report.initialized, second.report.initialized);
+    }
+
+    #[tokio::test]
+    async fn stale_active_upgrade_reenters_admission_after_winner_activates() {
+        let storage = crate::Memory::new();
+        let stale_active = seed_active_v75(&storage, EpochBank::A, 7).await;
+        let winner = StorageAdapter::for_epoch_unfenced(storage.clone(), EpochBank::B);
+        Engine::initialize_with_adapter(winner, None).await.unwrap();
+        let winner_active = encode_pointer(PointerState::Active {
+            bank: EpochBank::B,
+            generation: 8,
+            format: crate::init::CURRENT_FORMAT_VERSION,
+        });
+        replace_pointer(&storage, &stale_active, &winner_active)
+            .await
+            .unwrap();
+
+        let admitted = migrate_active(
+            &storage,
+            EpochBank::A,
+            7,
+            75,
+            stale_active,
+            None,
+        )
+        .await
+        .expect("a losing opener should join the winner's active epoch");
+
+        assert_eq!(admitted.adapter.epoch_bank(), EpochBank::B);
+        assert_eq!(admitted.report.migration, None);
+    }
+
+    #[test]
+    fn pointer_fencing_is_an_admission_race() {
+        assert!(is_admission_race(&StorageError::Fenced));
     }
 
     #[tokio::test]
