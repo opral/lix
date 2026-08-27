@@ -59,7 +59,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         .migration
         .expect("the open report should record the automatic migration");
     assert_eq!(migration.from_format, 72);
-    assert_eq!(migration.to_format, 76);
+    assert_eq!(migration.to_format, 77);
 
     let checkpoints = lix
         .execute(

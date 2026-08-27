@@ -672,6 +672,12 @@ pub(crate) fn remember_pending_registered_schema(
     let (key, schema) = schema_from_registered_snapshot(snapshot)?;
     reject_reserved_schema_namespace_unless_exact_builtin(&key, &schema)?;
     validate_lix_schema_definition(&schema)?;
+    // Exact built-in registration rows are durable introspection projections,
+    // not schema authority. The immutable engine catalog already contains the
+    // plan and must not acquire a second branch-scoped identity for it.
+    if crate::schema::seed_schema_definition(&key.schema_key).is_some() {
+        return Ok(());
+    }
     schema_catalog.insert_schema_for_domain(domain, key, schema)?;
     Ok(())
 }
@@ -692,10 +698,10 @@ pub(crate) fn reject_reserved_schema_namespace(key: &SchemaKey) -> Result<(), Li
     ))
 }
 
-/// The offline repository migration persists an engine-owned schema through
-/// the ordinary schema-amendment transaction path. Permit only the exact
-/// bundled definition; arbitrary runtime schemas remain excluded from the
-/// reserved namespace.
+/// Historical migration and initialization paths persist engine-owned schemas
+/// as introspection projections. Permit only the exact bundled definition;
+/// arbitrary runtime schemas remain excluded from the reserved namespace and
+/// the projection is ignored when composing the effective catalog.
 pub(crate) fn reject_reserved_schema_namespace_unless_exact_builtin(
     key: &SchemaKey,
     schema: &JsonValue,

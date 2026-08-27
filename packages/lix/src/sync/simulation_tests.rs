@@ -494,6 +494,78 @@ async fn deterministic_replica_scenarios(sim: Simulation) {
         .expect("reconciled offline chains should survive restart");
 }
 
+async fn checkpoint_reconciliation_keeps_builtin_file_schemas(_sim: Simulation) {
+    let authority = fresh_authority().await;
+    let mut left = Replica::bootstrap(AuthorityTransport::connected(authority.clone())).await;
+    let mut right = Replica::bootstrap(AuthorityTransport::connected(authority.clone())).await;
+
+    left.lix
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/shared.md', CAST('base' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("left file creation should use the engine catalog");
+    left.pump().await.expect("left file should publish");
+    right.pump().await.expect("right should receive the file");
+
+    left.lix
+        .create_checkpoint()
+        .await
+        .expect("left checkpoint should commit");
+    left.pump().await.expect("checkpoint should publish");
+    right.pump().await.expect("right should receive the checkpoint");
+
+    right.lix
+        .execute(
+            "UPDATE lix_file SET content = CAST('after-checkpoint' AS BYTEA) WHERE path = '/shared.md'",
+            &[],
+        )
+        .await
+        .expect("post-checkpoint file edit should commit");
+    right.pump().await.expect("post-checkpoint edit should publish");
+    left.pump().await.expect("left should receive the remote edit");
+
+    left.lix
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/left.md', CAST('left' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("left divergent file should commit");
+    right.lix
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/right.csv', CAST('right' AS BYTEA))",
+            &[],
+        )
+        .await
+        .expect("right divergent file should commit");
+
+    let (left_push, right_push) = tokio::join!(left.pump(), right.pump());
+    left_push.expect("left concurrent push should reconcile");
+    right_push.expect("right concurrent push should reconcile");
+    converge(&authority, &mut [&mut left, &mut right])
+        .await
+        .expect("checkpointed divergent file commits should converge");
+    left.restart().await;
+    right.restart().await;
+    converge(&authority, &mut [&mut left, &mut right])
+        .await
+        .expect("converged file schemas should survive restart");
+
+    for repository in [&authority, &left.lix, &right.lix] {
+        let files = repository
+            .execute("SELECT path FROM lix_file ORDER BY path", &[])
+            .await
+            .expect("all file descriptors should remain readable")
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("path").expect("file path"))
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec!["/left.md", "/right.csv", "/shared.md"]);
+    }
+}
+
 async fn lazy_history_and_binary_cas_scenarios(sim: Simulation) {
     let authority = authority_for_simulation(&sim).await;
     write_key_value(&authority, "history-0", "0").await;
@@ -1783,7 +1855,7 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
 	.await
 	.expect_err("the complete-snapshot hard cut must reject a pre-v72 repository");
 	assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
-	assert!(error.message.contains("predates the v76 complete-snapshot"));
+	assert!(error.message.contains("predates the v77 complete-snapshot"));
 	let _ = crate::tracked_state::take_diff_commits_test_probe(
 		&checkpoint_commit_id,
 		&head_commit_id,
@@ -1833,6 +1905,10 @@ async fn deterministic_sync_command_traces(_sim: Simulation) {
 sync_simulation_test!(
     deterministic_replica_scenarios,
     deterministic_replica_scenarios
+);
+sync_simulation_test!(
+    checkpoint_reconciliation_keeps_builtin_file_schemas,
+    checkpoint_reconciliation_keeps_builtin_file_schemas
 );
 sync_simulation_test!(
     lazy_history_and_binary_cas_scenarios,

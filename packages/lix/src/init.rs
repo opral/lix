@@ -107,9 +107,15 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// `v76` moves repository data behind Lix-owned copy-and-activate storage
 /// epochs. Logical data is unchanged; the new envelope makes migration,
 /// validation, rollback, and stale-writer fencing engine policy.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 76;
+///
+/// `v77` makes bundled `lix_*` schemas immutable engine authority. Persisted
+/// bootstrap registration rows remain history/introspection projections, but
+/// branch, checkpoint, and sync visibility can no longer remove or redefine a
+/// schema required to interpret engine rows.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 77;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v76";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v77";
+pub(crate) const REPOSITORY_PROTOCOL_V76: &[u8] = b"tracked-default-branch.v76";
 pub(crate) const REPOSITORY_PROTOCOL_V75: &[u8] = b"tracked-default-branch.v75";
 pub(crate) const REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP: &[u8] =
     b"tracked-default-branch.v72-row-pk-bootstrap";
@@ -1380,7 +1386,7 @@ mod tests {
     fn repository_protocol_parser_distinguishes_versions() {
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v76"),
-            RepositoryProtocolStatus::Current
+            RepositoryProtocolStatus::MigrationRequired { found_version: 76 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v75"),
@@ -1412,7 +1418,11 @@ mod tests {
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v77"),
-            RepositoryProtocolStatus::TooNew { found_version: 77 }
+            RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v78"),
+            RepositoryProtocolStatus::TooNew { found_version: 78 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),

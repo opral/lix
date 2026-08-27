@@ -63,10 +63,10 @@ impl CatalogSnapshot {
 
     /// Compiled catalog for schemas shipped with the engine.
     ///
-    /// Repository bootstrap must encode its first rows before a persisted
-    /// catalog exists. Keeping this immutable catalog in the binary gives
-    /// those rows the same schema fingerprint and native value layout used
-    /// after catalog hydration.
+    /// These schemas are engine authority, not repository authority. Every
+    /// transaction catalog starts with this immutable base; persisted
+    /// `lix_registered_schema` rows for the same keys are only discoverability
+    /// projections retained in repository history.
     pub(crate) fn builtin() -> &'static Self {
         static BUILTIN: OnceLock<CatalogSnapshot> = OnceLock::new();
         BUILTIN.get_or_init(|| {
@@ -80,14 +80,22 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn from_schema_facts(facts: &[SchemaCatalogFact]) -> Result<Self, LixError> {
-        let entries = facts
-            .iter()
-            .map(|fact| CatalogEntry {
-                identity: fact.identity.clone(),
-                key: fact.catalog_key.clone(),
-                schema: fact.schema.clone(),
-            })
-            .collect::<Vec<_>>();
+        let mut entries = Self::builtin().entries.clone();
+        entries.extend(facts.iter().filter_map(|fact| {
+            // Repository history can retain the old bootstrap projections, but
+            // it can no longer make an engine schema appear, disappear, or
+            // change definition. Runtime registration already reserves every
+            // `lix_*` key; filtering all known built-ins here also lets the
+            // migration chain read historical definitions while an older
+            // schema amendment is still being upgraded.
+            crate::schema::seed_schema_definition(&fact.catalog_key.schema_key).is_none().then(
+                || CatalogEntry {
+                    identity: fact.identity.clone(),
+                    key: fact.catalog_key.clone(),
+                    schema: fact.schema.clone(),
+                },
+            )
+        }));
         Self::from_entries(entries)
     }
 
@@ -348,14 +356,23 @@ pub(crate) fn fingerprint_schema_facts(
     facts: &[SchemaCatalogFact],
 ) -> Result<CatalogFingerprint, LixError> {
     let mut hasher = blake3::Hasher::new();
-    let mut facts = facts.iter().collect::<Vec<_>>();
-    facts.sort_by(|left, right| left.identity.cmp(&right.identity));
-    for fact in facts {
+    let mut effective_facts = CatalogSnapshot::builtin()
+        .entries
+        .iter()
+        .map(|entry| (&entry.identity, &entry.key.schema_key, &entry.schema))
+        .chain(facts.iter().filter_map(|fact| {
+            crate::schema::seed_schema_definition(&fact.catalog_key.schema_key)
+                .is_none()
+                .then_some((&fact.identity, &fact.catalog_key.schema_key, &fact.schema))
+        }))
+        .collect::<Vec<_>>();
+    effective_facts.sort_by(|left, right| left.0.cmp(right.0));
+    for (identity, schema_key, schema) in effective_facts {
         hash_catalog_fact(
             &mut hasher,
-            &fact.identity,
-            &fact.catalog_key.schema_key,
-            &fact.schema,
+            identity,
+            schema_key,
+            schema,
         )?;
     }
     Ok(CatalogFingerprint(hasher.finalize().to_hex().to_string()))
@@ -2405,6 +2422,49 @@ mod tests {
     }
 
     #[test]
+    fn transaction_catalog_always_contains_engine_builtin_schemas() {
+        let catalog = CatalogSnapshot::from_schema_facts(&[])
+            .expect("an empty repository catalog should still bind engine schemas");
+
+        for schema in crate::schema::seed_schema_definitions() {
+            let key = crate::schema::schema_key_from_definition(schema)
+                .expect("embedded schema should have a key");
+            assert!(catalog.contains(&key.schema_key), "{}", key.schema_key);
+        }
+    }
+
+    #[test]
+    fn persisted_builtin_projection_cannot_override_engine_authority() {
+        let mut stored = crate::schema::seed_schema_definition("lix_file_descriptor")
+            .expect("file descriptor schema should be embedded")
+            .clone();
+        stored["description"] = json!("repository-controlled definition");
+        let custom = SchemaCatalogFact::new(
+            Domain::schema_catalog("main", false),
+            SchemaKey::new("acme_note"),
+            schema_json("acme_note"),
+        );
+        let catalog_without_projection = CatalogSnapshot::from_schema_facts(&[custom.clone()])
+            .expect("custom catalog should bind");
+        let catalog = CatalogSnapshot::from_schema_facts(&[
+            SchemaCatalogFact::new(
+                Domain::schema_catalog("main", false),
+                SchemaKey::new("lix_file_descriptor"),
+                stored,
+            ),
+            custom,
+        ])
+        .expect("persisted built-in projections should be ignored as catalog authority");
+
+        assert_eq!(
+            catalog.schema("lix_file_descriptor"),
+            crate::schema::seed_schema_definition("lix_file_descriptor")
+        );
+        assert!(catalog.contains("acme_note"));
+        assert_eq!(catalog.fingerprint(), catalog_without_projection.fingerprint());
+    }
+
+    #[test]
     fn insert_schema_for_domain_is_atomic_when_binding_fails() {
         let mut catalog = CatalogSnapshot::from_schema_facts(&[SchemaCatalogFact::new(
             Domain::schema_catalog("main", false),
@@ -2533,7 +2593,17 @@ mod tests {
         ])
         .expect("catalog should bind");
 
-        assert_eq!(catalog.schema_jsons(), vec![alpha, zeta]);
+        let mut expected = crate::schema::seed_schema_definitions()
+            .into_iter()
+            .cloned()
+            .chain([alpha, zeta])
+            .collect::<Vec<_>>();
+        expected.sort_by_key(|schema| {
+            crate::schema::schema_key_from_definition(schema)
+                .expect("test schema should have a key")
+                .schema_key
+        });
+        assert_eq!(catalog.schema_jsons(), expected);
     }
 
     #[test]

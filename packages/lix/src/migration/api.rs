@@ -160,10 +160,12 @@ pub(crate) async fn migrate_lix_with_adapter<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let read = adapter
-        .begin_read(ReadOptions::default())
-        .await
-        .map_err(storage_error)?;
+    let read = SharedStorageAdapterRead::new(
+        adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?,
+    );
     let protocol_status = crate::init::repository_protocol_status(&read).await?;
     // The v75 chain traverses commit records with the v5-arity decoder before
     // rewriting them to v6. Repositories below v72 still carry older record
@@ -181,7 +183,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74 | 75),
+            found_version: found_version @ (72 | 73 | 74 | 75 | 76),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -207,7 +209,7 @@ where
             ));
         }
     };
-    drop(read);
+    read.finish().map_err(storage_error)?;
     // Every step from here on loads commit records through the current
     // v6 decoder, so the v5 records are rewritten first, under whichever
     // marker the repository currently carries.
@@ -225,25 +227,47 @@ where
     let commit_members_rewritten = if from_version <= 74 {
         migrate_v74_complete_snapshot_commits(&adapter, &storage, options).await?
     } else {
+        0
+    };
+    if from_version == 75 {
         let read = adapter
             .begin_read(ReadOptions::default())
             .await
             .map_err(storage_error)?;
-        let expected_revision =
-            crate::storage_adapter::load_repository_mutation_revision(&read)
-                .await
-                .map_err(storage_error)?;
+        let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+            .await
+            .map_err(storage_error)?;
         drop(read);
         crate::migration::publish::publish(
             &adapter,
             expected_revision,
             crate::init::REPOSITORY_PROTOCOL_V75,
-            crate::init::REPOSITORY_PROTOCOL_VALUE,
+            crate::init::REPOSITORY_PROTOCOL_V76,
             crate::migration::publish::PublicationPlan::bounded(0, 0),
         )
         .await?;
-        0
-    };
+    }
+    // v77 deliberately does not rewrite or validate historical built-in
+    // registration rows. Those rows describe the engine version that authored
+    // each commit; the current engine's immutable catalog is authoritative.
+    // Custom schemas are still loaded from the repository and validated when
+    // the migrated engine opens it.
+    let read = adapter
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(storage_error)?;
+    let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+        .await
+        .map_err(storage_error)?;
+    drop(read);
+    crate::migration::publish::publish(
+        &adapter,
+        expected_revision,
+        crate::init::REPOSITORY_PROTOCOL_V76,
+        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        crate::migration::publish::PublicationPlan::bounded(0, 0),
+    )
+    .await?;
     Ok(MigrationReport {
         from_version,
         to_version: CURRENT_FORMAT_VERSION,
@@ -546,7 +570,7 @@ where
         adapter,
         expected_revision,
         source_protocol,
-        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        crate::init::REPOSITORY_PROTOCOL_V76,
         publication,
     )
     .await?;
@@ -1668,6 +1692,56 @@ mod tests {
                 to_version: CURRENT_FORMAT_VERSION,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn v76_repository_advances_through_the_builtin_catalog_hard_cut() {
+        let storage = Memory::new();
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        crate::engine::Engine::initialize_with_adapter(adapter.clone(), None)
+            .await
+            .expect("repository should initialize");
+        let mut marker = adapter.new_write_set();
+        marker.put(
+            REPOSITORY_PROTOCOL_SPACE,
+            REPOSITORY_PROTOCOL_KEY,
+            crate::init::REPOSITORY_PROTOCOL_V76,
+        );
+        adapter
+            .commit_write_set(marker, WriteOptions::default())
+            .await
+            .expect("v76 marker should stage");
+
+        let report = migrate_lix_with_adapter(
+            storage.clone(),
+            adapter.clone(),
+            MigrationOptions::default(),
+        )
+        .await
+        .expect("v76 repository should migrate to engine-authoritative built-ins");
+
+        assert_eq!(report.from_version, 76);
+        assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(
+            inspect_lix_with_adapter(&adapter).await.unwrap(),
+            MigrationStatus::Current {
+                version: CURRENT_FORMAT_VERSION,
+            }
+        );
+        let engine = crate::engine::Engine::new_with_adapter(
+            adapter,
+            crate::engine::EngineOptions::new(),
+        )
+        .await
+        .expect("migrated repository should open");
+        let session = engine.open_session().await.expect("session should open");
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/after-v77.txt', CAST('ok' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("migrated repository should accept file descriptor writes");
     }
 
     #[tokio::test]
