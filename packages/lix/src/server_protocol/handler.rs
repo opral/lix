@@ -1655,6 +1655,15 @@ where
         }
     }
 
+    /// Configures a deterministic, stream-first snapshot export of the
+    /// repository owned by this protocol server.
+    ///
+    /// The export shares the server's existing storage session, so hosts do
+    /// not need to open a second engine behind a live protocol runtime.
+    pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<S> {
+        crate::snapshot::SnapshotExportBuilder::new(self.inner.engine.storage())
+    }
+
     /// Returns whether this server can be dropped without invalidating a live
     /// remote session.
     ///

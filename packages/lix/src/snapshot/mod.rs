@@ -94,6 +94,52 @@ mod tests {
         assert_eq!(roundtrip, bytes);
     }
 
+    #[cfg(feature = "server-protocol")]
+    #[tokio::test]
+    async fn protocol_owner_exports_without_opening_a_second_engine() {
+        let storage = Memory::new();
+        let source = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("open source Lix");
+        source
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('protocol-snapshot', 'complete')",
+                &[],
+            )
+            .await
+            .expect("seed snapshot state");
+        source.close().await.expect("close source Lix");
+
+        let server = open_lix()
+            .with_storage(storage)
+            .serve()
+            .await
+            .expect("serve source Lix");
+        let mut bytes = Vec::new();
+        server
+            .export_snapshot()
+            .write_to(&mut bytes)
+            .await
+            .expect("export from protocol owner");
+
+        let restored = open_lix()
+            .from_snapshot(Cursor::new(bytes))
+            .await
+            .expect("restore protocol snapshot");
+        let result = restored
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'protocol-snapshot'",
+                &[],
+            )
+            .await
+            .expect("query restored state");
+        assert_eq!(result.rows().len(), 1);
+
+        restored.close().await.expect("close restored Lix");
+        server.close().await.expect("close protocol server");
+    }
+
     #[tokio::test]
     async fn restore_rejects_nonempty_storage_without_changing_it() {
         let mut bytes = Vec::new();
