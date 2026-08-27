@@ -178,7 +178,7 @@ impl DiffRelation {
         })?;
         let mut fields = vec![
             json_field("lixcol_row_pk", false),
-            Field::new("lixcol_diff_type", DataType::Utf8, false),
+            Field::new("diff_type", DataType::Utf8, false),
         ];
         for column in surface.columns.iter().filter(|column| column.is_public()) {
             let field = source_schema
@@ -200,7 +200,7 @@ impl DiffRelation {
                 );
             }
         }
-        fields.push(Field::new("lixcol_row_count", DataType::Int64, false));
+        fields.push(Field::new("row_count", DataType::Int64, false));
         Ok(Self {
             kind,
             schema: Arc::new(Schema::new(fields)),
@@ -1273,7 +1273,7 @@ where
             row_pk,
             diff_type: diff_type(kind),
             row_count: i64::try_from(group.row_count).map_err(|_| {
-                DataFusionError::Execution("lix_diff lixcol_row_count exceeds INT8".to_string())
+                DataFusionError::Execution("lix_diff row_count exceeds INT8".to_string())
             })?,
             from,
             to,
@@ -1520,10 +1520,10 @@ fn diff_column_array(field: &Field, rows: &[DiffSqlRow]) -> Result<ArrayRef> {
                 })
                 .collect::<Result<Vec<_>>>()?,
         ))),
-        "lixcol_diff_type" => Ok(Arc::new(StringArray::from_iter_values(
+        "diff_type" => Ok(Arc::new(StringArray::from_iter_values(
             rows.iter().map(|row| row.diff_type),
         ))),
-        "lixcol_row_count" => Ok(Arc::new(Int64Array::from_iter_values(
+        "row_count" => Ok(Arc::new(Int64Array::from_iter_values(
             rows.iter().map(|row| row.row_count),
         ))),
         name => {
@@ -1682,14 +1682,16 @@ mod tests {
             &names[..6],
             &[
                 "lixcol_row_pk",
-                "lixcol_diff_type",
+                "diff_type",
                 "from_key",
                 "to_key",
                 "from_value",
                 "to_value"
             ]
         );
-        assert_eq!(names.last(), Some(&"lixcol_row_count"));
+        assert_eq!(names.last(), Some(&"row_count"));
+        assert!(!names.contains(&"lixcol_diff_type"));
+        assert!(!names.contains(&"lixcol_row_count"));
         assert!(!names.contains(&"diff_id"));
         assert!(!names.contains(&"before_change_id"));
         assert!(!names.contains(&"after_change_id"));
@@ -1703,6 +1705,17 @@ mod tests {
         assert!(field_is_json(
             relation.schema.field_with_name("from_value").unwrap()
         ));
+
+        for name in names.into_iter().filter(|name| name.contains("lixcol_")) {
+            let system_name = name
+                .strip_prefix("from_")
+                .or_else(|| name.strip_prefix("to_"))
+                .unwrap_or(name);
+            assert!(
+                crate::sql2::catalog::TRACKED_ROW_SYSTEM_COLUMN_NAMES.contains(&system_name),
+                "diff exposes relation payload with a lixcol name: {name}"
+            );
+        }
     }
 
     #[test]
@@ -1719,7 +1732,7 @@ mod tests {
         let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
             .expect("key/value relation is registered");
         let projection = Schema::new(vec![Field::new(
-            "lixcol_row_count",
+            "row_count",
             DataType::Int64,
             false,
         )]);

@@ -894,7 +894,7 @@ where
     let expected_diff = map_diff_oracle(&base, &target_before_preview);
     let diff_measure = measure_async(|| async {
         lix.execute(
-            "SELECT lixcol_row_pk, lixcol_diff_type, from_id, to_id \
+            "SELECT lixcol_row_pk, diff_type, from_id, to_id \
              FROM lix_diff('branch_bench_row', $1, $2) ORDER BY lixcol_row_pk",
             &[
                 Value::Text(preview.base_commit_id.clone()),
@@ -920,7 +920,7 @@ where
                 .expect("single-string diff identity")
                 .to_owned();
             let kind = row
-                .get::<String>("lixcol_diff_type")
+                .get::<String>("diff_type")
                 .expect("diff type");
             let side_id = |column| match row.value(column).expect("diff side identity column") {
                 Value::Null => None,

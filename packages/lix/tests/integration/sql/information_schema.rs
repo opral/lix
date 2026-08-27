@@ -141,8 +141,8 @@ simulation_test!(
              WHERE function_name = 'lix_diff' \
                AND source_relation IN ('lix_file', 'lix_key_value') \
                AND result_column IN (\
-                 'lixcol_row_pk', 'lixcol_diff_type', 'from_path', 'to_path', \
-                 'from_value', 'to_value', 'lixcol_row_count'\
+                 'lixcol_row_pk', 'diff_type', 'from_path', 'to_path', \
+                 'from_value', 'to_value', 'row_count'\
                ) \
              ORDER BY source_relation, ordinal_position",
                 &[],
@@ -162,7 +162,7 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("lix_file".to_string()),
-                    Value::Text("lixcol_diff_type".to_string()),
+                    Value::Text("diff_type".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
@@ -183,7 +183,7 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("lix_file".to_string()),
-                    Value::Text("lixcol_row_count".to_string()),
+                    Value::Text("row_count".to_string()),
                     Value::Text("BIGINT".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
@@ -197,7 +197,7 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("lix_key_value".to_string()),
-                    Value::Text("lixcol_diff_type".to_string()),
+                    Value::Text("diff_type".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
@@ -218,7 +218,7 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("lix_key_value".to_string()),
-                    Value::Text("lixcol_row_count".to_string()),
+                    Value::Text("row_count".to_string()),
                     Value::Text("BIGINT".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,

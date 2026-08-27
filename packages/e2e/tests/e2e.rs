@@ -5545,7 +5545,7 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     .unwrap();
     let selected_diff_count = lix
         .execute(
-            "SELECT coalesce(sum(lixcol_row_count), 0) AS count \
+            "SELECT coalesce(sum(row_count), 0) AS count \
              FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
              WHERE lixcol_row_pk ->> 0 = $1",
             &[

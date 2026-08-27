@@ -33,7 +33,7 @@ async fn checkpoints_example_sql_contract() {
         .expect("active head commit ID should decode");
     let working_diffs = lix
         .execute(
-            "SELECT lixcol_row_pk, lixcol_diff_type
+            "SELECT lixcol_row_pk, diff_type
              FROM lix_diff('lix_key_value', $1, $2)
              ORDER BY lixcol_row_pk",
             &[Value::Text(root_commit_id), Value::Text(head_commit_id)],
@@ -49,7 +49,7 @@ async fn checkpoints_example_sql_contract() {
     );
     assert_eq!(
         working_diffs.rows()[0]
-            .get::<String>("lixcol_diff_type")
+            .get::<String>("diff_type")
             .expect("diff_type is text"),
         "added"
     );
@@ -152,7 +152,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_row_pk, lixcol_diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
                     key_value_diff_relation(&session).await
                 ),
             )
@@ -166,7 +166,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_row_pk, lixcol_diff_type FROM {} \
+                    "SELECT lixcol_row_pk, diff_type FROM {} \
                      WHERE lixcol_row_pk = CAST('[\"checkpoint-key\"]' AS JSONB)",
                     key_value_diff_relation(&session).await
                 ),
@@ -518,7 +518,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_row_pk, lixcol_diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
                     key_value_diff_relation(&session).await
                 ),
             )
@@ -539,7 +539,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_diff_type FROM {} \
+                    "SELECT diff_type FROM {} \
                      WHERE lixcol_row_pk = CAST('[\"working-removed\"]' AS JSONB)",
                     key_value_diff_relation(&session).await
                 ),

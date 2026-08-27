@@ -810,7 +810,7 @@ simulation_test!(
         let working_diffs = main
             .execute(
                 &format!(
-                    "SELECT lixcol_row_pk, lixcol_diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
                     key_value_diff_relation(&main).await
                 ),
                 &[],
@@ -2013,7 +2013,7 @@ simulation_test!(
         let rows = draft
             .execute(
                 &format!(
-                    "SELECT lixcol_diff_type, from_value, to_value FROM {} \
+                    "SELECT diff_type, from_value, to_value FROM {} \
                      WHERE lixcol_row_pk = CAST('[\"branch-baseline\"]' AS JSONB)",
                     key_value_diff_relation(&draft).await
                 ),
@@ -2132,7 +2132,7 @@ simulation_test!(
         let rows = main
             .execute(
                 &format!(
-                    "SELECT lixcol_diff_type, from_value FROM {} \
+                    "SELECT diff_type, from_value FROM {} \
                      WHERE lixcol_row_pk = CAST('[\"merge-baseline\"]' AS JSONB)",
                     key_value_diff_relation(&main).await
                 ),
@@ -2185,7 +2185,7 @@ simulation_test!(
         let narrow = draft
             .execute(
                 &format!(
-                    "SELECT lixcol_diff_type, from_value FROM {} \
+                    "SELECT diff_type, from_value FROM {} \
                      WHERE lixcol_row_pk = CAST('[\"branch-delete\"]' AS JSONB)",
                     key_value_diff_relation(&draft).await
                 ),
@@ -2208,7 +2208,7 @@ simulation_test!(
         let broad = draft
             .execute(
                 &format!(
-                    "SELECT lixcol_row_pk, lixcol_diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],
@@ -2288,7 +2288,7 @@ simulation_test!(
         let rows = draft
             .execute(
                 &format!(
-                    "SELECT lixcol_row_pk, lixcol_diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],
@@ -2370,7 +2370,7 @@ simulation_test!(
         let rows = draft
             .execute(
                 &format!(
-                    "SELECT lixcol_row_pk, lixcol_diff_type FROM {} ORDER BY lixcol_row_pk",
+                    "SELECT lixcol_row_pk, diff_type FROM {} ORDER BY lixcol_row_pk",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],
@@ -2432,7 +2432,7 @@ simulation_test!(
         let rows = main
             .execute(
                 &format!(
-                    "SELECT lixcol_diff_type, from_value FROM {} \
+                    "SELECT diff_type, from_value FROM {} \
                      WHERE lixcol_row_pk = CAST('[\"switch-baseline\"]' AS JSONB)",
                     key_value_diff_relation(&main).await
                 ),

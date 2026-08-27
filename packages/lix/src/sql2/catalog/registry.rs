@@ -677,10 +677,103 @@ fn history_columns<const N: usize>(columns: [(&str, bool); N]) -> Vec<PublicColu
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use serde_json::json;
 
-    use super::PublicCatalog;
+    use super::{PublicCatalog, PublicSurfaceKind};
     use crate::LixError;
+    use crate::sql2::catalog::TRACKED_ROW_SYSTEM_COLUMN_NAMES;
+    use crate::sql2::history_route::{
+        HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT,
+        HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
+        HISTORY_COL_FILE_ID, HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA,
+        HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY, HISTORY_COL_ROW_PK,
+        HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
+    };
+
+    #[test]
+    fn lixcol_names_are_reserved_for_system_metadata() {
+        let catalog = PublicCatalog::fixed_system();
+        let tracked = TRACKED_ROW_SYSTEM_COLUMN_NAMES
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        for surface in catalog.surfaces() {
+            let lixcol_columns = surface
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .filter(|name| name.contains("lixcol_"))
+                .collect::<Vec<_>>();
+            let lixcol_names = lixcol_columns.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(
+                lixcol_columns.len(),
+                lixcol_names.len(),
+                "surface '{}' must not duplicate system columns",
+                surface.name
+            );
+            match &surface.kind {
+                PublicSurfaceKind::SchemaBase { .. }
+                | PublicSurfaceKind::File
+                | PublicSurfaceKind::Directory => assert_eq!(
+                    lixcol_names, tracked,
+                    "tracked relation '{}' must expose exactly the canonical bookkeeping set",
+                    surface.name
+                ),
+                _ => assert!(
+                    lixcol_names.is_empty(),
+                    "non-state surface '{}' must not expose lixcol payload",
+                    surface.name
+                ),
+            }
+        }
+
+        let history_system = [
+            HISTORY_COL_ROW_PK,
+            HISTORY_COL_SCHEMA_KEY,
+            HISTORY_COL_FILE_ID,
+            HISTORY_COL_METADATA,
+            HISTORY_COL_CHANGE_ID,
+            HISTORY_COL_CHANGE_CREATED_AT,
+            HISTORY_COL_SOURCE_CHANGES,
+            HISTORY_COL_ORIGIN_KEY,
+            HISTORY_COL_OBSERVED_COMMIT_ID,
+            HISTORY_COL_COMMIT_CREATED_AT,
+            HISTORY_COL_AS_OF_COMMIT_ID,
+            HISTORY_COL_DEPTH,
+            HISTORY_COL_IS_DELETED,
+        ];
+        assert!(
+            history_system
+                .iter()
+                .all(|name| name.starts_with("lixcol_")),
+            "history metadata must retain the collision-safe system prefix"
+        );
+        let allowed_history = history_system.into_iter().collect::<BTreeSet<_>>();
+        for history in catalog.history_relations() {
+            let lixcol_columns = history
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .filter(|name| name.contains("lixcol_"))
+                .collect::<Vec<_>>();
+            let lixcol_names = lixcol_columns.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(
+                lixcol_columns.len(),
+                lixcol_names.len(),
+                "history for '{}' must not duplicate system columns",
+                history.relation_name
+            );
+            for name in lixcol_names {
+                assert!(
+                    allowed_history.contains(name),
+                    "history for '{}' exposes non-system lixcol column '{name}'",
+                    history.relation_name
+                );
+            }
+        }
+    }
 
     #[test]
     fn catalog_rejects_legacy_runtime_schema_in_reserved_lix_namespace() {

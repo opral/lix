@@ -676,7 +676,7 @@ simulation_test!(state_at_branch_scopes_compose_with_local_shadow_history, |sim|
     assert_ne!(refreshed_head_id, local_commit_id);
     let effective_diff = local
         .execute(
-            "SELECT to_key, lixcol_diff_type, to_lixcol_global \
+            "SELECT to_key, diff_type, to_lixcol_global \
              FROM lix_diff('lix_key_value', $1, $2) \
              WHERE COALESCE(to_key, from_key) IN \
                  ('global-only', 'later-global', 'overridden', 'suppressed') \

@@ -108,7 +108,7 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "SELECT COUNT(*) AS change_count, SUM(lixcol_row_count) AS atom_count \
+                "SELECT COUNT(*) AS change_count, SUM(row_count) AS atom_count \
                  FROM {WORKING_SOURCE}"
             ),
         )
