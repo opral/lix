@@ -92,6 +92,13 @@ impl LixError {
     pub const CODE_STORAGE_DURABILITY_UNAVAILABLE: &'static str =
         "LIX_STORAGE_DURABILITY_UNAVAILABLE";
 
+    /// A snapshot is malformed, unsupported, truncated, or fails integrity
+    /// verification.
+    pub const CODE_INVALID_SNAPSHOT: &'static str = "LIX_INVALID_SNAPSHOT";
+
+    /// Reading or writing a snapshot stream failed.
+    pub const CODE_SNAPSHOT_IO: &'static str = "LIX_SNAPSHOT_IO";
+
     /// A newer storage client fenced this writer, so this Lix instance can no
     /// longer serve requests.
     pub const CODE_STORAGE_FENCED: &'static str = "LIX_STORAGE_FENCED";

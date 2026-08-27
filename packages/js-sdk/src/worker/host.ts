@@ -3,6 +3,7 @@ import type {
 	LixBinding,
 	LixTransactionBinding,
 	ObserveEventsBinding,
+	SnapshotExportBinding,
 } from "../binding-types.js";
 import type { LixOpenProgress, LixOpenReport, LixTelemetrySpan } from "../types.js";
 import {
@@ -24,6 +25,15 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 	let nextObserveId = 1;
 	const transactions = new Map<number, LixTransactionBinding>();
 	const observations = new Map<number, ObserveEventsBinding>();
+	let nextSnapshotExportId = 1;
+	const snapshotExports = new Map<number, SnapshotExportBinding>();
+	const snapshotInputs = new Map<
+		number,
+		{
+			readable: ReadableStream<Uint8Array>;
+			writer: WritableStreamDefaultWriter<Uint8Array>;
+		}
+	>();
 	let nextSyncRequestId = 1;
 	const pendingSyncHeaders = new Map<
 		number,
@@ -40,11 +50,37 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			handleNotification(message);
 			return;
 		}
-		if (message.operation.kind === "observe.next") {
-			const observeId = message.operation.observeId;
-			void respond(message, () =>
-				handleObserveNext(observeId, message.telemetryParent),
-			);
+		if (
+			message.operation.kind === "openSnapshot.write" ||
+			message.operation.kind === "openSnapshot.finish"
+		) {
+			const operation = message.operation;
+			void respond(message, () => handleSnapshotInput(operation));
+			return;
+		}
+		if (
+			message.operation.kind === "open" &&
+			message.operation.snapshotId !== undefined
+		) {
+			ensureSnapshotInput(message.operation.snapshotId);
+		}
+		if (
+			message.operation.kind === "observe.next" ||
+			message.operation.kind === "exportSnapshot.next" ||
+			message.operation.kind === "exportSnapshot.cancel"
+		) {
+			if (message.operation.kind === "observe.next") {
+				const observeId = message.operation.observeId;
+				void respond(message, () =>
+					handleObserveNext(observeId, message.telemetryParent),
+				);
+			} else if (message.operation.kind === "exportSnapshot.next") {
+				const exportId = message.operation.exportId;
+				void respond(message, () => handleSnapshotNext(exportId));
+			} else {
+				const exportId = message.operation.exportId;
+				void respond(message, () => handleSnapshotCancel(exportId));
+			}
 			return;
 		}
 		finiteQueue = finiteQueue.then(async () => {
@@ -78,6 +114,12 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				const events = observations.get(message.observeId);
 				observations.delete(message.observeId);
 				events?.close();
+				break;
+			}
+			case "openSnapshot.cancel": {
+				const input = snapshotInputs.get(message.snapshotId);
+				snapshotInputs.delete(message.snapshotId);
+				if (input) void input.writer.abort().catch(() => undefined);
 				break;
 			}
 			case "transaction.abandon":
@@ -132,6 +174,11 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				if (sessions.size > 0)
 					throw workerStateError("Lix worker is already open");
 				{
+					const snapshot =
+						operation.snapshotId === undefined
+							? undefined
+							: requiredSnapshotInput(operation.snapshotId).readable;
+					try {
 					const opened = await openLixBinding(
 						operation.storage,
 						operation.telemetryEnabled
@@ -144,10 +191,19 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 							? (progress: LixOpenProgress) =>
 									endpoint.postMessage({ kind: "open.progress", progress })
 							: undefined,
+						snapshot,
 					);
 					sessions.set(0, opened);
 					return opened.openReport?.() satisfies LixOpenReport | undefined;
+					} finally {
+						if (operation.snapshotId !== undefined) {
+							snapshotInputs.delete(operation.snapshotId);
+						}
+					}
 				}
+			case "openSnapshot.write":
+			case "openSnapshot.finish":
+				throw workerStateError("snapshot input uses the restore lane");
 			case "openAnotherSession": {
 				const opened = await requiredLix(sessionId).openAnotherSession(
 					operation.options,
@@ -213,6 +269,22 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return requiredLix(sessionId).importFilesystemPaths(operation.paths);
 			case "syncDiskToLix":
 				return requiredLix(sessionId).syncDiskToLix();
+			case "exportSnapshot":
+				{
+					const binding = requiredLix(sessionId);
+					const exportSnapshot = binding.exportSnapshot;
+					if (!exportSnapshot) {
+						throw workerStateError("this Lix binding cannot export snapshots");
+					}
+					const snapshot = exportSnapshot.call(binding);
+					const exportId = nextSnapshotExportId++;
+					snapshotExports.set(exportId, snapshot);
+					return exportId;
+				}
+			case "exportSnapshot.next":
+				throw workerStateError("snapshot pulls bypass the finite operation queue");
+			case "exportSnapshot.cancel":
+				throw workerStateError("snapshot cancellation bypasses the finite operation queue");
 			case "observe": {
 				const events = await requiredLix(sessionId).observe(
 					operation.sql,
@@ -231,6 +303,61 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			case "observe.next":
 				throw workerStateError("observe.next must use the observation lane");
 		}
+	}
+
+	async function handleSnapshotNext(
+		exportId: number,
+	): Promise<Uint8Array | undefined> {
+		const snapshot = snapshotExports.get(exportId);
+		if (!snapshot) return undefined;
+		try {
+			const chunk = await snapshot.next();
+			if (chunk == null) snapshotExports.delete(exportId);
+			return chunk ?? undefined;
+		} catch (error) {
+			snapshotExports.delete(exportId);
+			await Promise.resolve(snapshot.cancel()).catch(() => undefined);
+			throw error;
+		}
+	}
+
+	async function handleSnapshotCancel(exportId: number): Promise<void> {
+		const snapshot = snapshotExports.get(exportId);
+		snapshotExports.delete(exportId);
+		if (snapshot) await snapshot.cancel();
+	}
+
+	function ensureSnapshotInput(snapshotId: number): void {
+		if (snapshotInputs.has(snapshotId)) return;
+		const stream = new TransformStream<Uint8Array, Uint8Array>(
+			undefined,
+			{ highWaterMark: 0 },
+			{ highWaterMark: 0 },
+		);
+		snapshotInputs.set(snapshotId, {
+			readable: stream.readable,
+			writer: stream.writable.getWriter(),
+		});
+	}
+
+	function requiredSnapshotInput(snapshotId: number) {
+		const input = snapshotInputs.get(snapshotId);
+		if (!input) throw workerStateError("snapshot restore input is closed");
+		return input;
+	}
+
+	async function handleSnapshotInput(
+		operation: Extract<
+			WorkerOperation,
+			{ kind: "openSnapshot.write" | "openSnapshot.finish" }
+		>,
+	): Promise<void> {
+		const input = requiredSnapshotInput(operation.snapshotId);
+		if (operation.kind === "openSnapshot.write") {
+			await input.writer.write(operation.chunk);
+			return;
+		}
+		await input.writer.close();
 	}
 
 	function createSyncServerBridge(

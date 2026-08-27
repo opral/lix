@@ -16,7 +16,8 @@
       "path": "./collaboration-and-sync.md",
       "label": "Collaboration and Sync"
     },
-    { "path": "./persistence.md", "label": "Persistence and Storage" }
+    { "path": "./persistence.md", "label": "Persistence and Storage" },
+    { "path": "./snapshots.md", "label": "Snapshots" }
   ],
   "Guides": [
     { "path": "./lix-for-ai-agents.md", "label": "Lix for AI Agents" },

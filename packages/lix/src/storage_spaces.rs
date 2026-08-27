@@ -90,6 +90,73 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::storage_adapter::REPOSITORY_EPOCH_SPACE,
 ];
 
+/// Every logical space identifier the `LIXSNAP` wire family can contain.
+///
+/// This is an append-only protocol registry, not merely a view of today's
+/// active layout. A space removed from [`ALL_STORAGE_SPACES`] must remain here
+/// with its original descriptor so snapshots written before that retirement
+/// can still be decoded and migrated. Space ids are never reused.
+///
+/// New active logical spaces must be added here as well; the registry tests
+/// enforce that relationship. The epoch-control space is deliberately absent
+/// because snapshots publish their own fresh epoch at restore time.
+pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
+    crate::json_store::JSON_SPACE,
+    crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+    crate::init::REPOSITORY_PROTOCOL_SPACE,
+    crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+    crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+    crate::hot_state::ROW_SPACE,
+    crate::hot_state::FILE_SPACE,
+    crate::hot_state::DIFF_SPACE,
+    crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE,
+    crate::branch::BRANCH_HEAD_CONTROL_SPACE,
+    crate::hot_state::COLLECTION_CONTROL_SPACE,
+    crate::hot_state::PACKED_CURRENT_BASE_SPACE,
+    crate::hot_state::PACKED_CURRENT_BASE_CONTROL_SPACE,
+    crate::hot_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+    crate::hot_state::ROOT_CURRENT_BASE_SPACE,
+    crate::columnar_row_group::ROW_GROUP_MANIFEST_SPACE,
+    crate::columnar_row_group::ROW_GROUP_COLUMN_SPACE,
+    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+    crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+    crate::tracked_state::MUTATION_DIRECTORY_NODE_SPACE,
+    crate::tracked_state::TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
+    crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+    crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+    crate::hot_state::INDEX_SPACE,
+    crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
+    crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
+    crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
+    crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE,
+    crate::binary_cas::BINARY_CAS_CHUNK_DEMAND_SPACE,
+    crate::changelog::COMMIT_SPACE,
+    crate::changelog::CHANGE_SPACE,
+    crate::storage_adapter::REVISION_SPACE,
+    crate::session::EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
+    crate::session::UPLOAD_STATE_SPACE,
+    crate::session::UPLOAD_MANIFEST_LEAF_SPACE,
+    crate::sync::SYNC_SEQUENCE_SPACE,
+    crate::sync::SYNC_REPOSITORY_EVENT_SPACE,
+    crate::sync::SYNC_REPLICA_STATE_SPACE,
+    crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_0001),
+        "checkpoint.recovery_ref.v3",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_0002),
+        "checkpoint.gc_state.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_0008),
+        "gc.commit_retirement_intent.v1",
+        ValueSemantics::Mutable,
+    ),
+];
+
 /// Space ids the constructor check cannot reject yet.
 ///
 /// Empty, and it should stay that way. Every engine site that needs to place
@@ -147,38 +214,42 @@ const fn same_semantics(left: ValueSemantics, right: ValueSemantics) -> bool {
     )
 }
 
-/// Space ids that belonged to spaces this protocol has cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetiredStorageSpace {
+    pub(crate) space: StorageSpace,
+    /// True only when a released `LIXSNAP` exporter could have emitted it.
+    pub(crate) emitted_in_lixsnap_v1: bool,
+}
+
+/// Known Lix-owned spaces removed before the first `LIXSNAP` container.
 ///
-/// There is no compatibility reader for them; they are listed so the registry
-/// tests refuse to hand a retired id to a new space, which would silently
-/// reinterpret predecessor bytes left in an existing repository.
-#[cfg(test)]
-pub(crate) const RETIRED_STORAGE_SPACE_IDS: &[StorageSpaceId] = &[
-    // untracked_state.row.v1
-    StorageSpaceId(0x0001_0002),
-    // json_store.untracked_reclaim_candidate.v1
-    StorageSpaceId(0x0002_0002),
-    // live_state.index.branch_root.v1
-    StorageSpaceId(0x0004_0005),
-    // hot_state.certified_row_batch.v1
-    StorageSpaceId(0x0004_001f),
-    // hot_state.certified_row_batch_manifest.v2
-    StorageSpaceId(0x0004_0021),
-    // hot_state.certified_row_batch_page.v1
-    StorageSpaceId(0x0004_0022),
-    // plugin.current_checkpoint.v2
-    StorageSpaceId(0x0004_0026),
-    // gc.reachability_delta.v1
-    StorageSpaceId(0x0008_0003),
-    // gc.reachability_queue.v1
-    StorageSpaceId(0x0008_0004),
-    // gc.tree_sweep_epoch.v1
-    StorageSpaceId(0x0008_0005),
-    // gc.tree_sweep_mark.v1
-    StorageSpaceId(0x0008_0006),
-    // gc.tree_sweep_cursor.v1
-    StorageSpaceId(0x0008_0007),
+/// Their exact production descriptors remain reserved so restore admission
+/// detects predecessor bytes and no future space can reuse an id. They remain
+/// invalid inside v1 snapshots because a v1 exporter never emitted them.
+pub(crate) const RETIRED_STORAGE_SPACES: &[RetiredStorageSpace] = &[
+    retired(0x0001_0002, "untracked_state.row.v1"),
+    retired(0x0002_0002, "json_store.untracked_reclaim_candidate.v1"),
+    retired(0x0004_0005, "live_state.index.branch_root.v1"),
+    retired(0x0004_001f, "hot_state.certified_row_batch.v1"),
+    retired(
+        0x0004_0021,
+        "hot_state.certified_row_batch_manifest.v2",
+    ),
+    retired(0x0004_0022, "hot_state.certified_row_batch_page.v1"),
+    retired(0x0004_0026, "plugin.current_checkpoint.v2"),
+    retired(0x0008_0003, "gc.reachability_delta.v1"),
+    retired(0x0008_0004, "gc.reachability_queue.v1"),
+    retired(0x0008_0005, "gc.tree_sweep_epoch.v1"),
+    retired(0x0008_0006, "gc.tree_sweep_mark.v1"),
+    retired(0x0008_0007, "gc.tree_sweep_cursor.v1"),
 ];
+
+const fn retired(id: u32, name: &'static str) -> RetiredStorageSpace {
+    RetiredStorageSpace {
+        space: StorageSpace::declare(StorageSpaceId(id), name, ValueSemantics::Mutable),
+        emitted_in_lixsnap_v1: false,
+    }
+}
 
 /// The first live-row space id.
 ///
@@ -276,10 +347,38 @@ mod tests {
                 );
             }
             assert!(
-                !RETIRED_STORAGE_SPACE_IDS.contains(&space.id),
+                !RETIRED_STORAGE_SPACES
+                    .iter()
+                    .any(|retired| retired.space.id == space.id),
                 "{} reuses retired storage space id 0x{:08x}",
                 space.name,
                 space.id.0,
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_and_retired_space_registries_are_permanent_and_disjoint() {
+        assert!(SNAPSHOT_STORAGE_SPACES
+            .windows(2)
+            .all(|pair| pair[0].id.0 < pair[1].id.0));
+        assert!(RETIRED_STORAGE_SPACES
+            .windows(2)
+            .all(|pair| pair[0].space.id.0 < pair[1].space.id.0));
+
+        for retired in RETIRED_STORAGE_SPACES {
+            assert_eq!(retired.space.value_semantics, ValueSemantics::Mutable);
+            assert_eq!(
+                SNAPSHOT_STORAGE_SPACES
+                    .iter()
+                    .find(|space| space.id == retired.space.id),
+                if retired.emitted_in_lixsnap_v1 {
+                    Some(&retired.space)
+                } else {
+                    None
+                },
+                "retired snapshot membership disagrees for {}",
+                retired.space,
             );
         }
     }
@@ -353,7 +452,7 @@ mod tests {
         let registered = ALL_STORAGE_SPACES
             .iter()
             .map(|space| space.id.0)
-            .chain(RETIRED_STORAGE_SPACE_IDS.iter().map(|id| id.0))
+            .chain(RETIRED_STORAGE_SPACES.iter().map(|retired| retired.space.id.0))
             .chain(TEST_ONLY_SPACE_IDS.iter().copied())
             .collect::<std::collections::BTreeSet<_>>();
         let mut unregistered = Vec::new();

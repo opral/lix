@@ -18,18 +18,13 @@ use std::{
 
 use crate::engine::{Engine, EngineOptions};
 use crate::common::ExpiredReadRetryState;
+use crate::open_types::{
+    OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport, emit_open_progress,
+};
 use crate::session::SessionContext;
 use crate::session::{CoherentReadBatch, ExecuteOptions};
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
-
-/// A non-blocking observer for repository open and automatic migration.
-///
-/// Implementations must return promptly. Progress is observational: panics
-/// are isolated and cannot change whether opening succeeds.
-pub trait OpenProgressSink: Send + Sync {
-    fn report(&self, progress: OpenProgress);
-}
 
 /// Adapts a Rust closure to [`OpenProgressSink`].
 #[expect(missing_debug_implementations)]
@@ -53,42 +48,6 @@ where
     fn report(&self, progress: OpenProgress) {
         (self.callback)(progress);
     }
-}
-
-/// Coarse, stable phases suitable for a CLI, loading screen, or logs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum OpenPhase {
-    Inspecting,
-    Migrating,
-    Validating,
-    Opening,
-    Complete,
-}
-
-/// One repository-open progress snapshot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OpenProgress {
-    pub phase: OpenPhase,
-    pub from_format: Option<u32>,
-    pub to_format: u32,
-    pub completed: Option<u64>,
-    pub total: Option<u64>,
-}
-
-/// The migration performed by this open, if any.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OpenMigrationReport {
-    pub from_format: u32,
-    pub to_format: u32,
-}
-
-/// Immutable facts about how this handle was opened.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OpenReport {
-    pub format: u32,
-    pub initialized: bool,
-    pub migration: Option<OpenMigrationReport>,
 }
 
 struct RetainingOpenProgressSink {
@@ -135,15 +94,6 @@ impl OpenProgressSink for RetainingOpenProgressSink {
             downstream.report(progress);
         }
     }
-}
-
-pub(crate) fn emit_open_progress(
-    sink: Option<&Arc<dyn OpenProgressSink>>,
-    progress: OpenProgress,
-) {
-    let Some(sink) = sink else { return };
-    let sink = Arc::clone(sink);
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.report(progress)));
 }
 
 /// Server behavior for an opened local Lix repository.
@@ -218,6 +168,15 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
             server: self.server,
             open_progress: self.open_progress,
         }
+    }
+
+    /// Restores a verified snapshot into the selected fresh storage before
+    /// opening it. This is a terminal builder step.
+    pub fn from_snapshot<Source>(
+        self,
+        source: Source,
+    ) -> OpenLixFromSnapshotBuilder<StorageImpl, Source> {
+        OpenLixFromSnapshotBuilder { open: self, source }
     }
 
     /// Supplies the Component runtime used by plugins.
@@ -367,6 +326,53 @@ pub fn open_lix() -> OpenLixBuilder<Memory> {
     OpenLixBuilder::default()
 }
 
+/// Restores a snapshot into fresh storage and then opens the resulting Lix.
+#[expect(missing_debug_implementations)]
+pub struct OpenLixFromSnapshotBuilder<StorageImpl, Source> {
+    open: OpenLixBuilder<StorageImpl>,
+    source: Source,
+}
+
+async fn finish_open<StorageImpl>(
+    open: OpenLixBuilder<StorageImpl>,
+    storage: StorageSession<StorageImpl>,
+) -> Result<Lix<StorageImpl>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let retained_progress = Arc::new(RetainingOpenProgressSink::new(open.open_progress.clone()));
+    // Opening is one restartable unit. In cross-context storage, a competing
+    // tab may commit during any phase, including sync bootstrap after the
+    // engine and primary session exist.
+    let mut lix = retry_expired_read(|| {
+        open_lix_inner(
+            storage.clone(),
+            open.wasm_runtime.clone(),
+            open.telemetry.clone(),
+            open.server.clone(),
+            retained_progress.clone(),
+        )
+    })
+    .await?;
+    let initialized = lix.open_report.initialized || retained_progress.initialized();
+    let migration = lix.open_report.migration.or_else(|| {
+        retained_progress
+            .migrated_from()
+            .map(|from_format| OpenMigrationReport {
+                from_format,
+                to_format: crate::init::CURRENT_FORMAT_VERSION,
+            })
+    });
+    if initialized != lix.open_report.initialized || migration != lix.open_report.migration {
+        lix.open_report = Arc::new(OpenReport {
+            format: lix.open_report.format,
+            initialized,
+            migration,
+        });
+    }
+    Ok(lix)
+}
+
 impl<StorageImpl> IntoFuture for OpenLixBuilder<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -382,42 +388,33 @@ where
             crate::session::AssumeSendFuture::new(async move {
                 // Acquire exactly once and retain this fenced generation across
                 // every retry and for the complete lifetime of the returned Lix.
-                let storage = StorageSession::acquire(self.storage).await?;
-                let retained_progress = Arc::new(RetainingOpenProgressSink::new(
-                    self.open_progress.clone(),
-                ));
-                // Opening is one restartable unit. In cross-context storage, a
-                // competing tab may commit during any phase, including sync
-                // bootstrap after the engine and primary session exist.
-                let mut lix = retry_expired_read(|| {
-                    open_lix_inner(
-                        storage.clone(),
-                        self.wasm_runtime.clone(),
-                        self.telemetry.clone(),
-                        self.server.clone(),
-                        retained_progress.clone(),
-                    )
-                })
-                .await?;
-                let initialized = lix.open_report.initialized || retained_progress.initialized();
-                let migration = lix.open_report.migration.or_else(|| {
-                    retained_progress
-                        .migrated_from()
-                        .map(|from_format| OpenMigrationReport {
-                            from_format,
-                            to_format: crate::init::CURRENT_FORMAT_VERSION,
-                        })
-                });
-                if initialized != lix.open_report.initialized
-                    || migration != lix.open_report.migration
-                {
-                    lix.open_report = Arc::new(OpenReport {
-                        format: lix.open_report.format,
-                        initialized,
-                        migration,
-                    });
+                let storage = StorageSession::acquire(self.storage.clone()).await?;
+                finish_open(self, storage).await
+            })
+        })
+    }
+}
+
+impl<StorageImpl, Source> IntoFuture for OpenLixFromSnapshotBuilder<StorageImpl, Source>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Source: futures_io::AsyncRead + Unpin + Send + 'static,
+{
+    type Output = Result<Lix<StorageImpl>, LixError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                if self.open.server.is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "snapshot restore cannot be combined with server mode",
+                    ));
                 }
-                Ok(lix)
+                let storage = StorageSession::acquire(self.open.storage.clone()).await?;
+                let storage = crate::snapshot::restore_snapshot(storage, self.source).await?;
+                finish_open(self.open, storage).await
             })
         })
     }
@@ -808,6 +805,11 @@ impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    /// Configures a deterministic, stream-first snapshot export.
+    pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<StorageImpl> {
+        crate::snapshot::SnapshotExportBuilder::new(self.engine.storage())
+    }
+
     #[cfg(feature = "server-protocol")]
     pub(crate) async fn open_protocol_session(
         engine: Arc<Engine<StorageSession<StorageImpl>>>,

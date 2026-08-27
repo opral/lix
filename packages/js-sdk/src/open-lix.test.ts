@@ -47,6 +47,363 @@ test("parseSqlScript is not part of the JavaScript SDK export surface", async ()
 	expect("SqlScriptStatement" in sdk).toBe(false);
 });
 
+test("snapshot streams restore a complete Lix deterministically", async () => {
+	const source = await openLix();
+	await source.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('snapshot-js', 'complete')",
+	);
+	await source.createCheckpoint();
+
+	const bytes = new Uint8Array(
+		await new Response(source.exportSnapshot()).arrayBuffer(),
+	);
+	expect(new TextDecoder().decode(bytes.slice(0, 7))).toBe("LIXSNAP");
+
+	let restoreOffset = 0;
+	const restored = await openLix.fromSnapshot(
+		new ReadableStream<Uint8Array>(
+			{
+				pull(controller) {
+					if (restoreOffset >= bytes.byteLength) {
+						controller.close();
+						return;
+					}
+					const next = Math.min(restoreOffset + 4096, bytes.byteLength);
+					controller.enqueue(bytes.subarray(restoreOffset, next));
+					restoreOffset = next;
+				},
+			},
+			{ highWaterMark: 0 },
+		),
+	);
+	const rows = await restored.execute(
+		"SELECT value FROM lix_key_value WHERE key = 'snapshot-js'",
+	);
+	expect(rows.rows).toHaveLength(1);
+
+	const roundtrip = new Uint8Array(
+		await new Response(restored.exportSnapshot()).arrayBuffer(),
+	);
+	expect(roundtrip).toEqual(bytes);
+
+	await restored.close();
+	await source.close();
+});
+
+test("invalid streaming snapshots preserve the native semantic error and cancel upstream", async () => {
+	let pulls = 0;
+	let canceled = false;
+	const invalid = new ReadableStream<Uint8Array>(
+		{
+			pull(controller) {
+				pulls += 1;
+				controller.enqueue(
+					pulls === 1
+						? new TextEncoder().encode("not a Lix snapshot")
+						: new Uint8Array(64 * 1024),
+				);
+			},
+			cancel() {
+				canceled = true;
+			},
+		},
+		{ highWaterMark: 0 },
+	);
+	await expect(
+		openLix.fromSnapshot(invalid),
+	).rejects.toMatchObject({
+		name: "LixError",
+		code: "LIX_INVALID_SNAPSHOT",
+	});
+	expect(canceled).toBe(true);
+	expect(pulls).toBeLessThan(8);
+});
+
+test("a malformed first chunk interrupts a stalled native snapshot source", async () => {
+	let sent = false;
+	let canceled = false;
+	const stalled = new ReadableStream<Uint8Array>(
+		{
+			pull(controller) {
+				if (sent) return;
+				sent = true;
+				controller.enqueue(new TextEncoder().encode("not a Lix snapshot"));
+			},
+			cancel() {
+				canceled = true;
+			},
+		},
+		{ highWaterMark: 0 },
+	);
+
+	await expect(withTimeout(openLix.fromSnapshot(stalled), 3_000)).rejects.toMatchObject({
+		name: "LixError",
+		code: "LIX_INVALID_SNAPSHOT",
+	});
+	expect(canceled).toBe(true);
+});
+
+test("a source error completes restore cancellation before an immediate destination retry", async () => {
+	const source = await openLix();
+	await source.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('restore-retry', 'complete')",
+	);
+	const bytes = new Uint8Array(
+		await new Response(source.exportSnapshot()).arrayBuffer(),
+	);
+	await source.close();
+
+	const dir = mkdtempSync(join(tmpdir(), "lix-snapshot-restore-retry-"));
+	const storage = new FilesystemStorage({ path: dir, syncAllFiles: true });
+	const sourceError = new Error("snapshot producer failed");
+	let emitted = false;
+	const interrupted = new ReadableStream<Uint8Array>(
+		{
+			pull(controller) {
+				if (!emitted) {
+					emitted = true;
+					controller.enqueue(bytes.subarray(0, Math.min(128, bytes.byteLength)));
+					return;
+				}
+				controller.error(sourceError);
+			},
+		},
+		{ highWaterMark: 0 },
+	);
+
+	await expect(
+		openLix.fromSnapshot(interrupted, { storage }),
+	).rejects.toBe(sourceError);
+	const restored = await openLix.fromSnapshot(bytes, { storage });
+	try {
+		expect(
+			(
+				await restored.execute(
+					"SELECT value FROM lix_key_value WHERE key = 'restore-retry'",
+				)
+			).rows,
+		).toHaveLength(1);
+	} finally {
+		await restored.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a locked snapshot source does not strand the destination before retry", async () => {
+	const source = await openLix();
+	await source.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('locked-restore-retry', 'complete')",
+	);
+	const bytes = new Uint8Array(
+		await new Response(source.exportSnapshot()).arrayBuffer(),
+	);
+	await source.close();
+
+	const dir = mkdtempSync(join(tmpdir(), "lix-snapshot-locked-retry-"));
+	const storage = new FilesystemStorage({ path: dir, syncAllFiles: true });
+	const locked = new ReadableStream<Uint8Array>();
+	const lock = locked.getReader();
+	try {
+		await expect(
+			openLix.fromSnapshot(locked, { storage }),
+		).rejects.toBeInstanceOf(TypeError);
+		lock.releaseLock();
+		const restored = await openLix.fromSnapshot(bytes, { storage });
+		try {
+			expect(
+				(
+					await restored.execute(
+						"SELECT value FROM lix_key_value WHERE key = 'locked-restore-retry'",
+					)
+				).rows,
+			).toHaveLength(1);
+		} finally {
+			await restored.close();
+		}
+	} finally {
+		try {
+			lock.releaseLock();
+		} catch {
+			// The assertion path may already have released the reader.
+		}
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("snapshot export emits bounded chunks and cancellation releases the native actor", async () => {
+	const lix = await openLix();
+	let state = 0x1234_5678;
+	let payload = "";
+	for (let index = 0; index < 256 * 1024; index++) {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		payload += String.fromCharCode(33 + (state % 90));
+	}
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+		["large-snapshot-stream", payload],
+	);
+
+	const reader = lix.exportSnapshot().getReader();
+	let chunks = 0;
+	let bytes = 0;
+	while (true) {
+		const result = await reader.read();
+		if (result.done) break;
+		expect(result.value.byteLength).toBeLessThanOrEqual(64 * 1024);
+		chunks += 1;
+		bytes += result.value.byteLength;
+	}
+	expect(chunks).toBeGreaterThan(1);
+	expect(bytes).toBeGreaterThan(64 * 1024);
+
+	const canceled = lix.exportSnapshot().getReader();
+	const first = await canceled.read();
+	expect(first.done).toBe(false);
+	await canceled.cancel();
+	await withTimeout(lix.close(), 3_000);
+});
+
+test("an unread snapshot stream does not start or block export", async () => {
+	const lix = await openLix();
+	lix.exportSnapshot();
+	await withTimeout(lix.close());
+});
+
+test("a paused snapshot export does not block queries and close cancels it", async () => {
+	const lix = await openLix();
+	let state = 0xa5a5_5a5a;
+	let payload = "";
+	for (let index = 0; index < 192 * 1024; index++) {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		payload += String.fromCharCode(33 + (state % 90));
+	}
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+		["paused-snapshot-export", payload],
+	);
+	const reader = lix.exportSnapshot().getReader();
+	expect((await reader.read()).done).toBe(false);
+	expect(
+		(await withTimeout(lix.execute("SELECT 1 AS value"), 3_000)).rows[0]?.get(
+			"value",
+		),
+	).toBe(1);
+	await withTimeout(lix.close(), 3_000);
+});
+
+test("native snapshot exports use bounded concurrency and overload cancellation completes", async () => {
+	const lix = await openLix();
+	let state = 0x6d2b_79f5;
+	let payload = "";
+	for (let index = 0; index < 192 * 1024; index++) {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		payload += String.fromCharCode(33 + (state % 90));
+	}
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+		["bounded-snapshot-exports", payload],
+	);
+
+	const active = lix.exportSnapshot().getReader();
+	expect((await active.read()).done).toBe(false);
+	const contenders = Array.from({ length: 8 }, () =>
+		lix.exportSnapshot().getReader(),
+	);
+	const reads = contenders.map((reader) => reader.read());
+	const overload = await withTimeout(
+		Promise.race(
+			reads.map(async (read) => {
+				try {
+					await read;
+					return undefined;
+				} catch (error) {
+					return error;
+				}
+			}),
+		),
+		3_000,
+	);
+	expect(overload).toMatchObject({
+		name: "LixError",
+		code: "LIX_ERROR_SNAPSHOT_EXPORT_BUSY",
+	});
+
+	await withTimeout(active.cancel(), 3_000);
+	const results = await withTimeout(Promise.allSettled(reads), 3_000);
+	expect(
+		results.some(
+			(result) =>
+				result.status === "rejected" &&
+				(result.reason as { code?: string }).code ===
+					"LIX_ERROR_SNAPSHOT_EXPORT_BUSY",
+		),
+	).toBe(true);
+	await Promise.allSettled(contenders.map((reader) => reader.cancel()));
+	const afterCancellation = lix.exportSnapshot().getReader();
+	expect((await withTimeout(afterCancellation.read(), 3_000)).done).toBe(false);
+	await withTimeout(afterCancellation.cancel(), 3_000);
+	await withTimeout(lix.close(), 3_000);
+});
+
+test("native snapshot overload and close progress with one Node worker thread", async () => {
+	const sdkUrl = pathToFileURL(join(process.cwd(), "dist/index.js")).href;
+	const script = `
+		import { openLix } from ${JSON.stringify(sdkUrl)};
+		const timeout = async (promise, label) => {
+			let timer;
+			try {
+				return await Promise.race([
+					promise,
+					new Promise((_, reject) => {
+						timer = setTimeout(() => reject(new Error(label)), 3_000);
+					}),
+				]);
+			} finally {
+				clearTimeout(timer);
+			}
+		};
+		const lix = await openLix();
+		let state = 0x243f6a88;
+		let payload = "";
+		for (let index = 0; index < 192 * 1024; index++) {
+			state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+			payload += String.fromCharCode(33 + (state % 90));
+		}
+		await lix.execute(
+			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+			["pool-one-snapshot-export", payload],
+		);
+		const active = lix.exportSnapshot().getReader();
+		await active.read();
+		const contenders = Array.from({ length: 8 }, () => lix.exportSnapshot().getReader());
+		const reads = contenders.map((reader) => reader.read());
+		const overload = await timeout(
+			Promise.race(reads.map((read) => read.then(() => undefined, (error) => error))),
+			"snapshot overload did not settle",
+		);
+		if (overload?.code !== "LIX_ERROR_SNAPSHOT_EXPORT_BUSY") {
+			throw new Error("snapshot overload did not preserve its busy error");
+		}
+		await timeout(lix.close(), "snapshot close did not settle");
+		await Promise.allSettled(reads);
+	`;
+	await expect(
+		promisify(execFile)(process.execPath, ["--input-type=module", "--eval", script], {
+			env: { ...process.env, UV_THREADPOOL_SIZE: "1" },
+			timeout: 8_000,
+		}),
+	).resolves.toBeDefined();
+});
+
+test("snapshot reader cancellation is idempotent when it races close", async () => {
+	const lix = await openLix();
+	const reader = lix.exportSnapshot().getReader();
+	expect((await reader.read()).done).toBe(false);
+	await expect(
+		Promise.all([lix.close(), reader.cancel()]),
+	).resolves.toEqual([undefined, undefined]);
+});
+
 test("execute rejects multi-statement scripts", async () => {
 	const lix = await openLix();
 	await expect(lix.execute("SELECT 1; SELECT 2")).rejects.toMatchObject({

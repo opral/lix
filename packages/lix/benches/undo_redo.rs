@@ -7,7 +7,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use lix::{ExecuteBatchStatement, Memory, Value};
 use lix::{Lix, open_lix};
 
-fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Vec<u8> {
+fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Memory {
     runtime.block_on(async move {
         let storage = Memory::new();
         let session = open_lix()
@@ -30,13 +30,12 @@ fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Ve
                 .await
                 .expect("benchmark history commit succeeds");
         }
+        drop(session);
         storage
-            .export_snapshot()
-            .expect("benchmark storage snapshot exports")
     })
 }
 
-fn seeded_sparse_gap_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Vec<u8> {
+fn seeded_sparse_gap_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Memory {
     runtime.block_on(async move {
         let storage = Memory::new();
         let session = open_lix()
@@ -68,13 +67,12 @@ fn seeded_sparse_gap_storage(runtime: &tokio::runtime::Runtime, history_depth: u
             )
             .await
             .expect("benchmark target update succeeds");
+        drop(session);
         storage
-            .export_snapshot()
-            .expect("benchmark storage snapshot exports")
     })
 }
 
-fn seeded_wide_parent_storage(runtime: &tokio::runtime::Runtime, parent_width: usize) -> Vec<u8> {
+fn seeded_wide_parent_storage(runtime: &tokio::runtime::Runtime, parent_width: usize) -> Memory {
     runtime.block_on(async move {
         let storage = Memory::new();
         let session = open_lix()
@@ -106,16 +104,15 @@ fn seeded_wide_parent_storage(runtime: &tokio::runtime::Runtime, parent_width: u
             )
             .await
             .expect("benchmark target update succeeds");
+        drop(session);
         storage
-            .export_snapshot()
-            .expect("benchmark storage snapshot exports")
     })
 }
 
 fn seeded_wide_transition_storage(
     runtime: &tokio::runtime::Runtime,
     transition_width: usize,
-) -> Vec<u8> {
+) -> Memory {
     runtime.block_on(async move {
         let storage = Memory::new();
         let session = open_lix()
@@ -148,16 +145,15 @@ fn seeded_wide_transition_storage(
             .execute_batch(&updates)
             .await
             .expect("wide transition commit succeeds");
+        drop(session);
         storage
-            .export_snapshot()
-            .expect("benchmark storage snapshot exports")
     })
 }
 
 fn seeded_descriptor_unrelated_width_storage(
     runtime: &tokio::runtime::Runtime,
     unrelated_width: usize,
-) -> Vec<u8> {
+) -> Memory {
     runtime.block_on(async move {
         let storage = Memory::new();
         let session = open_lix()
@@ -192,9 +188,8 @@ fn seeded_descriptor_unrelated_width_storage(
             )
             .await
             .expect("target file deletes");
+        drop(session);
         storage
-            .export_snapshot()
-            .expect("benchmark storage snapshot exports")
     })
 }
 
@@ -224,8 +219,9 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                     for _ in 0..iterations {
                         let session = open_session(
                             &runtime,
-                            Memory::from_snapshot(&undo_snapshot)
-                                .expect("update benchmark snapshot restores"),
+                            undo_snapshot
+                                .fork()
+                                .expect("update benchmark fixture forks"),
                         );
                         let started = Instant::now();
                         runtime
@@ -253,8 +249,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                     for _ in 0..iterations {
                         let session = open_session(
                             &runtime,
-                            Memory::from_snapshot(&undo_snapshot)
-                                .expect("undo benchmark snapshot restores"),
+                            undo_snapshot.fork().expect("undo benchmark fixture forks"),
                         );
                         let started = Instant::now();
                         runtime
@@ -268,16 +263,13 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
         );
 
         let redo_snapshot = seeded_storage(&runtime, history_depth);
-        let redo_storage =
-            Memory::from_snapshot(&redo_snapshot).expect("redo seed snapshot restores");
+        let redo_storage = redo_snapshot.fork().expect("redo seed fixture forks");
         let redo_session = open_session(&runtime, redo_storage.clone());
         runtime
             .block_on(redo_session.undo())
             .expect("redo benchmark starts undone");
         drop(redo_session);
-        let redo_snapshot = redo_storage
-            .export_snapshot()
-            .expect("undone benchmark snapshot exports");
+        let redo_snapshot = redo_storage.fork().expect("undone benchmark fixture forks");
         group.bench_with_input(
             BenchmarkId::new("redo", history_depth),
             &history_depth,
@@ -287,8 +279,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                     for _ in 0..iterations {
                         let session = open_session(
                             &runtime,
-                            Memory::from_snapshot(&redo_snapshot)
-                                .expect("redo benchmark snapshot restores"),
+                            redo_snapshot.fork().expect("redo benchmark fixture forks"),
                         );
                         let started = Instant::now();
                         runtime
@@ -315,8 +306,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                     for _ in 0..iterations {
                         let session = open_session(
                             &runtime,
-                            Memory::from_snapshot(&snapshot)
-                                .expect("descriptor benchmark snapshot restores"),
+                            snapshot.fork().expect("descriptor benchmark fixture forks"),
                         );
                         let started = Instant::now();
                         runtime
@@ -343,8 +333,9 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                     for _ in 0..iterations {
                         let session = open_session(
                             &runtime,
-                            Memory::from_snapshot(&snapshot)
-                                .expect("wide-transition benchmark snapshot restores"),
+                            snapshot
+                                .fork()
+                                .expect("wide-transition benchmark fixture forks"),
                         );
                         let started = Instant::now();
                         runtime
@@ -371,8 +362,9 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                     for _ in 0..iterations {
                         let session = open_session(
                             &runtime,
-                            Memory::from_snapshot(&snapshot)
-                                .expect("wide-parent benchmark snapshot restores"),
+                            snapshot
+                                .fork()
+                                .expect("wide-parent benchmark fixture forks"),
                         );
                         let started = Instant::now();
                         runtime
@@ -399,8 +391,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                     for _ in 0..iterations {
                         let session = open_session(
                             &runtime,
-                            Memory::from_snapshot(&snapshot)
-                                .expect("sparse-gap benchmark snapshot restores"),
+                            snapshot.fork().expect("sparse-gap benchmark fixture forks"),
                         );
                         let started = Instant::now();
                         runtime

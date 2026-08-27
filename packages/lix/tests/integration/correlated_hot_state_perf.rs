@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use futures_lite::io::Cursor;
 use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
     ReadOptions, ScanCursor, Storage, StorageError, StorageRead, WriteOptions,
 };
-use lix::{ExecuteResult, Value};
-use lix::{engine::Engine, session::SessionContext};
+use lix::{ExecuteResult, Lix, Value, open_lix};
 use serde::Serialize;
 
 const FILES_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_FILES";
@@ -327,16 +327,10 @@ async fn prepare_seed_snapshot(config: &Config, ids: &[String]) -> Vec<u8> {
 
 async fn seed_snapshot(config: &Config, ids: &[String]) -> Vec<u8> {
     let storage = CountingStorage::new();
-    Engine::initialize(storage.clone())
+    let session = open_lix()
+        .with_storage(storage)
         .await
-        .expect("benchmark storage should initialize");
-    let engine = Engine::new(storage.clone())
-        .await
-        .expect("benchmark engine should open");
-    let session = engine
-        .open_session()
-        .await
-        .expect("benchmark session should open");
+        .expect("benchmark Lix should open");
 
     for chunk in ids.chunks(config.setup_chunk_size) {
         let values = chunk
@@ -366,10 +360,14 @@ async fn seed_snapshot(config: &Config, ids: &[String]) -> Vec<u8> {
         .await
         .expect("setup row count should be readable");
     assert_eq!(count.len(), config.files, "setup should seed every file");
-    session.close().await.expect("setup session should close");
-    storage
+    let mut snapshot = Vec::new();
+    session
         .export_snapshot()
-        .expect("seeded Memory storage should export")
+        .write_to(&mut snapshot)
+        .await
+        .expect("seeded Lix should export");
+    session.close().await.expect("setup session should close");
+    snapshot
 }
 
 async fn validate_seed_snapshot(snapshot: &[u8], expected_files: usize) {
@@ -424,16 +422,13 @@ fn update_sql(ids: &[String]) -> String {
     )
 }
 
-async fn open_case(seed_snapshot: &[u8]) -> (CountingStorage, SessionContext<CountingStorage>) {
-    let storage = CountingStorage::from_snapshot(seed_snapshot)
-        .expect("benchmark seed snapshot should reopen");
-    let engine = Engine::new(storage.clone())
+async fn open_case(seed_snapshot: &[u8]) -> (CountingStorage, Lix<CountingStorage>) {
+    let storage = CountingStorage::new();
+    let session = open_lix()
+        .with_storage(storage.clone())
+        .from_snapshot(Cursor::new(seed_snapshot.to_vec()))
         .await
-        .expect("benchmark engine should open from seed snapshot");
-    let session = engine
-        .open_session()
-        .await
-        .expect("benchmark session should open from seed snapshot");
+        .expect("benchmark Lix should open from seed snapshot");
     (storage, session)
 }
 
@@ -597,7 +592,7 @@ fn update_data(iteration: usize) -> Vec<u8> {
 }
 
 async fn validate_selected_data(
-    session: &SessionContext<CountingStorage>,
+    session: &Lix<CountingStorage>,
     select_sql: &str,
     ids: &[String],
     expected_data: &[u8],
@@ -775,17 +770,6 @@ struct CountingStorage {
 impl CountingStorage {
     fn new() -> Self {
         Self::default()
-    }
-
-    fn from_snapshot(snapshot: &[u8]) -> Result<Self, StorageError> {
-        Ok(Self {
-            inner: Memory::from_snapshot(snapshot)?,
-            counters: Arc::new(StorageCounters::default()),
-        })
-    }
-
-    fn export_snapshot(&self) -> Result<Vec<u8>, StorageError> {
-        self.inner.export_snapshot()
     }
 
     fn stats(&self) -> StorageStats {

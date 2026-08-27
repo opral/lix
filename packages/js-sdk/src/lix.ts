@@ -58,6 +58,7 @@ export class Lix {
 	readonly #activeBranchListeners = new Set<() => void>();
 	readonly #inFlightOperations = new Set<Promise<unknown>>();
 	readonly #observations = new Map<number, WeakRef<ObserveEvents>>();
+	readonly #snapshotExports = new Set<{ cancel(): Promise<void> }>();
 	#nextObservationId = 0;
 	#transactionsOpening = 0;
 	#activeTransactions = 0;
@@ -183,6 +184,104 @@ export class Lix {
 		return this.#runOperation(() => this.binding.createCheckpoint());
 	}
 
+	/** Streams a deterministic snapshot of the complete Lix. */
+	exportSnapshot(): ReadableStream<Uint8Array> {
+		let snapshot:
+			| {
+					binding: Promise<
+						ReturnType<NonNullable<LixBinding["exportSnapshot"]>>
+					>;
+					finish(): void;
+					cancel(): Promise<void>;
+			  }
+			| undefined;
+		const start = () => {
+			if (snapshot) return snapshot;
+			let finish!: () => void;
+			const completed = new Promise<void>((resolve) => {
+				finish = resolve;
+			});
+			let resolveBinding!: (
+				binding: ReturnType<NonNullable<LixBinding["exportSnapshot"]>>,
+			) => void;
+			let rejectBinding!: (error: unknown) => void;
+			const binding = new Promise<
+				ReturnType<NonNullable<LixBinding["exportSnapshot"]>>
+			>((resolve, reject) => {
+				resolveBinding = resolve;
+				rejectBinding = reject;
+			});
+			const operation = this.#runOperation(async () => {
+				try {
+					const exportSnapshot = this.binding.exportSnapshot;
+					if (!exportSnapshot) {
+						const error = new Error(
+							"snapshot export is not available for remote Lix handles",
+						) as Error & { code: string };
+						error.name = "LixError";
+						error.code = "LIX_UNSUPPORTED_STORAGE";
+						throw error;
+					}
+					resolveBinding(exportSnapshot.call(this.binding));
+					await completed;
+				} catch (error) {
+					rejectBinding(error);
+					throw error;
+				}
+			});
+			// Pull observes setup errors through `binding`; this catch only prevents
+			// the lifecycle-tracking promise from becoming an unhandled rejection.
+			void operation.catch((error: unknown) => rejectBinding(error));
+			let finished = false;
+			let cancelPromise: Promise<void> | undefined;
+			const active = {
+				binding,
+				finish: () => {
+					if (finished) return;
+					finished = true;
+					this.#snapshotExports.delete(active);
+					finish();
+				},
+				cancel: () =>
+					(cancelPromise ??= (async () => {
+						try {
+							await (await binding).cancel();
+						} finally {
+							active.finish();
+						}
+					})()),
+			};
+			snapshot = active;
+			this.#snapshotExports.add(active);
+			return snapshot;
+		};
+		return new ReadableStream<Uint8Array>(
+			{
+				pull: async (controller) => {
+				const active = start();
+				const binding = await active.binding;
+				try {
+					const chunk = await binding.next();
+					if (chunk == null) {
+						active.finish();
+						controller.close();
+						return;
+					}
+					controller.enqueue(chunk);
+				} catch (error) {
+					await active.cancel().catch(() => undefined);
+					throw error;
+				}
+			},
+				cancel: async () => {
+					if (!snapshot) return;
+					await snapshot.cancel();
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+	}
+
 	async undo(): Promise<UndoReceipt> {
 		return this.#runOperation(() => this.binding.undo());
 	}
@@ -243,6 +342,9 @@ export class Lix {
 			}
 			this.#observations.clear();
 			this.closePromise = (async () => {
+				await Promise.allSettled(
+					[...this.#snapshotExports].map((snapshot) => snapshot.cancel()),
+				);
 				await Promise.allSettled([...this.#inFlightOperations]);
 				const results = await Promise.allSettled([
 					Promise.resolve().then(() => this.binding.close()),

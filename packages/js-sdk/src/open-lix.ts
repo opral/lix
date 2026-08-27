@@ -15,7 +15,14 @@ export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
 
 const openStorages = new WeakSet<LixStorage>();
 
-export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
+export function openLix(options: OpenLixOptions = {}): Promise<Lix> {
+	return openLixInternal(options);
+}
+
+async function openLixInternal(
+	options: OpenLixOptions,
+	snapshot?: ReadableStream<Uint8Array>,
+): Promise<Lix> {
 	if (!options || typeof options !== "object") {
 		throw new TypeError("openLix() options must be an object");
 	}
@@ -46,6 +53,9 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		throw new TypeError("openLix() onProgress must be a function");
 	}
 	if (options.server !== undefined) {
+		if (snapshot) {
+			throw new TypeError("openLix.fromSnapshot() does not accept server mode");
+		}
 		if (options.server.mode === "remote") {
 			const { openRemoteLixBinding } = await import("./remote/client.js");
 			if ("storage" in options && options.storage !== undefined) {
@@ -86,6 +96,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				options.telemetry,
 				syncServer,
 				options.onProgress,
+				snapshot,
 			),
 		);
 	}
@@ -95,6 +106,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			options.telemetry,
 			syncServer,
 			options.onProgress,
+			snapshot,
 		);
 	}
 	if (isLixStorage(options.storage)) {
@@ -115,6 +127,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				options.telemetry,
 				syncServer,
 				options.onProgress,
+				snapshot,
 			);
 			const routed = routeStorageBinding(binding);
 			storage.lixStorage.connect({
@@ -180,6 +193,7 @@ async function openJsProviderStorage(
 	telemetry: OpenLixOptions["telemetry"],
 	syncServer: Omit<SyncLixServerOptions, "mode"> | undefined,
 	onProgress: ((progress: LixOpenProgress) => void) | undefined,
+	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<Lix> {
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (openStorages.has(storage)) throw storageAlreadyOpen();
@@ -196,6 +210,7 @@ async function openJsProviderStorage(
 			telemetry,
 			syncServer,
 			onProgress,
+			snapshot,
 		);
 		binding = opened;
 		return new Lix(opened);
@@ -204,6 +219,93 @@ async function openJsProviderStorage(
 		await binding?.close().catch(() => undefined);
 		throw error;
 	}
+}
+
+export namespace openLix {
+	export async function fromSnapshot(
+		source: ReadableStream<Uint8Array> | Uint8Array,
+		options: OpenLixOptions = {},
+	): Promise<Lix> {
+		const prepared = prepareSnapshotSource(source);
+		try {
+			return await openLixInternal(options, prepared.stream);
+		} catch (error) {
+			await prepared.cancel(error);
+			throw error;
+		}
+	}
+}
+
+function prepareSnapshotSource(
+	source: ReadableStream<Uint8Array> | Uint8Array,
+): {
+	stream: ReadableStream<Uint8Array>;
+	cancel(reason?: unknown): Promise<void>;
+} {
+	if (source instanceof Uint8Array) {
+		let sent = false;
+		const stream = new ReadableStream<Uint8Array>(
+			{
+				pull(controller) {
+					if (!sent) {
+						sent = true;
+						controller.enqueue(source);
+					}
+					controller.close();
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+		return {
+			stream,
+			cancel: async (reason) => {
+				await stream.cancel(reason).catch(() => undefined);
+			},
+		};
+	}
+	if (!source || typeof source.getReader !== "function") {
+		throw new TypeError(
+			"openLix.fromSnapshot() requires a ReadableStream<Uint8Array> or Uint8Array",
+		);
+	}
+	// Acquire the caller's stream before openLixInternal can start a native or
+	// worker restore. A locked source therefore fails without creating backend work.
+	const reader = source.getReader();
+	let released = false;
+	const release = () => {
+		if (released) return;
+		released = true;
+		reader.releaseLock();
+	};
+	const cancel = async (reason?: unknown) => {
+		if (released) return;
+		try {
+			await reader.cancel(reason);
+		} finally {
+			release();
+		}
+	};
+	const stream = new ReadableStream<Uint8Array>(
+		{
+			async pull(controller) {
+				try {
+					const result = await reader.read();
+					if (result.done) {
+						release();
+						controller.close();
+						return;
+					}
+					controller.enqueue(result.value);
+				} catch (error) {
+					release();
+					controller.error(error);
+				}
+			},
+			cancel,
+		},
+		{ highWaterMark: 0 },
+	);
+	return { stream, cancel };
 }
 
 function storageAlreadyOpen(): Error & { code: string } {

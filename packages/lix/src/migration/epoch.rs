@@ -4,21 +4,23 @@ use bytes::Bytes;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use futures_util::{FutureExt as _, select_biased};
 
+use crate::LixError;
 use crate::engine::{Engine, EngineOptions};
+use crate::open_types::{
+    OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport, emit_open_progress,
+};
 use crate::storage_adapter::{
     EpochBank, MAX_SCAN_PAGE_ROWS, MemoryRead, MemoryWrite, PutBatch, PutEntry,
-    REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE, Storage, StorageAdapter,
-    StorageAdapterRead as _, StorageBeginScanOptions as BeginScanOptions,
-    StorageCommitResult as CommitResult, StorageCoreProjection as CoreProjection, StorageError,
-    StorageGetManyRequest as GetManyRequest, StorageGetManyResult as GetManyResult,
-    StorageGetOptions as GetOptions, StorageKey as Key, StorageKeyRange as KeyRange,
-    StoragePrecondition as Precondition, StorageProjectedValue as ProjectedValue, StorageRead,
-    StorageReadEntry as ReadEntry, StorageReadOptions as ReadOptions,
-    StorageScanChunk as ScanChunk, StorageScanCursor as ScanCursor, StorageScanSource,
-    StorageSessionToken, StorageSpace, StorageValue as StoredValue, StorageWrite,
-    StorageWriteOptions as WriteOptions,
+    REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE, Storage, StorageAdapter, StorageAdapterRead as _,
+    StorageBeginScanOptions as BeginScanOptions, StorageCommitResult as CommitResult,
+    StorageCoreProjection as CoreProjection, StorageError, StorageGetManyRequest as GetManyRequest,
+    StorageGetManyResult as GetManyResult, StorageGetOptions as GetOptions, StorageKey as Key,
+    StorageKeyRange as KeyRange, StoragePrecondition as Precondition,
+    StorageProjectedValue as ProjectedValue, StorageRead, StorageReadEntry as ReadEntry,
+    StorageReadOptions as ReadOptions, StorageScanChunk as ScanChunk,
+    StorageScanCursor as ScanCursor, StorageScanSource, StorageSessionToken, StorageSpace,
+    StorageValue as StoredValue, StorageWrite, StorageWriteOptions as WriteOptions,
 };
-use crate::{LixError, OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport};
 
 const POINTER_PREFIX: &str = "lix.repository-epoch.v1";
 const LEGACY_FENCE: &[u8] = b"tracked-default-branch.v76-epoch-migrating";
@@ -31,9 +33,301 @@ const MIGRATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const MIGRATION_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 const MISSED_HEARTBEATS_BEFORE_RECOVERY: usize = 10;
 
+fn durable_candidate_write_options() -> WriteOptions {
+    WriteOptions {
+        // A durable epoch pointer must never outlive candidate rows or the
+        // deletion of stale rows in the bank it makes reachable.
+        await_durable: true,
+        ..WriteOptions::default()
+    }
+}
+
+fn epoch_data_spaces() -> impl Iterator<Item = StorageSpace> {
+    crate::storage_spaces::SNAPSHOT_STORAGE_SPACES
+        .iter()
+        .copied()
+}
+
 pub(crate) struct EpochAdmission<S> {
     pub(crate) adapter: StorageAdapter<S>,
     pub(crate) report: OpenReport,
+}
+
+/// Owns one hidden, durably fenced epoch while a complete external state is
+/// imported. Only the exact-pointer publication makes the candidate visible.
+pub(crate) struct FreshEpochImport<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    storage: S,
+    candidate: StorageAdapter<S>,
+    claim: Bytes,
+    publication: uuid::Uuid,
+    heartbeat: Option<MigrationHeartbeat>,
+    cleanup: Option<FreshEpochCleanup>,
+}
+
+enum FreshEpochCleanupCommand {
+    Cleanup,
+    Disarm,
+}
+
+struct FreshEpochCleanup {
+    command: Option<tokio::sync::oneshot::Sender<FreshEpochCleanupCommand>>,
+    claimed: Option<tokio::sync::oneshot::Receiver<Result<(), LixError>>>,
+    done: Option<tokio::sync::oneshot::Receiver<Result<(), LixError>>>,
+}
+
+impl FreshEpochCleanup {
+    async fn wait_for_claim(&mut self) -> Result<(), LixError> {
+        self.claimed
+            .take()
+            .expect("fresh epoch claim completion receiver is present")
+            .await
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "snapshot restore claim task stopped without reporting completion",
+                )
+            })?
+    }
+
+    async fn cleanup(mut self) -> Result<(), LixError> {
+        let command = self
+            .command
+            .take()
+            .expect("fresh epoch cleanup command sender is present");
+        command
+            .send(FreshEpochCleanupCommand::Cleanup)
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "snapshot restore cleanup task stopped before receiving cancellation",
+                )
+            })?;
+        self.done
+            .take()
+            .expect("fresh epoch cleanup completion receiver is present")
+            .await
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "snapshot restore cleanup task stopped without reporting completion",
+                )
+            })?
+    }
+
+    fn disarm(mut self) {
+        if let Some(command) = self.command.take() {
+            let _ = command.send(FreshEpochCleanupCommand::Disarm);
+        }
+    }
+}
+
+impl Drop for FreshEpochCleanup {
+    fn drop(&mut self) {
+        // Closing the command channel is the cancellation signal. The cleanup
+        // task is started before the claim is attempted, so Drop never needs
+        // to create a task or block on asynchronous storage work.
+        self.command.take();
+    }
+}
+
+pub(crate) async fn begin_fresh_epoch_import<S>(storage: S) -> Result<FreshEpochImport<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let target = EpochBank::A;
+    let publication = uuid::Uuid::now_v7();
+    let claim = encode_pointer(PointerState::Migrating {
+        source: EpochBank::Legacy,
+        source_format: 0,
+        target,
+        generation: 1,
+        attempt: publication,
+    });
+    let candidate = StorageAdapter::for_epoch_migration(storage.clone(), target, claim.clone());
+    let mut cleanup = start_fresh_epoch_cleanup(storage.clone(), candidate.clone(), claim.clone())?;
+    cleanup.wait_for_claim().await?;
+    let heartbeat = match start_migration_heartbeat(storage.clone(), claim.clone()) {
+        Ok(heartbeat) => heartbeat,
+        Err(error) => {
+            let cleaned = cleanup.cleanup().await;
+            return Err(with_cleanup_error(error, cleaned));
+        }
+    };
+    if let Err(error) = clear_bank(&candidate).await {
+        let cleaned = cleanup.cleanup().await;
+        let stopped = heartbeat.stop().await;
+        return Err(with_cleanup_error(
+            error,
+            combine_cleanup_results(Ok(()), cleaned, stopped),
+        ));
+    }
+    Ok(FreshEpochImport {
+        storage,
+        candidate,
+        claim,
+        publication,
+        heartbeat: Some(heartbeat),
+        cleanup: Some(cleanup),
+    })
+}
+
+impl<S> FreshEpochImport<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn candidate(&self) -> &StorageAdapter<S> {
+        &self.candidate
+    }
+
+    pub(crate) async fn write_exact_batch(
+        &self,
+        space: StorageSpace,
+        batch: PutBatch,
+    ) -> Result<(), LixError> {
+        let mut write = self
+            .candidate
+            .begin_migration_write(durable_candidate_write_options())
+            .await
+            .map_err(storage_error)?;
+        write.put_many(space, batch).await.map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
+        Ok(())
+    }
+
+    pub(crate) async fn publish(mut self, format: u32) -> Result<S, LixError> {
+        let active_bytes = encode_pointer(PointerState::Active {
+            bank: EpochBank::A,
+            generation: 1,
+            format,
+            publication: Some(self.publication),
+        });
+        if let Err(error) = replace_pointer(&self.storage, &self.claim, &active_bytes).await {
+            if error.code == LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN {
+                if let Some(heartbeat) = self.heartbeat.take() {
+                    let _ = heartbeat.stop().await;
+                }
+                return Err(error);
+            }
+            match load_pointer(&self.storage).await {
+                Ok(Some((_, bytes))) if bytes == active_bytes => {}
+                Ok(Some((_, bytes))) if bytes == self.claim => {
+                    let cleanup = self.abort().await;
+                    return Err(with_cleanup_error(error, cleanup));
+                }
+                Ok(_) => {
+                    if let Some(heartbeat) = self.heartbeat.take() {
+                        let _ = heartbeat.stop().await;
+                    }
+                    return Err(error);
+                }
+                Err(inspect_error) => {
+                    if let Some(heartbeat) = self.heartbeat.take() {
+                        let _ = heartbeat.stop().await;
+                    }
+                    return Err(LixError::new(
+                        error.code.clone(),
+                        format!(
+                            "{error}; could not resolve snapshot publication outcome: {inspect_error}"
+                        ),
+                    ));
+                }
+            }
+        }
+        // Publication is now exact and durable. Cancellation while joining the
+        // heartbeat must not tear down the epoch that was just made active.
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.disarm();
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            // The active pointer is the durable commit point. A heartbeat join
+            // failure after it cannot turn a committed restore into a failure.
+            let _ = heartbeat.stop().await;
+        }
+        Ok(self.storage)
+    }
+
+    pub(crate) async fn abort(mut self) -> Result<(), LixError> {
+        let cleaned = match self.cleanup.take() {
+            Some(cleanup) => cleanup.cleanup().await,
+            None => Ok(()),
+        };
+        let stopped = match self.heartbeat.take() {
+            Some(heartbeat) => heartbeat.stop().await,
+            None => Ok(()),
+        };
+        combine_cleanup_results(Ok(()), cleaned, stopped)
+    }
+}
+
+fn start_fresh_epoch_cleanup<S>(
+    storage: S,
+    candidate: StorageAdapter<S>,
+    claim: Bytes,
+) -> Result<FreshEpochCleanup, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let (command, receive_command) = tokio::sync::oneshot::channel();
+    let (report_claimed, claimed) = tokio::sync::oneshot::channel();
+    let (report_done, done) = tokio::sync::oneshot::channel();
+    crate::background_task::spawn(
+        "lix-snapshot-restore-cleanup",
+        move || async move {
+            // Claim acquisition is owned by this task, not by the restore
+            // future. JavaScript promises and remote commits can continue after
+            // their Rust waiter is dropped; keeping the waiter here guarantees
+            // that cancellation cannot run cleanup against an absent pointer
+            // and then let an in-flight claim appear after cleanup has exited.
+            if let Err(error) = claim_fresh_import(&storage, &claim).await {
+                let cleaned = cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await;
+                let error = with_cleanup_error(error, cleaned);
+                let _ = report_done.send(Ok(()));
+                let _ = report_claimed.send(Err(error));
+                return;
+            }
+            if report_claimed.send(Ok(())).is_err() {
+                // The restore was cancelled before it observed ownership. The
+                // claim is now settled and exact, so it is safe to remove it.
+                let result = cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await;
+                let _ = report_done.send(result);
+                return;
+            }
+            let should_cleanup = !matches!(
+                receive_command.await,
+                Ok(FreshEpochCleanupCommand::Disarm)
+            );
+            let result = if should_cleanup {
+                cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await
+            } else {
+                Ok(())
+            };
+            let _ = report_done.send(result);
+        },
+    )?;
+    Ok(FreshEpochCleanup {
+        command: Some(command),
+        claimed: Some(claimed),
+        done: Some(done),
+    })
+}
+
+async fn cleanup_fresh_epoch_claim<S>(
+    storage: &S,
+    candidate: &StorageAdapter<S>,
+    claim: &Bytes,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let cleared = clear_bank(&candidate).await;
+    // Always release the exact claim. A later admission clears its hidden
+    // target before use, so stale candidate rows are safer than an orphaned
+    // epoch-control pointer that makes restore permanently unretryable.
+    let deleted = delete_pointer_resolving_outcome(storage, claim).await;
+    combine_cleanup_results(cleared, deleted, Ok(()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +336,7 @@ enum PointerState {
         bank: EpochBank,
         generation: u64,
         format: u32,
+        publication: Option<uuid::Uuid>,
     },
     Migrating {
         source: EpochBank,
@@ -66,6 +361,7 @@ where
                     bank,
                     generation,
                     format,
+                    ..
                 },
                 bytes,
             )) => {
@@ -148,7 +444,7 @@ where
 }
 
 fn emit_migrating(progress: Option<&Arc<dyn OpenProgressSink>>, from_format: u32) {
-    crate::handle::emit_open_progress(
+    emit_open_progress(
         progress,
         OpenProgress {
             phase: OpenPhase::Migrating,
@@ -161,7 +457,7 @@ fn emit_migrating(progress: Option<&Arc<dyn OpenProgressSink>>, from_format: u32
 }
 
 fn emit_validating(progress: Option<&Arc<dyn OpenProgressSink>>, from_format: u32) {
-    crate::handle::emit_open_progress(
+    emit_open_progress(
         progress,
         OpenProgress {
             phase: OpenPhase::Validating,
@@ -181,17 +477,28 @@ async fn recover_interrupted_migration<S>(
     observed_source_marker: Option<&Bytes>,
 ) -> Result<(), LixError>
 where
-    S: Storage,
+    S: Storage + Clone,
 {
     let PointerState::Migrating {
         source,
         source_format,
+        target,
         generation,
         ..
     } = state
     else {
         return Err(epoch_error("cannot recover a non-migrating epoch pointer"));
     };
+    if source == EpochBank::Legacy && source_format == 0 {
+        return recover_interrupted_fresh_import(
+            storage,
+            target,
+            generation,
+            migrating_bytes,
+            observed_lease,
+        )
+        .await;
+    }
     let mut preconditions = vec![Precondition::KeyValueEquals {
         space: REPOSITORY_EPOCH_SPACE,
         key: Key(Bytes::from_static(REPOSITORY_EPOCH_KEY)),
@@ -226,12 +533,9 @@ where
         })
         .await
         .map_err(storage_error)?;
+    let mut restored_active = None;
     match (source, source_format) {
-        (EpochBank::Legacy, 0) => {
-            delete_epoch_control(&mut write)
-                .await
-                .map_err(storage_error)?;
-        }
+        (EpochBank::Legacy, 0) => unreachable!("fresh import recovery returns above"),
         (EpochBank::Legacy, _format) => {
             let marker = observed_source_marker.ok_or_else(|| {
                 epoch_error("interrupted legacy migration lost its exact source marker")
@@ -251,21 +555,87 @@ where
                 .map_err(storage_error)?;
         }
         (bank, format) => {
-            put_pointer(
-                &mut write,
-                encode_pointer(PointerState::Active {
-                    bank,
-                    generation: generation.saturating_sub(1),
-                    format,
-                }),
-            )
-            .await
-            .map_err(storage_error)?;
+            let active = encode_pointer(PointerState::Active {
+                bank,
+                generation: generation.saturating_sub(1),
+                format,
+                publication: None,
+            });
+            put_pointer(&mut write, active.clone())
+                .await
+                .map_err(storage_error)?;
             delete_lease(&mut write).await.map_err(storage_error)?;
+            restored_active = Some(active);
         }
     }
-    write.commit().await.map_err(storage_error)?;
+    let commit = write.commit().await;
+    if let Some(active) = restored_active {
+        resolve_exact_pointer_commit(storage, commit, &active)
+            .await
+            .map_err(storage_error)?;
+    } else {
+        commit.map_err(storage_error)?;
+    }
     Ok(())
+}
+
+async fn recover_interrupted_fresh_import<S>(
+    storage: &S,
+    target: EpochBank,
+    generation: u64,
+    migrating_bytes: &Bytes,
+    observed_lease: Option<&Bytes>,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone,
+{
+    // Recovery must own a distinct pointer before touching the candidate. The
+    // prior importer and all of its adapters are fenced by this transition.
+    let recovery_bytes = encode_pointer(PointerState::Migrating {
+        source: EpochBank::Legacy,
+        source_format: 0,
+        target,
+        generation,
+        attempt: uuid::Uuid::now_v7(),
+    });
+    let mut preconditions = vec![Precondition::KeyValueEquals {
+        space: REPOSITORY_EPOCH_SPACE,
+        key: Key(Bytes::from_static(REPOSITORY_EPOCH_KEY)),
+        expected: migrating_bytes.clone(),
+    }];
+    preconditions.push(match observed_lease {
+        Some(expected) => Precondition::KeyValueEquals {
+            space: REPOSITORY_EPOCH_SPACE,
+            key: Key(Bytes::from_static(REPOSITORY_EPOCH_LEASE_KEY)),
+            expected: expected.clone(),
+        },
+        None => Precondition::KeyAbsent {
+            space: REPOSITORY_EPOCH_SPACE,
+            key: Key(Bytes::from_static(REPOSITORY_EPOCH_LEASE_KEY)),
+        },
+    });
+    let mut write = storage
+        .begin_write(WriteOptions {
+            await_durable: true,
+            preconditions,
+            ..WriteOptions::default()
+        })
+        .await
+        .map_err(storage_error)?;
+    put_pointer(&mut write, recovery_bytes.clone())
+        .await
+        .map_err(storage_error)?;
+    put_lease(&mut write, Bytes::from_static(b"0"))
+        .await
+        .map_err(storage_error)?;
+    resolve_exact_pointer_commit(storage, write.commit().await, &recovery_bytes)
+        .await
+        .map_err(storage_error)?;
+
+    let recovery =
+        StorageAdapter::for_epoch_migration((*storage).clone(), target, recovery_bytes.clone());
+    clear_bank(&recovery).await?;
+    delete_pointer_resolving_outcome(storage, &recovery_bytes).await
 }
 
 async fn admit_legacy<S>(
@@ -327,6 +697,7 @@ where
                 bank: target,
                 generation: 1,
                 format: crate::init::CURRENT_FORMAT_VERSION,
+                publication: None,
             };
             let active_bytes = encode_pointer(active);
             replace_pointer(storage, &migrating_bytes, &active_bytes).await?;
@@ -343,8 +714,7 @@ where
             })
         }
         .await;
-        heartbeat.stop().await?;
-        return result;
+        return finish_after_heartbeat(heartbeat, result).await;
     }
 
     let from_format = match legacy_status {
@@ -442,7 +812,7 @@ where
                 original_marker.as_ref(),
             );
             target
-                .commit_write_set(marker_write, WriteOptions::default())
+                .commit_write_set(marker_write, durable_candidate_write_options())
                 .await
                 .map_err(|error| epoch_error(format!("candidate marker write failed: {error}")))?;
             super::migrate_lix_with_adapter(
@@ -474,11 +844,15 @@ where
             bank: target_bank,
             generation: 1,
             format: crate::init::CURRENT_FORMAT_VERSION,
+            publication: None,
         };
         let active_bytes = encode_pointer(active);
         if let Err(error) =
             activate_legacy(storage, &migrating_bytes, fenced_revision, &active_bytes).await
         {
+            if matches!(error, StorageError::CommitOutcomeUnknown(_)) {
+                return Err(LixError::from(error));
+            }
             rollback_legacy(storage, &migrating_bytes, &original_marker).await?;
             return Err(storage_error(error));
         }
@@ -495,8 +869,7 @@ where
         })
     }
     .await;
-    heartbeat.stop().await?;
-    result
+    finish_after_heartbeat(heartbeat, result).await
 }
 
 async fn migrate_active<S>(
@@ -560,7 +933,9 @@ where
     put_lease(&mut claim, Bytes::from_static(b"0"))
         .await
         .map_err(storage_error)?;
-    if let Err(error) = claim.commit().await {
+    if let Err(error) =
+        resolve_exact_pointer_commit(storage, claim.commit().await, &migrating_bytes).await
+    {
         if is_admission_race(&error) {
             return Box::pin(admit_repository(storage, progress)).await;
         }
@@ -610,6 +985,7 @@ where
             bank: target_bank,
             generation: source_generation.saturating_add(1),
             format: crate::init::CURRENT_FORMAT_VERSION,
+            publication: None,
         };
         let active_bytes = encode_pointer(active);
         replace_pointer(storage, &migrating_bytes, &active_bytes).await?;
@@ -630,8 +1006,7 @@ where
         })
     }
     .await;
-    heartbeat.stop().await?;
-    result
+    finish_after_heartbeat(heartbeat, result).await
 }
 
 fn schedule_legacy_retirement<S>(storage: S, active_pointer: Bytes) -> Result<(), LixError>
@@ -658,10 +1033,10 @@ where
         return Ok(());
     }
     let legacy = StorageAdapter::new(storage.clone());
-    for &space in crate::storage_spaces::ALL_STORAGE_SPACES {
-        if space.id == REPOSITORY_EPOCH_SPACE.id {
-            continue;
-        }
+    for space in crate::storage_spaces::SNAPSHOT_STORAGE_SPACES
+        .iter()
+        .copied()
+    {
         legacy
             .clear_space(
                 space,
@@ -705,12 +1080,9 @@ async fn clear_bank<S>(adapter: &StorageAdapter<S>) -> Result<(), LixError>
 where
     S: Storage,
 {
-    for &space in crate::storage_spaces::ALL_STORAGE_SPACES {
-        if space.id == REPOSITORY_EPOCH_SPACE.id {
-            continue;
-        }
+    for space in epoch_data_spaces() {
         adapter
-            .clear_space(space, WriteOptions::default())
+            .clear_space(space, durable_candidate_write_options())
             .await
             .map_err(storage_error)?;
     }
@@ -732,10 +1104,7 @@ where
         .await
         .map_err(storage_error)?;
     drop(read);
-    for &space in crate::storage_spaces::ALL_STORAGE_SPACES {
-        if space.id == REPOSITORY_EPOCH_SPACE.id {
-            continue;
-        }
+    for space in epoch_data_spaces() {
         let mut lower = Bound::Unbounded;
         loop {
             // The migration claim makes the source bank immutable. Reopen a
@@ -762,7 +1131,7 @@ where
                 writes.put(space, entry.key, StoredValue { bytes: value });
             }
             target
-                .commit_write_set(writes, WriteOptions::default())
+                .commit_write_set(writes, durable_candidate_write_options())
                 .await
                 .map_err(|error| epoch_error(format!("copy target write failed: {error}")))?;
             if !has_more {
@@ -838,10 +1207,18 @@ async fn load_pointer<S>(storage: &S) -> Result<Option<(PointerState, Bytes)>, L
 where
     S: Storage + ?Sized,
 {
-    let read = storage
-        .begin_read(ReadOptions::default())
-        .await
-        .map_err(storage_error)?;
+    let Some(bytes) = load_pointer_bytes(storage).await.map_err(storage_error)? else {
+        return Ok(None);
+    };
+    let state = decode_pointer(&bytes)?;
+    Ok(Some((state, bytes)))
+}
+
+async fn load_pointer_bytes<S>(storage: &S) -> Result<Option<Bytes>, StorageError>
+where
+    S: Storage + ?Sized,
+{
+    let read = storage.begin_read(ReadOptions::default()).await?;
     let keys = [Key(Bytes::from_static(REPOSITORY_EPOCH_KEY))];
     let values = read
         .get_many(&[GetManyRequest {
@@ -851,13 +1228,37 @@ where
                 projection: CoreProjection::FullValue,
             },
         }])
-        .await
-        .map_err(storage_error)?;
-    let Some(ProjectedValue::FullValue(bytes)) = values.values.into_iter().next().flatten() else {
-        return Ok(None);
-    };
-    let state = decode_pointer(&bytes)?;
-    Ok(Some((state, bytes)))
+        .await?;
+    match values.values.into_iter().next().flatten() {
+        Some(ProjectedValue::FullValue(bytes)) => Ok(Some(bytes)),
+        Some(ProjectedValue::KeyOnly) => Err(StorageError::Corruption(
+            "epoch pointer full-value read returned key-only data".to_string(),
+        )),
+        None => Ok(None),
+    }
+}
+
+async fn resolve_exact_pointer_commit<S>(
+    storage: &S,
+    result: Result<CommitResult, StorageError>,
+    expected: &Bytes,
+) -> Result<(), StorageError>
+where
+    S: Storage + ?Sized,
+{
+    match result {
+        Ok(_) => Ok(()),
+        Err(StorageError::CommitOutcomeUnknown(message)) => {
+            match load_pointer_bytes(storage).await {
+                Ok(Some(observed)) if observed == *expected => Ok(()),
+                Ok(_) => Err(StorageError::CommitOutcomeUnknown(message)),
+                Err(read_error) => Err(StorageError::CommitOutcomeUnknown(format!(
+                    "{message}; exact-pointer resolution read failed: {read_error}"
+                ))),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn load_lease<S>(storage: &S) -> Result<Option<Bytes>, LixError>
@@ -942,6 +1343,21 @@ impl MigrationHeartbeat {
             )
         })
     }
+}
+
+async fn finish_after_heartbeat<T>(
+    heartbeat: MigrationHeartbeat,
+    result: Result<T, LixError>,
+) -> Result<T, LixError> {
+    let stopped = heartbeat.stop().await;
+    if result
+        .as_ref()
+        .is_err_and(|error| error.code == LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN)
+    {
+        return result;
+    }
+    stopped?;
+    result
 }
 
 impl Drop for MigrationHeartbeat {
@@ -1106,7 +1522,9 @@ where
     put_pointer(&mut write, active.clone())
         .await
         .map_err(storage_error)?;
-    write.commit().await.map_err(storage_error)?;
+    resolve_exact_pointer_commit(storage, write.commit().await, active)
+        .await
+        .map_err(storage_error)?;
     Ok(())
 }
 
@@ -1132,8 +1550,138 @@ where
         .await?;
     put_pointer(&mut write, migrating.clone()).await?;
     put_lease(&mut write, Bytes::from_static(b"0")).await?;
-    write.commit().await?;
-    Ok(())
+    resolve_exact_pointer_commit(storage, write.commit().await, migrating).await
+}
+
+async fn claim_fresh_import<S>(storage: &S, migrating: &Bytes) -> Result<(), LixError>
+where
+    S: Storage + Clone,
+{
+    loop {
+        match try_claim_fresh_import(storage, migrating).await {
+            Ok(()) => return Ok(()),
+            Err(StorageError::PreconditionFailed(_)) => {
+                let Some((state, bytes)) = load_pointer(storage).await? else {
+                    return Err(nonempty_snapshot_destination());
+                };
+                if !matches!(
+                    state,
+                    PointerState::Migrating {
+                        source: EpochBank::Legacy,
+                        source_format: 0,
+                        ..
+                    }
+                ) {
+                    return Err(nonempty_snapshot_destination());
+                }
+                wait_for_stale_fresh_import(storage, state, &bytes).await?;
+            }
+            Err(error) => return Err(storage_error(error)),
+        }
+    }
+}
+
+async fn try_claim_fresh_import<S>(storage: &S, migrating: &Bytes) -> Result<(), StorageError>
+where
+    S: Storage,
+{
+    let mut preconditions = Vec::with_capacity(
+        crate::storage_spaces::SNAPSHOT_STORAGE_SPACES.len()
+            + crate::storage_spaces::RETIRED_STORAGE_SPACES.len()
+            + 1,
+    );
+    preconditions.push(Precondition::RangeEmpty {
+        space: REPOSITORY_EPOCH_SPACE,
+        range: KeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+    });
+    preconditions.extend(
+        crate::storage_spaces::SNAPSHOT_STORAGE_SPACES
+            .iter()
+            .chain(
+                crate::storage_spaces::RETIRED_STORAGE_SPACES
+                    .iter()
+                    .filter(|retired| !retired.emitted_in_lixsnap_v1)
+                    .map(|retired| &retired.space),
+            )
+            .copied()
+            .map(|space| Precondition::RangeEmpty {
+                space,
+                range: KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+            }),
+    );
+    let mut write = storage
+        .begin_write(WriteOptions {
+            await_durable: true,
+            preconditions,
+            ..WriteOptions::default()
+        })
+        .await?;
+    put_pointer(&mut write, migrating.clone()).await?;
+    put_lease(&mut write, Bytes::from_static(b"0")).await?;
+    resolve_exact_pointer_commit(storage, write.commit().await, migrating).await
+}
+
+async fn wait_for_stale_fresh_import<S>(
+    storage: &S,
+    state: PointerState,
+    migrating_bytes: &Bytes,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone,
+{
+    let mut observed_lease = load_lease(storage).await?;
+    let mut missed = 0;
+    loop {
+        portable_sleep(MIGRATION_HEARTBEAT_INTERVAL).await?;
+        match load_pointer(storage).await? {
+            Some((_, current)) if current == *migrating_bytes => {}
+            _ => return Ok(()),
+        }
+        let current_lease = load_lease(storage).await?;
+        if current_lease != observed_lease {
+            observed_lease = current_lease;
+            missed = 0;
+            continue;
+        }
+        missed += 1;
+        if missed >= MISSED_HEARTBEATS_BEFORE_RECOVERY {
+            break;
+        }
+    }
+    match recover_interrupted_migration(
+        storage,
+        state,
+        migrating_bytes,
+        observed_lease.as_ref(),
+        None,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => match load_pointer(storage).await? {
+            Some((_, current)) if current == *migrating_bytes => {
+                if load_lease(storage).await? == observed_lease {
+                    Err(error)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+fn nonempty_snapshot_destination() -> LixError {
+    LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        "snapshot restore destination is not empty",
+    )
 }
 
 async fn claim_legacy<S>(
@@ -1181,8 +1729,7 @@ where
         )
         .await?;
     crate::storage_adapter::stage_mutation_revision(&mut write).await?;
-    write.commit().await?;
-    Ok(())
+    resolve_exact_pointer_commit(storage, write.commit().await, migrating).await
 }
 
 async fn activate_legacy<S>(
@@ -1210,8 +1757,7 @@ where
         .await?;
     put_pointer(&mut write, active.clone()).await?;
     delete_lease(&mut write).await?;
-    write.commit().await?;
-    Ok(())
+    resolve_exact_pointer_commit(storage, write.commit().await, active).await
 }
 
 async fn rollback_legacy<S>(storage: &S, migrating: &Bytes, marker: &Bytes) -> Result<(), LixError>
@@ -1271,7 +1817,9 @@ where
         .await
         .map_err(storage_error)?;
     delete_lease(&mut write).await.map_err(storage_error)?;
-    write.commit().await.map_err(storage_error)?;
+    resolve_exact_pointer_commit(storage, write.commit().await, replacement)
+        .await
+        .map_err(storage_error)?;
     Ok(())
 }
 
@@ -1296,6 +1844,53 @@ where
         .map_err(storage_error)?;
     write.commit().await.map_err(storage_error)?;
     Ok(())
+}
+
+async fn delete_pointer_resolving_outcome<S>(storage: &S, expected: &Bytes) -> Result<(), LixError>
+where
+    S: Storage,
+{
+    match delete_pointer(storage, expected).await {
+        Ok(()) => Ok(()),
+        Err(error) => match load_pointer(storage).await {
+            Ok(Some((_, current))) if current == *expected => Err(error),
+            Ok(_) => Ok(()),
+            Err(inspect_error) => Err(LixError::new(
+                error.code.clone(),
+                format!("{error}; could not resolve epoch cleanup outcome: {inspect_error}"),
+            )),
+        },
+    }
+}
+
+fn combine_cleanup_results(
+    cleared: Result<(), LixError>,
+    deleted: Result<(), LixError>,
+    stopped: Result<(), LixError>,
+) -> Result<(), LixError> {
+    let mut errors = [cleared.err(), deleted.err(), stopped.err()]
+        .into_iter()
+        .flatten();
+    let Some(first) = errors.next() else {
+        return Ok(());
+    };
+    let code = first.code.clone();
+    let mut message = first.to_string();
+    for error in errors {
+        message.push_str("; additional cleanup failure: ");
+        message.push_str(&error.to_string());
+    }
+    Err(LixError::new(code, message))
+}
+
+fn with_cleanup_error(primary: LixError, cleanup: Result<(), LixError>) -> LixError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => LixError::new(
+            primary.code.clone(),
+            format!("{primary}; snapshot restore cleanup also failed: {cleanup}"),
+        ),
+    }
 }
 
 async fn put_pointer<W>(write: &mut W, bytes: Bytes) -> Result<(), StorageError>
@@ -1368,10 +1963,17 @@ fn encode_pointer(state: PointerState) -> Bytes {
             bank,
             generation,
             format,
-        } => format!(
-            "{POINTER_PREFIX}|active|{}|{generation}|{format}",
-            bank_code(bank)
-        ),
+            publication,
+        } => match publication {
+            Some(publication) => format!(
+                "{POINTER_PREFIX}|active|{}|{generation}|{format}|{publication}",
+                bank_code(bank)
+            ),
+            None => format!(
+                "{POINTER_PREFIX}|active|{}|{generation}|{format}",
+                bank_code(bank)
+            ),
+        },
         PointerState::Migrating {
             source,
             source_format,
@@ -1398,6 +2000,16 @@ fn decode_pointer(bytes: &Bytes) -> Result<PointerState, LixError> {
             bank: parse_bank(parts[2])?,
             generation: parse_generation(parts[3])?,
             format: parse_format(parts[4])?,
+            publication: None,
+        }),
+        Some("active") if parts.len() == 6 => Ok(PointerState::Active {
+            bank: parse_bank(parts[2])?,
+            generation: parse_generation(parts[3])?,
+            format: parse_format(parts[4])?,
+            publication: Some(
+                uuid::Uuid::parse_str(parts[5])
+                    .map_err(|_| epoch_error("epoch pointer publication is invalid"))?,
+            ),
         }),
         Some("migrating") if parts.len() == 7 => Ok(PointerState::Migrating {
             source: parse_bank(parts[2])?,
@@ -1445,7 +2057,10 @@ fn epoch_error(message: impl Into<String>) -> LixError {
 }
 
 fn storage_error(error: StorageError) -> LixError {
-    if matches!(error, StorageError::ReadExpired) {
+    if matches!(
+        error,
+        StorageError::ReadExpired | StorageError::CommitOutcomeUnknown(_)
+    ) {
         return LixError::from(error);
     }
     LixError::new(
@@ -1466,7 +2081,16 @@ mod tests {
     use super::*;
     use crate::storage_adapter::StorageWriteOptions;
     use std::future::Future;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+
+    #[test]
+    fn candidate_epoch_writes_are_durable_and_cover_snapshot_wire_spaces() {
+        assert!(durable_candidate_write_options().await_durable);
+        assert_eq!(
+            epoch_data_spaces().collect::<Vec<_>>().as_slice(),
+            crate::storage_spaces::SNAPSHOT_STORAGE_SPACES
+        );
+    }
 
     #[derive(Clone, Debug)]
     struct CommitExpiringStorage {
@@ -1517,12 +2141,8 @@ mod tests {
         fn next_page(
             &mut self,
             limit_rows: usize,
-        ) -> std::pin::Pin<
-            Box<
-                dyn Future<Output = Result<ScanChunk, StorageError>> + Send
-                    + '_,
-            >,
-        > {
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>>
+        {
             Box::pin(async move {
                 if self.expire_next_page.swap(false, Ordering::AcqRel) {
                     self.generation.fetch_add(1, Ordering::AcqRel);
@@ -1624,9 +2244,7 @@ mod tests {
         type Read<'a> = CommitExpiringRead;
         type Write<'a> = CommitExpiringWrite;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -1645,6 +2263,137 @@ mod tests {
                 inner: self.inner.begin_write(opts).await?,
                 generation: Arc::clone(&self.generation),
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct PostCommitUnknownStorage {
+        inner: crate::Memory,
+        commit_fault: Arc<AtomicU8>,
+        fail_next_read: Arc<AtomicBool>,
+    }
+
+    const COMMIT_FAULT_NONE: u8 = 0;
+    const COMMIT_FAULT_PRE_UNKNOWN: u8 = 1;
+    const COMMIT_FAULT_POST_UNKNOWN: u8 = 2;
+    const COMMIT_FAULT_POST_UNKNOWN_AND_READ: u8 = 3;
+
+    impl PostCommitUnknownStorage {
+        fn new() -> Self {
+            Self {
+                inner: crate::Memory::new(),
+                commit_fault: Arc::new(AtomicU8::new(COMMIT_FAULT_NONE)),
+                fail_next_read: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn fail_next_commit(&self) {
+            self.commit_fault
+                .store(COMMIT_FAULT_POST_UNKNOWN, Ordering::Release);
+        }
+
+        fn fail_next_commit_before_apply(&self) {
+            self.commit_fault
+                .store(COMMIT_FAULT_PRE_UNKNOWN, Ordering::Release);
+        }
+
+        fn fail_next_commit_and_resolution_read(&self) {
+            self.commit_fault
+                .store(COMMIT_FAULT_POST_UNKNOWN_AND_READ, Ordering::Release);
+        }
+    }
+
+    struct PostCommitUnknownWrite {
+        inner: MemoryWrite,
+        commit_fault: u8,
+        fail_next_read: Arc<AtomicBool>,
+    }
+
+    impl Storage for PostCommitUnknownStorage {
+        type Read<'a> = MemoryRead;
+        type Write<'a> = PostCommitUnknownWrite;
+
+        async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            if self.fail_next_read.swap(false, Ordering::AcqRel) {
+                return Err(StorageError::Io(
+                    "injected exact-pointer resolution read failure".to_string(),
+                ));
+            }
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            Ok(PostCommitUnknownWrite {
+                inner: self.inner.begin_write(options).await?,
+                commit_fault: self.commit_fault.swap(COMMIT_FAULT_NONE, Ordering::AcqRel),
+                fail_next_read: Arc::clone(&self.fail_next_read),
+            })
+        }
+    }
+
+    impl StorageWrite for PostCommitUnknownWrite {
+        async fn put_many(
+            &mut self,
+            space: StorageSpace,
+            entries: PutBatch,
+        ) -> Result<(), StorageError> {
+            self.inner.put_many(space, entries).await
+        }
+
+        async fn replace_many(
+            &mut self,
+            space: StorageSpace,
+            entries: PutBatch,
+        ) -> Result<(), StorageError> {
+            self.inner.replace_many(space, entries).await
+        }
+
+        async fn delete_many(
+            &mut self,
+            space: StorageSpace,
+            keys: &[Key],
+        ) -> Result<(), StorageError> {
+            self.inner.delete_many(space, keys).await
+        }
+
+        async fn delete_range(
+            &mut self,
+            space: StorageSpace,
+            range: KeyRange,
+        ) -> Result<(), StorageError> {
+            self.inner.delete_range(space, range).await
+        }
+
+        async fn commit(self) -> Result<CommitResult, StorageError> {
+            if self.commit_fault == COMMIT_FAULT_PRE_UNKNOWN {
+                return Err(StorageError::CommitOutcomeUnknown(
+                    "injected pre-commit failure".to_string(),
+                ));
+            }
+            let result = self.inner.commit().await?;
+            if self.commit_fault == COMMIT_FAULT_POST_UNKNOWN_AND_READ {
+                self.fail_next_read.store(true, Ordering::Release);
+            }
+            if matches!(
+                self.commit_fault,
+                COMMIT_FAULT_POST_UNKNOWN | COMMIT_FAULT_POST_UNKNOWN_AND_READ
+            ) {
+                return Err(StorageError::CommitOutcomeUnknown(
+                    "injected post-commit failure".to_string(),
+                ));
+            }
+            Ok(result)
+        }
+
+        async fn rollback(self) -> Result<(), StorageError> {
+            self.inner.rollback().await
         }
     }
 
@@ -1667,6 +2416,7 @@ mod tests {
             bank,
             generation,
             format: 75,
+            publication: None,
         });
         publish_pointer_absent(storage, &active).await.unwrap();
         active
@@ -1679,6 +2429,13 @@ mod tests {
                 bank: EpochBank::A,
                 generation: 7,
                 format: 76,
+                publication: None,
+            },
+            PointerState::Active {
+                bank: EpochBank::A,
+                generation: 7,
+                format: 76,
+                publication: Some(uuid::Uuid::from_u128(2)),
             },
             PointerState::Migrating {
                 source: EpochBank::A,
@@ -1741,8 +2498,7 @@ mod tests {
             .unwrap();
         let source =
             StorageAdapter::for_epoch_migration(storage.clone(), EpochBank::A, migrating.clone());
-        let target =
-            StorageAdapter::for_epoch_migration(storage, EpochBank::B, migrating.clone());
+        let target = StorageAdapter::for_epoch_migration(storage, EpochBank::B, migrating.clone());
 
         source.storage().expire_next_page();
         copy_repository(&source, &target)
@@ -1764,12 +2520,13 @@ mod tests {
         let copied = cursor.collect_all().await.unwrap();
         assert_eq!(copied.len(), row_count);
         for (index, entry) in copied.into_iter().enumerate() {
-            assert_eq!(entry.key.0.as_ref(), u64::try_from(index).unwrap().to_be_bytes());
+            assert_eq!(
+                entry.key.0.as_ref(),
+                u64::try_from(index).unwrap().to_be_bytes()
+            );
             assert_eq!(
                 entry.value,
-                ProjectedValue::FullValue(Bytes::from(vec![
-                    u8::try_from(index % 251).unwrap(),
-                ])),
+                ProjectedValue::FullValue(Bytes::from(vec![u8::try_from(index % 251).unwrap(),])),
             );
         }
     }
@@ -1782,6 +2539,7 @@ mod tests {
             bank: EpochBank::B,
             generation: 2,
             format: crate::init::CURRENT_FORMAT_VERSION,
+            publication: None,
         });
         let mut raw = storage.begin_write(WriteOptions::default()).await.unwrap();
         put_pointer(&mut raw, replacement).await.unwrap();
@@ -1904,6 +2662,224 @@ mod tests {
         assert!(load_pointer(&storage).await.unwrap().is_none());
         let admitted = admit_repository(&storage, None).await.unwrap();
         assert!(admitted.report.initialized);
+    }
+
+    #[tokio::test]
+    async fn fresh_recovery_claims_ownership_before_clearing_candidate() {
+        let storage = crate::Memory::new();
+        let state = PointerState::Migrating {
+            source: EpochBank::Legacy,
+            source_format: 0,
+            target: EpochBank::A,
+            generation: 1,
+            attempt: uuid::Uuid::from_u128(40),
+        };
+        let bytes = encode_pointer(state);
+        publish_migration_claim_absent(&storage, &bytes)
+            .await
+            .unwrap();
+        let candidate =
+            StorageAdapter::for_epoch_migration(storage.clone(), EpochBank::A, bytes.clone());
+        let mut write = candidate
+            .begin_migration_write(WriteOptions::default())
+            .await
+            .unwrap();
+        write
+            .put_many(
+                crate::json_store::JSON_SPACE,
+                single_put(b"candidate", Bytes::from_static(b"preserved")),
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+
+        let observed = Bytes::from_static(b"0");
+        let advanced = Bytes::from_static(b"1");
+        advance_lease(&storage, &bytes, &observed, &advanced)
+            .await
+            .unwrap();
+        assert!(
+            recover_interrupted_migration(&storage, state, &bytes, Some(&observed), None)
+                .await
+                .is_err(),
+            "a changed lease must defeat stale recovery"
+        );
+
+        let read = candidate.begin_read(ReadOptions::default()).await.unwrap();
+        let mut cursor = read
+            .begin_scan(
+                crate::json_store::JSON_SPACE,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cursor.collect_all().await.unwrap().len(), 1);
+
+        recover_interrupted_migration(&storage, state, &bytes, Some(&advanced), None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_fresh_import_is_reclaimed_by_direct_retry() {
+        let storage = crate::Memory::new();
+        let first = begin_fresh_epoch_import(storage.clone()).await.unwrap();
+        let first_claim = first.claim.clone();
+        drop(first);
+
+        let second = begin_fresh_epoch_import(storage.clone())
+            .await
+            .expect("a direct retry should reclaim the cancelled import");
+        assert_ne!(second.claim, first_claim);
+        assert!(
+            load_pointer(&storage)
+                .await
+                .unwrap()
+                .is_some_and(|(_, bytes)| bytes == second.claim)
+        );
+        second.abort().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_fresh_claim_commit_is_resolved_as_owned() {
+        let storage = PostCommitUnknownStorage::new();
+        storage.fail_next_commit();
+
+        let import = begin_fresh_epoch_import(storage.clone())
+            .await
+            .expect("the exact committed claim resolves ambiguous acknowledgement");
+        assert!(
+            load_pointer(&storage)
+                .await
+                .unwrap()
+                .is_some_and(|(_, bytes)| bytes == import.claim)
+        );
+        import.abort().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn precommit_unknown_fresh_claim_preserves_unknown_outcome() {
+        let storage = PostCommitUnknownStorage::new();
+        storage.fail_next_commit_before_apply();
+
+        let error = match begin_fresh_epoch_import(storage.clone()).await {
+            Ok(_) => panic!("a pre-commit unknown claim cannot be acknowledged"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN);
+        assert!(load_pointer(&storage).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_fresh_publication_is_resolved_by_attempt_identity() {
+        let storage = PostCommitUnknownStorage::new();
+        let mut import = begin_fresh_epoch_import(storage.clone()).await.unwrap();
+        if let Some(heartbeat) = import.heartbeat.take() {
+            heartbeat.stop().await.unwrap();
+        }
+        let publication = import.publication;
+        storage.fail_next_commit();
+
+        import
+            .publish(crate::init::CURRENT_FORMAT_VERSION)
+            .await
+            .expect("the exact active publication resolves ambiguous acknowledgement");
+        assert!(matches!(
+            load_pointer(&storage).await.unwrap(),
+            Some((
+                PointerState::Active {
+                    publication: Some(observed),
+                    ..
+                },
+                _
+            )) if observed == publication
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_pointer_resolution_read_preserves_unknown_outcome() {
+        let storage = PostCommitUnknownStorage::new();
+        let migrating = encode_pointer(PointerState::Migrating {
+            source: EpochBank::Legacy,
+            source_format: 0,
+            target: EpochBank::A,
+            generation: 1,
+            attempt: uuid::Uuid::from_u128(50),
+        });
+        publish_migration_claim_absent(&storage, &migrating)
+            .await
+            .unwrap();
+        let active = encode_pointer(PointerState::Active {
+            bank: EpochBank::A,
+            generation: 1,
+            format: crate::init::CURRENT_FORMAT_VERSION,
+            publication: Some(uuid::Uuid::from_u128(50)),
+        });
+        storage.fail_next_commit_and_resolution_read();
+
+        let error = replace_pointer(&storage, &migrating, &active)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN);
+        assert!(error.message.contains("resolution read failed"));
+        assert!(
+            load_pointer(&storage)
+                .await
+                .unwrap()
+                .is_some_and(|(_, bytes)| bytes == active)
+        );
+    }
+
+    #[tokio::test]
+    async fn old_snapshot_claim_and_activation_resolve_postcommit_unknown() {
+        let storage = PostCommitUnknownStorage::new();
+        let marker = Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_V75);
+        let mut seed = storage.begin_write(WriteOptions::default()).await.unwrap();
+        seed.put_many(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            single_put(crate::init::REPOSITORY_PROTOCOL_KEY, marker.clone()),
+        )
+        .await
+        .unwrap();
+        seed.commit().await.unwrap();
+
+        let migrating = encode_pointer(PointerState::Migrating {
+            source: EpochBank::Legacy,
+            source_format: 75,
+            target: EpochBank::A,
+            generation: 1,
+            attempt: uuid::Uuid::from_u128(51),
+        });
+        storage.fail_next_commit();
+        claim_legacy(&storage, None, &marker, &migrating)
+            .await
+            .expect("the exact old-snapshot claim resolves post-commit unknown");
+        let source = StorageAdapter::for_epoch_migration(
+            storage.clone(),
+            EpochBank::Legacy,
+            migrating.clone(),
+        );
+        let source_revision = source.load_mutation_revision().await.unwrap();
+        let active = encode_pointer(PointerState::Active {
+            bank: EpochBank::A,
+            generation: 1,
+            format: crate::init::CURRENT_FORMAT_VERSION,
+            publication: None,
+        });
+        storage.fail_next_commit();
+        activate_legacy(&storage, &migrating, source_revision, &active)
+            .await
+            .expect("the exact old-snapshot activation resolves post-commit unknown");
+        assert!(
+            load_pointer(&storage)
+                .await
+                .unwrap()
+                .is_some_and(|(_, bytes)| bytes == active)
+        );
     }
 
     #[tokio::test]
@@ -2044,21 +3020,15 @@ mod tests {
             bank: EpochBank::B,
             generation: 8,
             format: crate::init::CURRENT_FORMAT_VERSION,
+            publication: None,
         });
         replace_pointer(&storage, &stale_active, &winner_active)
             .await
             .unwrap();
 
-        let admitted = migrate_active(
-            &storage,
-            EpochBank::A,
-            7,
-            75,
-            stale_active,
-            None,
-        )
-        .await
-        .expect("a losing opener should join the winner's active epoch");
+        let admitted = migrate_active(&storage, EpochBank::A, 7, 75, stale_active, None)
+            .await
+            .expect("a losing opener should join the winner's active epoch");
 
         assert_eq!(admitted.adapter.epoch_bank(), EpochBank::B);
         assert_eq!(admitted.report.migration, None);

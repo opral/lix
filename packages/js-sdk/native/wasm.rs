@@ -2,9 +2,12 @@
 
 use std::cell::{Cell, RefCell};
 use std::future::{Future, IntoFuture};
+use std::io;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Array, Function, Reflect};
@@ -23,6 +26,7 @@ use serde_bytes::ByteBuf;
 use wasm_bindgen::prelude::*;
 #[cfg(feature = "storage-bridge-bench")]
 use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::browser_storage::BrowserStorage;
 use crate::js_storage::{JsStorage, JsStorageProvider};
@@ -101,6 +105,280 @@ pub struct WasmLix {
     telemetry_parent: Option<PendingTelemetryParent>,
 }
 
+const SNAPSHOT_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+type WasmSnapshotMessage = Result<Option<Vec<u8>>, LixError>;
+
+struct WasmSnapshotWriter {
+    sender: async_channel::Sender<WasmSnapshotMessage>,
+    buffer: Vec<u8>,
+    pending: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>>,
+}
+
+impl WasmSnapshotWriter {
+    fn new(sender: async_channel::Sender<WasmSnapshotMessage>) -> Self {
+        Self {
+            sender,
+            buffer: Vec::with_capacity(SNAPSHOT_STREAM_CHUNK_BYTES),
+            pending: None,
+        }
+    }
+
+    fn start_send(&mut self) {
+        let sender = self.sender.clone();
+        let chunk = std::mem::replace(
+            &mut self.buffer,
+            Vec::with_capacity(SNAPSHOT_STREAM_CHUNK_BYTES),
+        );
+        self.pending = Some(Box::pin(async move {
+            sender.send(Ok(Some(chunk))).await.map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "snapshot export was canceled")
+            })
+        }));
+    }
+
+    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(pending) = self.pending.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match pending.as_mut().poll(cx) {
+            Poll::Ready(result) => {
+                self.pending = None;
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl futures_lite::io::AsyncWrite for WasmSnapshotWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.poll_pending(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        let available = SNAPSHOT_STREAM_CHUNK_BYTES - self.buffer.len();
+        let written = available.min(bytes.len());
+        self.buffer.extend_from_slice(&bytes[..written]);
+        if self.buffer.len() == SNAPSHOT_STREAM_CHUNK_BYTES {
+            self.start_send();
+        }
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            match self.poll_pending(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+            if self.buffer.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            self.start_send();
+        }
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                self.sender.close();
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+#[wasm_bindgen]
+pub struct WasmSnapshotExport {
+    receiver: async_channel::Receiver<WasmSnapshotMessage>,
+    completion: async_channel::Receiver<()>,
+    canceled: Cell<bool>,
+}
+
+#[wasm_bindgen]
+impl WasmSnapshotExport {
+    #[wasm_bindgen]
+    pub async fn next(&self) -> Result<Option<Vec<u8>>, JsValue> {
+        match self.receiver.recv().await {
+            Ok(Ok(Some(chunk))) => Ok(Some(chunk)),
+            Ok(Ok(None)) | Err(_) => {
+                let _ = self.completion.recv().await;
+                Ok(None)
+            }
+            Ok(Err(error)) => {
+                let _ = self.completion.recv().await;
+                Err(lix_error_to_js(error))
+            }
+        }
+    }
+
+    #[wasm_bindgen]
+    pub async fn cancel(&self) -> Result<(), JsValue> {
+        if self.canceled.replace(true) {
+            return Ok(());
+        }
+        self.receiver.close();
+        let _ = self.completion.recv().await;
+        Ok(())
+    }
+}
+
+impl Drop for WasmSnapshotExport {
+    fn drop(&mut self) {
+        self.receiver.close();
+    }
+}
+
+enum WasmSnapshotInputMessage {
+    Chunk(Vec<u8>),
+    Done,
+}
+
+struct WasmSnapshotReader {
+    receiver: Pin<Box<async_channel::Receiver<WasmSnapshotInputMessage>>>,
+    pending: Option<
+        Pin<
+            Box<
+                dyn Future<Output = Result<WasmSnapshotInputMessage, async_channel::RecvError>>
+                    + Send,
+            >,
+        >,
+    >,
+    chunk: Vec<u8>,
+    offset: usize,
+    finished: bool,
+}
+
+impl WasmSnapshotReader {
+    fn new(receiver: async_channel::Receiver<WasmSnapshotInputMessage>) -> Self {
+        Self {
+            receiver: Box::pin(receiver),
+            pending: None,
+            chunk: Vec::new(),
+            offset: 0,
+            finished: false,
+        }
+    }
+}
+
+impl futures_lite::io::AsyncRead for WasmSnapshotReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        loop {
+            if this.offset < this.chunk.len() {
+                let read = output.len().min(this.chunk.len() - this.offset);
+                output[..read].copy_from_slice(&this.chunk[this.offset..this.offset + read]);
+                this.offset += read;
+                return Poll::Ready(Ok(read));
+            }
+            if this.finished {
+                return Poll::Ready(Ok(0));
+            }
+            if this.pending.is_none() {
+                let receiver = this.receiver.as_ref().get_ref().clone();
+                this.pending = Some(Box::pin(async move { receiver.recv().await }));
+            }
+            let pending = this
+                .pending
+                .as_mut()
+                .expect("pending receive was initialized");
+            match pending.as_mut().poll(cx) {
+                Poll::Ready(Ok(WasmSnapshotInputMessage::Chunk(chunk))) => {
+                    this.pending = None;
+                    this.chunk = chunk;
+                    this.offset = 0;
+                }
+                Poll::Ready(Ok(WasmSnapshotInputMessage::Done)) => {
+                    this.pending = None;
+                    this.finished = true;
+                }
+                Poll::Ready(Err(_)) => {
+                    this.pending = None;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "snapshot input was canceled",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+#[wasm_bindgen]
+pub struct WasmSnapshotRestore {
+    input: async_channel::Sender<WasmSnapshotInputMessage>,
+    result: async_channel::Receiver<Result<WasmLix, JsValue>>,
+    finished: Cell<bool>,
+    complete: Rc<Cell<bool>>,
+}
+
+#[wasm_bindgen]
+impl WasmSnapshotRestore {
+    #[wasm_bindgen(js_name = isComplete)]
+    pub fn is_complete(&self) -> bool {
+        self.complete.get()
+    }
+
+    #[wasm_bindgen]
+    pub async fn write(&self, chunk: Vec<u8>) -> Result<(), JsValue> {
+        if self.finished.get() {
+            return Err(JsValue::from_str("snapshot restore input is closed"));
+        }
+        self.input
+            .send(WasmSnapshotInputMessage::Chunk(chunk))
+            .await
+            .map_err(|_| JsValue::from_str("snapshot restore is no longer accepting input"))
+    }
+
+    #[wasm_bindgen]
+    pub async fn finish(&self) -> Result<WasmLix, JsValue> {
+        if self.finished.replace(true) {
+            return Err(JsValue::from_str(
+                "snapshot restore input is already closed",
+            ));
+        }
+        // Preserve the decoder's semantic error if it stopped reading before
+        // EOF; failure to send Done only means the result is already ready.
+        let _ = self.input.send(WasmSnapshotInputMessage::Done).await;
+        self.input.close();
+        self.result.recv().await.unwrap_or_else(|_| {
+            Err(JsValue::from_str(
+                "snapshot restore stopped without returning a result",
+            ))
+        })
+    }
+
+    #[wasm_bindgen]
+    pub async fn cancel(&self) -> Result<(), JsValue> {
+        if self.finished.replace(true) {
+            return Ok(());
+        }
+        self.input.close();
+        // Wait for the restore task to release storage ownership. Its expected
+        // cancellation error is intentionally discarded.
+        let _ = self.result.recv().await;
+        Ok(())
+    }
+}
+
+impl Drop for WasmSnapshotRestore {
+    fn drop(&mut self) {
+        self.input.close();
+    }
+}
+
 type PendingTelemetryParent = Rc<RefCell<Option<SpanContext>>>;
 
 #[wasm_bindgen]
@@ -126,12 +404,44 @@ pub async fn open_memory(
 ) -> Result<WasmLix, JsValue> {
     open_browser_storage(
         BrowserStorage::Memory(Memory::new()),
+        None,
         telemetry_dispatch,
         telemetry_parent,
         server,
         open_progress_dispatch,
     )
     .await
+}
+
+#[wasm_bindgen(js_name = openMemoryFromSnapshot)]
+pub fn open_memory_from_snapshot(
+    telemetry_dispatch: Option<Function>,
+    telemetry_parent: Option<JsValue>,
+    open_progress_dispatch: Option<Function>,
+) -> WasmSnapshotRestore {
+    let (input, receiver) = async_channel::bounded(1);
+    let source = WasmSnapshotReader::new(receiver);
+    let open = open_browser_storage(
+        BrowserStorage::Memory(Memory::new()),
+        Some(source),
+        telemetry_dispatch,
+        telemetry_parent,
+        None,
+        open_progress_dispatch,
+    );
+    let (result_sender, result) = async_channel::bounded(1);
+    let complete = Rc::new(Cell::new(false));
+    let task_complete = Rc::clone(&complete);
+    spawn_local(async move {
+        let _ = result_sender.send(open.await).await;
+        task_complete.set(true);
+    });
+    WasmSnapshotRestore {
+        input,
+        result,
+        finished: Cell::new(false),
+        complete,
+    }
 }
 
 #[wasm_bindgen(js_name = openJsStorage)]
@@ -146,6 +456,7 @@ pub async fn open_js_storage(
     let browser_storage = BrowserStorage::Js(storage);
     match open_browser_storage(
         browser_storage.clone(),
+        None,
         telemetry_dispatch,
         telemetry_parent,
         server,
@@ -161,8 +472,54 @@ pub async fn open_js_storage(
     }
 }
 
+#[wasm_bindgen(js_name = openJsStorageFromSnapshot)]
+pub fn open_js_storage_from_snapshot(
+    provider: JsStorageProvider,
+    telemetry_dispatch: Option<Function>,
+    telemetry_parent: Option<JsValue>,
+    open_progress_dispatch: Option<Function>,
+) -> WasmSnapshotRestore {
+    let storage = JsStorage::new(provider);
+    let browser_storage = BrowserStorage::Js(storage);
+    let (input, receiver) = async_channel::bounded(1);
+    let source = WasmSnapshotReader::new(receiver);
+    let open_storage = browser_storage.clone();
+    let open = async move {
+        match open_browser_storage(
+            open_storage.clone(),
+            Some(source),
+            telemetry_dispatch,
+            telemetry_parent,
+            None,
+            open_progress_dispatch,
+        )
+        .await
+        {
+            Ok(lix) => Ok(lix),
+            Err(error) => {
+                let _ = open_storage.close().await;
+                Err(error)
+            }
+        }
+    };
+    let (result_sender, result) = async_channel::bounded(1);
+    let complete = Rc::new(Cell::new(false));
+    let task_complete = Rc::clone(&complete);
+    spawn_local(async move {
+        let _ = result_sender.send(open.await).await;
+        task_complete.set(true);
+    });
+    WasmSnapshotRestore {
+        input,
+        result,
+        finished: Cell::new(false),
+        complete,
+    }
+}
+
 async fn open_browser_storage(
     storage: BrowserStorage,
+    snapshot: Option<WasmSnapshotReader>,
     telemetry_dispatch: Option<Function>,
     telemetry_parent: Option<JsValue>,
     server: Option<JsValue>,
@@ -236,9 +593,14 @@ async fn open_browser_storage(
         if let Some(open_progress) = open_progress {
             builder = builder.with_open_progress_sink(open_progress);
         }
-        match server {
-            Some(server) => builder.with_server(server).await,
-            None => builder.await,
+        match (server, snapshot) {
+            (Some(server), None) => builder.with_server(server).await,
+            (None, Some(snapshot)) => builder.from_snapshot(snapshot).await,
+            (None, None) => builder.await,
+            (Some(_), Some(_)) => Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "snapshot restore cannot be combined with server mode",
+            )),
         }
     };
     let inner = instrument_remote_parent(telemetry_parent, open)
@@ -433,6 +795,34 @@ impl WasmLix {
             browser_sync_transport_id: self.browser_sync_transport_id.clone(),
             telemetry_parent: self.telemetry_parent.clone(),
         })
+    }
+
+    #[wasm_bindgen(js_name = exportSnapshot)]
+    pub fn export_snapshot(&self) -> WasmSnapshotExport {
+        let (sender, receiver) = async_channel::bounded(1);
+        let (completion_sender, completion) = async_channel::bounded(1);
+        let builder = self.inner.export_snapshot();
+        let telemetry_parent = self
+            .telemetry_parent
+            .as_ref()
+            .and_then(|parent| parent.borrow_mut().take());
+        let task_sender = sender.clone();
+        spawn_local(async move {
+            let mut writer = WasmSnapshotWriter::new(task_sender.clone());
+            let result =
+                instrument_remote_parent(telemetry_parent, builder.write_to(&mut writer)).await;
+            let terminal = match result {
+                Ok(_) => Ok(None),
+                Err(error) => Err(error),
+            };
+            let _ = task_sender.send(terminal).await;
+            let _ = completion_sender.send(()).await;
+        });
+        WasmSnapshotExport {
+            receiver,
+            completion,
+            canceled: Cell::new(false),
+        }
     }
 
     #[wasm_bindgen(js_name = execute)]

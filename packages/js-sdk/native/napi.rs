@@ -17,11 +17,14 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Sender};
+use std::io;
+use std::pin::Pin;
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
+use std::task::{Context, Poll};
 use std::thread;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
@@ -35,6 +38,7 @@ type SharedJsOpenProgressDispatch = Arc<JsOpenProgressDispatch>;
 // and live-state async futures before their first suspension point. They must
 // not inherit the platform's small default thread stack for that graph.
 const NATIVE_ENGINE_ACTOR_STACK_SIZE: usize = 32 * 1024 * 1024;
+const NATIVE_SNAPSHOT_EXPORT_HANDOFF_CAPACITY: usize = 1;
 
 fn optional_telemetry_dispatch(
     dispatch: Option<Function<'_, String, ()>>,
@@ -67,6 +71,24 @@ enum NativeLixInner {
         FilesystemStorage,
         Arc<AtomicUsize>,
     ),
+}
+
+enum NativeSnapshotExportBuilder {
+    Memory(lix::snapshot::SnapshotExportBuilder<Memory>),
+    FilesystemStorage(lix::snapshot::SnapshotExportBuilder<FilesystemStorage>),
+}
+
+impl NativeSnapshotExportBuilder {
+    async fn write_to<W>(self, writer: &mut W) -> std::result::Result<(), LixError>
+    where
+        W: futures_lite::io::AsyncWrite + Unpin + Send + ?Sized,
+    {
+        match self {
+            Self::Memory(builder) => builder.write_to(writer).await?,
+            Self::FilesystemStorage(builder) => builder.write_to(writer).await?,
+        };
+        Ok(())
+    }
 }
 
 enum NativeLixTransactionInner {
@@ -185,6 +207,46 @@ struct NativeLixActor {
 struct NativeLixActorState {
     lix: NativeLixInner,
     transactions: HashMap<u64, NativeLixTransactionInner>,
+    snapshot_exports: SyncSender<NativeSnapshotExportJob>,
+    snapshot_export_active: Arc<AtomicBool>,
+}
+
+struct NativeSnapshotExportJob {
+    builder: NativeSnapshotExportBuilder,
+    sender: async_channel::Sender<NativeSnapshotMessage>,
+    completion: Arc<NativeSnapshotExportCompletion>,
+    telemetry_parent: Option<SpanContext>,
+    active: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct NativeSnapshotExportCompletion {
+    finished: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl NativeSnapshotExportCompletion {
+    fn finish(&self) {
+        let mut finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *finished = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while !*finished {
+            finished = self
+                .changed
+                .wait(finished)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
 }
 
 type NativeResult<T> = std::result::Result<T, LixError>;
@@ -253,6 +315,10 @@ enum LixCommand {
         deferred: NativeMergeReceiptDeferred,
     },
     SyncDiskToLix(NativeUnitDeferred),
+    ExportSnapshot {
+        sender: async_channel::Sender<NativeSnapshotMessage>,
+        completion: Arc<NativeSnapshotExportCompletion>,
+    },
     Close(NativeUnitDeferred),
     Observe {
         sql: String,
@@ -285,6 +351,361 @@ struct QueuedLixCommand {
     telemetry_parent: Option<SpanContext>,
 }
 
+const SNAPSHOT_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+enum NativeSnapshotMessage {
+    Chunk(Vec<u8>),
+    Done,
+    Error(LixError),
+}
+
+enum NativeSnapshotInputMessage {
+    Chunk(Vec<u8>),
+    Done,
+}
+
+struct NativeSnapshotReader {
+    receiver: Pin<Box<async_channel::Receiver<NativeSnapshotInputMessage>>>,
+    chunk: Vec<u8>,
+    offset: usize,
+    finished: bool,
+}
+
+impl NativeSnapshotReader {
+    fn new(receiver: async_channel::Receiver<NativeSnapshotInputMessage>) -> Self {
+        Self {
+            receiver: Box::pin(receiver),
+            chunk: Vec::new(),
+            offset: 0,
+            finished: false,
+        }
+    }
+}
+
+impl futures_lite::io::AsyncRead for NativeSnapshotReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        loop {
+            if this.offset < this.chunk.len() {
+                let read = output.len().min(this.chunk.len() - this.offset);
+                output[..read].copy_from_slice(&this.chunk[this.offset..this.offset + read]);
+                this.offset += read;
+                return Poll::Ready(Ok(read));
+            }
+            if this.finished {
+                return Poll::Ready(Ok(0));
+            }
+            match this.receiver.recv_blocking() {
+                Ok(NativeSnapshotInputMessage::Chunk(chunk)) => {
+                    this.chunk = chunk;
+                    this.offset = 0;
+                }
+                Ok(NativeSnapshotInputMessage::Done) => this.finished = true,
+                Err(_) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "snapshot input was canceled",
+                    )));
+                }
+            }
+        }
+    }
+}
+
+enum NativeSnapshotSource {
+    Bytes(futures_lite::io::Cursor<Vec<u8>>),
+    Stream(NativeSnapshotReader),
+}
+
+impl futures_lite::io::AsyncRead for NativeSnapshotSource {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Bytes(cursor) => Pin::new(cursor).poll_read(cx, output),
+            Self::Stream(reader) => Pin::new(reader).poll_read(cx, output),
+        }
+    }
+}
+
+struct NativeSnapshotWriter {
+    sender: async_channel::Sender<NativeSnapshotMessage>,
+    buffer: Vec<u8>,
+}
+
+impl NativeSnapshotWriter {
+    fn new(sender: async_channel::Sender<NativeSnapshotMessage>) -> Self {
+        Self {
+            sender,
+            buffer: Vec::with_capacity(SNAPSHOT_STREAM_CHUNK_BYTES),
+        }
+    }
+
+    fn send_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::replace(
+            &mut self.buffer,
+            Vec::with_capacity(SNAPSHOT_STREAM_CHUNK_BYTES),
+        );
+        self.sender
+            .send_blocking(NativeSnapshotMessage::Chunk(chunk))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "snapshot export was canceled"))
+    }
+}
+
+impl futures_lite::io::AsyncWrite for NativeSnapshotWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let available = SNAPSHOT_STREAM_CHUNK_BYTES - self.buffer.len();
+        let written = available.min(bytes.len());
+        self.buffer.extend_from_slice(&bytes[..written]);
+        if self.buffer.len() == SNAPSHOT_STREAM_CHUNK_BYTES {
+            self.send_buffer()?;
+        }
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(self.send_buffer())
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush(cx)
+    }
+}
+
+#[napi]
+#[expect(missing_debug_implementations)]
+pub struct NativeSnapshotExport {
+    receiver: async_channel::Receiver<NativeSnapshotMessage>,
+    completion: Arc<NativeSnapshotExportCompletion>,
+    canceled: Arc<AtomicBool>,
+}
+
+#[expect(missing_debug_implementations)]
+pub struct NativeSnapshotNextTask {
+    receiver: async_channel::Receiver<NativeSnapshotMessage>,
+    completion: Arc<NativeSnapshotExportCompletion>,
+}
+
+impl Task for NativeSnapshotNextTask {
+    type Output = std::result::Result<Option<Buffer>, LixError>;
+    type JsValue = Option<Buffer>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        Ok(match self.receiver.recv_blocking() {
+            Ok(NativeSnapshotMessage::Chunk(chunk)) => Ok(Some(Buffer::from(chunk))),
+            Ok(NativeSnapshotMessage::Done) | Err(_) => {
+                self.completion.wait();
+                Ok(None)
+            }
+            Ok(NativeSnapshotMessage::Error(error)) => {
+                self.completion.wait();
+                Err(error)
+            }
+        })
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        output.map_err(|error| lix_error_to_napi_error(&env, error))
+    }
+}
+
+#[napi]
+impl NativeSnapshotExport {
+    #[napi]
+    pub fn next(&self) -> AsyncTask<NativeSnapshotNextTask> {
+        AsyncTask::new(NativeSnapshotNextTask {
+            receiver: self.receiver.clone(),
+            completion: self.completion.clone(),
+        })
+    }
+
+    #[napi]
+    pub fn cancel(&self) -> Result<AsyncTask<NativeSnapshotExportCancelTask>> {
+        if self.canceled.swap(true, Ordering::SeqCst) {
+            return Err(Error::from_reason("snapshot export is already canceled"));
+        }
+        // Close before scheduling the completion wait. Both next() and cancel()
+        // use Node's worker pool; deferring this close to the cancel task can
+        // deadlock when a blocking next() occupies the last pool thread.
+        self.receiver.close();
+        Ok(AsyncTask::new(NativeSnapshotExportCancelTask {
+            completion: self.completion.clone(),
+        }))
+    }
+}
+
+#[expect(missing_debug_implementations)]
+pub struct NativeSnapshotExportCancelTask {
+    completion: Arc<NativeSnapshotExportCompletion>,
+}
+
+impl Task for NativeSnapshotExportCancelTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.completion.wait();
+        Ok(())
+    }
+
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+        Ok(())
+    }
+}
+
+impl Drop for NativeSnapshotExport {
+    fn drop(&mut self) {
+        self.receiver.close();
+    }
+}
+
+#[napi]
+#[expect(missing_debug_implementations)]
+pub struct NativeSnapshotRestore {
+    input: async_channel::Sender<NativeSnapshotInputMessage>,
+    result: async_channel::Receiver<NativeResult<NativeLix>>,
+    finished: Arc<AtomicBool>,
+    complete: Arc<AtomicBool>,
+}
+
+#[expect(missing_debug_implementations)]
+pub struct NativeSnapshotWriteTask {
+    input: async_channel::Sender<NativeSnapshotInputMessage>,
+    chunk: Option<Vec<u8>>,
+}
+
+impl Task for NativeSnapshotWriteTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.input
+            .send_blocking(NativeSnapshotInputMessage::Chunk(
+                self.chunk.take().unwrap_or_default(),
+            ))
+            .map_err(|_| Error::from_reason("snapshot restore is no longer accepting input"))
+    }
+
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+        Ok(())
+    }
+}
+
+#[expect(missing_debug_implementations)]
+pub struct NativeSnapshotFinishTask {
+    input: async_channel::Sender<NativeSnapshotInputMessage>,
+    result: async_channel::Receiver<NativeResult<NativeLix>>,
+}
+
+impl Task for NativeSnapshotFinishTask {
+    type Output = NativeResult<NativeLix>;
+    type JsValue = NativeLix;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        // A decoder may reject and drop the receiver before EOF is sent. The
+        // semantic restore result is authoritative; a failed EOF send is only
+        // evidence that the result is already ready.
+        let _ = self.input.send_blocking(NativeSnapshotInputMessage::Done);
+        self.input.close();
+        Ok(self.result.recv_blocking().unwrap_or_else(|_| {
+            Err(LixError::unknown(
+                "snapshot restore stopped without returning a result",
+            ))
+        }))
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        output.map_err(|error| lix_error_to_napi_error(&env, error))
+    }
+}
+
+#[expect(missing_debug_implementations)]
+pub struct NativeSnapshotCancelTask {
+    input: async_channel::Sender<NativeSnapshotInputMessage>,
+    result: async_channel::Receiver<NativeResult<NativeLix>>,
+}
+
+impl Task for NativeSnapshotCancelTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.input.close();
+        // Cancellation is completion-aware so callers can immediately reuse a
+        // destination after the restore task releases its storage claims.
+        let _ = self.result.recv_blocking();
+        Ok(())
+    }
+
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+        Ok(())
+    }
+}
+
+#[napi]
+impl NativeSnapshotRestore {
+    #[napi(js_name = "isComplete")]
+    pub fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::SeqCst)
+    }
+
+    #[napi]
+    pub fn write(&self, chunk: Uint8Array) -> Result<AsyncTask<NativeSnapshotWriteTask>> {
+        if self.finished.load(Ordering::SeqCst) {
+            return Err(Error::from_reason("snapshot restore input is closed"));
+        }
+        Ok(AsyncTask::new(NativeSnapshotWriteTask {
+            input: self.input.clone(),
+            chunk: Some(chunk.to_vec()),
+        }))
+    }
+
+    #[napi]
+    pub fn finish(&self) -> Result<AsyncTask<NativeSnapshotFinishTask>> {
+        if self.finished.swap(true, Ordering::SeqCst) {
+            return Err(Error::from_reason(
+                "snapshot restore input is already closed",
+            ));
+        }
+        Ok(AsyncTask::new(NativeSnapshotFinishTask {
+            input: self.input.clone(),
+            result: self.result.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn cancel(&self) -> Result<AsyncTask<NativeSnapshotCancelTask>> {
+        if self.finished.swap(true, Ordering::SeqCst) {
+            return Err(Error::from_reason(
+                "snapshot restore input is already closed",
+            ));
+        }
+        Ok(AsyncTask::new(NativeSnapshotCancelTask {
+            input: self.input.clone(),
+            result: self.result.clone(),
+        }))
+    }
+}
+
+impl Drop for NativeSnapshotRestore {
+    fn drop(&mut self) {
+        self.input.close();
+    }
+}
+
 fn take_pending_telemetry_parent(parent: &PendingTelemetryParent) -> Option<SpanContext> {
     parent
         .lock()
@@ -298,6 +719,14 @@ impl NativeLixActor {
         telemetry_parent: Option<PendingTelemetryParent>,
     ) -> Result<Self> {
         let (commands, receiver) = mpsc::channel();
+        let (snapshot_exports, snapshot_export_receiver) =
+            mpsc::sync_channel(NATIVE_SNAPSHOT_EXPORT_HANDOFF_CAPACITY);
+        let snapshot_export_active = Arc::new(AtomicBool::new(false));
+        thread::Builder::new()
+            .name("lix-snapshot-export".to_string())
+            .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
+            .spawn(move || run_native_snapshot_export_executor(snapshot_export_receiver))
+            .map_err(to_napi_error)?;
         let actor = Self {
             commands,
             closed: Arc::new(AtomicBool::new(false)),
@@ -310,7 +739,16 @@ impl NativeLixActor {
         thread::Builder::new()
             .name("lix-native".to_string())
             .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
-            .spawn(move || run_lix_actor(lix, receiver, actor_closed, actor_send_lock))
+            .spawn(move || {
+                run_lix_actor(
+                    lix,
+                    receiver,
+                    actor_closed,
+                    actor_send_lock,
+                    snapshot_exports,
+                    snapshot_export_active,
+                )
+            })
             .map_err(to_napi_error)?;
         Ok(actor)
     }
@@ -348,6 +786,37 @@ impl NativeLixActor {
             }
         }
     }
+
+    fn send_snapshot_export(
+        &self,
+        sender: async_channel::Sender<NativeSnapshotMessage>,
+        completion: Arc<NativeSnapshotExportCompletion>,
+    ) {
+        let Ok(_send_guard) = self.send_lock.lock() else {
+            let _ = sender.send_blocking(NativeSnapshotMessage::Error(lix_closed_error()));
+            completion.finish();
+            return;
+        };
+        if self.closed.load(Ordering::SeqCst) {
+            let _ = sender.send_blocking(NativeSnapshotMessage::Error(lix_closed_error()));
+            completion.finish();
+            return;
+        }
+        let queued = QueuedLixCommand {
+            command: LixCommand::ExportSnapshot {
+                sender: sender.clone(),
+                completion: completion.clone(),
+            },
+            telemetry_parent: self
+                .telemetry_parent
+                .as_ref()
+                .and_then(take_pending_telemetry_parent),
+        };
+        if self.commands.send(queued).is_err() {
+            let _ = sender.send_blocking(NativeSnapshotMessage::Error(lix_closed_error()));
+            completion.finish();
+        }
+    }
 }
 
 impl NativeLixActor {
@@ -376,6 +845,8 @@ fn run_lix_actor(
     receiver: mpsc::Receiver<QueuedLixCommand>,
     closed: Arc<AtomicBool>,
     send_lock: Arc<Mutex<()>>,
+    snapshot_exports: SyncSender<NativeSnapshotExportJob>,
+    snapshot_export_active: Arc<AtomicBool>,
 ) {
     let rt = match Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -388,6 +859,8 @@ fn run_lix_actor(
     let mut state = Some(NativeLixActorState {
         lix,
         transactions: HashMap::new(),
+        snapshot_exports,
+        snapshot_export_active,
     });
 
     while let Ok(queued) = receiver.recv() {
@@ -425,7 +898,7 @@ fn drain_commands_after_close(receiver: &mpsc::Receiver<QueuedLixCommand>, send_
     }
 }
 
-fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error: std::io::Error) {
+fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error: io::Error) {
     while let Ok(queued) = receiver.recv() {
         match queued.command {
             LixCommand::Execute { deferred, .. } => deferred.reject(to_napi_error(&error)),
@@ -445,6 +918,12 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
                 deferred.reject(to_napi_error(&error));
             }
             LixCommand::MergeBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::ExportSnapshot { sender, completion } => {
+                let _ = sender.send_blocking(NativeSnapshotMessage::Error(LixError::unknown(
+                    error.to_string(),
+                )));
+                completion.finish();
+            }
             LixCommand::SyncDiskToLix(deferred)
             | LixCommand::Close(deferred)
             | LixCommand::ImportFilesystemPaths { deferred, .. }
@@ -581,6 +1060,40 @@ fn handle_lix_command(
             settle_deferred(deferred, result);
             false
         }
+        LixCommand::ExportSnapshot { sender, completion } => {
+            if state.snapshot_export_active.swap(true, Ordering::SeqCst) {
+                finish_native_snapshot_export(
+                    sender,
+                    completion,
+                    Err(LixError::new(
+                        "LIX_ERROR_SNAPSHOT_EXPORT_BUSY",
+                        "a native snapshot export is already active; finish or cancel it before starting another",
+                    )),
+                );
+                return false;
+            }
+            let job = NativeSnapshotExportJob {
+                builder: state.lix.snapshot_export_builder(),
+                sender,
+                completion,
+                telemetry_parent,
+                active: Arc::clone(&state.snapshot_export_active),
+            };
+            match state.snapshot_exports.try_send(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
+                    job.active.store(false, Ordering::SeqCst);
+                    finish_native_snapshot_export(
+                        job.sender,
+                        job.completion,
+                        Err(LixError::unknown(
+                            "native snapshot export executor is unavailable",
+                        )),
+                    );
+                }
+            }
+            false
+        }
         LixCommand::Close(deferred) => {
             let result = block_on!(state.lix.close());
             let should_drop_state = result.is_ok();
@@ -654,6 +1167,74 @@ fn handle_lix_command(
     }
 }
 
+fn run_native_snapshot_export_executor(receiver: mpsc::Receiver<NativeSnapshotExportJob>) {
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            while let Ok(job) = receiver.recv() {
+                finish_active_native_snapshot_export(
+                    job.sender,
+                    job.completion,
+                    job.active,
+                    Err(LixError::unknown(format!(
+                        "failed to create snapshot export runtime: {error}"
+                    ))),
+                );
+            }
+            return;
+        }
+    };
+
+    while let Ok(job) = receiver.recv() {
+        let NativeSnapshotExportJob {
+            builder,
+            sender,
+            completion,
+            telemetry_parent,
+            active,
+        } = job;
+        if sender.is_closed() {
+            active.store(false, Ordering::SeqCst);
+            completion.finish();
+            continue;
+        }
+        let mut writer = NativeSnapshotWriter::new(sender.clone());
+        let result = runtime.block_on(instrument_remote_parent(
+            telemetry_parent,
+            builder.write_to(&mut writer),
+        ));
+        finish_active_native_snapshot_export(sender, completion, active, result);
+    }
+}
+
+fn finish_active_native_snapshot_export(
+    sender: async_channel::Sender<NativeSnapshotMessage>,
+    completion: Arc<NativeSnapshotExportCompletion>,
+    active: Arc<AtomicBool>,
+    result: NativeResult<()>,
+) {
+    let message = match result {
+        Ok(()) => NativeSnapshotMessage::Done,
+        Err(error) => NativeSnapshotMessage::Error(error),
+    };
+    let _ = sender.send_blocking(message);
+    active.store(false, Ordering::SeqCst);
+    completion.finish();
+}
+
+fn finish_native_snapshot_export(
+    sender: async_channel::Sender<NativeSnapshotMessage>,
+    completion: Arc<NativeSnapshotExportCompletion>,
+    result: NativeResult<()>,
+) {
+    let message = match result {
+        Ok(()) => NativeSnapshotMessage::Done,
+        Err(error) => NativeSnapshotMessage::Error(error),
+    };
+    let _ = sender.send_blocking(message);
+    completion.finish();
+}
+
 fn settle_command_after_close(command: LixCommand) {
     match command {
         LixCommand::Close(deferred) => settle_deferred(deferred, Ok(())),
@@ -695,6 +1276,10 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::Observe { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::ExportSnapshot { sender, completion } => {
+            let _ = sender.send_blocking(NativeSnapshotMessage::Error(lix_closed_error()));
+            completion.finish();
+        }
         LixCommand::ImportFilesystemPaths { deferred, .. }
         | LixCommand::SyncDiskToLix(deferred)
         | LixCommand::TransactionCommit { deferred, .. }
@@ -719,6 +1304,15 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.open_report(),
             Self::FilesystemStorage(lix, _, _) => lix.open_report(),
+        }
+    }
+
+    fn snapshot_export_builder(&self) -> NativeSnapshotExportBuilder {
+        match self {
+            Self::Memory(lix) => NativeSnapshotExportBuilder::Memory(lix.export_snapshot()),
+            Self::FilesystemStorage(lix, _, _) => {
+                NativeSnapshotExportBuilder::FilesystemStorage(lix.export_snapshot())
+            }
         }
     }
 
@@ -1003,6 +1597,7 @@ pub struct OpenFilesystemStorageTask {
     open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
+    snapshot: Option<Vec<u8>>,
 }
 
 #[expect(missing_debug_implementations)]
@@ -1012,6 +1607,7 @@ pub struct OpenMemoryTask {
     open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
+    snapshot: Option<Vec<u8>>,
 }
 
 impl Task for OpenFilesystemStorageTask {
@@ -1027,6 +1623,9 @@ impl Task for OpenFilesystemStorageTask {
             self.open_progress_dispatch.take(),
             self.server_url.take(),
             std::mem::take(&mut self.server_headers),
+            self.snapshot
+                .take()
+                .map(|bytes| NativeSnapshotSource::Bytes(futures_lite::io::Cursor::new(bytes))),
         ))
     }
 
@@ -1046,6 +1645,9 @@ impl Task for OpenMemoryTask {
             self.open_progress_dispatch.take(),
             self.server_url.take(),
             std::mem::take(&mut self.server_headers),
+            self.snapshot
+                .take()
+                .map(|bytes| NativeSnapshotSource::Bytes(futures_lite::io::Cursor::new(bytes))),
         ))
     }
 
@@ -1106,6 +1708,7 @@ fn open_memory_native(
     open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
+    snapshot: Option<NativeSnapshotSource>,
 ) -> std::result::Result<NativeLix, LixError> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -1124,8 +1727,11 @@ fn open_memory_native(
     if let Some(url) = server_url {
         builder = builder.with_server(ServerOptions::sync(url).with_headers(server_headers));
     }
-    let lix = rt.block_on(instrument_remote_parent(telemetry_parent, async {
-        builder.await
+    let lix = rt.block_on(instrument_remote_parent(telemetry_parent, async move {
+        match snapshot {
+            Some(snapshot) => builder.from_snapshot(snapshot).await,
+            None => builder.await,
+        }
     }));
     let lix = lix?;
     NativeLix::new(NativeLixInner::Memory(lix), telemetry_parent_source)
@@ -1139,6 +1745,7 @@ fn open_filesystem_storage_native(
     open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
+    snapshot: Option<NativeSnapshotSource>,
 ) -> std::result::Result<NativeLix, LixError> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -1160,8 +1767,11 @@ fn open_filesystem_storage_native(
     if let Some(url) = server_url {
         builder = builder.with_server(ServerOptions::sync(url).with_headers(server_headers));
     }
-    let lix = rt.block_on(instrument_remote_parent(telemetry_parent, async {
-        builder.await
+    let lix = rt.block_on(instrument_remote_parent(telemetry_parent, async move {
+        match snapshot {
+            Some(snapshot) => builder.from_snapshot(snapshot).await,
+            None => builder.await,
+        }
     }));
     let lix = lix?;
     rt.block_on(storage.start_sync(&lix))?;
@@ -1169,6 +1779,31 @@ fn open_filesystem_storage_native(
         NativeLixInner::FilesystemStorage(lix, storage, Arc::new(AtomicUsize::new(1))),
         telemetry_parent_source,
     )
+}
+
+fn start_native_snapshot_restore<F>(open: F) -> Result<NativeSnapshotRestore>
+where
+    F: FnOnce(NativeSnapshotSource) -> NativeResult<NativeLix> + Send + 'static,
+{
+    let (input, receiver) = async_channel::bounded(1);
+    let (result_sender, result) = async_channel::bounded(1);
+    let complete = Arc::new(AtomicBool::new(false));
+    let task_complete = Arc::clone(&complete);
+    thread::Builder::new()
+        .name("lix-snapshot-restore".to_string())
+        .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
+        .spawn(move || {
+            let source = NativeSnapshotSource::Stream(NativeSnapshotReader::new(receiver));
+            let _ = result_sender.send_blocking(open(source));
+            task_complete.store(true, Ordering::SeqCst);
+        })
+        .map_err(to_napi_error)?;
+    Ok(NativeSnapshotRestore {
+        input,
+        result,
+        finished: Arc::new(AtomicBool::new(false)),
+        complete,
+    })
 }
 
 #[napi]
@@ -1205,7 +1840,30 @@ impl NativeLix {
             open_progress_dispatch: optional_open_progress_dispatch(open_progress_dispatch)?,
             server_url,
             server_headers: parse_server_headers(server_headers)?,
+            snapshot: None,
         }))
+    }
+
+    #[napi(js_name = "openMemoryFromSnapshot")]
+    pub fn open_memory_from_snapshot(
+        telemetry_dispatch: Option<Function<'_, String, ()>>,
+        telemetry_parent_json: Option<String>,
+        open_progress_dispatch: Option<Function<'_, String, ()>>,
+    ) -> Result<NativeSnapshotRestore> {
+        let telemetry_dispatch = optional_telemetry_dispatch(telemetry_dispatch)?;
+        let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json)
+            .map_err(Error::from_reason)?;
+        let open_progress_dispatch = optional_open_progress_dispatch(open_progress_dispatch)?;
+        start_native_snapshot_restore(move |snapshot| {
+            open_memory_native(
+                telemetry_dispatch,
+                telemetry_parent,
+                open_progress_dispatch,
+                None,
+                Vec::new(),
+                Some(snapshot),
+            )
+        })
     }
 
     #[napi(js_name = "openFilesystemStorage")]
@@ -1227,7 +1885,34 @@ impl NativeLix {
             open_progress_dispatch: optional_open_progress_dispatch(open_progress_dispatch)?,
             server_url,
             server_headers: parse_server_headers(server_headers)?,
+            snapshot: None,
         }))
+    }
+
+    #[napi(js_name = "openFilesystemStorageFromSnapshot")]
+    pub fn open_filesystem_storage_from_snapshot(
+        path: String,
+        sync_all_files: bool,
+        telemetry_dispatch: Option<Function<'_, String, ()>>,
+        telemetry_parent_json: Option<String>,
+        open_progress_dispatch: Option<Function<'_, String, ()>>,
+    ) -> Result<NativeSnapshotRestore> {
+        let telemetry_dispatch = optional_telemetry_dispatch(telemetry_dispatch)?;
+        let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json)
+            .map_err(Error::from_reason)?;
+        let open_progress_dispatch = optional_open_progress_dispatch(open_progress_dispatch)?;
+        start_native_snapshot_restore(move |snapshot| {
+            open_filesystem_storage_native(
+                path,
+                sync_all_files,
+                telemetry_dispatch,
+                telemetry_parent,
+                open_progress_dispatch,
+                None,
+                Vec::new(),
+                Some(snapshot),
+            )
+        })
     }
 
     #[napi(js_name = "openAnotherSession")]
@@ -1479,6 +2164,19 @@ impl NativeLix {
         self.actor
             .send_with_deferred(deferred, LixCommand::SyncDiskToLix);
         Ok(promise)
+    }
+
+    #[napi(js_name = "exportSnapshot")]
+    pub fn export_snapshot(&self) -> NativeSnapshotExport {
+        let (sender, receiver) = async_channel::bounded(1);
+        let completion = Arc::new(NativeSnapshotExportCompletion::default());
+        self.actor
+            .send_snapshot_export(sender, Arc::clone(&completion));
+        NativeSnapshotExport {
+            receiver,
+            completion,
+            canceled: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     #[napi]

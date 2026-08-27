@@ -43,7 +43,9 @@ pub use crate::storage::{
     StoredValue as StorageValue, ValueIntegrity, ValueSemantics,
     WriteOptions as StorageWriteOptions,
 };
-pub(crate) use crate::storage::{Capability as StorageCapability, PutBatch, PutEntry};
+pub(crate) use crate::storage::{
+    Capability as StorageCapability, PutBatch, PutEntry, StorageSession,
+};
 
 pub use context::StorageAdapter;
 pub(crate) use context::{

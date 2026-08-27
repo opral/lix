@@ -48,6 +48,18 @@ export type BindingObserveEvent = {
 
 export type BindingParam = NativeLixValue;
 
+export type SnapshotExportBinding = {
+	next(): Promise<Uint8Array | null | undefined>;
+	cancel(): void | Promise<void>;
+};
+
+export type SnapshotRestoreBinding<T> = {
+	write(chunk: Uint8Array): Promise<void>;
+	isComplete(): boolean;
+	finish(): Promise<T>;
+	cancel(): void | Promise<void>;
+};
+
 export type BindingBatchStatement = {
 	sql: string;
 	params: BindingParam[];
@@ -80,6 +92,7 @@ export type LixBinding = {
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
 	syncDiskToLix(): Promise<void>;
+	exportSnapshot?(): SnapshotExportBinding;
 	close(): Promise<void>;
 };
 

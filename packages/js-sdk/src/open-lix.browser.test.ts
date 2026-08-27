@@ -8,6 +8,74 @@ registerMemoryStorageContract({
 	supportsPluginExecution: false,
 });
 
+test("exports and restores snapshot streams in browser WASM", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const source = await openLix();
+	await source.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('browser-snapshot', 'complete')",
+	);
+	const restored = await openLix.fromSnapshot(source.exportSnapshot());
+	try {
+		const rows = await restored.execute(
+			"SELECT value FROM lix_key_value WHERE key = 'browser-snapshot'",
+		);
+		expect(rows.rows).toHaveLength(1);
+	} finally {
+		await restored.close();
+		await source.close();
+	}
+});
+
+test("browser snapshot export is chunked and cancelable through the worker", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const lix = await openLix();
+	let state = 0x8765_4321;
+	let payload = "";
+	for (let index = 0; index < 160 * 1024; index++) {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		payload += String.fromCharCode(33 + (state % 90));
+	}
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+		["browser-large-snapshot", payload],
+	);
+
+	const reader = lix.exportSnapshot().getReader();
+	let chunks = 0;
+	while (true) {
+		const result = await reader.read();
+		if (result.done) break;
+		expect(result.value.byteLength).toBeLessThanOrEqual(64 * 1024);
+		chunks += 1;
+	}
+	expect(chunks).toBeGreaterThan(1);
+	const restored = await openLix.fromSnapshot(lix.exportSnapshot());
+	try {
+		expect(
+			(
+				await restored.execute(
+					"SELECT value FROM lix_key_value WHERE key = 'browser-large-snapshot'",
+				)
+			).rows,
+		).toHaveLength(1);
+	} finally {
+		await restored.close();
+	}
+
+	const canceled = lix.exportSnapshot().getReader();
+	expect((await canceled.read()).done).toBe(false);
+	await canceled.cancel();
+	await lix.close();
+});
+
+test("browser close cancels an abandoned started snapshot export", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const lix = await openLix();
+	const reader = lix.exportSnapshot().getReader();
+	expect((await reader.read()).done).toBe(false);
+	await lix.close();
+});
+
 test("forwards opt-in SQL telemetry from browser WASM", async () => {
 	const { openLix } = await import("@lix-js/sdk");
 	let resolveSpan!: (span: { attributes: Record<string, unknown> }) => void;

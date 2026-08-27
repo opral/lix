@@ -193,7 +193,7 @@ impl StorageBenchStorage for InMemoryBenchStorage {
 
     fn fork_for_write(&self, storage: &Self::Storage) -> Self::Storage {
         storage
-            .fork_snapshot()
+            .fork()
             .expect("fork in-memory bench storage")
     }
 }

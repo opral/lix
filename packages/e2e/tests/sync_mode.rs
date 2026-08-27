@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use http::header::CONTENT_TYPE;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt as _, Full};
+use futures_util::io::Cursor;
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -1928,17 +1929,17 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
     // Full lineage of the failing live repository: authored on the v71
     // engine, migrated and partial-checkpointed on the v72 engine
     // (fixture generated from 4816fdba5, SHA-256
-    // 0841a126e32c939786e152a88be337aefbdfdd6b4d28452bf9419f98517a1b1a),
+    // 634eefb12a96bbb656214d5f203fb2f0dbd0fc552379754e3c86eb9cb99b6f70),
     // migrated to the current format here, served, and read from a fresh
     // sync replica after a bounded history lookup hydrated only the
     // checkpoint anchor.
     const V72_PARTIAL_CHECKPOINTS: &[u8] =
-        include_bytes!("fixtures/v72_partial_checkpoints.snapshot");
-    let authority_storage =
-        Memory::from_snapshot(V72_PARTIAL_CHECKPOINTS).expect("decode v72 fixture");
+        include_bytes!("fixtures/v72_partial_checkpoints.lixsnap");
+    let authority_storage = Memory::new();
     let authority = Arc::new(
         open_lix()
             .with_storage(authority_storage.clone())
+            .from_snapshot(Cursor::new(V72_PARTIAL_CHECKPOINTS))
             .await
             .expect("open and automatically upgrade authority"),
     );
