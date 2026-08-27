@@ -27,7 +27,6 @@ export {
 	bundledPluginArchives,
 	type BundledPluginArchive,
 } from "./bundled-plugins.js";
-export { Row } from "./result.js";
 export { Value } from "./value.js";
 export type {
 	CreateBranchOptions,
@@ -36,10 +35,16 @@ export type {
 	RedoReceipt,
 	ExecuteOptions,
 	ExecuteResult,
+	ExecuteBatchResult,
 	LixBatchOptions,
 	LixBatchStatement,
 	JsonValue,
 	LixValue,
+	ResultArrayRow,
+	ResultColumn,
+	ResultColumnType,
+	ResultObjectRow,
+	ResultRow,
 	MergeBranchOptions,
 	MergeBranchOutcome,
 	MergeBranchPreview,

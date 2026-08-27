@@ -135,7 +135,7 @@ test("loads and executes the engine outside the browser main thread", async () =
 		const { openLix } = await import("@lix-js/sdk");
 		const lix = await openLix();
 		const result = await lix.execute("SELECT 1 AS value");
-		expect(result.rows[0]?.get("value")).toBe(1);
+		expect(result.rows[0]?.value).toBe(1);
 		await lix.close();
 		expect(mainThreadCalls).toBe(0);
 	} finally {
@@ -154,7 +154,7 @@ test("keeps browser worker sessions independent", async () => {
 	expect(await review.activeBranchId()).toBe(draft.id);
 	await main.close();
 	expect(
-		(await review.execute("SELECT 1 AS value")).rows[0]?.get("value"),
+		(await review.execute("SELECT 1 AS value")).rows[0]?.value,
 	).toBe(1);
 	await review.close();
 });
@@ -169,7 +169,7 @@ test("createCheckpoint returns the new active head through browser WASM", async 
 		);
 		const before = (
 			await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
-		).rows[0]?.get("commit_id");
+		).rows[0]?.commit_id;
 
 		const checkpoint = await lix.createCheckpoint();
 
@@ -177,7 +177,7 @@ test("createCheckpoint returns the new active head through browser WASM", async 
 		expect(
 			(
 				await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
-			).rows[0]?.get("commit_id"),
+			).rows[0]?.commit_id,
 		).toBe(checkpoint.commitId);
 	} finally {
 		await lix.close();
@@ -202,7 +202,7 @@ test("checkpoint GC starts without requiring a browser Tokio runtime", async () 
 			expect(checkpoint.commitId).toEqual(expect.any(String));
 		}
 
-		expect((await lix.execute("SELECT 1 AS value")).rows[0]?.get("value")).toBe(
+		expect((await lix.execute("SELECT 1 AS value")).rows[0]?.value).toBe(
 			1,
 		);
 	} finally {
@@ -216,7 +216,7 @@ test("lix_restore moves the active branch to an ancestor through browser WASM", 
 	try {
 		const initial = (
 			await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
-		).rows[0]?.get("commit_id") as string;
+		).rows[0]?.commit_id as string;
 		await lix.execute(
 			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
 			["restore-test", "later"],
@@ -230,7 +230,7 @@ test("lix_restore moves the active branch to an ancestor through browser WASM", 
 		expect(
 			(
 				await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
-			).rows[0]?.get("commit_id"),
+			).rows[0]?.commit_id,
 		).toBe(initial);
 		expect(
 			(await lix.execute("SELECT * FROM lix_key_value WHERE key = $1", [
@@ -261,7 +261,7 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 			ORDER BY path ASC
 		`);
 		const rows = result.rows
-			.map((row) => row.toObject() as { path: string; kind: string })
+			.map((row) => row as { path: string; kind: string })
 			.filter((row) => !row.path.startsWith("/.lix/"));
 
 		expect(rows).toEqual([

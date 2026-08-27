@@ -59,6 +59,7 @@ impl SqlWriteResult {
                     .iter()
                     .map(|item| item.output_name.clone())
                     .collect(),
+                column_types: vec![crate::ResultColumnType::Text; returning.items.len()],
                 rows,
                 notices: Vec::new(),
             },

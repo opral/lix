@@ -7,7 +7,7 @@ use crate::storage_adapter::{
     StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
     StorageKey, StorageProjectedValue, StorageSpace, ValueSemantics, exact_get_many,
 };
-use crate::{LixError, LixNotice, Value};
+use crate::{LixError, LixNotice, ResultColumnType, Value};
 
 use super::execute::ExecuteResult;
 
@@ -101,6 +101,8 @@ pub(crate) struct ExecuteIdempotencyReceipt {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct StoredExecuteResult {
     columns: Vec<String>,
+    #[serde(default)]
+    column_types: Vec<ResultColumnType>,
     rows: Vec<Vec<StoredValue>>,
     rows_affected: u64,
     notices: Vec<LixNotice>,
@@ -239,6 +241,7 @@ impl StoredExecuteResult {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             columns: result.columns().to_vec(),
+            column_types: result.column_types().to_vec(),
             rows,
             rows_affected: result.rows_affected(),
             notices: result.notices().to_vec(),
@@ -257,6 +260,7 @@ impl StoredExecuteResult {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ExecuteResult::from_idempotency_parts(
             self.columns,
+            self.column_types,
             rows,
             self.rows_affected,
             self.notices,

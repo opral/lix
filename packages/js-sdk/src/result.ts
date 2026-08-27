@@ -1,66 +1,51 @@
 import { fromNativeValue, type NativeLixValue, Value } from "./value.js";
-import type { ExecuteBatchResult, ExecuteResult, LixValue } from "./types.js";
-
-export class Row {
-	constructor(
-		private readonly columns: string[],
-		private readonly values: Value[],
-	) {}
-
-	static fromRaw(columns: string[], values: LixValue[]) {
-		return new Row(
-			columns,
-			values.map((value) => Value._fromNative(value)),
-		);
-	}
-
-	get(column: string): unknown {
-		return this.value(column).toJS();
-	}
-
-	value(column: string): Value {
-		const index = this.columns.indexOf(column);
-		if (index === -1) {
-			throw new Error(
-				`Unknown column "${column}". Available columns: ${this.columns.join(", ")}`,
-			);
-		}
-		const value = this.values[index];
-		if (!value) {
-			throw new Error(`Column "${column}" is missing a value`);
-		}
-		return value;
-	}
-
-	toObject(): Record<string, unknown> {
-		return Object.fromEntries(
-			this.columns.map((column, index) => [column, this.values[index]?.toJS()]),
-		);
-	}
-
-	toValueMap(): Record<string, Value> {
-		return Object.fromEntries(
-			this.columns.map((column, index) => [column, this.values[index]]),
-		);
-	}
-}
+import type {
+	ExecuteBatchResult,
+	ExecuteResult,
+	ResultArrayRow,
+	ResultObjectRow,
+	ResultRow,
+} from "./types.js";
 
 type NativeExecuteResult = Omit<ExecuteResult, "rows"> & {
 	rows: NativeLixValue[][];
 };
 
-export function wrapExecuteResult(result: NativeExecuteResult): ExecuteResult {
+export function wrapExecuteResult(result: NativeExecuteResult): ExecuteResult;
+export function wrapExecuteResult(
+	result: NativeExecuteResult,
+	rowMode: "object",
+): ExecuteResult<ResultObjectRow>;
+export function wrapExecuteResult(
+	result: NativeExecuteResult,
+	rowMode: "array",
+): ExecuteResult<ResultArrayRow>;
+export function wrapExecuteResult(
+	result: NativeExecuteResult,
+	rowMode: "object" | "array",
+): ExecuteResult<ResultRow>;
+export function wrapExecuteResult(
+	result: NativeExecuteResult,
+	rowMode: "object" | "array" = "object",
+): ExecuteResult<ResultRow> {
 	return {
 		...result,
-		rows: result.rows.map((row) =>
-			Row.fromRaw(result.columns, row.map(fromNativeValue)),
-		),
+		rows: result.rows.map((row) => {
+			const values = row.map((value) =>
+				Value._fromNative(fromNativeValue(value)).toJS(),
+			);
+			if (rowMode === "array") return values as ResultArrayRow;
+			return Object.fromEntries(
+				result.columns.map((column, index) => [column.name, values[index]]),
+			) as ResultObjectRow;
+		}),
 	};
 }
 
 export function wrapExecuteBatchResult(
 	result: NativeExecuteResult,
-): ExecuteBatchResult {
+	rowMode: "object" | "array" = "object",
+): ExecuteBatchResult<ResultRow> {
 	const statementIndex = result.statementIndex;
 	if (
 		typeof statementIndex !== "number" ||
@@ -70,7 +55,7 @@ export function wrapExecuteBatchResult(
 		throw new Error("executeBatch result is missing a valid statementIndex");
 	}
 	return {
-		...wrapExecuteResult(result),
+		...wrapExecuteResult(result, rowMode),
 		statementIndex,
 	};
 }

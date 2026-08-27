@@ -262,7 +262,7 @@ impl Event {
 /// Stable URL prefix owned by the Lix Server Protocol.
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 /// Canonical method and path registry for protocol hosts and conformance tools.
 pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
     ("GET", "/lix/v1"),
@@ -4352,10 +4352,17 @@ struct ExecuteResponse {
     statement_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
-    columns: Vec<String>,
+    columns: Vec<ExecuteColumn>,
     rows: Vec<Vec<WireValue>>,
     rows_affected: u64,
     notices: Vec<lix::LixNotice>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecuteColumn {
+    name: String,
+    #[serde(rename = "type")]
+    column_type: lix::ResultColumnType,
 }
 
 impl TryFrom<ExecuteResult> for ExecuteResponse {
@@ -4375,7 +4382,13 @@ impl TryFrom<ExecuteResult> for ExecuteResponse {
         Ok(Self {
             statement_index: result.statement_index(),
             label: result.label().map(str::to_owned),
-            columns: result.columns().to_vec(),
+            columns: result
+                .columns()
+                .iter()
+                .cloned()
+                .zip(result.column_types().iter().copied())
+                .map(|(name, column_type)| ExecuteColumn { name, column_type })
+                .collect(),
             rows,
             rows_affected: result.rows_affected(),
             notices: result.notices().to_vec(),

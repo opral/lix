@@ -181,7 +181,7 @@ fn protocol_error(code: &str, status: u16) -> serde_json::Value {
 
 fn execute_ok() -> serde_json::Value {
     serde_json::json!({
-        "columns": ["n"],
+        "columns": [{ "name": "n", "type": "integer" }],
         "rows": [[{ "kind": "int", "value": 1 }]],
         "rowsAffected": 0,
         "notices": [],

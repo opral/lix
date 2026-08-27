@@ -662,6 +662,13 @@ pub(crate) async fn execute_exact_lix_file_root_listing(
             "lixcol_metadata".to_string(),
             "lixcol_updated_at".to_string(),
         ],
+        column_types: vec![
+            crate::ResultColumnType::Text,
+            crate::ResultColumnType::Text,
+            crate::ResultColumnType::Text,
+            crate::ResultColumnType::Jsonb,
+            crate::ResultColumnType::Text,
+        ],
         rows,
         notices: Vec::new(),
     })
@@ -751,8 +758,21 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     } else {
         vec!["path".to_string(), "content".to_string()]
     };
+    let column_types = if data_range.is_some() {
+        vec![
+            crate::ResultColumnType::Text,
+            crate::ResultColumnType::Blob,
+            crate::ResultColumnType::Integer,
+            crate::ResultColumnType::Integer,
+            crate::ResultColumnType::Integer,
+            crate::ResultColumnType::Text,
+        ]
+    } else {
+        vec![crate::ResultColumnType::Text, crate::ResultColumnType::Blob]
+    };
     Ok(SqlQueryResult {
         columns,
+        column_types,
         rows,
         notices: Vec::new(),
     })

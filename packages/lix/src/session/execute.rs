@@ -18,7 +18,7 @@ use crate::storage_adapter::{
     StorageReadDurability, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
-use crate::{Blob, LixError, LixNotice, SqlQueryResult, Value};
+use crate::{Blob, LixError, LixNotice, ResultColumnType, SqlQueryResult, Value};
 use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -95,6 +95,7 @@ pub struct ExecuteResult {
 #[derive(Debug)]
 struct ExecuteResultBacking {
     columns: Arc<[String]>,
+    column_types: Arc<[ResultColumnType]>,
     rows: OnceLock<Vec<Row>>,
     columnar: StdMutex<Option<ColumnarResult>>,
     notices: Vec<LixNotice>,
@@ -119,6 +120,7 @@ impl PartialEq for ExecuteResult {
                 (&self.backing, &other.backing),
                 (Some(left), Some(right)) if Arc::ptr_eq(left, right)
             ) || (self.columns() == other.columns()
+                && self.column_types() == other.column_types()
                 && self.rows() == other.rows()
                 && self.notices() == other.notices()))
     }
@@ -197,7 +199,13 @@ impl ExecuteResult {
     fn from_sql_query_result(result: SqlQueryResult) -> Self {
         #[cfg(feature = "storage-benches")]
         let started = crate::sql_profile::is_active().then(std::time::Instant::now);
-        let result = Self::from_query_parts(result.columns, result.rows, 0, result.notices);
+        let result = Self::from_query_parts(
+            result.columns,
+            result.column_types,
+            result.rows,
+            0,
+            result.notices,
+        );
         #[cfg(feature = "storage-benches")]
         if let Some(started) = started {
             crate::sql_profile::record_phase(
@@ -215,7 +223,13 @@ impl ExecuteResult {
         } = result;
         match returning {
             Some(result) => {
-                Self::from_query_parts(result.columns, result.rows, rows_affected, result.notices)
+                Self::from_query_parts(
+                    result.columns,
+                    result.column_types,
+                    result.rows,
+                    rows_affected,
+                    result.notices,
+                )
             }
             None => Self::from_rows_affected(rows_affected),
         }
@@ -233,16 +247,17 @@ impl ExecuteResult {
     }
 
     pub fn from_rows(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
-        Self::from_query_parts(columns, rows, 0, Vec::new())
+        Self::from_query_parts(columns, Vec::new(), rows, 0, Vec::new())
     }
 
     pub(crate) fn from_idempotency_parts(
         columns: Vec<String>,
+        column_types: Vec<ResultColumnType>,
         rows: Vec<Vec<Value>>,
         rows_affected: u64,
         notices: Vec<LixNotice>,
     ) -> Self {
-        Self::from_query_parts(columns, rows, rows_affected, notices)
+        Self::from_query_parts(columns, column_types, rows, rows_affected, notices)
     }
 
     #[cfg(feature = "server-protocol-client")]
@@ -250,11 +265,13 @@ impl ExecuteResult {
         statement_index: Option<usize>,
         label: Option<String>,
         columns: Vec<String>,
+        column_types: Vec<ResultColumnType>,
         rows: Vec<Vec<Value>>,
         rows_affected: u64,
         notices: Vec<LixNotice>,
     ) -> Self {
-        let mut result = Self::from_query_parts(columns, rows, rows_affected, notices);
+        let mut result =
+            Self::from_query_parts(columns, column_types, rows, rows_affected, notices);
         result.statement_index = statement_index;
         result.statement_label = label;
         result
@@ -262,17 +279,23 @@ impl ExecuteResult {
 
     fn from_query_parts(
         columns: Vec<String>,
+        mut column_types: Vec<ResultColumnType>,
         rows: Vec<Vec<Value>>,
         rows_affected: u64,
         notices: Vec<LixNotice>,
     ) -> Self {
+        if column_types.len() != columns.len() {
+            column_types = infer_column_types(columns.len(), &rows);
+        }
         let columns: Arc<[String]> = columns.into();
+        let column_types: Arc<[ResultColumnType]> = column_types.into();
         let rows = Row::from_nested(Arc::clone(&columns), rows);
         Self {
             statement_index: None,
             statement_label: None,
             backing: Some(Arc::new(ExecuteResultBacking {
                 columns,
+                column_types,
                 rows: OnceLock::from(rows),
                 columnar: StdMutex::new(None),
                 notices,
@@ -294,11 +317,18 @@ impl ExecuteResult {
             .map(|field| field.name().clone())
             .collect::<Vec<_>>()
             .into();
+        let column_types = fields
+            .iter()
+            .map(sql2::result_column_type)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("columnar result fields were validated before public ownership transfer")
+            .into();
         Self {
             statement_index: None,
             statement_label: None,
             backing: Some(Arc::new(ExecuteResultBacking {
                 columns,
+                column_types,
                 rows: OnceLock::new(),
                 columnar: StdMutex::new(Some(ColumnarResult { fields, batches })),
                 notices,
@@ -314,6 +344,7 @@ impl ExecuteResult {
         let backing = self.backing.get_or_insert_with(|| {
             Arc::new(ExecuteResultBacking {
                 columns: Vec::new().into(),
+                column_types: Vec::new().into(),
                 rows: OnceLock::from(Vec::new()),
                 columnar: StdMutex::new(None),
                 notices: Vec::new(),
@@ -337,6 +368,13 @@ impl ExecuteResult {
         self.backing
             .as_deref()
             .map_or(&[], |backing| backing.columns.as_ref())
+    }
+
+    /// Returns the stable SQL type for each result-set column in row value order.
+    pub fn column_types(&self) -> &[ResultColumnType] {
+        self.backing
+            .as_deref()
+            .map_or(&[], |backing| backing.column_types.as_ref())
     }
 
     /// Returns the owned rows. Use `iter()` for name-based access.
@@ -392,6 +430,17 @@ impl ExecuteResult {
             .iter()
             .position(|column| column == column_name)
     }
+}
+
+fn infer_column_types(column_count: usize, rows: &[Vec<Value>]) -> Vec<ResultColumnType> {
+    (0..column_count)
+        .map(|column_index| {
+            rows.iter()
+                .filter_map(|row| row.get(column_index))
+                .find(|value| !matches!(value, Value::Null))
+                .map_or(ResultColumnType::Null, ResultColumnType::from_value)
+        })
+        .collect()
 }
 
 impl ExecuteResultBacking {
@@ -3275,6 +3324,14 @@ async fn hydrate_lix_file_content_result(
     query: &mut SqlQueryResult,
     data_column_index: usize,
 ) -> Result<(), LixError> {
+    let Some(column_type) = query.column_types.get_mut(data_column_index) else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "late lix_file content result was missing its column type",
+        ));
+    };
+    *column_type = ResultColumnType::Blob;
+
     let mut paths = BTreeSet::new();
     for row in &query.rows {
         let Some(Value::Text(path)) = row.get(data_column_index) else {
@@ -10804,6 +10861,10 @@ mod tests {
         );
         let row = &result.rows()[0];
 
+		assert_eq!(
+			result.column_types(),
+			&[ResultColumnType::Text, ResultColumnType::Boolean]
+		);
         assert_eq!(row.get::<String>("title").unwrap(), "Hello");
         assert!(row.get::<bool>("done").unwrap());
         assert_eq!(
@@ -10830,6 +10891,10 @@ mod tests {
         let result = ExecuteResult::from_columnar_result(fields, batches, Vec::new());
 
         assert_eq!(result.columns(), ["id", "title"]);
+		assert_eq!(
+			result.column_types(),
+			&[ResultColumnType::Integer, ResultColumnType::Text]
+		);
         assert!(
             result
                 .backing
@@ -10913,7 +10978,13 @@ mod tests {
     #[test]
     fn mutation_result_equality_is_independent_of_empty_backing_representation() {
         let inline = ExecuteResult::from_rows_affected(7);
-        let materialized = ExecuteResult::from_query_parts(Vec::new(), Vec::new(), 7, Vec::new());
+        let materialized = ExecuteResult::from_query_parts(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            7,
+            Vec::new(),
+        );
 
         assert_eq!(inline, materialized);
     }

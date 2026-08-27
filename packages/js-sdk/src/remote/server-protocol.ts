@@ -4,7 +4,7 @@ import type {
 } from "../binding-types.js";
 import type { NativeLixValue } from "../value.js";
 
-export const SERVER_PROTOCOL_VERSION = 4;
+export const SERVER_PROTOCOL_VERSION = 5;
 export const SERVER_PROTOCOL_PATH = "/lix/v1/";
 
 export type WireValue =
@@ -57,7 +57,7 @@ export type ServerProtocolExecuteBatchRequest = {
 };
 
 export type ServerProtocolExecuteResponse = {
-	columns: string[];
+	columns: BindingExecuteResult["columns"];
 	rows: WireValue[][];
 	rowsAffected: number;
 	notices: Array<{ code: string; message: string; hint?: string }>;
@@ -190,7 +190,18 @@ export function encodeWireValue(value: NativeLixValue): WireValue {
 
 export function decodeExecuteResult(value: unknown): BindingExecuteResult {
 	const result = record(value, "execute result");
-	const columns = stringArray(result.columns, "execute result columns");
+	if (!Array.isArray(result.columns)) {
+		throw protocolError("execute result columns must be an array");
+	}
+	const columns = result.columns.map((column, index) => {
+		const item = record(column, `execute result column ${index}`);
+		if (typeof item.name !== "string" || !isResultColumnType(item.type)) {
+			throw protocolError(
+				`execute result column ${index} requires a string name and valid type`,
+			);
+		}
+		return { name: item.name, type: item.type };
+	});
 	if (!Array.isArray(result.rows)) {
 		throw protocolError("execute result rows must be an array");
 	}
@@ -203,7 +214,16 @@ export function decodeExecuteResult(value: unknown): BindingExecuteResult {
 				`execute result row ${rowIndex} has ${row.length} values for ${columns.length} columns`,
 			);
 		}
-		return row.map((entry) => decodeWireValue(entry));
+		return row.map((entry, columnIndex) => {
+			const decoded = decodeWireValue(entry);
+			const declaredType = columns[columnIndex]?.type;
+			if (decoded.kind !== "null" && decoded.kind !== declaredType) {
+				throw protocolError(
+					`execute result row ${rowIndex} column ${columnIndex} declares ${String(declaredType)} but contains ${decoded.kind}`,
+				);
+			}
+			return decoded;
+		});
 	});
 	if (
 		typeof result.rowsAffected !== "number" ||
@@ -236,6 +256,21 @@ export function decodeExecuteResult(value: unknown): BindingExecuteResult {
 		};
 	});
 	return { columns, rows, rowsAffected: result.rowsAffected, notices };
+}
+
+function isResultColumnType(
+	value: unknown,
+): value is BindingExecuteResult["columns"][number]["type"] {
+	return (
+		value === "null" ||
+		value === "boolean" ||
+		value === "integer" ||
+		value === "real" ||
+		value === "text" ||
+		value === "jsonb" ||
+		value === "timestamptz" ||
+		value === "blob"
+	);
 }
 
 export function decodeExecuteBatchResult(value: unknown): BindingExecuteResult {
@@ -377,7 +412,8 @@ function applyObserveBlobDelta(
 	const baseValue = base.rows.rows[0]?.[0];
 	if (
 		base.rows.columns.length !== 1 ||
-		base.rows.columns[0] !== "content" ||
+		base.rows.columns[0]?.name !== "content" ||
+		base.rows.columns[0]?.type !== "blob" ||
 		base.rows.rows.length !== 1 ||
 		base.rows.rows[0]?.length !== 1 ||
 		base.rows.rowsAffected !== 0 ||
@@ -407,7 +443,7 @@ function applyObserveBlobDelta(
 		prefixBytes + insert.byteLength,
 	);
 	return {
-		columns: ["content"],
+		columns: [{ name: "content", type: "blob" }],
 		rows: [[{ kind: "blob", value: null, blob }]],
 		rowsAffected: 0,
 			notices: [],

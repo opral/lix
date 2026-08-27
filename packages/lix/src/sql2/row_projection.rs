@@ -22,7 +22,7 @@ use serde_json::Value as JsonValue;
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
 
-use crate::LixError;
+use crate::{LixError, ResultColumnType};
 use crate::plugin::wire::typed::{
     BorrowedNativeValue, CertifiedNativeProjectionSegment, CertifiedNativeScalarKind,
     ValidatedNativePayload,
@@ -186,6 +186,20 @@ impl RowProjectionDecoder {
             primary_key_field_ordinals,
             primary_key_kinds,
         })
+    }
+
+    pub(crate) fn column_types(&self) -> Vec<ResultColumnType> {
+        self.fields
+            .iter()
+            .map(|field| match field.column_type {
+                SchemaColumnType::String => ResultColumnType::Text,
+                SchemaColumnType::Jsonb => ResultColumnType::Jsonb,
+                SchemaColumnType::Integer => ResultColumnType::Integer,
+                SchemaColumnType::Number => ResultColumnType::Real,
+                SchemaColumnType::Boolean => ResultColumnType::Boolean,
+                SchemaColumnType::Timestamptz => ResultColumnType::Timestamptz,
+            })
+            .collect()
     }
 
     /// Decodes a batch directly into Arrow arrays in constructor field order.

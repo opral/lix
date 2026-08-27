@@ -49,9 +49,9 @@ const history = await lix.execute(
 );
 
 for (const row of history.rows) {
-  const bytes = row.value("content").asBytes();
+  const bytes = row.content as Uint8Array;
   const text = bytes ? new TextDecoder().decode(bytes) : "<deleted>";
-  console.log(row.get("lixcol_depth"), text);
+  console.log(row.lixcol_depth, text);
 }
 ```
 

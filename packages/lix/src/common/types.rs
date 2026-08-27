@@ -486,6 +486,37 @@ pub enum Value {
     Blob(Blob),
 }
 
+/// Stable SQL result type exposed at language and protocol boundaries.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ResultColumnType {
+    Null,
+    Boolean,
+    Integer,
+    Real,
+    Text,
+    Jsonb,
+    Timestamptz,
+    Blob,
+}
+
+impl ResultColumnType {
+    pub(crate) fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Boolean(_) => Self::Boolean,
+            Value::Integer(_) => Self::Integer,
+            Value::Real(_) => Self::Real,
+            Value::Text(_) => Self::Text,
+            Value::Jsonb(_) => Self::Jsonb,
+            Value::Timestamptz(_) => Self::Timestamptz,
+            Value::Blob(_) => Self::Blob,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum NullableKeyFilter<T> {
     #[default]
@@ -532,6 +563,8 @@ pub struct SqlQueryResult {
     pub rows: Vec<Vec<Value>>,
     #[serde(default)]
     pub columns: Vec<String>,
+    #[serde(default)]
+    pub column_types: Vec<ResultColumnType>,
     #[serde(default)]
     pub notices: Vec<LixNotice>,
 }

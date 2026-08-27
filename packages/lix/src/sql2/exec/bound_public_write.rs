@@ -1822,6 +1822,10 @@ pub(crate) async fn try_execute_bound_public_write(
                             .iter()
                             .map(|item| item.output_name.clone())
                             .collect(),
+                        column_types: vec![
+                            crate::ResultColumnType::Text;
+                            returning.items.len()
+                        ],
                         rows: vec![returning
                             .items
                             .iter()
@@ -2056,7 +2060,7 @@ async fn execute_row_write(
         BoundWriteOp::Insert => {
             if no_op {
                 row_insert_batch(ctx, plan, spec, params, active_branch_commit_id.as_ref())?;
-                return Ok(empty_row_returning_result(plan));
+                return Ok(empty_row_returning_result(plan, spec, params));
             }
             if plan.bound.conflict.is_some() {
                 row_upsert(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
@@ -2066,13 +2070,13 @@ async fn execute_row_write(
         }
         BoundWriteOp::Update => {
             if no_op {
-                return Ok(empty_row_returning_result(plan));
+                return Ok(empty_row_returning_result(plan, spec, params));
             }
             row_update(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
         }
         BoundWriteOp::Delete => {
             if no_op {
-                return Ok(empty_row_returning_result(plan));
+                return Ok(empty_row_returning_result(plan, spec, params));
             }
             if matches!(surface, RowWriteSurface::Base { .. })
                 && matches!(plan.bound.predicate, BoundPredicate::True)
@@ -3139,7 +3143,13 @@ async fn stage_rows_with_postimage_returning(
         }
         None => returning_rows,
     };
-    Ok(row_returning_result(plan, rows_affected, returning_rows))
+    Ok(row_returning_result(
+        plan,
+        spec,
+        params,
+        rows_affected,
+        returning_rows,
+    ))
 }
 
 fn row_postimage_returning_rows(
@@ -3282,6 +3292,8 @@ fn row_live_returning_identity(row: MaterializedHotStateRowRef<'_>) -> RowReturn
 
 fn row_returning_result(
     plan: &LogicalWritePlan,
+    spec: &SchemaSurfaceSpec,
+    params: &[Value],
     rows_affected: u64,
     rows: Option<Vec<Vec<Value>>>,
 ) -> SqlWriteResult {
@@ -3294,6 +3306,7 @@ fn row_returning_result(
                     .iter()
                     .map(|item| item.output_name.clone())
                     .collect(),
+                column_types: returning_column_types(returning, spec, params, &rows),
                 rows,
                 notices: Vec::new(),
             },
@@ -3476,6 +3489,7 @@ async fn row_delete(
                     .iter()
                     .map(|item| item.output_name.clone())
                     .collect(),
+                column_types: returning_column_types(returning, spec, params, &rows),
                 rows,
                 notices: Vec::new(),
             },
@@ -3484,8 +3498,130 @@ async fn row_delete(
     }
 }
 
-fn empty_row_returning_result(plan: &LogicalWritePlan) -> SqlWriteResult {
-    row_returning_result(plan, 0, plan.bound.returning.as_ref().map(|_| Vec::new()))
+fn empty_row_returning_result(
+    plan: &LogicalWritePlan,
+    spec: &SchemaSurfaceSpec,
+    params: &[Value],
+) -> SqlWriteResult {
+    row_returning_result(
+        plan,
+        spec,
+        params,
+        0,
+        plan.bound.returning.as_ref().map(|_| Vec::new()),
+    )
+}
+
+fn returning_column_types(
+    returning: &crate::sql2::bind::write::BoundReturning,
+    spec: &SchemaSurfaceSpec,
+    params: &[Value],
+    rows: &[Vec<Value>],
+) -> Vec<crate::ResultColumnType> {
+    returning
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            returning_expr_column_type(&item.expr, spec, params).unwrap_or_else(|| {
+                rows.iter()
+                    .filter_map(|row| row.get(index))
+                    .find(|value| !matches!(value, Value::Null))
+                    .map_or(crate::ResultColumnType::Null, |value| match value {
+                        Value::Null => crate::ResultColumnType::Null,
+                        Value::Boolean(_) => crate::ResultColumnType::Boolean,
+                        Value::Integer(_) => crate::ResultColumnType::Integer,
+                        Value::Real(_) => crate::ResultColumnType::Real,
+                        Value::Text(_) => crate::ResultColumnType::Text,
+                        Value::Jsonb(_) => crate::ResultColumnType::Jsonb,
+                        Value::Timestamptz(_) => crate::ResultColumnType::Timestamptz,
+                        Value::Blob(_) => crate::ResultColumnType::Blob,
+                    })
+            })
+        })
+        .collect()
+}
+
+fn returning_expr_column_type(
+    expr: &BoundExpr,
+    spec: &SchemaSurfaceSpec,
+    params: &[Value],
+) -> Option<crate::ResultColumnType> {
+    if let Some(column) = visible_row_column(expr, spec) {
+        return Some(match column.column_type {
+            SchemaColumnType::String => crate::ResultColumnType::Text,
+            SchemaColumnType::Jsonb => crate::ResultColumnType::Jsonb,
+            SchemaColumnType::Integer => crate::ResultColumnType::Integer,
+            SchemaColumnType::Number => crate::ResultColumnType::Real,
+            SchemaColumnType::Boolean => crate::ResultColumnType::Boolean,
+            SchemaColumnType::Timestamptz => crate::ResultColumnType::Timestamptz,
+        });
+    }
+    match expr {
+        BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => match column.name.as_str() {
+            "lixcol_row_pk" | "lixcol_metadata" => Some(crate::ResultColumnType::Jsonb),
+            "lixcol_global" | "lixcol_untracked" => Some(crate::ResultColumnType::Boolean),
+            "lixcol_schema_key" | "lixcol_file_id" | "lixcol_created_at"
+            | "lixcol_updated_at" | "lixcol_change_id" | "lixcol_commit_id" => {
+                Some(crate::ResultColumnType::Text)
+            }
+            _ => None,
+        },
+        BoundExpr::Literal(BoundLiteral::Null) => Some(crate::ResultColumnType::Null),
+        BoundExpr::Literal(BoundLiteral::Bool(_)) => Some(crate::ResultColumnType::Boolean),
+        BoundExpr::Literal(BoundLiteral::Integer(_)) => Some(crate::ResultColumnType::Integer),
+        BoundExpr::Literal(BoundLiteral::Number { .. }) => Some(crate::ResultColumnType::Real),
+        BoundExpr::Literal(BoundLiteral::Text(_)) => Some(crate::ResultColumnType::Text),
+        BoundExpr::Literal(BoundLiteral::Json(_)) => Some(crate::ResultColumnType::Jsonb),
+        BoundExpr::Cast { data_type, .. } => Some(match data_type {
+            BoundCastType::Text => crate::ResultColumnType::Text,
+            BoundCastType::Binary => crate::ResultColumnType::Blob,
+            BoundCastType::BigInt => crate::ResultColumnType::Integer,
+            BoundCastType::Double => crate::ResultColumnType::Real,
+            BoundCastType::Boolean => crate::ResultColumnType::Boolean,
+            BoundCastType::Jsonb => crate::ResultColumnType::Jsonb,
+        }),
+        BoundExpr::Function { name, .. }
+            if matches!(
+                name.as_str(),
+                "uuidv7" | "lix_active_branch_id" | "lix_active_branch_commit_id"
+                    | "__lix_json_get_text" | "__lix_json_path_get_text"
+            ) => Some(crate::ResultColumnType::Text),
+        BoundExpr::Function { name, .. } if name == "__lix_current_timestamp" => {
+            Some(crate::ResultColumnType::Timestamptz)
+        }
+        BoundExpr::Function { name, .. }
+            if matches!(
+                name.as_str(),
+                "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+            ) => Some(crate::ResultColumnType::Jsonb),
+        BoundExpr::Function { name, .. }
+            if matches!(name.as_str(), "__lix_json_contains" | "__lix_json_exists") => {
+                Some(crate::ResultColumnType::Boolean)
+            }
+        BoundExpr::Binary { left, right, .. } => {
+            let left = returning_expr_column_type(left, spec, params)?;
+            let right = returning_expr_column_type(right, spec, params)?;
+            if left == crate::ResultColumnType::Real || right == crate::ResultColumnType::Real {
+                Some(crate::ResultColumnType::Real)
+            } else {
+                Some(crate::ResultColumnType::Integer)
+            }
+        }
+        BoundExpr::Param(param) => params
+            .get(param.index.saturating_sub(1))
+            .map(|value| match value {
+                Value::Null => crate::ResultColumnType::Null,
+                Value::Boolean(_) => crate::ResultColumnType::Boolean,
+                Value::Integer(_) => crate::ResultColumnType::Integer,
+                Value::Real(_) => crate::ResultColumnType::Real,
+                Value::Text(_) => crate::ResultColumnType::Text,
+                Value::Jsonb(_) => crate::ResultColumnType::Jsonb,
+                Value::Timestamptz(_) => crate::ResultColumnType::Timestamptz,
+                Value::Blob(_) => crate::ResultColumnType::Blob,
+            }),
+        BoundExpr::Function { .. } => None,
+    }
 }
 
 fn row_returning_row(

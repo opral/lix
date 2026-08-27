@@ -3081,6 +3081,10 @@ pub(crate) fn query_result_from_batches(
         .iter()
         .map(|field| field.name().clone())
         .collect::<Vec<_>>();
+    let column_types = result_fields
+        .iter()
+        .map(crate::sql2::result_column_type)
+        .collect::<Result<Vec<_>, _>>()?;
     let mut rows =
         Vec::<Vec<Value>>::with_capacity(batches.iter().map(RecordBatch::num_rows).sum::<usize>());
     for batch in batches {
@@ -3090,6 +3094,7 @@ pub(crate) fn query_result_from_batches(
     Ok(SqlQueryResult {
         rows,
         columns: result_columns,
+        column_types,
         notices: Vec::new(),
     })
 }
@@ -3715,6 +3720,28 @@ mod tests {
             direct.columns,
             fields.iter().map(Field::name).cloned().collect::<Vec<_>>()
         );
+		assert_eq!(
+			direct.column_types,
+			vec![
+				crate::ResultColumnType::Null,
+				crate::ResultColumnType::Boolean,
+				crate::ResultColumnType::Integer,
+				crate::ResultColumnType::Integer,
+				crate::ResultColumnType::Integer,
+				crate::ResultColumnType::Integer,
+				crate::ResultColumnType::Integer,
+				crate::ResultColumnType::Integer,
+				crate::ResultColumnType::Integer,
+				crate::ResultColumnType::Integer,
+				crate::ResultColumnType::Real,
+				crate::ResultColumnType::Real,
+				crate::ResultColumnType::Text,
+				crate::ResultColumnType::Text,
+				crate::ResultColumnType::Text,
+				crate::ResultColumnType::Blob,
+				crate::ResultColumnType::Blob,
+			],
+		);
         assert_eq!(direct.rows, generic_rows);
         assert_eq!(flat_row_count, ROWS);
         assert_eq!(flat_rows, generic_rows);
@@ -4292,6 +4319,7 @@ mod tests {
         let count = execute_write_logical_plan(ctx, plan, params).await?;
         Ok(crate::SqlQueryResult {
             columns: vec!["count".to_string()],
+            column_types: vec![crate::ResultColumnType::Integer],
             rows: vec![vec![Value::Integer(count as i64)]],
             notices: Vec::new(),
         })
@@ -4309,6 +4337,7 @@ mod tests {
         Ok((
             crate::SqlQueryResult {
                 columns: vec!["count".to_string()],
+                column_types: vec![crate::ResultColumnType::Integer],
                 rows: vec![vec![Value::Integer(count as i64)]],
                 notices: Vec::new(),
             },
@@ -4490,6 +4519,7 @@ mod tests {
             result.returning,
             Some(crate::SqlQueryResult {
                 columns: vec!["commit_id".to_string()],
+                column_types: vec![crate::ResultColumnType::Text],
                 rows: vec![vec![Value::Text("commit-diff-command".to_string())]],
                 notices: Vec::new(),
             })

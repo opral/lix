@@ -14,7 +14,7 @@ async function run() {
 		if (!csvPlugin) throw new Error("Bundled CSV plugin is missing");
 		if (!markdownPlugin) throw new Error("Bundled Markdown plugin is missing");
 		return {
-			message: query.rows[0]?.get("message"),
+			message: query.rows[0]?.message,
 			bundledPluginKeys: [csvPlugin.key, markdownPlugin.key].sort(),
 		};
 	} finally {

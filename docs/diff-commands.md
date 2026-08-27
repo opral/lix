@@ -27,7 +27,7 @@ const changedFiles = await lix.execute(
 );
 
 for (const row of changedFiles.rows) {
-  console.log(row.get("diff_type"), row.get("to_path") ?? row.get("from_path"));
+  console.log(row.diff_type, row.to_path ?? row.from_path);
 }
 
 const reverted = await lix.execute(
@@ -40,11 +40,11 @@ const reverted = await lix.execute(
    )
    WHERE lixcol_row_pk = $1
    RETURNING commit_id`,
-  [changedFiles.rows[0].get("lixcol_row_pk")],
+  [changedFiles.rows[0].lixcol_row_pk],
 );
 
 if (reverted.rows.length > 0) {
-  console.log("reverted in commit", reverted.rows[0].get("commit_id"));
+  console.log("reverted in commit", reverted.rows[0].commit_id);
 }
 
 await lix.close();

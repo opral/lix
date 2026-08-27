@@ -3006,10 +3006,30 @@ impl TryFrom<&Value> for LixValue {
 pub struct ExecuteResult {
     pub statement_index: Option<u32>,
     pub label: Option<String>,
-    pub columns: Vec<String>,
+    pub columns: Vec<ExecuteColumn>,
     pub rows: Vec<Vec<LixValue>>,
     pub rows_affected: u32,
     pub notices: Vec<LixNotice>,
+}
+
+#[napi(object)]
+pub struct ExecuteColumn {
+    pub name: String,
+    #[napi(js_name = "type")]
+    pub column_type: String,
+}
+
+fn result_column_type_name(column_type: lix::ResultColumnType) -> &'static str {
+    match column_type {
+        lix::ResultColumnType::Null => "null",
+        lix::ResultColumnType::Boolean => "boolean",
+        lix::ResultColumnType::Integer => "integer",
+        lix::ResultColumnType::Real => "real",
+        lix::ResultColumnType::Text => "text",
+        lix::ResultColumnType::Jsonb => "jsonb",
+        lix::ResultColumnType::Timestamptz => "timestamptz",
+        lix::ResultColumnType::Blob => "blob",
+    }
 }
 
 impl TryFrom<RsExecuteResult> for ExecuteResult {
@@ -3028,7 +3048,16 @@ impl TryFrom<RsExecuteResult> for ExecuteResult {
         Ok(Self {
             statement_index: result.statement_index().map(|index| index as u32),
             label: result.label().map(str::to_owned),
-            columns: result.columns().to_vec(),
+            columns: result
+                .columns()
+                .iter()
+                .cloned()
+                .zip(result.column_types().iter().copied())
+                .map(|(name, column_type)| ExecuteColumn {
+                    name,
+                    column_type: result_column_type_name(column_type).to_owned(),
+                })
+                .collect(),
             rows,
             rows_affected: result.rows_affected() as u32,
             notices: result

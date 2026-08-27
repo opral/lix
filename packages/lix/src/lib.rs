@@ -168,7 +168,9 @@ pub use schema::{
 pub use lix_schema as schema_v1;
 
 pub use common::LixError;
-pub use common::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
+pub use common::{
+    Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, SharedStr, SqlQueryResult, Value,
+};
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
 pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};

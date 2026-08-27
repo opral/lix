@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ExecuteResult, LixError, LixNotice, Value, WireValue};
+use crate::{ExecuteResult, LixError, LixNotice, ResultColumnType, Value, WireValue};
 
-pub const SERVER_PROTOCOL_VERSION: u32 = 4;
+pub const SERVER_PROTOCOL_VERSION: u32 = 5;
 pub const SESSION_GONE_CODE: &str = "LIX_ERROR_PROTOCOL_SESSION_GONE";
 pub const SERVER_CLOSED_CODE: &str = "LIX_ERROR_PROTOCOL_SERVER_CLOSED";
 pub const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
@@ -85,16 +85,28 @@ pub struct ExecuteBatchRequestBody {
 pub struct ExecuteResponseBody {
     pub statement_index: Option<usize>,
     pub label: Option<String>,
-    pub columns: Vec<String>,
+    pub columns: Vec<ExecuteColumnBody>,
     pub rows: Vec<Vec<WireValue>>,
     pub rows_affected: u64,
     #[serde(default)]
     pub notices: Vec<LixNotice>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecuteColumnBody {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub column_type: ResultColumnType,
+}
+
 impl ExecuteResponseBody {
     pub fn into_execute_result(self) -> Result<ExecuteResult, LixError> {
         let column_count = self.columns.len();
+        let (columns, column_types): (Vec<String>, Vec<ResultColumnType>) = self
+            .columns
+            .into_iter()
+            .map(|column| (column.name, column.column_type))
+            .unzip();
         let rows = self
             .rows
             .into_iter()
@@ -107,14 +119,28 @@ impl ExecuteResponseBody {
                     )));
                 }
                 row.into_iter()
-                    .map(WireValue::try_into_engine)
+                    .enumerate()
+                    .map(|(column_index, value)| {
+                        let value = value.try_into_engine()?;
+                        let declared = column_types[column_index];
+                        if !matches!(value, Value::Null)
+                            && ResultColumnType::from_value(&value) != declared
+                        {
+                            return Err(protocol_error(format!(
+                                "execute result row {row_index} column {column_index} declares {declared:?} but contains {:?}",
+                                ResultColumnType::from_value(&value)
+                            )));
+                        }
+                        Ok(value)
+                    })
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ExecuteResult::from_protocol_response(
             self.statement_index,
             self.label,
-            self.columns,
+            columns,
+            column_types,
             rows,
             self.rows_affected,
             self.notices,

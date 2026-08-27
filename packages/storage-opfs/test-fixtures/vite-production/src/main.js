@@ -43,7 +43,7 @@ async function run() {
 		"SELECT value FROM lix_key_value WHERE key = $1",
 		["packed-vite"],
 	);
-	if (shared.rows[0]?.get("value") !== "persistent-production") {
+	if (shared.rows[0]?.value !== "persistent-production") {
 		throw new Error("second Lix worker did not observe the owner commit");
 	}
 	await Promise.all([first.close(), second.close()]);
@@ -56,7 +56,7 @@ async function run() {
 			"SELECT value FROM lix_key_value WHERE key = $1",
 			["packed-vite"],
 		);
-		return { message: persisted.rows[0]?.get("value") };
+		return { message: persisted.rows[0]?.value };
 	} finally {
 		await reopened.close();
 	}
@@ -71,7 +71,7 @@ async function failover() {
 			"SELECT value FROM lix_key_value WHERE key = $1",
 			["packed-vite"],
 		);
-		return result.rows[0]?.get("value");
+		return result.rows[0]?.value;
 	} finally {
 		await lix.close();
 	}
@@ -86,7 +86,7 @@ async function readValue(key) {
 			"SELECT value FROM lix_key_value WHERE key = $1",
 			[key],
 		);
-		return result.rows[0]?.get("value");
+		return result.rows[0]?.value;
 	} finally {
 		await lix.close();
 	}
@@ -115,7 +115,7 @@ async function readValues(keys) {
 			"SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
 			keys,
 		);
-		return result.rows.map((row) => [row.get("key"), row.get("value")]);
+		return result.rows.map((row) => [row.key, row.value]);
 	} finally {
 		await lix.close();
 	}
@@ -129,7 +129,7 @@ async function prepareOfflineSession() {
 		"SELECT value FROM lix_key_value WHERE key = $1",
 		["packed-vite"],
 	);
-	return result.rows[0]?.get("value");
+	return result.rows[0]?.value;
 }
 
 async function offlineReadWrite(value) {
@@ -142,7 +142,7 @@ async function offlineReadWrite(value) {
 		"SELECT value FROM lix_key_value WHERE key = $1",
 		["offline-round-trip"],
 	);
-	return result.rows[0]?.get("value");
+	return result.rows[0]?.value;
 }
 
 async function finishOfflineSession() {
@@ -167,7 +167,7 @@ async function readValueFrom(lix, key) {
 		"SELECT value FROM lix_key_value WHERE key = $1",
 		[key],
 	);
-	return result.rows[0]?.get("value");
+	return result.rows[0]?.value;
 }
 
 async function startObservation() {
@@ -204,7 +204,7 @@ async function finishObservation() {
 				setTimeout(() => reject(new Error("cross-tab observation timed out")), 5_000),
 			),
 		]);
-		return event?.result.rows[0]?.get("value");
+		return event?.result.rows[0]?.value;
 	} finally {
 		observation?.close();
 		await observedLix?.close();
@@ -269,7 +269,7 @@ async function benchmarkCrossTab(sampleCount) {
 					),
 				),
 			]);
-			if (event?.result.rows[0]?.get("value") !== sequence) {
+			if (event?.result.rows[0]?.value !== sequence) {
 				throw new Error(`cross-tab benchmark observed the wrong value at ${sequence}`);
 			}
 			samples.push(performance.now() - startedAt);

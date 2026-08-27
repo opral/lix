@@ -64,6 +64,7 @@ pub(crate) use exec::{
     execute_read_statement_in_session_with_collected_batches,
 };
 pub(crate) use exec::{SessionReadResult, SessionReadSqlResult, SqlWriteResult};
+pub(crate) use result_metadata::result_column_type;
 #[allow(unused_imports)]
 pub(crate) use exec::{
     SqlLogicalPlan, append_path_value_replacement_snapshot,

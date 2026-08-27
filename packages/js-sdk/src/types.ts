@@ -147,6 +147,8 @@ export type SqlParam = JsonValue | Uint8Array | import("./value.js").Value;
 
 export type ExecuteOptions = {
 	originKey?: string;
+	/** Returns positional arrays instead of plain objects. Defaults to "object". */
+	rowMode?: "object" | "array";
 	/**
 	 * Stable identity for one logical remote SQL mutation. Supply the same key
 	 * when retrying after a lost response; remote Lix generates one per call
@@ -163,15 +165,28 @@ export type LixBatchStatement = {
 
 export type LixBatchOptions = {
 	originKey?: string;
+	/** Returns positional arrays instead of plain objects. Defaults to "object". */
+	rowMode?: "object" | "array";
 	/** See {@link ExecuteOptions.idempotencyKey}. */
 	idempotencyKey?: string;
 };
 
-export type ExecuteResult = {
+export type ResultColumnType = LixValue["kind"];
+
+export type ResultColumn = {
+	name: string;
+	type: ResultColumnType;
+};
+
+export type ResultObjectRow = Record<string, unknown>;
+export type ResultArrayRow = unknown[];
+export type ResultRow = ResultObjectRow | ResultArrayRow;
+
+export type ExecuteResult<TRow extends object = ResultObjectRow> = {
 	statementIndex?: number;
 	label?: string;
-	columns: string[];
-	rows: RowLike[];
+	columns: ResultColumn[];
+	rows: TRow[];
 	rowsAffected: number;
 	notices: Array<{
 		code: string;
@@ -180,7 +195,8 @@ export type ExecuteResult = {
 	}>;
 };
 
-export type ExecuteBatchResult = ExecuteResult & {
+export type ExecuteBatchResult<TRow extends object = ResultObjectRow> =
+	ExecuteResult<TRow> & {
 	statementIndex: number;
 };
 
@@ -193,19 +209,6 @@ export type ObserveEvent = {
 	 * reconnects cannot expose a stale server snapshot to consumers.
 	 */
 	result: ExecuteResult;
-};
-
-export type RowLike = {
-	get(column: string): unknown;
-	value(column: string): ValueLike;
-	toObject(): Record<string, unknown>;
-	toValueMap(): Record<string, ValueLike>;
-};
-
-export type ValueLike = {
-	readonly kind: LixValue["kind"];
-	toJS(): unknown;
-	asBytes(): Uint8Array | undefined;
 };
 
 export type CreateBranchOptions = {
