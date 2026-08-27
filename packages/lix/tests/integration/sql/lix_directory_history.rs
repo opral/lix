@@ -123,6 +123,7 @@ simulation_test!(
                 "metadata",
                 "origin_key",
                 "row_ref",
+                "schema_key",
                 "snapshot_content",
             ]
         );

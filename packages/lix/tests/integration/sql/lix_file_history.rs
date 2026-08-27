@@ -2257,6 +2257,7 @@ simulation_test!(
                     "metadata",
                     "origin_key",
                     "row_ref",
+                    "schema_key",
                     "snapshot_content",
                 ],
                 "source change objects must mirror the stable lix_change field set"
