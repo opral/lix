@@ -170,7 +170,7 @@ impl PublicCatalog {
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("account_id", DataType::Utf8, false),
-                json_field("row_pk", false),
+                row_ref_field("row_ref", true),
                 Field::new("schema_key", DataType::Utf8, false),
                 Field::new("file_id", DataType::Utf8, true),
                 json_field("metadata", true),
@@ -263,7 +263,7 @@ impl PublicCatalog {
             public_columns([
                 ("id", false),
                 ("account_id", false),
-                ("row_pk", false),
+                ("row_ref", true),
                 ("schema_key", false),
                 ("file_id", true),
                 ("metadata", true),
@@ -476,7 +476,7 @@ fn history_filesystem_schema(include_data: bool) -> SchemaRef {
         ]
     };
     fields.extend([
-        json_field(HISTORY_COL_ROW_PK, false),
+        row_ref_field(HISTORY_COL_ROW_PK, false),
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
@@ -588,14 +588,9 @@ fn filesystem_system_columns() -> Vec<PublicColumn> {
     ]
 }
 
-fn row_system_columns(spec: &SchemaSurfaceSpec, variant: SchemaSurfaceShape) -> Vec<PublicColumn> {
+fn row_system_columns(_spec: &SchemaSurfaceSpec, variant: SchemaSurfaceShape) -> Vec<PublicColumn> {
     debug_assert_ne!(variant, SchemaSurfaceShape::History);
-    let row_pk = PublicColumn::public_insert_only("lixcol_row_pk", false);
-    let row_pk = if spec.primary_key_paths.is_empty() {
-        row_pk
-    } else {
-        row_pk.conditional_on_insert()
-    };
+    let row_pk = PublicColumn::hidden("lixcol_row_pk", false);
     vec![
         row_pk,
         PublicColumn::public_read_only("lixcol_schema_key", false),

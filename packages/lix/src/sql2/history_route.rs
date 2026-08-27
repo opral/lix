@@ -172,7 +172,7 @@ pub(crate) struct HistoryEntry {
     pub(crate) depth: u32,
 }
 
-pub(crate) const HISTORY_COL_ROW_PK: &str = "lixcol_row_pk";
+pub(crate) const HISTORY_COL_ROW_PK: &str = "lixcol_row_ref";
 pub(crate) const HISTORY_COL_SCHEMA_KEY: &str = "lixcol_schema_key";
 pub(crate) const HISTORY_COL_FILE_ID: &str = "lixcol_file_id";
 pub(crate) const HISTORY_COL_METADATA: &str = "lixcol_metadata";
@@ -200,14 +200,7 @@ pub(crate) fn serialize_history_source_changes(
     let source_changes = ordered_changes
         .into_iter()
         .map(|change| {
-            let row_pk =
-                serde_json::from_str::<serde_json::Value>(&change.row_pk.as_json_array_text()?)
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("{surface_name} source row_pk is invalid JSON: {error}"),
-                        )
-                    })?;
+            let row_ref = crate::row_ref::encode(&change.schema_key, &change.row_pk)?.to_string();
             let snapshot_content = parse_optional_source_json(
                 change.snapshot_content.as_deref(),
                 surface_name,
@@ -217,8 +210,7 @@ pub(crate) fn serialize_history_source_changes(
                 parse_optional_source_json(change.metadata.as_deref(), surface_name, "metadata")?;
             Ok(serde_json::json!({
                 "id": change.id,
-                "row_pk": row_pk,
-                "schema_key": change.schema_key,
+                "row_ref": row_ref,
                 "file_id": change.file_id,
                 "snapshot_content": snapshot_content,
                 "metadata": metadata,
@@ -285,6 +277,10 @@ impl HistoryMetadataProjection {
 
 pub(crate) fn parse_history_filter(expr: &Expr) -> Option<()> {
     parse_history_filter_terms(expr).map(|_| ())
+}
+
+pub(crate) fn history_filter_references_row_ref(expr: &Expr) -> bool {
+    expr.column_refs().iter().any(|column| column.name == HISTORY_COL_ROW_PK)
 }
 
 /// Rejects an anchor predicate unless every occurrence can be routed exactly.
@@ -581,8 +577,8 @@ fn parse_history_binary_filter(
             "file_id" => HistoryFilterTerm::FileIds(vec![value.clone()]),
             _ => unreachable!(),
         }),
-        ("row_pk", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
-            canonical_row_pk_value(value).map(|value| HistoryFilterTerm::RowPks(vec![value]))
+        ("row_ref", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
+            canonical_row_ref_pk_value(value).map(|value| HistoryFilterTerm::RowPks(vec![value]))
         }
         ("depth", Operator::Eq, depth_expr) => {
             scalar_i64_literal(depth_expr).map(HistoryFilterTerm::ExactDepth)
@@ -655,7 +651,7 @@ fn parse_history_in_list_filter(in_list: &InList) -> Option<HistoryFilterTerm> {
 
     match column_name {
         "as_of_commit_id" => Some(HistoryFilterTerm::AsOfCommitIds(values)),
-        "row_pk" => canonical_row_pk_values(values).map(HistoryFilterTerm::RowPks),
+        "row_ref" => canonical_row_ref_pk_values(values).map(HistoryFilterTerm::RowPks),
         "schema_key" => Some(HistoryFilterTerm::SchemaKeys(values)),
         "file_id" => Some(HistoryFilterTerm::FileIds(values)),
         _ => None,
@@ -708,16 +704,17 @@ fn apply_conjunctive_values_filter(bucket: &mut Vec<String>, incoming_values: Ve
     bucket.is_empty()
 }
 
-fn canonical_row_pk_values(values: Vec<String>) -> Option<Vec<String>> {
+fn canonical_row_ref_pk_values(values: Vec<String>) -> Option<Vec<String>> {
     values
         .into_iter()
-        .map(|value| canonical_row_pk_value(&value))
+        .map(|value| canonical_row_ref_pk_value(&value))
         .collect()
 }
 
-fn canonical_row_pk_value(value: &str) -> Option<String> {
-    RowPk::from_json_array_text(value)
+fn canonical_row_ref_pk_value(value: &str) -> Option<String> {
+    crate::row_ref::decode_str(value)
         .ok()?
+        .row_pk
         .as_json_array_text()
         .ok()
 }
@@ -725,9 +722,9 @@ fn canonical_row_pk_value(value: &str) -> Option<String> {
 fn canonical_history_column_name(name: &str) -> Option<&str> {
     match name {
         HISTORY_COL_AS_OF_COMMIT_ID => Some("as_of_commit_id"),
-        HISTORY_COL_ROW_PK => Some("row_pk"),
         HISTORY_COL_SCHEMA_KEY => Some("schema_key"),
         HISTORY_COL_FILE_ID => Some("file_id"),
+        HISTORY_COL_ROW_PK => Some("row_ref"),
         HISTORY_COL_DEPTH => Some("depth"),
         _ => None,
     }

@@ -20,7 +20,7 @@ use crate::sql2::change_materialization::{
     materialize_commit_graph_change,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
-use crate::sql2::result_metadata::json_field;
+use crate::sql2::result_metadata::{json_field, row_ref_field};
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
@@ -304,7 +304,7 @@ pub(super) fn lix_change_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("account_id", DataType::Utf8, false),
-        json_field("row_pk", false),
+        row_ref_field("row_ref", true),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("metadata", true),
@@ -319,14 +319,8 @@ static LIX_CHANGE_COLS: ColumnTable<MaterializedChange> = ColumnTable {
         ("id", Col::Utf8(|row| Some(row.id.as_str()))),
         ("account_id", Col::Utf8(|row| Some(row.account_id.as_str()))),
         (
-            "row_pk",
-            Col::Utf8Owned(|row| {
-                Some(
-                    row.row_pk
-                        .as_json_array_text()
-                        .expect("canonical change row primary key should project"),
-                )
-            }),
+            "row_ref",
+            Col::Utf8Fallible(change_public_row_ref),
         ),
         ("schema_key", Col::Utf8(|row| Some(row.schema_key.as_str()))),
         ("file_id", Col::Utf8(|row| row.file_id.as_deref())),
@@ -342,6 +336,25 @@ static LIX_CHANGE_COLS: ColumnTable<MaterializedChange> = ColumnTable {
         ),
     ],
 };
+
+fn change_public_row_ref(row: &MaterializedChange) -> Result<Option<String>, LixError> {
+    let (relation, row_pk) = if let Some(file_id) = row.file_id.as_deref() {
+        let row_pk = crate::row_pk::RowPk::uuid_from_canonical(file_id).map_err(|error| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("lix_change file identity is invalid: {error}"),
+            )
+        })?;
+        ("lix_file", row_pk)
+    } else if row.schema_key == "lix_directory_descriptor" {
+        ("lix_directory", row.row_pk.clone())
+    } else if crate::sql2::catalog::schema_exposed_as_schema_surface(&row.schema_key) {
+        (row.schema_key.as_str(), row.row_pk.clone())
+    } else {
+        return Ok(None);
+    };
+    crate::row_ref::encode(relation, &row_pk).map(|value| Some(value.to_string()))
+}
 
 fn change_batch_error(error: ColumnTableError) -> DataFusionError {
     match error {

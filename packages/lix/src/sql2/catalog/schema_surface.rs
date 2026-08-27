@@ -12,7 +12,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY,
     HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY,
 };
-use crate::sql2::result_metadata::{json_field, mark_json_field};
+use crate::sql2::result_metadata::{json_field, mark_json_field, row_ref_field};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaSurfaceShape {
@@ -425,7 +425,7 @@ pub(crate) fn row_visible_fields(spec: &SchemaSurfaceSpec) -> Vec<Field> {
 pub(crate) fn row_system_fields(shape: SchemaSurfaceShape) -> Vec<Field> {
     if shape == SchemaSurfaceShape::History {
         return vec![
-            json_field(HISTORY_COL_ROW_PK, false),
+            row_ref_field(HISTORY_COL_ROW_PK, false),
             Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
             Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
             json_field(HISTORY_COL_METADATA, true),
