@@ -2,6 +2,7 @@
 
 #![cfg_attr(test, allow(clippy::large_futures))]
 
+use super::PROTOCOL_VERSION;
 use crate::engine::Engine;
 use crate::session::ExecuteOptions;
 #[cfg(test)]
@@ -272,8 +273,6 @@ impl Event {
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Media type of a complete deterministic Lix snapshot.
 pub const SNAPSHOT_MEDIA_TYPE: &str = "application/vnd.lix.snapshot";
-/// Current wire protocol version.
-pub const PROTOCOL_VERSION: u32 = 5;
 /// Canonical method and path registry for protocol hosts and conformance tools.
 pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
     ("GET", "/lix/v1/{lix_id}"),
@@ -346,6 +345,7 @@ const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
 /// Maximum bytes held by one raw file-download response body at a time.
 const FILE_READ_STREAM_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 const SNAPSHOT_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_CONCURRENT_SNAPSHOT_EXPORTS: usize = 1;
 
 const SESSION_TOKEN_BYTES: usize = 32;
 const SESSION_TOKEN_HEX_LEN: usize = SESSION_TOKEN_BYTES * 2;
@@ -613,11 +613,14 @@ impl Default for ActiveOperationGate {
 }
 
 impl ActiveOperationGate {
-    fn reserve(self: &Arc<Self>) -> Result<ActiveOperation, ApiError> {
+    fn reserve(self: &Arc<Self>, max_active: usize) -> Result<ActiveOperation, ApiError> {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             if state & SESSION_OPEN_GATE_CLOSING != 0 {
                 return Err(ApiError::server_closed());
+            }
+            if state & SESSION_OPEN_GATE_COUNT_MASK >= max_active {
+                return Err(ApiError::snapshot_capacity());
             }
             assert!(
                 state & SESSION_OPEN_GATE_COUNT_MASK < SESSION_OPEN_GATE_COUNT_MASK,
@@ -1582,7 +1585,11 @@ async fn export_snapshot_response<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut operation = match server.inner.active_operations.reserve() {
+    let mut operation = match server
+        .inner
+        .active_operations
+        .reserve(MAX_CONCURRENT_SNAPSHOT_EXPORTS)
+    {
         Ok(operation) => operation,
         Err(error) => return error.into_response(),
     };
@@ -4133,6 +4140,18 @@ impl ApiError {
                 "LIX_ERROR_PROTOCOL_SESSION_CAPACITY",
                 "all Lix protocol session slots are currently active",
                 Some("retry after an active request or observation stream closes".to_string()),
+                None,
+            ),
+        }
+    }
+
+    fn snapshot_capacity() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: ErrorEnvelope::from_parts(
+                "LIX_ERROR_PROTOCOL_SNAPSHOT_CAPACITY",
+                "a snapshot export is already active for this Lix",
+                Some("retry after the active snapshot export completes".to_string()),
                 None,
             ),
         }
@@ -8676,6 +8695,24 @@ mod tests {
         assert!(is_terminal_storage_response(&response));
         assert_eq!(error_code(response).await, LixError::CODE_STORAGE_FENCED);
         assert!(signal.wait_for_terminal_storage().await);
+    }
+
+    #[test]
+    fn snapshot_operation_gate_bounds_concurrency_and_reopens_after_drop() {
+        let gate = Arc::new(ActiveOperationGate::default());
+        let first = gate.reserve(MAX_CONCURRENT_SNAPSHOT_EXPORTS).unwrap();
+        let second = gate.reserve(MAX_CONCURRENT_SNAPSHOT_EXPORTS);
+        let Err(error) = second else {
+            panic!("a second concurrent snapshot export must be rejected");
+        };
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.body.error.code,
+            "LIX_ERROR_PROTOCOL_SNAPSHOT_CAPACITY"
+        );
+
+        drop(first);
+        assert!(gate.reserve(MAX_CONCURRENT_SNAPSHOT_EXPORTS).is_ok());
     }
 
     #[tokio::test]

@@ -981,7 +981,7 @@ fn normalize_protocol_base_url(value: &str) -> Result<String, LixError> {
             "openLix() remote server url must not contain credentials",
         ));
     }
-    let locator_path = parsed.path().trim_end_matches('/');
+    let locator_path = parsed.path();
     let Some(lix_id) = locator_path.strip_prefix("/lix/") else {
         return Err(invalid_lix_locator());
     };

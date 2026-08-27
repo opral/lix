@@ -34,6 +34,7 @@ pub(crate) use bootstrap::{
     SyncBootstrapAdmission, inspect_sync_bootstrap_with_adapter, install_sync_bootstrap,
     prepare_sync_bootstrap,
 };
+pub(crate) use http::normalize_sync_locator;
 pub(crate) use contract::SyncTransport;
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]

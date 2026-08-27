@@ -8,6 +8,8 @@ test.each([
 	"https://example.test/prefix/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 	"https://user@example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 	"https://example.test/lix/01936F4E-7B6C-7C3D-8F9A-123456789ABC",
+	"https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc/",
+	"https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc//",
 ])("remote mode rejects unsafe or non-root locator %s", async (url) => {
 	await expect(
 		openRemoteLixBinding({

@@ -136,7 +136,7 @@ async fn inspect_tier(
 pub(crate) async fn prepare_sync_bootstrap(
     server: &crate::ServerOptions,
 ) -> Result<PreparedSyncBootstrap, LixError> {
-    let remote_id = server.url.trim_end_matches('/');
+    let remote_id = server.url.as_str();
     let transport = HttpSyncTransport::connect(remote_id, &server.headers).await?;
     let (snapshot, lix_id, default_branch_id) =
         runtime::fetch_repository_snapshot(&transport).await?;
@@ -172,7 +172,7 @@ where
     }
     let install = lix
         .try_install_initial_sync_snapshot(
-            server.url.trim_end_matches('/'),
+            &server.url,
             prepared.transport.active_account_id(),
             &prepared.snapshot.metadata,
             &prepared.snapshot.commits,
@@ -192,7 +192,7 @@ where
             let adapter = lix.storage_adapter();
             let _ = inspect_sync_bootstrap_with_adapter(
                 &adapter,
-                server.url.trim_end_matches('/'),
+                &server.url,
             )
             .await?;
             Err(restart_open_error())
@@ -201,7 +201,7 @@ where
         Err(error) => Err(
             reconcile_install_error(
                 &lix.storage_adapter(),
-                server.url.trim_end_matches('/'),
+                &server.url,
                 error,
             )
             .await,

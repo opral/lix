@@ -102,7 +102,6 @@ function connectionUrl(value: string | URL): URL {
 			"openLix() remote server url must not contain credentials",
 		);
 	}
-	locator.pathname = locator.pathname.replace(/\/$/, "");
 	if (
 		!/^\/lix\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
 			locator.pathname,

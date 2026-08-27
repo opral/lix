@@ -20,7 +20,7 @@ use super::{ProtocolExecuteOptions, open_protocol_client};
 fn connection_locator_maps_to_the_targeted_protocol_root() {
     assert_eq!(
         super::normalize_protocol_base_url(
-            "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc/"
+            "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
         )
         .expect("canonical locator"),
         "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/"
@@ -37,6 +37,7 @@ fn connection_locator_rejects_raw_protocol_and_noncanonical_ids() {
         "http://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
         "https://user@example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
         "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc?token=secret",
+        "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc/",
     ] {
         assert!(
             super::normalize_protocol_base_url(invalid).is_err(),

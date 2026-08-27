@@ -126,8 +126,9 @@ Your host is responsible for three things:
    boundary before dispatch. SDK connection locators themselves never contain
    a deployment prefix.
 3. **Forward the request and the response.** Preserve protocol status codes,
-   headers, and body bytes. Keep the repository alive until a server-sent
-   events (SSE) body closes.
+   headers, and body bytes. Keep the Lix runtime alive until every streaming
+   response body closes, including server-sent events (SSE) and snapshot
+   downloads.
 
 Use `ServerProtocolPrincipal::Anonymous` only where you deliberately allow
 anonymous access. Reject bad credentials with `401` before dispatch. Call

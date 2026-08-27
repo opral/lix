@@ -302,7 +302,7 @@ pub(crate) async fn activate_sync_mode<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let remote_id = server.url.trim_end_matches('/').to_owned();
+    let remote_id = server.url.clone();
     let headers = server.headers.clone();
     lix.set_sync_role(crate::sync::SyncRole::Replica)?;
 
