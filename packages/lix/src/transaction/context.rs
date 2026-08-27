@@ -35,7 +35,7 @@ use crate::changelog::{
     load_change_records, materialize_known_change_payloads,
 };
 use crate::checkpoint::{
-    CHECKPOINT_SCHEMA_KEY, checkpoint_commit_id_at_head, checkpoint_stage_row,
+    CHECKPOINT_SCHEMA_KEY, checkpoint_stage_row,
 };
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::common::{LixTimestamp, SharedStr};
@@ -971,6 +971,10 @@ impl<StorageImpl> Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    pub(crate) fn checkpoint_gc_sequence(&self) -> Option<u64> {
+        self.pending_checkpoint_gc_sequence
+    }
+
     pub(crate) fn stage_atomic_cas_publication(
         &mut self,
         writes: StorageWriteSet,
@@ -8334,16 +8338,6 @@ where
             .reader(SharedStorageAdapterRead::new(read)))
     }
 
-    /// Returns the private compaction cursor bound to this transaction's
-    /// retained opening read and the caller-observed branch head.
-    pub(crate) async fn checkpoint_commit_id_at_head(
-        &mut self,
-        branch_id: &str,
-        head_commit_id: CommitId,
-    ) -> Result<CommitId, LixError> {
-        checkpoint_commit_id_at_head(self.opening_read(), branch_id, head_commit_id).await
-    }
-
     pub(crate) async fn is_current_checkpoint_commit(
         &mut self,
         branch_id: &str,
@@ -9455,7 +9449,26 @@ where
             .flat_map(|(_, before, after)| [*before, *after])
             .flatten()
             .collect::<BTreeSet<_>>();
-        let mut records = load_change_records(&read, change_ids.into_iter()).await?;
+        let packed_records = futures_util::future::try_join_all(
+            change_ids.iter().copied().map(|change_id| {
+                let read = &read;
+                async move {
+                    crate::tracked_state::load_change_record_by_id(read, change_id)
+                        .await
+                        .map(|record| (change_id, record))
+                }
+            }),
+        )
+        .await?;
+        let mut records = packed_records
+            .into_iter()
+            .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
+            .collect::<HashMap<_, _>>();
+        let missing = change_ids
+            .into_iter()
+            .filter(|change_id| !records.contains_key(change_id))
+            .collect::<Vec<_>>();
+        records.extend(load_change_records(&read, missing.into_iter()).await?);
         let payloads = materialize_known_change_payloads(
             records.drain().map(|(_, record)| record),
             ChangeRecordProjection {

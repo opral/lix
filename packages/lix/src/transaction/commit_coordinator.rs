@@ -88,6 +88,7 @@ struct CommitCoordinatorStats {
     cohort_count: AtomicUsize,
     commit_count: AtomicUsize,
     max_cohort_size: AtomicUsize,
+    checkpoint_gc_post_commit_hooks: AtomicUsize,
 }
 
 impl<StorageImpl> CommitCoordinator<StorageImpl>
@@ -130,6 +131,22 @@ where
             .checkpoint_gc_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_checkpoint_gc_post_commit_hook(&self) {
+        self.inner
+            .stats
+            .checkpoint_gc_post_commit_hooks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_gc_post_commit_hooks(&self) -> usize {
+        self.inner
+            .stats
+            .checkpoint_gc_post_commit_hooks
+            .load(Ordering::Relaxed)
     }
 
     /// Process-local fallback when even the durable failure counter loses its
@@ -342,8 +359,10 @@ where
                 .map(|request| request.tracing_dispatch.clone());
             let mut senders = Vec::with_capacity(transaction_count);
             let mut inputs = Vec::with_capacity(cohort.len());
+            let mut checkpoint_gc_sequences = Vec::with_capacity(cohort.len());
             for request in cohort {
                 senders.push((request.result, request._capacity));
+                checkpoint_gc_sequences.push(request.transaction.checkpoint_gc_sequence());
                 inputs.push((request.transaction, request.runtime_functions));
             }
             let commit_and_notify = async {
@@ -376,8 +395,15 @@ where
                 Some(context) => Box::pin(context.instrument(commit_and_notify)).await,
                 None => Box::pin(commit_and_notify).await,
             };
-            for outcome in outcomes.iter_mut().flatten() {
-                *outcome = TransactionCommitOutcome::default();
+            for (outcome, checkpoint_gc_sequence) in
+                outcomes.iter_mut().zip(checkpoint_gc_sequences)
+            {
+                if let Ok(outcome) = outcome {
+                    *outcome = TransactionCommitOutcome {
+                        checkpoint_gc_sequence,
+                        ..TransactionCommitOutcome::default()
+                    };
+                }
             }
             debug_assert_eq!(outcomes.len(), senders.len());
             for ((sender, _capacity), outcome) in senders.into_iter().zip(outcomes) {

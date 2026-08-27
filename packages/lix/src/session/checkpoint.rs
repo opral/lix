@@ -115,6 +115,9 @@ where
         &self,
         checkpoint_sequence: u64,
     ) {
+        #[cfg(test)]
+        self.commit_coordinator
+            .record_checkpoint_gc_post_commit_hook();
         let result = async {
         let read = SharedStorageAdapterRead::new(
             self.storage.begin_read(StorageReadOptions::default()).await?,
@@ -291,6 +294,67 @@ mod tests {
             .expect_err("global branch checkpoint must be rejected");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error.to_string().contains("global branch"));
+    }
+
+    #[tokio::test]
+    async fn sql_checkpoint_schedules_gc_only_after_outer_commit() {
+        let storage = Memory::new();
+        crate::engine::Engine::initialize(storage.clone())
+            .await
+            .expect("repository initializes");
+        let engine = crate::engine::Engine::new(storage)
+            .await
+            .expect("repository opens");
+        let session = engine
+            .open_session()
+            .await
+            .expect("session opens");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('gc-hook', 'working')",
+                &[],
+            )
+            .await
+            .expect("working row commits");
+        assert_eq!(
+            session.commit_coordinator.checkpoint_gc_post_commit_hooks(),
+            0
+        );
+
+        let mut rolled_back = session
+            .begin_transaction()
+            .await
+            .expect("transaction begins");
+        rolled_back
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("checkpoint stages");
+        assert_eq!(
+            session.commit_coordinator.checkpoint_gc_post_commit_hooks(),
+            0,
+            "staging a checkpoint must not schedule maintenance"
+        );
+        rolled_back.rollback().await.expect("rollback succeeds");
+        assert_eq!(
+            session.commit_coordinator.checkpoint_gc_post_commit_hooks(),
+            0,
+            "rolling back a checkpoint must not schedule maintenance"
+        );
+
+        let mut committed = session
+            .begin_transaction()
+            .await
+            .expect("transaction begins");
+        committed
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("checkpoint stages");
+        committed.commit().await.expect("checkpoint commits");
+        assert_eq!(
+            session.commit_coordinator.checkpoint_gc_post_commit_hooks(),
+            1,
+            "a durable SQL checkpoint schedules maintenance exactly once"
+        );
     }
 
     #[test]
