@@ -27,7 +27,7 @@ test("concurrent first opens share one WASM initialization", async () => {
 	wasm.openRemote.mockResolvedValue({});
 	const options = {
 		mode: "remote" as const,
-		url: "https://lix.test/repository",
+		url: "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 		fetch: vi.fn(),
 	};
 
@@ -47,7 +47,7 @@ test("an initialization failure remains the shared result", async () => {
 	wasm.init.mockRejectedValue(failure);
 	const options = {
 		mode: "remote" as const,
-		url: "https://lix.test/repository",
+		url: "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 		fetch: vi.fn(),
 	};
 

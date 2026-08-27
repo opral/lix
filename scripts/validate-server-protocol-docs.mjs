@@ -49,7 +49,9 @@ export function docPaths(markdown) {
 
   const found = new Set();
   for (const [, token] of table.matchAll(/`(\/lix\/v1[^`]*)`/g)) {
-    const group = token.match(/^(.*)\{([^}]+)\}(.*)$/);
+    // Only comma-separated braces are documentation shorthand. OpenAPI path
+    // parameters such as `{lix_id}` must remain literal.
+    const group = token.match(/^(.*)\{([^}]*,[^}]*)\}(.*)$/);
     if (group) {
       for (const option of group[2].split(",")) {
         found.add(`${group[1]}${option.trim()}${group[3]}`);

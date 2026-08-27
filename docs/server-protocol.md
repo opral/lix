@@ -1,11 +1,12 @@
 # Lix Server Protocol
 
-The Lix Server Protocol is the HTTP contract for talking to a remote Lix
-repository. It is version `2` and lives under `/lix/v1`.
+The Lix Server Protocol is the HTTP contract for talking to a remote Lix. Its
+stable HTTP API major is `v1` and every operation lives under
+`/lix/v1/{lix_id}`.
 
 It defines the methods, wire formats, session behavior, and error envelopes.
-It does not define HTTP frameworks, authentication schemes, URLs above
-`/lix/v1`, or deployment policy.
+It does not define HTTP frameworks, authentication schemes, or deployment
+policy.
 
 Application developers should start with
 [Collaboration and Sync](./collaboration-and-sync.md). This page documents the
@@ -15,10 +16,10 @@ server wire contract.
 
 The protocol is the interop layer between clients and hosts.
 
-A server that implements `/lix/v1` is a Lix server, and every Lix client works
-against it unchanged. Point a client at a different server and nothing in the
-client changes but the URL. The OpenAPI document plus the normative behavior
-below is the entire contract. There is no separate vendor API.
+A server that implements `/lix/v1/{lix_id}` is a Lix server, and every Lix
+client works against it unchanged. Point a client at a different server and
+nothing in the client changes but the connection URL. The OpenAPI document plus
+the normative behavior below is the complete per-Lix contract.
 
 The `lix` crate contains the reference implementation, so a server provides HTTP
 and authentication and forwards requests to it. See [Hosting](./hosting.md).
@@ -27,17 +28,20 @@ and authentication and forwards requests to it. See [Hosting](./hosting.md).
 
 | Group       | Paths                                                                                         |
 | :---------- | :-------------------------------------------------------------------------------------------- |
-| Handshake   | `/lix/v1`, `/lix/v1/session`                                                                  |
-| SQL         | `/lix/v1/execute`, `/lix/v1/execute-batch`                                                    |
-| Transaction | `/lix/v1/transaction/{begin,execute,commit,rollback}`                                         |
-| Files       | `/lix/v1/file`, `/lix/v1/file/upsert`, `/lix/v1/file/upsert-batch`                            |
-| Sync        | `/lix/v1/sync/{push,pull,history,blob,chunk}`                                                 |
-| Versioning  | `/lix/v1/branch/{create,switch}`, `/lix/v1/checkpoint/create`, `/lix/v1/undo`, `/lix/v1/redo` |
-| Observation | `/lix/v1/observe`, `/lix/v1/observe/multiplex`                                                |
+| Handshake   | `/lix/v1/{lix_id}`, `/lix/v1/{lix_id}/session`                                                                  |
+| SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                                                    |
+| Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                                         |
+| Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert`, `/lix/v1/{lix_id}/file/upsert-batch`                            |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,blob,chunk}`                                                 |
+| Versioning  | `/lix/v1/{lix_id}/branch/{create,switch}`, `/lix/v1/{lix_id}/checkpoint/create`, `/lix/v1/{lix_id}/undo`, `/lix/v1/{lix_id}/redo` |
+| Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                                                |
+| Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                                         |
 
-Clients do not construct these paths. `openLix()` appends `/lix/v1/` to the
-repository URL, opens a session, carries the server-issued `Lix-Session-Id` on
-later requests, and reconnects observation streams.
+SDK users pass the complete stable locator `https://host/lix/{lix_id}`.
+`openLix()` rewrites that terminal locator to `/lix/v1/{lix_id}`, opens a
+session, carries the server-issued `Lix-Session-Id` on later requests, and
+reconnects observation streams. Raw HTTP clients use the versioned paths
+directly.
 
 ## Identity and sessions
 
@@ -56,29 +60,29 @@ idempotent by immutable commit identity and compare-and-swap branch updates.
 
 ## Sync
 
-Sync is repository-scoped: the repository URL selects the repository, so sync
-paths never repeat a repository identifier. A local write commits to the local
-Lix first and reaches these endpoints only from the background sync worker.
+Sync is Lix-scoped: the immutable ID in the path selects the Lix. A local write
+commits to the local Lix first and reaches these endpoints only from the
+background sync worker.
 
-- `POST /lix/v1/sync/push` atomically uploads immutable commits and applies
+- `POST /lix/v1/{lix_id}/sync/push` atomically uploads immutable commits and applies
   compare-and-swap branch-ref updates.
-- `GET /lix/v1/sync/pull` returns pinned hot-state metadata when all query
+- `GET /lix/v1/{lix_id}/sync/pull` returns pinned hot-state metadata when all query
   parameters are omitted: the repository cursor, default branch, and branch
   heads. With `snapshotBranchId` and `snapshotHeadCommitId`, it returns a
   bounded current-row page pinned to that immutable head; `snapshotAfter`
   continues the page scan. Each branch also carries a `hotStateRootId` over its
   live, tombstone-filtered rows so the replica can verify the assembled pages.
   With `after`, it long-polls the repository event sequence.
-- `GET /lix/v1/sync/history` fetches exact immutable commits by repeated
+- `GET /lix/v1/{lix_id}/sync/history` fetches exact immutable commits by repeated
   `commitId` parameters, together with bounded topology certificates. The
   bootstrap worker fetches the distinct branch-head bodies and current-row
   pages concurrently after reading metadata. History hydration does not change
   the live cursor or branch refs.
-- `GET /lix/v1/sync/blob?blobId=...` loads a canonical flat FastCDC manifest.
-  `POST /lix/v1/sync/blob` registers that manifest once every chunk is present,
+- `GET /lix/v1/{lix_id}/sync/blob?blobId=...` loads a canonical flat FastCDC manifest.
+  `POST /lix/v1/{lix_id}/sync/blob` registers that manifest once every chunk is present,
   or returns the exact missing chunk IDs.
-- `GET /lix/v1/sync/chunk?chunkId=...` and
-  `PUT /lix/v1/sync/chunk?chunkId=...` transfer raw chunks. Both identities are
+- `GET /lix/v1/{lix_id}/sync/chunk?chunkId=...` and
+  `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are
   64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
 The live pull protocol has one repository cursor. It has no schema or

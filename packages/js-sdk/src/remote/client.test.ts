@@ -9,7 +9,7 @@ test("Lix Server Protocol handshake requests a restored initial active branch", 
 	const binding = await openRemoteLixBinding(
 		{
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				requests.push(request);
@@ -30,7 +30,7 @@ test("Lix Server Protocol handshake requests a restored initial active branch", 
 	);
 
 	const handshakeUrl = new URL(requests[0]?.url ?? "");
-	expect(handshakeUrl.pathname).toBe("/@acme/repository/lix/v1/");
+	expect(handshakeUrl.pathname).toBe("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/");
 	expect(handshakeUrl.searchParams.get("activeBranchId")).toBe("draft / one");
 	expect(handshakeUrl.searchParams.has("activeAccountId")).toBe(false);
 	expect(requests[0]?.headers.has("lix-session-id")).toBe(false);
@@ -48,7 +48,7 @@ test("openAnotherSession creates an independent remote protocol session", async 
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				if (request.method === "DELETE")
@@ -90,7 +90,7 @@ test("openAnotherSession rejects and closes a remote identity mismatch", async (
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				requests.push(request);
@@ -132,7 +132,7 @@ test("remote mode uses the repository protocol without loading a local engine", 
 		async (input: RequestInfo | URL, init?: RequestInit) => {
 			const request = new Request(input, init);
 			requests.push(request);
-			if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
+			if (new URL(request.url).pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 				return Response.json({
 					protocolVersion: 5,
 					activeBranchId: "main-id",
@@ -140,7 +140,7 @@ test("remote mode uses the repository protocol without loading a local engine", 
 					sessionId: "session-1",
 				});
 			}
-			if (new URL(request.url).pathname.endsWith("/lix/v1/execute")) {
+			if (new URL(request.url).pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/execute")) {
 				return Response.json({
 					columns: [
 						{ name: "n", type: "integer" },
@@ -167,7 +167,7 @@ test("remote mode uses the repository protocol without loading a local engine", 
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: remoteFetch as typeof fetch,
 			headers: () => {
 				headerCalls += 1;
@@ -201,8 +201,8 @@ test("remote mode uses the repository protocol without loading a local engine", 
 	expect(result.rows[0]?.json).toEqual({ ok: true });
 	expect(headerCalls).toBe(2);
 	expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
-		"/@acme/repository/lix/v1/",
-		"/@acme/repository/lix/v1/execute",
+		"/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/",
+		"/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/execute",
 	]);
 	expect(requests[1]?.headers.get("authorization")).toBe("Bearer token-2");
 	expect(requests[0]?.headers.has("lix-session-id")).toBe(false);
@@ -226,7 +226,7 @@ test("remote mode uses the repository protocol without loading a local engine", 
 
 	await lix.close();
 	expect(new URL(requests[2]?.url ?? "").pathname).toBe(
-		"/@acme/repository/lix/v1/session",
+		"/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/session",
 	);
 	expect(requests[2]?.method).toBe("DELETE");
 	expect(requests[2]?.headers.get("lix-session-id")).toBe("session-1");
@@ -237,11 +237,11 @@ test("remote mode compresses only large compressible JSON requests", async () =>
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
 						protocolVersion: 5,
 						activeBranchId: "main-id",
@@ -249,7 +249,7 @@ test("remote mode compresses only large compressible JSON requests", async () =>
 						sessionId: "session-1",
 					});
 				}
-				if (pathname.endsWith("/lix/v1/execute")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/execute")) {
 					executeRequests.push(request.clone());
 					return Response.json({
 						columns: [],
@@ -304,11 +304,11 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
-				return new URL(request.url).pathname.endsWith("/lix/v1/")
+				return new URL(request.url).pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")
 					? Response.json({
 							protocolVersion: 5,
 							activeBranchId: "main-id",
@@ -352,7 +352,7 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 		[1, undefined],
 	]);
 	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
-		"/@acme/repository/lix/v1/execute-batch",
+		"/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/execute-batch",
 	);
 	expect(requests[1]?.headers.get("idempotency-key")).toMatch(
 		/^[0-9a-f-]{36}$/,
@@ -380,11 +380,11 @@ test("remote execute sends successful large blob updates as exact splices", asyn
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) return handshakeResponse();
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) return handshakeResponse();
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
@@ -428,11 +428,11 @@ test("remote execute splices the exact 10.68 MB CSV-size blob", async () => {
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) return handshakeResponse();
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) return handshakeResponse();
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
@@ -476,11 +476,11 @@ test("remote execute retries a missing blob base once with full bytes", async ()
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) return handshakeResponse();
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) return handshakeResponse();
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
@@ -529,11 +529,11 @@ test("remote execute uses a caller idempotency key only as a header", async () =
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
-				if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
+				if (new URL(request.url).pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return handshakeResponse();
 				}
 				if (request.method === "DELETE")
@@ -564,11 +564,11 @@ test("remote execute keeps small and low-saving blob updates full", async () => 
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) return handshakeResponse();
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) return handshakeResponse();
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
@@ -600,11 +600,11 @@ test("Lix Server Protocol v3 uses blob splices without capability negotiation", 
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
 						protocolVersion: 5,
 						activeBranchId: "main-id",
@@ -644,11 +644,11 @@ test("remote executeBatch uses blob splices for stable statement slots", async (
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) return handshakeResponse();
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) return handshakeResponse();
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
@@ -686,12 +686,12 @@ test("remote branches preserve local Lix branch semantics", async () => {
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: new URL("https://lixray.test/@acme/repository/"),
+			url: new URL("https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"),
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
 						protocolVersion: 5,
 						activeBranchId,
@@ -742,12 +742,12 @@ test("remote createCheckpoint posts no body and decodes the receipt", async () =
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
 						protocolVersion: 5,
 						activeBranchId: "main-id",
@@ -784,12 +784,12 @@ test("remote lix_restore uses the existing execute endpoint", async () => {
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
 						protocolVersion: 5,
 						activeBranchId: "main-id",
@@ -836,11 +836,11 @@ test("remote undo and redo decode branch-history receipts", async () => {
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
 						protocolVersion: 5,
 						activeBranchId: "main-id",
@@ -888,14 +888,14 @@ test("a failed remote branch switch leaves the active branch unchanged", async (
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					handshakeCalls += 1;
 					return Response.json({
 						protocolVersion: 5,
@@ -941,14 +941,14 @@ test("an ambiguous remote branch switch is reconciled by the next branch read", 
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					handshakeCalls += 1;
 					return Response.json({
 						protocolVersion: 5,
@@ -983,14 +983,14 @@ test("branch reconciliation rejects and never caches a replacement session", asy
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					handshakeCalls += 1;
 					return Response.json({
 						protocolVersion: 5,
@@ -1031,7 +1031,7 @@ test("remote clients retain independent active branches", async () => {
 	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 		const request = new Request(input, init);
 		const pathname = new URL(request.url).pathname;
-		if (pathname.endsWith("/lix/v1/")) {
+		if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 			const sessionId =
 				request.headers.get("lix-session-id") ?? `session-${++nextSessionId}`;
 			if (!activeBranches.has(sessionId)) {
@@ -1060,7 +1060,7 @@ test("remote clients retain independent active branches", async () => {
 	const options = {
 		server: {
 			mode: "remote" as const,
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: remoteFetch,
 		},
 	};
@@ -1084,11 +1084,11 @@ test("remote operations preserve normal Lix call ordering", async () => {
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
 						protocolVersion: 5,
 						activeBranchId: "main-id",
@@ -1143,11 +1143,11 @@ test("remote responses reject malformed rows and non-JSON HTTP errors", async ()
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
 						protocolVersion: 5,
 						activeBranchId: "main-id",
@@ -1196,7 +1196,7 @@ test("remote beginTransaction uses one capability-bound server lifecycle", async
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const path = new URL(request.url).pathname;
@@ -1212,7 +1212,7 @@ test("remote beginTransaction uses one capability-bound server lifecycle", async
 						? {}
 						: { body: await requestJson(request) }),
 				});
-				if (path.endsWith("/lix/v1/")) {
+				if (path.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
 						protocolVersion: 5,
 						activeBranchId: "main-id",
@@ -1251,11 +1251,11 @@ test("remote beginTransaction uses one capability-bound server lifecycle", async
 	await lix.close();
 
 	expect(requests).toEqual([
-		{ method: "GET", path: "/@acme/repository/lix/v1/" },
-		{ method: "POST", path: "/@acme/repository/lix/v1/transaction/begin" },
+		{ method: "GET", path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/" },
+		{ method: "POST", path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/transaction/begin" },
 		{
 			method: "POST",
-			path: "/@acme/repository/lix/v1/transaction/execute",
+			path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/transaction/execute",
 			transactionId: "transaction-1",
 			body: {
 				sql: "SELECT $1 AS value",
@@ -1265,16 +1265,16 @@ test("remote beginTransaction uses one capability-bound server lifecycle", async
 		},
 		{
 			method: "POST",
-			path: "/@acme/repository/lix/v1/transaction/commit",
+			path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/transaction/commit",
 			transactionId: "transaction-1",
 		},
-		{ method: "POST", path: "/@acme/repository/lix/v1/transaction/begin" },
+		{ method: "POST", path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/transaction/begin" },
 		{
 			method: "POST",
-			path: "/@acme/repository/lix/v1/transaction/rollback",
+			path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/transaction/rollback",
 			transactionId: "transaction-1",
 		},
-		{ method: "DELETE", path: "/@acme/repository/lix/v1/session" },
+		{ method: "DELETE", path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/session" },
 	]);
 });
 
@@ -1282,7 +1282,7 @@ test("remote mode rejects unsupported local-only operations honestly", async () 
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async () =>
 				Response.json({
 					protocolVersion: 5,
@@ -1310,7 +1310,7 @@ test("remote mode rejects incompatible protocol versions", async () => {
 			storage: undefined,
 			server: {
 				mode: "remote",
-				url: "https://lixray.test/repository",
+				url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 				fetch: (async () =>
 					Response.json({
 						protocolVersion: 1,
@@ -1330,7 +1330,7 @@ test.each([undefined, "", " contains-space", "contains\nnewline", 42])(
 			openLix({
 				server: {
 					mode: "remote",
-					url: "https://lixray.test/repository",
+					url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 					fetch: (async () =>
 						Response.json({
 							protocolVersion: 5,
@@ -1349,7 +1349,7 @@ test("active branch reads reuse the initial handshake without another GET", asyn
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				if (request.method === "DELETE") {
@@ -1379,12 +1379,12 @@ test("execute recovers a gone protocol session once by opening a new handshake",
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				requests.push(request.clone());
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					const presented = request.headers.get("lix-session-id");
 					if (presented !== null) {
 						return protocolSessionGone();
@@ -1422,24 +1422,24 @@ test("execute recovers a gone protocol session once by opening a new handshake",
 	expect(requests.map(describeRemoteRequest)).toEqual([
 		{
 			method: "GET",
-			path: "/@acme/repository/lix/v1/",
+			path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/",
 			sessionId: null,
 			activeBranchId: null,
 		},
 		{
 			method: "POST",
-			path: "/@acme/repository/lix/v1/execute",
+			path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/execute",
 			sessionId: "session-1",
 		},
 		{
 			method: "GET",
-			path: "/@acme/repository/lix/v1/",
+			path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/",
 			sessionId: null,
 			activeBranchId: "main-id",
 		},
 		{
 			method: "POST",
-			path: "/@acme/repository/lix/v1/execute",
+			path: "/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/execute",
 			sessionId: "session-2",
 		},
 	]);
@@ -1453,11 +1453,11 @@ test("execute recovers a closed protocol server once then retries with the new s
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					sessionIds.push(request.headers.get("lix-session-id"));
 					return Response.json({
 						protocolVersion: 5,
@@ -1495,11 +1495,11 @@ test("a second gone protocol session after recovery is not retried", async () =>
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					handshakeCalls += 1;
 					expect(request.headers.has("lix-session-id")).toBe(false);
 					return Response.json({
@@ -1535,14 +1535,14 @@ test("an active branch read adopts a new session after protocol session gone", a
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/@acme/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
 				if (request.method === "DELETE") {
 					return new Response(null, { status: 204 });
 				}
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					const presented = request.headers.get("lix-session-id");
 					if (presented !== null) {
 						handshakes.push({ sessionId: presented });
@@ -1587,11 +1587,11 @@ test("an expired session mutation is propagated without a new handshake or retry
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					handshakeCalls += 1;
 					return Response.json({
 						protocolVersion: 5,
@@ -1635,11 +1635,11 @@ test("close waits for queued operations before deleting the remote session", asy
 	const lix = await openLix({
 		server: {
 			mode: "remote",
-			url: "https://lixray.test/repository",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/lix/v1/")) {
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
 						protocolVersion: 5,
 						activeBranchId: "main-id",

@@ -16,6 +16,33 @@ use super::http::{
 use super::wire::{SERVER_CLOSED_CODE, SERVER_PROTOCOL_VERSION, SESSION_GONE_CODE};
 use super::{ProtocolExecuteOptions, open_protocol_client};
 
+#[test]
+fn connection_locator_maps_to_the_targeted_protocol_root() {
+    assert_eq!(
+        super::normalize_protocol_base_url(
+            "https://example.test/prefix/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc/"
+        )
+        .expect("canonical locator"),
+        "https://example.test/prefix/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/"
+    );
+}
+
+#[test]
+fn connection_locator_rejects_raw_protocol_and_noncanonical_ids() {
+    for invalid in [
+        "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        "https://example.test/lix/01936F4E-7B6C-7C3D-8F9A-123456789ABC",
+        "https://example.test/lix/not-a-uuid",
+        "https://user@example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc?token=secret",
+    ] {
+        assert!(
+            super::normalize_protocol_base_url(invalid).is_err(),
+            "accepted invalid locator: {invalid}"
+        );
+    }
+}
+
 #[derive(Clone, Default)]
 struct ScriptHttp {
     requests: Arc<Mutex<Vec<ProtocolHttpRequest>>>,
@@ -218,7 +245,7 @@ async fn execute_recovers_once_on_session_gone_and_pins_the_last_branch() {
     http.push_json(200, execute_ok());
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/repo", None)
+    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
         .await
         .expect("open");
     assert_eq!(client.active_branch_id().await.expect("branch"), "branch-a");
@@ -251,7 +278,7 @@ async fn execute_recovers_once_on_server_closed() {
     http.push_json(200, execute_ok());
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/repo", None)
+    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
         .await
         .expect("open");
     client
@@ -284,7 +311,7 @@ async fn execute_second_session_gone_fails_without_another_handshake() {
     http.push_json(410, protocol_error(SESSION_GONE_CODE, 410));
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/repo", None)
+    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
         .await
         .expect("open");
     let error = client
@@ -308,7 +335,7 @@ async fn open_handshake_can_pin_an_initial_branch() {
     http.push_empty(204);
     let client = open_protocol_client(
         http.clone(),
-        "https://lix.test/@acme/repository",
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
         Some("draft / one".to_owned()),
     )
     .await
@@ -319,7 +346,7 @@ async fn open_handshake_can_pin_an_initial_branch() {
     );
     client.close().await.expect("close");
     let handshake_url = &http.requests()[0].url;
-    assert!(handshake_url.contains("/@acme/repository/lix/v1/"));
+    assert!(handshake_url.contains("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/"));
     assert!(
         handshake_url.contains("activeBranchId=draft+%2F+one") || handshake_url.contains("draft")
     );
@@ -338,7 +365,7 @@ async fn observe_recovers_once_on_session_gone() {
     http.push_stream(200, "event: message\ndata: \n\n");
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/repo", None)
+    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
         .await
         .expect("open");
     let events = client
@@ -363,7 +390,7 @@ async fn observe_second_session_gone_fails_without_a_reconnect_loop() {
     http.push_json(410, protocol_error(SESSION_GONE_CODE, 410));
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/repo", None)
+    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
         .await
         .expect("open");
     let events = client
@@ -397,7 +424,7 @@ async fn observe_error_event_recovers_once_then_fails() {
     http.push_stream(200, &sse_error(SESSION_GONE_CODE));
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/repo", None)
+    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
         .await
         .expect("open");
     let events = client

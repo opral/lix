@@ -176,6 +176,23 @@ rejects remote or sync server mode and any destination that already contains
 a Lix. There is no separate byte-array export method; bounded callers can use
 standard APIs such as `new Response(lix.exportSnapshot()).arrayBuffer()`.
 
+## Remote export
+
+A host exposes the same deterministic stream through the Lix Server Protocol:
+
+```http
+GET /lix/v1/{lix_id}/snapshot
+Authorization: Bearer <access-token>
+Accept: application/vnd.lix.snapshot
+```
+
+The response is a backpressured `application/vnd.lix.snapshot` stream with
+`Cache-Control: no-store, no-transform`. Snapshot export requires an
+authenticated host principal even when selected files from the Lix are public.
+The remote protocol deliberately has no snapshot upload or import route. Restore
+the artifact into a fresh local or host-provisioned destination through the
+storage APIs described above.
+
 ## Consistency, integrity, and format
 
 One coherent read covers the full export. A concurrent commit is included

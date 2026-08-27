@@ -131,7 +131,9 @@ async fn request(
     idempotency_key: Option<&str>,
     body: Option<Value>,
 ) -> ServerProtocolResponse {
-    let mut builder = Request::builder().method(method).uri(path);
+    let suffix = path.strip_prefix("/lix/v1").expect("protocol test path");
+    let targeted_path = format!("/lix/v1/{}{}", server.lix_id(), suffix);
+    let mut builder = Request::builder().method(method).uri(targeted_path);
     if let Some(session_id) = session_id {
         builder = builder.header(SESSION_ID_HEADER, session_id);
     }

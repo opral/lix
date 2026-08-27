@@ -171,7 +171,8 @@ web-time = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 futures-io = "0.3"
 futures-lite = "2"
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["io-util", "rt", "sync"] }
+tokio-util = { version = "0.7", features = ["compat", "io"] }
 tracing = "0.1"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }

@@ -76,11 +76,11 @@ where
 {
     pub(super) async fn connect_with(
         client: Client,
-        repository_url: &str,
+        lix_url: &str,
     ) -> Result<Self, LixError> {
-        let repository_url = repository_url.trim_end_matches('/');
-        validate_sync_remote_id(repository_url)?;
-        let protocol_url = format!("{repository_url}/lix/v1");
+        let lix_url = lix_url.trim_end_matches('/');
+        validate_sync_remote_id(lix_url)?;
+        let protocol_url = protocol_url_from_locator(lix_url)?;
         let response = client
             .send(raw_request(
                 Method::GET,
@@ -124,6 +124,31 @@ where
         let operation = request.operation;
         decode_response(self.client.send(request).await?, operation)
     }
+}
+
+fn protocol_url_from_locator(locator: &str) -> Result<String, LixError> {
+    if locator.contains(['?', '#']) {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync server url must not contain a query or fragment",
+        ));
+    }
+    let Some((service_path, lix_id)) = locator.rsplit_once('/') else {
+        return Err(invalid_lix_locator());
+    };
+    if !service_path.ends_with("/lix")
+        || crate::row_pk::RowPk::uuid_from_canonical(lix_id).is_err()
+    {
+        return Err(invalid_lix_locator());
+    }
+    Ok(format!("{service_path}/v1/{lix_id}"))
+}
+
+fn invalid_lix_locator() -> LixError {
+    LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        "sync server url must end with /lix/{uuid}",
+    )
 }
 
 impl<Client> SyncTransport for HttpSyncTransport<Client>

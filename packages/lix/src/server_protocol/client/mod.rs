@@ -973,13 +973,37 @@ fn normalize_protocol_base_url(value: &str) -> Result<String, LixError> {
             "openLix() remote server url must not contain a query or fragment",
         ));
     }
-    let mut path = parsed.path().trim_end_matches('/').to_owned();
-    if !path.ends_with("/lix/v1") {
-        path.push_str("/lix/v1");
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "openLix() remote server url must not contain credentials",
+        ));
     }
-    path.push('/');
-    parsed.set_path(&path);
+    let locator_path = parsed.path().trim_end_matches('/');
+    let Some((service_path, lix_id)) = locator_path.rsplit_once('/') else {
+        return Err(invalid_lix_locator());
+    };
+    if !service_path.ends_with("/lix") {
+        return Err(invalid_lix_locator());
+    }
+    let canonical_id = uuid::Uuid::parse_str(lix_id)
+        .ok()
+        .map(|id| id.hyphenated().to_string());
+    if canonical_id.as_deref() != Some(lix_id) {
+        return Err(invalid_lix_locator());
+    }
+    let deployment_prefix = service_path
+        .strip_suffix("/lix")
+        .expect("validated Lix locator service path");
+    parsed.set_path(&format!("{deployment_prefix}/lix/v1/{lix_id}/"));
     Ok(parsed.to_string())
+}
+
+fn invalid_lix_locator() -> LixError {
+    LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        "openLix() remote server url must end with /lix/{uuid}",
+    )
 }
 
 fn maybe_compress_json(body: Vec<u8>) -> Result<(Bytes, bool), LixError> {
