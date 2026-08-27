@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.15.0 - 2026-08-27
+
+### Minor
+
+- Opening a Lix now upgrades supported older repository formats automatically and reports typed progress to Rust and JavaScript applications.
+
+  `open_lix()` is the single repository lifecycle API. The explicit public migration and inspection APIs have been removed, and every opened handle exposes an immutable report describing initialization or migration performed during open.
+- Added `lix_latest_checkpoint_commit_id()` for reading the active branch's latest checkpoint directly in SQL.
+
+  The accessor falls back to the repository root when the branch has no checkpoint, allowing reactive working changes to be queried with `lix_diff('lix_file', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id())`.
+- Added immutable, branch-scoped point-in-time reads with `lix_state_at(relation, commit_id)`.
+
+  Diff machinery columns now use the reserved `lixcol_` namespace, and repository format v74 adds the authenticated row-primary-key index used for bounded historical reads. Existing supported repositories are upgraded automatically while opening.
+- Hard-cut JavaScript SQL results to plain-object rows and typed column descriptors. `execute`, `executeBatch`, transactions, and observations now return enumerable rows with direct property access and `columns` entries shaped as `{ name, type }`; the `Row` accessor API has been removed. Positional array rows remain available through `rowMode: "array"` for duplicate-column and wire-adapter use cases. The Lix Server Protocol is now version 5.
+- Added deterministic, stream-first `.lixsnap` export and restore APIs for Rust and JavaScript.
+
+  Snapshots capture a complete logical Lix for reproduction, transfer, and recovery, verify integrity with BLAKE3, and restore atomically only into fresh storage.
+- Standardized relation payload column names in `lix_diff()`.
+
+  Diff queries now use `diff_type` and `row_count`; `lixcol_diff_type` and `lixcol_row_count` were renamed without compatibility aliases. The `lixcol_` prefix remains reserved for engine-owned system metadata.
+- Repository format v75 makes every commit a complete state snapshot: `lix_commit.base_commit_id` names the exact global commit whose state composes beneath a local commit's overlay, so branch-scoped and point-in-time reads (`lix_state_at`) are exact rather than replay-derived.
+
+  Opening automatically upgrades v72–v74 repositories — inferring each local commit's base chronologically, repairing filesystem trees that v72-era partial checkpoints left without their ancestor directories, and fencing every step so an interruption is cleanly retryable. Repositories below v72, or repositories whose commit timestamps contradict the chronological inference, are rejected with an explicit error instead of migrating on guessed history.
+
+### Patch
+
+- OPFS repositories remain writable across browser-tab navigation and owner-worker handoffs.
+
+  The shared storage session now survives an OPFS backend restart, so one healthy tab no longer fences another tab using the same repository generation.
+- Allow a `LixServerProtocol` owner to stream a coherent snapshot without opening a second engine for the same storage.
+
 ## 0.14.0 - 2026-08-25
 
 ### Minor
