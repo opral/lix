@@ -37,7 +37,7 @@ const lix = await openLix({
   storage: new FilesystemStorage({ path: "./project" }),
   server: {
     mode: "sync",
-    url: "https://lixray.com/@acme/project",
+    url: "https://lixray.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
 ```

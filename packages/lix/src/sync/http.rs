@@ -127,27 +127,52 @@ where
 }
 
 fn protocol_url_from_locator(locator: &str) -> Result<String, LixError> {
-    if locator.contains(['?', '#']) {
+    let mut parsed = url::Url::parse(locator).map_err(|_| invalid_lix_locator())?;
+    if parsed.scheme() != "https"
+        && !(parsed.scheme() == "http" && is_loopback_host(&parsed))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync server url must use https (http is allowed only for loopback development)",
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
             "sync server url must not contain a query or fragment",
         ));
     }
-    let Some((service_path, lix_id)) = locator.rsplit_once('/') else {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync server url must not contain credentials",
+        ));
+    }
+    let locator_path = parsed.path().trim_end_matches('/');
+    let Some(lix_id) = locator_path.strip_prefix("/lix/") else {
         return Err(invalid_lix_locator());
     };
-    if !service_path.ends_with("/lix")
-        || crate::row_pk::RowPk::uuid_from_canonical(lix_id).is_err()
+    if lix_id.contains('/') || crate::row_pk::RowPk::uuid_from_canonical(lix_id).is_err()
     {
         return Err(invalid_lix_locator());
     }
-    Ok(format!("{service_path}/v1/{lix_id}"))
+    parsed.set_path(&format!("/lix/v1/{lix_id}"));
+    Ok(parsed.to_string())
+}
+
+fn is_loopback_host(url: &url::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
 }
 
 fn invalid_lix_locator() -> LixError {
     LixError::new(
         LixError::CODE_INVALID_PARAM,
-        "sync server url must end with /lix/{uuid}",
+        "sync server url path must be exactly /lix/{uuid}",
     )
 }
 
@@ -402,7 +427,38 @@ fn encode_query(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawHttpResponse, encode_query, response_error};
+    use super::{RawHttpResponse, encode_query, protocol_url_from_locator, response_error};
+
+    #[test]
+    fn sync_connection_locator_maps_to_the_targeted_protocol_root() {
+        assert_eq!(
+            protocol_url_from_locator(
+                "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+            )
+            .expect("canonical locator"),
+            "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        );
+    }
+
+    #[test]
+    fn sync_connection_locator_rejects_non_http_and_credentialed_urls() {
+        for invalid in [
+            "relative/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            "ftp://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            "http://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            "https://example.test/prefix/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            "https://user@example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        ] {
+            assert!(
+                protocol_url_from_locator(invalid).is_err(),
+                "accepted invalid locator: {invalid}"
+            );
+        }
+        assert!(protocol_url_from_locator(
+            "http://localhost:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        )
+        .is_ok());
+    }
 
     #[test]
     fn query_encoding_is_rfc3986_component_encoding() {

@@ -7,6 +7,14 @@ import path from "node:path";
 
 const SPEC = "packages/lix/server-protocol.openapi.yaml";
 const DOC = "docs/server-protocol.md";
+const PUBLIC_LOCATOR_DOCS = [
+  "docs/hosting.md",
+  "docs/js-api-reference.md",
+  "docs/persistence.md",
+  "docs/snapshots.md",
+  "docs/what-is-lix.md",
+  "packages/js-sdk/README.md",
+];
 
 /**
  * Reads the top-level path keys from an OpenAPI document.
@@ -84,6 +92,15 @@ function main() {
       lines.push(`  Documented but not in the spec: ${stale.join(", ")}`);
     }
     throw new Error(lines.join("\n"));
+  }
+
+  for (const file of PUBLIC_LOCATOR_DOCS) {
+    const markdown = readFileSync(path.join(root, file), "utf8");
+    if (/\/repositories\/|\/@[^\s/]+\/[^\s/]+(?:\/lix\/v1)?/.test(markdown)) {
+      throw new Error(
+        `${file} contains a legacy server locator; use https://host/lix/{uuid}`,
+      );
+    }
   }
 
   console.log(`Validated ${spec.length} server protocol path(s).`);

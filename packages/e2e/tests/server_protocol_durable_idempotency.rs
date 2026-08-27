@@ -172,7 +172,7 @@ async fn open_server() -> (
     let storage = PostCommitUnknownSlateDB::new();
     let server = lix::open_lix()
         .with_storage(storage.clone())
-        .serve()
+        .serve().with_embedded_lix_id()
         .await
         .expect("serve Lix");
     let handshake = request(&server, "GET", "/lix/v1", None, None, None).await;

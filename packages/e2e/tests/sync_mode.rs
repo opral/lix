@@ -1302,7 +1302,7 @@ async fn serve_as(
 ) -> (String, tokio::task::JoinHandle<()>) {
     let protocol = open_lix()
         .with_storage(storage)
-        .serve()
+        .serve().with_embedded_lix_id()
         .await
         .expect("serve authority");
     spawn_http_server(protocol, probe, principal).await
@@ -1322,7 +1322,7 @@ async fn serve_as_with_authority_session(
 ) -> (String, tokio::task::JoinHandle<()>, ProtocolAuthority) {
     let protocol = open_lix()
         .with_storage(storage)
-        .serve()
+        .serve().with_embedded_lix_id()
         .await
         .expect("serve authority");
     let authority = ProtocolAuthority::open(protocol.clone(), principal.clone()).await;
@@ -1347,7 +1347,7 @@ impl ProtocolAuthority {
             .handle(
                 Request::builder()
                     .method("GET")
-                    .uri("/lix/v1")
+                    .uri(format!("/lix/v1/{}", protocol.lix_id()))
                     .body(ServerProtocolBody::empty())
                     .expect("build authority handshake"),
                 context.clone(),
@@ -1384,7 +1384,7 @@ impl ProtocolAuthority {
             .handle(
                 Request::builder()
                     .method("POST")
-                    .uri("/lix/v1/execute")
+                    .uri(format!("/lix/v1/{}/execute", self.protocol.lix_id()))
                     .header("lix-session-id", &self.session_id)
                     .header(
                         "idempotency-key",
@@ -1559,7 +1559,7 @@ where
     let one_way_delay = Duration::from_millis(probe.one_way_delay_millis.load(Ordering::Acquire));
     tokio::time::sleep(one_way_delay).await;
     let path = parts.uri.path();
-    let is_push = parts.method == Method::POST && path == "/lix/v1/sync/push";
+    let is_push = parts.method == Method::POST && path.ends_with("/sync/push");
     if is_push && probe.reject_pushes.load(Ordering::Acquire) {
         return Ok(Response::builder()
             .status(503)
@@ -1570,19 +1570,19 @@ where
             .expect("build push-offline response"));
     }
     let is_delta_pull = parts.method == Method::GET
-        && path == "/lix/v1/sync/pull"
+        && path.ends_with("/sync/pull")
         && parts
             .uri
             .query()
             .is_some_and(|query| query.split('&').any(|part| part.starts_with("after=")));
     let is_snapshot_row_pull = parts.method == Method::GET
-        && path == "/lix/v1/sync/pull"
+        && path.ends_with("/sync/pull")
         && parts.uri.query().is_some_and(|query| {
             query
                 .split('&')
                 .any(|part| part.starts_with("snapshotBranchId="))
         });
-    let is_history_get = parts.method == Method::GET && path == "/lix/v1/sync/history";
+    let is_history_get = parts.method == Method::GET && path.ends_with("/sync/history");
     if is_push {
         probe.pushes.fetch_add(1, Ordering::Release);
     }
@@ -1592,7 +1592,7 @@ where
     if is_snapshot_row_pull {
         probe.snapshot_row_pulls.fetch_add(1, Ordering::Release);
     }
-    if parts.method == Method::GET && path == "/lix/v1/sync/blob" {
+    if parts.method == Method::GET && path.ends_with("/sync/blob") {
         probe.blob_gets.fetch_add(1, Ordering::Release);
     }
     if is_history_get {
@@ -1602,10 +1602,10 @@ where
             .max_concurrent_history_gets
             .fetch_max(active, Ordering::AcqRel);
     }
-    if parts.method == Method::GET && path == "/lix/v1/sync/chunk" {
+    if parts.method == Method::GET && path.ends_with("/sync/chunk") {
         probe.chunk_gets.fetch_add(1, Ordering::Release);
     }
-    if parts.method == Method::PUT && path == "/lix/v1/sync/chunk" {
+    if parts.method == Method::PUT && path.ends_with("/sync/chunk") {
         probe.chunk_puts.fetch_add(1, Ordering::Release);
     }
     let body = body

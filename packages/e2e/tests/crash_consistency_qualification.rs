@@ -1332,14 +1332,14 @@ fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
             let storage = RocksDB::open(&path).expect("open durable round-trip store");
             let server = open_lix()
                 .with_storage(storage.clone())
-                .serve()
+                .serve().with_embedded_lix_id()
                 .await
                 .expect("serve durable round-trip Lix");
             let handshake = server
                 .handle(
                     http::Request::builder()
                         .method("GET")
-                        .uri("/lix/v1")
+                        .uri(format!("/lix/v1/{}", server.lix_id()))
                         .body(ServerProtocolBody::empty())
                         .expect("build durable upload handshake"),
                     ServerProtocolContext::anonymous(),
@@ -1359,7 +1359,10 @@ fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
                 .handle(
                     http::Request::builder()
                         .method("POST")
-                        .uri("/lix/v1/file/upsert?path=%2Fdurable-round-trip.bin")
+                        .uri(format!(
+                            "/lix/v1/{}/file/upsert?path=%2Fdurable-round-trip.bin",
+                            server.lix_id()
+                        ))
                         .header(SESSION_ID_HEADER, session_id)
                         .header(FILE_UPLOAD_ID_HEADER, "e35-durable-round-trip")
                         .header(

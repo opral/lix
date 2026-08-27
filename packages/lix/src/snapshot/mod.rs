@@ -113,7 +113,7 @@ mod tests {
 
         let server = open_lix()
             .with_storage(storage)
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve source Lix");
         let mut bytes = Vec::new();

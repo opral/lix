@@ -36,7 +36,7 @@ Connect to a remote server:
 const lix = await openLix({
   server: {
     mode: "remote",
-    url: "https://example.com/repositories/acme",
+    url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
     headers: () => ({ Authorization: `Bearer ${token}` }),
   },
 });
@@ -53,7 +53,7 @@ const lix = await openLix({
   storage: new OpfsStorage({ name: "atelier" }),
   server: {
     mode: "sync",
-    url: "https://example.com/repositories/acme",
+    url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
     headers: () => ({ Authorization: `Bearer ${token}` }),
   },
 });

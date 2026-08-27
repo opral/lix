@@ -118,8 +118,11 @@ Your host is responsible for three things:
    read tokens, cookies, or certificates. Never derive an `account_id` from an
    unverified header.
 2. **Resolve the Lix** identified by `{lix_id}` without creating an unknown
-   target. Pass the complete `/lix/v1/{lix_id}/...` request to the protocol; it
-   validates the immutable ID before dispatch.
+   target. Pass the complete root `/lix/v1/{lix_id}/...` request to the
+   protocol; it validates the immutable ID before dispatch. If your product is
+   mounted below a deployment prefix, strip that prefix at the reverse-proxy
+   boundary before dispatch. SDK connection locators themselves never contain
+   a deployment prefix.
 3. **Forward the request and the response.** Preserve protocol status codes,
    headers, and body bytes. Keep the repository alive until a server-sent
    events (SSE) body closes.
@@ -131,7 +134,8 @@ anonymous access. Reject bad credentials with `401` before dispatch. Call
 Clients connect exactly as they do to lixray.com. Only the URL changes.
 
 The SDK accepts `https://host/lix/{lix_id}`, derives the versioned API URL,
-opens a session, and reconnects observation streams on its own.
+opens a session, and reconnects observation streams on its own. HTTPS is
+required except for HTTP loopback addresses used in local development.
 
 For the wire format, session behavior, and the OpenAPI document, see
 [Lix Server Protocol](./server-protocol.md).

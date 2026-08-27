@@ -67,9 +67,10 @@ export async function openRemoteLixBinding(
 	) {
 		throw new TypeError("initialActiveBranchId must be a non-empty string");
 	}
+	const protocolLocator = connectionUrl(options.url).toString();
 	await initializeWasm();
 	return openRemote(
-		connectionUrl(options.url).toString(),
+		protocolLocator,
 		remoteFetch,
 		options.headers,
 		clientOptions.initialActiveBranchId,
@@ -84,10 +85,12 @@ function connectionUrl(value: string | URL): URL {
 		throw new TypeError("openLix() remote server url must be an absolute URL");
 	}
 	if (
-		locator.protocol !== "http:" &&
-		locator.protocol !== "https:"
+		locator.protocol !== "https:" &&
+		!(locator.protocol === "http:" && isLoopbackHost(locator.hostname))
 	) {
-		throw new TypeError("openLix() remote server url must use http or https");
+		throw new TypeError(
+			"openLix() remote server url must use https (http is allowed only for loopback development)",
+		);
 	}
 	if (locator.search || locator.hash) {
 		throw new TypeError(
@@ -101,15 +104,23 @@ function connectionUrl(value: string | URL): URL {
 	}
 	locator.pathname = locator.pathname.replace(/\/$/, "");
 	if (
-		!/\/lix\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+		!/^\/lix\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
 			locator.pathname,
 		)
 	) {
 		throw new TypeError(
-			"openLix() remote server url must end with /lix/{uuid}",
+			"openLix() remote server url path must be exactly /lix/{uuid}",
 		);
 	}
 	return locator;
+}
+
+function isLoopbackHost(hostname: string): boolean {
+	return (
+		hostname === "localhost" ||
+		hostname === "[::1]" ||
+		/^127(?:\.[0-9]{1,3}){3}$/.test(hostname)
+	);
 }
 
 function isHeadersInit(value: unknown): value is HeadersInit {

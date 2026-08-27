@@ -452,6 +452,9 @@ paths:
     get:
       operationId: exportSnapshot
       description: Streams a deterministic complete point-in-time copy of the Lix.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
       responses:
         "200":
           description: Canonical Lix snapshot stream.
@@ -472,7 +475,10 @@ components:
       in: path
       required: true
       description: Immutable canonical Lix UUID.
-      schema: { type: string, format: uuid }
+      schema:
+        type: string
+        format: uuid
+        pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
     SessionId:
       name: Lix-Session-Id
       in: header
@@ -539,7 +545,7 @@ components:
       type: object
       required: [protocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
-        protocolVersion: { type: integer, const: 4 }
+        protocolVersion: { type: integer, const: 5 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }

@@ -35,7 +35,7 @@ async fn same_base_server_protocol_plugin_writes_resolve_and_converge() {
     setup.close().await.expect("close setup Lix");
     let protocol = open_lix()
         .with_storage(storage.clone())
-        .serve()
+        .serve().with_embedded_lix_id()
         .await
         .expect("serve Lix");
     let sessions = [
@@ -188,7 +188,9 @@ async fn request(
     transaction: Option<&str>,
     body: Option<JsonValue>,
 ) -> ServerProtocolResponse {
-    let mut builder = Request::builder().method(method).uri(path);
+    let suffix = path.strip_prefix("/lix/v1").expect("protocol test path");
+    let targeted_path = format!("/lix/v1/{}{}", protocol.lix_id(), suffix);
+    let mut builder = Request::builder().method(method).uri(targeted_path);
     if let Some(session) = session {
         builder = builder.header(SESSION_ID_HEADER, session);
     }

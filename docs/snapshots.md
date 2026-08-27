@@ -189,6 +189,8 @@ Accept: application/vnd.lix.snapshot
 The response is a backpressured `application/vnd.lix.snapshot` stream with
 `Cache-Control: no-store, no-transform`. Snapshot export requires an
 authenticated host principal even when selected files from the Lix are public.
+`lix.exportSnapshot()` remains a local-handle API; non-SDK backup clients call
+this authenticated REST endpoint and stream the body to their destination.
 The remote protocol deliberately has no snapshot upload or import route. Restore
 the artifact into a fresh local or host-provisioned destination through the
 storage APIs described above.

@@ -961,10 +961,12 @@ fn normalize_protocol_base_url(value: &str) -> Result<String, LixError> {
             "openLix() remote server url must be an absolute URL",
         )
     })?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+    if parsed.scheme() != "https"
+        && !(parsed.scheme() == "http" && is_loopback_host(&parsed))
+    {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
-            "openLix() remote server url must use http or https",
+            "openLix() remote server url must use https (http is allowed only for loopback development)",
         ));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
@@ -980,10 +982,10 @@ fn normalize_protocol_base_url(value: &str) -> Result<String, LixError> {
         ));
     }
     let locator_path = parsed.path().trim_end_matches('/');
-    let Some((service_path, lix_id)) = locator_path.rsplit_once('/') else {
+    let Some(lix_id) = locator_path.strip_prefix("/lix/") else {
         return Err(invalid_lix_locator());
     };
-    if !service_path.ends_with("/lix") {
+    if lix_id.contains('/') {
         return Err(invalid_lix_locator());
     }
     let canonical_id = uuid::Uuid::parse_str(lix_id)
@@ -992,17 +994,23 @@ fn normalize_protocol_base_url(value: &str) -> Result<String, LixError> {
     if canonical_id.as_deref() != Some(lix_id) {
         return Err(invalid_lix_locator());
     }
-    let deployment_prefix = service_path
-        .strip_suffix("/lix")
-        .expect("validated Lix locator service path");
-    parsed.set_path(&format!("{deployment_prefix}/lix/v1/{lix_id}/"));
+    parsed.set_path(&format!("/lix/v1/{lix_id}/"));
     Ok(parsed.to_string())
+}
+
+fn is_loopback_host(url: &url::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
 }
 
 fn invalid_lix_locator() -> LixError {
     LixError::new(
         LixError::CODE_INVALID_PARAM,
-        "openLix() remote server url must end with /lix/{uuid}",
+        "openLix() remote server url path must be exactly /lix/{uuid}",
     )
 }
 

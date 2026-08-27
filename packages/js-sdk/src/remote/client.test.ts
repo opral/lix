@@ -3,6 +3,21 @@ import { gunzipSync } from "fflate";
 import { openLix } from "../index.js";
 import { openRemoteLixBinding } from "./client.js";
 
+test.each([
+	"http://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+	"https://example.test/prefix/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+	"https://user@example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+	"https://example.test/lix/01936F4E-7B6C-7C3D-8F9A-123456789ABC",
+])("remote mode rejects unsafe or non-root locator %s", async (url) => {
+	await expect(
+		openRemoteLixBinding({
+			mode: "remote",
+			url,
+			fetch: vi.fn(),
+		}),
+	).rejects.toBeInstanceOf(TypeError);
+});
+
 test("Lix Server Protocol handshake requests a restored initial active branch", async () => {
 	const accountId = "01920000-0000-7000-8000-000000000601";
 	const requests: Request[] = [];

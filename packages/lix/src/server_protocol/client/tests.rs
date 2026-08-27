@@ -20,10 +20,10 @@ use super::{ProtocolExecuteOptions, open_protocol_client};
 fn connection_locator_maps_to_the_targeted_protocol_root() {
     assert_eq!(
         super::normalize_protocol_base_url(
-            "https://example.test/prefix/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc/"
+            "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc/"
         )
         .expect("canonical locator"),
-        "https://example.test/prefix/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/"
+        "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/"
     );
 }
 
@@ -33,6 +33,8 @@ fn connection_locator_rejects_raw_protocol_and_noncanonical_ids() {
         "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc",
         "https://example.test/lix/01936F4E-7B6C-7C3D-8F9A-123456789ABC",
         "https://example.test/lix/not-a-uuid",
+        "https://example.test/prefix/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        "http://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
         "https://user@example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
         "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc?token=secret",
     ] {
@@ -41,6 +43,10 @@ fn connection_locator_rejects_raw_protocol_and_noncanonical_ids() {
             "accepted invalid locator: {invalid}"
         );
     }
+    assert!(super::normalize_protocol_base_url(
+        "http://127.0.0.1:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+    )
+    .is_ok());
 }
 
 #[derive(Clone, Default)]
