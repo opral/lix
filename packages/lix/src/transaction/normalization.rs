@@ -52,6 +52,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
     schema_catalog: &mut TransactionCatalog,
     functions: FunctionProviderHandle,
     default_timestamp: &mut Option<crate::common::LixTimestamp>,
+    transaction_base_commit_id: Option<&str>,
 ) -> Result<NormalizedRowFacts, LixError> {
     populate_registered_schema_snapshot(rows, row_index)?;
     let row = rows.row(row_index);
@@ -61,12 +62,12 @@ pub(crate) fn normalize_raw_write_row_in_place(
     let Some((schema_plan_id, schema_plan)) =
         schema_catalog.snapshot().plan_for_key(&row.schema_key)
     else {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            format!(
-                "schema '{}' is not visible to this transaction",
-                row.schema_key
-            ),
+        return Err(LixError::schema_not_visible(
+            row.schema_key.as_str(),
+            row.commit_id,
+            transaction_base_commit_id,
+            row.schema_scope_branch_id(),
+            row.untracked,
         ));
     };
 
@@ -105,9 +106,15 @@ pub(crate) fn normalize_raw_write_row_in_place(
         }
         if typed.boundary_validation_certified() {
             let Some(staged_row_pk) = rows.row(row_index).row_pk else {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
+                return Err(LixError::internal_invariant(
                     "boundary-certified typed row lost its durable primary key before transaction normalization",
+                    serde_json::json!({
+                        "schema_key": schema_key,
+                        "commit_id": rows.row(row_index).commit_id,
+                        "file_id": rows.row(row_index).file_id,
+                        "scope": format!("branch:{}", rows.row(row_index).schema_scope_branch_id()),
+                        "durability": if rows.row(row_index).untracked { "untracked" } else { "tracked" },
+                    }),
                 ));
             };
             if !staged_row_pk.matches_schema_values(&typed.row_pk) {
@@ -247,9 +254,15 @@ pub(crate) fn normalize_raw_write_row_in_place(
         && row.schema_key != REGISTERED_SCHEMA_KEY
     {
         if row.row_pk.is_none() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
+            return Err(LixError::internal_invariant(
                 "certified replacement row is missing its proven row identity",
+                serde_json::json!({
+                    "schema_key": row.schema_key,
+                    "commit_id": row.commit_id,
+                    "file_id": row.file_id,
+                    "scope": format!("branch:{}", row.schema_scope_branch_id()),
+                    "durability": if row.untracked { "untracked" } else { "tracked" },
+                }),
             ));
         }
         let typed =
@@ -497,9 +510,14 @@ fn ensure_internal_control_schema(
     }
     let schema = crate::schema::seed_schema_definition(&row.schema_key)
         .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
+            LixError::internal_invariant(
                 "compile-time internal control schema is missing",
+                serde_json::json!({
+                    "schema_key": row.schema_key,
+                    "commit_id": row.commit_id,
+                    "scope": format!("branch:{}", row.schema_scope_branch_id()),
+                    "durability": if row.untracked { "untracked" } else { "tracked" },
+                }),
             )
         })?
         .clone();
@@ -696,6 +714,46 @@ mod tests {
     use crate::schema::seed_schema_definition;
 
     #[test]
+    fn missing_schema_reports_entity_commit_and_transaction_scope() {
+        let mut catalog = catalog_with(Vec::new());
+        let mut rows = RawWriteBatch::with_capacity(1);
+        rows.push(TransactionWriteRow {
+            schema_key: "lix_file_descriptor".into(),
+            commit_id: Some("01a04058-entity".to_string()),
+            branch_id: "main".into(),
+            global: false,
+            ..base_stage_row()
+        });
+        let mut default_timestamp = None;
+
+        let error = normalize_raw_write_row_in_place(
+            &mut rows,
+            0,
+            &mut catalog,
+            functions(),
+            &mut default_timestamp,
+            Some("01a04058-base"),
+        )
+        .expect_err("missing schema should fail normalization");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({
+                "schema_key": "lix_file_descriptor",
+                "entity_commit_id": "01a04058-entity",
+                "base_commit_id": "01a04058-base",
+                "scope": "branch:main",
+                "durability": "tracked",
+            }))
+        );
+        let hint = error.hint().expect("visibility error should be actionable");
+        assert!(hint.contains("01a04058-entity"), "{hint}");
+        assert!(hint.contains("01a04058-base"), "{hint}");
+        assert!(hint.contains("not an ancestor"), "{hint}");
+    }
+
+    #[test]
     fn normalization_derives_row_pk_from_primary_key() {
         let mut catalog = catalog_with(vec![schema_with_default_id()]);
         let row = TransactionWriteRow {
@@ -879,6 +937,7 @@ mod tests {
             &mut catalog,
             functions(),
             &mut default_timestamp,
+            None,
         )
         .expect_err("typed envelope identity mismatch must fail");
 
@@ -929,6 +988,7 @@ mod tests {
             &mut catalog,
             functions(),
             &mut default_timestamp,
+            None,
         )
         .expect("typed defaults normalize");
 
@@ -1283,7 +1343,14 @@ mod tests {
         let mut rows = RawWriteBatch::with_capacity(1);
         rows.push(row);
         let mut default_timestamp = None;
-        normalize_raw_write_row_in_place(&mut rows, 0, catalog, functions, &mut default_timestamp)?;
+        normalize_raw_write_row_in_place(
+            &mut rows,
+            0,
+            catalog,
+            functions,
+            &mut default_timestamp,
+            None,
+        )?;
         Ok(rows.into_rows().pop().expect("single normalized test row"))
     }
 

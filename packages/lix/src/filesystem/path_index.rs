@@ -879,9 +879,16 @@ impl FilesystemPathIndex {
         kind: FilesystemPathKind,
     ) -> Result<FilesystemPathEntry, LixError> {
         let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
+            LixError::internal_invariant(
                 "descriptor delta has no snapshot",
+                serde_json::json!({
+                    "schema_key": row.schema_key,
+                    "change_id": row.change_id.map(|value| value.to_string()),
+                    "commit_id": row.commit_id.map(|value| value.to_string()),
+                    "descriptor_id": key.descriptor_id(),
+                    "file_id": key.file_id(),
+                    "scope": format!("branch:{}", key.branch_id()),
+                }),
             )
         })?;
         let (parent_id, name) = match kind {

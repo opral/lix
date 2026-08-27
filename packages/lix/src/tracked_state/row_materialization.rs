@@ -458,11 +458,17 @@ where
         };
         for ((key, change_id, updated_at), record) in expected.into_iter().zip(loaded) {
             let record = record.or_else(|| snapshot_records.remove(&change_id)).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
+                LixError::internal_invariant(
                     format!(
                         "tracked-state row references change '{change_id}' that is missing from owning commit '{commit_id}'"
                     ),
+                    serde_json::json!({
+                        "change_id": change_id.to_string(),
+                        "commit_id": commit_id.to_string(),
+                        "schema_key": key.schema_key,
+                        "row_pk": key.row_pk.as_typed_json_array_value().ok(),
+                        "file_id": key.file_id,
+                    }),
                 )
             })?;
             #[cfg(feature = "storage-benches")]
@@ -474,11 +480,17 @@ where
                 || record.snapshot.is_none()
                 || record.created_at != updated_at
             {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
+                return Err(LixError::internal_invariant(
                     format!(
                         "tracked-state row '{change_id}' does not match its authoritative payload in commit '{commit_id}'"
                     ),
+                    serde_json::json!({
+                        "change_id": change_id.to_string(),
+                        "commit_id": commit_id.to_string(),
+                        "schema_key": key.schema_key,
+                        "row_pk": key.row_pk.as_typed_json_array_value().ok(),
+                        "file_id": key.file_id,
+                    }),
                 ));
             }
             records.push(record);
@@ -545,6 +557,7 @@ where
                     row_pk: &key.row_pk,
                 },
                 value.change_id,
+                value.commit_id,
             )?
         };
         let ordinal = rows.rows.len();
@@ -594,7 +607,7 @@ where
         let (snapshot_content, metadata, snapshot) = if value.deleted {
             (None, None, None)
         } else {
-            shared_payload_fields(&payloads, key, value.change_id)?
+            shared_payload_fields(&payloads, key, value.change_id, value.commit_id)?
         };
         let ordinal = rows.rows.len();
         rows.push_ref(key, value, snapshot_content, metadata);
@@ -612,6 +625,7 @@ fn shared_payload_fields(
     payloads: &HashMap<ChangeId, MaterializedChangePayload>,
     key: TrackedStateKeyRef<'_>,
     change_id: ChangeId,
+    commit_id: CommitId,
 ) -> Result<
     (
         Option<SharedStr>,
@@ -621,11 +635,17 @@ fn shared_payload_fields(
     LixError,
 > {
     let payload = payloads.get(&change_id).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
+        LixError::internal_invariant(
             format!(
                 "tracked-state row references ChangeRecord '{change_id}' that was not materialized"
             ),
+            serde_json::json!({
+                "change_id": change_id.to_string(),
+                "commit_id": commit_id.to_string(),
+                "schema_key": key.schema_key,
+                "row_pk": key.row_pk.as_typed_json_array_value().ok(),
+                "file_id": key.file_id,
+            }),
         )
     })?;
     if let Some(identity) = payload.identity.as_ref()
@@ -633,11 +653,17 @@ fn shared_payload_fields(
             || identity.row_pk != *key.row_pk
             || identity.file_id.as_deref() != key.file_id)
     {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
+        return Err(LixError::internal_invariant(
             format!(
                 "tracked-state row identity does not match referenced ChangeRecord '{change_id}'"
             ),
+            serde_json::json!({
+                "change_id": change_id.to_string(),
+                "commit_id": commit_id.to_string(),
+                "schema_key": key.schema_key,
+                "row_pk": key.row_pk.as_typed_json_array_value().ok(),
+                "file_id": key.file_id,
+            }),
         ));
     }
     Ok((
@@ -1208,17 +1234,18 @@ mod tests {
     #[test]
     fn repeated_payload_uses_share_the_materialized_json_buffer() {
         let (change_id, key, payloads, source) = fixture("message");
+        let commit_id = CommitId::for_test_label("payload-owner");
 
         let key_ref = TrackedStateKeyRef {
             schema_key: key.schema_key.as_str(),
             file_id: key.file_id.as_deref(),
             row_pk: &key.row_pk,
         };
-        let first = shared_payload_fields(&payloads, key_ref, change_id)
+        let first = shared_payload_fields(&payloads, key_ref, change_id, commit_id)
             .expect("first payload use")
             .0
             .expect("snapshot");
-        let second = shared_payload_fields(&payloads, key_ref, change_id)
+        let second = shared_payload_fields(&payloads, key_ref, change_id, commit_id)
             .expect("second payload use")
             .0
             .expect("snapshot");
@@ -1230,6 +1257,7 @@ mod tests {
     #[test]
     fn payload_identity_mismatch_is_rejected() {
         let (change_id, key, payloads, _) = fixture("wrong-schema");
+        let commit_id = CommitId::for_test_label("payload-owner");
 
         let error = shared_payload_fields(
             &payloads,
@@ -1239,12 +1267,23 @@ mod tests {
                 row_pk: &key.row_pk,
             },
             change_id,
+            commit_id,
         )
         .expect_err("mismatched identity must fail");
         assert!(
             error
                 .to_string()
                 .contains("identity does not match referenced ChangeRecord")
+        );
+        let details = error.details.expect("invariant should retain entity IDs");
+        assert_eq!(details["change_id"], change_id.to_string());
+        assert_eq!(details["commit_id"], commit_id.to_string());
+        assert_eq!(details["schema_key"], key.schema_key);
+        assert_eq!(
+            details["row_pk"],
+            key.row_pk
+                .as_typed_json_array_value()
+                .expect("test row PK should encode")
         );
     }
 }

@@ -455,12 +455,15 @@ fn validate_commit_point_identity(
     if record.commit_id == requested_commit_id {
         return Ok(());
     }
-    Err(LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
+    Err(LixError::internal_invariant(
         format!(
             "commit point lookup for {requested_commit_id} decoded record {}",
             record.commit_id
         ),
+        serde_json::json!({
+            "requested_commit_id": requested_commit_id.to_string(),
+            "commit_id": record.commit_id.to_string(),
+        }),
     ))
 }
 

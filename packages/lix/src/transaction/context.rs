@@ -6713,6 +6713,21 @@ where
 
     async fn prepare_transaction_rows_with_homogeneous(
         &mut self,
+        rows: RawWriteBatch,
+        allow_homogeneous: bool,
+    ) -> Result<PreparedStateBatch, LixError> {
+        let opening_read = self.opening_read();
+        match self
+            .prepare_transaction_rows_with_homogeneous_inner(rows, allow_homogeneous)
+            .await
+        {
+            Ok(prepared) => Ok(prepared),
+            Err(error) => Err(Self::enrich_schema_visibility_error(opening_read, error).await),
+        }
+    }
+
+    async fn prepare_transaction_rows_with_homogeneous_inner(
+        &mut self,
         mut rows: RawWriteBatch,
         allow_homogeneous: bool,
     ) -> Result<PreparedStateBatch, LixError> {
@@ -6780,6 +6795,7 @@ where
                     catalog,
                     functions.clone(),
                     &mut default_timestamp,
+                    None,
                 )?;
                 scalar_facts.push(plan_prepared_row_scalars(
                     rows.row(index),
@@ -6873,6 +6889,7 @@ where
                     catalog,
                     functions.clone(),
                     &mut default_timestamp,
+                    None,
                 )?;
                 normalized_facts[index] = Some(normalized);
             }
@@ -6919,6 +6936,115 @@ where
             .record_transition_counters(typed_validation_counters);
         self.current_timestamp = default_timestamp;
         Ok(prepared_rows)
+    }
+
+    async fn enrich_schema_visibility_error(
+        opening_read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+        mut error: LixError,
+    ) -> LixError {
+        if error.code != LixError::CODE_SCHEMA_DEFINITION {
+            return error;
+        }
+        let Some(details) = error.details.as_mut().and_then(JsonValue::as_object_mut) else {
+            return error;
+        };
+        let Some(schema_key) = details
+            .get("schema_key")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned)
+        else {
+            return error;
+        };
+        let scope = details
+            .get("scope")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| "this transaction's scope".to_string());
+        let Some(branch_id) = scope.strip_prefix("branch:") else {
+            return error;
+        };
+        let base_commit_id = match BranchHeadControlContext::new()
+            .reader(opening_read.clone())
+            .load(branch_id)
+            .await
+        {
+            Ok(Some(control)) => Some(control.head_commit_id),
+            Ok(None) | Err(_) => None,
+        };
+        if let Some(base_commit_id) = base_commit_id {
+            details.insert(
+                "base_commit_id".to_string(),
+                JsonValue::String(base_commit_id.to_string()),
+            );
+        }
+        let Some(entity_commit_id) = details
+            .get("entity_commit_id")
+            .and_then(JsonValue::as_str)
+            .or_else(|| details.get("base_commit_id").and_then(JsonValue::as_str))
+            .and_then(|value| CommitId::parse_lix(value, "schema visibility entity commit").ok())
+        else {
+            return error;
+        };
+        let mut tracked_state = TrackedStateContext::new().reader(opening_read.clone());
+        let registrations = match tracked_state
+            .load_projected_batch_at_commit(
+                &entity_commit_id.to_string(),
+                &[TrackedStateKey {
+                    schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+                    file_id: None,
+                    row_pk: RowPk::single(schema_key.as_str()),
+                }],
+                &ChangeRecordProjection::identity_only(),
+            )
+            .await
+        {
+            Ok(registrations) => registrations,
+            Err(_) => return error,
+        };
+        let Some(registration_commit_id) = registrations.row(0).map(|row| row.commit_id()) else {
+            return error;
+        };
+        details.insert(
+            "commit_id".to_string(),
+            JsonValue::String(registration_commit_id.to_string()),
+        );
+        let Some(base_commit_id) = base_commit_id else {
+            error.hint = Some(format!(
+                "Schema '{schema_key}' is registered at commit {registration_commit_id}, but it is not visible in {scope}. This usually indicates that the schema was registered in a different branch or durability scope."
+            ));
+            return error;
+        };
+        let mut graph = CommitGraphContext::new().reader(opening_read);
+        const DIAGNOSTIC_ANCESTRY_LIMIT: usize = 1_024;
+        let registration_is_ancestor = match graph
+            .reachable_nodes_limited(&base_commit_id, DIAGNOSTIC_ANCESTRY_LIMIT)
+            .await
+        {
+            Ok(nodes)
+                if nodes
+                    .iter()
+                    .any(|node| node.commit.commit_id == registration_commit_id) =>
+            {
+                Some(true)
+            }
+            Ok(nodes) if nodes.len() < DIAGNOSTIC_ANCESTRY_LIMIT => Some(false),
+            Ok(_) => None,
+            Err(_) => None,
+        };
+        error.hint = Some(if registration_is_ancestor == Some(true) {
+            format!(
+                "Schema '{schema_key}' is registered at commit {registration_commit_id}, which is an ancestor of this transaction's base commit {base_commit_id}, but it is absent from {scope}'s transaction catalog. This can indicate a later schema removal, a durability-scope mismatch, or an internal catalog inconsistency."
+            )
+        } else if registration_is_ancestor == Some(false) {
+            format!(
+                "Schema '{schema_key}' is registered at commit {registration_commit_id}, but that commit is not an ancestor of this transaction's base commit {base_commit_id}. This usually indicates that an entity from another branch was staged without first merging or rebasing its schema registration into {scope}."
+            )
+        } else {
+            format!(
+                "Schema '{schema_key}' is registered at commit {registration_commit_id}, but its ancestry relative to this transaction's base commit {base_commit_id} could not be verified. Retry the transaction; if the error persists, inspect the commit graph and {scope}'s schema registration."
+            )
+        });
+        error
     }
 
     /// Validates the drained write set and, on the way through, hands the
@@ -15353,6 +15479,182 @@ fallback={large_fallback} decoded={large_decoded}"
                 .contains("schema 'missing_schema' is not visible"),
             "error should explain missing schema visibility: {error:?}"
         );
+        let details = error
+            .details
+            .as_ref()
+            .expect("visibility error should be structured");
+        assert_eq!(details["schema_key"], "missing_schema");
+        assert_eq!(details["scope"], format!("branch:{GLOBAL_BRANCH_ID}"));
+        assert_eq!(
+            details["base_commit_id"],
+            CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID).to_string()
+        );
+        assert!(details.get("commit_id").is_none());
+        assert!(error.hint().is_some(), "visibility error should include a hint");
+    }
+
+    #[tokio::test]
+    async fn schema_visibility_enrichment_resolves_registration_commit() {
+        let storage = Memory::new();
+        let (_hot_state, _binary_cas, _branch_ref, _runtime_functions, transaction) =
+            open_test_transaction(&storage).await;
+        let fixture_commit_id = CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID);
+        let error = LixError::schema_not_visible(
+            "lix_file_descriptor",
+            Some(fixture_commit_id.to_string()),
+            None::<String>,
+            GLOBAL_BRANCH_ID,
+            false,
+        );
+
+        let error = Transaction::<Memory>::enrich_schema_visibility_error(
+            transaction.opening_read(),
+            error,
+        )
+        .await;
+
+        let details = error
+            .details
+            .as_ref()
+            .expect("enriched visibility error should be structured");
+        assert_eq!(details["schema_key"], "lix_file_descriptor");
+        assert_eq!(details["commit_id"], fixture_commit_id.to_string());
+        assert_eq!(details["entity_commit_id"], fixture_commit_id.to_string());
+        assert_eq!(details["base_commit_id"], fixture_commit_id.to_string());
+        assert_eq!(details["scope"], format!("branch:{GLOBAL_BRANCH_ID}"));
+        let hint = error.hint().expect("enriched error should include a hint");
+        assert!(hint.contains("is registered at commit"), "{hint}");
+        assert!(hint.contains(&fixture_commit_id.to_string()), "{hint}");
+    }
+
+    #[tokio::test]
+    async fn stage_rows_reports_divergent_schema_registration_commit() {
+        const BASE_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000101";
+        const SCHEMA_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000102";
+        const BASE_COMMIT_ID: &str = "01920000-0000-7000-8000-000000000103";
+        const SCHEMA_REGISTRATION_COMMIT_ID: &str = "01920000-0000-7000-8000-000000000104";
+        const ENTITY_COMMIT_ID: &str = "01920000-0000-7000-8000-000000000105";
+        const SCHEMA_KEY: &str = "divergent_schema";
+
+        let storage = Memory::new();
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        seed_visible_schema_rows_for_branch(
+            storage_adapter.clone(),
+            BASE_BRANCH_ID,
+            BASE_COMMIT_ID,
+        )
+        .await;
+        let custom_schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": SCHEMA_KEY,
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"]
+        });
+        let schema_registration = crate::tracked_state::MaterializedTrackedStateRow {
+            row_pk: crate::schema::registered_schema_row_pk(SCHEMA_KEY)
+                .expect("registered schema identity should derive"),
+            schema_key: "lix_registered_schema".to_string(),
+            file_id: None,
+            snapshot_content: Some(
+                json!({ "schema_key": SCHEMA_KEY, "value": custom_schema })
+                    .to_string()
+                    .into(),
+            ),
+            decoded_snapshot: None,
+            metadata: None,
+            deleted: false,
+            created_at: "1970-01-01T00:00:00.000Z".to_string(),
+            updated_at: "1970-01-01T00:00:00.000Z".to_string(),
+            change_id: ChangeId::for_test_label("divergent-schema-registration"),
+            commit_id: CommitId::for_test_label(SCHEMA_REGISTRATION_COMMIT_ID),
+        };
+        crate::test_support::seed_branch_head_with_rows(
+            storage_adapter.clone(),
+            SCHEMA_BRANCH_ID,
+            SCHEMA_REGISTRATION_COMMIT_ID,
+            std::slice::from_ref(&schema_registration),
+        )
+        .await;
+        let mut entity_read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("entity commit read should open");
+        let mut entity_writes = StorageWriteSet::new();
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut entity_read,
+            &mut entity_writes,
+            &TrackedStateContext::new(),
+            ENTITY_COMMIT_ID,
+            Some(SCHEMA_REGISTRATION_COMMIT_ID),
+            &[],
+        )
+        .await
+        .expect("entity commit should retain its parent schema registration");
+        storage_adapter
+            .commit_write_set(
+                entity_writes,
+                StorageWriteOptions::default(),
+            )
+            .await
+            .expect("entity commit should persist");
+
+        let opened = open_transaction(
+            &SessionBranch::new(BASE_BRANCH_ID.to_string()),
+            crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            storage_adapter,
+            Arc::new(hot_state_context()),
+            Arc::new(TrackedStateContext::new()),
+            Arc::new(BinaryCasContext::new()),
+            PluginRuntimeHost::new(Arc::new(crate::plugin::runtime::UnsupportedWasmRuntime)),
+            Arc::new(BranchContext::new()),
+            Arc::new(CatalogContext::new()),
+            Arc::new(SqlPlanningCache::default()),
+            SessionFileViews::default(),
+        )
+        .await
+        .expect("base-branch transaction should open");
+        let mut transaction = opened.transaction;
+        let mut row = key_value_stage_row("divergent-row", "value", false);
+        row.schema_key = SCHEMA_KEY.into();
+        row.snapshot = Some(TransactionJson::from_value_for_test(
+            json!({ "id": "divergent-row" }),
+        ));
+        row.global = false;
+        row.branch_id = BASE_BRANCH_ID.into();
+        row.commit_id = Some(CommitId::for_test_label(ENTITY_COMMIT_ID).to_string());
+
+        let error = transaction
+            .stage_rows(raw_write_rows(vec![row]))
+            .await
+            .expect_err("a schema registered only on a divergent branch must not be visible");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        let details = error
+            .details
+            .as_ref()
+            .expect("divergent visibility error should be structured");
+        assert_eq!(details["schema_key"], SCHEMA_KEY);
+        assert_eq!(details["scope"], format!("branch:{BASE_BRANCH_ID}"));
+        assert_eq!(
+            details["commit_id"],
+            CommitId::for_test_label(SCHEMA_REGISTRATION_COMMIT_ID).to_string()
+        );
+        assert_eq!(
+            details["entity_commit_id"],
+            CommitId::for_test_label(ENTITY_COMMIT_ID).to_string()
+        );
+        assert_eq!(
+            details["base_commit_id"],
+            CommitId::for_test_label(BASE_COMMIT_ID).to_string()
+        );
+        let hint = error.hint().expect("divergent visibility error should have a hint");
+        assert!(hint.contains("not an ancestor"), "{hint}");
+        assert!(
+            hint.contains(
+                &CommitId::for_test_label(SCHEMA_REGISTRATION_COMMIT_ID).to_string()
+            ),
+            "{hint}"
+        );
     }
 
     #[tokio::test]
@@ -15731,8 +16033,10 @@ fallback={large_fallback} decoded={large_decoded}"
         )
     }
 
-    async fn seed_visible_schema_rows(storage: StorageAdapter) {
-        let rows = crate::schema::seed_schema_definitions()
+    fn visible_schema_fixture_rows(
+        commit_id: &str,
+    ) -> Vec<crate::tracked_state::MaterializedTrackedStateRow> {
+        crate::schema::seed_schema_definitions()
             .into_iter()
             .map(|schema| {
                 let key = crate::schema::schema_key_from_definition(schema)
@@ -15757,15 +16061,32 @@ fallback={large_fallback} decoded={large_decoded}"
                         "schema-fixture-{}",
                         key.schema_key
                     )),
-                    commit_id: CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
+                    commit_id: CommitId::for_test_label(commit_id),
                 }
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    async fn seed_visible_schema_rows_for_branch(
+        storage: StorageAdapter,
+        branch_id: &str,
+        commit_id: &str,
+    ) {
+        let rows = visible_schema_fixture_rows(commit_id);
         crate::test_support::seed_branch_head_with_rows(
+            storage,
+            branch_id,
+            commit_id,
+            &rows,
+        )
+        .await;
+    }
+
+    async fn seed_visible_schema_rows(storage: StorageAdapter) {
+        seed_visible_schema_rows_for_branch(
             storage,
             GLOBAL_BRANCH_ID,
             SCHEMA_FIXTURE_COMMIT_ID,
-            &rows,
         )
         .await;
     }
