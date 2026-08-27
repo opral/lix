@@ -2387,14 +2387,7 @@ fn required_session_id(headers: &HeaderMap) -> Result<String, ApiError> {
 fn require_sync_protocol_version(headers: &HeaderMap) -> Result<(), ApiError> {
     let mut values = headers.get_all(SYNC_PROTOCOL_VERSION_HEADER).iter();
     let Some(first) = values.next() else {
-        // Protocol v1 predates the request header. Treat omission as v1 so a
-        // v1 server can be deployed before browser/client updates. A future
-        // server version will reject this implicit v1 before transfer.
-        return if crate::sync::SYNC_PROTOCOL_VERSION == 1 {
-            Ok(())
-        } else {
-            Err(crate::sync::sync_client_protocol_mismatch(Some(1)).into())
-        };
+        return Err(crate::sync::sync_client_protocol_mismatch(None).into());
     };
     let version = first
         .to_str()
@@ -8026,11 +8019,15 @@ mod tests {
                 Request::builder()
                     .uri("/lix/v1/sync/pull")
                     .body(Body::empty())
-                    .expect("legacy v1 sync request"),
+                    .expect("headerless sync request"),
             )
             .await
-            .expect("legacy v1 sync response");
-        assert_ne!(missing.status(), StatusCode::CONFLICT);
+            .expect("headerless sync response");
+        assert_eq!(missing.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error_code(missing).await,
+            crate::sync::SYNC_PROTOCOL_MISMATCH_CODE
+        );
     }
 
     #[test]
