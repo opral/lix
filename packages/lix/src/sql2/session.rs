@@ -349,10 +349,7 @@ where
     let mut commit_graph = context.commit_graph();
     loop {
         let node = commit_graph.load_node(&current).await?.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("cannot resolve repository root: commit '{current}' is missing"),
-            )
+            crate::commit_graph::missing_commit_graph_error(&current)
         })?;
         let Some(first_parent) = node.parent_commit_ids.first().copied() else {
             return Ok(Some(node.commit_id.to_string()));
