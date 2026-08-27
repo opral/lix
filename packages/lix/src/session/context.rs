@@ -546,6 +546,10 @@ where
                     &outcome.storage_stats,
                     outcome.commit_cohort_id.as_deref(),
                 );
+                if let Some(checkpoint_sequence) = outcome.checkpoint_gc_sequence {
+                    self.schedule_checkpoint_gc_after_commit(checkpoint_sequence)
+                        .await?;
+                }
                 if self.branch.get()?.as_str() != GLOBAL_BRANCH_ID {
                     self.base_refresh_generation.store(
                         self.observe_invalidation.generation(),

@@ -1,8 +1,7 @@
 use crate::LixError;
-use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
-use crate::checkpoint::checkpoint_stage_row;
 use crate::gc::CheckpointGcState;
-use crate::storage_adapter::Storage;
+use crate::gc::load_checkpoint_gc_state;
+use crate::storage_adapter::{SharedStorageAdapterRead, Storage, StorageReadOptions};
 use crate::telemetry::{
     ActiveTelemetrySpan, CHECKPOINT_CREATE, Status, TelemetryAttribute,
 };
@@ -10,13 +9,12 @@ use crate::telemetry::{
 use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRow};
 #[cfg(test)]
 use crate::transaction::StagedCommitChangeBatchBuilder;
-use crate::transaction_types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 
 use super::context::SessionContext;
 
 /// Receipt returned after compacting the active working interval.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateCheckpointReceipt {
+pub(crate) struct CreateCheckpointReceipt {
     /// Commit containing the branch state captured by this checkpoint.
     pub commit_id: String,
     /// Logical change that published the repository-global checkpoint row.
@@ -37,13 +35,6 @@ const RECLAIM_FAILURE_BACKOFF_CAP: u32 = 10;
 /// full-sweep positions sublinear.
 const RECLAIM_MAX_STALENESS: u64 = 64;
 
-struct CreateCheckpointOutcome {
-    receipt: CreateCheckpointReceipt,
-    parent_commit_id: String,
-    gc_due: bool,
-    checkpoint_sequence: u64,
-}
-
 impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -54,87 +45,48 @@ where
     /// state while parenting the prior checkpoint. Publication never reads or
     /// copies interval members. Scale-dependent physical reclamation is
     /// maintenance work and cannot extend foreground checkpoint latency.
-    pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
+    pub(crate) async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
         let span = self.telemetry.as_ref().and_then(|sink| {
             ActiveTelemetrySpan::start_if_enabled(sink, &CHECKPOINT_CREATE, Vec::new())
         });
-        let operation = self.with_write_transaction_lending(async move |transaction| {
-            let branch_id = transaction.active_branch_id().to_string();
-            if branch_id == crate::GLOBAL_BRANCH_ID {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "the repository-global branch cannot be checkpointed",
-                ));
-            }
-            let (previous_recovery, mut gc_state) =
-                transaction.checkpoint_publication_state(&branch_id).await?;
-            let head_commit_id = {
-                let reader = transaction.branch_ref_reader().await?;
-                BranchLifecycle::new(&reader)
-                    .require_existing_commit_id(
-                        &branch_id,
-                        BranchOperation::CreateCheckpoint,
-                        BranchReferenceRole::Target,
-                    )
-                    .await?
-            };
-            let previous_checkpoint_commit_id = transaction
-                .checkpoint_commit_id_at_head(&branch_id, head_commit_id)
+        let operation = async {
+            let checkpoint = self
+                .execute(
+                    "SELECT commit_id FROM lix_create_checkpoint()",
+                    &[],
+                )
                 .await?;
-            let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
-            // The checkpoint commit severs the ordinary first-parent interval.
-            // Commit materialization publishes a complete-state fence that
-            // structurally shares the captured head root, so publication does
-            // not enumerate or copy interval members.
-            gc_state.checkpoint_sequence =
-                gc_state.checkpoint_sequence.checked_add(1).ok_or_else(|| {
+            let checkpoint_row = checkpoint.rows().first().ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "checkpoint sequence overflow",
+                        "checkpoint SQL function returned no commit ID",
                     )
                 })?;
-            if let Some(previous_recovery) = previous_recovery {
-                gc_state.add_collectible_interval(previous_recovery.interval_has_commits);
-            }
-            let gc_due = checkpoint_gc_due(gc_state)?;
-
-            let commit_id = transaction.stage_checkpoint_boundary_commit(
-                branch_id,
-                previous_checkpoint_commit_id,
-                head_commit_id,
-                interval_has_commits,
-                gc_state,
-            )?;
-            let checkpoint_commit_id =
-                crate::changelog::CommitId::parse_lix(&commit_id, "checkpoint commit id")?;
-            let change_id = transaction.functions().call_uuid_v7().to_string();
-            let mut checkpoint_rows = RawWriteBatch::with_capacity(1);
-            checkpoint_rows.push(checkpoint_stage_row(
-                &checkpoint_commit_id,
-                change_id.clone(),
-            ));
-            transaction
-                .stage_write(TransactionWrite::Rows {
-                    mode: TransactionWriteMode::Replace,
-                    rows: checkpoint_rows,
-                })
+            let commit_id = checkpoint_row.get::<String>("commit_id")?;
+            let marker = self
+                .execute(
+                    "SELECT lixcol_change_id FROM lix_checkpoint WHERE commit_id = $1",
+                    &[crate::Value::Text(commit_id.clone())],
+                )
                 .await?;
-            Ok(CreateCheckpointOutcome {
-                receipt: CreateCheckpointReceipt {
-                    commit_id,
-                    change_id,
-                },
-                parent_commit_id: previous_checkpoint_commit_id.to_string(),
-                gc_due,
-                checkpoint_sequence: gc_state.checkpoint_sequence,
+            let marker_row = marker.rows().first().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "checkpoint SQL function published no checkpoint marker",
+                    )
+                })?;
+            let change_id = marker_row.get::<String>("lixcol_change_id")?;
+            Ok::<_, LixError>(CreateCheckpointReceipt {
+                commit_id,
+                change_id,
             })
-        });
+        };
         let result = match span.as_ref() {
             Some(span) => span.instrument(operation).await,
             None => operation.await,
         };
-        let outcome = match result {
-            Ok(outcome) => outcome,
+        let receipt = match result {
+            Ok(receipt) => receipt,
             Err(error) => {
                 if let Some(span) = span {
                     span.finish(
@@ -149,18 +101,34 @@ where
             span.finish(
                 Status::Unset,
                 vec![
-                    TelemetryAttribute::string("lix.commit_id", outcome.receipt.commit_id.clone()),
-                    TelemetryAttribute::string(
-                        "lix.parent_commit_id",
-                        outcome.parent_commit_id.clone(),
-                    ),
+                    TelemetryAttribute::string("lix.commit_id", receipt.commit_id.clone()),
                 ],
             );
         }
-        if outcome.gc_due
+        Ok(receipt)
+    }
+
+    /// Consumes the post-commit checkpoint effect published by the transaction
+    /// planner. Every checkpoint entry point, including explicit transactions
+    /// and remote SQL, reaches this hook after durability.
+    pub(super) async fn schedule_checkpoint_gc_after_commit(
+        &self,
+        checkpoint_sequence: u64,
+    ) -> Result<(), LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage.begin_read(StorageReadOptions::default()).await?,
+        );
+        let gc_state = load_checkpoint_gc_state(&read).await?;
+        if gc_state.checkpoint_sequence < checkpoint_sequence {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "committed checkpoint GC sequence is not visible after commit",
+            ));
+        }
+        if checkpoint_gc_due(gc_state)?
             && self
                 .commit_coordinator
-                .try_begin_checkpoint_gc(outcome.checkpoint_sequence)
+                .try_begin_checkpoint_gc(gc_state.checkpoint_sequence)
         {
             // GC debt is durable in the checkpoint transaction. The sweep is
             // therefore safely retryable and does not need to delay the user
@@ -181,7 +149,7 @@ where
                 return Err(error);
             }
         }
-        Ok(outcome.receipt)
+        Ok(())
     }
 }
 

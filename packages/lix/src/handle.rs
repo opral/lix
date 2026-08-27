@@ -2,7 +2,7 @@ use lix::plugin::runtime::WasmRuntime;
 use lix::storage::{Storage, StorageSession};
 use lix::telemetry::TelemetrySink;
 use lix::{
-    Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, ExecuteBatchStatement,
+    Blob, CreateBranchOptions, CreateBranchReceipt, ExecuteBatchStatement,
     ExecuteIdempotency, ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, LixError,
     Memory, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     ObserveEvent, RedoReceipt, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
@@ -1302,10 +1302,6 @@ where
     ) -> Result<CreateBranchReceipt, LixError> {
         self.retry_sync_demands(|| self.session.create_branch(options.clone()))
             .await
-    }
-
-    pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
-        self.session.create_checkpoint().await
     }
 
     /// Reverses the latest undoable tracked commit on this handle's active branch.

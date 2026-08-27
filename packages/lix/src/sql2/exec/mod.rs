@@ -28,6 +28,30 @@ impl SqlWriteResult {
         }
     }
 
+    pub(crate) fn checkpoint_function(
+        outcome: crate::sql2::DiffCommandOutcome,
+    ) -> Result<Self, crate::LixError> {
+        let rows = match outcome.commit_id {
+            Some(commit_id) => vec![vec![crate::Value::Text(commit_id)]],
+            None if outcome.rows_affected == 0 => Vec::new(),
+            None => {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    "checkpoint function staged rows without a commit ID",
+                ));
+            }
+        };
+        Ok(Self::returning(
+            outcome.rows_affected,
+            SqlQueryResult {
+                columns: vec!["commit_id".to_string()],
+                column_types: vec![crate::ResultColumnType::Text],
+                rows,
+                notices: Vec::new(),
+            },
+        ))
+    }
+
     pub(crate) fn diff_command(
         outcome: crate::sql2::DiffCommandOutcome,
         returning: Option<&crate::sql2::bind::write::BoundReturning>,
@@ -94,6 +118,7 @@ pub(crate) use write::{
 };
 
 pub(crate) enum SqlLogicalPlan {
+    Checkpoint(crate::sql2::CheckpointFunctionPlan),
     DataFusion(SqlDataFusionLogicalPlan),
     Write(SqlWriteLogicalPlan),
 }

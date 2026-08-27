@@ -2,6 +2,7 @@ mod bind;
 mod branch_ref;
 mod branch_scope;
 mod catalog;
+mod checkpoint_function;
 mod change_materialization;
 mod context;
 mod dialect;
@@ -51,6 +52,7 @@ pub(crate) use catalog::{
     PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec,
     derive_schema_surface_spec_from_schema, row_visible_fields,
 };
+pub(crate) use checkpoint_function::{CheckpointFunctionPlan, checkpoint_function_plan};
 pub(crate) use context::WriteContextLiveness;
 pub(crate) use context::{
     ChangelogQuerySource, DiffCommand, DiffCommandOutcome, DiffCommandSelection, HistoryQuerySource,

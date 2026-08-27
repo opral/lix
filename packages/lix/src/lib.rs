@@ -181,7 +181,7 @@ pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata_value, serialize_row_metadata};
 pub(crate) use prepared_dml::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 pub use session::{
-    CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, MergeBranchOptions,
+    CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,

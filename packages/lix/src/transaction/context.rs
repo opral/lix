@@ -153,6 +153,7 @@ mod cohort;
 pub(crate) struct TransactionCommitOutcome {
     pub(crate) storage_stats: StorageWriteSetStats,
     pub(crate) commit_cohort_id: Option<String>,
+    pub(crate) checkpoint_gc_sequence: Option<u64>,
 }
 
 fn typed_transaction_validation_counters(rows: &RawWriteBatch) -> WasmTransitionCounters {
@@ -723,6 +724,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
+    pending_checkpoint_gc_sequence: Option<u64>,
     /// Explicit historical branch sources whose branchability may be owned by
     /// one still-pending authenticated checkpoint replacement. Resolution is
     /// delayed to the coherent commit-boundary read so its queue observation
@@ -827,6 +829,7 @@ pub(crate) struct SqlStatementCheckpoint {
     filesystem_path_index_epoch: usize,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     trust_filesystem_planner: bool,
+    pending_checkpoint_gc_sequence: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1694,6 +1697,7 @@ where
                     session_file_views,
                     pending_file_view_mutations: BTreeMap::new(),
                     pending_plugin_actor_publications: Vec::new(),
+                    pending_checkpoint_gc_sequence: None,
                     pending_branch_checkpoint_replacements: BTreeMap::new(),
                     pending_restore_targets: BTreeMap::new(),
                     plugin_generation_read_guard: None,
@@ -2186,6 +2190,7 @@ where
         Ok(TransactionCommitOutcome {
             storage_stats,
             commit_cohort_id: Some(commit_cohort_id),
+            checkpoint_gc_sequence: transaction.pending_checkpoint_gc_sequence,
         })
     }
 
@@ -2301,6 +2306,7 @@ where
             filesystem_path_index_epoch: self.filesystem_path_index_epoch.load(Ordering::SeqCst),
             pending_file_view_mutations: self.pending_file_view_mutations.clone(),
             trust_filesystem_planner: self.trust_filesystem_planner,
+            pending_checkpoint_gc_sequence: self.pending_checkpoint_gc_sequence,
         })
     }
 
@@ -2315,6 +2321,7 @@ where
             filesystem_path_index_epoch,
             pending_file_view_mutations,
             trust_filesystem_planner,
+            pending_checkpoint_gc_sequence,
         } = checkpoint;
         self.staged_writes.restore(staged_writes)?;
         self.filesystem_path_index_epoch
@@ -2324,6 +2331,7 @@ where
         self.filesystem_path_index_cache.clear();
         self.pending_file_view_mutations = pending_file_view_mutations;
         self.trust_filesystem_planner = trust_filesystem_planner;
+        self.pending_checkpoint_gc_sequence = pending_checkpoint_gc_sequence;
         // A failed statement may have chained a predecessor actor successor.
         // Its prior document can no longer be restored byte-for-byte, so
         // conservatively discard all unpublished actor cache work. The staged
@@ -7303,6 +7311,9 @@ where
         sql: &str,
         statement: &DataFusionStatement,
     ) -> Result<crate::sql2::SqlLogicalPlan, LixError> {
+        if let Some(plan) = crate::sql2::checkpoint_function_plan(statement)? {
+            return Ok(crate::sql2::SqlLogicalPlan::Checkpoint(plan));
+        }
         let fingerprint = self.sql_catalog_fingerprint();
         if let Some(plan) =
             self.sql_planning_cache
@@ -9128,55 +9139,58 @@ where
     pub(crate) async fn execute_full_checkpoint_command(
         &mut self,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-        let branch_id = self.active_branch_id.clone();
-        let (previous_recovery, mut gc_state) =
-            self.checkpoint_publication_state(&branch_id).await?;
-        let head_commit_id = self
-            .load_branch_head(&branch_id)
-            .await?
-            .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
-        let previous_checkpoint_commit_id = self
-            .checkpoint_commit_id_at_head(&branch_id, head_commit_id)
-            .await?;
-        let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
-        gc_state.checkpoint_sequence =
-            gc_state.checkpoint_sequence.checked_add(1).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "checkpoint sequence overflow",
-                )
-            })?;
-        if let Some(previous_recovery) = previous_recovery {
-            gc_state.add_collectible_interval(previous_recovery.interval_has_commits);
-        }
-        let commit_id = self.stage_checkpoint_boundary_commit(
-            branch_id,
-            previous_checkpoint_commit_id,
-            head_commit_id,
-            interval_has_commits,
-            gc_state,
-        )?;
-        let checkpoint_commit_id = CommitId::parse_lix(&commit_id, "checkpoint commit id")?;
-        let mut checkpoint_rows = RawWriteBatch::with_capacity(1);
-        checkpoint_rows.push(checkpoint_stage_row(
-            &checkpoint_commit_id,
-            self.functions.call_uuid_v7().to_string(),
-        ));
-        self.stage_write(TransactionWrite::Rows {
-            mode: TransactionWriteMode::Replace,
-            rows: checkpoint_rows,
-        })
-        .await?;
-        Ok(crate::sql2::DiffCommandOutcome {
-            rows_affected: 1,
-            commit_id: Some(commit_id),
-        })
+        self.execute_checkpoint_plan(None).await
     }
 
-    async fn execute_checkpoint_selection(
+    pub(crate) async fn execute_checkpoint_function(
         &mut self,
-        diff_ids: Vec<String>,
+        plan: crate::sql2::CheckpointFunctionPlan,
+        params: Vec<Value>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        match plan {
+            crate::sql2::CheckpointFunctionPlan::Full => {
+                self.execute_checkpoint_plan(None).await
+            }
+            crate::sql2::CheckpointFunctionPlan::Empty => {
+                Ok(crate::sql2::DiffCommandOutcome {
+                    rows_affected: 0,
+                    commit_id: None,
+                })
+            }
+            crate::sql2::CheckpointFunctionPlan::SelectionQuery(query_sql) => {
+                self.execute_diff_command_query_owned(
+                    DiffCommand::CreateCheckpoint,
+                    query_sql,
+                    params,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Plans and stages both full and scoped checkpoints through one path.
+    ///
+    /// `None` is the complete working interval. `Some` contains the private
+    /// diff identities resolved from public row references. Keeping the
+    /// publication mechanics below this boundary is load-bearing: full and
+    /// scoped checkpointing must rotate the same recovery root, advance the
+    /// same GC state, and publish the same logical checkpoint marker.
+    async fn execute_checkpoint_plan(
+        &mut self,
+        requested_diff_ids: Option<Vec<String>>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        if requested_diff_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(crate::sql2::DiffCommandOutcome {
+                rows_affected: 0,
+                commit_id: None,
+            });
+        }
+        if self.pending_checkpoint_gc_sequence.is_some() {
+            return Err(LixError::new(
+                "LIX_INVALID_TRANSACTION_STATE",
+                "a transaction can create at most one checkpoint",
+            ));
+        }
         let branch_id = self.active_branch_id.clone();
         let (previous_recovery, mut gc_state) =
             self.checkpoint_publication_state(&branch_id).await?;
@@ -9202,70 +9216,97 @@ where
                     format!("branch '{branch_id}' has no checkpoint cursor"),
                 )
             })?;
-        let direct_diff = TrackedHeadContext::new()
-            .reader(self.opening_read())
-            .working_diff_for_control(&branch_id, control, &TrackedStateDiffRequest::default())
-            .await?;
-        let hot_working_diff_certified = direct_diff.is_some();
-        let diff = match direct_diff {
-            Some(direct) => direct.diff,
-            None => {
-                let mut tracked = self.tracked_state_reader().await?;
-                tracked
-                    .diff_commits(
-                        &previous_checkpoint_commit_id.to_string(),
-                        &head_commit_id.to_string(),
+        let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
+
+        let (selected, unselected, rows_affected, hot_working_diff_certified) =
+            if let Some(requested_diff_ids) = requested_diff_ids {
+                let direct_diff = TrackedHeadContext::new()
+                    .reader(self.opening_read())
+                    .working_diff_for_control(
+                        &branch_id,
+                        control,
                         &TrackedStateDiffRequest::default(),
                     )
-                    .await?
-            }
-        };
-        let requested = diff_ids.iter().cloned().collect::<BTreeSet<_>>();
-        if requested.len() != diff_ids.len() {
-            return Err(LixError::new(
-                LixError::CODE_CONSTRAINT_VIOLATION,
-                "checkpoint selection contains duplicate relation-row changes",
-            ));
-        }
-        let mut matched = BTreeSet::new();
-        let mut selected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
-        let mut unselected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
-        let mut selected_source_membership_exact = true;
-        let mut unselected_source_membership_exact = true;
-        for entry in diff.entries.into_iter().filter(|entry| {
-            entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
-                && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
-        }) {
-            let diff_id = entry.diff_id()?;
-            let target = entry.after.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "selected working relation row has no target change",
-                )
-            })?;
-            if requested.contains(&diff_id) {
-                matched.insert(diff_id);
-                selected_source_membership_exact &=
-                    push_checkpoint_selected_change(&mut selected, target, entry.kind);
+                    .await?;
+                let hot_working_diff_certified = direct_diff.is_some();
+                let diff = match direct_diff {
+                    Some(direct) => direct.diff,
+                    None => {
+                        let mut tracked = self.tracked_state_reader().await?;
+                        tracked
+                            .diff_commits(
+                                &previous_checkpoint_commit_id.to_string(),
+                                &head_commit_id.to_string(),
+                                &TrackedStateDiffRequest::default(),
+                            )
+                            .await?
+                    }
+                };
+                let requested_count = requested_diff_ids.len();
+                let requested = requested_diff_ids.into_iter().collect::<BTreeSet<_>>();
+                if requested.len() != requested_count {
+                    return Err(LixError::new(
+                        LixError::CODE_CONSTRAINT_VIOLATION,
+                        "checkpoint selection contains duplicate rows",
+                    ));
+                }
+                if requested.is_empty() {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "scoped checkpoint selection cannot be empty",
+                    ));
+                }
+                let closed = close_and_validate_checkpoint_selection(&diff.entries, requested)?;
+                let rows_affected = u64::try_from(requested_count).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "checkpoint selection exceeds u64",
+                    )
+                })?;
+                let mut matched = BTreeSet::new();
+                let mut selected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
+                let mut unselected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
+                let mut selected_source_membership_exact = true;
+                let mut unselected_source_membership_exact = true;
+                for entry in diff.entries.into_iter().filter(|entry| {
+                    entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
+                        && entry.identity.schema_key()
+                            != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                }) {
+                    let diff_id = entry.diff_id()?;
+                    let target = entry.after.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "working relation row has no target change",
+                        )
+                    })?;
+                    if closed.contains(&diff_id) {
+                        matched.insert(diff_id);
+                        selected_source_membership_exact &=
+                            push_checkpoint_selected_change(&mut selected, target, entry.kind);
+                    } else {
+                        unselected_source_membership_exact &=
+                            push_checkpoint_selected_change(&mut unselected, target, entry.kind);
+                    }
+                }
+                if matched != closed {
+                    return Err(stale_or_unknown_diff_id());
+                }
+                let selected = if selected_source_membership_exact {
+                    selected.finish_source_certified()
+                } else {
+                    selected.finish()
+                };
+                let unselected = if unselected_source_membership_exact {
+                    unselected.finish_source_certified()
+                } else {
+                    unselected.finish()
+                };
+                (Some(selected), Some(unselected), rows_affected, hot_working_diff_certified)
             } else {
-                unselected_source_membership_exact &=
-                    push_checkpoint_selected_change(&mut unselected, target, entry.kind);
-            }
-        }
-        let selected = if selected_source_membership_exact {
-            selected.finish_source_certified()
-        } else {
-            selected.finish()
-        };
-        let unselected = if unselected_source_membership_exact {
-            unselected.finish_source_certified()
-        } else {
-            unselected.finish()
-        };
-        if matched != requested {
-            return Err(stale_or_unknown_diff_id());
-        }
-        let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
+                (None, None, 1, false)
+            };
+
         gc_state.checkpoint_sequence =
             gc_state.checkpoint_sequence.checked_add(1).ok_or_else(|| {
                 LixError::new(
@@ -9276,44 +9317,54 @@ where
         if let Some(previous_recovery) = previous_recovery {
             gc_state.add_collectible_interval(previous_recovery.interval_has_commits);
         }
-
-        let checkpoint_commit_id = if unselected.is_empty() {
-            self.stage_checkpoint_commit(
+        self.pending_checkpoint_gc_sequence = Some(gc_state.checkpoint_sequence);
+        let commit_id = match (selected, unselected) {
+            (None, None) => self.stage_checkpoint_boundary_commit(
                 branch_id.clone(),
                 previous_checkpoint_commit_id,
                 head_commit_id,
                 interval_has_commits,
                 gc_state,
-                selected,
-                hot_working_diff_certified,
-            )?
-        } else {
-            let checkpoint_commit_id = self.staged_writes.stage_intermediate_commit(
-                branch_id.clone(),
-                previous_checkpoint_commit_id,
-                selected,
-            )?;
-            self.staged_writes
-                .stage_selected_commit_change_refs(branch_id.clone(), unselected)?;
-            self.staged_writes
-                .set_first_commit_parent(branch_id.clone(), checkpoint_commit_id)?;
-            self.staged_writes
-                .add_checkpoint_publication(CheckpointPublication {
-                    recovery_ref: CheckpointRecoveryRef {
-                        branch_id: branch_id.clone(),
-                        recovered_head_commit_id: head_commit_id,
-                        checkpoint_commit_id,
-                        interval_has_commits,
-                    },
+            )?,
+            (Some(selected), Some(unselected)) if unselected.is_empty() => self
+                .stage_checkpoint_commit(
+                    branch_id.clone(),
+                    previous_checkpoint_commit_id,
+                    head_commit_id,
+                    interval_has_commits,
                     gc_state,
+                    selected,
                     hot_working_diff_certified,
-                })?;
-            checkpoint_commit_id.to_string()
+                )?,
+            (Some(selected), Some(unselected)) => {
+                let checkpoint_commit_id = self.staged_writes.stage_intermediate_commit(
+                    branch_id.clone(),
+                    previous_checkpoint_commit_id,
+                    selected,
+                )?;
+                self.staged_writes
+                    .stage_selected_commit_change_refs(branch_id.clone(), unselected)?;
+                self.staged_writes
+                    .set_first_commit_parent(branch_id.clone(), checkpoint_commit_id)?;
+                self.staged_writes
+                    .add_checkpoint_publication(CheckpointPublication {
+                        recovery_ref: CheckpointRecoveryRef {
+                            branch_id: branch_id.clone(),
+                            recovered_head_commit_id: head_commit_id,
+                            checkpoint_commit_id,
+                            interval_has_commits,
+                        },
+                        gc_state,
+                        hot_working_diff_certified,
+                    })?;
+                checkpoint_commit_id.to_string()
+            }
+            _ => unreachable!("checkpoint planner produces both selected partitions or neither"),
         };
-        let checkpoint_commit = CommitId::parse_lix(&checkpoint_commit_id, "checkpoint commit id")?;
+        let checkpoint_commit_id = CommitId::parse_lix(&commit_id, "checkpoint commit id")?;
         let mut checkpoint_rows = RawWriteBatch::with_capacity(1);
         checkpoint_rows.push(checkpoint_stage_row(
-            &checkpoint_commit,
+            &checkpoint_commit_id,
             self.functions.call_uuid_v7().to_string(),
         ));
         self.stage_write(TransactionWrite::Rows {
@@ -9322,9 +9373,16 @@ where
         })
         .await?;
         Ok(crate::sql2::DiffCommandOutcome {
-            rows_affected: diff_ids.len() as u64,
-            commit_id: Some(checkpoint_commit_id),
+            rows_affected,
+            commit_id: Some(commit_id),
         })
+    }
+
+    async fn execute_checkpoint_selection(
+        &mut self,
+        diff_ids: Vec<String>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        self.execute_checkpoint_plan(Some(diff_ids)).await
     }
 
     pub(crate) async fn execute_diff_command_query_owned(
@@ -9830,6 +9888,111 @@ fn parse_materialized_diff_json(
         TransactionJson::from_value(value, context)
     })
     .transpose()
+}
+
+/// Computes engine-owned dependencies for a scoped checkpoint and rejects a
+/// partition that could publish rows without the schema needed to read them.
+///
+/// Schema definitions are ordinary tracked rows. A relation and its
+/// `lix_registered_schema` row can therefore be introduced in the same
+/// working interval. Selecting only the relation row used to strand that row
+/// behind a checkpoint whose catalog could not decode it. Closure happens on
+/// the complete immutable working diff, before either partition is staged.
+fn close_and_validate_checkpoint_selection(
+    entries: &[TrackedStateDiffEntry],
+    requested: BTreeSet<String>,
+) -> Result<BTreeSet<String>, LixError> {
+    let mut by_diff_id = BTreeMap::new();
+    let mut registration_by_schema_key = BTreeMap::new();
+    for entry in entries.iter().filter(|entry| {
+        entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
+            && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+    }) {
+        let diff_id = entry.diff_id()?;
+        by_diff_id.insert(diff_id.clone(), entry);
+        if entry.identity.schema_key() == REGISTERED_SCHEMA_KEY {
+            let registered_schema_key = entry
+                .identity
+                .row_pk()
+                .as_single_string_owned()
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "working lix_registered_schema row has an invalid primary key",
+                    )
+                })?;
+            registration_by_schema_key.insert(registered_schema_key, diff_id);
+        }
+    }
+    if requested.iter().any(|diff_id| !by_diff_id.contains_key(diff_id)) {
+        return Err(stale_or_unknown_diff_id());
+    }
+
+    let mut closed = requested;
+    loop {
+        let required_schema_keys = closed
+            .iter()
+            .filter_map(|diff_id| by_diff_id.get(diff_id))
+            .map(|entry| entry.identity.schema_key().to_string())
+            .collect::<BTreeSet<_>>();
+        let mut changed = false;
+        for schema_key in required_schema_keys {
+            let Some(registration_diff_id) = registration_by_schema_key.get(&schema_key) else {
+                // No registration change in this interval means the schema is
+                // already part of the checkpoint baseline.
+                continue;
+            };
+            let registration = by_diff_id
+                .get(registration_diff_id)
+                .expect("registration diff index is coherent");
+            if registration
+                .after
+                .as_ref()
+                .is_none_or(|after| after.deleted)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    format!(
+                        "checkpoint selection contains a live '{schema_key}' row but its schema registration is removed"
+                    ),
+                )
+                .with_details(serde_json::json!({
+                    "operation": "createCheckpoint",
+                    "schemaKey": schema_key,
+                    "dependency": REGISTERED_SCHEMA_KEY,
+                })));
+            }
+            changed |= closed.insert(registration_diff_id.clone());
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Validate the final closure rather than trusting the construction loop.
+    // This keeps later dependency kinds fail-closed when they are added here.
+    for diff_id in &closed {
+        let entry = by_diff_id
+            .get(diff_id)
+            .ok_or_else(stale_or_unknown_diff_id)?;
+        let schema_key = entry.identity.schema_key();
+        if let Some(registration_diff_id) = registration_by_schema_key.get(schema_key)
+            && !closed.contains(registration_diff_id)
+        {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "checkpoint selection is missing the schema registration for '{schema_key}'"
+                ),
+            )
+            .with_details(serde_json::json!({
+                "operation": "createCheckpoint",
+                "schemaKey": schema_key,
+                "dependency": REGISTERED_SCHEMA_KEY,
+            })));
+        }
+    }
+    Ok(closed)
 }
 
 fn push_checkpoint_selected_change(

@@ -1093,7 +1093,6 @@ mod tests {
             vec![
                 "lix_apply",
                 "lix_branch",
-                "lix_create_checkpoint",
                 "lix_directory",
                 "lix_file",
                 "lix_restore",
@@ -1102,8 +1101,8 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 21, "construction count");
-        assert_eq!(read_only.len() + writable.len(), 13, "surface count");
+        assert_eq!(all_read + writable.len(), 20, "construction count");
+        assert_eq!(read_only.len() + writable.len(), 12, "surface count");
     }
 
     #[test]

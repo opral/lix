@@ -37,7 +37,7 @@ pub(crate) use media_upload::{UPLOAD_MANIFEST_LEAF_SPACE, UPLOAD_STATE_SPACE};
 pub(crate) use crate::common::ExecuteStatementMetadata;
 #[cfg(feature = "server-protocol")]
 pub(crate) use crate::common::VerifiedRequestBlob;
-pub use checkpoint::CreateCheckpointReceipt;
+pub(crate) use checkpoint::CreateCheckpointReceipt;
 pub use context::SessionContext;
 pub(crate) use context::{SessionBranch, load_default_branch_id_from_index};
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};

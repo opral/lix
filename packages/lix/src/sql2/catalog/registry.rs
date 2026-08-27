@@ -304,7 +304,6 @@ impl PublicCatalog {
         for (name, kind) in [
             ("lix_revert", PublicSurfaceKind::Revert),
             ("lix_apply", PublicSurfaceKind::Apply),
-            ("lix_create_checkpoint", PublicSurfaceKind::CreateCheckpoint),
         ] {
             self.insert(surface(
                 name,

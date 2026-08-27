@@ -4162,6 +4162,12 @@ async fn execute_prepared_transaction_write<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    if let sql2::SqlLogicalPlan::Checkpoint(checkpoint) = plan {
+        let outcome = transaction
+            .execute_checkpoint_function(checkpoint, params.to_vec())
+            .await?;
+        return sql2::SqlWriteResult::checkpoint_function(outcome);
+    }
     if let Some(returning) = sql2::full_checkpoint_command(&plan) {
         let outcome = transaction.execute_full_checkpoint_command().await?;
         return sql2::SqlWriteResult::diff_command(outcome, returning.as_ref());
