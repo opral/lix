@@ -16,6 +16,7 @@ import type {
 	LixOpenProgress,
 	LixOpenReport,
 	OpenAnotherSessionOptions,
+	ResultColumn,
 } from "./types.js";
 import type { NativeLixValue } from "./value.js";
 import type { LixStorageProvider } from "./storage-adapter.js";
@@ -30,7 +31,7 @@ export type SyncServerBindingOptions = {
 export type BindingExecuteResult = {
 	statementIndex?: number;
 	label?: string;
-	columns: string[];
+	columns: ResultColumn[];
 	rows: NativeLixValue[][];
 	rowsAffected: number;
 	notices: Array<{

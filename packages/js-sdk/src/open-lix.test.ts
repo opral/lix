@@ -25,6 +25,7 @@ import {
 } from "./index.js";
 import { FilesystemStorage } from "../../storage-filesystem/dist/index.js";
 import { registerMemoryStorageContract } from "../tests/memory-storage-contract.js";
+import { wrapExecuteResult } from "./result.js";
 
 const NATIVE_DRAFT_BRANCH_ID = "01920000-0000-7000-8000-000000000401";
 const EXPLICIT_COMMIT_BRANCH_ID = "01920000-0000-7000-8000-000000000402";
@@ -284,9 +285,8 @@ test("a paused snapshot export does not block queries and close cancels it", asy
 	const reader = lix.exportSnapshot().getReader();
 	expect((await reader.read()).done).toBe(false);
 	expect(
-		(await withTimeout(lix.execute("SELECT 1 AS value"), 3_000)).rows[0]?.get(
-			"value",
-		),
+		(await withTimeout(lix.execute("SELECT 1 AS value"), 3_000)).rows[0]
+			?.value,
 	).toBe(1);
 	await withTimeout(lix.close(), 3_000);
 });
@@ -561,6 +561,102 @@ test("openLix opens native storage without telemetry", async () => {
 	await lix.close();
 });
 
+test("execute returns typed columns and enumerable plain-object rows", async () => {
+	const lix = await openLix();
+	const result = await lix.execute(`
+		SELECT
+			NULL AS missing,
+			TRUE AS flag,
+			42 AS count,
+			1.5 AS ratio,
+			'hello' AS label,
+			CAST('{"ok":true}' AS JSONB) AS payload,
+			CURRENT_TIMESTAMP AS created_at,
+			CAST('bytes' AS BYTEA) AS bytes
+	`);
+
+	expect(result.columns).toEqual([
+		{ name: "missing", type: "null" },
+		{ name: "flag", type: "boolean" },
+		{ name: "count", type: "integer" },
+		{ name: "ratio", type: "real" },
+		{ name: "label", type: "text" },
+		{ name: "payload", type: "jsonb" },
+		{ name: "created_at", type: "timestamptz" },
+		{ name: "bytes", type: "blob" },
+	]);
+	const row = result.rows[0]!;
+	expect(Object.getPrototypeOf(row)).toBe(Object.prototype);
+	expect(Object.keys(row)).toEqual(result.columns.map((column) => column.name));
+	const { label, count } = row;
+	expect({ ...row, label, count }).toMatchObject({ label: "hello", count: 42 });
+	expect(JSON.parse(JSON.stringify({ label: row.label, payload: row.payload }))).toEqual(
+		{ label: "hello", payload: { ok: true } },
+	);
+	await lix.close();
+});
+
+test("execute retains declared types for empty and all-null results", async () => {
+	const lix = await openLix();
+	const empty = await lix.execute(
+		"SELECT CAST(NULL AS TEXT) AS value WHERE FALSE",
+	);
+	expect(empty).toMatchObject({
+		columns: [{ name: "value", type: "text" }],
+		rows: [],
+	});
+	const emptyBlobRelation = await lix.execute(
+		"SELECT content FROM lix_file WHERE FALSE",
+	);
+	expect(emptyBlobRelation).toMatchObject({
+		columns: [{ name: "content", type: "blob" }],
+		rows: [],
+	});
+	const allNull = await lix.execute("SELECT CAST(NULL AS JSONB) AS value");
+	expect(allNull.columns).toEqual([{ name: "value", type: "jsonb" }]);
+	expect(allNull.rows).toEqual([{ value: null }]);
+	await lix.close();
+});
+
+test("object rows use last-column-wins and array mode preserves duplicates", async () => {
+	const lix = await openLix();
+	const raw = {
+		columns: [
+			{ name: "value", type: "integer" as const },
+			{ name: "value", type: "integer" as const },
+		],
+		rows: [[
+			{ kind: "integer" as const, value: 1 },
+			{ kind: "integer" as const, value: 2 },
+		]],
+		rowsAffected: 0,
+		notices: [],
+	};
+	const objectResult = wrapExecuteResult(raw, "object");
+	expect(objectResult.columns.map((column) => column.name)).toEqual([
+		"value",
+		"value",
+	]);
+	expect(objectResult.rows).toEqual([{ value: 2 }]);
+
+	const arrayResult = wrapExecuteResult(raw, "array");
+	expect(arrayResult.rows).toEqual([[1, 2]]);
+
+	const dangerous = await lix.execute(
+		'SELECT 3 AS "__proto__", 4 AS "constructor"',
+	);
+	expect(dangerous.rows[0]).toEqual(
+		Object.fromEntries([
+			["__proto__", 3],
+			["constructor", 4],
+		]),
+	);
+	expect(Object.prototype.hasOwnProperty.call(dangerous.rows[0], "__proto__")).toBe(
+		true,
+	);
+	await lix.close();
+});
+
 test("openAnotherSession keeps branch and lifecycle independent", async () => {
 	const main = await openLix();
 	const mainBranchId = await main.activeBranchId();
@@ -768,7 +864,10 @@ test("execute and executeBatch expose registered-row RETURNING postimages", asyn
 		["returning-task", "Created through SDK RETURNING", false],
 	);
 	expect(inserted.rowsAffected).toBe(1);
-	expect(inserted.columns).toEqual(["id", "title"]);
+	expect(inserted.columns).toEqual([
+		{ name: "id", type: "text" },
+		{ name: "title", type: "text" },
+	]);
 	expect(inserted.rows).toHaveLength(1);
 	const id = get(inserted, "id");
 	expect(typeof id).toBe("string");
@@ -781,7 +880,10 @@ test("execute and executeBatch expose registered-row RETURNING postimages", asyn
 		["Updated through SDK RETURNING", taskId],
 	);
 	expect(updated.rowsAffected).toBe(1);
-	expect(updated.columns).toEqual(["id", "title"]);
+	expect(updated.columns).toEqual([
+		{ name: "id", type: "text" },
+		{ name: "title", type: "text" },
+	]);
 	expect(get(updated, "id")).toBe(taskId);
 	expect(get(updated, "title")).toBe("Updated through SDK RETURNING");
 
@@ -792,7 +894,10 @@ test("execute and executeBatch expose registered-row RETURNING postimages", asyn
 		},
 	]);
 	expect(batched?.rowsAffected).toBe(1);
-	expect(batched?.columns).toEqual(["id", "title"]);
+	expect(batched?.columns).toEqual([
+		{ name: "id", type: "text" },
+		{ name: "title", type: "text" },
+	]);
 	expect(get(batched!, "title")).toBe("Batched SDK RETURNING");
 	expect(typeof get(batched!, "id")).toBe("string");
 
@@ -847,7 +952,7 @@ test("observe remains usable after next rejects", async () => {
 	);
 	const update = await events.next();
 	expect(update?.sequence).toBe(0);
-	expect(update?.result.rows[0]?.value("value").toJS()).toBe("after-error");
+	expect(update?.result.rows[0]?.value).toBe("after-error");
 
 	events.close();
 	await lix.close();
@@ -951,7 +1056,7 @@ test("an idle open Lix worker does not keep Node.js alive", async () => {
 			const { openLix } = await import(${JSON.stringify(sdkUrl)});
 			const lix = await openLix();
 			const result = await lix.execute("SELECT 42 AS answer");
-			console.log(result.rows[0]?.get("answer"));
+			console.log(result.rows[0]?.answer);
 		})().catch((error) => {
 			console.error(error);
 			process.exitCode = 1;
@@ -1123,7 +1228,7 @@ test("fs storage on-demand sync imports selected paths and lix-created files", a
 		"SELECT path FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
 		["/docs/note.md", "/docs/sibling.md"],
 	);
-	expect(files.rows.map((row) => row.get("path"))).toEqual(["/docs/note.md"]);
+	expect(files.rows.map((row) => row.path)).toEqual(["/docs/note.md"]);
 
 	await lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2", [
 		new TextEncoder().encode("updated"),
@@ -1227,7 +1332,7 @@ test("fs storage imports files through installed WASM plugins", async () => {
 	const nodes = await lix.execute(
 		"SELECT kind FROM markdown_node ORDER BY kind",
 	);
-	expect(nodes.rows.map((row) => row.get("kind"))).toEqual([
+	expect(nodes.rows.map((row) => row.kind)).toEqual([
 		"document",
 		"heading",
 	]);
@@ -1448,13 +1553,13 @@ test.skipIf(process.platform === "win32")(
 			"SELECT path FROM lix_file WHERE path IN ($1, $2, $3) ORDER BY path",
 			["/target.txt", "/link.txt", "/linked-docs/readme.md"],
 		);
-		expect(files.rows.map((row) => row.get("path"))).toEqual(["/target.txt"]);
+		expect(files.rows.map((row) => row.path)).toEqual(["/target.txt"]);
 
 		const directories = await lix.execute(
 			"SELECT path FROM lix_directory WHERE path IN ($1, $2) ORDER BY path",
 			["/docs", "/linked-docs"],
 		);
-		expect(directories.rows.map((row) => row.get("path"))).toEqual(["/docs"]);
+		expect(directories.rows.map((row) => row.path)).toEqual(["/docs"]);
 
 		await expect(
 			lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
@@ -1523,7 +1628,7 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 		 ORDER BY table_name",
 		["csv_row", "csv_table", "markdown_node"],
 	);
-	expect(schemas.rows.map((row) => row.get("table_name"))).toEqual([
+	expect(schemas.rows.map((row) => row.table_name)).toEqual([
 		"csv_row",
 		"csv_table",
 		"markdown_node",
@@ -1556,7 +1661,7 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 		 ORDER BY table_name",
 		["csv_row", "csv_table"],
 	);
-	expect(schemas.rows.map((row) => row.get("table_name"))).toEqual([
+	expect(schemas.rows.map((row) => row.table_name)).toEqual([
 		"csv_row",
 		"csv_table",
 	]);
@@ -1584,7 +1689,7 @@ test("bundled Markdown plugin executes detect-changes and render", async () => {
 	const nodes = await lix.execute(
 		"SELECT id, kind FROM markdown_node ORDER BY kind",
 	);
-	expect(nodes.rows.map((row) => row.get("kind"))).toEqual([
+	expect(nodes.rows.map((row) => row.kind)).toEqual([
 		"document",
 		"heading",
 		"paragraph",
@@ -1594,8 +1699,8 @@ test("bundled Markdown plugin executes detect-changes and render", async () => {
 	expect(rendered && new TextDecoder().decode(rendered)).toBe(source);
 
 	const paragraphId = nodes.rows
-		.find((row) => row.get("kind") === "paragraph")
-		?.get("id");
+		.find((row) => row.kind === "paragraph")
+		?.id;
 	expect(typeof paragraphId).toBe("string");
 	await lix.execute("UPDATE markdown_node SET payload_json = $1 WHERE id = $2", [
 		JSON.stringify({ inline: [{ type: "text", value: "Edited paragraph." }] }),
@@ -1613,7 +1718,7 @@ test("execute supports UNION ALL without trapping", async () => {
 	const lix = await openLix();
 	const result = await lix.execute("SELECT 1 UNION ALL SELECT 2");
 
-	expect(result.rows.map((row) => row.get("Int64(1)"))).toEqual([1, 2]);
+	expect(result.rows.map((row) => row["Int64(1)"])).toEqual([1, 2]);
 	await lix.close();
 });
 
@@ -1622,7 +1727,7 @@ test("UNION DISTINCT executes without trapping native", async () => {
 
 	const result = await lix.execute("SELECT 1 UNION SELECT 1");
 
-	expect(result.rows.map((row) => row.get("Int64(1)"))).toEqual([1]);
+	expect(result.rows.map((row) => row["Int64(1)"])).toEqual([1]);
 
 	await lix.close();
 });
@@ -1656,7 +1761,7 @@ test("beginTransaction commits multiple statements together", async () => {
 		"SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
 		["tx-task-1", "tx-task-2"],
 	);
-	expect(staged.rows.map((row) => row.get("id"))).toEqual([
+	expect(staged.rows.map((row) => row.id)).toEqual([
 		"tx-task-1",
 		"tx-task-2",
 	]);
@@ -1667,7 +1772,7 @@ test("beginTransaction commits multiple statements together", async () => {
 		"SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
 		["tx-task-1", "tx-task-2"],
 	);
-	expect(committed.rows.map((row) => row.get("id"))).toEqual([
+	expect(committed.rows.map((row) => row.id)).toEqual([
 		"tx-task-1",
 		"tx-task-2",
 	]);
@@ -1762,7 +1867,7 @@ test("beginTransaction can continue after failed statement", async () => {
 		"SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
 		["continued-tx-task-1", "continued-tx-task-2"],
 	);
-	expect(committed.rows.map((row) => row.get("id"))).toEqual([
+	expect(committed.rows.map((row) => row.id)).toEqual([
 		"continued-tx-task-1",
 		"continued-tx-task-2",
 	]);
@@ -1811,7 +1916,7 @@ test("beginTransaction blocks session reads and writes on the same handle", asyn
 		"SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
 		["outside-task", "tx-only-task"],
 	);
-	expect(committed.rows.map((row) => row.get("id"))).toEqual(["tx-only-task"]);
+	expect(committed.rows.map((row) => row.id)).toEqual(["tx-only-task"]);
 
 	await lix.close();
 });
@@ -1924,7 +2029,7 @@ test("same-row merges use host column LWW without conflict details", async () =>
 		["conflict-task"],
 	);
 	expect(merged.rows).toHaveLength(1);
-	expect(["Draft", "Main"]).toContain(merged.rows[0]?.get("title"));
+	expect(["Draft", "Main"]).toContain(merged.rows[0]?.title);
 
 	await lix.close();
 });
@@ -2161,21 +2266,20 @@ test("execute round-trips Uint8Array blob parameters", async () => {
 
 	const bytes = new Uint8Array([0x01, 0x02, 0x03, 0xff]);
 	const result = await lix.execute("SELECT $1 AS v", [bytes]);
-	const value = result.rows[0]?.value("v");
+	const value = result.rows[0]?.v as Uint8Array | undefined;
 
 	expect(get(result, "v")).toEqual(bytes);
-	expect(value?.kind).toBe("blob");
-	expect(value?.toJS()).toEqual(bytes);
-	expect(value?.asBytes()).toEqual(bytes);
-	const returnedBytes = value?.asBytes();
+	expect(value).toEqual(bytes);
+	const returnedBytes = value;
 	if (!returnedBytes) throw new Error("expected blob bytes");
 	returnedBytes[0] = 0x99;
-	expect(value?.asBytes()).toEqual(bytes);
+	expect(value[0]).toBe(0x99);
+	expect(bytes[0]).toBe(0x01);
 
 	await lix.close();
 });
 
-test("Value and Row return copies for structured values", async () => {
+test("Value parameters and result rows do not alias inputs", async () => {
 	const source = { nested: { ok: true } };
 	const value = Value.jsonb(source);
 	source.nested.ok = false;
@@ -2188,11 +2292,11 @@ test("Value and Row return copies for structured values", async () => {
 	const result = await lix.execute("SELECT $1 AS value", [
 		{ nested: { ok: true } },
 	]);
-	const rowValue = result.rows[0]?.get("value") as { nested: { ok: boolean } };
+	const rowValue = result.rows[0]?.value as { nested: { ok: boolean } };
 	rowValue.nested.ok = false;
-	expect(result.rows[0]?.get("value")).toEqual({ nested: { ok: true } });
-	expect(result.rows[0]?.toObject()).toEqual({
-		value: { nested: { ok: true } },
+	expect(result.rows[0]?.value).toEqual({ nested: { ok: false } });
+	expect(result.rows[0]).toEqual({
+		value: { nested: { ok: false } },
 	});
 
 	await lix.close();
@@ -2224,12 +2328,15 @@ test("information_schema.columns SELECT * exposes the Lix column contract", asyn
 	);
 
 	expect(result.rows.length).toBeGreaterThan(0);
-	expect(result.columns).toContain("lix_value_kind");
-	expect(result.columns).toContain("lix_insert_policy");
+	expect(result.columns.some((column) => column.name === "lix_value_kind")).toBe(
+		true,
+	);
+	expect(result.columns.some((column) => column.name === "lix_insert_policy")).toBe(
+		true,
+	);
 	expect(
-		result.rows.find((row) => row.get("column_name") === "content")?.get(
-			"character_octet_length",
-		),
+		result.rows.find((row) => row.column_name === "content")
+			?.character_octet_length,
 	).toBeNull();
 
 	await lix.close();
@@ -2415,7 +2522,7 @@ async function readFile(
 	if (result.rows.length === 0) {
 		return undefined;
 	}
-	return result.rows[0]?.value("content").asBytes() ?? new Uint8Array();
+	return (result.rows[0]?.content as Uint8Array | undefined) ?? new Uint8Array();
 }
 
 async function currentFileChange(
@@ -2439,7 +2546,7 @@ async function activeHeadCommitId(lix: Lix): Promise<string> {
 }
 
 function get(result: ExecuteResult, column: string, rowIndex = 0): unknown {
-	return result.rows[rowIndex]?.get(column);
+	return result.rows[rowIndex]?.[column];
 }
 
 function expectBytesEqual(actual: unknown, expected: Uint8Array): void {

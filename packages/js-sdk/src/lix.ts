@@ -28,6 +28,9 @@ import type {
 	OpenAnotherSessionOptions,
 	LixOpenReport,
 	SqlParam,
+	ResultArrayRow,
+	ResultObjectRow,
+	ResultRow,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 	UndoReceipt,
@@ -86,12 +89,28 @@ export class Lix {
 		);
 	}
 
+	execute(
+		sql: string,
+		params: SqlParam[] | undefined,
+		options: ExecuteOptions & { rowMode: "array" },
+	): Promise<ExecuteResult<ResultArrayRow>>;
+	execute<TRow extends object = ResultObjectRow>(
+		sql: string,
+		params?: SqlParam[],
+		options?: ExecuteOptions & { rowMode?: "object" },
+	): Promise<ExecuteResult<TRow>>;
+	execute(
+		sql: string,
+		params: SqlParam[] | undefined,
+		options?: ExecuteOptions,
+	): Promise<ExecuteResult<ResultRow>>;
 	async execute(
 		sql: string,
 		params: SqlParam[] = [],
 		options?: ExecuteOptions,
-	): Promise<ExecuteResult> {
+	): Promise<ExecuteResult<ResultRow>> {
 		assertExecuteArgs("lix", sql, params, options);
+		const { rowMode = "object", ...bindingOptions } = options ?? {};
 		return this.#runOperation(async () =>
 			wrapExecuteResult(
 				await this.binding.execute(
@@ -99,23 +118,37 @@ export class Lix {
 					params.map((param, index) =>
 						toNativeValue(normalizeParam(param, index)),
 					),
-					options,
+					bindingOptions,
 				),
+				rowMode,
 			),
 		);
 	}
 
+	executeBatch(
+		statements: readonly LixBatchStatement[],
+		options: LixBatchOptions & { rowMode: "array" },
+	): Promise<readonly ExecuteBatchResult<ResultArrayRow>[]>;
+	executeBatch(
+		statements: readonly LixBatchStatement[],
+		options?: LixBatchOptions & { rowMode?: "object" },
+	): Promise<readonly ExecuteBatchResult<ResultObjectRow>[]>;
+	executeBatch(
+		statements: readonly LixBatchStatement[],
+		options?: LixBatchOptions,
+	): Promise<readonly ExecuteBatchResult<ResultRow>[]>;
 	async executeBatch(
 		statements: readonly LixBatchStatement[],
 		options?: LixBatchOptions,
-	): Promise<readonly ExecuteBatchResult[]> {
+	): Promise<readonly ExecuteBatchResult<ResultRow>[]> {
 		const normalizedStatements = normalizeBatchStatements(statements, options);
+		const { rowMode = "object", ...bindingOptions } = options ?? {};
 		return this.#runOperation(async () => {
 			const results = await this.binding.executeBatch(
 				normalizedStatements,
-				options,
+				bindingOptions,
 			);
-			return results.map(wrapExecuteBatchResult);
+			return results.map((result) => wrapExecuteBatchResult(result, rowMode));
 		});
 	}
 
@@ -469,20 +502,37 @@ export class LixTransaction {
 		);
 	}
 
+	execute(
+		sql: string,
+		params: SqlParam[] | undefined,
+		options: ExecuteOptions & { rowMode: "array" },
+	): Promise<ExecuteResult<ResultArrayRow>>;
+	execute<TRow extends object = ResultObjectRow>(
+		sql: string,
+		params?: SqlParam[],
+		options?: ExecuteOptions & { rowMode?: "object" },
+	): Promise<ExecuteResult<TRow>>;
+	execute(
+		sql: string,
+		params: SqlParam[] | undefined,
+		options?: ExecuteOptions,
+	): Promise<ExecuteResult<ResultRow>>;
 	async execute(
 		sql: string,
 		params: SqlParam[] = [],
 		options?: ExecuteOptions,
-	): Promise<ExecuteResult> {
+	): Promise<ExecuteResult<ResultRow>> {
 		assertExecuteArgs("lixTransaction", sql, params, options);
+		const { rowMode = "object", ...bindingOptions } = options ?? {};
 		return wrapExecuteResult(
 			await this.binding.execute(
 				sql,
 				params.map((param, index) =>
 					toNativeValue(normalizeParam(param, index)),
 				),
-				options,
+				bindingOptions,
 			),
+			rowMode,
 		);
 	}
 
@@ -565,6 +615,19 @@ function assertExecuteArgs(
 			"options.idempotencyKey",
 			"string",
 			typeof options.idempotencyKey,
+			receiver,
+		);
+	}
+	if (
+		options.rowMode !== undefined &&
+		options.rowMode !== "object" &&
+		options.rowMode !== "array"
+	) {
+		throw invalidArgument(
+			"execute",
+			"options.rowMode",
+			'"object" | "array"',
+			typeof options.rowMode,
 			receiver,
 		);
 	}
@@ -691,6 +754,18 @@ function assertBatchOptions(options?: LixBatchOptions) {
 			"options.idempotencyKey",
 			"string",
 			typeof options.idempotencyKey,
+		);
+	}
+	if (
+		options.rowMode !== undefined &&
+		options.rowMode !== "object" &&
+		options.rowMode !== "array"
+	) {
+		throw invalidArgument(
+			"lix.executeBatch",
+			"options.rowMode",
+			'"object" | "array"',
+			typeof options.rowMode,
 		);
 	}
 }

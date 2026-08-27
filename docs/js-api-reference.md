@@ -5,7 +5,7 @@ description: "Reference for opening local, remote, and synchronized Lix instance
 # JavaScript API Reference
 
 `@lix-js/sdk` exports `openLix()`, the generic JavaScript storage protocol,
-`Row`, `Value`, and `bundledPluginArchives`. `@lix-js/storage-opfs` and
+`Value` and `bundledPluginArchives`. `@lix-js/storage-opfs` and
 `@lix-js/storage-filesystem` provide concrete storage implementations.
 `openLix()` returns a local repository, a thin remote client, or a synchronized
 local replica.
@@ -138,15 +138,16 @@ type SqlParam = JsonValue | Uint8Array | Value;
 | ---------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `originKey`      | `string` | Optional origin label for the mutation.                                                                                                                                                                                                                                           |
 | `idempotencyKey` | `string` | Stable identity for one logical remote SQL mutation. This is the retry story: supply the same key when retrying after a lost response, and the server applies the mutation only once. Remote Lix generates one per call when omitted. Sent as `Idempotency-Key`, not SQL options. |
+| `rowMode`        | `"object" \| "array"` | Return plain objects by default or positional arrays when duplicate column names must remain separately addressable. |
 
 Result:
 
 ```ts
-type ExecuteResult = {
+type ExecuteResult<TRow = Record<string, unknown>> = {
   statementIndex?: number;
   label?: string;
-  columns: string[];
-  rows: Row[];
+  columns: { name: string; type: "null" | "boolean" | "integer" | "real" | "text" | "jsonb" | "timestamptz" | "blob" }[];
+  rows: TRow[];
   rowsAffected: number;
   notices: { code: string; message: string; hint?: string }[];
 };
@@ -154,8 +155,8 @@ type ExecuteResult = {
 
 | Field          | Description                                                                 |
 | -------------- | --------------------------------------------------------------------------- |
-| `columns`      | Column names in result order. Empty for statements that do not return rows. |
-| `rows`         | Result rows. Each row exposes typed accessors by column name or index.      |
+| `columns`      | Column names and SQL value types in result order. Empty for statements that do not return rows. |
+| `rows`         | Enumerable plain objects by default. Property access, destructuring, spread, and JSON serialization work directly. |
 | `rowsAffected` | Number of rows affected by write statements.                                |
 | `notices`      | Non-fatal engine notices with `{ code, message, hint? }`.                   |
 
@@ -167,8 +168,8 @@ const result = await lix.execute(
   ["/hello.txt"],
 );
 
-const path = result.rows[0]?.get("path");
-const content = result.rows[0]?.value("content").asBytes();
+const path = result.rows[0]?.path;
+const content = result.rows[0]?.content as Uint8Array | undefined;
 ```
 
 ### executeBatch()
@@ -205,7 +206,7 @@ const returning = await lix.executeBatch([
     params: ["task-1"],
   },
 ]);
-console.log(returning[0].rows[0]?.get("done"));
+console.log(returning[0].rows[0]?.done);
 ```
 
 ### observe()
@@ -456,24 +457,24 @@ Transactions expose:
 | `commit()`                        | Commit the transaction and close the transaction handle.                      |
 | `rollback()`                      | Roll back the transaction and close the transaction handle.                   |
 
-## Row
+## Result rows
 
-`execute()` returns rows.
+`execute()` returns ordinary JavaScript objects.
 
 ```ts
 const row = result.rows[0]!;
 ```
 
-| Surface                 | Return type               | Description                                                    |
-| ----------------------- | ------------------------- | -------------------------------------------------------------- |
-| `row.get(columnName)`   | `unknown`                 | Native JS value for a column. Throws if the column is missing. |
-| `row.value(columnName)` | `Value`                   | Typed `Value` for a column. Throws if the column is missing.   |
-| `row.toObject()`        | `Record<string, unknown>` | Object of native JS values keyed by column name.               |
-| `row.toValueMap()`      | `Record<string, Value>`   | Object of typed values keyed by column name.                   |
+Use `row.column_name`, `row[dynamicColumn]`, destructuring, spread, or
+`JSON.stringify(row)` directly. Duplicate output names use the last value in
+object mode while every descriptor remains in `columns`; pass
+`{ rowMode: "array" }` to `execute()` or `executeBatch()` when positional
+duplicates are required.
 
 ## Value
 
-`Value` preserves the SQL type returned by the engine.
+`Value` constructs explicitly typed SQL parameters. Returned values are native
+JavaScript values and their SQL types are described by `result.columns`.
 
 Accessors:
 

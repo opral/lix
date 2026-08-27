@@ -93,6 +93,7 @@ pub(crate) async fn execute_exact_schema_point_read(
         return Ok(None);
     };
     let decoder = RowProjectionDecoder::new(spec, projected_columns.iter().map(String::as_str))?;
+    let column_types = decoder.column_types();
     let rows = vec![if let Some(typed) = row.decoded_snapshot() {
         typed.validate_resolved_schema_binding(
             row.schema_key(),
@@ -106,6 +107,7 @@ pub(crate) async fn execute_exact_schema_point_read(
     Ok(Some(crate::SqlQueryResult {
         rows,
         columns: output_columns,
+        column_types,
         notices: Vec::new(),
     }))
 }
@@ -140,6 +142,7 @@ pub(crate) async fn execute_exact_schema_batch_read(
     };
     let exact = reader.load_exact_batch(&request).await?;
     let decoder = RowProjectionDecoder::new(spec, projected_columns.iter().map(String::as_str))?;
+    let column_types = decoder.column_types();
     let mut rows = Vec::with_capacity(exact.len());
     for slot in 0..exact.len() {
         let Some(row) = exact.row(slot) else {
@@ -160,6 +163,7 @@ pub(crate) async fn execute_exact_schema_batch_read(
     Ok(crate::SqlQueryResult {
         rows,
         columns: output_columns,
+        column_types,
         notices: Vec::new(),
     })
 }

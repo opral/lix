@@ -29,7 +29,7 @@ test("remote observe streams native Lix results", async () => {
 	const initial = await events.next();
 	expect(initial?.sequence).toBe(0);
 	expect(initial?.mutationSequence).toBe(7);
-	expect(initial?.result.rows[0]?.get("value")).toBe("hello");
+	expect(initial?.result.rows[0]?.value).toBe("hello");
 	expect(requests[1]?.headers.get("accept")).toBe("text/event-stream");
 	expect(requests[1]?.headers.get("lix-session-id")).toBe("session-1");
 	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
@@ -57,7 +57,7 @@ test("remote observe applies every blob delta before coalescing delivery", async
 			sequence: 0,
 			mutationSequence: 10,
 			result: {
-				columns: ["content"],
+				columns: [{ name: "content", type: "blob" }],
 				rows: [[{ kind: "blob", base64: "YWJjZGVm" }]],
 				rowsAffected: 0,
 				notices: [],
@@ -114,7 +114,7 @@ test("remote observe applies every blob delta before coalescing delivery", async
 	expect(latest?.sequence).toBe(2);
 	expect(latest?.mutationSequence).toBe(12);
 	expect(
-		new TextDecoder().decode(latest?.result.rows[0]?.value("content").asBytes()),
+		new TextDecoder().decode(latest?.result.rows[0]?.content as Uint8Array),
 	).toBe("abX!ef");
 
 	events.close();
@@ -128,7 +128,7 @@ test("remote observe applies sequential row deltas before coalescing delivery", 
 			sequence: 0,
 			mutationSequence: 10,
 			result: {
-				columns: ["value"],
+				columns: [{ name: "value", type: "text" }],
 				rows: [
 					[{ kind: "text", value: "a" }],
 					[{ kind: "text", value: "b" }],
@@ -186,7 +186,7 @@ test("remote observe applies sequential row deltas before coalescing delivery", 
 	const latest = await events.next();
 	expect(latest?.sequence).toBe(2);
 	expect(latest?.mutationSequence).toBe(12);
-	expect(latest?.result.rows.map((row) => row.get("value"))).toEqual([
+	expect(latest?.result.rows.map((row) => row.value)).toEqual([
 		"a",
 		"x",
 		"y",
@@ -286,7 +286,7 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 	const initial = await Promise.all(
 		observations.map((observation) => observation.next()),
 	);
-	expect(initial.map((event) => event?.result.rows[0]?.get("value"))).toEqual(
+	expect(initial.map((event) => event?.result.rows[0]?.value)).toEqual(
 		Array.from({ length: 33 }, (_, index) => `value-${index}`),
 	);
 	expect(liveObserveRequests).toBe(2);
@@ -319,7 +319,7 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 	expect(latestBody.subscriptions).toHaveLength(1);
 
 	const executed = await lix.execute("SELECT 'executed' AS value");
-	expect(executed.rows[0]?.get("value")).toBe("executed");
+	expect(executed.rows[0]?.value).toBe("executed");
 	expect(liveObserveRequests).toBe(2);
 
 	rebalanced = true;
@@ -341,7 +341,7 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 		"observe-33",
 	);
 	expect(
-		(await observations[32]?.next())?.result.rows[0]?.get("value"),
+		(await observations[32]?.next())?.result.rows[0]?.value,
 	).toBe("rebalanced-32");
 
 	await lix.close();
@@ -449,7 +449,7 @@ test("remote observe can continue after a semantic SSE error", async () => {
 		});
 		const recovered = events.next();
 		await vi.advanceTimersByTimeAsync(100);
-		expect((await recovered)?.result.rows[0]?.get("value")).toBe("recovered");
+		expect((await recovered)?.result.rows[0]?.value).toBe("recovered");
 		expect(observeRequests).toBe(2);
 
 		events.close();
@@ -563,12 +563,12 @@ test("a successful branch switch restarts observations on the pinned session", a
 	});
 
 	const events = lix.observe("SELECT active_branch");
-	expect((await events.next())?.result.rows[0]?.get("value")).toBe("main-id");
+	expect((await events.next())?.result.rows[0]?.value).toBe("main-id");
 	expect(await lix.activeBranchId()).toBe("main-id");
 	const afterSwitch = events.next();
 	await lix.switchBranch({ branchId: "draft-id" });
 	const switched = await afterSwitch;
-	expect(switched?.result.rows[0]?.get("value")).toBe("draft-id");
+	expect(switched?.result.rows[0]?.value).toBe("draft-id");
 	expect(switched?.sequence).toBe(1);
 	expect(await lix.activeBranchId()).toBe("draft-id");
 	expect(observeRequests).toBe(2);
@@ -619,7 +619,7 @@ test("a local branch switch setup failure preserves a healthy observation", asyn
 	});
 
 	const events = lix.observe("SELECT active_branch");
-	expect((await events.next())?.result.rows[0]?.get("value")).toBe("main-id");
+	expect((await events.next())?.result.rows[0]?.value).toBe("main-id");
 	failHeaders = true;
 	await expect(
 		lix.switchBranch({ branchId: "draft-id" }),
@@ -652,7 +652,7 @@ test("remote observe reconnects after a gone protocol session instead of failing
 					}
 					nextSession += 1;
 					return Response.json({
-						protocolVersion: 4,
+						protocolVersion: 5,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: `session-${nextSession}`,
@@ -676,7 +676,7 @@ test("remote observe reconnects after a gone protocol session instead of failing
 	});
 
 	const events = lix.observe("SELECT value");
-	expect((await events.next())?.result.rows[0]?.get("value")).toBe(
+	expect((await events.next())?.result.rows[0]?.value).toBe(
 		"recovered",
 	);
 	expect(observeCalls).toBe(2);
@@ -720,7 +720,7 @@ test("remote observe recovers multiple expired shards with one handshake", async
 				if (pathname.endsWith("/lix/v1/")) {
 					handshakeCalls += 1;
 					return Response.json({
-						protocolVersion: 4,
+						protocolVersion: 5,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: `session-${handshakeCalls}`,
@@ -773,7 +773,7 @@ test("remote observe recovers multiple expired shards with one handshake", async
 	const initial = await Promise.all(
 		observations.map((observation) => observation.next()),
 	);
-	expect(initial.map((event) => event?.result.rows[0]?.get("value"))).toEqual(
+	expect(initial.map((event) => event?.result.rows[0]?.value)).toEqual(
 		Array.from({ length: 33 }, (_, index) => `value-${index}`),
 	);
 	const observeCallsBeforeExpiry = observeCalls;
@@ -787,7 +787,7 @@ test("remote observe recovers multiple expired shards with one handshake", async
 			.map((observation) => observation.next()),
 		replacement.next(),
 	]);
-	expect(recovered.map((event) => event?.result.rows[0]?.get("value"))).toEqual(
+	expect(recovered.map((event) => event?.result.rows[0]?.value)).toEqual(
 		Array.from({ length: 33 }, (_, index) => `recovered-${index + 1}`),
 	);
 	expect(expiredShardResponses).toBe(0);
@@ -813,7 +813,7 @@ test("remote observe fails if the recovered protocol session is also gone", asyn
 						handshakeCalls += 1;
 						expect(request.headers.has("lix-session-id")).toBe(false);
 						return Response.json({
-							protocolVersion: 4,
+							protocolVersion: 5,
 							activeBranchId: "main-id",
 							activeAccountId: "00000000-0000-7000-8000-000000000002",
 							sessionId: `session-${handshakeCalls}`,
@@ -895,13 +895,13 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 		});
 
 		const events = lix.observe("SELECT value");
-		expect((await events.next())?.result.rows[0]?.get("value")).toBe("first");
+		expect((await events.next())?.result.rows[0]?.value).toBe("first");
 		const afterReconnect = events.next();
 		await Promise.resolve();
 		await Promise.resolve();
 		await vi.advanceTimersByTimeAsync(200);
 		const reconnected = await afterReconnect;
-		expect(reconnected?.result.rows[0]?.get("value")).toBe("second");
+		expect(reconnected?.result.rows[0]?.value).toBe("second");
 		expect(reconnected?.sequence).toBe(1);
 		expect(reconnected?.mutationSequence).toBe(0);
 		expect(observedAuthorization).toEqual([
@@ -979,7 +979,7 @@ test("closing Lix stops observations before an earlier finite request settles", 
 
 function handshake(): Response {
 	return Response.json({
-		protocolVersion: 4,
+		protocolVersion: 5,
 		activeBranchId: "main-id",
 		activeAccountId: "00000000-0000-7000-8000-000000000002",
 		sessionId: "session-1",
@@ -1005,7 +1005,7 @@ function closedSession(): Response {
 
 function executeValueResponse(value: string): Response {
 	return Response.json({
-		columns: ["value"],
+		columns: [{ name: "value", type: "text" }],
 		rows: [[{ kind: "text", value }]],
 		rowsAffected: 0,
 		notices: [],
@@ -1014,7 +1014,7 @@ function executeValueResponse(value: string): Response {
 
 function executeValuesResponse(values: string[]): Response {
 	return Response.json({
-		columns: ["value"],
+		columns: [{ name: "value", type: "text" }],
 		rows: values.map((value) => [{ kind: "text", value }]),
 		rowsAffected: 0,
 		notices: [],
@@ -1025,7 +1025,7 @@ function executeBlobResponse(bytes: Uint8Array): Response {
 	let binary = "";
 	for (const byte of bytes) binary += String.fromCharCode(byte);
 	return Response.json({
-		columns: ["content"],
+		columns: [{ name: "content", type: "blob" }],
 		rows: [[{ kind: "blob", base64: btoa(binary) }]],
 		rowsAffected: 0,
 		notices: [],
@@ -1041,7 +1041,7 @@ function observePayload(
 		sequence,
 		mutationSequence,
 		result: {
-			columns: ["value"],
+			columns: [{ name: "value", type: "text" }],
 			rows: [[{ kind: "text", value }]],
 			rowsAffected: 0,
 			notices: [],

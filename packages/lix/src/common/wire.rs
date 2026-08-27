@@ -1,4 +1,4 @@
-use crate::{Json, LixError, LixNotice, SqlQueryResult, Value};
+use crate::{Json, LixError, LixNotice, ResultColumnType, SqlQueryResult, Value};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,8 @@ pub struct WireQueryResult {
     pub rows: Vec<Vec<WireValue>>,
     #[serde(default)]
     pub columns: Vec<String>,
+    #[serde(default)]
+    pub column_types: Vec<ResultColumnType>,
     #[serde(default)]
     pub notices: Vec<LixNotice>,
 }
@@ -123,6 +125,7 @@ impl WireQueryResult {
         Ok(Self {
             rows,
             columns: result.columns.clone(),
+            column_types: result.column_types.clone(),
             notices: result.notices.clone(),
         })
     }
@@ -139,6 +142,7 @@ impl WireQueryResult {
         Ok(SqlQueryResult {
             rows,
             columns: self.columns,
+            column_types: self.column_types,
             notices: self.notices,
         })
     }
@@ -147,7 +151,7 @@ impl WireQueryResult {
 #[cfg(test)]
 mod tests {
     use super::{WireQueryResult, WireValue};
-    use crate::{LixNotice, SqlQueryResult, Value};
+    use crate::{LixNotice, ResultColumnType, SqlQueryResult, Value};
     use serde_json::json;
 
     #[test]
@@ -184,6 +188,11 @@ mod tests {
                 vec![Value::Null, Value::Boolean(false), Value::Real(2.5)],
             ],
             columns: vec!["i".to_string(), "t".to_string(), "b".to_string()],
+            column_types: vec![
+                ResultColumnType::Integer,
+                ResultColumnType::Text,
+                ResultColumnType::Blob,
+            ],
             notices: vec![LixNotice {
                 code: "LIX_TEST_NOTICE".to_string(),
                 message: "test notice".to_string(),
@@ -220,6 +229,7 @@ mod tests {
                 },
             ]],
             columns: vec!["a".to_string()],
+            column_types: vec![ResultColumnType::Null],
             notices: Vec::new(),
         };
 

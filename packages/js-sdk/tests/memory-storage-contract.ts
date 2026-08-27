@@ -33,7 +33,7 @@ export function registerMemoryStorageContract({
 					true,
 					42,
 				]);
-				expect(scalar.rows[0]?.toObject()).toEqual({
+				expect(scalar.rows[0]).toEqual({
 					text: "hello",
 					flag: true,
 					count: 42,
@@ -41,23 +41,24 @@ export function registerMemoryStorageContract({
 
 				const json = { nested: { ok: true }, items: [1, "two", null] };
 				const jsonResult = await lix.execute("SELECT $1 AS value", [json]);
-				expect(jsonResult.rows[0]?.get("value")).toEqual(json);
-				const returnedJson = jsonResult.rows[0]?.get("value") as typeof json;
+				expect(jsonResult.rows[0]?.value).toEqual(json);
+				const returnedJson = jsonResult.rows[0]?.value as typeof json;
 				returnedJson.nested.ok = false;
-				expect(jsonResult.rows[0]?.get("value")).toEqual(json);
+				expect(jsonResult.rows[0]?.value).toEqual({ ...json, nested: { ok: false } });
+				expect(json.nested.ok).toBe(true);
 
 				const bytes = new Uint8Array([0x00, 0x01, 0x7f, 0xff]);
 				const blobResult = await lix.execute("SELECT $1 AS value", [bytes]);
-				const blob = blobResult.rows[0]?.value("value");
-				expect(blob?.kind).toBe("blob");
-				expect(blob?.asBytes()).toEqual(bytes);
-				const returnedBytes = blob?.asBytes();
+				const blob = blobResult.rows[0]?.value as Uint8Array | undefined;
+				expect(blob).toEqual(bytes);
+				const returnedBytes = blob;
 				if (!returnedBytes) throw new Error("expected blob bytes");
 				returnedBytes[0] = 0xff;
-				expect(blob?.asBytes()).toEqual(bytes);
+				expect(blob[0]).toBe(0xff);
+				expect(bytes[0]).toBe(0x00);
 
 				const explicit = await lix.execute("SELECT $1 AS value", [Value.real(1.5)]);
-				expect(explicit.rows[0]?.get("value")).toBe(1.5);
+				expect(explicit.rows[0]?.value).toBe(1.5);
 
 				await expect(
 					lix.execute("SELECT $1 AS value", [Number.NaN]),
@@ -95,7 +96,7 @@ export function registerMemoryStorageContract({
 						"SELECT value FROM lix_key_value WHERE key = $1",
 						["contract-committed"],
 					)
-				).rows[0]?.get("value"),
+				).rows[0]?.value,
 			).toBe("yes");
 
 			const rolledBack = await lix.beginTransaction();
@@ -107,14 +108,14 @@ export function registerMemoryStorageContract({
 				name: "LixError",
 				code: "LIX_INVALID_TRANSACTION_STATE",
 			});
-			expect((await rolledBack.execute("SELECT 1 AS ok")).rows[0]?.get("ok")).toBe(1);
+			expect((await rolledBack.execute("SELECT 1 AS ok")).rows[0]?.ok).toBe(1);
 			await rolledBack.rollback();
 
 			const afterRollback = await lix.execute(
 				"SELECT COUNT(*) AS count FROM lix_key_value WHERE key = $1",
 				["contract-rolled-back"],
 			);
-			expect(afterRollback.rows[0]?.get("count")).toBe(0);
+			expect(afterRollback.rows[0]?.count).toBe(0);
 			await lix.close();
 		});
 
@@ -129,7 +130,7 @@ export function registerMemoryStorageContract({
 				expect(oneStatement).toHaveLength(1);
 				expect(oneStatement[0]?.statementIndex).toBe(0);
 				expect(oneStatement[0]?.label).toBeUndefined();
-				expect(oneStatement[0]?.rows[0]?.get("value")).toBe(
+				expect(oneStatement[0]?.rows[0]?.value).toBe(
 					"one statement",
 				);
 
@@ -157,7 +158,7 @@ export function registerMemoryStorageContract({
 				expect(results[0]?.rowsAffected).toBe(1);
 				expect(results[1]?.rowsAffected).toBe(1);
 				expect(
-					results[2]?.rows.map((row) => row.toObject()),
+					results[2]?.rows.map((row) => row),
 				).toEqual([
 					{ key: "batch-a", value: "first" },
 					{ key: "batch-b", value: "second" },
@@ -204,7 +205,7 @@ export function registerMemoryStorageContract({
 				]);
 				expect(returning[0]?.statementIndex).toBe(0);
 				expect(returning[0]?.rowsAffected).toBe(1);
-				expect(returning[0]?.rows[0]?.toObject()).toEqual({
+				expect(returning[0]?.rows[0]).toEqual({
 					key: "batch-a",
 					value: "updated",
 				});
@@ -212,7 +213,7 @@ export function registerMemoryStorageContract({
 				const executeResult = await lix.execute("SELECT $1 AS value", [
 					"execute remains unchanged",
 				]);
-				expect(executeResult.rows[0]?.get("value")).toBe(
+				expect(executeResult.rows[0]?.value).toBe(
 					"execute remains unchanged",
 				);
 
@@ -304,7 +305,7 @@ export function registerMemoryStorageContract({
 
 			const update = await wait(events.next(), "updated observation");
 			expect(update?.sequence).toBe(1);
-			expect(update?.result.rows[0]?.toObject()).toEqual({
+			expect(update?.result.rows[0]).toEqual({
 				key: "contract-observe",
 				value: "updated",
 			});
@@ -338,7 +339,7 @@ export function registerMemoryStorageContract({
 				const update = await wait(updatePromise, "batch observation");
 				await wait(batch, "atomic batch");
 				expect(update?.sequence).toBe(1);
-				expect(update?.result.rows.map((row) => row.toObject())).toEqual([
+				expect(update?.result.rows.map((row) => row)).toEqual([
 					{ key: "batch-observe-a", value: "first" },
 					{ key: "batch-observe-b", value: "second" },
 				]);
@@ -408,7 +409,7 @@ export function registerMemoryStorageContract({
 					const rows = await lix.execute(
 						"SELECT cells FROM csv_row ORDER BY order_key",
 					);
-					expect(rows.rows.map((row) => row.get("cells"))).toEqual([
+					expect(rows.rows.map((row) => row.cells)).toEqual([
 						["name", "age"],
 						["Ada", "36"],
 						["Grace", "37"],
@@ -464,7 +465,7 @@ async function writeBytes(
 
 async function readTextFile(lix: SqlExecutor, path: string): Promise<string> {
 	const result = await lix.execute("SELECT content FROM lix_file WHERE path = $1", [path]);
-	const bytes = result.rows[0]?.value("content").asBytes();
+	const bytes = result.rows[0]?.content as Uint8Array | undefined;
 	if (!bytes) throw new Error(`expected file at ${path}`);
 	return new TextDecoder().decode(bytes);
 }

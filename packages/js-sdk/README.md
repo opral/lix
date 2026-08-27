@@ -18,7 +18,7 @@ import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
 const result = await lix.execute("SELECT $1 AS message", ["hello"]);
-console.log(result.rows[0]?.get("message"));
+console.log(result.rows[0]?.message);
 await lix.close();
 ```
 
@@ -104,7 +104,7 @@ const result = await lix.execute(
   "SELECT content FROM lix_file WHERE path = $1",
   ["/hello.txt"],
 );
-const bytes = result.rows[0]?.value("content").asBytes();
+const bytes = result.rows[0]?.content as Uint8Array | undefined;
 
 console.log(bytes && new TextDecoder().decode(bytes));
 

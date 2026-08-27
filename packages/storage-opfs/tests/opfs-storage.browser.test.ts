@@ -114,7 +114,7 @@ test("persists a complete local Lix", async () => {
 				await second.execute("SELECT value FROM lix_key_value WHERE key = $1", [
 					"durable-opfs",
 				])
-			).rows[0]?.get("value"),
+			).rows[0]?.value,
 		).toEqual({ value: 42 });
 	} finally {
 		await second.close();
@@ -135,7 +135,7 @@ test("shares a name across Lix workers", async () => {
 				await second.execute("SELECT value FROM lix_key_value WHERE key = $1", [
 					"shared-value",
 				])
-			).rows[0]?.get("value"),
+			).rows[0]?.value,
 		).toEqual({ value: 1 });
 		await second.execute(
 			"UPDATE lix_key_value SET value = $1 WHERE key = $2",
@@ -146,7 +146,7 @@ test("shares a name across Lix workers", async () => {
 				await first.execute("SELECT value FROM lix_key_value WHERE key = $1", [
 					"shared-value",
 				])
-			).rows[0]?.get("value"),
+			).rows[0]?.value,
 		).toEqual({ value: 2 });
 	} finally {
 		await Promise.all([first.close(), second.close()]);
@@ -388,7 +388,7 @@ test("wakes lix.observe after another Lix worker commits", async () => {
 		);
 
 		const update = await withTimeout(changed, 2_000);
-		expect(update?.result.rows[0]?.get("value")).toEqual({ value: 1 });
+		expect(update?.result.rows[0]?.value).toEqual({ value: 1 });
 	} finally {
 		observation.close();
 		await Promise.all([first.close(), second.close()]);
@@ -786,7 +786,7 @@ async function keyValue(
 ): Promise<unknown> {
 	return (
 		await lix.execute("SELECT value FROM lix_key_value WHERE key = $1", [key])
-	).rows[0]?.get("value");
+	).rows[0]?.value;
 }
 
 async function keyValues(
@@ -797,7 +797,7 @@ async function keyValues(
 		"SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
 		keys,
 	);
-	return result.rows.map((row) => [row.get("key"), row.get("value")]);
+	return result.rows.map((row) => [row.key, row.value]);
 }
 
 function keyBytes(index: number): Uint8Array {

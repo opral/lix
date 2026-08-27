@@ -1541,10 +1541,17 @@ pub(super) struct ExecuteResultDto {
     statement_index: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
-    columns: Vec<String>,
+    columns: Vec<ExecuteColumnDto>,
     rows: Vec<Vec<LixValueDto>>,
     rows_affected: f64,
     notices: Vec<LixNoticeDto>,
+}
+
+#[derive(Serialize)]
+struct ExecuteColumnDto {
+    name: String,
+    #[serde(rename = "type")]
+    column_type: lix::ResultColumnType,
 }
 
 impl TryFrom<RsExecuteResult> for ExecuteResultDto {
@@ -1564,7 +1571,13 @@ impl TryFrom<RsExecuteResult> for ExecuteResultDto {
         Ok(Self {
             statement_index: result.statement_index().map(js_index),
             label: result.label().map(str::to_owned),
-            columns: result.columns().to_vec(),
+            columns: result
+                .columns()
+                .iter()
+                .cloned()
+                .zip(result.column_types().iter().copied())
+                .map(|(name, column_type)| ExecuteColumnDto { name, column_type })
+                .collect(),
             rows,
             rows_affected: js_number(result.rows_affected()),
             notices: result

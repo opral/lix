@@ -135,6 +135,12 @@ pub(crate) async fn execute_exact_lix_directory_root_listing(
             "name".to_string(),
             "lixcol_updated_at".to_string(),
         ],
+        column_types: vec![
+            crate::ResultColumnType::Text,
+            crate::ResultColumnType::Text,
+            crate::ResultColumnType::Text,
+            crate::ResultColumnType::Text,
+        ],
         rows,
         notices: Vec::new(),
     })

@@ -25,7 +25,7 @@ test(
 				["warm-reopen"],
 			);
 			samples.push(performance.now() - startedAt);
-			expect(result.rows[0]?.get("value")).toBe("ready");
+			expect(result.rows[0]?.value).toBe("ready");
 			await lix.close();
 		}
 
@@ -61,7 +61,7 @@ test(
 					["local-observer", index],
 				);
 				const event = await withTimeout(changed, 2_000);
-				expect(event?.result.rows[0]?.get("value")).toBe(index);
+				expect(event?.result.rows[0]?.value).toBe(index);
 				samples.push(performance.now() - startedAt);
 			}
 

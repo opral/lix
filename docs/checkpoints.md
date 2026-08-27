@@ -44,7 +44,7 @@ const working = await lix.execute(
 );
 
 for (const row of working.rows) {
-  console.log(row.get("diff_type"), row.get("lixcol_row_pk"));
+  console.log(row.diff_type, row.lixcol_row_pk);
 }
 
 await lix.createCheckpoint();
@@ -56,7 +56,7 @@ const remaining = await lix.execute(
      lix_active_branch_commit_id()
    )`,
 );
-console.assert(remaining.rows[0].get("count") === 0);
+console.assert(remaining.rows[0].count === 0);
 
 await lix.close();
 ```

@@ -31,7 +31,9 @@ pub(crate) use string_dictionary::{
     FastHashBuilder, StringDictionary, StringDictionaryBuilder, fast_hash_builder,
 };
 pub(crate) use timestamp::LixTimestamp;
-pub use types::{Blob, Json, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
+pub use types::{
+    Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, SharedStr, SqlQueryResult, Value,
+};
 pub use wire::{WireQueryResult, WireValue};
 
 /// Renders a JSON value through the public SQL string-column coercion.

@@ -76,7 +76,7 @@ try {
 				const lix = await openLix();
 				try {
 					const query = await lix.execute("SELECT $1 AS message", ["node-wasm"]);
-					console.log(JSON.stringify({ message: query.rows[0]?.get("message") }));
+					console.log(JSON.stringify({ message: query.rows[0]?.message }));
 				} finally {
 					await lix.close();
 				}`,

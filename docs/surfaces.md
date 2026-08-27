@@ -221,7 +221,7 @@ WHERE path = '/orders.md';
 For the server wire protocol, the `$1` parameter is a plain text value such as
 `{ "kind": "text", "value": "# Orders\n" }`. Use a `Uint8Array` parameter
 when the file contains arbitrary non-UTF-8 bytes, and read `content` with
-`row.value("content").asBytes()`.
+`row.content as Uint8Array`.
 
 `length(content)` is character-oriented even though `content` is `BYTEA`. Use
 the standard `OCTET_LENGTH(content)` function to verify the stored byte count;
