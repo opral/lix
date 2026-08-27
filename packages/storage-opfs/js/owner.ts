@@ -24,7 +24,10 @@ type BackendEntry = {
 };
 
 const backends = new Map<string, BackendEntry>();
-const channel = new BroadcastChannel(OPFS_RPC_CHANNEL);
+const ownerUrl = new URL(globalThis.location.href);
+const channel = new BroadcastChannel(
+	ownerUrl.searchParams.get("rpcChannel") ?? OPFS_RPC_CHANNEL,
+);
 const inFlightRequests = new Map<string, Promise<void>>();
 const completedRequests = new Map<string, number>();
 const MAX_WARM_IDLE_BACKENDS = 2;
