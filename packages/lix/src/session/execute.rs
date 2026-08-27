@@ -3628,6 +3628,9 @@ fn profile_result_checksum(checksum: u64, values: &[Value]) -> Result<u64, LixEr
                 let checksum = profile_checksum_bytes(checksum, &[7]);
                 profile_checksum_bytes(checksum, &value.to_le_bytes())
             }
+            Value::RowRef(value) => {
+                profile_checksum_sized_bytes(checksum, 8, value.as_str().as_bytes())
+            }
         };
     }
     Ok(checksum)
