@@ -388,9 +388,9 @@ impl ExecuteResult {
     }
 
     /// Iterates rows with borrowed access to the shared column metadata.
-    pub fn iter(&self) -> impl Iterator<Item = RowRef<'_>> {
+    pub fn iter(&self) -> impl Iterator<Item = ResultRowRef<'_>> {
         let columns = self.columns();
-        self.rows().iter().map(move |row| RowRef {
+        self.rows().iter().map(move |row| ResultRowRef {
             columns,
             values: row.values(),
         })
@@ -707,12 +707,12 @@ fn value_type_error(expected: &str, actual: &Value) -> LixError {
 /// This is the ergonomic path for callers that want `row.get("column")`
 /// without storing column metadata on every owned row.
 #[derive(Debug, Clone, Copy)]
-pub struct RowRef<'a> {
+pub struct ResultRowRef<'a> {
     columns: &'a [String],
     values: &'a [Value],
 }
 
-impl RowRef<'_> {
+impl ResultRowRef<'_> {
     /// Returns the result-set column names in row value order.
     pub fn columns(&self) -> &[String] {
         self.columns

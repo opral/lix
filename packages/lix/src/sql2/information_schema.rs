@@ -19,9 +19,18 @@ use super::catalog::{
     PublicCatalog, PublicColumnInsertPolicy, PublicRelationKind, PublicSurfaceClass,
     PublicSurfaceKind,
 };
-use super::result_metadata::field_is_json;
+use super::result_metadata::{field_is_json, field_is_row_ref};
 
 const LIX_VALUE_KIND_JSONB: &str = "JSONB";
+const LIX_VALUE_KIND_ROW_REF: &str = "ROW_REF";
+
+fn field_value_kind(field: &Field) -> Option<String> {
+    if field_is_row_ref(field) {
+        Some(LIX_VALUE_KIND_ROW_REF.to_owned())
+    } else {
+        field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_owned())
+    }
+}
 const TABLE_FUNCTIONS: &str = "table_functions";
 const LIX_SURFACES: &str = "lix_surfaces";
 
@@ -205,7 +214,7 @@ impl LixInformationSchemaProvider {
                 ordinal_position.push((position + 1) as u64);
                 is_nullable.push(if column.read_nullable { "YES" } else { "NO" }.to_string());
                 data_type.push(public_sql_type(field.data_type()));
-                lix_value_kind.push(field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_string()));
+                lix_value_kind.push(field_value_kind(field));
             }
         }
 
@@ -255,7 +264,7 @@ impl LixInformationSchemaProvider {
                             .push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
                         data_type.push(public_sql_type(field.data_type()));
                         lix_value_kind.push(
-                            field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_string()),
+                            field_value_kind(field),
                         );
                     }
                 }
@@ -286,7 +295,7 @@ impl LixInformationSchemaProvider {
                 ordinal_position.push((position + 1) as u64);
                 is_nullable.push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
                 data_type.push(public_sql_type(field.data_type()));
-                lix_value_kind.push(field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_string()));
+                lix_value_kind.push(field_value_kind(field));
             }
         }
 
@@ -546,7 +555,7 @@ impl ColumnsRows {
             self.datetime_precision.push(None);
             self.interval_type.push(None);
             self.lix_value_kind
-                .push(field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_string()));
+                .push(field_value_kind(field));
             self.lix_insert_policy
                 .push(insert_policy.as_str().to_string());
         }

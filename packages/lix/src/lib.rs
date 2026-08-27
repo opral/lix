@@ -68,6 +68,7 @@ pub(crate) mod domain;
 mod engine;
 pub(crate) mod row_columnar;
 pub(crate) mod row_pk;
+pub(crate) mod row_ref;
 pub(crate) mod filesystem;
 pub(crate) mod functions;
 pub(crate) mod gc;
@@ -171,7 +172,8 @@ pub use lix_schema as schema_v1;
 
 pub use common::LixError;
 pub use common::{
-    Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, SharedStr, SqlQueryResult, Value,
+    Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, RowRef, SharedStr, SqlQueryResult,
+    Value,
 };
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
 pub use common::{LixPath, validate_lix_path_segment};
@@ -185,7 +187,7 @@ pub use session::{
     RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
 pub use session::{
-    ExecuteBatchStatement, ExecuteResult, ObserveEvent, Row, RowRef, TryFromValue,
+    ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row, TryFromValue,
 };
 #[doc(hidden)]
 pub use session::CoherentReadBatch;

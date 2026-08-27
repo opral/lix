@@ -35,6 +35,10 @@ export class Value {
 		return new Value({ kind: "jsonb", value });
 	}
 
+	static rowRef(value: string) {
+		return new Value({ kind: "row_ref", value });
+	}
+
 	static timestamptz(value: string) {
 		return new Value({ kind: "timestamptz", value });
 	}
@@ -164,6 +168,7 @@ function unwrapValue(value: LixValue): unknown {
 		case "text":
 		case "timestamptz":
 		case "jsonb":
+		case "row_ref":
 			return cloneJsonValue(value.value);
 		case "blob":
 			return new Uint8Array(value.value);
@@ -284,6 +289,9 @@ function validateExplicitValue(value: LixValue) {
 		case "jsonb":
 			assertJsonSerializable(value.value, new WeakSet(), 0);
 			return;
+		case "row_ref":
+			if (typeof value.value === "string" && isWellFormedString(value.value)) return;
+			break;
 		case "timestamptz":
 			if (typeof value.value === "string" && !Number.isNaN(Date.parse(value.value))) {
 				return;

@@ -9346,32 +9346,27 @@ where
         let result = self
             .execute_read_sql_statement(query_sql, statement, params)
             .await?;
-        if result.columns.len() != 2 {
+        if result.columns.len() != 1 {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
                 format!(
-                    "diff command query must return relation and row_pk, got {} columns",
+                    "diff command query must return exactly one row_ref column, got {} columns",
                     result.columns.len()
                 ),
             ));
         }
         let mut selections = Vec::with_capacity(result.rows.len());
         for row in result.rows {
-            let [Value::Text(relation), Value::Jsonb(row_pk)] = row.as_slice() else {
+            let [Value::RowRef(row_ref)] = row.as_slice() else {
                 return Err(LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    "diff command query must return non-null relation text and JSONB row_pk values",
+                    "diff command query must return one non-null lix_row_ref value",
                 ));
             };
-            let row_pk = RowPk::from_json_array_text(&row_pk.to_string()).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    format!("row_pk must be a JSON primary-key array: {error}"),
-                )
-            })?;
+            let resolved = crate::row_ref::decode(row_ref)?;
             selections.push(DiffCommandSelection {
-                relation: relation.clone(),
-                row_pk,
+                relation: resolved.relation,
+                row_pk: resolved.row_pk,
                 source_commits: source_commits.clone(),
             });
         }

@@ -57,7 +57,8 @@ use crate::sql2::predicate_typecheck::{
 };
 use crate::sql2::providers::ProviderSelection;
 use crate::sql2::result_metadata::{
-    LIX_VALUE_TYPE_JSONB, LIX_VALUE_TYPE_METADATA_KEY, field_is_json,
+    LIX_VALUE_TYPE_JSONB, LIX_VALUE_TYPE_METADATA_KEY, LIX_VALUE_TYPE_ROW_REF, field_is_json,
+    field_is_row_ref,
 };
 use crate::sql2::session::{
     SqlWriteSessionOptions, build_read_session, build_read_session_at_head,
@@ -3055,6 +3056,10 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
             ScalarValue::Utf8(Some(value.to_string())),
             Some(json_field_metadata()),
         ),
+        Value::RowRef(value) => ScalarAndMetadata::new(
+            ScalarValue::Utf8(Some(value.as_str().to_owned())),
+            Some(row_ref_field_metadata()),
+        ),
         Value::Timestamptz(value) => {
             ScalarValue::TimestampMicrosecond(Some(*value), Some("UTC".into())).into()
         }
@@ -3066,6 +3071,13 @@ fn json_field_metadata() -> FieldMetadata {
     FieldMetadata::new(BTreeMap::from([(
         LIX_VALUE_TYPE_METADATA_KEY.to_string(),
         LIX_VALUE_TYPE_JSONB.to_string(),
+    )]))
+}
+
+fn row_ref_field_metadata() -> FieldMetadata {
+    FieldMetadata::new(BTreeMap::from([(
+        LIX_VALUE_TYPE_METADATA_KEY.to_string(),
+        LIX_VALUE_TYPE_ROW_REF.to_string(),
     )]))
 }
 
@@ -3242,13 +3254,16 @@ enum ColumnCursor<'a> {
 enum TextKind {
     Text,
     Jsonb,
+    RowRef,
 }
 
 fn column_cursor<'a>(
     field: Option<&Field>,
     array: &'a dyn Array,
 ) -> Result<ColumnCursor<'a>, LixError> {
-    let text_kind = if field.is_some_and(field_is_json) {
+    let text_kind = if field.is_some_and(field_is_row_ref) {
+        TextKind::RowRef
+    } else if field.is_some_and(field_is_json) {
         TextKind::Jsonb
     } else {
         TextKind::Text
@@ -3547,6 +3562,7 @@ fn text_value(value: &str, kind: TextKind) -> Value {
         // verbatim. Re-parsing here only rebuilt a DOM that was immediately
         // re-serialized, so the bytes are retained directly instead.
         TextKind::Jsonb => Value::Jsonb(crate::Json::from_canonical_text(value)),
+        TextKind::RowRef => Value::RowRef(crate::RowRef(value.to_owned())),
         TextKind::Text => Value::Text(value.to_owned()),
     }
 }

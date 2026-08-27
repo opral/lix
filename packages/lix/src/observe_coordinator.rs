@@ -88,6 +88,7 @@ enum ObserveParamKey {
     Real(u64),
     Text(String),
     Jsonb(String),
+    RowRef(String),
     Timestamptz(i64),
     Blob(crate::Blob),
 }
@@ -109,6 +110,7 @@ impl ObserveParamKey {
                 })?;
                 Ok(Self::Jsonb(json))
             }
+            Value::RowRef(value) => Ok(Self::RowRef(value.as_str().to_owned())),
             Value::Timestamptz(value) => Ok(Self::Timestamptz(*value)),
             Value::Blob(value) => Ok(Self::Blob(value.clone())),
         }
@@ -123,7 +125,7 @@ impl Hash for ObserveParamKey {
             Self::Boolean(value) => value.hash(state),
             Self::Integer(value) => value.hash(state),
             Self::Real(value) => value.hash(state),
-            Self::Text(value) | Self::Jsonb(value) => value.hash(state),
+            Self::Text(value) | Self::Jsonb(value) | Self::RowRef(value) => value.hash(state),
             Self::Timestamptz(value) => value.hash(state),
             Self::Blob(value) => value.hash(state),
         }

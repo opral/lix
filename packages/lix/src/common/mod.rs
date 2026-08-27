@@ -32,7 +32,8 @@ pub(crate) use string_dictionary::{
 };
 pub(crate) use timestamp::LixTimestamp;
 pub use types::{
-    Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, SharedStr, SqlQueryResult, Value,
+    Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, RowRef, SharedStr, SqlQueryResult,
+    Value,
 };
 pub use wire::{WireQueryResult, WireValue};
 

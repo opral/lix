@@ -11,6 +11,7 @@ mod lix_jsonb;
 mod lix_latest_checkpoint_commit_id;
 mod lix_octet_length;
 mod lix_root_commit_id;
+mod lix_row_ref;
 mod uuidv7;
 
 use std::sync::Arc;
@@ -21,6 +22,13 @@ use datafusion::logical_expr::ScalarUDF;
 use crate::functions::FunctionProviderHandle;
 
 pub(crate) use execution_slots::{ExecutionSlots, execution_slots};
+
+pub(crate) fn register_row_ref_function(
+    ctx: &SessionContext,
+    catalog: Arc<crate::sql2::catalog::PublicCatalog>,
+) {
+    ctx.register_udf(ScalarUDF::from(lix_row_ref::LixRowRef::new(catalog)));
+}
 
 #[cfg(test)]
 pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {

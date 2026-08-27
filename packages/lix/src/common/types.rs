@@ -2,6 +2,8 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::ops::{Deref, Range};
 
+use super::error::LixError;
+
 /// Immutable, cheaply cloned binary SQL value.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
@@ -480,6 +482,12 @@ pub enum Value {
     Real(f64),
     Text(String),
     Jsonb(Json),
+    /// An opaque, relation-qualified logical row address.
+    ///
+    /// Construct values in SQL with `lix_row_ref(...)`. The encoded payload is
+    /// intentionally not a JSON primary-key tuple: callers may retain and bind
+    /// it, but the engine remains responsible for interpreting it.
+    RowRef(RowRef),
     /// PostgreSQL `timestamptz`, represented losslessly as signed UTC
     /// microseconds since the Unix epoch.
     Timestamptz(i64),
@@ -498,6 +506,8 @@ pub enum ResultColumnType {
     Real,
     Text,
     Jsonb,
+    #[serde(rename = "row_ref")]
+    RowRef,
     Timestamptz,
     Blob,
 }
@@ -511,9 +521,39 @@ impl ResultColumnType {
             Value::Real(_) => Self::Real,
             Value::Text(_) => Self::Text,
             Value::Jsonb(_) => Self::Jsonb,
+            Value::RowRef(_) => Self::RowRef,
             Value::Timestamptz(_) => Self::Timestamptz,
             Value::Blob(_) => Self::Blob,
         }
+    }
+}
+
+/// Opaque address of one logical row in one Lix relation.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct RowRef(pub(crate) String);
+
+impl RowRef {
+    /// Validates and retains a canonical encoded row reference received from a
+    /// result or transport boundary.
+    pub fn from_encoded(value: impl Into<String>) -> Result<Self, LixError> {
+        let value = value.into();
+        crate::row_ref::decode_str(&value)?;
+        Ok(Self(value))
+    }
+
+    /// Returns the canonical opaque representation used for SQL parameters and
+    /// wire transport.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RowRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
 

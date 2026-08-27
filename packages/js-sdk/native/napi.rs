@@ -2797,8 +2797,7 @@ impl From<MergeChangeStats> for MergeChangeStatsDto {
 #[napi(object)]
 pub struct MergeConflictDto {
     pub kind: String,
-    pub schema_key: String,
-    pub row_pk: serde_json::Value,
+    pub row_ref: String,
     pub file_id: Option<String>,
     pub target: MergeConflictSideDto,
     pub source: MergeConflictSideDto,
@@ -2808,8 +2807,7 @@ impl From<MergeConflict> for MergeConflictDto {
     fn from(conflict: MergeConflict) -> Self {
         Self {
             kind: merge_conflict_kind_to_string(conflict.kind),
-            schema_key: conflict.schema_key,
-            row_pk: conflict.row_pk,
+            row_ref: conflict.row_ref.to_string(),
             file_id: conflict.file_id,
             target: conflict.target.into(),
             source: conflict.source.into(),
@@ -2903,6 +2901,18 @@ impl TryFrom<LixValue> for Value {
             "jsonb" => Ok(Self::Jsonb(
                 value.value.unwrap_or(serde_json::Value::Null).into(),
             )),
+            "row_ref" => {
+                let encoded = value
+                    .value
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "row_ref value must be a string",
+                        )
+                    })?;
+                Ok(Self::RowRef(lix::RowRef::from_encoded(encoded)?))
+            }
             "timestamptz" => {
                 let raw = value
                     .value
@@ -2981,6 +2991,11 @@ impl TryFrom<&Value> for LixValue {
                 value: Some(value.to_value()),
                 blob: None,
             }),
+            Value::RowRef(value) => Ok(Self {
+                kind: "row_ref".to_string(),
+                value: Some(serde_json::json!(value.as_str())),
+                blob: None,
+            }),
             Value::Timestamptz(value) => {
                 let value = chrono::DateTime::from_timestamp_micros(*value).ok_or_else(|| {
                     LixError::new("LIX_ERROR_JS_SDK_NATIVE", "timestamptz is out of range")
@@ -3027,6 +3042,7 @@ fn result_column_type_name(column_type: lix::ResultColumnType) -> &'static str {
         lix::ResultColumnType::Real => "real",
         lix::ResultColumnType::Text => "text",
         lix::ResultColumnType::Jsonb => "jsonb",
+        lix::ResultColumnType::RowRef => "row_ref",
         lix::ResultColumnType::Timestamptz => "timestamptz",
         lix::ResultColumnType::Blob => "blob",
     }

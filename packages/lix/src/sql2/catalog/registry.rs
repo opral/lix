@@ -23,7 +23,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY,
     HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
 };
-use crate::sql2::result_metadata::json_field;
+use crate::sql2::result_metadata::{json_field, row_ref_field};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PublicCatalog {
@@ -160,8 +160,7 @@ impl PublicCatalog {
             PublicSurfaceKind::Revert
             | PublicSurfaceKind::Apply
             | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![
-                Field::new("relation", DataType::Utf8, false),
-                json_field("row_pk", false),
+                row_ref_field("row_ref", false),
             ])),
             PublicSurfaceKind::Restore => Arc::new(Schema::new(vec![Field::new(
                 "commit_id",
@@ -312,8 +311,7 @@ impl PublicCatalog {
                 PublicSurfaceClass::CommandSink,
                 kind,
                 vec![
-                    PublicColumn::public_insert_only("relation", false),
-                    PublicColumn::public_insert_only("row_pk", false),
+                    PublicColumn::public_insert_only("row_ref", false),
                     PublicColumn::public_read_only("commit_id", false),
                 ],
                 SurfaceCapabilities {

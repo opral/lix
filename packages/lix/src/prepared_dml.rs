@@ -26,6 +26,7 @@ enum PreparedDmlValueKind {
     Real,
     Text,
     Jsonb,
+    RowRef,
     Timestamptz,
     Blob,
 }
@@ -48,6 +49,7 @@ pub(crate) enum PreparedDmlValueRef<'a> {
     Real(f64),
     Text(&'a str),
     Jsonb(&'a [u8]),
+    RowRef(&'a str),
     Timestamptz(i64),
     Blob(&'a [u8]),
 }
@@ -128,6 +130,11 @@ impl PreparedDmlParameterBatch {
                 })?)
             }
             PreparedDmlValueKind::Jsonb => PreparedDmlValueRef::Jsonb(self.slice(cell)),
+            PreparedDmlValueKind::RowRef => PreparedDmlValueRef::RowRef(
+                std::str::from_utf8(self.slice(cell)).map_err(|_| {
+                    LixError::new(LixError::CODE_INVALID_PARAM, "prepared DML row_ref is not UTF-8")
+                })?,
+            ),
             PreparedDmlValueKind::Timestamptz => {
                 PreparedDmlValueRef::Timestamptz(i64::from_le_bytes(cell.scalar))
             }
@@ -156,6 +163,9 @@ impl PreparedDmlParameterBatch {
                 })
             }
             PreparedDmlValueKind::Jsonb => PreparedDmlValueRef::Jsonb(self.slice(cell)),
+            PreparedDmlValueKind::RowRef => PreparedDmlValueRef::RowRef(unsafe {
+                std::str::from_utf8_unchecked(self.slice(cell))
+            }),
             PreparedDmlValueKind::Timestamptz => {
                 PreparedDmlValueRef::Timestamptz(i64::from_le_bytes(cell.scalar))
             }
@@ -188,6 +198,8 @@ impl PreparedDmlParameterBatch {
                             format!("prepared DML JSON parameter is invalid: {error}"),
                         )
                     }),
+                PreparedDmlValueRef::RowRef(value) => crate::row_ref::decode_str(value)
+                    .map(|_| Value::RowRef(crate::RowRef(value.to_owned()))),
                 PreparedDmlValueRef::Timestamptz(value) => Ok(Value::Timestamptz(value)),
                 PreparedDmlValueRef::Blob(value) => Ok(Value::Blob(Blob::from(value.to_vec()))),
             })
@@ -228,6 +240,10 @@ impl PreparedDmlParameterBatch {
                     )
                 })?;
                 Self::set_bytes(&mut cell, bytes, &encoded)?;
+            }
+            Value::RowRef(value) => {
+                cell.kind = PreparedDmlValueKind::RowRef;
+                Self::set_bytes(&mut cell, bytes, value.as_str().as_bytes())?;
             }
             Value::Timestamptz(value) => {
                 cell.kind = PreparedDmlValueKind::Timestamptz;

@@ -272,6 +272,7 @@ enum ParameterKind {
     Real,
     Text,
     Jsonb,
+    RowRef,
     Timestamptz,
     Blob,
 }
@@ -285,6 +286,7 @@ impl ParameterKind {
             Value::Real(_) => Some(Self::Real),
             Value::Text(_) => Some(Self::Text),
             Value::Jsonb(_) => Some(Self::Jsonb),
+            Value::RowRef(_) => Some(Self::RowRef),
             Value::Timestamptz(_) => Some(Self::Timestamptz),
             Value::Blob(_) => Some(Self::Blob),
         }
@@ -295,7 +297,7 @@ impl ParameterKind {
             Self::Boolean => DataType::Boolean,
             Self::Integer => DataType::Int64,
             Self::Real => DataType::Float64,
-            Self::Text | Self::Jsonb => DataType::Utf8,
+            Self::Text | Self::Jsonb | Self::RowRef => DataType::Utf8,
             Self::Timestamptz => DataType::Timestamp(
                 datafusion::arrow::datatypes::TimeUnit::Microsecond,
                 Some("UTC".into()),
@@ -311,6 +313,9 @@ impl ParameterKind {
             (Self::Real, Value::Real(value)) => Ok(ScalarValue::Float64(Some(*value))),
             (Self::Text, Value::Text(value)) => Ok(ScalarValue::Utf8(Some(value.clone()))),
             (Self::Jsonb, Value::Jsonb(value)) => Ok(ScalarValue::Utf8(Some(value.to_string()))),
+            (Self::RowRef, Value::RowRef(value)) => {
+                Ok(ScalarValue::Utf8(Some(value.as_str().to_owned())))
+            }
             (Self::Timestamptz, Value::Timestamptz(value)) => Ok(
                 ScalarValue::TimestampMicrosecond(Some(*value), Some("UTC".into())),
             ),
@@ -318,7 +323,7 @@ impl ParameterKind {
             (Self::Boolean, Value::Null) => Ok(ScalarValue::Boolean(None)),
             (Self::Integer, Value::Null) => Ok(ScalarValue::Int64(None)),
             (Self::Real, Value::Null) => Ok(ScalarValue::Float64(None)),
-            (Self::Text | Self::Jsonb, Value::Null) => Ok(ScalarValue::Utf8(None)),
+            (Self::Text | Self::Jsonb | Self::RowRef, Value::Null) => Ok(ScalarValue::Utf8(None)),
             (Self::Timestamptz, Value::Null) => Ok(ScalarValue::TimestampMicrosecond(
                 None,
                 Some("UTC".into()),

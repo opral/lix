@@ -3534,6 +3534,7 @@ fn returning_column_types(
                         Value::Real(_) => crate::ResultColumnType::Real,
                         Value::Text(_) => crate::ResultColumnType::Text,
                         Value::Jsonb(_) => crate::ResultColumnType::Jsonb,
+                        Value::RowRef(_) => crate::ResultColumnType::RowRef,
                         Value::Timestamptz(_) => crate::ResultColumnType::Timestamptz,
                         Value::Blob(_) => crate::ResultColumnType::Blob,
                     })
@@ -3617,6 +3618,7 @@ fn returning_expr_column_type(
                 Value::Real(_) => crate::ResultColumnType::Real,
                 Value::Text(_) => crate::ResultColumnType::Text,
                 Value::Jsonb(_) => crate::ResultColumnType::Jsonb,
+                Value::RowRef(_) => crate::ResultColumnType::RowRef,
                 Value::Timestamptz(_) => crate::ResultColumnType::Timestamptz,
                 Value::Blob(_) => crate::ResultColumnType::Blob,
             }),
@@ -7485,6 +7487,7 @@ fn value_json(value: &Value) -> JsonValue {
             .unwrap_or(JsonValue::Null),
         Value::Text(value) => JsonValue::String(value.clone()),
         Value::Jsonb(value) => value.to_value(),
+        Value::RowRef(value) => JsonValue::String(value.as_str().to_owned()),
         Value::Timestamptz(value) => JsonValue::from(*value),
         Value::Blob(value) => {
             JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())

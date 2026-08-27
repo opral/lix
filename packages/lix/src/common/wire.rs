@@ -11,6 +11,8 @@ pub enum WireValue {
     Float { value: f64 },
     Text { value: String },
     Jsonb { value: Json },
+    #[serde(rename = "row_ref")]
+    RowRef { value: String },
     Timestamptz { value: String },
     Blob { base64: String },
 }
@@ -49,6 +51,9 @@ impl WireValue {
             Value::Jsonb(value) => Ok(Self::Jsonb {
                 value: value.clone(),
             }),
+            Value::RowRef(value) => Ok(Self::RowRef {
+                value: value.as_str().to_owned(),
+            }),
             Value::Timestamptz(value) => Ok(Self::Timestamptz {
                 value: format_timestamptz(*value)?,
             }),
@@ -77,6 +82,8 @@ impl WireValue {
             }
             Self::Text { value } => Ok(Value::Text(value)),
             Self::Jsonb { value } => Ok(Value::Jsonb(value)),
+            Self::RowRef { value } => crate::row_ref::decode_str(&value)
+                .map(|_| Value::RowRef(crate::RowRef(value))),
             Self::Timestamptz { value } => parse_timestamptz(&value).map(Value::Timestamptz),
             Self::Blob { base64 } => {
                 let decoded = base64::engine::general_purpose::STANDARD

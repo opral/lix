@@ -274,6 +274,15 @@ fn statement_uses_execution_function(statement: &DataFusionStatement, function_n
             {
                 return ControlFlow::Break(());
             }
+            if matches!(
+                self.function_name,
+                "lix_latest_checkpoint_commit_id" | "lix_active_branch_commit_id"
+            ) && let TableFactor::Table { name, args: Some(arguments), .. } = table
+                && crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
+                && arguments.args.len() == 1
+            {
+                return ControlFlow::Break(());
+            }
             ControlFlow::Continue(())
         }
     }

@@ -13,6 +13,7 @@ export type WireValue =
 	| { kind: "float"; value: number }
 	| { kind: "text"; value: string }
 	| { kind: "jsonb"; value: unknown }
+	| { kind: "row_ref"; value: string }
 	| { kind: "timestamptz"; value: string }
 	| { kind: "blob"; base64: string };
 
@@ -180,6 +181,8 @@ export function encodeWireValue(value: NativeLixValue): WireValue {
 			return { kind: "text", value: value.value };
 		case "jsonb":
 			return { kind: "jsonb", value: value.value };
+		case "row_ref":
+			return { kind: "row_ref", value: value.value };
 		case "timestamptz":
 			return { kind: "timestamptz", value: value.value };
 		case "blob":
@@ -267,6 +270,7 @@ function isResultColumnType(
 		value === "real" ||
 		value === "text" ||
 		value === "jsonb" ||
+		value === "row_ref" ||
 		value === "timestamptz" ||
 		value === "blob"
 	);
@@ -615,6 +619,11 @@ function decodeWireValue(value: unknown): NativeLixValue {
 		case "jsonb":
 			assertJsonValue(wire.value, "jsonb wire value");
 			return { kind: "jsonb", value: wire.value };
+		case "row_ref":
+			if (typeof wire.value !== "string") {
+				throw protocolError("row_ref wire value is invalid");
+			}
+			return { kind: "row_ref", value: wire.value };
 		case "timestamptz":
 			if (typeof wire.value !== "string") {
 				throw protocolError("timestamptz wire value is invalid");

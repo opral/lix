@@ -11,9 +11,8 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::LixError;
-use crate::row_pk::RowPk;
 use crate::sql2::error::lix_error_to_datafusion_error;
-use crate::sql2::result_metadata::json_field;
+use crate::sql2::result_metadata::row_ref_field;
 use crate::sql2::{DiffCommand, DiffCommandSelection, SqlWriteContext, WriteAccess};
 
 use super::spec::{InsertApply, PlannedScan, TableSpec, register_spec_table, scan_row_source};
@@ -101,8 +100,7 @@ impl TableSpec for DiffCommandSpec {
 
 fn command_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("relation", DataType::Utf8, false),
-        json_field("row_pk", false),
+        row_ref_field("row_ref", false),
         Field::new("commit_id", DataType::Utf8, false),
     ]))
 }
@@ -110,32 +108,23 @@ fn command_schema() -> SchemaRef {
 fn selections_from_batches(batches: &[RecordBatch]) -> Result<Vec<DiffCommandSelection>> {
     let mut selections = Vec::new();
     for batch in batches {
-        let relations = batch
-            .column_by_name("relation")
-            .ok_or_else(|| DataFusionError::Execution("relation column is required".to_string()))?
+        let row_refs = batch
+            .column_by_name("row_ref")
+            .ok_or_else(|| DataFusionError::Execution("row_ref column is required".to_string()))?
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| DataFusionError::Execution("relation must be text".to_string()))?;
-        let row_pks = batch
-            .column_by_name("row_pk")
-            .ok_or_else(|| DataFusionError::Execution("row_pk column is required".to_string()))?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| DataFusionError::Execution("row_pk must be JSONB".to_string()))?;
-        for index in 0..relations.len() {
-            if relations.is_null(index) || row_pks.is_null(index) {
+            .ok_or_else(|| DataFusionError::Execution("row_ref must be lix_row_ref".to_string()))?;
+        for index in 0..row_refs.len() {
+            if row_refs.is_null(index) {
                 return Err(DataFusionError::Execution(
-                    "relation and row_pk cannot be NULL".to_string(),
+                    "row_ref cannot be NULL".to_string(),
                 ));
             }
-            let row_pk = RowPk::from_json_array_text(row_pks.value(index)).map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "row_pk must be a JSON primary-key array: {error}"
-                ))
-            })?;
+            let resolved = crate::row_ref::decode_str(row_refs.value(index))
+                .map_err(lix_error_to_datafusion_error)?;
             selections.push(DiffCommandSelection {
-                relation: relations.value(index).to_string(),
-                row_pk,
+                relation: resolved.relation,
+                row_pk: resolved.row_pk,
                 source_commits: None,
             });
         }
@@ -148,7 +137,7 @@ fn selections_from_batches(batches: &[RecordBatch]) -> Result<Vec<DiffCommandSel
         .any(|pair| pair[0].relation == pair[1].relation && pair[0].row_pk == pair[1].row_pk)
     {
         return Err(DataFusionError::Execution(
-            "diff command selection contains duplicate (relation, row_pk) rows".to_string(),
+            "diff command selection contains duplicate row_ref values".to_string(),
         ));
     }
     Ok(selections)

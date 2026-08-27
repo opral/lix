@@ -42,7 +42,7 @@ pub use context::SessionContext;
 pub(crate) use context::{SessionBranch, load_default_branch_id_from_index};
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{
-    CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, Row, RowRef,
+    CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ResultRowRef, Row,
     TryFromValue,
 };
 pub(crate) use execute::{ExecutionDisposition, FileRead};

@@ -1350,8 +1350,7 @@ impl From<lix::MergeChangeStats> for MergeChangeStatsDto {
 #[serde(rename_all = "camelCase")]
 struct MergeConflictDto {
     kind: &'static str,
-    schema_key: String,
-    row_pk: serde_json::Value,
+    row_ref: String,
     file_id: Option<String>,
     target: MergeConflictSideDto,
     source: MergeConflictSideDto,
@@ -1361,8 +1360,7 @@ impl From<lix::MergeConflict> for MergeConflictDto {
     fn from(conflict: lix::MergeConflict) -> Self {
         Self {
             kind: "sameRowChanged",
-            schema_key: conflict.schema_key,
-            row_pk: conflict.row_pk,
+            row_ref: conflict.row_ref.to_string(),
             file_id: conflict.file_id,
             target: conflict.target.into(),
             source: conflict.source.into(),
@@ -1480,6 +1478,13 @@ impl TryFrom<LixValueDto> for Value {
             "jsonb" => Ok(Self::Jsonb(
                 value.value.unwrap_or(serde_json::Value::Null).into(),
             )),
+            "row_ref" => {
+                let encoded = value
+                    .value
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or_else(|| invalid_param("row_ref value must be a string"))?;
+                Ok(Self::RowRef(lix::RowRef::from_encoded(encoded)?))
+            }
             "timestamptz" => {
                 let raw = value
                     .value
@@ -1513,6 +1518,7 @@ impl TryFrom<&Value> for LixValueDto {
             Value::Real(_) => return Err(invalid_param("cannot encode non-finite real value")),
             Value::Text(value) => ("text", Some(serde_json::json!(value)), None),
             Value::Jsonb(value) => ("jsonb", Some(value.to_value()), None),
+            Value::RowRef(value) => ("row_ref", Some(serde_json::json!(value.as_str())), None),
             Value::Timestamptz(value) => {
                 let value = chrono::DateTime::from_timestamp_micros(*value)
                     .ok_or_else(|| invalid_param("timestamptz is out of range"))?;
