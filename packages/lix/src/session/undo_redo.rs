@@ -197,7 +197,7 @@ where
     let local_operation_key = semantic_key(branch_id)?;
     let marker_schemas = [UNDO_REDO_MARKER_SCHEMA_KEY.to_string()];
     let marker_delta = {
-        let mut tracked = transaction.tracked_state_reader().await;
+        let mut tracked = transaction.tracked_state_reader().await?;
         tracked
             .commit_delta_values_for_schemas(commit_id, &marker_schemas)
             .await?
@@ -290,7 +290,7 @@ where
         return Ok((SemanticState::default(), delta));
     }
     let rows = {
-        let mut tracked = transaction.tracked_state_reader().await;
+        let mut tracked = transaction.tracked_state_reader().await?;
         tracked
             .load_projected_batch_at_commit(
                 &commit_id.to_string(),
@@ -341,7 +341,7 @@ where
     let branch_pk = RowPk::uuid_from_canonical(branch_id)
         .map_err(|error| LixError::new(LixError::CODE_INVALID_PARAM, error.to_string()))?;
     let rows = {
-        let mut tracked = transaction.tracked_state_reader().await;
+        let mut tracked = transaction.tracked_state_reader().await?;
         tracked
             .load_projected_batch_at_commit(
                 &commit_id.to_string(),
@@ -407,7 +407,7 @@ async fn load_commit_delta<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut tracked = transaction.tracked_state_reader().await;
+    let mut tracked = transaction.tracked_state_reader().await?;
     tracked.commit_delta_members(commit_id).await
 }
 
@@ -420,7 +420,7 @@ where
 {
     transaction
         .commit_graph_reader()
-        .await
+        .await?
         .load_node(&commit_id)
         .await?
         .ok_or_else(|| {
@@ -468,7 +468,7 @@ where
     } else {
         let visible_schema_keys = transaction.visible_schema_keys()?;
         let dependency_commit = if desired_is_target { current } else { desired };
-        let mut tracked = transaction.tracked_state_reader().await;
+        let mut tracked = transaction.tracked_state_reader().await?;
         tracked
             .descriptor_dependency_closure(
                 &current.to_string(),

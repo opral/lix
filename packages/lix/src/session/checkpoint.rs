@@ -69,7 +69,7 @@ where
             let (previous_recovery, mut gc_state) =
                 transaction.checkpoint_publication_state(&branch_id).await?;
             let head_commit_id = {
-                let reader = transaction.branch_ref_reader().await;
+                let reader = transaction.branch_ref_reader().await?;
                 BranchLifecycle::new(&reader)
                     .require_existing_commit_id(
                         &branch_id,
