@@ -5689,7 +5689,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    const TEST_REMOTE: &str = "https://sync.example/repository";
+    const TEST_REMOTE: &str = "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001";
 
     #[derive(Clone, Default)]
     struct SyncAccountingStorage {
@@ -7390,7 +7390,7 @@ mod tests {
         storage.gate_bootstrap_commits(2);
         let (first_result, second_result) = tokio::join!(
             first.try_install_initial_sync_snapshot(
-                "https://sync.example/first",
+                "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000003",
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
                 &history.commits,
@@ -7399,7 +7399,7 @@ mod tests {
                 &checkpoint_roots,
             ),
             second.try_install_initial_sync_snapshot(
-                "https://sync.example/second",
+                "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000004",
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
                 &history.commits,
@@ -7430,7 +7430,7 @@ mod tests {
         ) {
             second
                 .try_install_initial_sync_snapshot(
-                    "https://sync.example/second",
+                    "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000004",
                     crate::ANONYMOUS_ACCOUNT_ID,
                     &snapshot,
                     &history.commits,
@@ -7442,7 +7442,7 @@ mod tests {
         } else {
             first
                 .try_install_initial_sync_snapshot(
-                    "https://sync.example/first",
+                    "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000003",
                     crate::ANONYMOUS_ACCOUNT_ID,
                     &snapshot,
                     &history.commits,

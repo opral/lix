@@ -5,7 +5,6 @@ import type {
 import type { NativeLixValue } from "../value.js";
 
 export const SERVER_PROTOCOL_VERSION = 5;
-export const SERVER_PROTOCOL_PATH = "/lix/v1/";
 
 export type WireValue =
 	| { kind: "null"; value: null }

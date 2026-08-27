@@ -2,6 +2,7 @@
 
 #![cfg_attr(test, allow(clippy::large_futures))]
 
+use super::PROTOCOL_VERSION;
 use crate::engine::Engine;
 use crate::session::ExecuteOptions;
 #[cfg(test)]
@@ -13,9 +14,13 @@ use crate::sync::{
 };
 use bytes::Bytes;
 use futures_core::Stream;
+use futures_util::StreamExt as _;
 use http::{
     HeaderMap, HeaderName, Method, Request, Response as HttpResponse, StatusCode,
-    header::{ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE},
+    header::{
+        ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
+        CONTENT_TYPE, RANGE,
+    },
 };
 use http_body::{Body, Frame, SizeHint};
 use lix::storage::{Storage, StorageSession};
@@ -41,8 +46,13 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, Notify, mpsc, watch},
+    io::DuplexStream,
+    sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch},
     task::JoinHandle,
+};
+use tokio_util::{
+    compat::TokioAsyncWriteCompatExt as _,
+    io::ReaderStream,
 };
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
@@ -261,35 +271,36 @@ impl Event {
 
 /// Stable URL prefix owned by the Lix Server Protocol.
 pub const PROTOCOL_PATH: &str = "/lix/v1";
-/// Current wire protocol version.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// Media type of a complete deterministic Lix snapshot.
+pub const SNAPSHOT_MEDIA_TYPE: &str = "application/vnd.lix.snapshot";
 /// Canonical method and path registry for protocol hosts and conformance tools.
 pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
-    ("GET", "/lix/v1"),
-    ("DELETE", "/lix/v1/session"),
-    ("POST", "/lix/v1/execute"),
-    ("POST", "/lix/v1/execute-batch"),
-    ("POST", "/lix/v1/sync/push"),
-    ("GET", "/lix/v1/sync/pull"),
-    ("GET", "/lix/v1/sync/history"),
-    ("GET", "/lix/v1/sync/blob"),
-    ("POST", "/lix/v1/sync/blob"),
-    ("GET", "/lix/v1/sync/chunk"),
-    ("PUT", "/lix/v1/sync/chunk"),
-    ("POST", "/lix/v1/transaction/begin"),
-    ("POST", "/lix/v1/transaction/execute"),
-    ("POST", "/lix/v1/transaction/commit"),
-    ("POST", "/lix/v1/transaction/rollback"),
-    ("GET", "/lix/v1/file"),
-    ("POST", "/lix/v1/file/upsert"),
-    ("POST", "/lix/v1/file/upsert-batch"),
-    ("POST", "/lix/v1/branch/create"),
-    ("POST", "/lix/v1/checkpoint/create"),
-    ("POST", "/lix/v1/undo"),
-    ("POST", "/lix/v1/redo"),
-    ("POST", "/lix/v1/branch/switch"),
-    ("POST", "/lix/v1/observe"),
-    ("POST", "/lix/v1/observe/multiplex"),
+    ("GET", "/lix/v1/{lix_id}"),
+    ("DELETE", "/lix/v1/{lix_id}/session"),
+    ("POST", "/lix/v1/{lix_id}/execute"),
+    ("POST", "/lix/v1/{lix_id}/execute-batch"),
+    ("POST", "/lix/v1/{lix_id}/sync/push"),
+    ("GET", "/lix/v1/{lix_id}/sync/pull"),
+    ("GET", "/lix/v1/{lix_id}/sync/history"),
+    ("GET", "/lix/v1/{lix_id}/sync/blob"),
+    ("POST", "/lix/v1/{lix_id}/sync/blob"),
+    ("GET", "/lix/v1/{lix_id}/sync/chunk"),
+    ("PUT", "/lix/v1/{lix_id}/sync/chunk"),
+    ("POST", "/lix/v1/{lix_id}/transaction/begin"),
+    ("POST", "/lix/v1/{lix_id}/transaction/execute"),
+    ("POST", "/lix/v1/{lix_id}/transaction/commit"),
+    ("POST", "/lix/v1/{lix_id}/transaction/rollback"),
+    ("GET", "/lix/v1/{lix_id}/file"),
+    ("POST", "/lix/v1/{lix_id}/file/upsert"),
+    ("POST", "/lix/v1/{lix_id}/file/upsert-batch"),
+    ("POST", "/lix/v1/{lix_id}/branch/create"),
+    ("POST", "/lix/v1/{lix_id}/checkpoint/create"),
+    ("POST", "/lix/v1/{lix_id}/undo"),
+    ("POST", "/lix/v1/{lix_id}/redo"),
+    ("POST", "/lix/v1/{lix_id}/branch/switch"),
+    ("POST", "/lix/v1/{lix_id}/observe"),
+    ("POST", "/lix/v1/{lix_id}/observe/multiplex"),
+    ("GET", "/lix/v1/{lix_id}/snapshot"),
 ];
 /// Header carrying the opaque server-issued session capability.
 pub const SESSION_ID_HEADER: &str = "lix-session-id";
@@ -333,6 +344,8 @@ pub const DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
 /// Maximum bytes held by one raw file-download response body at a time.
 const FILE_READ_STREAM_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+const SNAPSHOT_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_CONCURRENT_SNAPSHOT_EXPORTS: usize = 1;
 
 const SESSION_TOKEN_BYTES: usize = 32;
 const SESSION_TOKEN_HEX_LEN: usize = SESSION_TOKEN_BYTES * 2;
@@ -428,12 +441,19 @@ impl Default for ServerProtocolOptions {
 
 /// Configures opening a repository as a Lix Server Protocol session factory.
 ///
-/// Await directly for default limits, or set protocol-specific limits first
-/// with [`Self::with_options`].
+/// Select a host identity with [`Self::with_lix_id`] or
+/// [`Self::with_embedded_lix_id`], then await with default limits or set
+/// protocol-specific limits first with [`Self::with_options`].
 #[expect(missing_debug_implementations)]
 pub struct ServeLixBuilder<S> {
     open: OpenLixBuilder<S>,
     options: ServerProtocolOptions,
+    identity: Option<ServeLixIdentity>,
+}
+
+enum ServeLixIdentity {
+    Host(String),
+    Embedded,
 }
 
 impl<S> ServeLixBuilder<S> {
@@ -441,12 +461,33 @@ impl<S> ServeLixBuilder<S> {
         Self {
             open,
             options: ServerProtocolOptions::default(),
+            identity: None,
         }
     }
 
     /// Sets resource limits for this repository's protocol sessions.
     pub fn with_options(mut self, options: ServerProtocolOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Binds this server to the host's immutable Lix resource ID.
+    ///
+    /// Hosts use this ID in `/lix/v1/{lix_id}`. It is deliberately separate
+    /// from the portable identity stored inside a snapshot, so restoring the
+    /// same snapshot does not force every host to reuse one URL.
+    pub fn with_lix_id(mut self, lix_id: impl Into<String>) -> Self {
+        self.identity = Some(ServeLixIdentity::Host(lix_id.into()));
+        self
+    }
+
+    /// Explicitly uses the identity embedded in the Lix as its host URL ID.
+    ///
+    /// This is useful for single-host tools and tests. Hosts that can restore
+    /// one snapshot into multiple independently addressed resources must use
+    /// [`Self::with_lix_id`] instead.
+    pub fn with_embedded_lix_id(mut self) -> Self {
+        self.identity = Some(ServeLixIdentity::Embedded);
         self
     }
 }
@@ -462,14 +503,42 @@ where
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 validate_server_protocol_options(self.options)?;
+                let identity = self.identity.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "serving requires with_lix_id() or with_embedded_lix_id()",
+                    )
+                })?;
+                if let ServeLixIdentity::Host(lix_id) = &identity {
+                    validate_server_lix_id(lix_id)?;
+                }
                 let engine = self.open.open_protocol_engine().await?;
+                let lix_id = match identity {
+                    ServeLixIdentity::Host(lix_id) => lix_id,
+                    ServeLixIdentity::Embedded => engine.lix_id().to_owned(),
+                };
+                validate_server_lix_id(&lix_id)?;
                 Ok(LixServerProtocol::from_engine(
                     Arc::new(engine),
                     self.options,
+                    lix_id,
                 ))
             })
         })
     }
+}
+
+fn validate_server_lix_id(lix_id: &str) -> Result<(), LixError> {
+    let canonical_lix_id = uuid::Uuid::parse_str(lix_id)
+        .ok()
+        .map(|id| id.hyphenated().to_string());
+    if canonical_lix_id.as_deref() != Some(lix_id) {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "Lix Server Protocol resource ID must be a canonical UUID",
+        ));
+    }
+    Ok(())
 }
 
 /// Persistent canonical protocol server for one Lix repository.
@@ -500,11 +569,13 @@ struct ServerInner<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    lix_id: String,
     engine: Arc<Engine<StorageSession<S>>>,
     options: ServerProtocolOptions,
     registry: AsyncMutex<HashMap<String, Arc<SessionRecord<S>>>>,
     request_blob_budget: Arc<RequestBlobCacheBudget>,
     session_open_gate: Arc<SessionOpenGate>,
+    active_operations: Arc<ActiveOperationGate>,
     close_started: Once,
     close_result: watch::Sender<Option<Result<(), LixError>>>,
 }
@@ -517,6 +588,94 @@ struct SessionOpenGate {
 
 struct PendingSessionOpen {
     gate: Arc<SessionOpenGate>,
+}
+
+struct ActiveOperationGate {
+    state: AtomicUsize,
+    drained: Notify,
+    closing: watch::Sender<bool>,
+}
+
+struct ActiveOperation {
+    gate: Arc<ActiveOperationGate>,
+    closing: watch::Receiver<bool>,
+}
+
+impl Default for ActiveOperationGate {
+    fn default() -> Self {
+        let (closing, _) = watch::channel(false);
+        Self {
+            state: AtomicUsize::new(0),
+            drained: Notify::new(),
+            closing,
+        }
+    }
+}
+
+impl ActiveOperationGate {
+    fn reserve(self: &Arc<Self>, max_active: usize) -> Result<ActiveOperation, ApiError> {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & SESSION_OPEN_GATE_CLOSING != 0 {
+                return Err(ApiError::server_closed());
+            }
+            if state & SESSION_OPEN_GATE_COUNT_MASK >= max_active {
+                return Err(ApiError::snapshot_capacity());
+            }
+            assert!(
+                state & SESSION_OPEN_GATE_COUNT_MASK < SESSION_OPEN_GATE_COUNT_MASK,
+                "active operation count overflow"
+            );
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(ActiveOperation {
+                        gate: Arc::clone(self),
+                        closing: self.closing.subscribe(),
+                    });
+                }
+                Err(current) => state = current,
+            }
+        }
+    }
+
+    fn start_closing(&self) {
+        self.state
+            .fetch_or(SESSION_OPEN_GATE_CLOSING, Ordering::AcqRel);
+        self.closing.send_replace(true);
+    }
+
+    fn active(&self) -> usize {
+        self.state.load(Ordering::Acquire) & SESSION_OPEN_GATE_COUNT_MASK
+    }
+}
+
+impl ActiveOperation {
+    async fn cancelled(&mut self) {
+        loop {
+            if *self.closing.borrow() {
+                return;
+            }
+            if self.closing.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for ActiveOperation {
+    fn drop(&mut self) {
+        let previous = self.gate.state.fetch_sub(1, Ordering::AcqRel);
+        let previous_active = previous & SESSION_OPEN_GATE_COUNT_MASK;
+        debug_assert!(previous_active > 0, "active operation count underflow");
+        if previous_active == 1 {
+            self.gate.drained.notify_one();
+        }
+    }
 }
 
 impl SessionOpenGate {
@@ -1118,7 +1277,7 @@ where
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
         let record = Arc::clone(&self.record);
-        let (cancel_on_drop, mut cancelled) = tokio::sync::oneshot::channel::<()>();
+        let (cancel_on_drop, mut cancelled) = oneshot::channel::<()>();
         let result = self.run_detached(
             async move {
                 let mut transactions = record.transactions.lock().await;
@@ -1375,12 +1534,156 @@ fn method_not_allowed() -> Response {
 }
 
 fn not_found() -> Response {
+    protocol_not_found().into_response()
+}
+
+fn protocol_not_found() -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
         "LIX_ERROR_PROTOCOL_PATH_NOT_FOUND",
         "the path is not part of the Lix Server Protocol",
     )
-    .into_response()
+}
+
+fn targeted_protocol_request(
+    mut request: ServerProtocolRequest,
+    expected_lix_id: &str,
+) -> Result<ServerProtocolRequest, ApiError> {
+    let Some(targeted_path) = request.uri().path().strip_prefix("/lix/v1/") else {
+        return Err(protocol_not_found());
+    };
+    let (lix_id, operation) = targeted_path
+        .split_once('/')
+        .map_or((targeted_path, ""), |(lix_id, operation)| {
+            (lix_id, operation)
+        });
+    let canonical_id = uuid::Uuid::parse_str(lix_id)
+        .ok()
+        .map(|id| id.hyphenated().to_string());
+    if canonical_id.as_deref() != Some(lix_id) || lix_id != expected_lix_id {
+        return Err(protocol_not_found());
+    }
+
+    let operation_path = if operation.is_empty() {
+        format!("{PROTOCOL_PATH}/")
+    } else {
+        format!("{PROTOCOL_PATH}/{operation}")
+    };
+    let path_and_query = request.uri().query().map_or(operation_path.clone(), |query| {
+        format!("{operation_path}?{query}")
+    });
+    let mut parts = request.uri().clone().into_parts();
+    parts.path_and_query = Some(path_and_query.parse().expect("canonical protocol URI"));
+    *request.uri_mut() = http::Uri::from_parts(parts).expect("canonical protocol URI parts");
+    Ok(request)
+}
+
+async fn export_snapshot_response<S>(
+    server: LixServerProtocol<S>,
+    durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
+) -> Response
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let mut operation = match server
+        .inner
+        .active_operations
+        .reserve(MAX_CONCURRENT_SNAPSHOT_EXPORTS)
+    {
+        Ok(operation) => operation,
+        Err(error) => return error.into_response(),
+    };
+    let lix_id = server.lix_id().to_owned();
+    let (reader, writer) = tokio::io::duplex(SNAPSHOT_STREAM_BUFFER_BYTES);
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let (terminal_sender, terminal_signal) = TerminalStorageStreamSignal::new();
+    tokio::spawn(async move {
+        let mut writer = writer.compat_write();
+        let result = {
+            let export = server.export_snapshot().write_to(&mut writer);
+            tokio::pin!(export);
+            tokio::select! {
+                result = &mut export => result,
+                () = operation.cancelled() => Err(LixError::new(
+                    LixError::CODE_CLOSED,
+                    "snapshot export cancelled because the protocol server is closing",
+                )),
+            }
+        };
+        if let Err(error) = &result {
+            terminal_sender.signal_if_terminal(error);
+            if let Some(notifier) = &durable_terminal_storage_notifier {
+                notifier.signal_if_terminal(error);
+            }
+        }
+        drop(writer);
+        let _ = completion_tx.send(result);
+    });
+
+    let mut body_stream = Box::pin(snapshot_body_stream(reader, completion_rx));
+    let Some(first) = futures_util::StreamExt::next(&mut body_stream).await else {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LixError::CODE_INTERNAL_ERROR,
+            "snapshot export produced no bytes",
+        )
+        .into_response();
+    };
+    let first = match first {
+        Ok(first) => first,
+        Err(error) => {
+            if let Some(error) = error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<LixError>())
+            {
+                return ApiError::from(error.clone()).into_response();
+            }
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                LixError::CODE_INTERNAL_ERROR,
+                format!("snapshot export failed: {error}"),
+            )
+            .into_response();
+        }
+    };
+    let stream = futures_util::stream::once(async move { Ok(first) }).chain(body_stream);
+    let mut response = HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, SNAPSHOT_MEDIA_TYPE)
+        .header(CACHE_CONTROL, "no-store, no-transform")
+        .header(
+            CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{lix_id}.lixsnap\""),
+        )
+        .body(ServerProtocolBody::stream(stream))
+        .expect("snapshot response headers are valid");
+    response.extensions_mut().insert(terminal_signal);
+    response
+}
+
+fn snapshot_body_stream(
+    reader: DuplexStream,
+    completion: oneshot::Receiver<Result<crate::snapshot::SnapshotExportReport, LixError>>,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
+    async_stream::stream! {
+        let mut reader = ReaderStream::new(reader);
+        while let Some(chunk) = futures_util::StreamExt::next(&mut reader).await {
+            yield chunk;
+        }
+        match completion.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => yield Err(io::Error::other(error)),
+            Err(_) => yield Err(io::Error::other("snapshot export task stopped unexpectedly")),
+        }
+    }
+}
+
+fn is_known_operation_path(path: &str) -> bool {
+    SERVER_PROTOCOL_ENDPOINTS.iter().any(|(_, endpoint)| {
+        endpoint
+            .strip_prefix("/lix/v1/{lix_id}")
+            .is_some_and(|suffix| format!("{PROTOCOL_PATH}{suffix}") == path)
+    })
 }
 
 impl<S> LixServerProtocol<S>
@@ -1390,11 +1693,13 @@ where
     fn from_engine(
         engine: Arc<Engine<StorageSession<S>>>,
         options: ServerProtocolOptions,
+        lix_id: String,
     ) -> Self {
         engine.sync_mode().set_role(crate::sync::SyncRole::Authority);
         let (close_result, _) = watch::channel(None);
         Self {
             inner: Arc::new(ServerInner {
+                lix_id,
                 engine,
                 options,
                 registry: AsyncMutex::new(HashMap::new()),
@@ -1402,6 +1707,7 @@ where
                     options.max_request_blob_cache_bytes,
                 )),
                 session_open_gate: Arc::new(SessionOpenGate::default()),
+                active_operations: Arc::new(ActiveOperationGate::default()),
                 close_started: Once::new(),
                 close_result,
             }),
@@ -1410,10 +1716,11 @@ where
 
     /// Handles one canonical protocol request.
     ///
-    /// Hosts authenticate before calling this method, strip their outer
-    /// repository prefix, decompress the request body, and pass the resulting
-    /// trusted principal through `context`. The protocol owns every method and
-    /// path beginning at [`PROTOCOL_PATH`].
+    /// Hosts authenticate and resolve the target Lix before calling this
+    /// method, decompress the request body, and pass the resulting trusted
+    /// principal through `context`. The request retains its complete canonical
+    /// `/lix/v1/{lix_id}` path; this handler verifies the ID and dispatches the
+    /// operation against its already-open Lix.
     pub fn handle(
         &self,
         request: ServerProtocolRequest,
@@ -1421,6 +1728,10 @@ where
     ) -> impl Future<Output = ServerProtocolResponse> + 'static {
         let server = self.clone();
         async move {
+            let request = match targeted_protocol_request(request, &server.inner.lix_id) {
+                Ok(request) => request,
+                Err(error) => return error.into_response(),
+            };
             let mut response = Box::pin(server.dispatch(request, context)).await;
             response
                 .headers_mut()
@@ -1453,6 +1764,25 @@ where
                 Err(error) => return error.into_response(),
             };
             return result_response(Box::pin(handshake(self, query, parts.headers, context)).await);
+        }
+
+        if path == "/lix/v1/snapshot" {
+            if method != Method::GET {
+                return method_not_allowed();
+            }
+            if matches!(context.principal, ServerProtocolPrincipal::Anonymous) {
+                return ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "LIX_ERROR_UNAUTHENTICATED",
+                    "snapshot export requires an authenticated principal",
+                )
+                .into_response();
+            }
+            return export_snapshot_response(
+                self,
+                context.durable_terminal_storage_notifier.clone(),
+            )
+            .await;
         }
 
         if path == "/lix/v1/session" {
@@ -1644,11 +1974,7 @@ where
             (&Method::POST, "/lix/v1/observe/multiplex") => result_response(
                 observe_multiplex(lease, json_request!(MultiplexObserveRequest)).await,
             ),
-            (_, known)
-                if SERVER_PROTOCOL_ENDPOINTS
-                    .iter()
-                    .any(|(_, path)| *path == known) =>
-            {
+            (_, known) if is_known_operation_path(known) => {
                 method_not_allowed()
             }
             _ => not_found(),
@@ -1660,8 +1986,13 @@ where
     ///
     /// The export shares the server's existing storage session, so hosts do
     /// not need to open a second engine behind a live protocol runtime.
-    pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<S> {
+    pub(crate) fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<S> {
         crate::snapshot::SnapshotExportBuilder::new(self.inner.engine.storage())
+    }
+
+    /// Returns the immutable ID addressed by this protocol instance.
+    pub fn lix_id(&self) -> &str {
+        &self.inner.lix_id
     }
 
     /// Returns whether this server can be dropped without invalidating a live
@@ -1677,6 +2008,9 @@ where
         if self.inner.session_open_gate.pending() != 0 {
             return false;
         }
+        if self.inner.active_operations.active() != 0 {
+            return false;
+        }
         let now = Instant::now();
         registry
             .values()
@@ -1689,6 +2023,7 @@ where
         let mut close_result = self.inner.close_result.subscribe();
         self.inner.close_started.call_once(|| {
             self.inner.session_open_gate.start_closing();
+            self.inner.active_operations.start_closing();
             let server = self.clone();
             tokio::spawn(async move {
                 let closing_server = server.clone();
@@ -1718,6 +2053,9 @@ where
     async fn close_once(&self) -> Result<(), LixError> {
         while self.inner.session_open_gate.pending() != 0 {
             self.inner.session_open_gate.drained.notified().await;
+        }
+        while self.inner.active_operations.active() != 0 {
+            self.inner.active_operations.drained.notified().await;
         }
         let sessions = {
             let mut registry = self.inner.registry.lock().await;
@@ -3741,7 +4079,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             body: ErrorEnvelope::from_parts(
                 "LIX_ERROR_PROTOCOL_SESSION_REQUIRED",
-                "Lix-Session-Id is required; initialize the client with GET /lix/v1",
+                "Lix-Session-Id is required; initialize the client with GET /lix/v1/{lix_id}",
                 None,
                 None,
             ),
@@ -3802,6 +4140,18 @@ impl ApiError {
                 "LIX_ERROR_PROTOCOL_SESSION_CAPACITY",
                 "all Lix protocol session slots are currently active",
                 Some("retry after an active request or observation stream closes".to_string()),
+                None,
+            ),
+        }
+    }
+
+    fn snapshot_capacity() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: ErrorEnvelope::from_parts(
+                "LIX_ERROR_PROTOCOL_SNAPSHOT_CAPACITY",
+                "a snapshot export is already active for this Lix",
+                Some("retry after the active snapshot export completes".to_string()),
                 None,
             ),
         }
@@ -4902,37 +5252,41 @@ mod tests {
     #[test]
     fn openapi_contains_every_canonical_method_and_path() {
         let openapi = include_str!("../../server-protocol.openapi.yaml");
+        assert!(openapi.contains(&format!(
+            "protocolVersion: {{ type: integer, const: {PROTOCOL_VERSION} }}"
+        )));
         for (method, path) in SERVER_PROTOCOL_ENDPOINTS {
             assert!(
                 openapi.contains(&format!("  {path}:")),
                 "OpenAPI is missing {path}"
             );
             let operation_id = match (*method, *path) {
-                ("GET", "/lix/v1") => "handshake",
-                ("DELETE", "/lix/v1/session") => "deleteSession",
-                ("POST", "/lix/v1/execute") => "execute",
-                ("POST", "/lix/v1/execute-batch") => "executeBatch",
-                ("POST", "/lix/v1/sync/push") => "syncPush",
-                ("GET", "/lix/v1/sync/pull") => "syncPull",
-                ("GET", "/lix/v1/sync/history") => "syncHistory",
-                ("GET", "/lix/v1/sync/blob") => "syncGetBlobs",
-                ("POST", "/lix/v1/sync/blob") => "syncRegisterBlob",
-                ("GET", "/lix/v1/sync/chunk") => "syncGetChunk",
-                ("PUT", "/lix/v1/sync/chunk") => "syncPutChunk",
-                ("POST", "/lix/v1/transaction/begin") => "beginTransaction",
-                ("POST", "/lix/v1/transaction/execute") => "transactionExecute",
-                ("POST", "/lix/v1/transaction/commit") => "commitTransaction",
-                ("POST", "/lix/v1/transaction/rollback") => "rollbackTransaction",
-                ("GET", "/lix/v1/file") => "readFile",
-                ("POST", "/lix/v1/file/upsert") => "upsertFile",
-                ("POST", "/lix/v1/file/upsert-batch") => "upsertFileBatch",
-                ("POST", "/lix/v1/branch/create") => "createBranch",
-                ("POST", "/lix/v1/checkpoint/create") => "createCheckpoint",
-                ("POST", "/lix/v1/undo") => "undo",
-                ("POST", "/lix/v1/redo") => "redo",
-                ("POST", "/lix/v1/branch/switch") => "switchBranch",
-                ("POST", "/lix/v1/observe") => "observe",
-                ("POST", "/lix/v1/observe/multiplex") => "observeMultiplex",
+                ("GET", "/lix/v1/{lix_id}") => "handshake",
+                ("DELETE", "/lix/v1/{lix_id}/session") => "deleteSession",
+                ("POST", "/lix/v1/{lix_id}/execute") => "execute",
+                ("POST", "/lix/v1/{lix_id}/execute-batch") => "executeBatch",
+                ("POST", "/lix/v1/{lix_id}/sync/push") => "syncPush",
+                ("GET", "/lix/v1/{lix_id}/sync/pull") => "syncPull",
+                ("GET", "/lix/v1/{lix_id}/sync/history") => "syncHistory",
+                ("GET", "/lix/v1/{lix_id}/sync/blob") => "syncGetBlobs",
+                ("POST", "/lix/v1/{lix_id}/sync/blob") => "syncRegisterBlob",
+                ("GET", "/lix/v1/{lix_id}/sync/chunk") => "syncGetChunk",
+                ("PUT", "/lix/v1/{lix_id}/sync/chunk") => "syncPutChunk",
+                ("POST", "/lix/v1/{lix_id}/transaction/begin") => "beginTransaction",
+                ("POST", "/lix/v1/{lix_id}/transaction/execute") => "transactionExecute",
+                ("POST", "/lix/v1/{lix_id}/transaction/commit") => "commitTransaction",
+                ("POST", "/lix/v1/{lix_id}/transaction/rollback") => "rollbackTransaction",
+                ("GET", "/lix/v1/{lix_id}/file") => "readFile",
+                ("POST", "/lix/v1/{lix_id}/file/upsert") => "upsertFile",
+                ("POST", "/lix/v1/{lix_id}/file/upsert-batch") => "upsertFileBatch",
+                ("POST", "/lix/v1/{lix_id}/branch/create") => "createBranch",
+                ("POST", "/lix/v1/{lix_id}/checkpoint/create") => "createCheckpoint",
+                ("POST", "/lix/v1/{lix_id}/undo") => "undo",
+                ("POST", "/lix/v1/{lix_id}/redo") => "redo",
+                ("POST", "/lix/v1/{lix_id}/branch/switch") => "switchBranch",
+                ("POST", "/lix/v1/{lix_id}/observe") => "observe",
+                ("POST", "/lix/v1/{lix_id}/observe/multiplex") => "observeMultiplex",
+                ("GET", "/lix/v1/{lix_id}/snapshot") => "exportSnapshot",
                 _ => panic!("endpoint registry needs an OpenAPI operation mapping"),
             };
             assert!(
@@ -5093,6 +5447,7 @@ mod tests {
         S: Storage + Clone + Send + Sync + 'static,
     {
         async fn oneshot(self, mut request: Request<Body>) -> Result<Response, Infallible> {
+            target_test_request(&mut request, self.server.lix_id());
             let durable_terminal_storage_notifier = request
                 .extensions_mut()
                 .remove::<DurableTerminalStorageNotifier>();
@@ -5107,6 +5462,27 @@ mod tests {
                 )
                 .await)
         }
+    }
+
+    fn target_test_request(request: &mut Request<Body>, lix_id: &str) {
+        let path = request.uri().path();
+        let suffix = if path == PROTOCOL_PATH {
+            ""
+        } else if let Some(suffix) = path
+            .strip_prefix(PROTOCOL_PATH)
+            .filter(|suffix| suffix.starts_with('/'))
+        {
+            suffix
+        } else {
+            return;
+        };
+        let targeted_path = format!("{PROTOCOL_PATH}/{lix_id}{suffix}");
+        let path_and_query = request.uri().query().map_or(targeted_path.clone(), |query| {
+            format!("{targeted_path}?{query}")
+        });
+        let mut parts = request.uri().clone().into_parts();
+        parts.path_and_query = Some(path_and_query.parse().expect("test protocol URI"));
+        *request.uri_mut() = http::Uri::from_parts(parts).expect("test protocol URI parts");
     }
 
     fn handler<S>(server: LixServerProtocol<S>) -> Router<S>
@@ -5916,7 +6292,7 @@ mod tests {
         storage.expire_next_read();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve should retry repository admission");
         assert_eq!(storage.expired_reads.load(Ordering::Acquire), 1);
@@ -5928,7 +6304,7 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server.clone());
@@ -5972,7 +6348,7 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6013,7 +6389,7 @@ mod tests {
         lix.close().await.expect("close setup session");
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6045,7 +6421,7 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let lease = server
@@ -6240,7 +6616,7 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6291,7 +6667,7 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6372,7 +6748,7 @@ mod tests {
         let storage = FailOneBlockedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6460,7 +6836,7 @@ mod tests {
         let storage = FailOneBlockedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6539,7 +6915,7 @@ mod tests {
 
     async fn app_with_options(options: ServerProtocolOptions) -> TestApp {
         let server = open_lix()
-            .serve()
+            .serve().with_embedded_lix_id()
             .with_options(options)
             .await
             .expect("serve lix");
@@ -6553,7 +6929,7 @@ mod tests {
     {
         let server = open_lix()
             .with_storage(storage)
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve Lix");
         handler(server)
@@ -6953,7 +7329,7 @@ mod tests {
         let storage = PostCommitUnknownStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -7006,7 +7382,7 @@ mod tests {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let server = open_lix()
             .with_telemetry(Arc::new(OpenTelemetryTracingSink::new(dispatch)))
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -7444,7 +7820,7 @@ mod tests {
             .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
                 captured.lock().expect("spans").push(span);
             })))
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -8240,10 +8616,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_snapshot_route_streams_the_canonical_export() {
+        let app = app().await;
+        let uri = format!("/lix/v1/{}/snapshot", app.server.lix_id());
+        let response = app
+            .server
+            .handle(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("snapshot request"),
+                ServerProtocolContext {
+                    principal: ServerProtocolPrincipal::Authenticated {
+                        account_id: lix::SYSTEM_ACCOUNT_ID.to_owned(),
+                        idempotency_scope: "snapshot-test".to_owned(),
+                    },
+                    durable_terminal_storage_notifier: None,
+                },
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static(SNAPSHOT_MEDIA_TYPE))
+        );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&http::HeaderValue::from_static("no-store, no-transform"))
+        );
+        assert!(
+            terminal_storage_stream_signal(&response).is_some(),
+            "snapshot streams must expose late terminal storage failures to hosts"
+        );
+        let streamed = response
+            .into_body()
+            .collect()
+            .await
+            .expect("snapshot stream")
+            .to_bytes();
+        let mut direct = Vec::new();
+        app.server
+            .export_snapshot()
+            .write_to(&mut direct)
+            .await
+            .expect("direct snapshot export");
+        assert_eq!(streamed.as_ref(), direct);
+    }
+
+    #[tokio::test]
+    async fn snapshot_failure_before_headers_preserves_terminal_storage_metadata() {
+        let storage = FencedReadStorage::new();
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .expect("serve snapshot source");
+        storage.fence_reads();
+        let (notifier, signal) = durable_terminal_storage_signal();
+        let uri = format!("/lix/v1/{}/snapshot", server.lix_id());
+        let response = server
+            .handle(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("snapshot request"),
+                ServerProtocolContext {
+                    principal: ServerProtocolPrincipal::Authenticated {
+                        account_id: lix::SYSTEM_ACCOUNT_ID.to_owned(),
+                        idempotency_scope: "snapshot-terminal-test".to_owned(),
+                    },
+                    durable_terminal_storage_notifier: Some(notifier),
+                },
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(is_terminal_storage_response(&response));
+        assert_eq!(error_code(response).await, LixError::CODE_STORAGE_FENCED);
+        assert!(signal.wait_for_terminal_storage().await);
+    }
+
+    #[test]
+    fn snapshot_operation_gate_bounds_concurrency_and_reopens_after_drop() {
+        let gate = Arc::new(ActiveOperationGate::default());
+        let first = gate.reserve(MAX_CONCURRENT_SNAPSHOT_EXPORTS).unwrap();
+        let second = gate.reserve(MAX_CONCURRENT_SNAPSHOT_EXPORTS);
+        let Err(error) = second else {
+            panic!("a second concurrent snapshot export must be rejected");
+        };
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.body.error.code,
+            "LIX_ERROR_PROTOCOL_SNAPSHOT_CAPACITY"
+        );
+
+        drop(first);
+        assert!(gate.reserve(MAX_CONCURRENT_SNAPSHOT_EXPORTS).is_ok());
+    }
+
+    #[tokio::test]
+    async fn snapshot_route_rejects_anonymous_and_mutating_requests() {
+        let app = app().await;
+        let path = format!("/lix/v1/{}/snapshot", app.server.lix_id());
+        let anonymous = app
+            .server
+            .handle(
+                Request::builder()
+                    .uri(&path)
+                    .body(Body::empty())
+                    .expect("anonymous snapshot request"),
+                ServerProtocolContext::anonymous(),
+            )
+            .await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let mutation = app
+            .server
+            .handle(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("snapshot mutation request"),
+                ServerProtocolContext {
+                    principal: ServerProtocolPrincipal::Authenticated {
+                        account_id: lix::SYSTEM_ACCOUNT_ID.to_owned(),
+                        idempotency_scope: "snapshot-test".to_owned(),
+                    },
+                    durable_terminal_storage_notifier: None,
+                },
+            )
+            .await;
+        assert_eq!(mutation.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn protocol_rejects_a_request_targeted_at_another_lix() {
+        let app = app().await;
+        let response = app
+            .server
+            .handle(
+                Request::builder()
+                    .uri("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc")
+                    .body(Body::empty())
+                    .expect("mismatched target request"),
+                ServerProtocolContext::anonymous(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn trusted_account_binding_overrides_creation_and_rejects_cross_account_resume() {
         let app = app().await;
         let create = Request::builder()
-            .uri("/lix/v1")
+            .uri(format!("/lix/v1/{}", app.server.lix_id()))
             .body(Body::empty())
             .expect("trusted handshake request");
         let response = app
@@ -8265,7 +8793,7 @@ mod tests {
         let session_id = body["sessionId"].as_str().expect("session id");
 
         let resume = Request::builder()
-            .uri("/lix/v1")
+            .uri(format!("/lix/v1/{}", app.server.lix_id()))
             .header(SESSION_ID_HEADER, session_id)
             .body(Body::empty())
             .expect("cross-account resume request");
@@ -8280,7 +8808,7 @@ mod tests {
         );
 
         let changed_scope = Request::builder()
-            .uri("/lix/v1")
+            .uri(format!("/lix/v1/{}", app.server.lix_id()))
             .header(SESSION_ID_HEADER, session_id)
             .body(Body::empty())
             .expect("changed-scope resume request");
@@ -8308,7 +8836,7 @@ mod tests {
             idempotency_scope: "sync-account-binding".to_string(),
         };
         let handshake = Request::builder()
-            .uri("/lix/v1")
+            .uri(format!("/lix/v1/{}", app.server.lix_id()))
             .body(Body::empty())
             .expect("trusted handshake request");
         let response = app
@@ -8337,7 +8865,7 @@ mod tests {
         });
         let push = Request::builder()
             .method(Method::POST)
-            .uri("/lix/v1/sync/push")
+            .uri(format!("/lix/v1/{}/sync/push", app.server.lix_id()))
             .header(SESSION_ID_HEADER, session_id)
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
@@ -11312,7 +11840,7 @@ mod tests {
         );
         let server = open_lix()
             .with_telemetry(Arc::new(OpenTelemetryTracingSink::new(dispatch)))
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve lix");
         let app = TestApp {
@@ -11515,7 +12043,7 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 ..ServerProtocolOptions::default()
@@ -11575,7 +12103,7 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 ..ServerProtocolOptions::default()
@@ -11752,7 +12280,7 @@ mod tests {
         lix.close().await.expect("close setup session");
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: SESSION_COUNT,
                 ..ServerProtocolOptions::default()
@@ -11996,7 +12524,7 @@ mod tests {
         let storage = BlockingReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
@@ -12061,7 +12589,7 @@ mod tests {
         let storage = BlockingReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -12093,7 +12621,7 @@ mod tests {
         let storage = BlockingReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -12142,7 +12670,7 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
@@ -12216,7 +12744,7 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
@@ -12394,7 +12922,7 @@ mod tests {
         let storage = BlockingFencedBranchControlReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve()
+            .serve().with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -12480,9 +13008,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serving_requires_an_explicit_host_identity_policy() {
+        let Err(error) = open_lix().serve().await else {
+            panic!("serving without an identity policy must fail");
+        };
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("with_lix_id"));
+    }
+
+    #[tokio::test]
     async fn zero_capacity_is_rejected() {
         let result = open_lix()
-            .serve()
+            .serve().with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 0,
                 session_idle_timeout: Duration::from_secs(1),
@@ -12495,7 +13032,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = open_lix()
-            .serve()
+            .serve().with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_request_blob_cache_bytes: 0,
                 ..ServerProtocolOptions::default()
@@ -12511,7 +13048,7 @@ mod tests {
     async fn sync_replica_configuration_cannot_be_served_as_an_authority() {
         let result = open_lix()
             .with_server(lix::ServerOptions::sync("https://example.invalid/repository"))
-            .serve()
+            .serve().with_embedded_lix_id()
             .await;
         let Err(error) = result else {
             panic!("sync replica configuration must not open as an authority");
@@ -12541,7 +13078,7 @@ mod tests {
             .await
             .expect("persist replica identity");
 
-        let result = open_lix().with_storage(storage).serve().await;
+        let result = open_lix().with_storage(storage).serve().with_embedded_lix_id().await;
         let Err(error) = result else {
             panic!("persisted sync replica must not be promoted to authority");
         };

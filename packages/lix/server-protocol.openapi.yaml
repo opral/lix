@@ -1,19 +1,18 @@
 openapi: 3.1.0
 info:
   title: Lix Server Protocol
-  version: "3"
+  version: "1"
   description: Canonical HTTP surface implemented by lix::server_protocol.
 servers:
-  - url: https://host.example/{repositoryPrefix}
-    variables:
-      repositoryPrefix:
-        default: repositories/example
+  - url: https://host.example
 security:
   - bearerAuth: []
   - cookieAuth: []
   - {}
 paths:
-  /lix/v1:
+  /lix/v1/{lix_id}:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     get:
       operationId: handshake
       parameters:
@@ -31,14 +30,18 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Handshake" }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/session:
+  /lix/v1/{lix_id}/session:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     delete:
       operationId: deleteSession
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
       responses:
         "204": { description: Session deleted. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/execute:
+  /lix/v1/{lix_id}/execute:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: execute
       parameters:
@@ -51,7 +54,9 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Execute" }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/execute-batch:
+  /lix/v1/{lix_id}/execute-batch:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: executeBatch
       parameters:
@@ -79,7 +84,9 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/ExecuteResponse" }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/sync/push:
+  /lix/v1/{lix_id}/sync/push:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: syncPush
       description: Atomically stores at most 512 total immutable commits plus compare-and-swap branch-ref updates. Commit identity makes retries idempotent; oversized batches must be split on dependency-complete boundaries.
@@ -97,7 +104,9 @@ paths:
           description: The branch no longer has the expected head, or an immutable identity names different content.
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/sync/pull:
+  /lix/v1/{lix_id}/sync/pull:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     get:
       operationId: syncPull
       description: Returns a hot-state snapshot when after is omitted. Otherwise long-polls complete repository commit/ref events after a repository cursor.
@@ -134,7 +143,9 @@ paths:
           description: The encoded response exceeds the 64 MiB protocol limit.
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/sync/history:
+  /lix/v1/{lix_id}/sync/history:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     get:
       operationId: syncHistory
       description: Fetches one bounded first-parent history page without changing live sync state.
@@ -156,7 +167,9 @@ paths:
           description: The encoded response exceeds the 64 MiB protocol limit.
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/sync/blob:
+  /lix/v1/{lix_id}/sync/blob:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     get:
       operationId: syncGetBlobs
       description: Loads up to 16 canonical FastCDC manifests by their BLAKE3-derived blob identities.
@@ -189,7 +202,9 @@ paths:
           description: Missing chunks to upload, or confirmation that the blob is complete.
           content: { application/json: { schema: { $ref: "#/components/schemas/SyncBlobRegistration" } } }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/sync/chunk:
+  /lix/v1/{lix_id}/sync/chunk:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     get:
       operationId: syncGetChunk
       description: Loads one authenticated raw BLAKE3-addressed chunk.
@@ -220,7 +235,9 @@ paths:
       responses:
         "204": { description: Chunk is durably present. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/transaction/begin:
+  /lix/v1/{lix_id}/transaction/begin:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: beginTransaction
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -234,7 +251,9 @@ paths:
                 required: [transactionId]
                 properties: { transactionId: { type: string } }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/transaction/execute:
+  /lix/v1/{lix_id}/transaction/execute:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: transactionExecute
       parameters:
@@ -247,7 +266,9 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Execute" }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/transaction/commit:
+  /lix/v1/{lix_id}/transaction/commit:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: commitTransaction
       parameters:
@@ -256,7 +277,9 @@ paths:
       responses:
         "204": { description: Transaction committed. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/transaction/rollback:
+  /lix/v1/{lix_id}/transaction/rollback:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: rollbackTransaction
       parameters:
@@ -265,7 +288,9 @@ paths:
       responses:
         "204": { description: Transaction rolled back. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/file:
+  /lix/v1/{lix_id}/file:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     get:
       operationId: readFile
       parameters:
@@ -278,7 +303,9 @@ paths:
         "200": { $ref: "#/components/responses/File" }
         "206": { $ref: "#/components/responses/File" }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/file/upsert:
+  /lix/v1/{lix_id}/file/upsert:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: upsertFile
       parameters:
@@ -299,7 +326,9 @@ paths:
         "200": { $ref: "#/components/responses/Execute" }
         "308": { description: Resumable upload part accepted. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/file/upsert-batch:
+  /lix/v1/{lix_id}/file/upsert-batch:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: upsertFileBatch
       parameters:
@@ -313,7 +342,9 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Execute" }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/branch/create:
+  /lix/v1/{lix_id}/branch/create:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: createBranch
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -331,28 +362,36 @@ paths:
       responses:
         "200": { description: Branch created. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/checkpoint/create:
+  /lix/v1/{lix_id}/checkpoint/create:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: createCheckpoint
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
       responses:
         "200": { description: Checkpoint created. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/undo:
+  /lix/v1/{lix_id}/undo:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: undo
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
       responses:
         "200": { description: Undo committed. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/redo:
+  /lix/v1/{lix_id}/redo:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: redo
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
       responses:
         "200": { description: Redo committed. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/branch/switch:
+  /lix/v1/{lix_id}/branch/switch:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: switchBranch
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -367,7 +406,9 @@ paths:
       responses:
         "200": { description: Session switched. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/observe:
+  /lix/v1/{lix_id}/observe:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: observe
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -378,7 +419,9 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/EventStream" }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/observe/multiplex:
+  /lix/v1/{lix_id}/observe/multiplex:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
     post:
       operationId: observeMultiplex
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -403,11 +446,39 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/EventStream" }
         default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/snapshot:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    get:
+      operationId: exportSnapshot
+      description: Streams a deterministic complete point-in-time copy of the Lix.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Canonical Lix snapshot stream.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: "no-store, no-transform" }
+          content:
+            application/vnd.lix.snapshot:
+              schema: { type: string, format: binary }
+        default: { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bearerAuth: { type: http, scheme: bearer }
     cookieAuth: { type: apiKey, in: cookie, name: session }
   parameters:
+    LixId:
+      name: lix_id
+      in: path
+      required: true
+      description: Immutable canonical Lix UUID.
+      schema:
+        type: string
+        format: uuid
+        pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
     SessionId:
       name: Lix-Session-Id
       in: header
@@ -474,7 +545,7 @@ components:
       type: object
       required: [protocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
-        protocolVersion: { type: integer, const: 4 }
+        protocolVersion: { type: integer, const: 5 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }

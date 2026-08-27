@@ -283,7 +283,7 @@ test("browser sync resolves fresh headers for reconnect requests", async () => {
 	let generation = 0;
 	const client = new LixWorkerClient(transport.connection);
 	client.beginLease(undefined, undefined, {
-		url: "https://example.test/repository",
+		url: "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 		headers: async () => ({ Authorization: `Bearer token-${++generation}` }),
 	});
 
@@ -311,7 +311,7 @@ test("browser sync custom fetch crosses the worker boundary", async () => {
 	const seen: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
 	const client = new LixWorkerClient(transport.connection);
 	client.beginLease(undefined, undefined, {
-		url: "https://example.test/repository",
+		url: "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 		fetch: async (input, init) => {
 			seen.push({ input, init });
 			return new Response("ok", {
@@ -325,7 +325,7 @@ test("browser sync custom fetch crosses the worker boundary", async () => {
 		kind: "sync.fetch",
 		requestId: 7,
 		request: {
-			url: "https://example.test/repository/lix/v1/sync/pull",
+			url: "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/sync/pull",
 			method: "GET",
 			headers: [["authorization", "Bearer fresh"]],
 			credentials: "include",
@@ -366,7 +366,7 @@ test("browser sync cancels a streamed response at the Rust byte limit", async ()
 	let fetchAborted = false;
 	const client = new LixWorkerClient(transport.connection);
 	client.beginLease(undefined, undefined, {
-		url: "https://example.test/repository",
+		url: "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 		fetch: async (_input, init) => {
 			init?.signal?.addEventListener("abort", () => {
 				fetchAborted = true;
@@ -389,7 +389,7 @@ test("browser sync cancels a streamed response at the Rust byte limit", async ()
 		kind: "sync.fetch",
 		requestId: 9,
 		request: {
-			url: "https://example.test/repository/lix/v1/sync/pull",
+			url: "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/sync/pull",
 			method: "GET",
 			headers: [],
 			responseLimit: 4,
@@ -423,7 +423,7 @@ test("browser sync cancellation aborts the bridged fetch", async () => {
 	let aborted = false;
 	const client = new LixWorkerClient(transport.connection);
 	client.beginLease(undefined, undefined, {
-		url: "https://example.test/repository",
+		url: "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 		fetch: async (_input, init) =>
 			await new Promise<Response>((_resolve, reject) => {
 				init?.signal?.addEventListener(
@@ -441,7 +441,7 @@ test("browser sync cancellation aborts the bridged fetch", async () => {
 		kind: "sync.fetch",
 		requestId: 8,
 		request: {
-			url: "https://example.test/repository/lix/v1/sync/pull",
+			url: "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/sync/pull",
 			method: "GET",
 			headers: [],
 			responseLimit: 1024,

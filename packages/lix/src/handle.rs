@@ -668,6 +668,13 @@ async fn open_lix_inner<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    let server = match server {
+        Some(mut server) => {
+            server.url = crate::sync::normalize_sync_locator(&server.url)?.locator;
+            Some(server)
+        }
+        None => None,
+    };
     let open_progress: Arc<dyn OpenProgressSink> = retained_progress.clone();
     let admission = ensure_current_repository(&storage, Some(&open_progress)).await?;
     let mut open_report = admission.report;
@@ -692,7 +699,7 @@ where
     let (reopened_sync_account_id, mut prepared_sync) = if let Some(server) = server.as_ref() {
         match crate::sync::inspect_sync_bootstrap_with_adapter(
             &admission.adapter,
-            server.url.trim_end_matches('/'),
+            &server.url,
         )
         .await?
         {
@@ -1654,6 +1661,28 @@ mod tests {
                 None
             }
         })
+    }
+
+    #[tokio::test]
+    async fn invalid_sync_locator_is_rejected_before_storage_initialization() {
+        let storage = Memory::new();
+        let result = open_lix()
+            .with_storage(storage.clone())
+            .with_server(ServerOptions::sync("https://example.test/not-a-lix"))
+            .await;
+        let Err(error) = result else {
+            panic!("invalid sync locator must fail");
+        };
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+
+        let lix = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("open untouched storage");
+        assert!(
+            lix.open_report().initialized,
+            "the rejected sync open must leave initialization to the next valid open"
+        );
     }
 
     #[tokio::test]

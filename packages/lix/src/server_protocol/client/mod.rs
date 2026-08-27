@@ -961,10 +961,12 @@ fn normalize_protocol_base_url(value: &str) -> Result<String, LixError> {
             "openLix() remote server url must be an absolute URL",
         )
     })?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+    if parsed.scheme() != "https"
+        && !(parsed.scheme() == "http" && is_loopback_host(&parsed))
+    {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
-            "openLix() remote server url must use http or https",
+            "openLix() remote server url must use https (http is allowed only for loopback development)",
         ));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
@@ -973,13 +975,43 @@ fn normalize_protocol_base_url(value: &str) -> Result<String, LixError> {
             "openLix() remote server url must not contain a query or fragment",
         ));
     }
-    let mut path = parsed.path().trim_end_matches('/').to_owned();
-    if !path.ends_with("/lix/v1") {
-        path.push_str("/lix/v1");
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "openLix() remote server url must not contain credentials",
+        ));
     }
-    path.push('/');
-    parsed.set_path(&path);
+    let locator_path = parsed.path();
+    let Some(lix_id) = locator_path.strip_prefix("/lix/") else {
+        return Err(invalid_lix_locator());
+    };
+    if lix_id.contains('/') {
+        return Err(invalid_lix_locator());
+    }
+    let canonical_id = uuid::Uuid::parse_str(lix_id)
+        .ok()
+        .map(|id| id.hyphenated().to_string());
+    if canonical_id.as_deref() != Some(lix_id) {
+        return Err(invalid_lix_locator());
+    }
+    parsed.set_path(&format!("/lix/v1/{lix_id}/"));
     Ok(parsed.to_string())
+}
+
+fn is_loopback_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn invalid_lix_locator() -> LixError {
+    LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        "openLix() remote server url path must be exactly /lix/{uuid}",
+    )
 }
 
 fn maybe_compress_json(body: Vec<u8>) -> Result<(Bytes, bool), LixError> {

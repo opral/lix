@@ -8,7 +8,7 @@ Collaboration requires a Lix server. The server connects users and devices
 through one shared repository.
 
 Use [LixRay](https://lixray.com/docs) for a hosted Lix server, or
-[host a Lix server yourself](./hosting.md). Once you have a repository URL,
+[host a Lix server yourself](./hosting.md). Once you have a Lix connection URL,
 choose how each client connects.
 
 ## Choose a client mode
@@ -33,7 +33,7 @@ import { openLix } from "@lix-js/sdk";
 const lix = await openLix({
   server: {
     mode: "remote",
-    url: repositoryUrl,
+		url: lixConnectionUrl,
   },
 });
 ```
@@ -62,7 +62,7 @@ const lix = await openLix({
   }),
   server: {
     mode: "sync",
-    url: repositoryUrl,
+		url: lixConnectionUrl,
     headers: async () => ({
       Authorization: `Bearer ${await getAccessToken()}`,
     }),
@@ -70,9 +70,10 @@ const lix = await openLix({
 });
 ```
 
-The repository URL identifies the server repository. The OPFS name identifies
-its local working copy within the current browser origin. Use a stable OPFS
-name for each repository.
+The Lix connection URL identifies the hosted Lix. It is an absolute HTTPS URL
+whose path is exactly `/lix/{uuid}`; HTTP is accepted only on loopback. The OPFS
+name identifies its local working copy within the current browser origin. Use a
+stable OPFS name for each Lix.
 
 Reads and writes execute locally. They do not wait for a server round trip,
 which makes sync mode suitable for responsive editors and interactive apps.

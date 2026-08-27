@@ -38,7 +38,6 @@ server-protocol-client = [
   "dep:async-stream",
   "dep:flate2",
   "dep:futures-core",
-  "dep:url",
   "tokio/sync",
 ]
 
@@ -171,7 +170,8 @@ web-time = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 futures-io = "0.3"
 futures-lite = "2"
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["io-util", "rt", "sync"] }
+tokio-util = { version = "0.7", features = ["compat", "io"] }
 tracing = "0.1"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
@@ -190,7 +190,7 @@ getrandom = { version = "0.3", optional = true }
 http = "1"
 http-body = { version = "1", optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
-url = { version = "2", optional = true }
+url = "2"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 wasmparser = { version = "0.247", features = ["component-model"] }
 wasmtime = { version = "45", default-features = false, features = ["cache", "component-model", "cranelift", "runtime", "std"], optional = true }

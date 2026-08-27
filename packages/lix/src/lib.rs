@@ -32,6 +32,8 @@
     )
 )]
 
+pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 5;
+
 // Let implementation modules use the same `lix::...` paths as external
 // consumers now that the former engine and SDK share one crate.
 extern crate self as lix;

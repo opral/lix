@@ -136,7 +136,7 @@ async fn inspect_tier(
 pub(crate) async fn prepare_sync_bootstrap(
     server: &crate::ServerOptions,
 ) -> Result<PreparedSyncBootstrap, LixError> {
-    let remote_id = server.url.trim_end_matches('/');
+    let remote_id = server.url.as_str();
     let transport = HttpSyncTransport::connect(remote_id, &server.headers).await?;
     let (snapshot, lix_id, default_branch_id) =
         runtime::fetch_repository_snapshot(&transport).await?;
@@ -172,7 +172,7 @@ where
     }
     let install = lix
         .try_install_initial_sync_snapshot(
-            server.url.trim_end_matches('/'),
+            &server.url,
             prepared.transport.active_account_id(),
             &prepared.snapshot.metadata,
             &prepared.snapshot.commits,
@@ -192,7 +192,7 @@ where
             let adapter = lix.storage_adapter();
             let _ = inspect_sync_bootstrap_with_adapter(
                 &adapter,
-                server.url.trim_end_matches('/'),
+                &server.url,
             )
             .await?;
             Err(restart_open_error())
@@ -201,7 +201,7 @@ where
         Err(error) => Err(
             reconcile_install_error(
                 &lix.storage_adapter(),
-                server.url.trim_end_matches('/'),
+                &server.url,
                 error,
             )
             .await,
@@ -357,11 +357,11 @@ mod tests {
     async fn malformed_durable_replica_state_fails_closed() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_malformed_replica_state(&visible, "https://sync.example/repository").await;
-        store_malformed_replica_state(&durable, "https://sync.example/repository").await;
+        store_malformed_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_malformed_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
         let storage = tiered(visible, durable);
 
-        let error = inspect_sync_bootstrap(&storage, "https://sync.example/repository")
+        let error = inspect_sync_bootstrap(&storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
             .await
             .expect_err("malformed durable state must not trigger a fresh bootstrap");
         assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
@@ -373,12 +373,12 @@ mod tests {
     async fn visible_replica_state_is_publishing_not_ready() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/repository").await;
+        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
         let storage = tiered(visible, durable);
         let adapter = StorageAdapter::new(storage);
 
         assert_eq!(
-            inspect_once(&adapter, "https://sync.example/repository")
+            inspect_once(&adapter, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
                 .await
                 .expect("bootstrap state should inspect"),
             BootstrapInspection::Publishing,
@@ -389,13 +389,13 @@ mod tests {
     async fn durable_exact_remote_is_the_ready_witness() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/repository").await;
-        store_replica_state(&durable, "https://sync.example/repository").await;
+        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
         let storage = tiered(visible, durable);
         let adapter = StorageAdapter::new(storage);
 
         assert_eq!(
-            inspect_once(&adapter, "https://sync.example/repository")
+            inspect_once(&adapter, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
                 .await
                 .expect("bootstrap state should inspect"),
             BootstrapInspection::Ready {
@@ -409,11 +409,11 @@ mod tests {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
         for storage in [&visible, &durable] {
-            store_replica_state(storage, "https://sync.example/repository").await;
-            store_replica_state(storage, "https://sync.example/other").await;
+            store_replica_state(storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+            store_replica_state(storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
         }
         let storage = tiered(visible, durable);
-        let error = inspect_sync_bootstrap(&storage, "https://sync.example/repository")
+        let error = inspect_sync_bootstrap(&storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
             .await
             .expect_err("multiple durable remotes must fail closed");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
@@ -424,14 +424,14 @@ mod tests {
     async fn visible_ambiguous_binding_prevents_ready_admission() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/repository").await;
-        store_replica_state(&visible, "https://sync.example/other").await;
-        store_replica_state(&durable, "https://sync.example/repository").await;
+        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
+        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
         let storage = tiered(visible, durable);
         let adapter = StorageAdapter::new(storage);
 
         assert_eq!(
-            inspect_once(&adapter, "https://sync.example/repository")
+            inspect_once(&adapter, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
                 .await
                 .expect("bootstrap state should inspect"),
             BootstrapInspection::Publishing,
@@ -442,17 +442,17 @@ mod tests {
     async fn publishing_restarts_the_complete_open_until_the_receipt_is_durable() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/repository").await;
+        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
         let storage = tiered(visible, durable.clone());
 
-        let error = inspect_sync_bootstrap(&storage, "https://sync.example/repository")
+        let error = inspect_sync_bootstrap(&storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
             .await
             .expect_err("visible state must restart rather than admit an opener");
         assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
-        store_replica_state(&durable, "https://sync.example/repository").await;
+        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
 
         assert_eq!(
-            inspect_sync_bootstrap(&storage, "https://sync.example/repository")
+            inspect_sync_bootstrap(&storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
                 .await
                 .expect("durable publication should admit the retried open"),
             SyncBootstrapAdmission::Ready {
@@ -465,14 +465,14 @@ mod tests {
     async fn semantic_install_errors_are_never_rewritten_as_a_race() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/repository").await;
-        store_replica_state(&durable, "https://sync.example/repository").await;
+        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
         let storage = tiered(visible, durable);
         let original = LixError::new(LixError::CODE_INVALID_PARAM, "malformed snapshot");
 
         let error = reconcile_install_error(
             &StorageAdapter::new(storage.clone()),
-            "https://sync.example/repository",
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
             original.clone(),
         )
         .await;
@@ -483,13 +483,13 @@ mod tests {
     async fn ambiguous_install_write_reconciles_only_from_durable_binding_state() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/repository").await;
-        store_replica_state(&durable, "https://sync.example/repository").await;
+        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
         let storage = tiered(visible, durable);
 
         let error = reconcile_install_error(
             &StorageAdapter::new(storage.clone()),
-            "https://sync.example/repository",
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "lost publication race"),
         )
         .await;
@@ -504,12 +504,12 @@ mod tests {
     async fn ambiguous_install_write_restarts_while_the_winner_is_only_visible() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/repository").await;
+        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
         let storage = tiered(visible, durable);
 
         let error = reconcile_install_error(
             &StorageAdapter::new(storage.clone()),
-            "https://sync.example/repository",
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "lost publication race"),
         )
         .await;
@@ -524,13 +524,13 @@ mod tests {
     async fn ambiguous_install_write_reports_a_different_durable_owner() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/other").await;
-        store_replica_state(&durable, "https://sync.example/other").await;
+        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
+        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
         let storage = tiered(visible, durable);
 
         let error = reconcile_install_error(
             &StorageAdapter::new(storage.clone()),
-            "https://sync.example/repository",
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "lost publication race"),
         )
         .await;

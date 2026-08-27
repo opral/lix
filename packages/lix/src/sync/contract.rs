@@ -1,6 +1,6 @@
 //! Platform-neutral transport contract consumed by the shared sync engine.
 //!
-//! The repository URL already selects one Lix repository. Accordingly the
+//! The Lix connection URL already selects one hosted Lix. Accordingly the
 //! live protocol has one cursor and no branch, schema, projection, or session
 //! topology side channels. HTTP, task, timer, and cancellation mechanics live
 //! under [`super::platform`].

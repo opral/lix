@@ -131,7 +131,9 @@ async fn request(
     idempotency_key: Option<&str>,
     body: Option<Value>,
 ) -> ServerProtocolResponse {
-    let mut builder = Request::builder().method(method).uri(path);
+    let suffix = path.strip_prefix("/lix/v1").expect("protocol test path");
+    let targeted_path = format!("/lix/v1/{}{}", server.lix_id(), suffix);
+    let mut builder = Request::builder().method(method).uri(targeted_path);
     if let Some(session_id) = session_id {
         builder = builder.header(SESSION_ID_HEADER, session_id);
     }
@@ -170,7 +172,7 @@ async fn open_server() -> (
     let storage = PostCommitUnknownSlateDB::new();
     let server = lix::open_lix()
         .with_storage(storage.clone())
-        .serve()
+        .serve().with_embedded_lix_id()
         .await
         .expect("serve Lix");
     let handshake = request(&server, "GET", "/lix/v1", None, None, None).await;

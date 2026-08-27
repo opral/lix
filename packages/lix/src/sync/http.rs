@@ -43,6 +43,7 @@ pub(crate) trait RawHttpClient: SyncTransportBounds {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HandshakeResponse {
+    protocol_version: u32,
     session_id: String,
     active_account_id: String,
 }
@@ -76,11 +77,10 @@ where
 {
     pub(super) async fn connect_with(
         client: Client,
-        repository_url: &str,
+        lix_url: &str,
     ) -> Result<Self, LixError> {
-        let repository_url = repository_url.trim_end_matches('/');
-        validate_sync_remote_id(repository_url)?;
-        let protocol_url = format!("{repository_url}/lix/v1");
+        let normalized = normalize_sync_locator(lix_url)?;
+        let protocol_url = normalized.protocol_url;
         let response = client
             .send(raw_request(
                 Method::GET,
@@ -89,18 +89,7 @@ where
             ))
             .await?;
         let handshake: HandshakeResponse = decode_response(response, "open sync session")?;
-        if handshake.session_id.is_empty() || handshake.session_id.len() > 4096 {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "sync handshake returned an invalid session identity",
-            ));
-        }
-        crate::row_pk::RowPk::uuid_from_canonical(&handshake.active_account_id).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "sync handshake returned an invalid active account identity",
-            )
-        })?;
+        validate_handshake(&handshake)?;
         Ok(Self {
             client,
             protocol_url,
@@ -124,6 +113,96 @@ where
         let operation = request.operation;
         decode_response(self.client.send(request).await?, operation)
     }
+}
+
+fn validate_handshake(handshake: &HandshakeResponse) -> Result<(), LixError> {
+    if handshake.protocol_version != crate::SERVER_PROTOCOL_VERSION {
+        return Err(LixError::new(
+            "LIX_SERVER_PROTOCOL_ERROR",
+            format!(
+                "unsupported Lix Server Protocol version: {}",
+                handshake.protocol_version
+            ),
+        ));
+    }
+    if handshake.session_id.is_empty() || handshake.session_id.len() > 4096 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync handshake returned an invalid session identity",
+        ));
+    }
+    crate::row_pk::RowPk::uuid_from_canonical(&handshake.active_account_id).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync handshake returned an invalid active account identity",
+        )
+    })?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NormalizedSyncLocator {
+    pub(crate) locator: String,
+    pub(crate) protocol_url: String,
+}
+
+pub(crate) fn normalize_sync_locator(
+    locator: &str,
+) -> Result<NormalizedSyncLocator, LixError> {
+    let mut parsed = url::Url::parse(locator).map_err(|_| invalid_lix_locator())?;
+    if parsed.scheme() != "https"
+        && !(parsed.scheme() == "http" && is_loopback_host(&parsed))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync server url must use https (http is allowed only for loopback development)",
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync server url must not contain a query or fragment",
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync server url must not contain credentials",
+        ));
+    }
+    let locator_path = parsed.path();
+    let Some(lix_id) = locator_path.strip_prefix("/lix/") else {
+        return Err(invalid_lix_locator());
+    };
+    if lix_id.contains('/') || crate::row_pk::RowPk::uuid_from_canonical(lix_id).is_err()
+    {
+        return Err(invalid_lix_locator());
+    }
+    let lix_id = lix_id.to_owned();
+    parsed.set_path(&format!("/lix/{lix_id}"));
+    let canonical_locator = parsed.to_string();
+    validate_sync_remote_id(&canonical_locator)?;
+    parsed.set_path(&format!("/lix/v1/{lix_id}"));
+    Ok(NormalizedSyncLocator {
+        locator: canonical_locator,
+        protocol_url: parsed.to_string(),
+    })
+}
+
+fn is_loopback_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn invalid_lix_locator() -> LixError {
+    LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        "sync server url path must be exactly /lix/{uuid}",
+    )
 }
 
 impl<Client> SyncTransport for HttpSyncTransport<Client>
@@ -377,7 +456,71 @@ fn encode_query(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawHttpResponse, encode_query, response_error};
+    use super::{
+        HandshakeResponse, RawHttpResponse, encode_query, normalize_sync_locator,
+        response_error, validate_handshake,
+    };
+
+    #[test]
+    fn sync_connection_locator_maps_to_the_targeted_protocol_root() {
+        assert_eq!(
+            normalize_sync_locator(
+                "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+            )
+            .expect("canonical locator")
+            .protocol_url,
+            "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        );
+        assert_eq!(
+            normalize_sync_locator(
+                "https://EXAMPLE.test:443/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+            )
+            .expect("equivalent locator")
+            .locator,
+            "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        );
+    }
+
+    #[test]
+    fn sync_connection_locator_rejects_non_http_and_credentialed_urls() {
+        for invalid in [
+            "relative/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            "ftp://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            "http://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            "https://example.test/prefix/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            "https://user@example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc/",
+        ] {
+            assert!(
+                normalize_sync_locator(invalid).is_err(),
+                "accepted invalid locator: {invalid}"
+            );
+        }
+        assert!(normalize_sync_locator(
+            "http://localhost:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        )
+        .is_ok());
+        assert!(normalize_sync_locator(
+            "http://127.0.0.1:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        )
+        .is_ok());
+        assert!(normalize_sync_locator(
+            "http://[::1]:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn sync_handshake_rejects_an_incompatible_protocol_before_bootstrap() {
+        let error = validate_handshake(&HandshakeResponse {
+            protocol_version: crate::SERVER_PROTOCOL_VERSION + 1,
+            session_id: "session-1".to_owned(),
+            active_account_id: "01920000-0000-7000-8000-000000000602".to_owned(),
+        })
+        .expect_err("incompatible protocol must fail");
+        assert_eq!(error.code, "LIX_SERVER_PROTOCOL_ERROR");
+        assert!(error.message.contains("unsupported"));
+    }
 
     #[test]
     fn query_encoding_is_rfc3986_component_encoding() {

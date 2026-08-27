@@ -302,7 +302,7 @@ pub(crate) async fn activate_sync_mode<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let remote_id = server.url.trim_end_matches('/').to_owned();
+    let remote_id = server.url.clone();
     let headers = server.headers.clone();
     lix.set_sync_role(crate::sync::SyncRole::Replica)?;
 
@@ -2450,7 +2450,7 @@ mod tests {
             .expect("replica role");
         replica
             .try_install_initial_sync_snapshot(
-                "https://sync.example/history",
+                "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005",
                 crate::ANONYMOUS_ACCOUNT_ID,
                 &snapshot,
                 &history.commits,
@@ -3539,7 +3539,7 @@ mod tests {
 
         let error = sync_iteration(
             &replica,
-            "https://sync.example/history",
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005",
             &transport,
             &mut push_item_limit,
             &mut delta_pull_limit,
@@ -3561,7 +3561,7 @@ mod tests {
 
         let error = sync_iteration(
             &replica,
-            "https://sync.example/history",
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005",
             &transport,
             &mut push_item_limit,
             &mut delta_pull_limit,
@@ -3611,7 +3611,7 @@ mod tests {
 
         let error = sync_iteration(
             &replica,
-            "https://sync.example/history",
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005",
             &transport,
             &mut push_item_limit,
             &mut delta_pull_limit,

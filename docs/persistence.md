@@ -115,7 +115,7 @@ import { openLix } from "@lix-js/sdk";
 const lix = await openLix({
   server: {
     mode: "remote",
-    url: "https://example.com/repositories/acme",
+    url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
 ```
@@ -132,7 +132,7 @@ const lix = await openLix({
   storage: new OpfsStorage({ name: "acme" }),
   server: {
     mode: "sync",
-    url: "https://example.com/repositories/acme",
+    url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
 ```
