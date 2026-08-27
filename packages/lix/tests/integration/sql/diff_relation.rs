@@ -599,5 +599,27 @@ simulation_test!(relation_diff_fences_machinery_from_user_column_names, |sim| as
             "error should identify retired column {retired}: {}",
             error.message
         );
+        assert!(
+            error.message.contains("Did you mean"),
+            "renamed diff columns should preserve DataFusion's near-match guidance: {}",
+            error.message
+        );
     }
+
+    let error = session
+        .execute(
+            &format!(
+                "SELECT not_a_diff_column FROM lix_diff('diff_name_collision', '{baseline}', '{head}')"
+            ),
+            &[],
+        )
+        .await
+        .expect_err("unknown diff column must not exist");
+    assert!(
+        error.message.contains("Valid fields are")
+            && error.message.contains("diff_type")
+            && error.message.contains("row_count"),
+        "unknown diff columns should preserve DataFusion's discoverable field listing: {}",
+        error.message
+    );
 });

@@ -53,17 +53,21 @@ For branch-scoped working changes, use `lix_latest_checkpoint_commit_id()` and
 latest-checkpoint accessor returns the repository root when the active branch
 has no checkpoint.
 
-The `lixcol_` segment is reserved for engine-owned system metadata on read
-surfaces. Relation payload uses ordinary names: for example, `lix_diff()` uses
-`diff_type` and `row_count`. Registered user schemas reject column names
-beginning with `lixcol_` or containing `_lixcol_`; this keeps system metadata
-mechanically distinguishable even after `from_`/`to_` side prefixing.
+The rule is: `lixcol_` prefixes only engine-owned system metadata, while
+relation-specific payload always uses ordinary names such as `diff_type`,
+`row_count`, `from_path`, and `to_path`. Registered user schemas reject column
+names beginning with `lixcol_` or containing `_lixcol_`; this keeps system
+metadata mechanically distinguishable even after `from_`/`to_` side prefixing.
 
 ## The executable column contract
 
 The SQL engine is backed by DataFusion. Query `information_schema.columns` for
 the executable public contract instead of inferring types from Arrow or JSON
 Schema names:
+
+Column-resolution errors retain DataFusion's discovery guidance: close misses
+get a `Did you mean ...` suggestion, while other misses include the complete
+`Valid fields are ...` listing.
 
 ```sql
 SELECT column_name, data_type, is_nullable, column_default,
