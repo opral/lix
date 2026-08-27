@@ -52,7 +52,7 @@ for a new branch.
 
 Every relation diff exposes `row_ref`, the relation's typed primary-key
 columns, `diff_type`, `row_count`, and a
-`from_<column>` / `to_<column>` pair for each column of the compared relation.
+`from_<column>` / `to_<column>` pair for each non-primary-key column of the compared relation.
 `diff_type` is `added`, `modified`, or `removed`. Added rows have empty `from_`
 values; removed rows have empty `to_` values. Use
 `coalesce(to_path, from_path)` when displaying a path that also covers removed
@@ -123,10 +123,9 @@ SELECT commit_id FROM lix_create_checkpoint();
 ```
 
 Selecting a file includes the tracked rows composing that file. Partial file
-checkpoints also include required ancestor directory descriptors. Selections
-outside the supported dependency-closure paths fail with a descriptive error
-instead of producing an invalid checkpoint. Selecting `lix_directory` rows
-directly is unsupported; select the affected `lix_file` rows instead.
+checkpoints also include required ancestor directory descriptors. Directory
+rows and mixed-relation selections use the same dependency planner. A scope
+that cannot be closed into a valid checkpoint fails before commit.
 
 Each statement is atomic. An empty selection succeeds without creating a
 commit and duplicate selected identities are rejected. Apply and revert support

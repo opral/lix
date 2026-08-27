@@ -182,7 +182,7 @@ async fn main() {
             }
             if checkpoint_every > 0 && revision % checkpoint_every == 0 {
                 session
-                    .create_checkpoint()
+                    .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
                     .await
                     .expect("create a checkpoint");
             }
@@ -192,7 +192,7 @@ async fn main() {
             // last one needs a successor before its predecessors are provably
             // retirable.
             session
-                .create_checkpoint()
+                .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
                 .await
                 .expect("create the releasing checkpoint");
         }

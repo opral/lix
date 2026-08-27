@@ -238,6 +238,7 @@ const COMMIT_DELTA_PAYLOAD_AUTHORED: u8 = 0;
 const COMMIT_DELTA_PAYLOAD_SELECTED_REF: u8 = 1;
 const COMMIT_DELTA_PAYLOAD_SELECTED_TOMBSTONE: u8 = 2;
 const COMMIT_DELTA_PAYLOAD_AUTHORED_SNAPSHOT: u8 = 3;
+const STALE_SELECTED_CHANGE_LOCATOR: &str = "LIX_STALE_SELECTED_CHANGE_LOCATOR";
 
 #[derive(Debug, musli::Decode)]
 #[musli(packed)]
@@ -541,6 +542,10 @@ pub(crate) struct CommitDeltaChangeLocator {
 
 pub(crate) struct AddressableCommitDeltaStage {
     pub(crate) locators: Vec<CommitDeltaChangeLocator>,
+    /// Locators whose durable payload is authored by this commit. Selected
+    /// references may need physical locators while moving sync inventories,
+    /// but must never replace the canonical locator owned by their source.
+    pub(crate) authored_locators: Vec<CommitDeltaChangeLocator>,
     /// Final ids by input delta ordinal. Non-addressable entries retain the
     /// nil sentinel and never require a second per-row index.
     pub(crate) assigned_change_ids: Vec<crate::changelog::ChangeId>,
@@ -6589,6 +6594,7 @@ fn stage_commit_deltas_inner(
     let Some(&commit_id) = deltas.first().map(|delta| &delta.delta.commit_id) else {
         return Ok(AddressableCommitDeltaStage {
             locators: Vec::new(),
+            authored_locators: Vec::new(),
             assigned_change_ids: Vec::new(),
             mutation_inventory: CommitStateMutationInventory::default(),
         });
@@ -6821,7 +6827,6 @@ fn stage_commit_deltas_inner(
             .map(|(range, _)| direct_ownership_bits(&addressable[range.clone()]))
             .collect::<Vec<_>>()
     };
-    let has_direct_address_inventory = !direct_segment_row_counts.is_empty();
     let segment_count = encoded_segments.len();
     if segment_count == 1 {
         let (_, inline_segment) = encoded_segments
@@ -6843,18 +6848,29 @@ fn stage_commit_deltas_inner(
             inline_segment: inline_segment.encoded,
             segments: Vec::new(),
         };
-        let locators = commit_delta_change_locators(commit_id, 0, &entries)?
+        let all_locators = commit_delta_change_locators(commit_id, 0, &entries)?;
+        let authored_locators = all_locators
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, locator)| {
+                (payloads[index].authored && !addressable[index]).then_some(locator)
+            })
+            .collect();
+        let locators = all_locators
             .into_iter()
             .enumerate()
             .filter_map(|(index, locator)| (!addressable[index]).then_some(locator))
             .collect();
         return Ok(AddressableCommitDeltaStage {
             locators,
+            authored_locators,
             assigned_change_ids,
             mutation_inventory: commit_state_inventory_from_delta_manifest(&manifest),
         });
     }
     writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, segment_count, 0);
+    let has_direct_address_inventory = !direct_segment_row_counts.is_empty();
     let mut manifest = CommitDeltaManifest {
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         selected_source_commit_id: selected_source_commit_id
@@ -6872,9 +6888,11 @@ fn stage_commit_deltas_inner(
         segments: Vec::with_capacity(segment_count),
     };
     let mut locators = Vec::with_capacity(entries.len());
+    let mut authored_locators = Vec::with_capacity(entries.len());
     for (segment_index, (range, encoded)) in encoded_segments.into_iter().enumerate() {
         let segment_entries = &entries[range.clone()];
-        let segment_addressable = &addressable[range];
+        let segment_addressable = &addressable[range.clone()];
+        let segment_payloads = &payloads[range];
         let first_key = segment_entries
             .first()
             .expect("non-empty packed commit-delta segment")
@@ -6900,6 +6918,16 @@ fn stage_commit_deltas_inner(
         );
         let segment_locators =
             commit_delta_change_locators(commit_id, segment_index, segment_entries)?;
+        authored_locators.extend(
+            segment_locators
+                .iter()
+                .copied()
+                .zip(segment_addressable)
+                .zip(segment_payloads)
+                .filter_map(|((locator, &direct), payload)| {
+                    (payload.authored && !direct).then_some(locator)
+                }),
+        );
         if has_direct_address_inventory {
             locators.extend(
                 segment_locators
@@ -6913,6 +6941,7 @@ fn stage_commit_deltas_inner(
     }
     Ok(AddressableCommitDeltaStage {
         locators,
+        authored_locators,
         assigned_change_ids,
         mutation_inventory: commit_state_inventory_from_delta_manifest(&manifest),
     })
@@ -7104,9 +7133,21 @@ pub(crate) async fn load_change_record_by_id(
         super::mutation_directory::record_direct_route_explicit_fallback(1);
     }
     if let Some(locator) = load_change_locator_by_id(store, change_id).await? {
-        return Ok(load_explicit_change_records_at_locators(store, &[locator])
-            .await?
-            .pop());
+        return match load_explicit_change_records_at_locators(store, &[locator]).await {
+            Ok(mut records) => Ok(records.pop()),
+            // v72 partial checkpoints could overwrite a direct owner's
+            // explicit fallback locator with a selected reference. Treat that
+            // stale alias as missing local authority so sync-mode callers can
+            // demand the encoded direct owner instead of accepting the
+            // checkpoint copy as canonical.
+            Err(error)
+                if direct_change_locator(change_id).is_some()
+                    && error.code == STALE_SELECTED_CHANGE_LOCATOR =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        };
     }
     Ok(None)
 }
@@ -8333,7 +8374,7 @@ where
         ),
         CommitDeltaPayload::SelectedRef(_) | CommitDeltaPayload::SelectedTombstone(_) => {
             return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
+                STALE_SELECTED_CHANGE_LOCATOR,
                 format!(
                     "tracked_state authoritative change locator for '{change_id}' points to a selected row"
                 ),

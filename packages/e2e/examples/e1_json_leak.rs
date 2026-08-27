@@ -169,7 +169,7 @@ async fn run_cell(shape: &str, cadence: usize, edits: usize) {
         }
         if cadence > 0 && revision % cadence == 0 {
             session
-                .create_checkpoint()
+                .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
                 .await
                 .expect("create a checkpoint");
         }
@@ -180,7 +180,7 @@ async fn run_cell(shape: &str, cadence: usize, edits: usize) {
         // one needs a successor before its predecessors are provably retirable.
         checkpoints = edits / cadence + 1;
         session
-            .create_checkpoint()
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
             .expect("create the releasing checkpoint");
     }

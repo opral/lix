@@ -94,7 +94,7 @@ pub(crate) use exec::{
 pub(crate) use file_view::{
     SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,
 };
-pub(crate) use parse::parse_statement;
+pub(crate) use parse::{object_name_is_public_function, parse_statement};
 pub(crate) use plan::plan_write;
 pub(crate) use planning_cache::{
     CachedPhysicalRead, CachedReadPlan, CachedScanRequest, CachedUpdateLiteralShape,

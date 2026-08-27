@@ -32,7 +32,7 @@
     )
 )]
 
-pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 5;
+pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 6;
 
 // Let implementation modules use the same `lix::...` paths as external
 // consumers now that the former engine and SDK share one crate.
@@ -175,7 +175,7 @@ pub use common::{
     Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, RowRef, SharedStr, SqlQueryResult,
     Value,
 };
-pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, RowPk, FileId};
+pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, FileId};
 pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata_value, serialize_row_metadata};

@@ -470,8 +470,8 @@ async fn try_execute_row_insert_batch(
                 LixError::new(
                     LixError::CODE_UNIQUE,
                     format!(
-                        "cannot insert {requested} row for schema '{}' row_pk {:?}: a canonical {existing} row already exists; delete it first",
-                        row.schema_key, row_pk,
+                        "cannot insert {requested} row for schema '{}': a canonical {existing} row with the same primary key already exists; delete it first",
+                        row.schema_key,
                     ),
                 )
             } else {
@@ -5482,7 +5482,7 @@ fn certified_row_insert_rows<'a>(
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!(
-                        "INSERT into {} has lixcol_row_pk that does not match its public primary-key columns",
+                        "INSERT into {} has an internal identity that does not match its public primary-key columns",
                         layout.schema_key
                     ),
                 ));
@@ -5766,7 +5766,7 @@ fn append_row_insert_row(
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "INSERT into {} has lixcol_row_pk that does not match its public primary-key columns",
+                    "INSERT into {} has an internal identity that does not match its public primary-key columns",
                     layout.schema_key
                 ),
             ));
@@ -5819,7 +5819,7 @@ fn append_row_insert_row(
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "INSERT into {} has lixcol_row_pk that does not match its public primary-key columns",
+                    "INSERT into {} has an internal identity that does not match its public primary-key columns",
                     layout.schema_key
                 ),
             ));

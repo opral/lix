@@ -191,7 +191,7 @@ async fn checkpoints_scenario(samples: &[usize], rows_per_commit: usize) {
             commit_batch(&fixture.session, created, rows_per_commit).await;
             fixture
                 .session
-                .create_checkpoint()
+                .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
                 .await
                 .expect("create checkpoint");
             created += 1;
@@ -284,7 +284,7 @@ async fn checkpoint_then_gc_scenario(commits: usize, rows_per_commit: usize, gc_
     );
     fixture
         .session
-        .create_checkpoint()
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("create checkpoint");
     report(

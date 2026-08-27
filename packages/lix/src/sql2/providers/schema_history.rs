@@ -625,10 +625,16 @@ mod tests {
             "primary_key": ["locale", "key"],
         }))
         .expect("schema should derive");
+        let conflicting_row_ref = crate::row_ref::encode(
+            "localized_message",
+            &RowPk::from_json_array_text(r#"["fr","welcome"]"#).unwrap(),
+        )
+        .unwrap()
+        .to_string();
         let filters = vec![
             eq("key", "welcome"),
             eq("locale", "en"),
-            eq("lixcol_row_pk", r#"["fr","welcome"]"#),
+            eq("lixcol_row_ref", &conflicting_row_ref),
         ];
 
         let route =
@@ -636,12 +642,18 @@ mod tests {
 
         assert!(route.is_contradictory());
 
+        let wrong_arity_row_ref = crate::row_ref::encode(
+            "localized_message",
+            &RowPk::single("en"),
+        )
+        .unwrap()
+        .to_string();
         let wrong_arity_route = row_history_route_from_filters(
             &spec,
             &[
                 eq("key", "welcome"),
                 eq("locale", "en"),
-                eq("lixcol_row_pk", r#"["en"]"#),
+                eq("lixcol_row_ref", &wrong_arity_row_ref),
             ],
         )
         .expect("wrong-arity identity should produce a route");

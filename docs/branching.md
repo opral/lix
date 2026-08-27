@@ -84,8 +84,7 @@ If both branches changed the same row after their merge base, the preview includ
 ```ts
 {
 	kind: "sameRowChanged",
-	schemaKey: "acme_section",
-	rowPk: ["s1"],
+	rowRef: "lix_row_ref:v1:…",
 	fileId: null,
 	target: { kind: "modified", beforeChangeId, afterChangeId },
 	source: { kind: "modified", beforeChangeId, afterChangeId },

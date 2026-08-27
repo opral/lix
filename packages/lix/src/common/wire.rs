@@ -170,6 +170,10 @@ mod tests {
             Value::Real(1.5),
             Value::Text("hello".to_string()),
             Value::Jsonb(json!({"hello": "world"}).into()),
+            Value::RowRef(
+                crate::row_ref::encode("lix_key_value", &crate::row_pk::RowPk::single("hello"))
+                    .expect("test row reference should encode"),
+            ),
             Value::Timestamptz(1_700_000_000_000_000),
             Value::Blob(vec![1, 2, 3].into()),
         ];
@@ -228,6 +232,10 @@ mod tests {
                 WireValue::Jsonb {
                     value: json!({"hello": "world"}).into(),
                 },
+                WireValue::RowRef {
+                    value: "lix_row_ref:v1:AAAADWxpeF9rZXlfdmFsdWUAAQMAAAAFaGVsbG8"
+                        .to_string(),
+                },
                 WireValue::Timestamptz {
                     value: "2023-11-14T22:13:20.000000Z".to_string(),
                 },
@@ -248,6 +256,7 @@ mod tests {
         assert!(serialized.contains("\"kind\":\"float\""));
         assert!(serialized.contains("\"kind\":\"text\""));
         assert!(serialized.contains("\"kind\":\"jsonb\""));
+        assert!(serialized.contains("\"kind\":\"row_ref\""));
         assert!(serialized.contains("\"kind\":\"timestamptz\""));
         assert!(serialized.contains("\"kind\":\"blob\""));
         assert!(!serialized.contains("\"kind\":\"Null\""));

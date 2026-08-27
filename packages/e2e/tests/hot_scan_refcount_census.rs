@@ -63,7 +63,7 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
             "a seed statement that affects no rows produces the same zero counters as a route that never ran"
         );
     }
-    lix.create_checkpoint()
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("drive the census fixture to packed-base steady state");
 

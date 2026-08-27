@@ -27,9 +27,9 @@ pub(crate) struct HistoryRoute {
     pub(crate) row_pks: Vec<String>,
     /// Schema-resolved physical identities for traversal.
     ///
-    /// `row_pks` remains the canonical JSON surface representation used to
-    /// match projected rows. Keeping the typed form alongside it avoids
-    /// re-inferring component types from values after routing.
+    /// `row_pks` is the provider's legacy physical-filter scratch space;
+    /// public history identities resolve from opaque row references into the
+    /// typed form below before traversal.
     pub(crate) resolved_row_pks: Vec<RowPk>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) file_ids: Vec<String>,

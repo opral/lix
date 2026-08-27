@@ -338,7 +338,15 @@ static LIX_CHANGE_COLS: ColumnTable<MaterializedChange> = ColumnTable {
 };
 
 fn change_public_row_ref(row: &MaterializedChange) -> Result<Option<String>, LixError> {
-    let (relation, row_pk) = if let Some(file_id) = row.file_id.as_deref() {
+    let (relation, row_pk) = if crate::sql2::catalog::schema_exposed_as_schema_surface(&row.schema_key)
+    {
+        // File ownership is scope, not identity. Public semantic relations
+        // keep their own typed (including composite) primary key even when
+        // their physical change is attached to a file.
+        (row.schema_key.as_str(), row.row_pk.clone())
+    } else if row.schema_key == "lix_directory_descriptor" {
+        ("lix_directory", row.row_pk.clone())
+    } else if let Some(file_id) = row.file_id.as_deref() {
         let row_pk = crate::row_pk::RowPk::uuid_from_canonical(file_id).map_err(|error| {
             LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
@@ -346,10 +354,6 @@ fn change_public_row_ref(row: &MaterializedChange) -> Result<Option<String>, Lix
             )
         })?;
         ("lix_file", row_pk)
-    } else if row.schema_key == "lix_directory_descriptor" {
-        ("lix_directory", row.row_pk.clone())
-    } else if crate::sql2::catalog::schema_exposed_as_schema_surface(&row.schema_key) {
-        (row.schema_key.as_str(), row.row_pk.clone())
     } else {
         return Ok(None);
     };

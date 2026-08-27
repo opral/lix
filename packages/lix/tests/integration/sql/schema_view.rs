@@ -1,6 +1,5 @@
 use lix::ExecuteResult;
 use lix::Value;
-use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -61,7 +60,7 @@ simulation_test!(
             .await
             .expect("filter-only payload query should succeed");
 
-        assert_rows_eq(result, vec![vec![Value::Jsonb(json!(["n1"]).into())]]);
+        assert_rows_eq(result, vec![vec![Value::Text("n1".to_string())]]);
     }
 );
 

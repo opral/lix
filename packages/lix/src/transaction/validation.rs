@@ -1979,8 +1979,8 @@ where
                     LixError::new(
                         LixError::CODE_UNIQUE,
                         format!(
-                            "cannot insert {requested} row for schema '{}' row_pk {:?}: a canonical {existing} row already exists; delete it first",
-                            insert.row.schema_key, insert.row.row_pk,
+                            "cannot insert {requested} row for schema '{}': a canonical {existing} row with the same primary key already exists; delete it first",
+                            insert.row.schema_key,
                         ),
                     ),
                     insert.statement_index,
@@ -2490,7 +2490,7 @@ fn validate_typed_primary_key_identity(
     typed: &WasmTypedRow,
 ) -> Result<(), LixError> {
     if !row.row_pk().matches_schema_values(&typed.row_pk) {
-        let derived = RowPk::from_schema_values(&typed.row_pk).map_err(|error| {
+        let _derived = RowPk::from_schema_values(&typed.row_pk).map_err(|error| {
             LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
@@ -2502,10 +2502,8 @@ fn validate_typed_primary_key_identity(
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
             format!(
-                "primary-key constraint violation on schema '{}': durable row_pk '{}' does not match typed primary key '{}'",
-                row.schema_key(),
-                row.row_pk().as_json_array_text()?,
-                derived.as_json_array_text()?
+                "primary-key constraint violation on schema '{}': the stored identity does not match the typed primary-key columns",
+                row.schema_key()
             ),
         ));
     }
@@ -2571,10 +2569,8 @@ fn validate_primary_key_identity(
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
             format!(
-                "primary-key constraint violation on schema '{}': row_pk '{}' does not match derived primary key '{}'",
-                row.schema_key(),
-                row.row_pk().as_json_array_text()?,
-                derived.as_json_array_text()?
+                "primary-key constraint violation on schema '{}': the stored identity does not match the primary-key columns",
+                row.schema_key()
             ),
         ));
     }

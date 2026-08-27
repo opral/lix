@@ -26,6 +26,7 @@ use crate::plugin::runtime::WasmTypedRow;
 use crate::row_pk::{RowPk, RowPkComponent, RowPkComponentType};
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
+use crate::sql2::catalog::schema_surface::SchemaSurfaceSpec;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::{field_is_json, row_ref_field};
 #[cfg(test)]
@@ -153,6 +154,7 @@ struct DiffRelation {
     kind: DiffRelationKind,
     schema: SchemaRef,
     primary_key_columns: Vec<String>,
+    schema_spec: Option<SchemaSurfaceSpec>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -182,6 +184,10 @@ impl DiffRelation {
         let source_schema = catalog.surface_schema(name).ok_or_else(|| {
             DataFusionError::Plan(format!("lix_diff does not support relation '{name}'"))
         })?;
+        let schema_spec = match &kind {
+            DiffRelationKind::Schema { schema_key } => catalog.schema_spec(schema_key).cloned(),
+            DiffRelationKind::File | DiffRelationKind::Directory => None,
+        };
         let primary_key_columns = match &kind {
             DiffRelationKind::File | DiffRelationKind::Directory => vec!["id".to_owned()],
             DiffRelationKind::Schema { schema_key } => catalog
@@ -241,6 +247,7 @@ impl DiffRelation {
             kind,
             schema: Arc::new(Schema::new(fields)),
             primary_key_columns,
+            schema_spec,
         })
     }
 }
@@ -472,10 +479,16 @@ impl DiffRoute {
         let conjuncts = filter_conjuncts(filters);
         let row_ref_values = optional_values(&conjuncts, "row_ref");
         let id_values = optional_values(&conjuncts, "id");
-        let explicit_row_filter = row_ref_values.is_some();
+        let typed_row_pks = relation.schema_spec.as_ref().and_then(|spec| {
+            super::schema::row_pks_from_primary_key_filters(spec, filters)
+                .ok()
+                .flatten()
+        });
+        let explicit_row_filter = row_ref_values.is_some() || typed_row_pks.is_some();
         let mut contradictory = row_ref_values.as_ref().is_some_and(Vec::is_empty)
-            || id_values.as_ref().is_some_and(Vec::is_empty);
-        let mut row_pks = row_ref_values
+            || id_values.as_ref().is_some_and(Vec::is_empty)
+            || typed_row_pks.as_ref().is_some_and(Vec::is_empty);
+        let row_ref_pks = row_ref_values
             .unwrap_or_default()
             .into_iter()
             .filter_map(|value| {
@@ -483,6 +496,14 @@ impl DiffRoute {
                 (resolved.relation == relation.name).then_some(resolved.row_pk)
             })
             .collect::<Vec<_>>();
+        let mut row_pks = match typed_row_pks {
+            Some(typed) if !row_ref_pks.is_empty() => typed
+                .into_iter()
+                .filter(|row_pk| row_ref_pks.contains(row_pk))
+                .collect(),
+            Some(typed) => typed,
+            None => row_ref_pks,
+        };
         contradictory |= explicit_row_filter && row_pks.is_empty();
         let mut schema_keys = Vec::new();
         let mut file_ids = Vec::new();
@@ -1762,12 +1783,12 @@ mod tests {
     }
 
     #[test]
-    fn relation_diff_pushes_file_id_without_filtering_content_row_primary_keys() {
+    fn relation_diff_pushes_typed_file_id_without_filtering_content_row_primary_keys() {
         let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_file")
             .expect("file relation is registered");
         let projection = Schema::empty();
         let route = DiffRoute::from_filters(
-            &[col("to_id").eq(lit("0193182b-2a72-7ed5-9015-76bf271af333"))],
+            &[col("id").eq(lit("0193182b-2a72-7ed5-9015-76bf271af333"))],
             &relation,
             &projection,
         );

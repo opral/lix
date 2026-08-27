@@ -1581,7 +1581,7 @@ simulation_test!(
                  "INSERT INTO engine_excluded_typed_default (id) VALUES ('same') \
                  ON CONFLICT (id) DO UPDATE \
                  SET mirror = excluded.status, \
-                     identity_copy = CAST(excluded.id AS JSONB)",
+                     identity_copy = CAST('\"same\"' AS JSONB)",
                 &[],
             )
             .await

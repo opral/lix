@@ -4763,14 +4763,10 @@ where
             if parent_value.as_ref().is_some_and(|value| !value.deleted())
                 && absence_guards.contains(&key)
             {
-                let row_pk = key
-                    .row_pk
-                    .as_json_array_text()
-                    .unwrap_or_else(|_| "<invalid row_pk>".to_string());
                 return Err(LixError::new(
                     LixError::CODE_UNIQUE,
                     format!(
-                        "primary-key constraint violation on schema '{}': INSERT would duplicate row_pk '{row_pk}'",
+                        "primary-key constraint violation on schema '{}': INSERT would duplicate a primary key",
                         key.schema_key
                     ),
                 ));

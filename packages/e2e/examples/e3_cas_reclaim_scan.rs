@@ -119,7 +119,7 @@ fn main() {
                 .await
                 .expect("delete reclaim scan payloads");
             session
-                .create_checkpoint()
+                .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
                 .await
                 .expect("checkpoint reclaim scan deletion");
         }

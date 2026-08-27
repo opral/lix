@@ -43,9 +43,9 @@ A text diff sees a line:
 
 Lix sees a row:
 
-| schema_key | row_pk                   | snapshot_content                                                        |
-| ---------- | ------------------------ | ----------------------------------------------------------------------- |
-| `csv_row`  | `["0192f3a1-…-7b2c"]` | `{"id": "0192f3a1-…-7b2c", "order_key": "…", "cells": ["1002", "Widget B", "shipped"]}` |
+| row_ref | schema_key | snapshot_content |
+| --- | --- | --- |
+| `lix_row_ref:v1:…` | `csv_row` | `{"id": "0192f3a1-…-7b2c", "order_key": "…", "cells": ["1002", "Widget B", "shipped"]}` |
 
 The CSV plugin gives each record a stable `id`, so the row keeps its identity
 even when the file is reordered. `cells` holds the decoded record. One cell

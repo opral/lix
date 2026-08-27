@@ -2224,14 +2224,10 @@ where
 }
 
 fn duplicate_root_insert_error(delta: &TrackedStateDeltaRef<'_>) -> LixError {
-    let row_pk = delta
-        .row_pk
-        .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
-            "primary-key constraint violation on schema '{}': INSERT would duplicate row_pk '{row_pk}'",
+            "primary-key constraint violation on schema '{}': INSERT would duplicate a primary key",
             delta.schema_key
         ),
     )

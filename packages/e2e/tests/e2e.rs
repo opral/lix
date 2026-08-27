@@ -1749,7 +1749,7 @@ where
         .await
         .expect("main Markdown branch should reactivate");
     }
-    lix.create_checkpoint()
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("Markdown checkpoint should commit");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1882,7 +1882,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_runtime_stack_guard() {
         Some(expected.clone())
     );
     qualify_markdown_server_style_branch(&lix, &expected).await;
-    lix.create_checkpoint()
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("server-style SlateDB branch checkpoint");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1914,7 +1914,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_checkpoint_guard() {
     write_file(&lix, "/company/competitors.md", expected.clone())
         .await
         .expect("server-style SlateDB Markdown write");
-    lix.create_checkpoint()
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("server-style SlateDB Markdown checkpoint");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5525,7 +5525,13 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     )
     .await
     .unwrap();
-    let baseline_checkpoint = lix.create_checkpoint().await.unwrap();
+    let baseline_checkpoint = lix
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
     let selected_file_id = file_id_at_path(&lix, "/selected.csv").await;
     let remaining_file_id = file_id_at_path(&lix, "/remaining.csv").await;
 
@@ -5550,7 +5556,7 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
              WHERE id = $1",
             &[
                 Value::Text(selected_file_id.clone()),
-                Value::Text(baseline_checkpoint.commit_id),
+                Value::Text(baseline_checkpoint),
             ],
         )
         .await

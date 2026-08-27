@@ -186,7 +186,9 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
     )
     .await
     .expect("insert healthy probe");
-    lix.create_checkpoint().await.expect("create checkpoint");
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .expect("create checkpoint");
     let checkpoint_head = active_head(&lix).await;
     lix.execute(
         "UPDATE lix_key_value SET value = 'after' WHERE key = 'corruption-probe'",
@@ -266,7 +268,7 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         .await
         .expect("insert tracked-tree fixture row");
     }
-    lix.create_checkpoint()
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("checkpoint tracked-tree fixture");
     let checkpoint_head = active_head(&lix).await;
@@ -276,7 +278,7 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
     )
     .await
     .expect("update tracked-tree fixture row");
-    lix.create_checkpoint()
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
         .await
         .expect("checkpoint updated tracked-tree fixture");
     let updated_head = active_head(&lix).await;

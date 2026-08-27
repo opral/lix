@@ -685,24 +685,33 @@ fn reject_retention_change(
             return Err(LixError::new(
                 LixError::CODE_UNIQUE,
                 format!(
-                    "cannot insert tracked row in schema '{}' row_pk {:?}: a canonical untracked row already exists; delete it first",
-                    delta.schema_key, delta.row_pk,
+                    "cannot insert tracked row in schema '{}': a canonical untracked row with the same primary key already exists; delete it first",
+                    delta.schema_key,
                 ),
-            ));
+            )
+            .with_details(serde_json::json!({
+                "rowRef": crate::row_ref::encode_schema_identity(delta.schema_key, delta.row_pk)
+                    .map(|row_ref| row_ref.to_string())
+                    .ok(),
+            })));
         }
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
             format!(
-                "cannot change retention for existing current-state row in schema '{}' row_pk {:?}; delete it before inserting it as {}",
+                "cannot change retention for an existing current-state row in schema '{}'; delete it before inserting it as {}",
                 delta.schema_key,
-                delta.row_pk,
                 if delta.untracked {
                     "untracked"
                 } else {
                     "tracked"
                 },
             ),
-        ));
+        )
+        .with_details(serde_json::json!({
+            "rowRef": crate::row_ref::encode_schema_identity(delta.schema_key, delta.row_pk)
+                .map(|row_ref| row_ref.to_string())
+                .ok(),
+        })));
     }
     Ok(())
 }
@@ -712,16 +721,18 @@ fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
 }
 
 fn tracked_head_duplicate_insert_error_ref(schema_key: &str, row_pk: &RowPk) -> LixError {
-    let row_pk = row_pk
-        .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid row_pk>".to_string());
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
-            "primary-key constraint violation on schema '{}': INSERT would duplicate row_pk '{row_pk}'",
+            "primary-key constraint violation on schema '{}': INSERT would duplicate an existing row",
             schema_key
         ),
     )
+    .with_details(serde_json::json!({
+        "rowRef": crate::row_ref::encode_schema_identity(schema_key, row_pk)
+            .map(|row_ref| row_ref.to_string())
+            .ok(),
+    }))
 }
 
 fn matches_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {

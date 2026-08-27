@@ -874,11 +874,11 @@ mod tests {
              SELECT left_side.id \
              FROM shadowed AS left_side \
              JOIN (\
-                 SELECT row_pk FROM lix_change \
+                 SELECT row_ref FROM lix_change \
                  UNION ALL \
-                 SELECT row_pk FROM lix_change\
-             ) AS right_side \
-               ON left_side.id = right_side.row_pk \
+                 SELECT row_ref FROM lix_change\
+               ) AS right_side \
+               ON false \
              JOIN public.\"lix_directory\" AS directory_a ON true \
              JOIN public.\"lix_directory\" AS directory_b ON true"]);
 
@@ -1075,6 +1075,7 @@ mod tests {
             vec![
                 "lix_change",
                 "lix_commit_ancestry",
+                "lix_create_checkpoint",
                 "lix_diff",
                 "lix_history",
                 "lix_state_at",
@@ -1094,7 +1095,7 @@ mod tests {
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
         assert_eq!(all_read + writable.len(), 20, "construction count");
-        assert_eq!(read_only.len() + writable.len(), 12, "surface count");
+        assert_eq!(read_only.len() + writable.len(), 13, "surface count");
     }
 
     #[test]
@@ -1111,7 +1112,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(all_writable, 7, "standalone write count");
+        assert_eq!(all_writable, 6, "standalone write count");
         assert_eq!(selected_writable, vec!["lix_file"]);
     }
 

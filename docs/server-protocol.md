@@ -92,8 +92,11 @@ being embedded in commit JSON. Upload is one retryable loop: register the
 manifest, PUT only the returned missing chunks, then register the same manifest
 again. There is no separate presence request.
 
-Every commit member and snapshot row encodes `rowPk` losslessly as an ordered
-array of typed components. Each component is an object with `type` equal to
+Every commit member and snapshot row encodes its physical replication identity
+as `(schemaKey, fileId, rowPk)`. This is deliberately not the public SQL/SDK
+`lix_row_ref`: one logical file reference may aggregate several physical rows.
+The sync-only `rowPk` is an ordered array of typed components. Each component is
+an object with `type` equal to
 `uuid`, `integer`, `string`, or `bytes`; `value` is respectively a canonical
 UUID string, a JSON integer, a string, or a base64 string. For example:
 

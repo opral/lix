@@ -36,7 +36,7 @@ order_id 1002 status:
 You query that history with SQL:
 
 ```sql
-SELECT created_at, schema_key, row_pk, snapshot_content
+SELECT created_at, schema_key, row_ref, snapshot_content
 FROM lix_change
 ORDER BY created_at DESC
 LIMIT 20;

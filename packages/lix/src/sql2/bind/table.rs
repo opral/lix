@@ -227,6 +227,7 @@ mod tests {
             "lix_checkpoint",
             "lix_commit",
             "lix_commit_ancestry",
+            "lix_create_checkpoint",
             "lix_diff",
             "lix_directory",
             "lix_file",
@@ -334,7 +335,7 @@ mod tests {
             history
                 .columns
                 .iter()
-                .any(|column| { column.name == "lixcol_row_pk" && column.is_public() })
+                .any(|column| { column.name == "lixcol_row_ref" && column.is_public() })
         );
         assert!(
             !history

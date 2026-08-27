@@ -193,7 +193,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "SELECT row_pk FROM lix_change WHERE row_pk = 'state-latest'",
+                "SELECT snapshot_content FROM lix_change WHERE snapshot_content = 'state-latest'",
                 &[],
             )
             .await
@@ -221,7 +221,8 @@ simulation_test!(
 
         session
             .execute(
-                "SELECT row_pk FROM lix_change WHERE row_pk = CAST('[\"state-latest\"]' AS JSONB)",
+                "SELECT snapshot_content FROM lix_change \
+                 WHERE snapshot_content = CAST('[\"state-latest\"]' AS JSONB)",
                 &[],
             )
             .await

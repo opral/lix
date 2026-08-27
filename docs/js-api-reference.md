@@ -422,8 +422,7 @@ type MergeChangeStats = {
 ```ts
 type MergeConflict = {
   kind: "sameRowChanged";
-  schemaKey: string;
-  rowPk: unknown;
+  rowRef: string;
   fileId: string | null;
   target: MergeConflictSide;
   source: MergeConflictSide;

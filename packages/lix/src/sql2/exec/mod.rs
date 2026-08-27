@@ -11,6 +11,7 @@ use crate::SqlQueryResult;
 pub(crate) struct SqlWriteResult {
     pub(crate) rows_affected: u64,
     pub(crate) returning: Option<SqlQueryResult>,
+    pub(crate) checkpoint_telemetry: Option<(String, String)>,
 }
 
 impl SqlWriteResult {
@@ -18,6 +19,7 @@ impl SqlWriteResult {
         Self {
             rows_affected,
             returning: None,
+            checkpoint_telemetry: None,
         }
     }
 
@@ -25,12 +27,20 @@ impl SqlWriteResult {
         Self {
             rows_affected,
             returning: Some(returning),
+            checkpoint_telemetry: None,
         }
     }
 
     pub(crate) fn checkpoint_function(
         outcome: crate::sql2::DiffCommandOutcome,
     ) -> Result<Self, crate::LixError> {
+        let checkpoint_telemetry = outcome
+            .commit_id
+            .as_ref()
+            .zip(outcome.parent_commit_id.as_ref())
+            .map(|(commit_id, parent_commit_id)| {
+                (commit_id.clone(), parent_commit_id.clone())
+            });
         let rows = match outcome.commit_id {
             Some(commit_id) => vec![vec![crate::Value::Text(commit_id)]],
             None if outcome.rows_affected == 0 => Vec::new(),
@@ -41,7 +51,7 @@ impl SqlWriteResult {
                 ));
             }
         };
-        Ok(Self::returning(
+        let mut result = Self::returning(
             outcome.rows_affected,
             SqlQueryResult {
                 columns: vec!["commit_id".to_string()],
@@ -49,7 +59,9 @@ impl SqlWriteResult {
                 rows,
                 notices: Vec::new(),
             },
-        ))
+        );
+        result.checkpoint_telemetry = checkpoint_telemetry;
+        Ok(result)
     }
 
     pub(crate) fn diff_command(

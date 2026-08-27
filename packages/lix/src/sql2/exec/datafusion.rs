@@ -1782,6 +1782,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
             } else {
                 ctx.staged_commit_id(ctx.active_branch_id())?
             },
+            parent_commit_id: None,
         };
         return SqlWriteResult::diff_command(outcome, plan.bound.returning.as_ref());
     }
@@ -4244,6 +4245,7 @@ mod tests {
             Ok(crate::sql2::DiffCommandOutcome {
                 rows_affected: selections.len() as u64,
                 commit_id: (!selections.is_empty()).then(|| "commit-diff-command".to_string()),
+                parent_commit_id: None,
             })
         }
 
@@ -4515,9 +4517,8 @@ mod tests {
         };
         let plan = create_write_logical_plan(
             &mut ctx,
-            "INSERT INTO lix_revert (relation, row_pk) \
-             SELECT relation, CAST(row_pk AS JSONB) \
-             FROM (VALUES ('lix_key_value', '[\"test\"]')) AS selected(relation, row_pk) \
+            "INSERT INTO lix_revert (row_ref) \
+             SELECT lix_row_ref('lix_file', '01920000-0000-7000-8000-0000000000d2') \
              RETURNING commit_id",
         )
         .await
@@ -5484,8 +5485,8 @@ mod tests {
         session
             .execute(
                 "INSERT INTO test_state_schema \
-             (lixcol_row_pk, id, value, count, lixcol_metadata, lixcol_untracked) \
-             VALUES (CAST('[\"row-history\"]' AS JSONB), 'row-history', 'A', 7, '{\"source\":\"history\"}', false)",
+             (id, value, count, lixcol_metadata, lixcol_untracked) \
+             VALUES ('row-history', 'A', 7, '{\"source\":\"history\"}', false)",
                 &[],
             )
             .await?;
@@ -6073,9 +6074,9 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, count, lixcol_row_pk, lixcol_depth \
+                    "SELECT value, count, lixcol_row_ref, lixcol_depth \
 	             FROM lix_history('test_state_schema', '{head_commit_id}') \
-	             WHERE lixcol_row_pk = CAST('[\"row-history\"]' AS JSONB)"
+	             WHERE lixcol_row_ref = lix_row_ref('test_state_schema', 'row-history')"
                 ),
                 &[],
             )
@@ -6085,12 +6086,12 @@ mod tests {
 
         assert_eq!(
             columns,
-            vec!["value", "count", "lixcol_row_pk", "lixcol_depth",]
+            vec!["value", "count", "lixcol_row_ref", "lixcol_depth",]
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Text("A".to_string()));
         assert_eq!(rows[0][1], Value::Integer(7));
-        assert_eq!(rows[0][2], Value::Jsonb(json!(["row-history"]).into()));
+        assert!(matches!(rows[0][2], Value::RowRef(_)));
         assert!(matches!(rows[0][3], Value::Integer(_)));
     }
 
@@ -6987,8 +6988,7 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_row_pk, id, value) \
-	     VALUES (CAST('[\"row-c\"]' AS JSONB), 'row-c', 'C')",
+            "INSERT INTO test_state_schema (id, value) VALUES ('row-c', 'C')",
             &[],
         )
         .await
@@ -7094,8 +7094,7 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_row_pk, id, value) \
-             VALUES (CAST('[\"row-c\"]' AS JSONB), 'row-c', 'C')",
+            "INSERT INTO test_state_schema (id, value) VALUES ('row-c', 'C')",
             &[],
         )
         .await
@@ -9310,17 +9309,17 @@ mod tests {
 
         let result = execute_sql(
             &ctx,
-            "SELECT value, lixcol_row_pk \
+            "SELECT value, id \
                      FROM test_state_schema",
             &[],
         )
         .await
         .expect("sql2 execute should read row view");
 
-        assert_eq!(result.columns, vec!["value", "lixcol_row_pk"]);
+        assert_eq!(result.columns, vec!["value", "id"]);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
-        assert_eq!(result.rows[0][1], Value::Jsonb(json!(["row-a"]).into()));
+        assert_eq!(result.rows[0][1], Value::Text("row-a".to_string()));
     }
 
     #[tokio::test]

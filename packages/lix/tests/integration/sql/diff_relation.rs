@@ -470,7 +470,7 @@ simulation_test!(relation_diff_tracks_directory_descriptor_add_rename_and_remove
     );
 });
 
-simulation_test!(relation_diff_requires_explicit_relation_and_commit_ids, |sim| async move {
+simulation_test!(relation_diff_accepts_default_range_and_rejects_partial_range, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine.open_session().await.expect("session should open"),
@@ -481,7 +481,11 @@ simulation_test!(relation_diff_requires_explicit_relation_and_commit_ids, |sim| 
         .execute("SELECT * FROM lix_diff('a', 'b')", &[])
         .await
         .expect_err("legacy two-argument lix_diff must be rejected");
-    assert!(missing_relation.message.contains("relation and exactly two commit ID arguments"));
+    assert!(
+        missing_relation
+            .message
+            .contains("requires a relation and either zero or two commit ID arguments")
+    );
 
     let unsupported = session
         .execute(

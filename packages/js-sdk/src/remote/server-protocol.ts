@@ -4,7 +4,7 @@ import type {
 } from "../binding-types.js";
 import type { NativeLixValue } from "../value.js";
 
-export const SERVER_PROTOCOL_VERSION = 5;
+export const SERVER_PROTOCOL_VERSION = 6;
 
 export type WireValue =
 	| { kind: "null"; value: null }

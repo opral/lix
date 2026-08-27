@@ -124,7 +124,7 @@ simulation_test!(
         assert_eq!(
             changed.rows.rows()[0].values(),
             &[
-                Value::Jsonb(json!(["observe-checkpoint"]).into()),
+                Value::Text("observe-checkpoint".to_string()),
                 Value::Text("added".to_string()),
             ]
         );
@@ -151,7 +151,7 @@ simulation_test!(
         assert_eq!(
             changed_again.rows.rows()[0].values(),
             &[
-                Value::Jsonb(json!(["observe-checkpoint"]).into()),
+                Value::Text("observe-checkpoint".to_string()),
                 Value::Text("modified".to_string()),
             ]
         );

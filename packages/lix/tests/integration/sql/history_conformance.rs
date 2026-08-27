@@ -784,6 +784,7 @@ simulation_test!(history_discovery_has_no_suffix_surfaces, |sim| async move {
         .await,
         vec![
             vec![Value::Text("lix_commit_ancestry".to_string())],
+            vec![Value::Text("lix_create_checkpoint".to_string())],
             vec![Value::Text("lix_diff".to_string())],
             vec![Value::Text("lix_history".to_string())],
             vec![Value::Text("lix_state_at".to_string())],

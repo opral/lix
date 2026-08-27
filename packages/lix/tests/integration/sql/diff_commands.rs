@@ -146,8 +146,9 @@ simulation_test!(
         let duplicate = session
             .execute(
                 "INSERT INTO lix_revert (row_ref) \
-                 VALUES (lix_row_ref('lix_key_value', 'b')), \
-                        (lix_row_ref('lix_key_value', 'b'))",
+                 SELECT lix_row_ref('lix_key_value', 'b') \
+                 UNION ALL \
+                 SELECT lix_row_ref('lix_key_value', 'b')",
                 &[],
             )
             .await

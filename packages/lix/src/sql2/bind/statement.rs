@@ -1581,7 +1581,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_row_insert_select() {
         let statement = parse_statement(
-            "INSERT INTO test_state_schema (lixcol_row_pk, value) SELECT '[\"a\"]'::jsonb, 'A'",
+            "INSERT INTO test_state_schema (value) SELECT 'A'",
         );
         let error = bind_statement(
             &statement,
@@ -1972,8 +1972,8 @@ mod tests {
     fn bind_statement_allows_only_commit_id_for_diff_command_insert_returning() {
         let bound = bind_statement(
             &parse_statement(
-                "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', CAST('[\"test\"]' AS JSONB) \
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT lix_row_ref('lix_key_value', 'test') \
                  RETURNING commit_id AS created_commit_id",
             ),
             &[],
@@ -1993,8 +1993,8 @@ mod tests {
         ));
 
         for sql in [
-            "INSERT INTO lix_revert (relation, row_pk) SELECT 'lix_key_value', CAST('[\"test\"]' AS JSONB) RETURNING row_pk",
-            "INSERT INTO lix_revert (relation, row_pk) SELECT 'lix_key_value', CAST('[\"test\"]' AS JSONB) RETURNING *",
+            "INSERT INTO lix_revert (row_ref) SELECT lix_row_ref('lix_key_value', 'test') RETURNING row_ref",
+            "INSERT INTO lix_revert (row_ref) SELECT lix_row_ref('lix_key_value', 'test') RETURNING *",
         ] {
             let error = bind_statement(&parse_statement(sql), &[], "branch1")
                 .expect_err("unsupported INSERT RETURNING shape should fail");

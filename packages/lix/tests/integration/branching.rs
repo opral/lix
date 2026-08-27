@@ -38,7 +38,9 @@ simulation_test!(create_branch_rejects_existing_id, |sim| async move {
 
     assert_eq!(error.code, "LIX_ERROR_UNIQUE");
     assert!(
-        error.to_string().contains("INSERT would duplicate row_pk"),
+        error
+            .to_string()
+            .contains("INSERT would duplicate a primary key"),
         "error should explain the duplicate branch id: {error:?}"
     );
     assert_branch_descriptor(&main, "01930000-0000-7000-8000-000000000001", "Draft").await;
@@ -821,10 +823,7 @@ simulation_test!(
         assert_eq!(
             working_diffs.rows()[0].values(),
             &[
-                Value::Jsonb(
-                    JsonValue::Array(vec![JsonValue::String("draft-merge-source".to_string())])
-                        .into()
-                ),
+                Value::Text("draft-merge-source".to_string()),
                 Value::Text("added".to_string()),
             ],
             "the selected source delta must remain visible against the target checkpoint"
@@ -832,10 +831,7 @@ simulation_test!(
         assert_eq!(
             working_diffs.rows()[1].values(),
             &[
-                Value::Jsonb(
-                    JsonValue::Array(vec![JsonValue::String("main-merge-target".to_string())])
-                        .into()
-                ),
+                Value::Text("main-merge-target".to_string()),
                 Value::Text("added".to_string()),
             ],
             "the target delta must remain visible against the target checkpoint"
@@ -1239,7 +1235,7 @@ simulation_test!(
             "SELECT count(*) \
 	     FROM lix_change \
 	     WHERE schema_key = 'lix_key_value' \
-	       AND row_pk = CAST('[\"merge-select-change\"]' AS JSONB) \
+	       AND row_ref = lix_row_ref('lix_key_value', 'merge-select-change') \
 	       AND snapshot_content = CAST('{\"key\":\"merge-select-change\",\"value\":\"source\"}' AS JSONB)",
         )
         .await;
@@ -2304,24 +2300,15 @@ simulation_test!(
             actual,
             vec![
                 vec![
-                    Value::Jsonb(
-                        JsonValue::Array(vec![JsonValue::String("branch-broad-a".to_string())])
-                            .into()
-                    ),
+                    Value::Text("branch-broad-a".to_string()),
                     Value::Text("modified".to_string()),
                 ],
                 vec![
-                    Value::Jsonb(
-                        JsonValue::Array(vec![JsonValue::String("branch-broad-b".to_string())])
-                            .into()
-                    ),
+                    Value::Text("branch-broad-b".to_string()),
                     Value::Text("modified".to_string()),
                 ],
                 vec![
-                    Value::Jsonb(
-                        JsonValue::Array(vec![JsonValue::String("branch-broad-new".to_string())])
-                            .into()
-                    ),
+                    Value::Text("branch-broad-new".to_string()),
                     Value::Text("added".to_string()),
                 ],
             ],

@@ -49,6 +49,7 @@ pub(crate) struct DiffCommandSelection {
 pub(crate) struct DiffCommandOutcome {
     pub(crate) rows_affected: u64,
     pub(crate) commit_id: Option<String>,
+    pub(crate) parent_commit_id: Option<String>,
 }
 
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;

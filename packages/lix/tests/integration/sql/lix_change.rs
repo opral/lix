@@ -25,19 +25,19 @@ simulation_test!(lix_change_queries_durable_change_facts, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT row_pk, schema_key, snapshot_content \
+            "SELECT row_ref, schema_key, snapshot_content \
              FROM lix_change \
-             WHERE row_pk = CAST('[\"change-query\"]' AS JSONB)",
+             WHERE row_ref = lix_row_ref('lix_key_value', 'change-query')",
             &[],
         )
         .await
         .expect("lix_change should read");
     let rows = result;
     assert_eq!(rows.len(), 1);
+    assert!(matches!(rows.rows()[0].values()[0], Value::RowRef(_)));
     assert_eq!(
-        rows.rows()[0].values(),
+        &rows.rows()[0].values()[1..],
         &[
-            Value::Jsonb(json!(["change-query"]).into()),
             Value::Text("lix_key_value".to_string()),
             Value::Jsonb(json!({"key": "change-query", "value": "one"}).into()),
         ]
@@ -78,7 +78,7 @@ simulation_test!(lix_change_includes_commit_changes, |sim| async move {
 });
 
 simulation_test!(
-    lix_change_row_pk_is_json_array_for_composite_primary_keys,
+    lix_change_row_ref_is_lossless_for_composite_primary_keys,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -103,35 +103,35 @@ simulation_test!(
             .expect("composite schema insert should succeed");
         session
             .execute(
-                "INSERT INTO engine_composite_message (key, locale, text) \
-                 VALUES ('welcome.title', 'en', 'Welcome')",
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('01950000-0000-7000-8000-000000000031', '/messages.json', CAST('{}' AS BYTEA))",
                 &[],
             )
             .await
-            .expect("composite row insert should succeed");
+            .expect("owning file insert should succeed");
+        session
+            .execute(
+                "INSERT INTO engine_composite_message (key, locale, text, lixcol_file_id) \
+                 VALUES ('welcome.title', 'en', 'Welcome', '01950000-0000-7000-8000-000000000031')",
+                &[],
+            )
+            .await
+            .expect("file-owned composite row insert should succeed");
 
         let result = session
             .execute(
-                "SELECT row_pk, \
-                        row_pk ->> 0 AS row_key, \
-                        row_pk ->> 1 AS row_locale \
+                "SELECT row_ref, \
+                        row_ref = lix_row_ref('engine_composite_message', 'welcome.title', 'en') AS expected_ref \
                  FROM lix_change \
-                 WHERE schema_key = 'engine_composite_message' \
-                   AND row_pk = CAST('[\"welcome.title\",\"en\"]' AS JSONB)",
+                 WHERE schema_key = 'engine_composite_message'",
                 &[],
             )
             .await
-            .expect("lix_change should expose composite row_pk as JSON");
+            .expect("lix_change should expose the semantic composite row_ref");
 
         assert_eq!(result.len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Jsonb(json!(["welcome.title", "en"]).into()),
-                Value::Text("welcome.title".to_string()),
-                Value::Text("en".to_string()),
-            ]
-        );
+        assert!(matches!(result.rows()[0].values()[0], Value::RowRef(_)));
+        assert_eq!(result.rows()[0].values()[1], Value::Boolean(true));
     }
 );
 

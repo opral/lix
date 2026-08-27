@@ -406,7 +406,11 @@ where
                 deterministic: true,
             },
             case_id,
-            test_fn,
+            // Keep the scenario state machine off the test harness thread's
+            // fixed-size stack. Engine SQL futures intentionally carry their
+            // transaction state across awaits and should not be nested inline
+            // into this generic simulation runner.
+            move |sim| Box::pin(test_fn(sim)),
         ),
     );
 }
@@ -692,7 +696,7 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT lixcol_row_pk FROM __LIX_RELATION_DIFF__ ORDER BY lixcol_row_pk",
+                "SELECT key FROM __LIX_RELATION_DIFF__ ORDER BY key",
             )
             .await,
             &[],
@@ -702,9 +706,9 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
     assert_eq!(remaining.rows().len(), 1);
     assert_eq!(
         remaining.rows()[0]
-            .get::<serde_json::Value>("lixcol_row_pk")
+            .get::<String>("key")
             .expect("remaining row key"),
-        serde_json::json!(["remaining"]),
+        "remaining",
     );
     let final_values = hot_digest(&replica.lix)
         .await
@@ -758,7 +762,7 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
 			&working_diff_sql(
 				&replica.lix,
 				"lix_key_value",
-				"SELECT lixcol_row_pk FROM __LIX_RELATION_DIFF__ ORDER BY lixcol_row_pk",
+				"SELECT key FROM __LIX_RELATION_DIFF__ ORDER BY key",
 			)
 			.await,
 			&[],
@@ -767,10 +771,8 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
 		.expect("unselected snapshot-local diff should remain readable");
 	assert_eq!(remaining.rows().len(), 49);
 	assert_eq!(
-		remaining.rows()[0]
-			.get::<serde_json::Value>("lixcol_row_pk")
-			.unwrap(),
-		serde_json::json!(["working-01"]),
+		remaining.rows()[0].get::<String>("key").unwrap(),
+		"working-01",
 	);
 }
 
@@ -1130,7 +1132,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                 &replica.lix,
                 "lix_key_value",
                 "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ \
-                 WHERE lixcol_row_pk ->> 0 = 'selected-recreate'",
+                 WHERE key = 'selected-recreate'",
             )
             .await,
             &[],
@@ -1148,7 +1150,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                 &replica.lix,
                 "lix_key_value",
                 "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ \
-                 WHERE lixcol_row_pk ->> 0 = 'remaining'",
+                 WHERE key = 'remaining'",
             )
             .await,
             &[],
@@ -1168,7 +1170,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                 &replica.lix,
                 "lix_key_value",
                 "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ \
-                 WHERE lixcol_row_pk ->> 0 = 'remaining'",
+                 WHERE key = 'remaining'",
             )
             .await,
             &[],
@@ -1256,7 +1258,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                 &working_diff_sql(
                     &replica.lix,
                     "lix_file",
-                    "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ WHERE lixcol_row_pk ->> 0 = $1",
+                    "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ WHERE id = $1",
                 )
                 .await,
                 &[Value::Text(selected_file_id.clone())],
@@ -1307,7 +1309,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                 &working_diff_sql(
                     &replica.lix,
                     "lix_file",
-                    "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ WHERE lixcol_row_pk ->> 0 = $1",
+                    "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ WHERE id = $1",
                 )
                 .await,
                 &[Value::Text(selected_file_id)],
@@ -1582,7 +1584,7 @@ async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Si
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT lixcol_row_pk ->> 0 AS key FROM __LIX_RELATION_DIFF__",
+                "SELECT key FROM __LIX_RELATION_DIFF__",
             )
             .await,
             &[],
@@ -1641,7 +1643,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT diff_type, lixcol_row_pk FROM __LIX_RELATION_DIFF__",
+                "SELECT diff_type, key FROM __LIX_RELATION_DIFF__",
             )
             .await,
             &[],
@@ -1656,10 +1658,8 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
         "removed"
     );
     assert_eq!(
-        remaining.rows()[0]
-            .get::<serde_json::Value>("lixcol_row_pk")
-            .unwrap(),
-        serde_json::json!(["removed"]),
+        remaining.rows()[0].get::<String>("key").unwrap(),
+        "removed",
     );
     replica.restart().await;
     assert_eq!(

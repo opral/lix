@@ -830,7 +830,10 @@ where
 {
     ALLOCATION_CALLS.with(|calls| calls.set(0));
     ALLOCATED_BYTES.with(|bytes| bytes.set(0));
-    let (result, storage) = measure_checkpoint_foreground(lix.create_checkpoint()).await;
+    let (result, storage) = measure_checkpoint_foreground(
+        lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[]),
+    )
+    .await;
     result.expect("create benchmark checkpoint");
     let accounting = ForegroundAccounting {
         storage,

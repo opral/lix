@@ -2,9 +2,6 @@ use crate::LixError;
 use crate::gc::CheckpointGcState;
 use crate::gc::load_checkpoint_gc_state;
 use crate::storage_adapter::{SharedStorageAdapterRead, Storage, StorageReadOptions};
-use crate::telemetry::{
-    ActiveTelemetrySpan, CHECKPOINT_CREATE, Status, TelemetryAttribute,
-};
 #[cfg(test)]
 use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRow};
 #[cfg(test)]
@@ -46,66 +43,33 @@ where
     /// copies interval members. Scale-dependent physical reclamation is
     /// maintenance work and cannot extend foreground checkpoint latency.
     pub(crate) async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
-        let span = self.telemetry.as_ref().and_then(|sink| {
-            ActiveTelemetrySpan::start_if_enabled(sink, &CHECKPOINT_CREATE, Vec::new())
-        });
-        let operation = async {
-            let checkpoint = self
-                .execute(
-                    "SELECT commit_id FROM lix_create_checkpoint()",
-                    &[],
-                )
-                .await?;
-            let checkpoint_row = checkpoint.rows().first().ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "checkpoint SQL function returned no commit ID",
-                    )
-                })?;
-            let commit_id = checkpoint_row.get::<String>("commit_id")?;
-            let marker = self
-                .execute(
-                    "SELECT lixcol_change_id FROM lix_checkpoint WHERE commit_id = $1",
-                    &[crate::Value::Text(commit_id.clone())],
-                )
-                .await?;
-            let marker_row = marker.rows().first().ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "checkpoint SQL function published no checkpoint marker",
-                    )
-                })?;
-            let change_id = marker_row.get::<String>("lixcol_change_id")?;
-            Ok::<_, LixError>(CreateCheckpointReceipt {
-                commit_id,
-                change_id,
-            })
-        };
-        let result = match span.as_ref() {
-            Some(span) => span.instrument(operation).await,
-            None => operation.await,
-        };
-        let receipt = match result {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                if let Some(span) = span {
-                    span.finish(
-                        Status::error(error.code.clone()),
-                        vec![TelemetryAttribute::string("error.type", error.code.clone())],
-                    );
-                }
-                return Err(error);
-            }
-        };
-        if let Some(span) = span {
-            span.finish(
-                Status::Unset,
-                vec![
-                    TelemetryAttribute::string("lix.commit_id", receipt.commit_id.clone()),
-                ],
-            );
-        }
-        Ok(receipt)
+        let checkpoint = self
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await?;
+        let checkpoint_row = checkpoint.rows().first().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "checkpoint SQL function returned no commit ID",
+            )
+        })?;
+        let commit_id = checkpoint_row.get::<String>("commit_id")?;
+        let marker = self
+            .execute(
+                "SELECT lixcol_change_id FROM lix_checkpoint WHERE commit_id = $1",
+                &[crate::Value::Text(commit_id.clone())],
+            )
+            .await?;
+        let marker_row = marker.rows().first().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "checkpoint SQL function published no checkpoint marker",
+            )
+        })?;
+        let change_id = marker_row.get::<String>("lixcol_change_id")?;
+        Ok(CreateCheckpointReceipt {
+            commit_id,
+            change_id,
+        })
     }
 
     /// Consumes the post-commit checkpoint effect published by the transaction
@@ -275,7 +239,7 @@ mod tests {
     use crate::transaction::StagedCommitChangeBatchBuilder;
 
     #[tokio::test]
-    async fn repository_global_branch_cannot_be_checkpointed() {
+    async fn repository_global_branch_cannot_be_checkpointed_through_sql() {
         let storage = Memory::new();
         let _receipt = crate::engine::Engine::initialize(storage.clone())
             .await
@@ -289,7 +253,7 @@ mod tests {
             .expect("global session opens");
 
         let error = session
-            .create_checkpoint()
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
             .expect_err("global branch checkpoint must be rejected");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);

@@ -1281,10 +1281,7 @@ simulation_test!(
         };
         let source_changes = source_changes.to_value();
         assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
-        assert_eq!(
-            source_changes[0]["schema_key"],
-            json!("lix_file_descriptor")
-        );
+        assert!(source_changes[0]["row_ref"].as_str().is_some());
         assert_eq!(
             source_changes[0]["snapshot_content"]["name"],
             json!("readme-renamed.md")

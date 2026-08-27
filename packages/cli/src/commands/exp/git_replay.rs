@@ -444,11 +444,12 @@ where
         let checkpoint_ms = if checkpoint_every.is_some_and(|interval| (index + 1) % interval == 0)
         {
             let checkpoint_started = Instant::now();
-            db::block_on(lix.create_checkpoint()).map_err(|error| {
-                CliError::msg(format!(
-                    "failed to checkpoint after replay commit {commit_sha}: {error}"
-                ))
-            })?;
+            db::block_on(lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[]))
+                .map_err(|error| {
+                    CliError::msg(format!(
+                        "failed to checkpoint after replay commit {commit_sha}: {error}"
+                    ))
+                })?;
             let elapsed_ms = duration_to_ms(checkpoint_started.elapsed());
             phase_totals.checkpoint_ms += elapsed_ms;
             Some(elapsed_ms)

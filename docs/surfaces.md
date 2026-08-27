@@ -111,7 +111,7 @@ schema contributes another `RELATION` / `BASE` surface.
 | Relation / view | `lix_branch`, `lix_change`, `lix_directory`, `lix_file` |
 | Table function | `lix_commit_ancestry`, `lix_create_checkpoint` (mutating), `lix_diff`, `lix_history` |
 | Command sink | `lix_apply`, `lix_restore`, `lix_revert` |
-| Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `lix_latest_checkpoint_commit_id`, `lix_root_commit_id`, `uuidv7` |
+| Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `lix_latest_checkpoint_commit_id`, `lix_root_commit_id`, `lix_row_ref`, `uuidv7` |
 
 Standard SQL value expressions such as `CURRENT_TIMESTAMP` are supported SQL
 syntax, not Lix-owned scalar-function surfaces, and are therefore omitted from

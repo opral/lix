@@ -10,6 +10,9 @@ use crate::branch::BranchRefReader;
 use crate::common::{ExecuteStatementMetadata, ExpiredReadRetryState};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
+use crate::telemetry::{
+    ActiveTelemetrySpan, CHECKPOINT_CREATE, Status, TelemetryAttribute,
+};
 use crate::sql2;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::Storage;
@@ -88,6 +91,7 @@ pub struct ExecuteResult {
     /// empty case inline avoids one Arc clone/drop pair for every scalar write.
     backing: Option<Arc<ExecuteResultBacking>>,
     rows_affected: u64,
+    checkpoint_telemetry: Option<(String, String)>,
     #[cfg(feature = "storage-benches")]
     profile_provider_rows_examined: u64,
 }
@@ -220,8 +224,9 @@ impl ExecuteResult {
         let sql2::SqlWriteResult {
             rows_affected,
             returning,
+            checkpoint_telemetry,
         } = result;
-        match returning {
+        let mut result = match returning {
             Some(result) => {
                 Self::from_query_parts(
                     result.columns,
@@ -232,7 +237,9 @@ impl ExecuteResult {
                 )
             }
             None => Self::from_rows_affected(rows_affected),
-        }
+        };
+        result.checkpoint_telemetry = checkpoint_telemetry;
+        result
     }
 
     pub fn from_rows_affected(rows_affected: u64) -> Self {
@@ -241,6 +248,7 @@ impl ExecuteResult {
             statement_label: None,
             backing: None,
             rows_affected,
+            checkpoint_telemetry: None,
             #[cfg(feature = "storage-benches")]
             profile_provider_rows_examined: 0,
         }
@@ -302,6 +310,7 @@ impl ExecuteResult {
                 file_view_mutations: Vec::new(),
             })),
             rows_affected,
+            checkpoint_telemetry: None,
             #[cfg(feature = "storage-benches")]
             profile_provider_rows_examined: 0,
         }
@@ -335,6 +344,7 @@ impl ExecuteResult {
                 file_view_mutations: Vec::new(),
             })),
             rows_affected: 0,
+            checkpoint_telemetry: None,
             #[cfg(feature = "storage-benches")]
             profile_provider_rows_examined: 0,
         }
@@ -1432,18 +1442,89 @@ where
     ) -> Result<ExecuteResult, LixError> {
         let telemetry =
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, execution_kind, None);
-        let operation = self.execute_with_options_inner(
-            sql,
-            params,
-            options,
-            metadata,
-            execution_kind == "observe",
-            idempotency,
-            require_idempotency_for_writes,
-        );
-        let result = match telemetry.as_ref() {
-            Some(telemetry) => telemetry.instrument(operation).await,
-            None => operation.await,
+        let checkpoint_statement = self
+            .sql_planning_cache
+            .parse_statement(sql)
+            .ok()
+            .and_then(|statement| sql2::checkpoint_function_plan(&statement).ok().flatten())
+            .is_some();
+        let result = if checkpoint_statement {
+            // The checkpoint-only wrapper must begin while the SQL span is
+            // current so transaction/storage spans become its children. Box
+            // this exceptional path: nesting the engine's large execution
+            // future inline here materially increases every SQL caller's
+            // stack frame, including non-checkpoint sync traffic.
+            let operation = Box::pin(async {
+                let checkpoint_span =
+                    ActiveTelemetrySpan::start_current(&CHECKPOINT_CREATE, Vec::new());
+                let execution = self.execute_with_options_inner(
+                    sql,
+                    params,
+                    options,
+                    metadata,
+                    execution_kind == "observe",
+                    idempotency,
+                    require_idempotency_for_writes,
+                );
+                let result = match checkpoint_span.as_ref() {
+                    Some(span) => span.instrument(execution).await,
+                    None => execution.await,
+                };
+                match result {
+                    Ok(result) => {
+                        if let Some(span) = checkpoint_span {
+                            let attributes = result
+                                .checkpoint_telemetry
+                                .as_ref()
+                                .map(|(commit_id, parent_commit_id)| {
+                                    vec![
+                                        TelemetryAttribute::string(
+                                            "lix.commit_id",
+                                            commit_id.clone(),
+                                        ),
+                                        TelemetryAttribute::string(
+                                            "lix.parent_commit_id",
+                                            parent_commit_id.clone(),
+                                        ),
+                                    ]
+                                })
+                                .unwrap_or_default();
+                            span.finish(Status::Unset, attributes);
+                        }
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        if let Some(span) = checkpoint_span {
+                            span.finish(
+                                Status::error(error.code.clone()),
+                                vec![TelemetryAttribute::string(
+                                    "error.type",
+                                    error.code.clone(),
+                                )],
+                            );
+                        }
+                        Err(error)
+                    }
+                }
+            });
+            match telemetry.as_ref() {
+                Some(telemetry) => telemetry.instrument(operation).await,
+                None => operation.await,
+            }
+        } else {
+            let operation = self.execute_with_options_inner(
+                sql,
+                params,
+                options,
+                metadata,
+                execution_kind == "observe",
+                idempotency,
+                require_idempotency_for_writes,
+            );
+            match telemetry.as_ref() {
+                Some(telemetry) => telemetry.instrument(operation).await,
+                None => operation.await,
+            }
         };
         if let Some(telemetry) = telemetry {
             telemetry.finish(&result);
@@ -5823,12 +5904,12 @@ mod tests {
         storage.expire_after_each_transaction_open(3);
         let reverted = session
             .execute(
-                "INSERT INTO lix_revert (relation, row_pk) \
-                 SELECT 'lix_key_value', lixcol_row_pk \
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref \
                  FROM lix_diff(\
                    'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
                  ) \
-                 WHERE lixcol_row_pk = CAST('[\"retry-revert\"]' AS JSONB)",
+                 WHERE key = 'retry-revert'",
                 &[],
             )
             .await
@@ -5887,12 +5968,12 @@ mod tests {
             [7; 32],
         )
         .with_branch(branch_id);
-        let sql = "INSERT INTO lix_revert (relation, row_pk) \
-                   SELECT 'lix_key_value', lixcol_row_pk \
+        let sql = "INSERT INTO lix_revert (row_ref) \
+                   SELECT row_ref \
                    FROM lix_diff(\
                      'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
                    ) \
-                   WHERE lixcol_row_pk = CAST('[\"idempotent-revert\"]' AS JSONB)";
+                   WHERE key = 'idempotent-revert'";
 
         // The first read checks for a pre-existing receipt, then every attempt
         // opens its coherent transaction read before the tracked-state reader.
@@ -6001,7 +6082,7 @@ mod tests {
         );
         let working_diff = session
             .execute(
-                "SELECT lixcol_row_pk FROM lix_diff(\
+                "SELECT row_ref FROM lix_diff(\
                  'lix_key_value', $1, lix_active_branch_commit_id())",
                 &[Value::Text(restore_target.clone())],
             )
@@ -9606,7 +9687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_compares_explicit_uuid_keys_by_external_value() {
+    async fn insert_accepts_explicit_uuid_keys_by_external_value() {
         const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
         let session = open_session().await;
@@ -9629,12 +9710,8 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO explicit_uuid_key_probe (id, value, lixcol_row_pk) \
-                 VALUES ($1, 'value', CAST($2 AS JSONB))",
-                &[
-                    Value::Text(UUID.to_string()),
-                    Value::Text(format!("[\"{UUID}\"]")),
-                ],
+                "INSERT INTO explicit_uuid_key_probe (id, value) VALUES ($1, 'value')",
+                &[Value::Text(UUID.to_string())],
             )
             .await
             .expect("matching typed and external UUID keys should commit");
@@ -11554,9 +11631,9 @@ mod tests {
                  FROM files AS file_a \
                  JOIN files AS file_b ON file_a.id = file_b.id \
                  LEFT JOIN (\
-                     SELECT row_pk FROM lix_change \
+                     SELECT row_ref FROM lix_change \
                      UNION ALL \
-                     SELECT row_pk FROM lix_change\
+                     SELECT row_ref FROM lix_change\
                  ) AS changes ON false",
                 &[],
             )
