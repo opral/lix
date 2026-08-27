@@ -72,7 +72,10 @@ pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 1;
+// v2 fences the v77 engine-authoritative built-in schema semantics. Repository
+// format markers are local storage metadata and do not cross the sync wire, so
+// the sync handshake must reject v76 peers explicitly.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 2;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str =

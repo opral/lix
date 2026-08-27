@@ -118,14 +118,14 @@ async fn released_v75_repository_auto_upgrades_with_semantics_intact() {
         .await
         .expect("released v75 repository should auto-upgrade");
 
-    assert_eq!(lix.open_report().format, 76);
+    assert_eq!(lix.open_report().format, 77);
     assert!(!lix.open_report().initialized);
     let migration = lix
         .open_report()
         .migration
         .expect("v75 open should report its automatic upgrade");
     assert_eq!(migration.from_format, 75);
-    assert_eq!(migration.to_format, 76);
+    assert_eq!(migration.to_format, 77);
 
     let main_branch_id = lix
         .active_branch_id()
@@ -175,7 +175,7 @@ async fn released_v75_repository_auto_upgrades_with_semantics_intact() {
         .from_snapshot(Cursor::new(migrated))
         .await
         .expect("migrated repository should cold-open");
-    assert_eq!(reopened.open_report().format, 76);
+    assert_eq!(reopened.open_report().format, 77);
     assert!(!reopened.open_report().initialized);
     assert_eq!(reopened.open_report().migration, None);
 

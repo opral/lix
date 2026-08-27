@@ -3005,7 +3005,7 @@ mod tests {
             admitted.report.migration,
             Some(OpenMigrationReport {
                 from_format: 75,
-                to_format: 76,
+                to_format: crate::init::CURRENT_FORMAT_VERSION,
             })
         );
     }

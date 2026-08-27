@@ -492,7 +492,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 1 }
+      schema: { type: integer, const: 2 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -550,7 +550,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 6 }
-        syncProtocolVersion: { type: integer, const: 1 }
+        syncProtocolVersion: { type: integer, const: 2 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }

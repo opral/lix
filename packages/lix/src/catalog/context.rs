@@ -28,12 +28,12 @@ const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
 
 /// Engine schema visibility boundary.
 ///
-/// Dynamic SQL planning receives a schema snapshot from live state. System
-/// schemas are also seeded as ordinary `lix_registered_schema` rows for
-/// validation and introspection, while fixed-surface reads may use their
-/// compile-time definitions without loading those rows. The context also owns
-/// engine-wide caches of compiled snapshots, keyed by either fact content or
-/// the atomic storage revision captured when a transaction opens.
+/// Dynamic SQL planning receives an effective schema snapshot composed from
+/// immutable engine built-ins plus custom schemas in live state. Historical
+/// repositories can retain built-in `lix_registered_schema` rows for
+/// introspection, but those mirrors never participate in schema authority. The
+/// context also owns engine-wide caches keyed by effective fact content or the
+/// atomic storage revision captured when a transaction opens.
 pub(crate) struct CatalogContext {
     compiled_catalogs: Mutex<HashMap<CatalogFingerprint, Arc<CatalogSnapshot>>>,
     transaction_opening_catalogs:
@@ -216,9 +216,18 @@ impl CatalogContext {
         let facts = self
             .schema_facts_for_domain(hot_state, &Domain::schema_catalog(branch_id, true))
             .await?;
-        let mut schemas = BTreeMap::<String, JsonValue>::new();
+        let mut schemas = crate::schema::seed_schema_definitions()
+            .into_iter()
+            .map(|schema| {
+                let key = crate::schema::schema_key_from_definition(schema)?;
+                Ok((key.schema_key, schema.clone()))
+            })
+            .collect::<Result<BTreeMap<String, JsonValue>, LixError>>()?;
         for fact in facts {
             let schema_key = fact.catalog_key().schema_key.clone();
+            if crate::schema::seed_schema_definition(&schema_key).is_some() {
+                continue;
+            }
             if schemas
                 .insert(schema_key.clone(), fact.schema().clone())
                 .is_some()
@@ -751,7 +760,12 @@ mod tests {
             .await
             .expect("schema visibility should load");
 
-        assert!(schemas.is_empty());
+        assert!(schemas.iter().all(|schema| {
+            schema.get("key").and_then(JsonValue::as_str) != Some("global_only_schema")
+        }));
+        assert!(schemas.iter().any(|schema| {
+            schema.get("key").and_then(JsonValue::as_str) == Some("lix_file_descriptor")
+        }));
     }
 
     #[tokio::test]
@@ -779,7 +793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn visible_schemas_are_empty_when_no_schema_rows_are_visible() {
+    async fn visible_schemas_still_include_engine_builtins_when_no_rows_are_visible() {
         let context = CatalogContext::new();
 
         let schemas = context
@@ -790,7 +804,10 @@ mod tests {
             .await
             .expect("schema visibility should load");
 
-        assert!(schemas.is_empty());
+        assert_eq!(schemas.len(), crate::schema::seed_schema_definitions().len());
+        assert!(schemas.iter().any(|schema| {
+            schema.get("key").and_then(JsonValue::as_str) == Some("lix_file_descriptor")
+        }));
     }
 
     struct RowsHotStateReader {

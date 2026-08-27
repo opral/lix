@@ -39,7 +39,7 @@ async fn fresh_open_reports_initialization_without_migration() {
         .await
         .expect("fresh repository should initialize and open");
 
-    assert_eq!(lix.open_report().format, 76);
+    assert_eq!(lix.open_report().format, 77);
     assert!(lix.open_report().initialized);
     assert_eq!(lix.open_report().migration, None);
     assert_eq!(
@@ -71,14 +71,14 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
         .from_snapshot(Cursor::new(V72_ACCOUNT_SNAPSHOT))
         .await
         .expect("opening a v72 repository should migrate it automatically");
-    assert_eq!(lix.open_report().format, 76);
+    assert_eq!(lix.open_report().format, 77);
     assert!(!lix.open_report().initialized);
     let migration = lix
         .open_report()
         .migration
         .expect("the open report should record the automatic migration");
     assert_eq!(migration.from_format, 72);
-    assert_eq!(migration.to_format, 76);
+    assert_eq!(migration.to_format, 77);
 
     let events = progress.events();
     assert_eq!(
@@ -93,7 +93,7 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
         "automatic migration progress should be deterministic and ordered",
     );
     assert_eq!(events[1].from_format, Some(72));
-    assert_eq!(events[1].to_format, 76);
+    assert_eq!(events[1].to_format, 77);
     assert_eq!(events[1].completed, Some(0));
     assert_eq!(events[1].total, None);
     assert!(
@@ -138,7 +138,7 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
         .from_snapshot(Cursor::new(migrated))
         .await
         .expect("migrated repository should cold-open");
-    assert_eq!(lix.open_report().format, 76);
+    assert_eq!(lix.open_report().format, 77);
     assert_eq!(lix.open_report().migration, None);
     assert!(!lix.open_report().initialized);
     let result = lix
