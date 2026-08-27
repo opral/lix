@@ -32,7 +32,7 @@ simulation_test!(
         let working = select_rows(
             &session,
             &format!(
-                "SELECT lixcol_row_pk, lixcol_diff_type FROM lix_diff('lix_key_value', '{baseline}', '{original_head}') ORDER BY lixcol_row_pk"
+                "SELECT lixcol_row_pk, diff_type FROM lix_diff('lix_key_value', '{baseline}', '{original_head}') ORDER BY lixcol_row_pk"
             ),
         )
         .await;
@@ -309,7 +309,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_diff_type FROM lix_diff('lix_key_value', '{checkpoint_id}', '{head}') \
+                    "SELECT diff_type FROM lix_diff('lix_key_value', '{checkpoint_id}', '{head}') \
                      WHERE lixcol_row_pk = CAST('[\"recycled\"]' AS JSONB)"
                 ),
             )

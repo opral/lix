@@ -1656,7 +1656,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT lixcol_diff_type, lixcol_row_pk FROM __LIX_RELATION_DIFF__",
+                "SELECT diff_type, lixcol_row_pk FROM __LIX_RELATION_DIFF__",
             )
             .await,
             &[],
@@ -1666,7 +1666,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
     assert_eq!(remaining.rows().len(), 1);
     assert_eq!(
         remaining.rows()[0]
-            .get::<String>("lixcol_diff_type")
+            .get::<String>("diff_type")
             .unwrap(),
         "removed"
     );
@@ -1685,7 +1685,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
                     &replica.lix,
                     "lix_key_value",
                     "SELECT COUNT(*) AS count FROM __LIX_RELATION_DIFF__ \
-                     WHERE lixcol_diff_type = 'removed'",
+                     WHERE diff_type = 'removed'",
                 )
                 .await,
                 &[],

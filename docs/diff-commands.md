@@ -17,7 +17,7 @@ import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
 const changedFiles = await lix.execute(
-  `SELECT lixcol_row_pk, lixcol_diff_type, from_path, to_path, lixcol_row_count
+  `SELECT lixcol_row_pk, diff_type, from_path, to_path, row_count
    FROM lix_diff(
      'lix_file',
      lix_latest_checkpoint_commit_id(),
@@ -27,7 +27,7 @@ const changedFiles = await lix.execute(
 );
 
 for (const row of changedFiles.rows) {
-  console.log(row.get("lixcol_diff_type"), row.get("to_path") ?? row.get("from_path"));
+  console.log(row.get("diff_type"), row.get("to_path") ?? row.get("from_path"));
 }
 
 const reverted = await lix.execute(
@@ -57,10 +57,10 @@ for a new branch.
 
 ## Diff rows
 
-Every relation diff exposes `lixcol_row_pk`, `lixcol_diff_type`,
-`lixcol_row_count`, and a
+Every relation diff exposes `lixcol_row_pk`, `diff_type`,
+`row_count`, and a
 `from_<column>` / `to_<column>` pair for each column of the compared relation.
-`lixcol_diff_type` is `added`, `modified`, or `removed`. Added rows have empty `from_`
+`diff_type` is `added`, `modified`, or `removed`. Added rows have empty `from_`
 values; removed rows have empty `to_` values. Use
 `coalesce(to_path, from_path)` when displaying a path that also covers removed
 or renamed files.
@@ -70,11 +70,11 @@ reconstructing historical file bytes would turn lightweight diff reads into blob
 materialization. Query `lix_history('lix_file', commit_id)` when file bytes are
 required.
 
-`lixcol_row_count` is `1` for a changed schema row. For a file it counts the underlying
+`row_count` is `1` for a changed schema row. For a file it counts the underlying
 descriptor and content rows contributing to the aggregate:
 
 ```sql
-SELECT count(*) AS changed_files, sum(lixcol_row_count) AS changed_rows
+SELECT count(*) AS changed_files, sum(row_count) AS changed_rows
 FROM lix_diff(
   'lix_file',
   lix_latest_checkpoint_commit_id(),

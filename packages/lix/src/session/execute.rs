@@ -6875,7 +6875,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('rootless_ordered_insert_probe', $1, $2) \
-                 WHERE lixcol_diff_type = 'added'",
+                 WHERE diff_type = 'added'",
                 &[
                     Value::Text(baseline.commit_id.to_string()),
                     Value::Text(head.commit_id.to_string()),
@@ -6958,7 +6958,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('rootless_ordered_insert_probe', $1, $2) \
-                 WHERE lixcol_diff_type = 'modified'",
+                 WHERE diff_type = 'modified'",
                 &[
                     Value::Text(head.commit_id.to_string()),
                     Value::Text(descendant.commit_id.to_string()),
@@ -7140,7 +7140,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('rootless_ordered_insert_probe', $1, $2) \
-                 WHERE lixcol_diff_type = 'modified'",
+                 WHERE diff_type = 'modified'",
                 &[
                     Value::Text(reseed_head.commit_id.to_string()),
                     Value::Text(rooted_fence.to_string()),
@@ -7392,7 +7392,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('columnar_lifecycle_probe', $1, $2) \
-                 WHERE lixcol_diff_type = 'added'",
+                 WHERE diff_type = 'added'",
                 &[
                     Value::Text(before_insert.to_string()),
                     Value::Text(inserted_head.to_string()),
@@ -7560,7 +7560,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('columnar_lifecycle_probe', $1, $2) \
-                 WHERE lixcol_diff_type = 'modified'",
+                 WHERE diff_type = 'modified'",
                 &[
                     Value::Text(checkpoint.commit_id.to_string()),
                     Value::Text(merged_head.to_string()),
@@ -7703,7 +7703,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('ordered_packed_update_probe', lix_root_commit_id(), lix_active_branch_commit_id()) \
-                 WHERE lixcol_diff_type = 'added'",
+                 WHERE diff_type = 'added'",
                 &[],
             )
             .await
@@ -7854,7 +7854,7 @@ mod tests {
             .execute(
                 "SELECT count(*) AS count \
                  FROM lix_diff('packed_replacement_working_diff_probe', $1, $2) \
-                 WHERE lixcol_diff_type = 'modified'",
+                 WHERE diff_type = 'modified'",
                 &[
                     Value::Text(checkpoint_commit_id.clone()),
                     Value::Text(head_commit_id.clone()),
@@ -9693,7 +9693,7 @@ mod tests {
                 .execute(
                     "SELECT COUNT(*) AS entries \
                      FROM lix_diff('packed_replacement_probe', $1, $2) \
-                     WHERE lixcol_diff_type = 'modified'",
+                     WHERE diff_type = 'modified'",
                     &[Value::Text(before.clone()), Value::Text(after.clone())],
                 )
                 .await
@@ -9861,7 +9861,7 @@ mod tests {
             .execute(
                 "SELECT COUNT(*) AS entries \
                  FROM lix_diff('packed_replacement_probe', $1, $2) \
-                 WHERE lixcol_diff_type = 'modified'",
+                 WHERE diff_type = 'modified'",
                 &[
                     Value::Text(second_commit_id.clone()),
                     Value::Text(merged_commit_id.clone()),

@@ -35,7 +35,7 @@ await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
 ]);
 
 const working = await lix.execute(
-  `SELECT lixcol_row_pk, lixcol_diff_type, from_value, to_value
+  `SELECT lixcol_row_pk, diff_type, from_value, to_value
    FROM lix_diff(
      'lix_key_value',
      lix_latest_checkpoint_commit_id(),
@@ -44,7 +44,7 @@ const working = await lix.execute(
 );
 
 for (const row of working.rows) {
-  console.log(row.get("lixcol_diff_type"), row.get("lixcol_row_pk"));
+  console.log(row.get("diff_type"), row.get("lixcol_row_pk"));
 }
 
 await lix.createCheckpoint();
@@ -68,7 +68,7 @@ A runnable Rust version lives at
 
 | Surface | Scope | Columns |
 | :-- | :-- | :-- |
-| `lix_diff(relation, from_commit_id, to_commit_id)` | One relation across two explicit commits | `lixcol_row_pk`, `lixcol_diff_type`, `lixcol_row_count`, and paired `from_<column>` / `to_<column>` relation columns |
+| `lix_diff(relation, from_commit_id, to_commit_id)` | One relation across two explicit commits | `lixcol_row_pk`, `diff_type`, `row_count`, and paired `from_<column>` / `to_<column>` relation columns |
 | `lix_checkpoint` | Repository-global checkpoint markers | `id`, `commit_id`, and standard `lixcol_*` columns |
 | `lix_commit` | Repository-global commit graph | `id`, `parent_commit_ids`, and standard `lixcol_*` columns |
 | `lix_history('lix_checkpoint'[, commit_id])` | Global checkpoint-row authorship history | Checkpoint columns and standard history `lixcol_*` columns |
@@ -91,7 +91,7 @@ when the branch has no checkpoint. Pair it with the active head to inspect
 working changes in one query, including before the first checkpoint:
 
 ```sql
-SELECT lixcol_row_pk, lixcol_diff_type
+SELECT lixcol_row_pk, diff_type
 FROM lix_diff(
   'lix_file',
   lix_latest_checkpoint_commit_id(),

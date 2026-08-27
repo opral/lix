@@ -1786,7 +1786,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
     // with both sides' paths resolved through their own commit trees.
     let span = replica
         .execute(
-            "SELECT lixcol_diff_type, coalesce(to_path, from_path) AS path
+            "SELECT diff_type, coalesce(to_path, from_path) AS path
              FROM lix_diff('lix_file', $1, $2)
              ORDER BY coalesce(to_path, from_path)",
             &[
@@ -1801,7 +1801,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .iter()
         .map(|row| {
             (
-                row.get::<String>("lixcol_diff_type").expect("diff type"),
+                row.get::<String>("diff_type").expect("diff type"),
                 row.get::<String>("path").expect("path"),
             )
         })

@@ -708,7 +708,7 @@ async fn assert_working_diff(
         .unwrap_or_else(|error| panic!("{label}: checkpoint ID should be text: {error:?}"));
     let rows = session
         .execute(
-            "SELECT lixcol_row_pk, lixcol_diff_type \
+            "SELECT lixcol_row_pk, diff_type \
              FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id()) \
              ORDER BY lixcol_row_pk",
             &[Value::Text(checkpoint)],
@@ -733,7 +733,7 @@ async fn assert_working_diff(
             continue;
         }
         let diff_type = row
-            .get::<String>("lixcol_diff_type")
+            .get::<String>("diff_type")
             .unwrap_or_else(|error| panic!("{label}: diff_type should be text: {error:?}"));
         actual.push((key.to_string(), diff_type));
     }

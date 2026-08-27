@@ -247,7 +247,7 @@ simulation_test!(
             super::select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_diff_type, to_id \
+                    "SELECT diff_type, to_id \
                      FROM lix_diff('lix_file', '{baseline}', '{renamed_head}') \
                      WHERE lixcol_row_pk ->> 0 = '{file_id}'"
                 ),
@@ -263,7 +263,7 @@ simulation_test!(
             super::select_rows(
                 &session,
                 &format!(
-                    "SELECT lixcol_diff_type, to_id \
+                    "SELECT diff_type, to_id \
                      FROM lix_diff('lix_file', '{baseline}', '{renamed_head}') \
                      WHERE lixcol_row_pk ->> 0 = '{file_id}'"
                 ),

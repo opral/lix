@@ -10742,7 +10742,7 @@ mod tests {
         );
         let peer_diff = peer
             .execute(
-                "SELECT lixcol_row_pk, lixcol_diff_type \
+                "SELECT lixcol_row_pk, diff_type \
                  FROM lix_diff('lix_file', $1, lix_active_branch_commit_id())",
                 &[Value::Text(pushed_checkpoint.to_owned())],
             )
@@ -10827,7 +10827,7 @@ mod tests {
 
         let diff = replica
             .execute(
-                "SELECT lixcol_diff_type FROM lix_diff('lix_file', $1, $2)",
+                "SELECT diff_type FROM lix_diff('lix_file', $1, $2)",
                 &[Value::Text(checkpoint), Value::Text(head)],
             )
             .await
@@ -10835,7 +10835,7 @@ mod tests {
         assert_eq!(diff.rows().len(), 1);
         assert_eq!(
             diff.rows()[0]
-                .get::<String>("lixcol_diff_type")
+                .get::<String>("diff_type")
                 .expect("diff type should decode"),
             "modified",
         );

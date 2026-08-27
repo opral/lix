@@ -63,7 +63,7 @@ no checkpoint, it returns `lix_root_commit_id()`. Use both branch-scoped
 accessors to read working changes in one query:
 
 ```sql
-SELECT lixcol_row_pk, lixcol_diff_type
+SELECT lixcol_row_pk, diff_type
 FROM lix_diff(
   'lix_file',
   lix_latest_checkpoint_commit_id(),

@@ -20,6 +20,24 @@ pub(crate) enum SchemaSurfaceShape {
     History,
 }
 
+/// Engine-owned bookkeeping shared by every tracked row state projection.
+///
+/// Relation payload must never use these names or introduce another
+/// `lixcol_` segment. Derived surfaces may preserve these names directly or
+/// through a structural side prefix such as `from_lixcol_created_at`.
+pub(crate) const TRACKED_ROW_SYSTEM_COLUMN_NAMES: [&str; 10] = [
+    "lixcol_row_pk",
+    "lixcol_schema_key",
+    "lixcol_file_id",
+    "lixcol_metadata",
+    "lixcol_created_at",
+    "lixcol_updated_at",
+    "lixcol_global",
+    "lixcol_change_id",
+    "lixcol_commit_id",
+    "lixcol_untracked",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaColumnType {
     String,
