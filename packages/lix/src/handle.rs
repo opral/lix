@@ -695,7 +695,7 @@ where
     // A fresh repository or one left in the initialization/bootstrap crash
     // window needs one handshake and snapshot before its application session
     // can be bound to the authority's account. Reopens with durable state for
-    // this exact remote remain entirely local.
+    // this repository remain entirely local even when its transport URL changes.
     let (reopened_sync_account_id, mut prepared_sync) = if let Some(server) = server.as_ref() {
         match crate::sync::inspect_sync_bootstrap_with_adapter(
             &admission.adapter,

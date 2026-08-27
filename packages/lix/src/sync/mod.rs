@@ -75,6 +75,8 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
+pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str =
+    "LIX_SYNC_REPOSITORY_ID_MISMATCH";
 pub(crate) const SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE: &str =
     "LIX_SYNC_IMMUTABLE_OBJECT_MISMATCH";
 const MAX_SYNC_REMOTE_ID_BYTES: usize = 4 * 1024;
@@ -92,6 +94,25 @@ pub(crate) fn sync_server_protocol_mismatch(server_version: Option<u32>) -> LixE
     .with_details(serde_json::json!({
         "clientSyncProtocolVersion": SYNC_PROTOCOL_VERSION,
         "serverSyncProtocolVersion": server_version,
+    }))
+}
+
+pub(crate) fn sync_server_protocol_missing_field(field: &str) -> LixError {
+    LixError::new(
+        SYNC_PROTOCOL_MISMATCH_CODE,
+        format!("incompatible sync protocol: server handshake omitted required {field}"),
+    )
+    .with_details(serde_json::json!({ "missingField": field }))
+}
+
+pub(crate) fn sync_repository_id_mismatch(local: &str, authority: &str) -> LixError {
+    LixError::new(
+        SYNC_REPOSITORY_ID_MISMATCH_CODE,
+        "sync authority lixId does not match the local repository",
+    )
+    .with_details(serde_json::json!({
+        "localLixId": local,
+        "authorityLixId": authority,
     }))
 }
 

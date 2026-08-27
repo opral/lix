@@ -27,8 +27,8 @@ pub(crate) struct PreparedSyncBootstrap {
 enum BootstrapTier {
     Empty,
     Unbound,
-    Exact { account_id: String },
-    Other,
+    Bound { account_id: String },
+    Ambiguous,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,7 +36,7 @@ enum BootstrapInspection {
     Prepare,
     Publishing,
     Ready { account_id: String },
-    BoundToOther,
+    Ambiguous,
 }
 
 pub(crate) async fn inspect_sync_bootstrap<StorageImpl>(
@@ -57,6 +57,7 @@ pub(crate) async fn inspect_sync_bootstrap_with_adapter<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    super::repository::migrate_legacy_sync_replica_state(adapter).await?;
     match inspect_once(&adapter, remote_id).await? {
         BootstrapInspection::Prepare => Ok(SyncBootstrapAdmission::Prepare),
         BootstrapInspection::Ready { account_id } => {
@@ -67,7 +68,7 @@ where
             "sync bootstrap publication is not durable yet",
         )
         .with_details(serde_json::json!({ "retryable": true }))),
-        BootstrapInspection::BoundToOther => Err(bound_to_other_remote_error()),
+        BootstrapInspection::Ambiguous => Err(ambiguous_replica_error()),
     }
 }
 
@@ -86,41 +87,41 @@ where
         .await?;
     let durable_tier = inspect_tier(&durable, remote_id).await?;
     match durable_tier {
-        BootstrapTier::Other => return Ok(BootstrapInspection::BoundToOther),
-        BootstrapTier::Empty | BootstrapTier::Unbound | BootstrapTier::Exact { .. } => {}
+        BootstrapTier::Ambiguous => return Ok(BootstrapInspection::Ambiguous),
+        BootstrapTier::Empty | BootstrapTier::Unbound | BootstrapTier::Bound { .. } => {}
     }
 
     let visible = adapter.begin_read(StorageReadOptions::default()).await?;
     let visible_tier = inspect_tier(&visible, remote_id).await?;
     Ok(match (durable_tier, visible_tier) {
-        (BootstrapTier::Exact { account_id }, BootstrapTier::Exact { account_id: visible })
+        (BootstrapTier::Bound { account_id }, BootstrapTier::Bound { account_id: visible })
             if account_id == visible =>
         {
             BootstrapInspection::Ready { account_id }
         }
         (BootstrapTier::Empty, BootstrapTier::Empty)
         | (BootstrapTier::Unbound, BootstrapTier::Unbound) => BootstrapInspection::Prepare,
-        (_, BootstrapTier::Exact { .. } | BootstrapTier::Other)
+        (_, BootstrapTier::Bound { .. } | BootstrapTier::Ambiguous)
         | (BootstrapTier::Empty, BootstrapTier::Unbound)
         | (BootstrapTier::Unbound, BootstrapTier::Empty) => BootstrapInspection::Publishing,
-        (BootstrapTier::Exact { .. }, _) => BootstrapInspection::Publishing,
-        (BootstrapTier::Other, _) => unreachable!("terminal durable tier returned above"),
+        (BootstrapTier::Bound { .. }, _) => BootstrapInspection::Publishing,
+        (BootstrapTier::Ambiguous, _) => unreachable!("terminal durable tier returned above"),
     })
 }
 
 async fn inspect_tier(
     read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
-    remote_id: &str,
+    _remote_id: &str,
 ) -> Result<BootstrapTier, LixError> {
     match crate::init::repository_protocol_status(read).await? {
         crate::init::RepositoryProtocolStatus::Missing => Ok(BootstrapTier::Empty),
         crate::init::RepositoryProtocolStatus::Current => {
-            Ok(match super::repository::inspect_sync_replica_binding(read, remote_id).await? {
+            Ok(match super::repository::inspect_sync_replica_binding(read).await? {
                 SyncReplicaBinding::Unbound => BootstrapTier::Unbound,
-                SyncReplicaBinding::Exact { account_id } => {
-                    BootstrapTier::Exact { account_id }
+                SyncReplicaBinding::Bound { account_id } => {
+                    BootstrapTier::Bound { account_id }
                 }
-                SyncReplicaBinding::Other => BootstrapTier::Other,
+                SyncReplicaBinding::Ambiguous => BootstrapTier::Ambiguous,
             })
         }
         crate::init::RepositoryProtocolStatus::MigrationRequired { found_version } => {
@@ -140,6 +141,12 @@ pub(crate) async fn prepare_sync_bootstrap(
     let transport = HttpSyncTransport::connect(remote_id, &server.headers).await?;
     let (snapshot, lix_id, default_branch_id) =
         runtime::fetch_repository_snapshot(&transport).await?;
+    if transport.lix_id() != lix_id {
+        return Err(super::sync_repository_id_mismatch(
+            &lix_id,
+            transport.lix_id(),
+        ));
+    }
     Ok(PreparedSyncBootstrap {
         transport,
         snapshot,
@@ -188,7 +195,7 @@ where
                 .await?;
             Ok(prepared.transport)
         }
-        Ok(InitialSyncSnapshotInstall::ExistingExact) => {
+        Ok(InitialSyncSnapshotInstall::ExistingRepository) => {
             let adapter = lix.storage_adapter();
             let _ = inspect_sync_bootstrap_with_adapter(
                 &adapter,
@@ -197,7 +204,7 @@ where
             .await?;
             Err(restart_open_error())
         }
-        Ok(InitialSyncSnapshotInstall::ExistingOther) => Err(bound_to_other_remote_error()),
+        Ok(InitialSyncSnapshotInstall::Ambiguous) => Err(ambiguous_replica_error()),
         Err(error) => Err(
             reconcile_install_error(
                 &lix.storage_adapter(),
@@ -224,7 +231,7 @@ where
         Ok(BootstrapInspection::Ready { .. } | BootstrapInspection::Publishing) => {
             restart_open_error()
         }
-        Ok(BootstrapInspection::BoundToOther) => bound_to_other_remote_error(),
+        Ok(BootstrapInspection::Ambiguous) => ambiguous_replica_error(),
         Ok(BootstrapInspection::Prepare) | Err(_) => error,
     }
 }
@@ -242,10 +249,10 @@ fn restart_open_error() -> LixError {
     .with_details(serde_json::json!({ "retryable": true }))
 }
 
-fn bound_to_other_remote_error() -> LixError {
+fn ambiguous_replica_error() -> LixError {
     LixError::new(
         LixError::CODE_INVALID_PARAM,
-        "an initialized sync replica cannot be rebound to a different remote",
+        "sync replica contains conflicting durable authority receipts",
     )
 }
 
@@ -254,13 +261,48 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
     use crate::storage_adapter::{
-        Memory, MemoryRead, MemoryWrite, StorageError, StorageWriteOptions,
+        Memory, MemoryRead, MemoryWrite, StorageAdapterRead, StorageError,
+        StorageWriteOptions,
     };
 
     #[derive(Clone)]
     struct TieredStorage {
         visible: Memory,
         durable: Memory,
+    }
+
+    #[derive(Clone)]
+    struct DurableMemory {
+        inner: Memory,
+    }
+
+    impl Storage for DurableMemory {
+        type Read<'a> = MemoryRead;
+        type Write<'a> = MemoryWrite;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            Err(StorageError::Unsupported(
+                crate::storage::Capability::StorageSessions,
+            ))
+        }
+
+        async fn begin_read(
+            &self,
+            mut options: StorageReadOptions,
+        ) -> Result<Self::Read<'_>, StorageError> {
+            options.durability = StorageReadDurability::Visible;
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            mut options: StorageWriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            options.await_durable = false;
+            self.inner.begin_write(options).await
+        }
     }
 
     impl Storage for TieredStorage {
@@ -315,21 +357,38 @@ mod tests {
         storage
     }
 
-    async fn store_replica_state(storage: &Memory, remote_id: &str) {
+    async fn store_replica_state(storage: &Memory, _remote_id: &str) {
+        store_replica_state_at_key(storage, b"repository", canonical_replica_state()).await;
+    }
+
+    async fn store_legacy_replica_state(storage: &Memory, remote_id: &str) {
+        store_replica_state_at_key(
+            storage,
+            remote_id.as_bytes(),
+            canonical_replica_state(),
+        )
+        .await;
+    }
+
+    fn canonical_replica_state() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "activeAccountId": crate::ANONYMOUS_ACCOUNT_ID,
+            "cursor": 7,
+            "authoritativeBranches": {},
+            "authorityKnownCommitIds": []
+        }))
+        .expect("replica state should encode")
+    }
+
+    async fn store_replica_state_at_key(storage: &Memory, key: &[u8], value: Vec<u8>) {
         let adapter = StorageAdapter::new(storage.clone());
         let mut writes = adapter.new_write_set();
         writes.put(
             super::super::SYNC_REPLICA_STATE_SPACE,
             crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
-                remote_id.as_bytes(),
+                key,
             )),
-            serde_json::to_vec(&serde_json::json!({
-                "activeAccountId": crate::ANONYMOUS_ACCOUNT_ID,
-                "cursor": 7,
-                "authoritativeBranches": {},
-                "authorityKnownCommitIds": []
-            }))
-            .expect("replica state should encode"),
+            value,
         );
         adapter
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -337,20 +396,94 @@ mod tests {
             .expect("replica state should commit");
     }
 
-    async fn store_malformed_replica_state(storage: &Memory, remote_id: &str) {
-        let adapter = StorageAdapter::new(storage.clone());
-        let mut writes = adapter.new_write_set();
-        writes.put(
-            super::super::SYNC_REPLICA_STATE_SPACE,
-            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
-                remote_id.as_bytes(),
-            )),
+    async fn store_malformed_replica_state(storage: &Memory, _remote_id: &str) {
+        store_replica_state_at_key(
+            storage,
+            b"repository",
             br#"{"activeAccountId":"anonymous"}"#.to_vec(),
-        );
-        adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
+        )
+        .await;
+    }
+
+    async fn replica_state_rows(storage: &Memory) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let adapter = StorageAdapter::new(storage.clone());
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
             .await
-            .expect("malformed replica state should commit");
+            .expect("replica-state read should open");
+        let mut cursor = read
+            .begin_scan(
+                super::super::SYNC_REPLICA_STATE_SPACE,
+                crate::storage_adapter::StoragePrefix {
+                    bytes: bytes::Bytes::new(),
+                }
+                .to_range()
+                .expect("replica-state range should build"),
+                crate::storage_adapter::StorageBeginScanOptions {
+                    projection: crate::storage_adapter::StorageCoreProjection::FullValue,
+                    ..crate::storage_adapter::StorageBeginScanOptions::default()
+                },
+            )
+            .await
+            .expect("replica-state scan should begin");
+        let mut rows = Vec::new();
+        while let Some(entries) = cursor
+            .next_chunk()
+            .await
+            .expect("replica-state scan should advance")
+        {
+            for entry in entries {
+                let crate::storage_adapter::StorageProjectedValue::FullValue(value) = entry.value
+                else {
+                    panic!("replica-state scan omitted its value");
+                };
+                rows.push((entry.key.0, value));
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn legacy_url_key_migrates_byte_for_byte_and_accepts_a_new_url() {
+        let storage = DurableMemory {
+            inner: Memory::new(),
+        };
+        Engine::initialize_with_main_branch_id(storage.clone(), None)
+            .await
+            .expect("test storage should initialize");
+        let old_url =
+            "https://old.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001";
+        let raw = format!(
+            r#"{{ "activeAccountId":"{}", "cursor":7, "authoritativeBranches":{{}}, "pendingResets":{{}}, "authorityKnownCommitIds":[] }}"#,
+            crate::ANONYMOUS_ACCOUNT_ID
+        )
+        .into_bytes();
+        store_replica_state_at_key(&storage.inner, old_url.as_bytes(), raw.clone()).await;
+
+        assert_eq!(
+            inspect_sync_bootstrap(
+                &storage,
+                "https://new.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+            )
+            .await
+            .expect("legacy replica should migrate"),
+            SyncBootstrapAdmission::Ready {
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            }
+        );
+        assert_eq!(
+            replica_state_rows(&storage.inner).await,
+            vec![(bytes::Bytes::from_static(b"repository"), bytes::Bytes::from(raw))],
+            "migration must preserve the durable receipt and remove its URL key",
+        );
+        assert!(matches!(
+            inspect_sync_bootstrap(
+                &storage,
+                "https://third.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+            )
+            .await,
+            Ok(SyncBootstrapAdmission::Ready { .. })
+        ));
     }
 
     #[tokio::test]
@@ -409,15 +542,15 @@ mod tests {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
         for storage in [&visible, &durable] {
-            store_replica_state(storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
-            store_replica_state(storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
+            store_legacy_replica_state(storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+            store_legacy_replica_state(storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
         }
         let storage = tiered(visible, durable);
         let error = inspect_sync_bootstrap(&storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
             .await
             .expect_err("multiple durable remotes must fail closed");
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(error.message.contains("different remote"));
+        assert_eq!(error.code, "LIX_ERROR_SYNC_REPLICA_STATE_AMBIGUOUS");
+        assert!(error.message.contains("multiple durable authority receipts"));
     }
 
     #[tokio::test]
@@ -425,7 +558,7 @@ mod tests {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
         store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
-        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
+        store_legacy_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
         store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
         let storage = tiered(visible, durable);
         let adapter = StorageAdapter::new(storage);
@@ -521,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_install_write_reports_a_different_durable_owner() {
+    async fn ambiguous_install_write_restarts_for_the_same_repository() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
         store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
@@ -534,7 +667,10 @@ mod tests {
             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "lost publication race"),
         )
         .await;
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(error.message.contains("different remote"));
+        assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({ "retryable": true }))
+        );
     }
 }
