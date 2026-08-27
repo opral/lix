@@ -2215,9 +2215,23 @@ simulation_test!(
             .as_array()
             .unwrap()
             .iter()
-            .map(|source| source["row_ref"].as_str().unwrap())
+            .map(|source| source["row_ref"].as_str().unwrap().to_owned())
             .collect::<BTreeSet<_>>();
-        assert_eq!(source_row_refs.len(), 2);
+        let expected_row_ref = session
+            .execute(
+                "SELECT lix_row_ref('lix_file', '68697374-6f72-892d-8669-6c652d626c00')",
+                &[],
+            )
+            .await
+            .expect("public file row reference should be constructible");
+        let Value::RowRef(expected_row_ref) = &expected_row_ref.rows()[0].values()[0] else {
+            panic!("lix_row_ref should return the opaque row-reference type");
+        };
+        assert_eq!(
+            source_row_refs,
+            BTreeSet::from([expected_row_ref.as_str().to_owned()]),
+            "descriptor and blob provenance must address the same public file row"
+        );
         let source_ids = initial_sources
             .as_array()
             .unwrap()

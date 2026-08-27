@@ -17,7 +17,7 @@ use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::WriteAccess;
 use crate::sql2::change_materialization::{
     ChangePayloadProjection, MaterializedChange, materialize_changelog_change_record,
-    materialize_commit_graph_change,
+    materialize_commit_graph_change, public_change_row_ref,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::{json_field, row_ref_field};
@@ -338,26 +338,7 @@ static LIX_CHANGE_COLS: ColumnTable<MaterializedChange> = ColumnTable {
 };
 
 fn change_public_row_ref(row: &MaterializedChange) -> Result<Option<String>, LixError> {
-    let (relation, row_pk) = if crate::sql2::catalog::schema_exposed_as_schema_surface(&row.schema_key)
-    {
-        // File ownership is scope, not identity. Public semantic relations
-        // keep their own typed (including composite) primary key even when
-        // their physical change is attached to a file.
-        (row.schema_key.as_str(), row.row_pk.clone())
-    } else if row.schema_key == "lix_directory_descriptor" {
-        ("lix_directory", row.row_pk.clone())
-    } else if let Some(file_id) = row.file_id.as_deref() {
-        let row_pk = crate::row_pk::RowPk::uuid_from_canonical(file_id).map_err(|error| {
-            LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("lix_change file identity is invalid: {error}"),
-            )
-        })?;
-        ("lix_file", row_pk)
-    } else {
-        return Ok(None);
-    };
-    crate::row_ref::encode(relation, &row_pk).map(|value| Some(value.to_string()))
+    public_change_row_ref(row).map(|row_ref| row_ref.map(|value| value.to_string()))
 }
 
 fn change_batch_error(error: ColumnTableError) -> DataFusionError {

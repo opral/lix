@@ -13,7 +13,9 @@ use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::row_pk::RowPk;
 
 use super::SqlHistoryQuerySource;
-use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
+use crate::sql2::change_materialization::{
+    MaterializedChange, materialize_located_history_change, public_change_row_ref,
+};
 use crate::storage_adapter::StorageAdapterRead;
 
 /// Shared routing state for commit-shaped history SQL surfaces.
@@ -188,9 +190,9 @@ pub(crate) const HISTORY_COL_IS_DELETED: &str = "lixcol_is_deleted";
 
 /// Serializes the deterministic provenance set for one composed history row.
 ///
-/// Each object mirrors the public `lix_change` fields. Composed history uses
-/// an array because one logical revision can be caused by multiple source
-/// changes in the same commit.
+/// Each object carries the stable public provenance subset of `lix_change`.
+/// Composed history uses an array because one logical revision can be caused
+/// by multiple source changes in the same commit.
 pub(crate) fn serialize_history_source_changes(
     changes: &[MaterializedChange],
     surface_name: &str,
@@ -200,7 +202,7 @@ pub(crate) fn serialize_history_source_changes(
     let source_changes = ordered_changes
         .into_iter()
         .map(|change| {
-            let row_ref = crate::row_ref::encode(&change.schema_key, &change.row_pk)?.to_string();
+            let row_ref = public_change_row_ref(change)?.map(|value| value.to_string());
             let snapshot_content = parse_optional_source_json(
                 change.snapshot_content.as_deref(),
                 surface_name,
@@ -524,12 +526,18 @@ fn parse_history_disjunction(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HistoryFilterTerm {
     AsOfCommitIds(Vec<String>),
-    RowPks(Vec<String>),
+    RowRefs(Vec<RoutedRowRef>),
     SchemaKeys(Vec<String>),
     FileIds(Vec<String>),
     MinDepth(i64),
     MaxDepth(i64),
     ExactDepth(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutedRowRef {
+    row_pk_json: String,
+    row_pk: RowPk,
 }
 
 fn merge_history_disjunction_terms(
@@ -541,9 +549,9 @@ fn merge_history_disjunction_terms(
             extend_unique(&mut left, right);
             Some(HistoryFilterTerm::AsOfCommitIds(left))
         }
-        (HistoryFilterTerm::RowPks(mut left), HistoryFilterTerm::RowPks(right)) => {
+        (HistoryFilterTerm::RowRefs(mut left), HistoryFilterTerm::RowRefs(right)) => {
             extend_unique(&mut left, right);
-            Some(HistoryFilterTerm::RowPks(left))
+            Some(HistoryFilterTerm::RowRefs(left))
         }
         (HistoryFilterTerm::FileIds(mut left), HistoryFilterTerm::FileIds(right)) => {
             extend_unique(&mut left, right);
@@ -578,7 +586,7 @@ fn parse_history_binary_filter(
             _ => unreachable!(),
         }),
         ("row_ref", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
-            canonical_row_ref_pk_value(value).map(|value| HistoryFilterTerm::RowPks(vec![value]))
+            routed_row_ref(value).map(|value| HistoryFilterTerm::RowRefs(vec![value]))
         }
         ("depth", Operator::Eq, depth_expr) => {
             scalar_i64_literal(depth_expr).map(HistoryFilterTerm::ExactDepth)
@@ -651,7 +659,7 @@ fn parse_history_in_list_filter(in_list: &InList) -> Option<HistoryFilterTerm> {
 
     match column_name {
         "as_of_commit_id" => Some(HistoryFilterTerm::AsOfCommitIds(values)),
-        "row_ref" => canonical_row_ref_pk_values(values).map(HistoryFilterTerm::RowPks),
+        "row_ref" => routed_row_refs(values).map(HistoryFilterTerm::RowRefs),
         "schema_key" => Some(HistoryFilterTerm::SchemaKeys(values)),
         "file_id" => Some(HistoryFilterTerm::FileIds(values)),
         _ => None,
@@ -665,8 +673,25 @@ fn apply_history_filter(expr: &Expr, route: &mut HistoryRoute) {
                 route.contradictory |=
                     apply_conjunctive_values_filter(&mut route.as_of_commit_ids, values);
             }
-            HistoryFilterTerm::RowPks(values) => {
-                route.contradictory |= apply_conjunctive_values_filter(&mut route.row_pks, values);
+            HistoryFilterTerm::RowRefs(values) => {
+                let row_pk_json = values
+                    .iter()
+                    .map(|value| value.row_pk_json.clone())
+                    .collect();
+                route.contradictory |=
+                    apply_conjunctive_values_filter(&mut route.row_pks, row_pk_json);
+                let typed_row_pks = values
+                    .into_iter()
+                    .filter(|value| route.row_pks.contains(&value.row_pk_json))
+                    .map(|value| value.row_pk)
+                    .collect::<Vec<_>>();
+                if route.resolved_row_pks.is_empty() {
+                    route.resolved_row_pks = typed_row_pks;
+                } else {
+                    route
+                        .resolved_row_pks
+                        .retain(|row_pk| typed_row_pks.contains(row_pk));
+                }
             }
             HistoryFilterTerm::SchemaKeys(values) => {
                 route.contradictory |=
@@ -704,19 +729,19 @@ fn apply_conjunctive_values_filter(bucket: &mut Vec<String>, incoming_values: Ve
     bucket.is_empty()
 }
 
-fn canonical_row_ref_pk_values(values: Vec<String>) -> Option<Vec<String>> {
+fn routed_row_refs(values: Vec<String>) -> Option<Vec<RoutedRowRef>> {
     values
         .into_iter()
-        .map(|value| canonical_row_ref_pk_value(&value))
+        .map(|value| routed_row_ref(&value))
         .collect()
 }
 
-fn canonical_row_ref_pk_value(value: &str) -> Option<String> {
-    crate::row_ref::decode_str(value)
-        .ok()?
-        .row_pk
-        .as_json_array_text()
-        .ok()
+fn routed_row_ref(value: &str) -> Option<RoutedRowRef> {
+    let row_pk = crate::row_ref::decode_str(value).ok()?.row_pk;
+    Some(RoutedRowRef {
+        row_pk_json: row_pk.as_json_array_text().ok()?,
+        row_pk,
+    })
 }
 
 fn canonical_history_column_name(name: &str) -> Option<&str> {
@@ -734,7 +759,7 @@ fn nonnegative_u32(value: i64) -> Option<u32> {
     u32::try_from(value).ok()
 }
 
-fn extend_unique(bucket: &mut Vec<String>, values: Vec<String>) {
+fn extend_unique<T: PartialEq>(bucket: &mut Vec<T>, values: Vec<T>) {
     for value in values {
         if !bucket.contains(&value) {
             bucket.push(value);
@@ -780,6 +805,7 @@ mod tests {
         CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
     };
     use crate::row_pk::RowPk;
+    use crate::sql2::change_materialization::MaterializedChange;
     use crate::sql2::HistoryQuerySource;
     use crate::storage_adapter::{
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
@@ -787,9 +813,57 @@ mod tests {
 
     use super::{
         HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-        HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor, load_history_entries,
-        parse_history_filter,
+        HISTORY_COL_ROW_PK, HistoryMetadataProjection, HistoryRoute, HistoryViewDescriptor,
+        commit_graph_history_request, load_history_entries, parse_history_filter,
+        serialize_history_source_changes,
     };
+
+    #[test]
+    fn row_ref_route_preserves_uuid_primary_key_type() {
+        let row_pk = RowPk::uuid_from_canonical("018f6f7e-7cb2-7d45-8e1f-0a2b3c4d5e6f")
+            .expect("test UUID should be canonical");
+        let row_ref = crate::row_ref::encode("lix_file", &row_pk)
+            .expect("row reference should encode");
+        let route = HistoryRoute::from_filters(&[eq(
+            col(HISTORY_COL_ROW_PK),
+            str_lit(row_ref.as_str()),
+        )]);
+
+        assert_eq!(route.resolved_row_pks, vec![row_pk.clone()]);
+        let request = commit_graph_history_request(&route, vec![], None)
+            .expect("history request should route");
+        assert_eq!(request.row_pks, vec![row_pk]);
+    }
+
+    #[test]
+    fn source_change_row_ref_uses_public_filesystem_relation() {
+        let file_id = "018f6f7e-7cb2-7d45-8e1f-0a2b3c4d5e6f";
+        let row_pk = RowPk::uuid_from_canonical(file_id).expect("test UUID should be canonical");
+        let change = MaterializedChange {
+            id: "change-1".to_owned(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            row_pk: row_pk.clone(),
+            schema_key: "lix_file_descriptor".to_owned(),
+            file_id: Some(file_id.to_owned()),
+            snapshot_content: None,
+            metadata: None,
+            decoded_snapshot: None,
+            created_at: "2026-08-27T00:00:00Z".to_owned(),
+            origin_key: None,
+        };
+
+        let json = serialize_history_source_changes(&[change], "test history")
+            .expect("source changes should serialize");
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("source changes should be JSON");
+        let encoded = value[0]["row_ref"]
+            .as_str()
+            .expect("public change should have a row reference");
+        let decoded = crate::row_ref::decode_str(encoded).expect("row reference should decode");
+
+        assert_eq!(decoded.relation, "lix_file");
+        assert_eq!(decoded.row_pk, row_pk);
+    }
 
     #[test]
     fn route_extraction_keeps_supported_terms_from_mixed_and_filter() {

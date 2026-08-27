@@ -26,6 +26,33 @@ pub(crate) struct MaterializedChange {
     pub(crate) origin_key: Option<String>,
 }
 
+/// Returns the stable public identity for a materialized change.
+///
+/// A change's physical schema and ownership scope are storage details. Public
+/// semantic relations retain their own primary key; filesystem implementation
+/// rows collapse to the logical file or directory identity.
+pub(crate) fn public_change_row_ref(
+    change: &MaterializedChange,
+) -> Result<Option<crate::RowRef>, LixError> {
+    let (relation, row_pk) =
+        if crate::sql2::catalog::schema_exposed_as_schema_surface(&change.schema_key) {
+            (change.schema_key.as_str(), change.row_pk.clone())
+        } else if change.schema_key == "lix_directory_descriptor" {
+            ("lix_directory", change.row_pk.clone())
+        } else if let Some(file_id) = change.file_id.as_deref() {
+            let row_pk = RowPk::uuid_from_canonical(file_id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("lix_change file identity is invalid: {error}"),
+                )
+            })?;
+            ("lix_file", row_pk)
+        } else {
+            return Ok(None);
+        };
+    crate::row_ref::encode(relation, &row_pk).map(Some)
+}
+
 /// Payloads that a change scan must project for its output or filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChangePayloadProjection {

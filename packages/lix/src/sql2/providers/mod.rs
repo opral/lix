@@ -163,10 +163,6 @@ pub(crate) enum ProviderSelection {
 }
 
 impl ProviderSelection {
-    fn is_empty(&self) -> bool {
-        matches!(self, Self::Only { names, history_relations } if names.is_empty() && history_relations.is_empty())
-    }
-
     fn includes(&self, surface: &PublicSurfaceContract) -> bool {
         match self {
             Self::All | Self::AllWithHistory(_) => true,
