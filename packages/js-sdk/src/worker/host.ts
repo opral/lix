@@ -4,7 +4,7 @@ import type {
 	LixTransactionBinding,
 	ObserveEventsBinding,
 } from "../binding-types.js";
-import type { LixTelemetrySpan } from "../types.js";
+import type { LixOpenProgress, LixOpenReport, LixTelemetrySpan } from "../types.js";
 import {
 	deserializeWorkerError,
 	serializeWorkerError,
@@ -131,9 +131,8 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			case "open":
 				if (sessions.size > 0)
 					throw workerStateError("Lix worker is already open");
-				sessions.set(
-					0,
-					await openLixBinding(
+				{
+					const opened = await openLixBinding(
 						operation.storage,
 						operation.telemetryEnabled
 							? (span: LixTelemetrySpan) =>
@@ -141,9 +140,14 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 							: undefined,
 						telemetryParent,
 						createSyncServerBridge(operation.server),
-					),
-				);
-				return undefined;
+						operation.progressEnabled
+							? (progress: LixOpenProgress) =>
+									endpoint.postMessage({ kind: "open.progress", progress })
+							: undefined,
+					);
+					sessions.set(0, opened);
+					return opened.openReport?.() satisfies LixOpenReport | undefined;
+				}
 			case "openAnotherSession": {
 				const opened = await requiredLix(sessionId).openAnotherSession(
 					operation.options,

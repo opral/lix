@@ -18,7 +18,7 @@ use http::{
     header::{ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE},
 };
 use http_body::{Body, Frame, SizeHint};
-use lix::storage::Storage;
+use lix::storage::{Storage, StorageSession};
 use lix::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction, ObserveEvent,
@@ -500,7 +500,7 @@ struct ServerInner<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    engine: Arc<Engine<S>>,
+    engine: Arc<Engine<StorageSession<S>>>,
     options: ServerProtocolOptions,
     registry: AsyncMutex<HashMap<String, Arc<SessionRecord<S>>>>,
     request_blob_budget: Arc<RequestBlobCacheBudget>,
@@ -1388,7 +1388,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     fn from_engine(
-        engine: Arc<Engine<S>>,
+        engine: Arc<Engine<StorageSession<S>>>,
         options: ServerProtocolOptions,
     ) -> Self {
         engine.sync_mode().set_role(crate::sync::SyncRole::Authority);
@@ -5039,6 +5039,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.0.acquire_session().await
+        }
+
         async fn begin_read(
             &self,
             mut options: ReadOptions,
@@ -5289,6 +5295,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self
                 .first_reads
@@ -5369,6 +5381,12 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self
@@ -5453,6 +5471,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.inner.begin_read(options).await
         }
@@ -5480,7 +5504,7 @@ mod tests {
     }
 
     /// The branch-control space, identified the way the storage layer
-    /// identifies it: by space id.
+    /// identifies it: by the logical portion of its space id.
     ///
     /// This gate has to recognise the authoritative branch-control read that
     /// `switch_branch` issues. It used to recognise it by *name*, and a space
@@ -5494,14 +5518,15 @@ mod tests {
     /// version bump but still breaks on an actual rename, because it is still
     /// a contract on the name.
     ///
-    /// The id is the durable identity: it is the first four bytes of every
-    /// physical key, so changing it for a live space is a layout break rather
-    /// than a routine bump, and `0x0004_0020` came through `v10 -> v11`
-    /// untouched. The declaration this pins to is
-    /// `lix::registered_spaces::BRANCH_HEAD_CONTROL_SPACE`, which is `pub` only
-    /// under the `storage-benches` feature that this crate deliberately does
-    /// not enable; the id is therefore restated here rather than imported.
+    /// The low 30 bits are the durable logical identity; epoch routing reserves
+    /// the high two bits to select the physical bank. Changing the logical id
+    /// for a live space is a layout break rather than a routine bump, and
+    /// `0x0004_0020` came through `v10 -> v11` untouched. The declaration this
+    /// pins to is `lix::registered_spaces::BRANCH_HEAD_CONTROL_SPACE`, which is
+    /// `pub` only under the `storage-benches` feature that this crate deliberately
+    /// does not enable; the id is therefore restated here rather than imported.
     const BRANCH_HEAD_CONTROL_SPACE_ID: SpaceId = SpaceId(0x0004_0020);
+    const EPOCH_BANK_MASK: u32 = 0xc000_0000;
 
     #[derive(Clone)]
     struct BlockingFencedBranchControlReadStorage {
@@ -5568,6 +5593,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             Ok(BlockingFencedBranchControlRead {
                 inner: self.inner.begin_read(options).await?,
@@ -5594,7 +5625,10 @@ mod tests {
         ) -> Result<GetManyResult, StorageError> {
             let reads_branch_control = requests
                 .iter()
-                .any(|request| request.space.id == BRANCH_HEAD_CONTROL_SPACE_ID);
+                .any(|request| {
+                    SpaceId(request.space.id.0 & !EPOCH_BANK_MASK)
+                        == BRANCH_HEAD_CONTROL_SPACE_ID
+                });
             if reads_branch_control
                 && self
                     .gate
@@ -5656,6 +5690,12 @@ mod tests {
             = PostCommitUnknownWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.inner.begin_read(options).await
@@ -5763,6 +5803,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self.fenced.load(Ordering::Acquire) {
                 self.fenced_read_count.fetch_add(1, Ordering::AcqRel);
@@ -5778,6 +5824,81 @@ mod tests {
         ) -> Result<Self::Write<'_>, StorageError> {
             self.inner.begin_write(options).await
         }
+    }
+
+    #[derive(Clone)]
+    struct ExpireOneReadStorage {
+        inner: Memory,
+        expire_next_read: Arc<AtomicBool>,
+        expired_reads: Arc<AtomicUsize>,
+    }
+
+    impl ExpireOneReadStorage {
+        fn new() -> Self {
+            Self {
+                inner: Memory::new(),
+                expire_next_read: Arc::new(AtomicBool::new(false)),
+                expired_reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn expire_next_read(&self) {
+            assert!(
+                !self.expire_next_read.swap(true, Ordering::AcqRel),
+                "test read expiration must be idle before arming"
+            );
+        }
+    }
+
+    impl Storage for ExpireOneReadStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            if self.expire_next_read.swap(false, Ordering::AcqRel) {
+                self.expired_reads.fetch_add(1, Ordering::AcqRel);
+                return Err(StorageError::ReadExpired);
+            }
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_retries_read_expired_during_repository_admission() {
+        let storage = ExpireOneReadStorage::new();
+        let lix = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("initialize Lix before serving");
+        lix.close().await.expect("close setup Lix");
+
+        storage.expire_next_read();
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve should retry repository admission");
+        assert_eq!(storage.expired_reads.load(Ordering::Acquire), 1);
+        server.close().await.expect("close server");
     }
 
     #[tokio::test]
@@ -6047,6 +6168,12 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self.gate.pause_next_read.swap(false, Ordering::AcqRel) {

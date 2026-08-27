@@ -1595,6 +1595,14 @@ impl Storage for CountingStorage {
         = CountingWrite
     where
         Self: 'a;
+
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        Err(StorageError::Unsupported(
+            lix::storage::Capability::StorageSessions,
+        ))
+    }
     async fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         Ok(EmptyRead)
     }

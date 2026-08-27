@@ -6,6 +6,7 @@ import type {
 	SyncServerBindingOptions,
 	TelemetryDispatch,
 	TelemetryParentContext,
+	OpenProgressDispatch,
 } from "../binding-types.js";
 import type {
 	WorkerConnection,
@@ -69,9 +70,16 @@ export const openDirectLixBinding = async (
 	telemetry?: TelemetryDispatch,
 	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
+	openProgress?: OpenProgressDispatch,
 ): Promise<LixBinding | undefined> => {
 	try {
-		return await openNativeLixBinding(storage, telemetry, telemetryParent, server);
+		return await openNativeLixBinding(
+			storage,
+			telemetry,
+			telemetryParent,
+			server,
+			openProgress,
+		);
 	} catch (error) {
 		if (server !== undefined) throw error;
 		if (storage.kind === "memory") return undefined;

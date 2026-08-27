@@ -158,6 +158,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.counters.begin_reads.fetch_add(1, Ordering::Relaxed);
             Ok(CountingRead {
@@ -260,6 +266,12 @@ mod tests {
             = MemoryWrite
         where
             Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             self.inner.begin_read(options).await

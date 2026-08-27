@@ -97,10 +97,30 @@ for (const mode of ["direct", "shared"] as const) {
 				code: "LIX_STORAGE_CLOSED",
 			});
 		});
+
+		test("carries the acquired session token through commit", async () => {
+			const { write, committed } = createHarness(
+				mode,
+				{
+					...WRITE_OPTIONS,
+					sessionToken: "18446744073709551615",
+				},
+				"owner-epoch",
+			);
+
+			await write.commit();
+
+			expect(committed().sessionToken).toBe("18446744073709551615");
+			expect(committed().ownerEpoch).toBe("owner-epoch");
+		});
 	});
 }
 
-function createHarness(mode: "direct" | "shared") {
+function createHarness(
+	mode: "direct" | "shared",
+	options: LixStorageWriteOptions = WRITE_OPTIONS,
+	ownerEpoch?: string,
+) {
 	let payload: OpfsWritePayload | undefined;
 	const finish = (next: OpfsWritePayload): LixStorageCommitResult => {
 		payload = mode === "shared" ? structuredClone(next) : next;
@@ -111,7 +131,7 @@ function createHarness(mode: "direct" | "shared") {
 			? async (next: OpfsWritePayload) => finish(next)
 			: (next: OpfsWritePayload) => finish(next);
 	return {
-		write: new BufferedOpfsWrite(WRITE_OPTIONS, commit),
+		write: new BufferedOpfsWrite(options, commit, ownerEpoch),
 		committed: () => {
 			if (!payload) throw new Error("write was not committed");
 			return payload;

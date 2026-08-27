@@ -1,7 +1,6 @@
 use lix::Value;
 use lix::open_lix;
 use lix::storage::Storage;
-use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
     collect_repository_gc_for_bench, read_binary_cas_for_bench, write_binary_cas_for_bench,
 };
@@ -101,6 +100,7 @@ where
         .open_another_session()
         .await
         .expect("open shared-blob session");
+    let adapter = lix.storage_adapter();
     let branch = session
         .create_branch(lix::CreateBranchOptions {
             id: Some("01990000-0000-7000-8000-00000000000c".to_owned()),
@@ -153,11 +153,11 @@ where
         Some(OLD.to_vec())
     );
     let rolled_back_hash = blake3::hash(ROLLED_BACK).to_hex().to_string();
-    collect_repository_gc_for_bench(&StorageAdapter::new(storage.clone()))
+    collect_repository_gc_for_bench(&adapter)
         .await
         .expect("collect rolled-back replacement");
     assert!(
-        read_binary_cas_for_bench(&StorageAdapter::new(storage.clone()), &rolled_back_hash,)
+        read_binary_cas_for_bench(&adapter, &rolled_back_hash)
             .await
             .expect("rolled-back CAS lookup should succeed")
             .is_none(),
@@ -179,7 +179,7 @@ where
         .execute("DELETE FROM lix_file WHERE path = '/shared-a.bin'", &[])
         .await
         .expect("delete replaced shared owner");
-    collect_repository_gc_for_bench(&StorageAdapter::new(storage.clone()))
+    collect_repository_gc_for_bench(&adapter)
         .await
         .expect("collect while second shared owner remains");
     assert_eq!(
@@ -189,14 +189,14 @@ where
     let old_hash = blake3::hash(OLD).to_hex().to_string();
     let new_hash = blake3::hash(NEW).to_hex().to_string();
     assert_eq!(
-        read_binary_cas_for_bench(&StorageAdapter::new(storage.clone()), &old_hash)
+        read_binary_cas_for_bench(&adapter, &old_hash)
             .await
             .expect("shared old CAS lookup should succeed")
             .as_deref(),
         Some(OLD),
     );
     assert_eq!(
-        read_binary_cas_for_bench(&StorageAdapter::new(storage.clone()), &new_hash)
+        read_binary_cas_for_bench(&adapter, &new_hash)
             .await
             .expect("historical replacement CAS lookup should succeed")
             .as_deref(),
@@ -204,6 +204,7 @@ where
         "deleted replacement must remain while branch history still reaches it",
     );
     drop(session);
+    drop(adapter);
     drop(lix);
     drop(storage);
 
@@ -226,7 +227,7 @@ where
         read_file_at(&reopened_session, "/shared-b.bin").await,
         Some(OLD.to_vec())
     );
-    let reopened_adapter = StorageAdapter::new(reopened_storage.clone());
+    let reopened_adapter = reopened.storage_adapter();
     assert_eq!(
         read_binary_cas_for_bench(&reopened_adapter, &old_hash)
             .await
@@ -261,8 +262,7 @@ where
     .expect("release shared-blob branch history");
     drop(main);
 
-    let adapter = StorageAdapter::new(reopened_storage);
-    let sweep = collect_repository_gc_for_bench(&adapter)
+    let sweep = collect_repository_gc_for_bench(&reopened_adapter)
         .await
         .expect("collect after final owner and history release");
     assert_ne!(
@@ -270,14 +270,14 @@ where
         "shared history release must sweep commits"
     );
     assert!(
-        read_binary_cas_for_bench(&adapter, &old_hash)
+        read_binary_cas_for_bench(&reopened_adapter, &old_hash)
             .await
             .expect("released old CAS lookup should succeed")
             .is_none(),
         "old shared content must reclaim after every current and historical owner is released",
     );
     assert!(
-        read_binary_cas_for_bench(&adapter, &new_hash)
+        read_binary_cas_for_bench(&reopened_adapter, &new_hash)
             .await
             .expect("released replacement CAS lookup should succeed")
             .is_none(),
@@ -325,7 +325,7 @@ where
         )
         .await
         .expect("current untracked file should publish");
-    let adapter = StorageAdapter::new(storage.clone());
+    let adapter = lix.storage_adapter();
     let orphan_hash = write_binary_cas_for_bench(&adapter, b"durable-untracked-orphan")
         .await
         .expect("untracked unrelated orphan should stage");
@@ -421,7 +421,7 @@ where
         .await
         .expect("history v2 should publish");
     let root_b = branch_commit(&branch_session, &branch_id).await;
-    let adapter = StorageAdapter::new(storage.clone());
+    let adapter = lix.storage_adapter();
     collect_repository_gc_for_bench(&adapter)
         .await
         .expect("history-preserving sweep should commit");
@@ -501,7 +501,7 @@ where
     .expect("history disposable branch should delete");
     drop(main);
 
-    let adapter = StorageAdapter::new(storage.clone());
+    let adapter = lix.storage_adapter();
     let sweep = collect_repository_gc_for_bench(&adapter)
         .await
         .expect("post-deletion sweep should consume B -> None");

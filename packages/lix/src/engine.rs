@@ -125,7 +125,17 @@ where
         storage: StorageImpl,
         requested_main_branch_id: Option<&str>,
     ) -> Result<InitReceipt, LixError> {
-        let storage = StorageAdapter::new(storage);
+        Self::initialize_with_adapter(
+            StorageAdapter::new(storage),
+            requested_main_branch_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn initialize_with_adapter(
+        storage: StorageAdapter<StorageImpl>,
+        requested_main_branch_id: Option<&str>,
+    ) -> Result<InitReceipt, LixError> {
 
         crate::init::initialize_with_main_branch_id(
             storage,
@@ -151,17 +161,21 @@ where
         storage: StorageImpl,
         options: EngineOptions,
     ) -> Result<Self, LixError> {
-        Self::new_with_options_for_migration(storage, options, None).await
+        Self::new_with_adapter_for_migration(StorageAdapter::new(storage), options, None).await
     }
 
-    /// Opens the immediately preceding layout only for an explicit offline
-    /// migration whose edge changes logical repository data but not physical
-    /// storage decoding. Normal engine construction remains protocol-gated.
-    pub(crate) async fn new_for_migration(
-        storage: StorageImpl,
+    pub(crate) async fn new_with_adapter(
+        storage: StorageAdapter<StorageImpl>,
+        options: EngineOptions,
+    ) -> Result<Self, LixError> {
+        Self::new_with_adapter_for_migration(storage, options, None).await
+    }
+
+    pub(crate) async fn new_for_migration_with_adapter(
+        storage: StorageAdapter<StorageImpl>,
         source_version: u32,
     ) -> Result<Self, LixError> {
-        Self::new_with_options_for_migration(
+        Self::new_with_adapter_for_migration(
             storage,
             EngineOptions::new(),
             Some(source_version),
@@ -169,8 +183,8 @@ where
         .await
     }
 
-    async fn new_with_options_for_migration(
-        storage: StorageImpl,
+    async fn new_with_adapter_for_migration(
+        storage: StorageAdapter<StorageImpl>,
         options: EngineOptions,
         migration_source_version: Option<u32>,
     ) -> Result<Self, LixError> {
@@ -178,7 +192,6 @@ where
             ActiveTelemetrySpan::start_if_enabled(sink, &ENGINE_OPEN, Vec::new())
         });
         instrument_lix_result(span, async move {
-            let storage = StorageAdapter::new(storage);
             let wasm_runtime = options
                 .wasm_runtime
                 .unwrap_or_else(|| Arc::new(UnsupportedWasmRuntime));

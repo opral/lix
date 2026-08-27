@@ -103,9 +103,14 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// `v75` hard-cuts commit records to complete-snapshot semantics. Global
 /// commits have no base; every local commit names the exact global commit
 /// whose state is composed beneath its immutable local-overlay tracked root.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 75;
+///
+/// `v76` moves repository data behind Lix-owned copy-and-activate storage
+/// epochs. Logical data is unchanged; the new envelope makes migration,
+/// validation, rollback, and stale-writer fencing engine policy.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 76;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v75";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v76";
+pub(crate) const REPOSITORY_PROTOCOL_V75: &[u8] = b"tracked-default-branch.v75";
 pub(crate) const REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP: &[u8] =
     b"tracked-default-branch.v72-row-pk-bootstrap";
 /// Offline-migration fences for the v6 commit-record rewrite. The rewrite
@@ -213,7 +218,7 @@ pub(crate) fn migration_required_error(found_version: u32) -> LixError {
     LixError::new(
         "LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED",
         format!(
-            "repository format v{found_version} must be migrated to v{CURRENT_FORMAT_VERSION} with lix::migration::migrate_lix before opening"
+            "repository format v{found_version} must be upgraded to v{CURRENT_FORMAT_VERSION} by opening it with this Lix version"
         ),
     )
 }
@@ -1374,8 +1379,12 @@ mod tests {
     #[test]
     fn repository_protocol_parser_distinguishes_versions() {
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v75"),
+            parse_repository_protocol(b"tracked-default-branch.v76"),
             RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v75"),
+            RepositoryProtocolStatus::MigrationRequired { found_version: 75 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v74-commit-rewrite"),
@@ -1402,8 +1411,8 @@ mod tests {
             RepositoryProtocolStatus::MigrationRequired { found_version: 69 }
         );
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v76"),
-            RepositoryProtocolStatus::TooNew { found_version: 76 }
+            parse_repository_protocol(b"tracked-default-branch.v77"),
+            RepositoryProtocolStatus::TooNew { found_version: 77 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),

@@ -1,7 +1,7 @@
 /// One directed repository-format migration edge.
 ///
-/// Registration does not authorize migration during normal repository open;
-/// the explicit offline migration API owns execution.
+/// The engine-owned open path executes the complete registered chain inside a
+/// hidden storage epoch before activation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Migration {
     pub(crate) from_version: u32,
@@ -20,6 +20,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         from_version: 74,
         to_version: 75,
+    },
+    Migration {
+        from_version: 75,
+        to_version: 76,
     },
 ];
 
@@ -77,7 +81,14 @@ mod tests {
                 to_version: 75,
             })
         );
-        assert_eq!(registered_migrations().len(), 3);
+        assert_eq!(
+            migration_from(75),
+            Some(&Migration {
+                from_version: 75,
+                to_version: 76,
+            })
+        );
+        assert_eq!(registered_migrations().len(), 4);
         assert!(has_complete_migration_path(
             72,
             crate::init::CURRENT_FORMAT_VERSION

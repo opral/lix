@@ -26,6 +26,7 @@ import type {
 	MergeBranchReceipt,
 	ObserveEvent,
 	OpenAnotherSessionOptions,
+	LixOpenReport,
 	SqlParam,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
@@ -52,6 +53,7 @@ const observeFinalizer = new FinalizationRegistry<{
 });
 
 export class Lix {
+	readonly openReport: LixOpenReport | undefined;
 	private closePromise: Promise<void> | undefined;
 	readonly #activeBranchListeners = new Set<() => void>();
 	readonly #inFlightOperations = new Set<Promise<unknown>>();
@@ -61,7 +63,17 @@ export class Lix {
 	#activeTransactions = 0;
 	#acceptingOperations = true;
 
-	constructor(private readonly binding: LixBinding) {}
+	constructor(private readonly binding: LixBinding) {
+		const report = binding.openReport?.();
+		this.openReport = report
+			? Object.freeze({
+					...report,
+					...(report.migration
+						? { migration: Object.freeze({ ...report.migration }) }
+						: {}),
+				})
+			: undefined;
+	}
 
 	/** Opens an independent session over the same repository storage. */
 	async openAnotherSession(

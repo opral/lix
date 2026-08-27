@@ -2,7 +2,6 @@ use std::io::{Cursor, Write as _};
 use std::path::Path;
 
 use lix::storage::{Memory, Storage};
-use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::{
     collect_repository_gc_for_bench, read_binary_cas_for_bench, write_binary_cas_for_bench,
 };
@@ -16,7 +15,7 @@ async fn repository_gc_keeps_plugin_wasm_for_cold_runtime_execution() {
     install_csv_plugin(&lix, archive).await;
     write_file(&lix, "/owned.csv", b"before,gc\n").await;
 
-    let storage = StorageAdapter::new(memory.clone());
+    let storage = lix.storage_adapter();
     let wasm_hash = write_binary_cas_for_bench(&storage, &wasm).await.unwrap();
     let orphan_hash = write_binary_cas_for_bench(&storage, b"unrelated-orphan")
         .await
@@ -61,7 +60,7 @@ async fn repository_gc_keeps_graph_reachable_file_history_content() {
     write_file(&lix, "/history.txt", b"after gc").await;
     lix.create_checkpoint().await.unwrap();
 
-    let storage = StorageAdapter::new(memory);
+    let storage = lix.storage_adapter();
     let orphan_hash = write_binary_cas_for_bench(&storage, b"history-gc-orphan")
         .await
         .unwrap();
@@ -98,7 +97,7 @@ async fn repository_gc_reclaims_plugin_wasm_after_final_registry_root_releases()
     let lix = open_lix().with_storage(memory.clone()).await.unwrap();
     let (archive, wasm) = csv_plugin_archive();
     install_csv_plugin(&lix, archive).await;
-    let storage = StorageAdapter::new(memory);
+    let storage = lix.storage_adapter();
     let wasm_hash = write_binary_cas_for_bench(&storage, &wasm).await.unwrap();
 
     let branch = lix

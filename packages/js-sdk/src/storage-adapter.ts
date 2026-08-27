@@ -9,7 +9,7 @@ export type LixStorage = {
  * the same dedicated worker as the Lix Wasm engine.
  */
 export type LixStorageProviderRegistration = {
-	readonly version: 2;
+	readonly version: 3;
 	readonly moduleUrl: string;
 	readonly options: unknown;
 };
@@ -60,7 +60,7 @@ export function isJsProviderLixStorage(
 	return Boolean(
 		registration &&
 			typeof registration === "object" &&
-			(registration as { version?: unknown }).version === 2 &&
+			(registration as { version?: unknown }).version === 3 &&
 			typeof (registration as { moduleUrl?: unknown }).moduleUrl === "string",
 	);
 }
@@ -96,6 +96,8 @@ export type LixStorageReadOptions = {
 	snapshot?: Uint8Array;
 	consistency: "snapshot" | "staleOk" | "latest";
 	durability: "visible" | "durable";
+	/** Canonical unsigned 64-bit base-10 token obtained from `acquireSession()`. */
+	sessionToken?: string;
 };
 
 export type LixStorageWriteOptions = {
@@ -104,6 +106,8 @@ export type LixStorageWriteOptions = {
 	awaitDurable: boolean;
 	preconditions: LixStoragePrecondition[];
 	batchCapacityHintBytes: number;
+	/** Canonical unsigned 64-bit base-10 token obtained from `acquireSession()`. */
+	sessionToken?: string;
 };
 
 export type LixStoragePrecondition =
@@ -163,6 +167,8 @@ export type LixStorageCommitResult = {
 
 /** Mirrors `lix::storage::Storage`. */
 export interface LixStorageProvider {
+	/** Joins the active generation and returns its canonical unsigned 64-bit base-10 token. */
+	acquireSession(): Promise<string>;
 	beginRead(options: LixStorageReadOptions): Promise<LixStorageRead>;
 	beginWrite(options: LixStorageWriteOptions): Promise<LixStorageWrite>;
 	watchForChanges(): Promise<LixStorageChangeWatch>;

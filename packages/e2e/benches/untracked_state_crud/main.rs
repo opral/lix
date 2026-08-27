@@ -248,6 +248,12 @@ where
     where
         Self: 'a;
 
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
+
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.inner.begin_read(opts).await
     }
@@ -283,6 +289,12 @@ where
         = CountingWrite<StorageImpl::Write<'a>>
     where
         Self: 'a;
+
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         Ok(CountingRead {
             inner: self.inner.begin_read(opts).await?,

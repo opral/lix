@@ -26,8 +26,9 @@ use lix::storage::{
     BeginScanOptions, Capability, CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key,
     KeyRange, Precondition, PreconditionFailure, ProjectedValue, PutBatch, ReadDurability,
     ReadEntry, ReadOptions, ScanChunk, ScanCursor as StorageScanCursor, ScanOrder, SpaceId,
-    Storage, StorageError, StorageRead, StorageScanSource, StorageSpace, StorageWrite, StoredValue,
-    ValueIntegrity, ValueSemantics, WriteOptions, WriteStats,
+    Storage, StorageError, StorageRead, StorageScanSource, StorageSessionGate, StorageSessionToken,
+    StorageSpace, StorageWrite, StoredValue, ValueIntegrity, ValueSemantics, WriteOptions,
+    WriteStats,
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
@@ -843,6 +844,7 @@ pub struct SlateDB {
     worker: SlateDBWorker,
     immutable_value_store: ImmutableValueStore,
     write_gate: WriteGate,
+    sessions: Arc<StorageSessionGate>,
     write_pipeline: WritePipeline,
     point_cache: SnapshotPointCache,
     startup_immutable_gc: StartupImmutableGc,
@@ -1726,6 +1728,8 @@ pub struct SlateDBWrite {
     write_pipeline: WritePipeline,
     point_cache: SnapshotPointCache,
     write_gate: WriteGate,
+    sessions: Arc<StorageSessionGate>,
+    session_token: Option<StorageSessionToken>,
     writer_permit: Option<OwnedMutexGuard<()>>,
     preconditions: Vec<Precondition>,
     background_maintenance: bool,
@@ -2476,6 +2480,7 @@ impl SlateDB {
             immutable_value_store,
             path: PathBuf::from(db_path),
             write_gate: WriteGate::new(),
+            sessions: Arc::new(StorageSessionGate::default()),
             write_pipeline: WritePipeline::new(),
             point_cache: SnapshotPointCache::new(),
             startup_immutable_gc: StartupImmutableGc::default(),
@@ -2554,11 +2559,24 @@ impl Storage for SlateDB {
     where
         Self: 'a;
 
+    fn acquire_session(
+        &self,
+    ) -> impl Future<Output = Result<StorageSessionToken, StorageError>> + Send {
+        async move {
+            let _writer_permit = self.write_gate.acquire(false).await;
+            self.sessions.acquire()
+        }
+    }
+
     fn begin_read(
         &self,
         opts: ReadOptions,
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
+            // Validation is the read's admission linearization point. Unlike a
+            // commit, the immutable snapshot does not need to hold the session
+            // gate after it has been admitted.
+            drop(self.sessions.validate(opts.session_token)?);
             self.write_pipeline.terminal_error()?;
             let (snapshot, snapshot_fetch) = self.write_pipeline.snapshot(&self.worker).await?;
             self.point_cache.observe_snapshot(snapshot.seq());
@@ -2593,6 +2611,7 @@ impl Storage for SlateDB {
         opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
+            drop(self.sessions.validate(opts.session_token)?);
             self.startup_immutable_gc.completed_result()?;
             self.startup_immutable_gc
                 .schedule(&self.worker, &self.immutable_value_store);
@@ -2602,6 +2621,8 @@ impl Storage for SlateDB {
                 write_pipeline: self.write_pipeline.clone(),
                 point_cache: self.point_cache.clone(),
                 write_gate: self.write_gate.clone(),
+                sessions: Arc::clone(&self.sessions),
+                session_token: opts.session_token,
                 writer_permit: None,
                 preconditions: opts.preconditions,
                 background_maintenance: opts.background_maintenance,
@@ -3463,6 +3484,10 @@ impl SlateDBWrite {
         }
         let wait_started = Instant::now();
         let permit = self.write_gate.acquire(self.background_maintenance).await;
+        // Session acquisition enters this same writer gate before advancing
+        // the generation. Once this validation succeeds, retaining `permit`
+        // through publication prevents acquisition from racing the commit.
+        drop(self.sessions.validate(self.session_token)?);
         if let Some(counters) = &self.immutable_value_store.counters {
             counters
                 .inner
@@ -4870,9 +4895,83 @@ impl WriteGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lix::storage::StorageSession;
 
     const TEST_IMMUTABLE_SPACE: StorageSpace =
         StorageSpace::immutable(SpaceId(0x00ff_0001), "test.immutable");
+
+    #[tokio::test]
+    async fn session_acquisition_serializes_with_commits_and_fences_prepared_tokenless_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = SlateDB::open(directory.path()).unwrap();
+        let space = StorageSpace::mutable(SpaceId(91), "test.mutable");
+        let mut prepared = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("prepare tokenless write");
+        prepared
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: Key(Bytes::from_static(b"prepared")),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"must-not-commit"),
+                        },
+                    }],
+                },
+            )
+            .await
+            .expect("stage tokenless write");
+
+        let publication = storage.write_gate.acquire(false).await;
+        let acquiring_storage = storage.clone();
+        let acquisition =
+            tokio::spawn(async move { StorageSession::acquire(acquiring_storage).await });
+        while storage
+            .write_gate
+            .foreground_waiters
+            .load(Ordering::Acquire)
+            == 0
+        {
+            assert!(
+                !acquisition.is_finished(),
+                "session acquisition bypassed the publication gate"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !acquisition.is_finished(),
+            "session acquisition must wait for the publication gate"
+        );
+        drop(publication);
+
+        let first = acquisition
+            .await
+            .expect("session acquisition task")
+            .expect("acquire first session");
+        let second = StorageSession::acquire(storage.clone())
+            .await
+            .expect("acquire shared session");
+        assert_eq!(first.token(), second.token());
+        assert_eq!(prepared.commit().await, Err(StorageError::Fenced));
+        assert!(matches!(
+            storage.begin_read(ReadOptions::default()).await,
+            Err(StorageError::Fenced)
+        ));
+        assert!(matches!(
+            storage.begin_write(WriteOptions::default()).await,
+            Err(StorageError::Fenced)
+        ));
+
+        second
+            .begin_write(WriteOptions::default())
+            .await
+            .expect("token-bearing write")
+            .rollback()
+            .await
+            .expect("rollback session write");
+    }
 
     #[tokio::test]
     async fn foreground_writer_overtakes_queued_background_maintenance() {

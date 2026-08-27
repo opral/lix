@@ -2,7 +2,7 @@ use std::{fmt, ops::Bound};
 
 use bytes::Bytes;
 
-use crate::storage::{Precondition, StorageError};
+use crate::storage::{Precondition, StorageError, StorageSessionToken};
 
 /// Maximum number of owned rows returned by one storage scan page.
 pub const MAX_SCAN_PAGE_ROWS: usize = 1024;
@@ -19,6 +19,16 @@ pub struct SpaceId(pub u32);
 pub enum ValueSemantics {
     Mutable,
     Immutable,
+}
+
+/// Whether repository storage is primary data or can be reconstructed from it.
+///
+/// The distinction belongs to Lix's storage-format registry. Backends only
+/// provide ordered key spaces; they do not decide migration policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StorageSpaceRole {
+    Authoritative,
+    Rebuildable,
 }
 
 /// Who is responsible for detecting corruption of a space's *value* bytes.
@@ -63,6 +73,7 @@ pub struct StorageSpace {
     pub value_semantics: ValueSemantics,
     /// Who detects value corruption in this space. See [`ValueIntegrity`].
     pub value_integrity: ValueIntegrity,
+    pub role: StorageSpaceRole,
 }
 
 impl StorageSpace {
@@ -84,6 +95,7 @@ impl StorageSpace {
             name,
             value_semantics,
             value_integrity: ValueIntegrity::BackendVerified,
+            role: StorageSpaceRole::Authoritative,
         }
     }
 
@@ -115,6 +127,7 @@ impl StorageSpace {
             name,
             value_semantics,
             value_integrity: ValueIntegrity::ContentAddressed,
+            role: StorageSpaceRole::Authoritative,
         }
     }
 
@@ -190,6 +203,7 @@ impl StorageSpace {
             // the key's digest, so this view must not claim the engine will
             // authenticate them.
             value_integrity: ValueIntegrity::BackendVerified,
+            role: self.role,
         }
     }
 }
@@ -530,6 +544,8 @@ pub enum ProjectedValue {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadOptions {
+    /// Fenced storage generation authorizing this operation.
+    pub session_token: Option<StorageSessionToken>,
     pub snapshot: Option<SnapshotRef>,
     pub consistency: ReadConsistency,
     /// Minimum persistence boundary for rows returned by this read.
@@ -569,6 +585,8 @@ pub enum ReadConsistency {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteOptions {
+    /// Fenced storage generation authorizing this operation and its commit.
+    pub session_token: Option<StorageSessionToken>,
     pub base_snapshot: Option<SnapshotRef>,
     pub idempotency_key: Option<Bytes>,
     /// Do not acknowledge the commit until the backend has crossed its

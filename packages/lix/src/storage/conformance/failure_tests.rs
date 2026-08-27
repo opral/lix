@@ -268,6 +268,14 @@ impl Storage for BrokenStorage {
     where
         Self: 'a;
 
+    async fn acquire_session(
+        &self,
+    ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+        Err(StorageError::Unsupported(
+            crate::storage::Capability::StorageSessions,
+        ))
+    }
+
     fn begin_read(
         &self,
         _opts: ReadOptions,

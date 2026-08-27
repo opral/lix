@@ -8,6 +8,7 @@ mod error;
 pub mod immutable;
 mod in_memory;
 mod predicate;
+mod session;
 mod traits;
 mod types;
 
@@ -22,11 +23,15 @@ pub use predicate::{
     HeaderFieldId, HeaderPredicate, KeyPredicate, PredicateExpr, PredicateId,
     PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, StoragePredicate, Support,
 };
+pub use session::{
+    StorageSession, StorageSessionGate, StorageSessionPermit, StorageSessionToken,
+};
 pub use traits::{Storage, StorageRead, StorageWrite};
 pub use types::{
     BeginScanOptions, BufferRange, CommitResult, CoreProjection, EncodedMutationBatch,
     EncodedMutationBatchError, EncodedPut, GetManyRequest, GetManyResult, GetOptions, Key,
     KeyRange, MAX_SCAN_PAGE_ROWS, Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency,
     ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOrder, SnapshotRef, SpaceId,
-    StorageSpace, StoredValue, ValueIntegrity, ValueSemantics, WriteOptions, WriteStats,
+    StorageSpace, StorageSpaceRole, StoredValue, ValueIntegrity, ValueSemantics, WriteOptions,
+    WriteStats,
 };

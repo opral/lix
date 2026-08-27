@@ -8,8 +8,10 @@ use lix::storage::{
     WriteOptions,
 };
 
+// Fresh repositories are admitted into epoch bank A. This test deliberately
+// corrupts physical storage, so it addresses the banked space directly.
 const HOT_ROW_SPACE: StorageSpace =
-    StorageSpace::mutable(SpaceId(0x0004_001b), "hot_state.row.v21");
+    StorageSpace::mutable(SpaceId(0x4004_001b), "hot_state.row.v21.epoch-a");
 const SEQUENCE_IDENTITY: &[u8] = b"lix_deterministic_sequence_number";
 const UNRELATED_IDENTITY: &[u8] = b"lix_unrelated_sequence_substitute";
 

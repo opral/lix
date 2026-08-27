@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use lix::storage::Storage;
-use lix::{Memory, ObserveEvent, ObserveEvents, Value};
+use lix::{Memory, ObserveEvent, Value};
 use lix::{engine::Engine, session::SessionContext};
 use serde_json::json;
 
@@ -26,7 +26,7 @@ async fn open_two_engines() -> (Engine, Engine) {
 fn observe_key<StorageImpl>(
     session: &SessionContext<StorageImpl>,
     key: &str,
-) -> ObserveEvents<StorageImpl>
+) -> crate::session::SessionObserveEvents<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -36,7 +36,7 @@ where
 }
 
 async fn next_event<StorageImpl>(
-    events: &mut ObserveEvents<StorageImpl>,
+    events: &mut crate::session::SessionObserveEvents<StorageImpl>,
     label: &str,
 ) -> ObserveEvent
 where
@@ -49,7 +49,10 @@ where
         .unwrap_or_else(|| panic!("observe closed before event: {label}"))
 }
 
-async fn expect_no_event<StorageImpl>(events: &mut ObserveEvents<StorageImpl>, label: &str)
+async fn expect_no_event<StorageImpl>(
+    events: &mut crate::session::SessionObserveEvents<StorageImpl>,
+    label: &str,
+)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {

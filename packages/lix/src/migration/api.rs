@@ -13,7 +13,7 @@ use crate::init::{
 use crate::storage_adapter::{
     SharedStorageAdapterRead, Storage, StorageCoreProjection as CoreProjection, StorageError,
     StorageGetManyRequest as GetManyRequest, StorageGetOptions as GetOptions, StorageKey as Key,
-    StoragePrecondition as Precondition, StorageProjectedValue as ProjectedValue, StorageRead,
+    StoragePrecondition as Precondition, StorageProjectedValue as ProjectedValue,
     StorageAdapterRead as _, StorageBeginScanOptions, StorageKeyRange,
     StorageReadOptions as ReadOptions, StorageWrite,
     StorageWriteOptions as WriteOptions,
@@ -29,11 +29,22 @@ const REPOSITORY_PROTOCOL_V73: &[u8] = b"tracked-default-branch.v73";
 const REPOSITORY_PROTOCOL_V74: &[u8] = b"tracked-default-branch.v74";
 const ACCOUNT_SCHEMA_KEY: &str = "lix_account";
 
-/// Bounds for explicit offline repository migrations.
+/// Work bounds used by migration qualification and fault-injection tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MigrationOptions {
+pub(crate) struct MigrationOptions {
     pub max_changes: usize,
     pub max_preflight_bytes: usize,
+}
+
+impl MigrationOptions {
+    /// Automatic upgrades cannot strand a valid repository behind a fixed
+    /// limit that applications have no public API to override.
+    pub(crate) const fn automatic() -> Self {
+        Self {
+            max_changes: usize::MAX,
+            max_preflight_bytes: usize::MAX,
+        }
+    }
 }
 
 impl Default for MigrationOptions {
@@ -46,7 +57,7 @@ impl Default for MigrationOptions {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MigrationReport {
+pub(crate) struct MigrationReport {
     pub from_version: u32,
     pub to_version: u32,
     pub changes_rewritten: u64,
@@ -55,7 +66,7 @@ pub struct MigrationReport {
 
 /// Repository-format state observed without opening the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MigrationStatus {
+pub(crate) enum MigrationStatus {
     Current {
         version: u32,
     },
@@ -75,7 +86,7 @@ pub enum MigrationStatus {
 ///
 /// This is read-only and intentionally understands only the format marker;
 /// migration preflight performs the deeper physical validation.
-pub async fn inspect_lix<S>(storage: &S) -> Result<MigrationStatus, LixError>
+pub(crate) async fn inspect_lix<S>(storage: &S) -> Result<MigrationStatus, LixError>
 where
     S: Storage + ?Sized,
 {
@@ -83,6 +94,25 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(storage_error)?;
+    inspect_lix_read(&crate::storage_adapter::StorageAdapterReadScope::new(read)).await
+}
+
+pub(crate) async fn inspect_lix_with_adapter<S>(
+    storage: &crate::storage_adapter::StorageAdapter<S>,
+) -> Result<MigrationStatus, LixError>
+where
+    S: Storage,
+{
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(storage_error)?;
+    inspect_lix_read(&read).await
+}
+
+async fn inspect_lix_read(
+    read: &impl crate::storage_adapter::StorageAdapterRead,
+) -> Result<MigrationStatus, LixError> {
     let keys = [Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY))];
     let request = [GetManyRequest {
         space: REPOSITORY_PROTOCOL_SPACE,
@@ -122,24 +152,14 @@ where
     })
 }
 
-/// Offline, bounded repository migration to the current format.
-///
-/// Callers must place the repository in maintenance mode and take their
-/// backend-level backup first. Physical authority and marker replacements
-/// publish atomically. A v68 migration may stop in a valid, retryable v69
-/// state after its typed rewrite; chronology-root chunks may likewise be
-/// persisted unreferenced before each edge's final atomic manifest replacement
-/// and marker publication. The v72 logical schema amendment publishes one
-/// ordinary durable commit per branch and remains on v72 until every branch is
-/// complete, so interruption is also safely retryable.
-pub async fn migrate_lix<S>(
+pub(crate) async fn migrate_lix_with_adapter<S>(
     storage: S,
+    adapter: crate::storage_adapter::StorageAdapter<S>,
     options: MigrationOptions,
 ) -> Result<MigrationReport, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
     let read = adapter
         .begin_read(ReadOptions::default())
         .await
@@ -161,7 +181,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74),
+            found_version: found_version @ (72 | 73 | 74 | 75),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -191,16 +211,39 @@ where
     // Every step from here on loads commit records through the current
     // v6 decoder, so the v5 records are rewritten first, under whichever
     // marker the repository currently carries.
-    let commit_records_rewritten =
-        rewrite_commit_records_to_v6(&adapter, &storage, options, from_version).await?;
+    let commit_records_rewritten = if from_version <= 74 {
+        rewrite_commit_records_to_v6(&adapter, &storage, options, from_version).await?
+    } else {
+        0
+    };
     if from_version <= 72 {
         migrate_v72_account_profile_uri(&adapter, &storage, options).await?;
     }
     if from_version <= 73 {
         migrate_v73_row_pk_indexes(&adapter, &storage, options).await?;
     }
-    let commit_members_rewritten =
-        migrate_v74_complete_snapshot_commits(&adapter, &storage, options).await?;
+    let commit_members_rewritten = if from_version <= 74 {
+        migrate_v74_complete_snapshot_commits(&adapter, &storage, options).await?
+    } else {
+        let read = adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let expected_revision =
+            crate::storage_adapter::load_repository_mutation_revision(&read)
+                .await
+                .map_err(storage_error)?;
+        drop(read);
+        crate::migration::publish::publish(
+            &adapter,
+            expected_revision,
+            crate::init::REPOSITORY_PROTOCOL_V75,
+            crate::init::REPOSITORY_PROTOCOL_VALUE,
+            crate::migration::publish::PublicationPlan::bounded(0, 0),
+        )
+        .await?;
+        0
+    };
     Ok(MigrationReport {
         from_version,
         to_version: CURRENT_FORMAT_VERSION,
@@ -298,7 +341,7 @@ where
     let target_schema = lix_schema::from_value(target.clone()).map_err(|error| {
         migration_error(format!("bundled lix_account schema is invalid: {error}"))
     })?;
-    let engine = crate::engine::Engine::new_for_migration(storage.clone(), 72).await?;
+    let engine = crate::engine::Engine::new_for_migration_with_adapter(adapter.clone(), 72).await?;
     for branch_id in branch_ids {
         let session = engine.open_session_at_for_migration(&branch_id);
         let result = session
@@ -367,7 +410,7 @@ where
         .map_err(storage_error)?;
     read.finish().map_err(storage_error)?;
     crate::migration::publish::publish(
-        storage,
+        adapter,
         expected_revision,
         crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP,
         REPOSITORY_PROTOCOL_V73,
@@ -500,7 +543,7 @@ where
         }
     }
     crate::migration::publish::publish(
-        storage,
+        adapter,
         expected_revision,
         source_protocol,
         crate::init::REPOSITORY_PROTOCOL_VALUE,
@@ -648,7 +691,7 @@ fn resolve_missing_directory_closure(
 /// atomically with the v75 marker replacement.
 async fn repair_filesystem_closure<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
-    storage: &S,
+    _storage: &S,
     options: MigrationOptions,
     source_protocol: &'static [u8],
 ) -> Result<(u64, Vec<crate::tracked_state::CommitStateManifest>), LixError>
@@ -989,8 +1032,8 @@ where
         ));
     }
     if chunk_stats.staged_puts != 0 || chunk_stats.staged_deletes != 0 {
-        let mut write = storage
-            .begin_write(WriteOptions {
+        let mut write = adapter
+            .begin_migration_write(WriteOptions {
                 await_durable: true,
                 preconditions: vec![
                     Precondition::KeyValueEquals {
@@ -1028,7 +1071,7 @@ where
 /// interrupted runs resume cleanly.
 async fn rewrite_commit_records_to_v6<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
-    storage: &S,
+    _storage: &S,
     options: MigrationOptions,
     expected_version: u32,
 ) -> Result<u64, LixError>
@@ -1254,8 +1297,8 @@ where
         rewritten += 1;
     }
 
-    let mut write = storage
-        .begin_write(WriteOptions {
+    let mut write = adapter
+        .begin_migration_write(WriteOptions {
             await_durable: true,
             preconditions: vec![
                 Precondition::KeyValueEquals {
@@ -1282,7 +1325,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn backfill_missing_row_pk_indexes<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
-    storage: &S,
+    _storage: &S,
     options: MigrationOptions,
     expected_version: u32,
     expected_protocol: &'static [u8],
@@ -1405,8 +1448,8 @@ where
         ));
     }
     if chunk_stats.staged_puts != 0 || chunk_stats.staged_deletes != 0 {
-        let mut write = storage
-            .begin_write(WriteOptions {
+        let mut write = adapter
+            .begin_migration_write(WriteOptions {
                 await_durable: true,
                 preconditions: vec![
                     Precondition::KeyValueEquals {
@@ -1442,7 +1485,7 @@ where
         }
     }
     crate::migration::publish::publish(
-        storage,
+        adapter,
         expected_revision,
         expected_protocol,
         target_protocol,
@@ -1598,11 +1641,6 @@ mod tests {
     #[tokio::test]
     async fn v69_marker_is_rejected_by_the_v75_hard_cut() {
         let storage = Memory::new();
-        let lix = crate::open_lix()
-            .with_storage(storage.clone())
-            .await
-            .unwrap();
-        lix.close().await.unwrap();
         let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
         let mut seed = adapter.new_write_set();
         seed.put(
@@ -1615,12 +1653,16 @@ mod tests {
             .await
             .unwrap();
 
-        let error = migrate_lix(storage.clone(), MigrationOptions::default())
+        let error = migrate_lix_with_adapter(
+            storage.clone(),
+            adapter.clone(),
+            MigrationOptions::default(),
+        )
             .await
             .expect_err("v75 intentionally has no in-place migration from v69");
         assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
         assert_eq!(
-            inspect_lix(&storage).await.unwrap(),
+            inspect_lix_with_adapter(&adapter).await.unwrap(),
             MigrationStatus::Required {
                 from_version: 69,
                 to_version: CURRENT_FORMAT_VERSION,
@@ -1631,16 +1673,14 @@ mod tests {
     #[tokio::test]
     async fn v73_repository_migrates_through_the_v74_backfill() {
         let storage = Memory::new();
-        let (_branch_id, _head_commit_id, rootless_commit_id, _) =
+        let (adapter, _branch_id, _head_commit_id, rootless_commit_id, _) =
             seed_rooted_head_with_rootless_checkpoint_cursor(
                 &storage,
                 REPOSITORY_PROTOCOL_V73,
             )
             .await;
-        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
-
         assert_eq!(
-            inspect_lix(&storage).await.unwrap(),
+            inspect_lix_with_adapter(&adapter).await.unwrap(),
             MigrationStatus::Required {
                 from_version: 73,
                 to_version: CURRENT_FORMAT_VERSION,
@@ -1676,13 +1716,17 @@ mod tests {
             .is_none()
         );
         pre_migration.finish().unwrap();
-        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+        let report = migrate_lix_with_adapter(
+            adapter.storage().clone(),
+            adapter.clone(),
+            MigrationOptions::default(),
+        )
             .await
             .expect("a v73 repository migrates through the v74 backfill to v75");
         assert_eq!(report.from_version, 73);
         assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
         assert_eq!(
-            inspect_lix(&storage).await.unwrap(),
+            inspect_lix_with_adapter(&adapter).await.unwrap(),
             MigrationStatus::Current {
                 version: CURRENT_FORMAT_VERSION,
             }
@@ -1692,12 +1736,13 @@ mod tests {
     #[tokio::test]
     async fn v72_index_bootstrap_marker_resumes_through_the_chain() {
         let storage = Memory::new();
-        seed_rooted_head_with_rootless_checkpoint_cursor(&storage, REPOSITORY_PROTOCOL_V72).await;
-        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        let (adapter, ..) =
+            seed_rooted_head_with_rootless_checkpoint_cursor(&storage, REPOSITORY_PROTOCOL_V72)
+                .await;
 
         backfill_missing_row_pk_indexes(
             &adapter,
-            &storage,
+            adapter.storage(),
             MigrationOptions::default(),
             72,
             REPOSITORY_PROTOCOL_V72,
@@ -1719,13 +1764,17 @@ mod tests {
             crate::engine::Engine::new(storage.clone()).await.is_err(),
             "normal engine open must reject an interrupted bootstrap"
         );
-        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+        let report = migrate_lix_with_adapter(
+            adapter.storage().clone(),
+            adapter.clone(),
+            MigrationOptions::default(),
+        )
             .await
             .expect("an interrupted v72 bootstrap resumes through the chain to v75");
         assert_eq!(report.from_version, 72);
         assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
         assert_eq!(
-            inspect_lix(&storage).await.unwrap(),
+            inspect_lix_with_adapter(&adapter).await.unwrap(),
             MigrationStatus::Current {
                 version: CURRENT_FORMAT_VERSION,
             }
@@ -1738,7 +1787,7 @@ mod tests {
         // leaves the v74 rewrite marker: normal opens must refuse it, and
         // migration must resume from it to v75.
         let storage = Memory::new();
-        seed_rooted_head_with_rootless_checkpoint_cursor(
+        let (adapter, ..) = seed_rooted_head_with_rootless_checkpoint_cursor(
             &storage,
             crate::init::REPOSITORY_PROTOCOL_V74_COMMIT_REWRITE,
         )
@@ -1747,13 +1796,17 @@ mod tests {
             crate::engine::Engine::new(storage.clone()).await.is_err(),
             "normal engine open must reject an interrupted rewrite"
         );
-        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+        let report = migrate_lix_with_adapter(
+            adapter.storage().clone(),
+            adapter.clone(),
+            MigrationOptions::default(),
+        )
             .await
             .expect("an interrupted v74 rewrite resumes to v75");
         assert_eq!(report.from_version, 74);
         assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
         assert_eq!(
-            inspect_lix(&storage).await.unwrap(),
+            inspect_lix_with_adapter(&adapter).await.unwrap(),
             MigrationStatus::Current {
                 version: CURRENT_FORMAT_VERSION,
             }
@@ -1763,18 +1816,22 @@ mod tests {
     #[tokio::test]
     async fn v72_commit_rewrite_fence_resumes_through_the_chain() {
         let storage = Memory::new();
-        seed_rooted_head_with_rootless_checkpoint_cursor(
+        let (adapter, ..) = seed_rooted_head_with_rootless_checkpoint_cursor(
             &storage,
             crate::init::REPOSITORY_PROTOCOL_V72_COMMIT_REWRITE,
         )
         .await;
-        let report = migrate_lix(storage.clone(), MigrationOptions::default())
+        let report = migrate_lix_with_adapter(
+            adapter.storage().clone(),
+            adapter.clone(),
+            MigrationOptions::default(),
+        )
             .await
             .expect("an interrupted v72 rewrite resumes through the chain to v75");
         assert_eq!(report.from_version, 72);
         assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
         assert_eq!(
-            inspect_lix(&storage).await.unwrap(),
+            inspect_lix_with_adapter(&adapter).await.unwrap(),
             MigrationStatus::Current {
                 version: CURRENT_FORMAT_VERSION,
             }
@@ -1880,12 +1937,12 @@ mod tests {
         // the closure audit see empty trees and pass unrepaired; it must
         // surface the bound instead.
         let storage = Memory::new();
-        seed_rooted_head_with_rootless_checkpoint_cursor(&storage, REPOSITORY_PROTOCOL_V74)
-            .await;
-        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        let (adapter, ..) =
+            seed_rooted_head_with_rootless_checkpoint_cursor(&storage, REPOSITORY_PROTOCOL_V74)
+                .await;
         let error = repair_filesystem_closure(
             &adapter,
-            &storage,
+            adapter.storage(),
             MigrationOptions {
                 max_changes: 1,
                 ..MigrationOptions::default()
@@ -1900,7 +1957,13 @@ mod tests {
     async fn seed_rooted_head_with_rootless_checkpoint_cursor(
         storage: &Memory,
         protocol: &'static [u8],
-    ) -> (String, CommitId, CommitId, TrackedStateRootId) {
+    ) -> (
+        crate::storage_adapter::StorageAdapter<crate::storage::StorageSession<Memory>>,
+        String,
+        CommitId,
+        CommitId,
+        TrackedStateRootId,
+    ) {
         let lix = crate::open_lix()
             .with_storage(storage.clone())
             .await
@@ -1927,9 +1990,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let adapter = lix.storage_adapter().clone();
         lix.close().await.unwrap();
 
-        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
         let read = SharedStorageAdapterRead::new(
             adapter.begin_read(ReadOptions::default()).await.unwrap(),
         );
@@ -2000,7 +2063,10 @@ mod tests {
             .collect::<Vec<_>>();
         read.finish().unwrap();
 
-        let mut fixture = storage.begin_write(WriteOptions::default()).await.unwrap();
+        let mut fixture = adapter
+            .begin_migration_write(WriteOptions::default())
+            .await
+            .unwrap();
         for (space, key, value) in replacements {
             fixture
                 .replace_many(
@@ -2034,6 +2100,7 @@ mod tests {
         fixture.commit().await.unwrap();
 
         (
+            adapter,
             branch_id,
             head_commit_id,
             checkpoint_commit_id,

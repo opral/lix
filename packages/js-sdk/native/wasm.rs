@@ -14,8 +14,9 @@ use lix::{
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
     Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreviewOptions,
-    ObserveEvents as RsObserveEvents, ServerOptions, SwitchBranchOptions as RsSwitchBranchOptions,
-    Value, open_lix, register_browser_sync_transport, unregister_browser_sync_transport,
+    ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
+    ServerOptions, SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
+    register_browser_sync_transport, unregister_browser_sync_transport,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -121,12 +122,14 @@ pub async fn open_memory(
     telemetry_dispatch: Option<Function>,
     telemetry_parent: Option<JsValue>,
     server: Option<JsValue>,
+    open_progress_dispatch: Option<Function>,
 ) -> Result<WasmLix, JsValue> {
     open_browser_storage(
         BrowserStorage::Memory(Memory::new()),
         telemetry_dispatch,
         telemetry_parent,
         server,
+        open_progress_dispatch,
     )
     .await
 }
@@ -137,6 +140,7 @@ pub async fn open_js_storage(
     telemetry_dispatch: Option<Function>,
     telemetry_parent: Option<JsValue>,
     server: Option<JsValue>,
+    open_progress_dispatch: Option<Function>,
 ) -> Result<WasmLix, JsValue> {
     let storage = JsStorage::new(provider);
     let browser_storage = BrowserStorage::Js(storage);
@@ -145,6 +149,7 @@ pub async fn open_js_storage(
         telemetry_dispatch,
         telemetry_parent,
         server,
+        open_progress_dispatch,
     )
     .await
     {
@@ -161,6 +166,7 @@ async fn open_browser_storage(
     telemetry_dispatch: Option<Function>,
     telemetry_parent: Option<JsValue>,
     server: Option<JsValue>,
+    open_progress_dispatch: Option<Function>,
 ) -> Result<WasmLix, JsValue> {
     console_error_panic_hook::set_once();
     let telemetry_parent = telemetry_parent
@@ -187,6 +193,11 @@ async fn open_browser_storage(
             let _ = dispatch.0.call1(&JsValue::UNDEFINED, &span);
         });
         let sink: Arc<dyn TelemetrySink> = Arc::new(sink);
+        sink
+    });
+    let open_progress = open_progress_dispatch.map(|dispatch| {
+        let sink: Arc<dyn OpenProgressSink> =
+            Arc::new(BrowserOpenProgressSink(BrowserFunctionDispatch(dispatch)));
         sink
     });
     #[derive(Deserialize)]
@@ -218,23 +229,16 @@ async fn open_browser_storage(
         None => None,
     };
     let open = async {
-        match telemetry {
-            Some(telemetry) => {
-                let builder = open_lix()
-                    .with_storage(storage.clone())
-                    .with_telemetry(telemetry);
-                match server {
-                    Some(server) => builder.with_server(server).await,
-                    None => builder.await,
-                }
-            }
-            None => {
-                let builder = open_lix().with_storage(storage.clone());
-                match server {
-                    Some(server) => builder.with_server(server).await,
-                    None => builder.await,
-                }
-            }
+        let mut builder = open_lix().with_storage(storage.clone());
+        if let Some(telemetry) = telemetry {
+            builder = builder.with_telemetry(telemetry);
+        }
+        if let Some(open_progress) = open_progress {
+            builder = builder.with_open_progress_sink(open_progress);
+        }
+        match server {
+            Some(server) => builder.with_server(server).await,
+            None => builder.await,
         }
     };
     let inner = instrument_remote_parent(telemetry_parent, open)
@@ -268,12 +272,32 @@ fn optional_function_property(value: &JsValue, name: &str) -> Result<Option<Func
 
 struct BrowserTelemetryDispatch(Function);
 
+struct BrowserFunctionDispatch(Function);
+
 #[expect(
     clippy::non_send_fields_in_send_ty,
     reason = "browser WASM is single-threaded but the shared telemetry trait requires Send"
 )]
 unsafe impl Send for BrowserTelemetryDispatch {}
 unsafe impl Sync for BrowserTelemetryDispatch {}
+
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "browser WASM is single-threaded but the shared progress trait requires Send"
+)]
+unsafe impl Send for BrowserFunctionDispatch {}
+unsafe impl Sync for BrowserFunctionDispatch {}
+
+struct BrowserOpenProgressSink(BrowserFunctionDispatch);
+
+impl OpenProgressSink for BrowserOpenProgressSink {
+    fn report(&self, progress: OpenProgress) {
+        let Ok(progress) = to_js(&OpenProgressDto::from(progress)) else {
+            return;
+        };
+        let _ = self.0.0.call1(&JsValue::UNDEFINED, &progress);
+    }
+}
 
 impl WasmLix {
     fn instrument_operation<F: IntoFuture>(&self, future: F) -> impl Future<Output = F::Output> {
@@ -286,8 +310,82 @@ impl WasmLix {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenProgressDto {
+    phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_format: Option<u32>,
+    to_format: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<f64>,
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "JavaScript progress counters are observational Number values"
+)]
+impl From<OpenProgress> for OpenProgressDto {
+    fn from(progress: OpenProgress) -> Self {
+        Self {
+            phase: open_phase_name(progress.phase),
+            from_format: progress.from_format,
+            to_format: progress.to_format,
+            completed: progress.completed.map(|value| value as f64),
+            total: progress.total.map(|value| value as f64),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenMigrationReportDto {
+    from_format: u32,
+    to_format: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenReportDto {
+    format: u32,
+    initialized: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migration: Option<OpenMigrationReportDto>,
+}
+
+impl From<&OpenReport> for OpenReportDto {
+    fn from(report: &OpenReport) -> Self {
+        Self {
+            format: report.format,
+            initialized: report.initialized,
+            migration: report.migration.map(|migration| OpenMigrationReportDto {
+                from_format: migration.from_format,
+                to_format: migration.to_format,
+            }),
+        }
+    }
+}
+
+fn open_phase_name(phase: OpenPhase) -> &'static str {
+    match phase {
+        OpenPhase::Inspecting => "inspecting",
+        OpenPhase::Migrating => "migrating",
+        OpenPhase::Validating => "validating",
+        OpenPhase::Opening => "opening",
+        OpenPhase::Complete => "complete",
+        _ => "opening",
+    }
+}
+
 #[wasm_bindgen]
 impl WasmLix {
+    #[wasm_bindgen(js_name = openReport)]
+    pub fn open_report(&self) -> Result<JsValue, JsValue> {
+        to_js(&OpenReportDto::from(self.inner.open_report()))
+    }
+
     #[wasm_bindgen(js_name = setTelemetryParent)]
     pub fn set_telemetry_parent(&self, parent: Option<JsValue>) -> Result<(), JsValue> {
         let Some(parent_source) = &self.telemetry_parent else {

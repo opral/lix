@@ -31,7 +31,7 @@ pub(crate) use commit::{
     SyncCommit, SyncCommitMemberRef, SyncCommitStateAlias, encode_sync_commit_member,
 };
 pub(crate) use bootstrap::{
-    SyncBootstrapAdmission, inspect_sync_bootstrap, install_sync_bootstrap,
+    SyncBootstrapAdmission, inspect_sync_bootstrap_with_adapter, install_sync_bootstrap,
     prepare_sync_bootstrap,
 };
 pub(crate) use contract::SyncTransport;

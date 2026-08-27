@@ -6,45 +6,106 @@
 //! It contains the v72 bootstrap account rows and persisted account schema.
 //! SHA-256: `05503801b91c41d821897e76ee64c476851336932e3b9c9a6618210e66b60b29`.
 
-use lix::migration::{MigrationOptions, MigrationStatus, inspect_lix, migrate_lix};
-use lix::{ANONYMOUS_ACCOUNT_ID, Memory, Value, open_lix};
+use std::sync::{Arc, Mutex};
+
+use lix::{
+    ANONYMOUS_ACCOUNT_ID, Memory, OpenPhase, OpenProgress, OpenProgressSink, Value, open_lix,
+};
 
 const V72_ACCOUNT_SNAPSHOT: &[u8] =
     include_bytes!("fixtures/v72_account_without_profile_uri.snapshot");
+
+#[derive(Default)]
+struct RecordingProgress {
+    events: Mutex<Vec<OpenProgress>>,
+}
+
+impl OpenProgressSink for RecordingProgress {
+    fn report(&self, progress: OpenProgress) {
+        self.events.lock().expect("progress events").push(progress);
+    }
+}
+
+impl RecordingProgress {
+    fn events(&self) -> Vec<OpenProgress> {
+        self.events.lock().expect("progress events").clone()
+    }
+}
+
+#[tokio::test]
+async fn fresh_open_reports_initialization_without_migration() {
+    let progress = Arc::new(RecordingProgress::default());
+    let lix = open_lix()
+        .with_open_progress_sink(progress.clone())
+        .await
+        .expect("fresh repository should initialize and open");
+
+    assert_eq!(lix.open_report().format, 76);
+    assert!(lix.open_report().initialized);
+    assert_eq!(lix.open_report().migration, None);
+    assert_eq!(
+        progress
+            .events()
+            .iter()
+            .map(|event| event.phase)
+            .collect::<Vec<_>>(),
+        vec![
+            OpenPhase::Inspecting,
+            OpenPhase::Opening,
+            OpenPhase::Complete,
+        ],
+    );
+    assert!(
+        progress
+            .events()
+            .iter()
+            .all(|event| event.from_format.is_none()),
+        "initialization is not a format migration",
+    );
+}
 
 #[tokio::test]
 async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
     let storage =
         Memory::from_snapshot(V72_ACCOUNT_SNAPSHOT).expect("v72 account fixture should decode");
-
-    assert_eq!(
-        inspect_lix(&storage)
-            .await
-            .expect("v72 format inspection should succeed"),
-        MigrationStatus::Required {
-            from_version: 72,
-            to_version: 75,
-        }
-    );
-    let Err(open_error) = open_lix().with_storage(storage.clone()).await else {
-        panic!("normal engine open must require the v72 account-schema migration");
-    };
-    assert_eq!(open_error.code, "LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED");
-
-    let report = migrate_lix(storage.clone(), MigrationOptions::default())
-        .await
-        .expect("v72 account schema should migrate");
-    assert_eq!(report.from_version, 72);
-    assert_eq!(report.to_version, 75);
-    assert_eq!(
-        inspect_lix(&storage).await.unwrap(),
-        MigrationStatus::Current { version: 75 }
-    );
-
+    let progress = Arc::new(RecordingProgress::default());
     let lix = open_lix()
         .with_storage(storage.clone())
+        .with_open_progress_sink(progress.clone())
         .await
-        .expect("migrated v72 repository should open");
+        .expect("opening a v72 repository should migrate it automatically");
+    assert_eq!(lix.open_report().format, 76);
+    assert!(!lix.open_report().initialized);
+    let migration = lix
+        .open_report()
+        .migration
+        .expect("the open report should record the automatic migration");
+    assert_eq!(migration.from_format, 72);
+    assert_eq!(migration.to_format, 76);
+
+    let events = progress.events();
+    assert_eq!(
+        events.iter().map(|event| event.phase).collect::<Vec<_>>(),
+        vec![
+            OpenPhase::Inspecting,
+            OpenPhase::Migrating,
+            OpenPhase::Validating,
+            OpenPhase::Opening,
+            OpenPhase::Complete,
+        ],
+        "automatic migration progress should be deterministic and ordered",
+    );
+    assert_eq!(events[1].from_format, Some(72));
+    assert_eq!(events[1].to_format, 76);
+    assert_eq!(events[1].completed, Some(0));
+    assert_eq!(events[1].total, None);
+    assert!(
+        events
+            .iter()
+            .skip(1)
+            .all(|event| event.from_format == Some(72)),
+        "every phase after inspection should retain the migration source format",
+    );
     let accounts = lix
         .execute("SELECT id, profile_uri FROM lix_account ORDER BY id", &[])
         .await
@@ -83,6 +144,9 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
         .with_storage(reopened)
         .await
         .expect("migrated repository should cold-open");
+    assert_eq!(lix.open_report().format, 76);
+    assert_eq!(lix.open_report().migration, None);
+    assert!(!lix.open_report().initialized);
     let result = lix
         .execute(
             "SELECT profile_uri FROM lix_account WHERE id = $1",

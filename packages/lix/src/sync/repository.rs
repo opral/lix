@@ -5680,7 +5680,7 @@ mod tests {
         MemoryRead, MemoryWrite, PutBatch, ReadOptions, ScanCursor, Storage, StorageError,
         StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
-    use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter};
+    use crate::storage_adapter::SharedStorageAdapterRead;
     use crate::{
         CreateBranchOptions, GLOBAL_BRANCH_ID, Lix, NullableKeyFilter, SwitchBranchOptions, Value,
         open_lix,
@@ -5718,6 +5718,10 @@ mod tests {
         bootstrap_commit_barrier: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
         touches_branch_control: bool,
         touches_replica_state: bool,
+    }
+
+    fn is_logical_space(space: StorageSpace, logical: StorageSpace) -> bool {
+        space.id.0 & 0x3fff_ffff == logical.id.0
     }
 
     impl SyncAccountingStorage {
@@ -5774,6 +5778,12 @@ mod tests {
         where
             Self: 'a;
 
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             Ok(SyncAccountingRead {
                 inner: self.inner.begin_read(options).await?,
@@ -5808,8 +5818,9 @@ mod tests {
             space: StorageSpace,
             entries: PutBatch,
         ) -> Result<(), StorageError> {
-            self.touches_branch_control |= space == crate::branch::BRANCH_HEAD_CONTROL_SPACE;
-            self.touches_replica_state |= space == SYNC_REPLICA_STATE_SPACE;
+            self.touches_branch_control |=
+                is_logical_space(space, crate::branch::BRANCH_HEAD_CONTROL_SPACE);
+            self.touches_replica_state |= is_logical_space(space, SYNC_REPLICA_STATE_SPACE);
             self.inner.replace_many(space, entries).await
         }
 
@@ -5818,8 +5829,9 @@ mod tests {
             space: StorageSpace,
             entries: PutBatch,
         ) -> Result<(), StorageError> {
-            self.touches_branch_control |= space == crate::branch::BRANCH_HEAD_CONTROL_SPACE;
-            self.touches_replica_state |= space == SYNC_REPLICA_STATE_SPACE;
+            self.touches_branch_control |=
+                is_logical_space(space, crate::branch::BRANCH_HEAD_CONTROL_SPACE);
+            self.touches_replica_state |= is_logical_space(space, SYNC_REPLICA_STATE_SPACE);
             self.inner.put_many(space, entries).await
         }
 
@@ -5828,8 +5840,9 @@ mod tests {
             space: StorageSpace,
             keys: &[Key],
         ) -> Result<(), StorageError> {
-            self.touches_branch_control |= space == crate::branch::BRANCH_HEAD_CONTROL_SPACE;
-            self.touches_replica_state |= space == SYNC_REPLICA_STATE_SPACE;
+            self.touches_branch_control |=
+                is_logical_space(space, crate::branch::BRANCH_HEAD_CONTROL_SPACE);
+            self.touches_replica_state |= is_logical_space(space, SYNC_REPLICA_STATE_SPACE);
             self.inner.delete_many(space, keys).await
         }
 
@@ -5838,8 +5851,9 @@ mod tests {
             space: StorageSpace,
             range: KeyRange,
         ) -> Result<(), StorageError> {
-            self.touches_branch_control |= space == crate::branch::BRANCH_HEAD_CONTROL_SPACE;
-            self.touches_replica_state |= space == SYNC_REPLICA_STATE_SPACE;
+            self.touches_branch_control |=
+                is_logical_space(space, crate::branch::BRANCH_HEAD_CONTROL_SPACE);
+            self.touches_replica_state |= is_logical_space(space, SYNC_REPLICA_STATE_SPACE);
             self.inner.delete_range(space, range).await
         }
 
@@ -5892,7 +5906,7 @@ mod tests {
             options: BeginScanOptions,
         ) -> Result<ScanCursor<'_>, StorageError> {
             self.forbidden_operations.fetch_add(1, Ordering::Relaxed);
-            if space == crate::branch::BRANCH_HEAD_CONTROL_SPACE {
+            if is_logical_space(space, crate::branch::BRANCH_HEAD_CONTROL_SPACE) {
                 self.branch_control_scans.fetch_add(1, Ordering::Relaxed);
             }
             self.inner.begin_scan(space, range, options).await
@@ -7444,7 +7458,7 @@ mod tests {
             InitialSyncSnapshotInstall::ExistingOther
         );
 
-        let adapter = StorageAdapter::new(storage);
+        let adapter = first.storage_adapter();
         let read = adapter
             .begin_read(StorageReadOptions::default())
             .await

@@ -59,6 +59,15 @@ impl Storage for ChangelogScoreStorage {
         = ChangelogScoreWrite
     where
         Self: 'a;
+
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        match self {
+            Self::Unit(storage) => storage.acquire_session().await,
+            Self::RocksDB { storage, .. } => storage.acquire_session().await,
+        }
+    }
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         match self {
             Self::Unit(storage) => storage.begin_read(opts).await.map(ChangelogScoreRead::Unit),

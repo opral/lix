@@ -13,8 +13,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use lix::storage::{
-    CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
-    StorageWrite, WriteOptions,
+    CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSessionToken,
+    StorageSpace, StorageWrite, WriteOptions,
 };
 #[cfg(test)]
 use lix::storage::{
@@ -507,6 +507,12 @@ impl Storage for FilesystemStorage {
         = FilesystemStorageWrite
     where
         Self: 'a;
+
+    fn acquire_session(
+        &self,
+    ) -> impl Future<Output = Result<StorageSessionToken, StorageError>> + Send {
+        self.inner.acquire_session()
+    }
 
     fn begin_read(
         &self,

@@ -1,7 +1,8 @@
 use lix::Value;
 use lix::open_lix;
 use lix::storage::{
-    Memory, MemoryRead, MemoryWrite, ReadOptions, Storage, StorageError, WriteOptions,
+    Memory, MemoryRead, MemoryWrite, ReadOptions, Storage, StorageError, StorageSessionToken,
+    WriteOptions,
 };
 
 /// Models an adapter living in an unrelated crate. Integration tests compile
@@ -18,6 +19,10 @@ impl Storage for DelegatingStorage {
         = MemoryWrite
     where
         Self: 'a;
+
+    async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
+        self.0.acquire_session().await
+    }
 
     async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.0.begin_read(options).await

@@ -64,22 +64,58 @@ export type LixTelemetryOptions = {
 	parentContext?(): LixTelemetryParentContext | undefined;
 };
 
+/** Stable phases emitted while a local repository is opened. */
+export type LixOpenPhase =
+	| "inspecting"
+	| "migrating"
+	| "validating"
+	| "opening"
+	| "complete";
+
+/** One observational repository-open progress snapshot. */
+export type LixOpenProgress = {
+	phase: LixOpenPhase;
+	fromFormat?: number;
+	toFormat: number;
+	completed?: number;
+	total?: number;
+};
+
+/** The automatic repository migration performed by an open, if any. */
+export type LixOpenMigrationReport = {
+	fromFormat: number;
+	toFormat: number;
+};
+
+/** Immutable facts about how a local Lix handle was opened. */
+export type LixOpenReport = {
+	format: number;
+	initialized: boolean;
+	migration?: LixOpenMigrationReport;
+};
+
+export type LixOpenProgressOptions = {
+	/** Observes local inspection, automatic migration, and opening. */
+	onProgress?(progress: LixOpenProgress): void;
+};
+
 export type OpenLixOptions =
 	| {
 			storage?: import("./storage-adapter.js").LixStorage;
 			server?: never;
 			telemetry?: LixTelemetryOptions;
-	  }
+	  } & LixOpenProgressOptions
 	| {
 			storage?: never;
 			server: RemoteLixServerOptions;
 			telemetry?: never;
+			onProgress?: never;
 	  }
 	| {
 			storage: import("./storage-adapter.js").LixStorage;
 			server: SyncLixServerOptions;
 			telemetry?: LixTelemetryOptions;
-	  };
+	  } & LixOpenProgressOptions;
 
 /** Selects the initial context for an additional independent session. */
 export type OpenAnotherSessionOptions = {

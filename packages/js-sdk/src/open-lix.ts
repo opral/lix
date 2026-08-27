@@ -5,7 +5,11 @@ import {
 	isLixStorage,
 	type LixStorage,
 } from "./storage-adapter.js";
-import type { OpenLixOptions, SyncLixServerOptions } from "./types.js";
+import type {
+	LixOpenProgress,
+	OpenLixOptions,
+	SyncLixServerOptions,
+} from "./types.js";
 
 export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
 
@@ -34,6 +38,12 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		throw new TypeError(
 			"openLix() telemetry parentContext must be a context provider function",
 		);
+	}
+	if (
+		options.onProgress !== undefined &&
+		typeof options.onProgress !== "function"
+	) {
+		throw new TypeError("openLix() onProgress must be a function");
 	}
 	if (options.server !== undefined) {
 		if (options.server.mode === "remote") {
@@ -75,6 +85,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				undefined,
 				options.telemetry,
 				syncServer,
+				options.onProgress,
 			),
 		);
 	}
@@ -83,6 +94,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			options.storage,
 			options.telemetry,
 			syncServer,
+			options.onProgress,
 		);
 	}
 	if (isLixStorage(options.storage)) {
@@ -102,6 +114,7 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 				disconnect,
 				options.telemetry,
 				syncServer,
+				options.onProgress,
 			);
 			const routed = routeStorageBinding(binding);
 			storage.lixStorage.connect({
@@ -159,13 +172,14 @@ function routeStorageBinding(root: LixBinding): {
 async function openJsProviderStorage(
 	storage: LixStorage & {
 		readonly lixStorage: {
-			readonly version: 2;
+			readonly version: 3;
 			readonly moduleUrl: string;
 			readonly options: unknown;
 		};
 	},
 	telemetry: OpenLixOptions["telemetry"],
 	syncServer: Omit<SyncLixServerOptions, "mode"> | undefined,
+	onProgress: ((progress: LixOpenProgress) => void) | undefined,
 ): Promise<Lix> {
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (openStorages.has(storage)) throw storageAlreadyOpen();
@@ -181,6 +195,7 @@ async function openJsProviderStorage(
 			() => openStorages.delete(storage),
 			telemetry,
 			syncServer,
+			onProgress,
 		);
 		binding = opened;
 		return new Lix(opened);

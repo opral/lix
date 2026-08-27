@@ -35,6 +35,8 @@ export type OpfsWritePayload = {
 	preconditions: LixStoragePrecondition[];
 	strictDurability: boolean;
 	stats: LixStorageWriteStats;
+	sessionToken?: string;
+	ownerEpoch?: string;
 };
 
 type CommitBufferedWrite = (
@@ -59,6 +61,7 @@ export class BufferedOpfsWrite implements LixStorageWrite {
 	constructor(
 		private readonly options: LixStorageWriteOptions,
 		private readonly commitBuffered: CommitBufferedWrite,
+		private readonly ownerEpoch?: string,
 	) {}
 
 	async putMany(
@@ -161,6 +164,8 @@ export class BufferedOpfsWrite implements LixStorageWrite {
 			preconditions: this.options.preconditions,
 			strictDurability: this.options.awaitDurable,
 			stats: { ...this.#stats },
+			sessionToken: this.options.sessionToken,
+			ownerEpoch: this.ownerEpoch,
 		});
 	}
 

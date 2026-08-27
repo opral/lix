@@ -809,6 +809,12 @@ impl Storage for CountingStorage {
     where
         Self: 'a;
 
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
+
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.counters
             .begin_read_calls

@@ -5,6 +5,7 @@ import type {
 	LixStorageConfig,
 	TelemetryDispatch,
 	TelemetryParentContext,
+	OpenProgressDispatch,
 	SyncServerBindingOptions,
 } from "../binding-types.js";
 import type {
@@ -19,6 +20,7 @@ export const openDirectLixBinding: undefined | ((
 	telemetry?: TelemetryDispatch,
 	telemetryParent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
+	openProgress?: OpenProgressDispatch,
 ) => Promise<LixBinding>) = undefined;
 
 export function createWorkerConnection(): WorkerConnection {

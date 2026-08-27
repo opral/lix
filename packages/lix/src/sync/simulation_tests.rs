@@ -1707,6 +1707,7 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
 	let mut replica = Replica::bootstrap(AuthorityTransport::connected(authority)).await;
 	let branch_id = replica.lix.active_branch_id().await.unwrap();
 	let adapter = replica.lix.storage_adapter();
+	let migration_adapter = adapter.clone();
 	let read = adapter
 		.begin_read(crate::storage_adapter::StorageReadOptions::default())
 		.await
@@ -1791,14 +1792,15 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
 	crate::tracked_state::arm_diff_commits_test_probe(&checkpoint_commit_id, &head_commit_id);
 
 	replica.lix.close().await.unwrap();
-	let error = crate::migration::migrate_lix(
-		replica.storage.clone(),
+	let error = crate::migration::migrate_lix_with_adapter(
+		migration_adapter.storage().clone(),
+		migration_adapter,
 		crate::migration::MigrationOptions::default(),
 	)
 	.await
-	.expect_err("the complete-snapshot hard cut must reject a pre-v75 repository");
+	.expect_err("the complete-snapshot hard cut must reject a pre-v72 repository");
 	assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
-	assert!(error.message.contains("predates the v75 complete-snapshot"));
+	assert!(error.message.contains("predates the v76 complete-snapshot"));
 	let _ = crate::tracked_state::take_diff_commits_test_probe(
 		&checkpoint_commit_id,
 		&head_commit_id,

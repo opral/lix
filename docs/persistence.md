@@ -137,6 +137,34 @@ Reads and writes execute locally while Lix exchanges commits with the server in
 the background. See [Collaboration and Sync](./collaboration-and-sync.md) for
 offline and lazy-loading behavior.
 
+## Automatic format upgrades
+
+`open_lix()` is the repository lifecycle boundary. When it encounters a
+supported older format, Lix copies the repository into an inactive storage
+epoch, validates it, and atomically publishes that epoch before opening the
+handle. Applications do not call a separate migration API. Rust applications
+can attach an `OpenProgressSink`; JavaScript applications can pass
+`onProgress` to `openLix()` to make the blocking upgrade visible.
+
+Capacity planning must include two repository generations. Lix retains the
+immediately previous generation for rollback. A later upgrade clears the
+inactive epoch before reusing it; once a newer epoch is active, Lix reclaims
+the legacy pre-epoch layout asynchronously. Budget approximately 2× the live
+repository bytes, plus the backend's normal WAL, compaction, and
+temporary-write headroom. Upgrade latency is proportional to authoritative
+bytes and depends on the storage backend and hardware. Automatic upgrades do
+not impose a fixed row or byte ceiling that could strand an otherwise valid
+repository; available backend capacity is the practical bound.
+
+The ignored RocksDB capacity profile reproduces the copy with a released-v75
+repository and a configurable payload:
+
+```sh
+LIX_MIGRATION_PROFILE_MIB=256 cargo test -p lix-storage-rocksdb \
+  --features storage-benches --test migration_profile --release -- \
+  --ignored --nocapture
+```
+
 For S3, the server runs Lix with the Rust `SlateDB` storage on an S3-compatible object store. The server exposes the repository through the [Lix Server Protocol](./server-protocol.md). See [Hosting](./hosting.md). Clients do not pass S3 to `openLix()`.
 
 ```text

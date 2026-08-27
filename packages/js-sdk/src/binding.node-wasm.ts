@@ -3,6 +3,7 @@ import type {
 	LixBinding,
 	TelemetryDispatch,
 	TelemetryParentContext,
+	OpenProgressDispatch,
 } from "./binding-types.js";
 
 // Generated before TypeScript compilation and emitted beside this module.
@@ -22,7 +23,13 @@ function initializeWasm(): Promise<unknown> {
 export async function openMemoryWasmBinding(
 	telemetry?: TelemetryDispatch,
 	telemetryParent?: TelemetryParentContext,
+	openProgress?: OpenProgressDispatch,
 ): Promise<LixBinding> {
 	await initializeWasm();
-	return openMemory(telemetry, telemetryParent) as Promise<LixBinding>;
+	return openMemory(
+		telemetry,
+		telemetryParent,
+		undefined,
+		openProgress,
+	) as Promise<LixBinding>;
 }

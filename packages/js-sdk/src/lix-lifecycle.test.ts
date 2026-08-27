@@ -2,6 +2,29 @@ import { expect, test, vi } from "vitest";
 import type { LixBinding } from "./binding-types.js";
 import { Lix } from "./lix.js";
 
+test("Lix captures an immutable open report", () => {
+	const source = {
+		format: 75,
+		initialized: false,
+		migration: { fromFormat: 74, toFormat: 75 },
+	};
+	const binding = {
+		openReport: vi.fn(() => source),
+	} as unknown as LixBinding;
+
+	const lix = new Lix(binding);
+	source.format = 76;
+	source.migration.fromFormat = 73;
+
+	expect(lix.openReport).toEqual({
+		format: 75,
+		initialized: false,
+		migration: { fromFormat: 74, toFormat: 75 },
+	});
+	expect(Object.isFrozen(lix.openReport)).toBe(true);
+	expect(Object.isFrozen(lix.openReport?.migration)).toBe(true);
+});
+
 test("managed Lix close rejects new work and drains an in-flight branch switch", async () => {
 	const remoteSwitch = deferred<{ branchId: string }>();
 	const order: string[] = [];

@@ -47,6 +47,16 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let adapter = StorageAdapter::new(storage.clone());
+    inspect_sync_bootstrap_with_adapter(&adapter, remote_id).await
+}
+
+pub(crate) async fn inspect_sync_bootstrap_with_adapter<StorageImpl>(
+    adapter: &StorageAdapter<StorageImpl>,
+    remote_id: &str,
+) -> Result<SyncBootstrapAdmission, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     match inspect_once(&adapter, remote_id).await? {
         BootstrapInspection::Prepare => Ok(SyncBootstrapAdmission::Prepare),
         BootstrapInspection::Ready { account_id } => {
@@ -140,7 +150,6 @@ pub(crate) async fn prepare_sync_bootstrap(
 
 pub(crate) async fn install_sync_bootstrap<StorageImpl>(
     lix: &mut Lix<StorageImpl>,
-    storage: &StorageImpl,
     server: &crate::ServerOptions,
     prepared: PreparedSyncBootstrap,
 ) -> Result<HttpSyncTransport, LixError>
@@ -180,18 +189,28 @@ where
             Ok(prepared.transport)
         }
         Ok(InitialSyncSnapshotInstall::ExistingExact) => {
-            let _ = inspect_sync_bootstrap(storage, server.url.trim_end_matches('/')).await?;
+            let adapter = lix.storage_adapter();
+            let _ = inspect_sync_bootstrap_with_adapter(
+                &adapter,
+                server.url.trim_end_matches('/'),
+            )
+            .await?;
             Err(restart_open_error())
         }
         Ok(InitialSyncSnapshotInstall::ExistingOther) => Err(bound_to_other_remote_error()),
         Err(error) => Err(
-            reconcile_install_error(storage, server.url.trim_end_matches('/'), error).await,
+            reconcile_install_error(
+                &lix.storage_adapter(),
+                server.url.trim_end_matches('/'),
+                error,
+            )
+            .await,
         ),
     }
 }
 
 async fn reconcile_install_error<StorageImpl>(
-    storage: &StorageImpl,
+    adapter: &StorageAdapter<StorageImpl>,
     remote_id: &str,
     error: LixError,
 ) -> LixError
@@ -201,8 +220,7 @@ where
     if !is_ambiguous_bootstrap_write(&error) {
         return error;
     }
-    let adapter = StorageAdapter::new(storage.clone());
-    match inspect_once(&adapter, remote_id).await {
+    match inspect_once(adapter, remote_id).await {
         Ok(BootstrapInspection::Ready { .. } | BootstrapInspection::Publishing) => {
             restart_open_error()
         }
@@ -248,6 +266,14 @@ mod tests {
     impl Storage for TieredStorage {
         type Read<'a> = MemoryRead;
         type Write<'a> = MemoryWrite;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            Err(StorageError::Unsupported(
+                crate::storage::Capability::StorageSessions,
+            ))
+        }
 
         async fn begin_read(
             &self,
@@ -445,7 +471,7 @@ mod tests {
         let original = LixError::new(LixError::CODE_INVALID_PARAM, "malformed snapshot");
 
         let error = reconcile_install_error(
-            &storage,
+            &StorageAdapter::new(storage.clone()),
             "https://sync.example/repository",
             original.clone(),
         )
@@ -462,7 +488,7 @@ mod tests {
         let storage = tiered(visible, durable);
 
         let error = reconcile_install_error(
-            &storage,
+            &StorageAdapter::new(storage.clone()),
             "https://sync.example/repository",
             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "lost publication race"),
         )
@@ -482,7 +508,7 @@ mod tests {
         let storage = tiered(visible, durable);
 
         let error = reconcile_install_error(
-            &storage,
+            &StorageAdapter::new(storage.clone()),
             "https://sync.example/repository",
             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "lost publication race"),
         )
@@ -503,7 +529,7 @@ mod tests {
         let storage = tiered(visible, durable);
 
         let error = reconcile_install_error(
-            &storage,
+            &StorageAdapter::new(storage.clone()),
             "https://sync.example/repository",
             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "lost publication race"),
         )

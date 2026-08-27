@@ -265,6 +265,12 @@ impl<B: CrashBackend> Storage for CrashStorage<B> {
     where
         Self: 'a;
 
+    fn acquire_session(
+        &self,
+    ) -> impl Future<Output = Result<lix::storage::StorageSessionToken, StorageError>> + Send {
+        self.inner.acquire_session()
+    }
+
     fn begin_read(
         &self,
         opts: ReadOptions,

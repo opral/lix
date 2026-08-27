@@ -56,7 +56,8 @@ pub use merge::{
     MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
     MergeConflictKind, MergeConflictSide,
 };
-pub use observe::{ObserveEvent, ObserveEvents};
+pub use observe::ObserveEvent;
+pub(crate) use observe::ObserveEvents as SessionObserveEvents;
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;
 pub use undo_redo::{RedoReceipt, UndoReceipt};
@@ -159,6 +160,13 @@ pub(crate) mod borrowing_proof_storage {
             = MemoryWrite
         where
             Self: 'a;
+
+        fn acquire_session(
+            &self,
+        ) -> impl Future<Output = Result<crate::storage::StorageSessionToken, StorageError>> + Send
+        {
+            self.0.acquire_session()
+        }
 
         fn begin_read(
             &self,

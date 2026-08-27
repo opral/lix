@@ -1429,6 +1429,12 @@ impl Storage for InterferingStorage {
     where
         Self: 'a;
 
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
+
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.inner.begin_read(opts).await
     }
@@ -1584,6 +1590,12 @@ impl Storage for BlockingBeginWriteStorage {
         = <RecordingStorage as Storage>::Write<'a>
     where
         Self: 'a;
+
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.inner.begin_read(opts).await
     }
@@ -1604,6 +1616,12 @@ impl Storage for BlockingBeginReadStorage {
         = <RecordingStorage as Storage>::Write<'a>
     where
         Self: 'a;
+
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.gate.maybe_block();
         self.inner.begin_read(opts).await
@@ -1624,6 +1642,12 @@ impl Storage for BlockingCommitStorage {
         = BlockingCommitWrite
     where
         Self: 'a;
+
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.inner.begin_read(opts).await
     }
@@ -1801,6 +1825,12 @@ impl Storage for RecordingStorage {
         = RecordingWrite
     where
         Self: 'a;
+
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.stats.read_opened.fetch_add(1, Ordering::SeqCst);
         Ok(RecordingRead {

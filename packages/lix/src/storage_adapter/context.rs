@@ -12,6 +12,8 @@ use crate::storage_adapter::{
     StorageWriteSetError, StorageWriteSetStats,
 };
 
+use super::epoch::{EpochBank, EpochRouting, EpochStorageWrite};
+
 use super::spaces::{
     REVISION_KEY_MUTATION, REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE, load_revision,
     revision_key,
@@ -20,6 +22,7 @@ use super::spaces::{
 #[derive(Clone, Debug)]
 pub struct StorageAdapter<StorageImpl = Memory> {
     storage: StorageImpl,
+    routing: EpochRouting,
 }
 
 #[expect(missing_debug_implementations)]
@@ -27,7 +30,7 @@ pub struct PreparedStorageCommit<'a, StorageImpl>
 where
     StorageImpl: Storage + 'a,
 {
-    write: StorageImpl::Write<'a>,
+    write: EpochStorageWrite<StorageImpl::Write<'a>>,
     stats: StorageWriteSetStats,
 }
 
@@ -36,7 +39,55 @@ where
     StorageImpl: Storage,
 {
     pub fn new(storage: StorageImpl) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            routing: EpochRouting::legacy(),
+        }
+    }
+
+    pub(crate) fn storage(&self) -> &StorageImpl {
+        &self.storage
+    }
+
+    /// Routes engine storage into one hidden physical epoch bank without
+    /// admitting writes. Migration construction and validation use this while
+    /// the stable pointer is in a non-active state.
+    pub(crate) fn for_epoch_unfenced(storage: StorageImpl, bank: EpochBank) -> Self {
+        Self {
+            storage,
+            routing: EpochRouting::unfenced(bank),
+        }
+    }
+
+    /// Routes engine storage into the active physical epoch and fences every
+    /// write on the exact stable-pointer bytes observed during admission.
+    pub(crate) fn for_epoch(
+        storage: StorageImpl,
+        bank: EpochBank,
+        expected_pointer: Bytes,
+    ) -> Self {
+        Self {
+            storage,
+            routing: EpochRouting::fenced(bank, expected_pointer),
+        }
+    }
+
+    /// Routes candidate construction into an epoch bank, fences every write
+    /// on the exact migration claim, and forces each commit durable before the
+    /// active pointer can publish the candidate.
+    pub(crate) fn for_epoch_migration(
+        storage: StorageImpl,
+        bank: EpochBank,
+        expected_pointer: Bytes,
+    ) -> Self {
+        Self {
+            storage,
+            routing: EpochRouting::migration(bank, expected_pointer),
+        }
+    }
+
+    pub(crate) fn epoch_bank(&self) -> EpochBank {
+        self.routing.bank()
     }
 
     pub async fn begin_read(
@@ -45,10 +96,12 @@ where
     ) -> Result<StorageAdapterReadScope<StorageImpl::Read<'_>>, StorageError> {
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_checkpoint_read_view();
-        self.storage
-            .begin_read(opts)
-            .await
-            .map(StorageAdapterReadScope::new)
+        let read = self.storage.begin_read(opts).await?;
+        self.routing.validate_read(&read).await?;
+        Ok(StorageAdapterReadScope::with_routing(
+            read,
+            self.routing.clone(),
+        ))
     }
 
     pub(crate) async fn watch_for_changes(&self) -> Result<StorageChangeWatch, StorageError> {
@@ -57,6 +110,19 @@ where
 
     pub fn new_write_set(&self) -> StorageWriteSet {
         StorageWriteSet::new()
+    }
+
+    pub(crate) async fn begin_migration_write(
+        &self,
+        opts: WriteOptions,
+    ) -> Result<EpochStorageWrite<StorageImpl::Write<'_>>, StorageError> {
+        let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
+        let write = self.storage.begin_write(opts).await?;
+        Ok(EpochStorageWrite::new(
+            write,
+            self.routing.clone(),
+            fence_precondition_index,
+        ))
     }
 
     pub async fn begin_read_transaction(
@@ -96,7 +162,11 @@ where
         opts.batch_capacity_hint_bytes = opts
             .batch_capacity_hint_bytes
             .max(write_set.backend_batch_capacity_hint_bytes());
-        let mut write = self
+        let (opts, fence_precondition_index) = self
+            .routing
+            .route_write_options(opts)
+            .map_err(StorageWriteSetError::Storage)?;
+        let write = self
             .storage
             .begin_write(opts)
             .instrument(tracing::debug_span!(
@@ -105,6 +175,8 @@ where
             ))
             .await
             .map_err(StorageWriteSetError::Storage)?;
+        let mut write =
+            EpochStorageWrite::new(write, self.routing.clone(), fence_precondition_index);
         let lowered = async {
             let stats = write_set.lower_into(&mut write).await?;
             if stats.staged_puts > 0 || stats.staged_deletes > 0 {
@@ -134,8 +206,8 @@ where
     }
 
     pub(crate) async fn load_mutation_revision(&self) -> Result<Option<Bytes>, StorageError> {
-        let read = self.storage.begin_read(ReadOptions::default()).await?;
-        Self::load_mutation_revision_from_read(&StorageAdapterReadScope::new(read)).await
+        let read = self.begin_read(ReadOptions::default()).await?;
+        Self::load_mutation_revision_from_read(&read).await
     }
 
     pub(crate) fn tracked_mutation_revision_precondition(expected: Option<Bytes>) -> Precondition {
@@ -198,7 +270,10 @@ where
         range: KeyRange,
         opts: WriteOptions,
     ) -> Result<CommitResult, StorageError> {
-        let mut write = self.storage.begin_write(opts).await?;
+        let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
+        let write = self.storage.begin_write(opts).await?;
+        let mut write =
+            EpochStorageWrite::new(write, self.routing.clone(), fence_precondition_index);
         if let Err(error) = write.delete_range(space, range).await {
             let _ = write.rollback().await;
             return Err(error);

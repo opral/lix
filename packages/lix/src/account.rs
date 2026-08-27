@@ -102,7 +102,8 @@ pub(crate) fn clear_validated_accounts_for_test() {
 mod tests {
     use super::*;
 
-    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions};
+    use crate::storage::{Storage, Memory};
+    use crate::storage_adapter::{StorageAdapter, StorageReadOptions};
     use crate::{Value, open_lix};
 
     /// The cache is one process-wide static, so the tests that assert on its
@@ -113,7 +114,7 @@ mod tests {
         Bytes::from(vec![byte; 16])
     }
 
-    async fn current_token(adapter: &StorageAdapter<Memory>) -> Option<Bytes> {
+    async fn current_token<S: Storage>(adapter: &StorageAdapter<S>) -> Option<Bytes> {
         let read = adapter
             .begin_read(StorageReadOptions::default())
             .await
@@ -131,11 +132,11 @@ mod tests {
     async fn ordinary_commits_keep_the_token_while_account_writes_rotate_it() {
         const AUTHOR_ID: &str = "01920000-0000-7000-8000-0000000006a1";
         let storage = Memory::new();
-        let adapter = StorageAdapter::new(storage.clone());
         let lix = open_lix()
             .with_storage(storage)
             .await
             .expect("repository should open");
+        let adapter = lix.storage_adapter();
 
         let initialized = current_token(&adapter)
             .await

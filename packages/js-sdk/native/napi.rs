@@ -6,15 +6,16 @@ use lix::{
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
-    ObserveEvents as RsObserveEvents, RedoReceipt, ServerOptions,
-    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
-    open_lix,
+    ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
+    RedoReceipt, ServerOptions, SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt,
+    UndoReceipt, Value, open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{
@@ -27,6 +28,8 @@ use tokio::sync::watch;
 
 type JsTelemetryDispatch = ThreadsafeFunction<String, (), String, Status, false>;
 type SharedJsTelemetryDispatch = Arc<JsTelemetryDispatch>;
+type JsOpenProgressDispatch = ThreadsafeFunction<String, (), String, Status, false>;
+type SharedJsOpenProgressDispatch = Arc<JsOpenProgressDispatch>;
 
 // SQL command and observation actors can compose catalog, filesystem, plugin,
 // and live-state async futures before their first suspension point. They must
@@ -41,11 +44,20 @@ fn optional_telemetry_dispatch(
         .transpose()
 }
 
+fn optional_open_progress_dispatch(
+    dispatch: Option<Function<'_, String, ()>>,
+) -> Result<Option<SharedJsOpenProgressDispatch>> {
+    dispatch
+        .map(|dispatch| dispatch.build_threadsafe_function().build().map(Arc::new))
+        .transpose()
+}
+
 #[expect(missing_debug_implementations)]
 #[napi(js_name = "Lix")]
 pub struct NativeLix {
     actor: NativeLixActor,
     telemetry_parent: Option<PendingTelemetryParent>,
+    open_report: NativeOpenReport,
 }
 
 enum NativeLixInner {
@@ -81,6 +93,76 @@ pub struct NativeOpenAnotherSessionOptions {
     pub branch_id: Option<String>,
     #[napi(js_name = "accountId")]
     pub account_id: Option<String>,
+}
+
+#[napi(object)]
+#[derive(Clone, Copy, Debug)]
+pub struct NativeOpenMigrationReport {
+    #[napi(js_name = "fromFormat")]
+    pub from_format: u32,
+    #[napi(js_name = "toFormat")]
+    pub to_format: u32,
+}
+
+#[napi(object)]
+#[derive(Clone, Copy, Debug)]
+pub struct NativeOpenReport {
+    pub format: u32,
+    pub initialized: bool,
+    pub migration: Option<NativeOpenMigrationReport>,
+}
+
+impl From<&OpenReport> for NativeOpenReport {
+    fn from(report: &OpenReport) -> Self {
+        Self {
+            format: report.format,
+            initialized: report.initialized,
+            migration: report.migration.map(|migration| NativeOpenMigrationReport {
+                from_format: migration.from_format,
+                to_format: migration.to_format,
+            }),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenProgressDto {
+    phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_format: Option<u32>,
+    to_format: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<f64>,
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "JavaScript progress counters are observational Number values"
+)]
+impl From<OpenProgress> for OpenProgressDto {
+    fn from(progress: OpenProgress) -> Self {
+        Self {
+            phase: open_phase_name(progress.phase),
+            from_format: progress.from_format,
+            to_format: progress.to_format,
+            completed: progress.completed.map(|value| value as f64),
+            total: progress.total.map(|value| value as f64),
+        }
+    }
+}
+
+fn open_phase_name(phase: OpenPhase) -> &'static str {
+    match phase {
+        OpenPhase::Inspecting => "inspecting",
+        OpenPhase::Migrating => "migrating",
+        OpenPhase::Validating => "validating",
+        OpenPhase::Opening => "opening",
+        OpenPhase::Complete => "complete",
+        _ => "opening",
+    }
 }
 
 #[napi(object)]
@@ -633,6 +715,13 @@ fn transaction_closed_error() -> LixError {
 }
 
 impl NativeLixInner {
+    fn open_report(&self) -> &OpenReport {
+        match self {
+            Self::Memory(lix) => lix.open_report(),
+            Self::FilesystemStorage(lix, _, _) => lix.open_report(),
+        }
+    }
+
     async fn execute(
         &self,
         sql: &str,
@@ -911,6 +1000,7 @@ pub struct OpenFilesystemStorageTask {
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
+    open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
 }
@@ -919,6 +1009,7 @@ pub struct OpenFilesystemStorageTask {
 pub struct OpenMemoryTask {
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
+    open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
 }
@@ -933,6 +1024,7 @@ impl Task for OpenFilesystemStorageTask {
             self.sync_all_files,
             self.telemetry_dispatch.take(),
             self.telemetry_parent.take(),
+            self.open_progress_dispatch.take(),
             self.server_url.take(),
             std::mem::take(&mut self.server_headers),
         ))
@@ -951,6 +1043,7 @@ impl Task for OpenMemoryTask {
         Ok(open_memory_native(
             self.telemetry_dispatch.take(),
             self.telemetry_parent.take(),
+            self.open_progress_dispatch.take(),
             self.server_url.take(),
             std::mem::take(&mut self.server_headers),
         ))
@@ -975,6 +1068,25 @@ fn telemetry_sink(
     (Arc::new(sink), parent_source)
 }
 
+struct NativeOpenProgressSink {
+    dispatch: SharedJsOpenProgressDispatch,
+}
+
+impl OpenProgressSink for NativeOpenProgressSink {
+    fn report(&self, progress: OpenProgress) {
+        let Ok(json) = serde_json::to_string(&OpenProgressDto::from(progress)) else {
+            return;
+        };
+        let _ = self
+            .dispatch
+            .call(json, ThreadsafeFunctionCallMode::NonBlocking);
+    }
+}
+
+fn open_progress_sink(dispatch: SharedJsOpenProgressDispatch) -> Arc<dyn OpenProgressSink> {
+    Arc::new(NativeOpenProgressSink { dispatch })
+}
+
 fn parse_server_headers(headers: Option<Vec<Vec<String>>>) -> Result<Vec<(String, String)>> {
     headers
         .unwrap_or_default()
@@ -991,6 +1103,7 @@ fn parse_server_headers(headers: Option<Vec<Vec<String>>>) -> Result<Vec<(String
 fn open_memory_native(
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
+    open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
 ) -> std::result::Result<NativeLix, LixError> {
@@ -998,32 +1111,22 @@ fn open_memory_native(
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let (lix, telemetry_parent_source) = match telemetry_dispatch.map(telemetry_sink) {
-        Some((telemetry, parent_source)) => {
-            let builder = open_lix().with_telemetry(telemetry);
-            let builder = match server_url {
-                Some(url) => builder
-                    .with_server(ServerOptions::sync(url).with_headers(server_headers.clone())),
-                None => builder,
-            };
-            (
-                rt.block_on(instrument_remote_parent(telemetry_parent, async {
-                    builder.await
-                })),
-                Some(parent_source),
-            )
-        }
-        None => {
-            let builder = open_lix();
-            let builder = match server_url {
-                Some(url) => {
-                    builder.with_server(ServerOptions::sync(url).with_headers(server_headers))
-                }
-                None => builder,
-            };
-            (rt.block_on(async { builder.await }), None)
-        }
-    };
+    let (telemetry, telemetry_parent_source) = telemetry_dispatch
+        .map(telemetry_sink)
+        .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
+    let mut builder = open_lix();
+    if let Some(telemetry) = telemetry {
+        builder = builder.with_telemetry(telemetry);
+    }
+    if let Some(dispatch) = open_progress_dispatch {
+        builder = builder.with_open_progress_sink(open_progress_sink(dispatch));
+    }
+    if let Some(url) = server_url {
+        builder = builder.with_server(ServerOptions::sync(url).with_headers(server_headers));
+    }
+    let lix = rt.block_on(instrument_remote_parent(telemetry_parent, async {
+        builder.await
+    }));
     let lix = lix?;
     NativeLix::new(NativeLixInner::Memory(lix), telemetry_parent_source)
 }
@@ -1033,6 +1136,7 @@ fn open_filesystem_storage_native(
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
+    open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
 ) -> std::result::Result<NativeLix, LixError> {
@@ -1043,34 +1147,22 @@ fn open_filesystem_storage_native(
     let storage = FilesystemStorage::new(path)
         .sync_all_files(sync_all_files)
         .open()?;
-    let (lix, telemetry_parent_source) = match telemetry_dispatch.map(telemetry_sink) {
-        Some((telemetry, parent_source)) => {
-            let builder = open_lix()
-                .with_storage(storage.clone())
-                .with_telemetry(telemetry);
-            let builder = match server_url {
-                Some(url) => builder
-                    .with_server(ServerOptions::sync(url).with_headers(server_headers.clone())),
-                None => builder,
-            };
-            (
-                rt.block_on(instrument_remote_parent(telemetry_parent, async {
-                    builder.await
-                })),
-                Some(parent_source),
-            )
-        }
-        None => {
-            let builder = open_lix().with_storage(storage.clone());
-            let builder = match server_url {
-                Some(url) => {
-                    builder.with_server(ServerOptions::sync(url).with_headers(server_headers))
-                }
-                None => builder,
-            };
-            (rt.block_on(async { builder.await }), None)
-        }
-    };
+    let (telemetry, telemetry_parent_source) = telemetry_dispatch
+        .map(telemetry_sink)
+        .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
+    let mut builder = open_lix().with_storage(storage.clone());
+    if let Some(telemetry) = telemetry {
+        builder = builder.with_telemetry(telemetry);
+    }
+    if let Some(dispatch) = open_progress_dispatch {
+        builder = builder.with_open_progress_sink(open_progress_sink(dispatch));
+    }
+    if let Some(url) = server_url {
+        builder = builder.with_server(ServerOptions::sync(url).with_headers(server_headers));
+    }
+    let lix = rt.block_on(instrument_remote_parent(telemetry_parent, async {
+        builder.await
+    }));
     let lix = lix?;
     rt.block_on(storage.start_sync(&lix))?;
     NativeLix::new(
@@ -1081,6 +1173,11 @@ fn open_filesystem_storage_native(
 
 #[napi]
 impl NativeLix {
+    #[napi(js_name = "openReport")]
+    pub fn open_report(&self) -> NativeOpenReport {
+        self.open_report.clone()
+    }
+
     #[napi(js_name = "setTelemetryParent")]
     pub fn set_telemetry_parent(&self, parent_json: Option<String>) -> Result<()> {
         if let Some(parent_source) = &self.telemetry_parent {
@@ -1099,11 +1196,13 @@ impl NativeLix {
         telemetry_parent_json: Option<String>,
         server_url: Option<String>,
         server_headers: Option<Vec<Vec<String>>>,
+        open_progress_dispatch: Option<Function<'_, String, ()>>,
     ) -> Result<AsyncTask<OpenMemoryTask>> {
         Ok(AsyncTask::new(OpenMemoryTask {
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
             telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json)
                 .map_err(Error::from_reason)?,
+            open_progress_dispatch: optional_open_progress_dispatch(open_progress_dispatch)?,
             server_url,
             server_headers: parse_server_headers(server_headers)?,
         }))
@@ -1117,6 +1216,7 @@ impl NativeLix {
         telemetry_parent_json: Option<String>,
         server_url: Option<String>,
         server_headers: Option<Vec<Vec<String>>>,
+        open_progress_dispatch: Option<Function<'_, String, ()>>,
     ) -> Result<AsyncTask<OpenFilesystemStorageTask>> {
         Ok(AsyncTask::new(OpenFilesystemStorageTask {
             path,
@@ -1124,6 +1224,7 @@ impl NativeLix {
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
             telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json)
                 .map_err(Error::from_reason)?,
+            open_progress_dispatch: optional_open_progress_dispatch(open_progress_dispatch)?,
             server_url,
             server_headers: parse_server_headers(server_headers)?,
         }))
@@ -1673,11 +1774,13 @@ impl NativeLix {
         lix: NativeLixInner,
         telemetry_parent: Option<PendingTelemetryParent>,
     ) -> std::result::Result<Self, LixError> {
+        let open_report = NativeOpenReport::from(lix.open_report());
         let actor = NativeLixActor::start(lix, telemetry_parent.clone())
             .map_err(|error| LixError::unknown(format!("failed to start native actor: {error}")))?;
         Ok(Self {
             actor,
             telemetry_parent,
+            open_report,
         })
     }
 }

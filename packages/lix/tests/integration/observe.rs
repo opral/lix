@@ -23,7 +23,7 @@ async fn open_default_session(sim: &Simulation, engine: &Engine) -> (SessionCont
     (raw_session, session)
 }
 
-fn observe_key(session: &SessionContext, key: &str) -> lix::ObserveEvents {
+fn observe_key(session: &SessionContext, key: &str) -> crate::session::SessionObserveEvents {
     let params = [Value::Text(key.to_string())];
     session
         .observe(KEY_VALUE_SQL, &params)
@@ -31,7 +31,7 @@ fn observe_key(session: &SessionContext, key: &str) -> lix::ObserveEvents {
 }
 
 async fn next_event<StorageImpl>(
-    events: &mut lix::ObserveEvents<StorageImpl>,
+    events: &mut crate::session::SessionObserveEvents<StorageImpl>,
     label: &str,
 ) -> ObserveEvent
 where
@@ -44,7 +44,10 @@ where
         .unwrap_or_else(|| panic!("observe closed before event: {label}"))
 }
 
-async fn expect_no_event<StorageImpl>(events: &mut lix::ObserveEvents<StorageImpl>, label: &str)
+async fn expect_no_event<StorageImpl>(
+    events: &mut crate::session::SessionObserveEvents<StorageImpl>,
+    label: &str,
+)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
@@ -1082,6 +1085,12 @@ impl Storage for BlockingBeginReadStorage {
     where
         Self: 'a;
 
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
+
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.gate.maybe_block();
         self.inner.begin_read(opts).await
@@ -1102,6 +1111,12 @@ impl Storage for BlockingBeginWriteStorage {
         = MemoryWrite
     where
         Self: 'a;
+
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
 
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         self.inner.begin_read(opts).await
@@ -1247,6 +1262,12 @@ impl Storage for CountingReadStorage {
         = MemoryWrite
     where
         Self: 'a;
+
+    async fn acquire_session(
+        &self,
+    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
 
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         Ok(CountingRead {

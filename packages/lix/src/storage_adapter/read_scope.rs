@@ -5,6 +5,8 @@ use crate::storage::{
     StorageRead, StorageSpace,
 };
 
+use super::epoch::EpochRouting;
+
 /// The async read capability consumed by engine stores.
 ///
 /// Implementations preserve one coherent storage read view while allowing
@@ -30,15 +32,19 @@ pub trait StorageAdapterRead: Send + Sync {
 #[derive(Debug)]
 pub struct StorageAdapterReadScope<R> {
     read: R,
+    routing: EpochRouting,
 }
 
 impl<R> StorageAdapterReadScope<R> {
     pub fn new(read: R) -> Self {
-        Self { read }
+        Self {
+            read,
+            routing: EpochRouting::legacy(),
+        }
     }
 
-    fn into_inner(self) -> R {
-        self.read
+    pub(super) fn with_routing(read: R, routing: EpochRouting) -> Self {
+        Self { read, routing }
     }
 }
 
@@ -50,7 +56,7 @@ pub(crate) struct SharedStorageAdapterRead<R>
 where
     R: StorageRead,
 {
-    read: Arc<R>,
+    read: Arc<StorageAdapterReadScope<R>>,
 }
 
 impl<R> SharedStorageAdapterRead<R>
@@ -59,7 +65,7 @@ where
 {
     pub(crate) fn new(read: StorageAdapterReadScope<R>) -> Self {
         Self {
-            read: Arc::new(read.into_inner()),
+            read: Arc::new(read),
         }
     }
 
@@ -128,7 +134,8 @@ where
     R: StorageRead,
 {
     fn snapshot_cache_key(&self) -> Option<u128> {
-        self.read.snapshot_cache_key()
+        self.routing
+            .mix_snapshot_cache_key(self.read.snapshot_cache_key())
     }
 
     fn get_many(
@@ -140,13 +147,23 @@ where
             requests.len(),
             requests.iter().map(|request| request.keys.len()).sum(),
         );
-        #[cfg(feature = "root-replay-trace")]
-        {
-            traced_get_many(requests, self.read.get_many(requests))
-        }
-        #[cfg(not(feature = "root-replay-trace"))]
-        {
-            self.read.get_many(requests)
+        async move {
+            let requests = requests
+                .iter()
+                .map(|request| GetManyRequest {
+                    space: self.routing.map_space(request.space),
+                    keys: request.keys,
+                    opts: request.opts,
+                })
+                .collect::<Vec<_>>();
+            #[cfg(feature = "root-replay-trace")]
+            {
+                traced_get_many(&requests, self.read.get_many(&requests)).await
+            }
+            #[cfg(not(feature = "root-replay-trace"))]
+            {
+                self.read.get_many(&requests).await
+            }
         }
     }
 
@@ -158,7 +175,8 @@ where
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_checkpoint_scan_start();
-        self.read.begin_scan(space, range, opts)
+        self.read
+            .begin_scan(self.routing.map_space(space), range, opts)
     }
 }
 
@@ -167,26 +185,14 @@ where
     R: StorageRead,
 {
     fn snapshot_cache_key(&self) -> Option<u128> {
-        self.read.snapshot_cache_key()
+        StorageAdapterRead::snapshot_cache_key(self.read.as_ref())
     }
 
     fn get_many(
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_checkpoint_point_read(
-            requests.len(),
-            requests.iter().map(|request| request.keys.len()).sum(),
-        );
-        #[cfg(feature = "root-replay-trace")]
-        {
-            traced_get_many(requests, self.read.get_many(requests))
-        }
-        #[cfg(not(feature = "root-replay-trace"))]
-        {
-            self.read.get_many(requests)
-        }
+        StorageAdapterRead::get_many(self.read.as_ref(), requests)
     }
 
     fn begin_scan(
@@ -195,9 +201,7 @@ where
         range: KeyRange,
         opts: BeginScanOptions,
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
-        #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_checkpoint_scan_start();
-        self.read.begin_scan(space, range, opts)
+        StorageAdapterRead::begin_scan(self.read.as_ref(), space, range, opts)
     }
 }
 
