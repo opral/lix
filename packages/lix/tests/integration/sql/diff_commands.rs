@@ -459,3 +459,165 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    scoped_file_revert_restores_removed_parent_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        let directory_id = "01950000-0000-7000-8000-000000000001";
+        let file_id = "01950000-0000-7000-8000-000000000002";
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ($1, '/docs')",
+                &[Value::Text(directory_id.to_owned())],
+            )
+            .await
+            .expect("parent directory should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ($1, '/docs/a.md', CAST('hello' AS BYTEA))",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("child file should insert");
+        session
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("baseline checkpoint should succeed");
+
+        session
+            .execute(
+                "DELETE FROM lix_directory WHERE id = $1",
+                &[Value::Text(directory_id.to_owned())],
+            )
+            .await
+            .expect("recursive directory delete should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1 \
+                 RETURNING commit_id",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("file revert should close over its removed parent directory");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path FROM lix_directory WHERE id = '01950000-0000-7000-8000-000000000001'",
+            )
+            .await,
+            vec![vec![Value::Text("/docs".to_owned())]],
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path FROM lix_file WHERE id = '01950000-0000-7000-8000-000000000002'",
+            )
+            .await,
+            vec![vec![Value::Text("/docs/a.md".to_owned())]],
+        );
+    }
+);
+
+simulation_test!(
+    scoped_file_apply_creates_changed_parent_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        let baseline = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("baseline head should load")
+            .expect("baseline head should exist")
+            .to_string();
+        let directory_id = "01950000-0000-7000-8000-000000000011";
+        let file_id = "01950000-0000-7000-8000-000000000012";
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ($1, '/apply-docs')",
+                &[Value::Text(directory_id.to_owned())],
+            )
+            .await
+            .expect("parent directory should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ($1, '/apply-docs/a.md', CAST('hello' AS BYTEA))",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("child file should insert");
+        let target = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("target head should load")
+            .expect("target head should exist")
+            .to_string();
+
+        session
+            .execute(
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1",
+                &[Value::Text(file_id.to_owned())],
+            )
+            .await
+            .expect("precondition revert should remove the file");
+        session
+            .execute(
+                "INSERT INTO lix_revert (row_ref) \
+                 SELECT row_ref FROM lix_diff('lix_directory') WHERE id = $1",
+                &[Value::Text(directory_id.to_owned())],
+            )
+            .await
+            .expect("precondition revert should remove the parent directory");
+        assert!(
+            select_rows(
+                &session,
+                "SELECT id FROM lix_directory WHERE id = '01950000-0000-7000-8000-000000000011'",
+            )
+            .await
+            .is_empty(),
+            "the apply dependency must actually be absent before the command",
+        );
+        session
+            .execute(
+                "INSERT INTO lix_apply (row_ref) \
+                 SELECT row_ref FROM lix_diff('lix_file', $1, $2) WHERE id = $3 \
+                 RETURNING commit_id",
+                &[
+                    Value::Text(baseline),
+                    Value::Text(target),
+                    Value::Text(file_id.to_owned()),
+                ],
+            )
+            .await
+            .expect("file apply should close over its changed parent directory");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path FROM lix_directory WHERE id = '01950000-0000-7000-8000-000000000011'",
+            )
+            .await,
+            vec![vec![Value::Text("/apply-docs".to_owned())]],
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT path FROM lix_file WHERE id = '01950000-0000-7000-8000-000000000012'",
+            )
+            .await,
+            vec![vec![Value::Text("/apply-docs/a.md".to_owned())]],
+        );
+    }
+);

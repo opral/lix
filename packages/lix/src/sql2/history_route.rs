@@ -213,6 +213,7 @@ pub(crate) fn serialize_history_source_changes(
             Ok(serde_json::json!({
                 "id": change.id,
                 "row_ref": row_ref,
+                "schema_key": change.schema_key,
                 "file_id": change.file_id,
                 "snapshot_content": snapshot_content,
                 "metadata": metadata,
@@ -861,6 +862,7 @@ mod tests {
             .expect("public change should have a row reference");
         let decoded = crate::row_ref::decode_str(encoded).expect("row reference should decode");
 
+        assert_eq!(value[0]["schema_key"], "lix_file_descriptor");
         assert_eq!(decoded.relation, "lix_file");
         assert_eq!(decoded.row_pk, row_pk);
     }

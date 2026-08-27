@@ -2107,8 +2107,8 @@ async fn sparse_replica_observer_hydrates_root_history_past_a_merge_frontier() {
     let command_bootstrap_history_gets = probe.history_gets.load(Ordering::Acquire);
     let applied = command_replica
         .execute(
-            "INSERT INTO lix_apply (relation, row_pk) \
-             SELECT 'lix_key_value', lixcol_row_pk \
+            "INSERT INTO lix_apply (row_ref) \
+             SELECT row_ref \
              FROM lix_diff(\
                'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
              ) \

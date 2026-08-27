@@ -8666,7 +8666,11 @@ where
                 None => current.as_ref().is_none_or(|row| row.deleted),
             };
             if !current_matches {
-                return Err(stale_or_unknown_diff_id());
+                return Err(stale_or_unknown_diff_id().with_details(serde_json::json!({
+                    "operation": diff_command_operation(command),
+                    "rowRef": crate::row_ref::encode_schema_identity(&schema_key, &row_pk)?
+                        .as_str(),
+                })));
             }
             if let Some(target) = target {
                 required_diff_change(&records, target, diff_id)?;
@@ -8922,6 +8926,14 @@ where
                 retain_payloads: false,
             });
         }
+        if matches!(command, DiffCommand::Apply | DiffCommand::Revert) {
+            // Apply/revert dependency closure must see the complete immutable
+            // source diff. A relation-filtered read cannot discover a changed
+            // schema registration, parent directory, FK target, or unique
+            // value owner outside the explicitly selected relation.
+            requests.clear();
+            requests.push(TrackedStateDiffRequest::default());
+        }
 
         let source = selections
             .iter()
@@ -9003,7 +9015,7 @@ where
             };
         let mut matched = BTreeSet::new();
         let mut resolved = Vec::new();
-        for entry in entries {
+        for entry in &entries {
             if entry.identity.schema_key() == CHECKPOINT_SCHEMA_KEY
                 || entry.identity.schema_key() == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
             {
@@ -9049,7 +9061,143 @@ where
         }
         resolved.sort();
         resolved.dedup();
-        Ok(resolved)
+        self.close_apply_or_revert_selection(command, &entries, resolved)
+            .await
+    }
+
+    async fn close_apply_or_revert_selection(
+        &mut self,
+        command: DiffCommand,
+        entries: &[TrackedStateDiffEntry],
+        requested: Vec<String>,
+    ) -> Result<Vec<String>, LixError> {
+        if command == DiffCommand::CreateCheckpoint {
+            return Ok(requested);
+        }
+        let requested = requested.into_iter().collect::<BTreeSet<_>>();
+        let source_requested = requested.clone();
+        let (candidate_entries, candidate_requested, candidate_to_source) =
+            if command == DiffCommand::Revert {
+                let mut reversed = Vec::with_capacity(entries.len());
+                let mut source_to_candidate = BTreeMap::new();
+                let mut candidate_to_source = BTreeMap::new();
+                for entry in entries {
+                    let source_diff_id = entry.diff_id()?;
+                    let mut candidate = entry.clone();
+                    std::mem::swap(&mut candidate.before, &mut candidate.after);
+                    candidate.kind = match candidate.kind {
+                        TrackedStateDiffKind::Added => TrackedStateDiffKind::Removed,
+                        TrackedStateDiffKind::Modified => TrackedStateDiffKind::Modified,
+                        TrackedStateDiffKind::Removed => TrackedStateDiffKind::Added,
+                    };
+                    let candidate_diff_id = candidate.diff_id()?;
+                    source_to_candidate.insert(source_diff_id.clone(), candidate_diff_id.clone());
+                    candidate_to_source.insert(candidate_diff_id, source_diff_id);
+                    reversed.push(candidate);
+                }
+                let candidate_requested = requested
+                    .iter()
+                    .map(|diff_id| {
+                        source_to_candidate
+                            .get(diff_id)
+                            .cloned()
+                            .ok_or_else(stale_or_unknown_diff_id)
+                    })
+                    .collect::<Result<BTreeSet<_>, _>>()?;
+                (reversed, candidate_requested, Some(candidate_to_source))
+            } else {
+                (entries.to_vec(), requested, None)
+            };
+        let (before_snapshots, after_snapshots) = self
+            .checkpoint_dependency_snapshots(&candidate_entries)
+            .await?;
+        let closed = close_and_validate_diff_command_selection(
+            command,
+            &candidate_entries,
+            candidate_requested,
+            self.tracked_schema_snapshot.as_ref(),
+            &before_snapshots,
+            &after_snapshots,
+        )?;
+        let mut closed = closed
+            .into_iter()
+            .map(|diff_id| {
+                candidate_to_source
+                    .as_ref()
+                    .map_or(Ok(diff_id.clone()), |mapping| {
+                        mapping
+                            .get(&diff_id)
+                            .cloned()
+                            .ok_or_else(stale_or_unknown_diff_id)
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let by_diff_id = entries
+            .iter()
+            .map(|entry| Ok((entry.diff_id()?, entry)))
+            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+        let auto_dependencies = closed
+            .iter()
+            .filter(|diff_id| !source_requested.contains(*diff_id))
+            .map(|diff_id| {
+                by_diff_id
+                    .get(diff_id)
+                    .copied()
+                    .ok_or_else(stale_or_unknown_diff_id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !auto_dependencies.is_empty() {
+            let branch_id = self.active_branch_id.clone();
+            let request = HotStateExactBatchRequest {
+                rows: auto_dependencies
+                    .iter()
+                    .map(|entry| HotStateExactRowRequest {
+                        schema_key: entry.identity.schema_key().to_owned(),
+                        branch_id: branch_id.clone(),
+                        row_pk: entry.identity.row_pk().clone(),
+                        file_id: entry.identity.file_id().map(ToOwned::to_owned),
+                    })
+                    .collect(),
+                projection: HotStateProjection::default(),
+                untracked: Some(false),
+                include_tombstones: true,
+            };
+            let current = self
+                .load_visible_exact_hot_state_batch(&request)
+                .await?
+                .into_rows();
+            let already_satisfied = auto_dependencies
+                .into_iter()
+                .zip(current)
+                .map(|(entry, current)| {
+                    let target_change_id = match command {
+                        DiffCommand::Apply => entry.after.as_ref(),
+                        DiffCommand::Revert => entry.before.as_ref(),
+                        DiffCommand::CreateCheckpoint => unreachable!(),
+                    }
+                    .filter(|row| !row.deleted)
+                    .map(|row| row.change_id);
+                    let satisfied = match target_change_id {
+                        Some(target) => current
+                            .as_ref()
+                            .and_then(|row| row.change_id)
+                            .is_some_and(|change_id| change_id == target),
+                        None => current.as_ref().is_none_or(|row| row.deleted),
+                    };
+                    if satisfied {
+                        entry.diff_id().map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .collect::<Result<Vec<_>, LixError>>()?
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>();
+            closed.retain(|diff_id| !already_satisfied.contains(diff_id));
+        }
+        closed.sort();
+        Ok(closed)
     }
 
     /// Includes only changed, live ancestors of selected file descriptors.
@@ -9303,7 +9451,8 @@ where
                 let (before_snapshots, after_snapshots) = self
                     .checkpoint_dependency_snapshots(&diff.entries)
                     .await?;
-                let closed = close_and_validate_checkpoint_selection(
+                let closed = close_and_validate_diff_command_selection(
+                    DiffCommand::CreateCheckpoint,
                     &diff.entries,
                     requested,
                     self.tracked_schema_snapshot.as_ref(),
@@ -10078,21 +10227,31 @@ fn parse_materialized_diff_json(
     .transpose()
 }
 
-/// Computes engine-owned dependencies for a scoped checkpoint and rejects a
-/// partition that could publish rows without the schema needed to read them.
+fn diff_command_operation(command: DiffCommand) -> &'static str {
+    match command {
+        DiffCommand::Revert => "lix_revert",
+        DiffCommand::Apply => "lix_apply",
+        DiffCommand::CreateCheckpoint => "lix_create_checkpoint",
+    }
+}
+
+/// Computes engine-owned dependencies for a scoped diff command and rejects a
+/// candidate that could publish rows without the schema needed to read them.
 ///
 /// Schema definitions are ordinary tracked rows. A relation and its
 /// `lix_registered_schema` row can therefore be introduced in the same
 /// working interval. Selecting only the relation row used to strand that row
 /// behind a checkpoint whose catalog could not decode it. Closure happens on
 /// the complete immutable working diff, before either partition is staged.
-fn close_and_validate_checkpoint_selection(
+fn close_and_validate_diff_command_selection(
+    command: DiffCommand,
     entries: &[TrackedStateDiffEntry],
     requested: BTreeSet<String>,
     catalog: &CatalogSnapshot,
     before_snapshots: &BTreeMap<String, JsonValue>,
     after_snapshots: &BTreeMap<String, JsonValue>,
 ) -> Result<BTreeSet<String>, LixError> {
+    let operation = diff_command_operation(command);
     let mut by_diff_id = BTreeMap::new();
     let mut registration_by_schema_key = BTreeMap::new();
     for entry in entries.iter().filter(|entry| {
@@ -10130,10 +10289,10 @@ fn close_and_validate_checkpoint_selection(
             {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    "a scoped checkpoint cannot remove a schema registration; checkpoint the complete working set",
+                    format!("a scoped {operation} cannot remove a schema registration without its complete dependent set"),
                 )
                 .with_details(serde_json::json!({
-                    "operation": "lix_create_checkpoint",
+                    "operation": operation,
                     "rowRef": crate::row_ref::encode_schema_identity(
                         REGISTERED_SCHEMA_KEY,
                         entry.identity.row_pk(),
@@ -10162,14 +10321,23 @@ fn close_and_validate_checkpoint_selection(
                 .as_ref()
                 .is_none_or(|after| after.deleted)
             {
+                if command != DiffCommand::CreateCheckpoint
+                    && catalog.plan_for_key(&schema_key).is_some()
+                {
+                    // The operation's current candidate already has this
+                    // schema. A historical source interval may contain an
+                    // obsolete registration tombstone (notably for builtin
+                    // relations); it is not a dependency transition.
+                    continue;
+                }
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
-                        "checkpoint selection contains a live '{schema_key}' row but its schema registration is removed"
+                        "{operation} selection contains a live '{schema_key}' row but its schema registration is removed"
                     ),
                 )
                 .with_details(serde_json::json!({
-                    "operation": "lix_create_checkpoint",
+                    "operation": operation,
                     "rowRef": crate::row_ref::encode_schema_identity(
                         REGISTERED_SCHEMA_KEY,
                         registration.identity.row_pk(),
@@ -10321,7 +10489,7 @@ fn close_and_validate_checkpoint_selection(
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         format!(
-                            "checkpoint dependency target schema '{}' is not visible",
+                            "{operation} dependency target schema '{}' is not visible",
                             foreign_key.referenced_schema.schema_key
                         ),
                     ));
@@ -10373,7 +10541,7 @@ fn close_and_validate_checkpoint_selection(
                     .map_err(|error| {
                         LixError::new(
                             LixError::CODE_CONSTRAINT_VIOLATION,
-                            format!("checkpoint foreign-key value is invalid: {error}"),
+                            format!("{operation} foreign-key value is invalid: {error}"),
                         )
                     })?;
                 if let Some((target_diff_id, target_entry)) = by_diff_id.iter().find(|(_, target)| {
@@ -10388,7 +10556,7 @@ fn close_and_validate_checkpoint_selection(
                         return Err(LixError::new(
                             LixError::CODE_CONSTRAINT_VIOLATION,
                             format!(
-                                "checkpoint selection references removed row '{} {:?}'",
+                                "{operation} selection references removed row '{} {:?}'",
                                 foreign_key.referenced_schema.schema_key,
                                 target_row_pk
                             ),
@@ -10474,10 +10642,10 @@ fn close_and_validate_checkpoint_selection(
                     {
                         return Err(LixError::new(
                             LixError::CODE_CONSTRAINT_VIOLATION,
-                            "checkpoint selection would retain a row that references a removed dependency",
+                            format!("{operation} selection would retain a row that references a removed dependency"),
                         )
                         .with_details(serde_json::json!({
-                            "operation": "lix_create_checkpoint",
+                            "operation": operation,
                             "rowRef": crate::row_ref::encode_schema_identity(
                                 child_entry.identity.schema_key(),
                                 child_entry.identity.row_pk(),
@@ -10506,15 +10674,19 @@ fn close_and_validate_checkpoint_selection(
         let schema_key = entry.identity.schema_key();
         if let Some(registration_diff_id) = registration_by_schema_key.get(schema_key)
             && !closed.contains(registration_diff_id)
+            && by_diff_id
+                .get(registration_diff_id)
+                .and_then(|registration| registration.after.as_ref())
+                .is_some_and(|after| !after.deleted)
         {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 format!(
-                    "checkpoint selection is missing the schema registration for '{schema_key}'"
+                    "{operation} selection is missing the schema registration for '{schema_key}'"
                 ),
             )
             .with_details(serde_json::json!({
-                "operation": "lix_create_checkpoint",
+                "operation": operation,
                 "rowRef": crate::row_ref::encode_schema_identity(
                     schema_key,
                     entry.identity.row_pk(),
@@ -10555,10 +10727,10 @@ fn close_and_validate_checkpoint_selection(
             {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    "checkpoint closure violates a declared unique constraint",
+                    format!("{operation} closure violates a declared unique constraint"),
                 )
                 .with_details(serde_json::json!({
-                    "operation": "lix_create_checkpoint",
+                    "operation": operation,
                     "rowRef": crate::row_ref::encode_schema_identity(
                         left_entry.identity.schema_key(),
                         left_entry.identity.row_pk(),
@@ -10590,10 +10762,10 @@ fn close_and_validate_checkpoint_selection(
             }) {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    "checkpoint closure violates the filesystem namespace",
+                    format!("{operation} closure violates the filesystem namespace"),
                 )
                 .with_details(serde_json::json!({
-                    "operation": "lix_create_checkpoint",
+                    "operation": operation,
                     "rowRef": crate::row_ref::encode_schema_identity(
                         left_entry.identity.schema_key(),
                         left_entry.identity.row_pk(),

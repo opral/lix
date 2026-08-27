@@ -106,6 +106,7 @@ fn fold_value(accumulator: u64, value: &Value) -> u64 {
         Value::Jsonb(value) => fold_bytes(accumulator, 5, value.as_bytes()),
         Value::Blob(value) => fold_bytes(accumulator, 6, value.as_bytes()),
         Value::Timestamptz(value) => fold_bytes(accumulator, 7, &value.to_le_bytes()),
+        Value::RowRef(value) => fold_bytes(accumulator, 8, value.as_str().as_bytes()),
     }
 }
 
