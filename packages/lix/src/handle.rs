@@ -288,43 +288,55 @@ where
             ));
         }
         let storage = StorageSession::acquire(self.storage).await?;
-        let admission = ensure_current_repository(&storage, self.open_progress.as_ref()).await?;
-        let migrated_from = admission
-            .report
-            .migration
-            .map(|migration| migration.from_format);
-        emit_open_progress(
-            self.open_progress.as_ref(),
-            OpenProgress {
-                phase: OpenPhase::Opening,
-                from_format: migrated_from,
-                to_format: crate::init::CURRENT_FORMAT_VERSION,
-                completed: None,
-                total: None,
-            },
-        );
-        let (engine, _) = retry_expired_read(|| {
-            open_or_initialize_engine_with_adapter(
-                admission.adapter.clone(),
-                self.wasm_runtime.clone(),
-                self.telemetry.clone(),
-                None,
-                None,
-            )
+        let retained_progress = Arc::new(RetainingOpenProgressSink::new(self.open_progress));
+        let (engine, migrated_from) = retry_expired_read(|| {
+            let storage = storage.clone();
+            let open_progress: Arc<dyn OpenProgressSink> = retained_progress.clone();
+            let wasm_runtime = self.wasm_runtime.clone();
+            let telemetry = self.telemetry.clone();
+            async move {
+                let admission =
+                    ensure_current_repository(&storage, Some(&open_progress)).await?;
+                let migrated_from = admission
+                    .report
+                    .migration
+                    .map(|migration| migration.from_format);
+                emit_open_progress(
+                    Some(&open_progress),
+                    OpenProgress {
+                        phase: OpenPhase::Opening,
+                        from_format: migrated_from,
+                        to_format: crate::init::CURRENT_FORMAT_VERSION,
+                        completed: None,
+                        total: None,
+                    },
+                );
+                let (engine, _) = open_or_initialize_engine_with_adapter(
+                    admission.adapter,
+                    wasm_runtime,
+                    telemetry,
+                    None,
+                    None,
+                )
+                .await?;
+                let engine_storage = engine.storage();
+                let read = engine_storage
+                    .begin_read(crate::storage_adapter::StorageReadOptions::default())
+                    .await?;
+                if crate::sync::has_any_sync_replica_state(&read).await? {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "a persisted sync replica cannot be served as a protocol authority",
+                    ));
+                }
+                Ok((engine, migrated_from))
+            }
         })
         .await?;
-        let storage = engine.storage();
-        let read = storage
-            .begin_read(crate::storage_adapter::StorageReadOptions::default())
-            .await?;
-        if crate::sync::has_any_sync_replica_state(&read).await? {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "a persisted sync replica cannot be served as a protocol authority",
-            ));
-        }
+        let migrated_from = migrated_from.or_else(|| retained_progress.migrated_from());
+        let open_progress: Arc<dyn OpenProgressSink> = retained_progress;
         emit_open_progress(
-            self.open_progress.as_ref(),
+            Some(&open_progress),
             OpenProgress {
                 phase: OpenPhase::Complete,
                 from_format: migrated_from,

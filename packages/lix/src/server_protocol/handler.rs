@@ -5826,6 +5826,81 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ExpireOneReadStorage {
+        inner: Memory,
+        expire_next_read: Arc<AtomicBool>,
+        expired_reads: Arc<AtomicUsize>,
+    }
+
+    impl ExpireOneReadStorage {
+        fn new() -> Self {
+            Self {
+                inner: Memory::new(),
+                expire_next_read: Arc::new(AtomicBool::new(false)),
+                expired_reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn expire_next_read(&self) {
+            assert!(
+                !self.expire_next_read.swap(true, Ordering::AcqRel),
+                "test read expiration must be idle before arming"
+            );
+        }
+    }
+
+    impl Storage for ExpireOneReadStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            if self.expire_next_read.swap(false, Ordering::AcqRel) {
+                self.expired_reads.fetch_add(1, Ordering::AcqRel);
+                return Err(StorageError::ReadExpired);
+            }
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_retries_read_expired_during_repository_admission() {
+        let storage = ExpireOneReadStorage::new();
+        let lix = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("initialize Lix before serving");
+        lix.close().await.expect("close setup Lix");
+
+        storage.expire_next_read();
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .await
+            .expect("serve should retry repository admission");
+        assert_eq!(storage.expired_reads.load(Ordering::Acquire), 1);
+        server.close().await.expect("close server");
+    }
+
     #[tokio::test]
     async fn fenced_storage_does_not_affect_resumed_cached_handshake() {
         let storage = FencedReadStorage::new();
