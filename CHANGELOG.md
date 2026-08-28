@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.16.0 - 2026-08-28
+
+### Minor
+
+- Standardized remote Lix URLs and added streamed snapshot export to the server protocol.
+
+  Remote clients now connect with an immutable `https://host/lix/{uuid}` locator, while raw HTTP clients use `/lix/v1/{uuid}/...`. The previous host-specific URL plus appended `/lix/v1` shape is no longer supported.
+- Made bundled `lix_*` schemas immutable engine authority instead of deriving their availability from branch-visible `lix_registered_schema` rows.
+
+  Repository format v77 migrates v72-v76 repositories through the existing copy-and-activate epoch path. Retained built-in registration rows remain introspection and history projections, while custom registered schemas remain repository-owned. Sync protocol v2 rejects peers with the older catalog semantics.
+- Added opaque row references and a single SQL checkpoint function for full and scoped checkpoints.
+
+  Diff and selection surfaces now use `row_ref`, scoped checkpoints accept arrays of row references, and omitted diff commits default to the latest checkpoint through the active branch head. The former typed checkpoint SDK and two-column JSON row-key selection contract have been removed.
+
+### Patch
+
+- Root and latest-checkpoint queries now hydrate deferred commit history on sparse sync replicas.
+
+  Observers and diff commands transparently retry after fetching a missing commit-graph ancestor instead of failing with an internal error.
+- Concurrent browser sync no longer crashes an in-flight write when its transaction read expires.
+
+  Lix now returns the transient storage error to its bounded write retry path instead of panicking while opening transaction-scoped history readers.
+
 ## 0.15.0 - 2026-08-27
 
 ### Minor
