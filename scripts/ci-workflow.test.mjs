@@ -9,6 +9,10 @@ const workflow = readFileSync(
 	resolve(repositoryRoot, ".github/workflows/ci.yml"),
 	"utf8",
 );
+const releasePrWorkflow = readFileSync(
+	resolve(repositoryRoot, ".github/workflows/release-pr.yml"),
+	"utf8",
+);
 
 test("superseded CI runs are cancelled per pull request or branch", () => {
 	assert.match(
@@ -19,21 +23,62 @@ test("superseded CI runs are cancelled per pull request or branch", () => {
 });
 
 test("Rust test scopes run independently with workspace-specific caches", () => {
-	for (const [name, task, workspace] of [
-		["Test", "test", "."],
-		["Tooling Test", "tooling", "tooling"],
-		["E2E Test", "e2e", "tooling"],
+	for (const [name, task, workspace, runner] of [
+		["Clippy", "clippy", ".", "blacksmith-32vcpu-ubuntu-2404"],
+		["Test", "test", ".", "blacksmith-32vcpu-ubuntu-2404"],
+		["Tooling Test", "tooling", "tooling", "blacksmith-16vcpu-ubuntu-2404"],
+		["E2E Test", "e2e", "tooling", "blacksmith-16vcpu-ubuntu-2404"],
 	]) {
 		assert.match(
 			workflow,
 			new RegExp(
-				`- name: ${name}\\n\\s+task: ${task}\\n\\s+workspace: ${workspace === "." ? "\\." : workspace}`,
+				`- name: ${name}\\n\\s+task: ${task}\\n\\s+workspace: ${workspace === "." ? "\\." : workspace}[\\s\\S]*?runner: ${runner}`,
 			),
 		);
 	}
 	assert.match(workflow, /workspaces: \$\{\{ matrix\.workspace \}\}/);
 	assert.match(workflow, /name: rust-nextest-junit-\$\{\{ matrix\.task \}\}/);
 	assert.match(workflow, /name: rust-cargo-timings-\$\{\{ matrix\.task \}\}/);
+	assert.match(workflow, /name: Cargo \$\{\{ matrix\.name \}\}[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/);
+});
+
+test("short support jobs use free standard runners for the public repository", () => {
+	assert.match(workflow, /name: Changelog[\s\S]*?runs-on: ubuntu-24\.04/);
+	for (const [name, runner] of [
+		["Linux x64", "ubuntu-24.04"],
+		["macOS arm64", "macos-15"],
+		["Windows x64", "windows-2025"],
+	]) {
+		assert.match(
+			workflow,
+			new RegExp(`- name: ${name}\\n\\s+runner: ${runner.replaceAll(".", "\\.")}`),
+		);
+	}
+});
+
+test("JS SDK native CI is right-sized without changing browser architecture coverage", () => {
+	assert.match(
+		workflow,
+		/- name: Native\n\s+runtime: native\n\s+runner: blacksmith-16vcpu-ubuntu-2404/,
+	);
+	assert.match(
+		workflow,
+		/- name: Browser\n\s+runtime: browser\n\s+runner: blacksmith-32vcpu-ubuntu-2404/,
+	);
+	assert.match(workflow, /name: JS SDK \$\{\{ matrix\.name \}\} Test[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/);
+});
+
+test("release PR automation reuses same-SHA pull request CI with a dispatch fallback", () => {
+	assert.match(
+		releasePrWorkflow,
+		/RELEASE_SHA: \$\{\{ steps\.release_pr\.outputs\.pull-request-head-sha \}\}/,
+	);
+	assert.match(releasePrWorkflow, /--event pull_request/);
+	assert.match(releasePrWorkflow, /--commit "\$RELEASE_SHA"/);
+	for (const conclusion of ["action_required", "cancelled", "skipped", "stale"]) {
+		assert.match(releasePrWorkflow, new RegExp(`\\. == "${conclusion}"`));
+	}
+	assert.match(releasePrWorkflow, /gh workflow run ci\.yml --ref "\$TARGET_BRANCH"/);
 });
 
 test("nextest compiles test targets without building unused examples", () => {

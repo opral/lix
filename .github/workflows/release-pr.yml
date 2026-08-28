@@ -59,8 +59,70 @@ jobs:
         if: steps.prepare.outputs.has_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ steps.release_pr.outputs.pull-request-head-sha }}
           TARGET_BRANCH: release/v${{ steps.prepare.outputs.version }}
-        run: gh workflow run ci.yml --ref "$TARGET_BRANCH"
+        run: |
+          set -euo pipefail
+
+          # Creating or updating the release PR can already trigger ordinary
+          # pull_request CI. Reuse that run when GitHub accepted it instead of
+          # paying for a second full workflow_dispatch run for the same SHA.
+          # GITHUB_TOKEN-authored PR events can be approval-blocked, so retain
+          # workflow_dispatch as a fail-open fallback.
+          if [ -n "$RELEASE_SHA" ]; then
+            for attempt in 1 2 3 4 5 6; do
+              if ! runs="$(gh run list \
+                --workflow ci.yml \
+                --event pull_request \
+                --commit "$RELEASE_SHA" \
+                --limit 100 \
+                --json status,conclusion,url)"; then
+                echo "Could not inspect pull request CI; dispatching the fallback run."
+                break
+              fi
+
+              if jq -e 'def blocked:
+                  . == "action_required" or . == "cancelled" or
+                  . == "skipped" or . == "stale";
+                any(.[];
+                .status == "queued" or
+                .status == "in_progress" or
+                (.status == "completed" and
+                  (.conclusion | blocked | not)))' \
+                <<< "$runs" >/dev/null; then
+                echo "Reusing pull request CI for $RELEASE_SHA."
+                jq -r 'def blocked:
+                    . == "action_required" or . == "cancelled" or
+                    . == "skipped" or . == "stale";
+                  .[] | select(
+                  .status == "queued" or
+                  .status == "in_progress" or
+                  (.status == "completed" and
+                    (.conclusion | blocked | not))) |
+                  .url' <<< "$runs"
+                exit 0
+              fi
+
+              if jq -e 'def blocked:
+                  . == "action_required" or . == "cancelled" or
+                  . == "skipped" or . == "stale";
+                any(.[];
+                .status == "completed" and
+                (.conclusion | blocked))' \
+                <<< "$runs" >/dev/null; then
+                echo "Pull request CI cannot provide a reusable check; dispatching the fallback run."
+                break
+              fi
+
+              if [ "$attempt" -lt 6 ]; then
+                sleep 5
+              fi
+            done
+          else
+            echo "The release PR action did not return a head SHA; dispatching the fallback run."
+          fi
+
+          gh workflow run ci.yml --ref "$TARGET_BRANCH"
 
       - name: Close superseded release PRs
         if: steps.prepare.outputs.has_release == 'true'

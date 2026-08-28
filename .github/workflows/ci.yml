@@ -26,7 +26,7 @@ jobs:
   changelog:
     name: Changelog
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -50,11 +50,11 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - name: macOS arm64
-            runner: blacksmith-12vcpu-macos-15
+            runner: macos-15
           - name: Windows x64
-            runner: blacksmith-16vcpu-windows-2025
+            runner: windows-2025
 
     steps:
       - name: Checkout repository
@@ -68,7 +68,7 @@ jobs:
   cargo:
     name: Cargo ${{ matrix.name }}
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -76,18 +76,22 @@ jobs:
           - name: Clippy
             task: clippy
             workspace: .
+            runner: blacksmith-32vcpu-ubuntu-2404
           - name: Test
             task: test
             workspace: .
             junit: target/nextest/ci/junit.xml
+            runner: blacksmith-32vcpu-ubuntu-2404
           - name: Tooling Test
             task: tooling
             workspace: tooling
             junit: tooling/target/nextest/ci/junit.xml
+            runner: blacksmith-16vcpu-ubuntu-2404
           - name: E2E Test
             task: e2e
             workspace: tooling
             junit: tooling/target/nextest/ci-e2e/junit.xml
+            runner: blacksmith-16vcpu-ubuntu-2404
 
     steps:
       - name: Checkout repository
@@ -290,15 +294,17 @@ jobs:
   js-sdk-test:
     name: JS SDK ${{ matrix.name }} Test
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Native
             runtime: native
+            runner: blacksmith-16vcpu-ubuntu-2404
           - name: Browser
             runtime: browser
+            runner: blacksmith-32vcpu-ubuntu-2404
 
     steps:
       - name: Checkout repository
