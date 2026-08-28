@@ -21,10 +21,10 @@ categories = ["development-tools", "artificial-intelligence", "filesystem"]
 rust-version = "1.93"
 
 [workspace.dependencies]
-lix = { path = "../packages/lix", version = "=0.16.0", default-features = false }
-lix_storage_filesystem = { package = "lix-storage-filesystem", path = "../packages/storage-filesystem", version = "=0.16.0", default-features = false }
-lix_storage_rocksdb = { package = "lix-storage-rocksdb", path = "../packages/storage-rocksdb", version = "=0.16.0" }
-lix_storage_slatedb = { package = "lix-storage-slatedb", path = "../packages/storage-slatedb", version = "=0.16.0" }
+lix = { path = "../packages/lix", version = "=0.14.0", default-features = false }
+lix_storage_filesystem = { package = "lix-storage-filesystem", path = "../packages/storage-filesystem", version = "=0.14.0", default-features = false }
+lix_storage_rocksdb = { package = "lix-storage-rocksdb", path = "../packages/storage-rocksdb", version = "=0.14.0" }
+lix_storage_slatedb = { package = "lix-storage-slatedb", path = "../packages/storage-slatedb", version = "=0.14.0" }
 mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
 
 [workspace.lints.rust]

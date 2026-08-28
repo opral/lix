@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.16.0 - 2026-08-28
+## 0.14.0 - 2026-08-28
 
 ### Minor
 
@@ -23,9 +23,9 @@
 
   Lix now returns the transient storage error to its bounded write retry path instead of panicking while opening transaction-scoped history readers.
 
-## 0.15.0 - 2026-08-27
+### Core engine and SDK changes
 
-### Minor
+#### Minor
 
 - Opening a Lix now upgrades supported older repository formats automatically and reports typed progress to Rust and JavaScript applications.
 
@@ -47,22 +47,22 @@
 
   Opening automatically upgrades v72–v74 repositories — inferring each local commit's base chronologically, repairing filesystem trees that v72-era partial checkpoints left without their ancestor directories, and fencing every step so an interruption is cleanly retryable. Repositories below v72, or repositories whose commit timestamps contradict the chronological inference, are rejected with an explicit error instead of migrating on guessed history.
 
-### Patch
+#### Patch
 
 - OPFS repositories remain writable across browser-tab navigation and owner-worker handoffs.
 
   The shared storage session now survives an OPFS backend restart, so one healthy tab no longer fences another tab using the same repository generation.
 - Allow a `LixServerProtocol` owner to stream a coherent snapshot without opening a second engine for the same storage.
 
-## 0.14.0 - 2026-08-25
+### Sync and version-control changes
 
-### Minor
+#### Minor
 
 - Added optional public profile URIs to repository accounts.
 
   Applications can now associate an account with a machine-readable public profile while keeping authentication and authorization separate from presentation metadata.
 
-  v0.14 uses repository format v73. Existing repositories must run the explicit offline migration before opening; historical accounts receive `NULL` for the new field and profile updates remain durable.
+  This release uses repository format v77. Supported older repositories upgrade automatically while opening; historical accounts receive `NULL` for the new field and profile updates remain durable.
 - Added durable local-first repository sync for offline-capable applications.
 
   `openLix({ storage, server: { mode: "sync" } })` keeps reads and writes local while synchronizing with the server in the background. Browser applications can use OPFS for durable offline work, safely share a repository across tabs and workers, and recover when the owning tab closes.
@@ -71,9 +71,9 @@
   Use `lix_diff(relation, from_commit_id, to_commit_id)` to compare tracked relations, `lix_restore` to move a branch to an ancestor, and `lix_commit_ancestry()` plus commit parent IDs to inspect history. This replaces the former `*_by_branch`, branch descriptor/ref, heterogeneous working-diff, `diff_id`, and commit-edge surfaces; open a separate session for each branch.
 - Simplified the public SDK surface for serving, batching, migrations, and telemetry.
 
-  Serve a repository with `open_lix().with_storage(storage).serve().await`, submit atomic statement arrays through `executeBatch`, and run explicit offline migrations through `inspect_lix` and `migrate_lix`. Rust and JavaScript now share one stable telemetry contract. The former protocol constructors, Workerd entry point, SQL script parser, migration names, and legacy telemetry surface have been removed.
+  Serve a repository with `open_lix().with_storage(storage).serve().await`, submit atomic statement arrays through `executeBatch`, and let `open_lix` perform supported repository upgrades with typed progress. Rust and JavaScript now share one stable telemetry contract. The former protocol constructors, Workerd entry point, SQL script parser, migration names, and legacy telemetry surface have been removed.
 
-### Patch
+#### Patch
 
 - Improved browser, remote, and large-repository reliability and performance.
 
