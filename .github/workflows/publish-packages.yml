@@ -63,36 +63,41 @@ jobs:
               exit 1
             fi
 
-            node scripts/prepare-manual-release.mjs "$MANUAL_VERSION"
-            git diff --check
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -- \
-              .changenotes \
-              CHANGELOG.md \
-              Cargo.lock \
-              Cargo.toml \
-              packages \
-              plugins \
-              tooling/Cargo.lock \
-              tooling/Cargo.toml
-            git commit -m "Release $tag"
-            release_sha="$(git rev-parse HEAD)"
-            manual_branch="manual-release/${tag}"
-            git push --force origin "HEAD:refs/heads/${manual_branch}"
-            existing_manual_pr="$(gh pr list \
-              --repo "$GITHUB_REPOSITORY" \
-              --state open \
-              --head "$manual_branch" \
-              --json number \
-              --jq 'length')"
-            if [ "$existing_manual_pr" = 0 ]; then
-              gh pr create \
+            current_version="$(node --input-type=module -e 'import { currentVersion } from "./scripts/release.mjs"; console.log(currentVersion(process.cwd()));')"
+            if [ "$MANUAL_VERSION" = "$current_version" ]; then
+              echo "Retrying already-prepared release $tag from $release_sha."
+            else
+              node scripts/prepare-manual-release.mjs "$MANUAL_VERSION"
+              git diff --check
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add -- \
+                .changenotes \
+                CHANGELOG.md \
+                Cargo.lock \
+                Cargo.toml \
+                packages \
+                plugins \
+                tooling/Cargo.lock \
+                tooling/Cargo.toml
+              git commit -m "Release $tag"
+              release_sha="$(git rev-parse HEAD)"
+              manual_branch="manual-release/${tag}"
+              git push --force origin "HEAD:refs/heads/${manual_branch}"
+              existing_manual_pr="$(gh pr list \
                 --repo "$GITHUB_REPOSITORY" \
-                --base main \
+                --state open \
                 --head "$manual_branch" \
-                --title "Release $tag" \
-                --body "Manually generated release commit for $tag. Merging this PR keeps main's Cargo, npm, lockfile, changelog, and changenote state aligned with the published release."
+                --json number \
+                --jq 'length')"
+              if [ "$existing_manual_pr" = 0 ]; then
+                gh pr create \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --base main \
+                  --head "$manual_branch" \
+                  --title "Release $tag" \
+                  --body "Manually generated release commit for $tag. Merging this PR keeps main's Cargo, npm, lockfile, changelog, and changenote state aligned with the published release."
+              fi
             fi
           else
             tag="$(node scripts/release-tag.mjs | tail -n 1)"
