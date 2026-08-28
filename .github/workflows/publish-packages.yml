@@ -331,6 +331,9 @@ jobs:
           name: storage-opfs-package-build
           path: packages/storage-opfs/dist
 
+      - name: Restore generated WASM source link
+        run: ln -s ../dist/wasm packages/js-sdk/src/wasm
+
       - name: Test JS SDK package
         working-directory: packages/js-sdk
         run: |
