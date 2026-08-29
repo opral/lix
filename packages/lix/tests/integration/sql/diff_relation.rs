@@ -449,6 +449,43 @@ simulation_test!(
 );
 
 simulation_test!(
+    working_diff_remains_available_after_interval_local_add_then_delete,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) VALUES \
+                 ('87851c4d-9308-46af-9046-5aa5351250fd', '/net-zero.md', CAST('temporary' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+        session
+            .execute(
+                "DELETE FROM lix_file WHERE id = '87851c4d-9308-46af-9046-5aa5351250fd'",
+                &[],
+            )
+            .await
+            .expect("file delete should succeed");
+
+        assert!(
+            select_rows(
+                &session,
+                "SELECT id, diff_type FROM lix_working_diff('lix_file')",
+            )
+            .await
+            .is_empty(),
+            "net-zero file churn must not appear in working review",
+        );
+    }
+);
+
+simulation_test!(
     relation_diff_tracks_directory_descriptor_add_rename_and_remove,
     |sim| async move {
         let engine = sim.boot_engine().await;
