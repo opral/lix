@@ -7,7 +7,10 @@ use crate::columnar_row_group::{RowGroupRowLocation, RowGroupSetId};
 
 pub(crate) const ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY: &str =
     "lix.row_columnar.lossless_snapshot.v1";
-pub(crate) const ROW_COLUMNAR_ROW_PK_FIELD: &str = "lixcol_row_pk";
+// Persisted in immutable v1 row-group manifests. This is a private physical
+// field name, not a column in any SQL surface, and cannot be renamed without a
+// storage-format migration.
+pub(crate) const ROW_COLUMNAR_IDENTITY_FIELD: &str = "lixcol_row_pk";
 
 pub(crate) fn row_identity_column_index(
     manifest: &crate::columnar_row_group::RowGroupManifest,
@@ -19,7 +22,7 @@ pub(crate) fn row_identity_column_index(
         == Some("true"))
     .then(|| manifest.fields.len().checked_sub(1))
     .flatten()
-    .filter(|&index| manifest.fields[index].name == ROW_COLUMNAR_ROW_PK_FIELD)
+    .filter(|&index| manifest.fields[index].name == ROW_COLUMNAR_IDENTITY_FIELD)
 }
 
 pub(crate) struct RowColumnarWriteSets {

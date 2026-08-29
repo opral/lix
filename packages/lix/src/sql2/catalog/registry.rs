@@ -449,7 +449,6 @@ fn filesystem_schema(include_data: bool) -> SchemaRef {
         ]
     };
     fields.extend([
-        json_field("lixcol_row_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
@@ -580,7 +579,6 @@ fn row_hidden_columns(spec: &SchemaSurfaceSpec) -> Vec<PublicColumn> {
 
 fn filesystem_system_columns() -> Vec<PublicColumn> {
     vec![
-        PublicColumn::hidden("lixcol_row_pk", false),
         PublicColumn::hidden("lixcol_schema_key", false),
         PublicColumn::hidden("lixcol_file_id", true),
         PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
@@ -595,9 +593,7 @@ fn filesystem_system_columns() -> Vec<PublicColumn> {
 
 fn row_system_columns(_spec: &SchemaSurfaceSpec, variant: SchemaSurfaceShape) -> Vec<PublicColumn> {
     debug_assert_ne!(variant, SchemaSurfaceShape::History);
-    let row_pk = PublicColumn::hidden("lixcol_row_pk", false);
     vec![
-        row_pk,
         PublicColumn::public_read_only("lixcol_schema_key", false),
         PublicColumn::public_insert_only("lixcol_file_id", true).optional_on_insert(),
         PublicColumn::public("lixcol_metadata", true).optional_on_insert(),

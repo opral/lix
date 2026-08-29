@@ -112,7 +112,7 @@ pub(crate) use row_batch::{CurrentRowSnapshotReader, RowSnapshotReader};
 pub(crate) use row_columnar_layout::{
     EncodedRowGroups, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
     ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
-    ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, ROW_COLUMNAR_ROW_PK_FIELD, RowColumnarRowRef,
+    ROW_COLUMNAR_IDENTITY_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, RowColumnarRowRef,
     RowGroupLocations, encode_registered_row_groups, encode_unclustered_registered_row_groups,
 };
 pub(crate) use row_projection::RowProjectionDecoder;

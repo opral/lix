@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 #[cfg(test)]
 use datafusion::arrow::array::Array;
 use datafusion::arrow::array::{
@@ -61,7 +62,7 @@ use super::spec::{
     row_source, scan_row_source, take_record_batch_rows,
 };
 use super::values::{
-    optional_bool_value, optional_string_value, required_string_value, string_expr_literal,
+    optional_bool_value, optional_string_value, string_expr_literal,
 };
 
 /// Executes the already-proved unique registered-schema point shape without
@@ -350,17 +351,12 @@ impl SchemaSpec {
         batch: &RecordBatch,
         row_index: usize,
     ) -> Result<RowReturningKey> {
-        let row_pk = RowPk::from_json_array_text(&required_string_value(
+        let row_pk = row_pk_from_primary_key_columns(
             batch,
             row_index,
-            "lixcol_row_pk",
-            "UPDATE schema surface RETURNING",
-        )?)
-        .map_err(|error| {
-            DataFusionError::Execution(format!(
-                "UPDATE schema surface RETURNING has invalid lixcol_row_pk: {error}"
-            ))
-        })?;
+            &self.spec,
+            SchemaRowIdentityUse::UpdateReturning,
+        )?;
         let branch_id = String::new();
         Ok(RowReturningKey { row_pk, branch_id })
     }
@@ -967,7 +963,7 @@ async fn row_columnar_scan_source(
         .fields
         .iter()
         .position(|field| {
-            field.name == crate::sql2::ROW_COLUMNAR_ROW_PK_FIELD
+            field.name == crate::sql2::ROW_COLUMNAR_IDENTITY_FIELD
                 && field.data_type.to_arrow() == datafusion::arrow::datatypes::DataType::Utf8
         })
         .ok_or_else(|| {
@@ -1568,6 +1564,85 @@ fn contains_like_filter(expr: &Expr) -> bool {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SchemaRowIdentityUse {
+    Delete,
+    Update,
+    UpdateReturning,
+}
+
+impl SchemaRowIdentityUse {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Delete => "DELETE FROM schema surface",
+            Self::Update => "UPDATE schema surface",
+            Self::UpdateReturning => "UPDATE schema surface RETURNING",
+        }
+    }
+}
+
+fn row_pk_from_primary_key_columns(
+    batch: &RecordBatch,
+    row_index: usize,
+    spec: &SchemaSurfaceSpec,
+    purpose: SchemaRowIdentityUse,
+) -> Result<RowPk> {
+    let purpose = purpose.label();
+    let parts = spec
+        .primary_key_paths
+        .iter()
+        .zip(&spec.primary_key_component_types)
+        .map(|(path, component_type)| {
+            let [column_name] = path.as_slice() else {
+                return Err(DataFusionError::Execution(format!(
+                    "{purpose} cannot derive a row identity from a nested primary-key path"
+                )));
+            };
+            let column_index = batch.schema().index_of(column_name).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "{purpose} is missing primary-key column '{column_name}'"
+                ))
+            })?;
+            let value = ScalarValue::try_from_array(batch.column(column_index).as_ref(), row_index)
+                .map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "{purpose} failed to decode primary-key column '{column_name}': {error}"
+                    ))
+                })?;
+            match (component_type, value) {
+                (
+                    crate::row_pk::RowPkComponentType::String
+                    | crate::row_pk::RowPkComponentType::Uuid,
+                    ScalarValue::Utf8(Some(value))
+                    | ScalarValue::LargeUtf8(Some(value))
+                    | ScalarValue::Utf8View(Some(value)),
+                ) => Ok(value),
+                (
+                    crate::row_pk::RowPkComponentType::Integer,
+                    ScalarValue::Int64(Some(value)),
+                ) => {
+                    Ok(value.to_string())
+                }
+                (
+                    crate::row_pk::RowPkComponentType::Bytes,
+                    ScalarValue::Binary(Some(value))
+                    | ScalarValue::LargeBinary(Some(value))
+                    | ScalarValue::BinaryView(Some(value)),
+                ) => Ok(base64::engine::general_purpose::STANDARD.encode(value)),
+                (_, value) => Err(DataFusionError::Execution(format!(
+                    "{purpose} primary-key column '{column_name}' has invalid value {value:?}"
+                ))),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RowPk::from_external_parts(parts, &spec.primary_key_component_types).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "{purpose} failed to derive row identity for schema '{}': {error}",
+            spec.schema_key
+        ))
+    })
+}
+
 fn row_delete_stage_rows_from_batch(
     batch: &RecordBatch,
     spec: &SchemaSurfaceSpec,
@@ -1590,17 +1665,12 @@ fn row_delete_stage_rows_from_batch(
                 .expect("active row surface has an active branch")
                 .to_owned()
         };
-        let row_pk = RowPk::from_json_array_text(&required_string_value(
+        let row_pk = row_pk_from_primary_key_columns(
             batch,
             row_index,
-            "lixcol_row_pk",
-            "DELETE FROM schema surface",
-        )?)
-        .map_err(|error| {
-            DataFusionError::Execution(format!(
-                "DELETE FROM schema surface has invalid lixcol_row_pk: {error}"
-            ))
-        })?;
+            spec,
+            SchemaRowIdentityUse::Delete,
+        )?;
         let metadata = optional_string_value(
             batch,
             row_index,
@@ -1670,17 +1740,12 @@ fn row_update_stage_rows_from_batch(
                 .expect("active row surface has an active branch")
                 .to_owned()
         };
-        let row_pk = RowPk::from_json_array_text(&required_string_value(
+        let row_pk = row_pk_from_primary_key_columns(
             batch,
             row_index,
-            "lixcol_row_pk",
-            "UPDATE schema surface",
-        )?)
-        .map_err(|error| {
-            DataFusionError::Execution(format!(
-                "UPDATE schema surface has invalid lixcol_row_pk: {error}"
-            ))
-        })?;
+            spec,
+            SchemaRowIdentityUse::Update,
+        )?;
         let snapshot_content = update_snapshots
             .get(&RowUpdateSnapshotKey {
                 row_pk: row_pk.clone(),
@@ -3287,18 +3352,6 @@ fn row_pk_constraint_from_in_list_filter(
         return None;
     }
     match column.name.as_str() {
-        "lixcol_row_pk" => in_list
-            .list
-            .iter()
-            .map(string_expr_literal)
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .map(|value| {
-                let parts = RowPk::from_json_array_text(&value).ok()?.into_parts();
-                RowPk::from_external_parts(parts, component_types).ok()
-            })
-            .collect::<Option<BTreeSet<_>>>()
-            .map(RowPkConstraint::Full),
         column_name if primary_key_columns.contains(&column_name) => {
             let component_type =
                 primary_key_component_type(column_name, primary_key_columns, component_types)?;
@@ -3326,12 +3379,6 @@ fn row_pk_constraint_from_column_literal_filter(
         return None;
     };
     match column.name.as_str() {
-        "lixcol_row_pk" => RowPk::from_json_array_text(&string_expr_literal(literal_expr)?)
-            .ok()
-            .and_then(|identity| {
-                RowPk::from_external_parts(identity.into_parts(), component_types).ok()
-            })
-            .map(|identity| RowPkConstraint::Full(BTreeSet::from([identity]))),
         column_name if primary_key_columns.contains(&column_name) => {
             let component_type =
                 primary_key_component_type(column_name, primary_key_columns, component_types)?;
@@ -4128,12 +4175,6 @@ fn row_system_column_array(
 ) -> Result<ArrayRef> {
     #[expect(trivial_casts)]
     let array = match column_name {
-        "row_pk" => Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.row_pk().as_json_array_text().map(Some))
-                .collect::<std::result::Result<Vec<_>, LixError>>()
-                .map_err(lix_error_to_datafusion_error)?,
-        )) as ArrayRef,
         "schema_key" => Arc::new(StringArray::from_iter(
             rows.iter().map(|row| Some(row.schema_key())),
         )) as ArrayRef,
@@ -4669,7 +4710,7 @@ mod tests {
     #[test]
     fn direct_row_batch_accepts_exact_payload_reads() {
         let payload_schema = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
-        let system_schema = Schema::new(vec![Field::new("lixcol_row_pk", DataType::Utf8, true)]);
+        let system_schema = Schema::new(vec![Field::new("lixcol_metadata", DataType::Utf8, true)]);
         let mut request = HotStateScanRequest::default();
         assert!(super::direct_row_batch_eligible(
             &payload_schema,
@@ -5238,7 +5279,7 @@ mod tests {
             spec.visible_column("meta").map(|column| column.column_type),
             Some(SchemaColumnType::Jsonb)
         );
-        assert!(spec.visible_column("lixcol_row_pk").is_none());
+        assert!(spec.visible_column("lixcol_metadata").is_none());
     }
 
     #[test]
@@ -5272,8 +5313,25 @@ mod tests {
         .expect("schema should derive schema surface spec");
 
         let schema = schema_surface_schema(&spec, SchemaSurfaceShape::Active);
-        assert!(schema.field_with_name("body").is_ok());
-        assert!(schema.field_with_name("lixcol_row_pk").is_ok());
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "body",
+                "lixcol_schema_key",
+                "lixcol_file_id",
+                "lixcol_metadata",
+                "lixcol_created_at",
+                "lixcol_updated_at",
+                "lixcol_global",
+                "lixcol_change_id",
+                "lixcol_commit_id",
+                "lixcol_untracked",
+            ]
+        );
         assert!(schema.field_with_name("lixcol_branch_id").is_err());
     }
 
@@ -5297,13 +5355,6 @@ mod tests {
                 .expect("id field")
                 .is_nullable(),
             "read nullability must not encode that INSERT may omit a defaulted id"
-        );
-        assert!(
-            schema
-                .field_with_name("lixcol_row_pk")
-                .expect("row pk field")
-                .is_nullable(),
-            "opaque identity projection should be nullable for normal primary-key inserts"
         );
     }
 
@@ -5365,16 +5416,6 @@ mod tests {
                 .expect("count is i64")
                 .value(0),
             7
-        );
-        assert_eq!(
-            batch
-                .column_by_name("lixcol_row_pk")
-                .expect("row pk column")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("row pk is string")
-                .value(0),
-            "[\"row-1\"]"
         );
     }
 
@@ -5560,7 +5601,6 @@ mod tests {
 
         for field in [
             "lixcol_metadata",
-            "lixcol_row_pk",
             "lixcol_file_id",
             "lixcol_global",
             "lixcol_untracked",
@@ -6126,11 +6166,11 @@ mod tests {
             "branch-a".to_string(),
             None,
         );
-        let row_pk_index = provider
+        let identity_index = provider
             .schema
-            .index_of("lixcol_row_pk")
-            .expect("system row-pk column should exist");
-        let projection = vec![row_pk_index];
+            .index_of("id")
+            .expect("declared primary-key column should exist");
+        let projection = vec![identity_index];
 
         let (_schema, request, row_filters) = provider
             .plan_scan_parts(Some(&projection), &[eq_filter("kind", "todo")], Some(5))
@@ -6176,11 +6216,11 @@ mod tests {
             "branch-a".to_string(),
             None,
         );
-        let row_pk_index = provider
+        let identity_index = provider
             .schema
-            .index_of("lixcol_row_pk")
-            .expect("system row-pk column should exist");
-        let projection = vec![row_pk_index];
+            .index_of("id")
+            .expect("declared primary-key column should exist");
+        let projection = vec![identity_index];
         let range_filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(column("score")),
             Operator::Gt,
@@ -6215,11 +6255,11 @@ mod tests {
             "branch-a".to_string(),
             None,
         );
-        let row_pk_index = provider
+        let identity_index = provider
             .schema
-            .index_of("lixcol_row_pk")
-            .expect("system row-pk column should exist");
-        let projection = vec![row_pk_index];
+            .index_of("id")
+            .expect("declared primary-key column should exist");
+        let projection = vec![identity_index];
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(column("count")),
             Operator::Eq,
@@ -6601,7 +6641,7 @@ mod tests {
         ]));
         let physical_schema = Arc::new(Schema::new(vec![
             Field::new(
-                crate::sql2::ROW_COLUMNAR_ROW_PK_FIELD,
+                crate::sql2::ROW_COLUMNAR_IDENTITY_FIELD,
                 DataType::Utf8,
                 false,
             ),

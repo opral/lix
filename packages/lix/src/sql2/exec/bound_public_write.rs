@@ -3560,7 +3560,7 @@ fn returning_expr_column_type(
     }
     match expr {
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => match column.name.as_str() {
-            "lixcol_row_pk" | "lixcol_metadata" => Some(crate::ResultColumnType::Jsonb),
+            "lixcol_metadata" => Some(crate::ResultColumnType::Jsonb),
             "lixcol_global" | "lixcol_untracked" => Some(crate::ResultColumnType::Boolean),
             "lixcol_schema_key" | "lixcol_file_id" | "lixcol_created_at"
             | "lixcol_updated_at" | "lixcol_change_id" | "lixcol_commit_id" => {
@@ -4322,7 +4322,6 @@ enum InsertColumnTarget {
         column_type: SchemaColumnType,
         read_nullable: bool,
     },
-    RowPk,
     FileId,
     Metadata,
     Global,
@@ -4352,7 +4351,6 @@ impl InsertRowLayout {
                     });
                 }
                 Ok(match column.name.as_str() {
-                    "lixcol_row_pk" => InsertColumnTarget::RowPk,
                     "lixcol_file_id" => InsertColumnTarget::FileId,
                     "lixcol_metadata" => InsertColumnTarget::Metadata,
                     "lixcol_global" => InsertColumnTarget::Global,
@@ -5357,7 +5355,6 @@ fn certified_row_insert_rows<'a>(
                 ));
             }
 
-            let mut explicit_row_pk = None;
             let mut file_id = None;
             let mut metadata = None;
             let mut global = None;
@@ -5423,9 +5420,6 @@ fn certified_row_insert_rows<'a>(
                     InsertColumnTarget::Visible { .. } => {
                         unreachable!("visible columns handled above")
                     }
-                    InsertColumnTarget::RowPk => {
-                        explicit_row_pk = Some(row_pk_from_value(&value, "lixcol_row_pk")?);
-                    }
                     InsertColumnTarget::FileId => {
                         file_id = text_value(value, "lixcol_file_id")?;
                     }
@@ -5471,22 +5465,7 @@ fn certified_row_insert_rows<'a>(
                     ),
                 )
             })?;
-            let explicit_row_pk_parts = explicit_row_pk
-                .as_ref()
-                .map(|explicit| explicit.clone().into_parts());
             let derived_row_pk_parts = derived_row_pk.clone().into_parts();
-            if explicit_row_pk_parts
-                .as_ref()
-                .is_some_and(|explicit| explicit != &derived_row_pk_parts)
-            {
-                return Err(LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    format!(
-                        "INSERT into {} has an internal identity that does not match its public primary-key columns",
-                        layout.schema_key
-                    ),
-                ));
-            }
 
             let start = normalized.len();
             normalized.push(b'{');
@@ -5709,9 +5688,6 @@ fn append_row_insert_row(
         let value = eval_value.into_json();
         match target {
             InsertColumnTarget::Visible { .. } => unreachable!("visible columns handled above"),
-            InsertColumnTarget::RowPk => {
-                row_pk = Some(row_pk_from_value(&value, "lixcol_row_pk")?);
-            }
             InsertColumnTarget::FileId => {
                 file_id = text_value(value, "lixcol_file_id")?;
             }
@@ -5760,17 +5736,6 @@ fn append_row_insert_row(
         };
         let (derived_row_pk, typed) =
             finalize_typed_row_with_plan(&layout.schema_key, native_schema_plan, typed)?;
-        if row_pk.as_ref().is_some_and(|explicit_row_pk| {
-            explicit_row_pk.clone().into_parts() != derived_row_pk.clone().into_parts()
-        }) {
-            return Err(LixError::new(
-                LixError::CODE_SCHEMA_VALIDATION,
-                format!(
-                    "INSERT into {} has an internal identity that does not match its public primary-key columns",
-                    layout.schema_key
-                ),
-            ));
-        }
         let global = global.unwrap_or(false);
         let branch_id = row_branch_id(plan, global)?;
         rows.push_typed_parts(
@@ -5813,17 +5778,6 @@ fn append_row_insert_row(
                 ),
             )
         })?;
-        if row_pk.as_ref().is_some_and(|explicit_row_pk| {
-            explicit_row_pk.clone().into_parts() != derived_row_pk.clone().into_parts()
-        }) {
-            return Err(LixError::new(
-                LixError::CODE_SCHEMA_VALIDATION,
-                format!(
-                    "INSERT into {} has an internal identity that does not match its public primary-key columns",
-                    layout.schema_key
-                ),
-            ));
-        }
         row_pk = Some(derived_row_pk);
     }
     let global = global.unwrap_or(false);
@@ -6012,13 +5966,6 @@ enum RowEvalRowRef<'a> {
 }
 
 impl<'a> RowEvalRowRef<'a> {
-    fn row_pk(self) -> Option<&'a RowPk> {
-        match self {
-            Self::Live(row) => Some(row.row_pk()),
-            Self::Staged(row) => row.row_pk,
-        }
-    }
-
     fn schema_key(self) -> &'a str {
         match self {
             Self::Live(row) => row.schema_key(),
@@ -6900,7 +6847,7 @@ fn is_identity_json_expr(expr: &BoundExpr) -> bool {
     matches!(
         expr,
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)
-            if matches!(column.name.as_str(), "row_pk" | "lixcol_row_pk")
+            if column.name == "row_pk"
     )
 }
 
@@ -6918,7 +6865,7 @@ fn bound_expr_is_json(expr: &BoundExpr, spec: &SchemaSurfaceSpec) -> bool {
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => {
             spec.visible_column(&column.name)
                 .is_some_and(|column| column.column_type == SchemaColumnType::Jsonb)
-                || matches!(column.name.as_str(), "lixcol_row_pk" | "lixcol_metadata")
+                || column.name == "lixcol_metadata"
         }
         BoundExpr::Literal(BoundLiteral::Json(_)) => true,
         BoundExpr::Function { name, .. } => matches!(
@@ -7589,15 +7536,6 @@ fn column_eval_value(
         return Ok(RowEvalValue::SqlNull);
     };
     match column_name {
-        "lixcol_row_pk" => row
-            .row_pk()
-            .map(RowPk::as_json_array_value)
-            .transpose()
-            .map(|value| {
-                value
-                    .map(RowEvalValue::Json)
-                    .unwrap_or(RowEvalValue::SqlNull)
-            }),
         "lixcol_schema_key" => Ok(RowEvalValue::Json(JsonValue::String(
             row.schema_key().to_string(),
         ))),
@@ -7672,11 +7610,6 @@ fn excluded_column_eval_value(
         return Ok(RowEvalValue::SqlNull);
     };
     match column_name {
-        "lixcol_row_pk" => row
-            .row_pk
-            .map(|row_pk| row_pk.as_json_array_value().map(RowEvalValue::Json))
-            .transpose()
-            .map(|value| value.unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_schema_key" => Ok(RowEvalValue::Json(JsonValue::String(
             row.schema_key.to_string(),
         ))),
@@ -7811,23 +7744,6 @@ fn bool_value(value: JsonValue, column_name: &str) -> Result<Option<bool>, LixEr
             LixError::CODE_TYPE_MISMATCH,
             format!("row write expected boolean column '{column_name}', got {other}"),
         )),
-    }
-}
-
-fn row_pk_from_value(value: &JsonValue, column_name: &str) -> Result<RowPk, LixError> {
-    match value {
-        JsonValue::String(value) => RowPk::from_json_array_text(value).map_err(|error| {
-            LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("row write has invalid {column_name}: {error}"),
-            )
-        }),
-        value => RowPk::from_json_array_value(value).map_err(|error| {
-            LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("row write has invalid {column_name}: {error}"),
-            )
-        }),
     }
 }
 

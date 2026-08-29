@@ -247,13 +247,11 @@ simulation_test!(state_at_matches_live_columns_and_unchanged_row_metadata, |sim|
         )
         .await
         .expect("historical wildcard should load");
-    assert!(
-        historical_star
-            .columns()
-            .iter()
-            .all(|column| column != "lixcol_row_pk"),
-        "lix_state_at must not expose the durable JSON row key"
-    );
+    let current_star = session
+        .execute("SELECT * FROM lix_key_value WHERE key = 'stable'", &[])
+        .await
+        .expect("current wildcard should load");
+    assert_eq!(historical_star.columns(), current_star.columns());
 });
 
 simulation_test!(state_at_omits_deleted_and_untracked_rows, |sim| async move {

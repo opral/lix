@@ -218,9 +218,7 @@ impl DiffRelation {
         }
         fields.push(Field::new("diff_type", DataType::Utf8, false));
         for column in surface.columns.iter().filter(|column| {
-            column.is_public()
-                && column.name != "lixcol_row_pk"
-                && !primary_key_columns.contains(&column.name)
+            column.is_public() && !primary_key_columns.contains(&column.name)
         }) {
             let field = source_schema
                 .field_with_name(&column.name)
@@ -542,7 +540,7 @@ impl DiffRoute {
                 .any(|(_, column)| {
                     !matches!(
                         column,
-                        "id" | "lixcol_row_pk"
+                        "id"
                             | "lixcol_schema_key"
                             | "lixcol_file_id"
                             | "lixcol_created_at"
@@ -597,7 +595,6 @@ struct DiffSide {
     schema_key: String,
     global: bool,
     file_id: Option<String>,
-    row_pk: RowPk,
     created_at: String,
     updated_at: String,
     change_id: String,
@@ -1011,7 +1008,6 @@ fn diff_side(
             row_pk: entry.identity.row_pk().clone(),
         }),
         file_id: entry.identity.file_id().map(str::to_string),
-        row_pk: entry.identity.row_pk().clone(),
         created_at: row.created_at.to_string(),
         updated_at: row.updated_at.to_string(),
         change_id: row.change_id.to_string(),
@@ -1104,7 +1100,7 @@ where
         .any(|(_, column)| {
             !matches!(
                 column,
-                "id" | "lixcol_row_pk"
+                "id"
                     | "lixcol_schema_key"
                     | "lixcol_file_id"
                     | "lixcol_created_at"
@@ -1350,7 +1346,6 @@ fn materialized_side(
         schema_key: row.schema_key().to_string(),
         global: row.schema_key() == crate::checkpoint::CHECKPOINT_SCHEMA_KEY,
         file_id: row.file_id().map(str::to_string),
-        row_pk: row.row_pk().clone(),
         created_at: row.created_at().to_string(),
         updated_at: row.updated_at().to_string(),
         change_id: row.change_id().to_string(),
@@ -1593,12 +1588,6 @@ fn side_value(side: Option<&DiffSide>, column: &str) -> Result<Option<lix_schema
     Ok(match column {
         "id" => side.id.clone().map(lix_schema::Value::Text),
         "path" => side.path.clone().map(lix_schema::Value::Text),
-        "lixcol_row_pk" => Some(lix_schema::Value::Jsonb(
-            side.row_pk
-                .as_json_array_value()
-                .map_err(lix_error_to_datafusion_error)?
-                .into(),
-        )),
         "lixcol_schema_key" => Some(lix_schema::Value::Text(side.schema_key.clone())),
         "lixcol_file_id" => side.file_id.clone().map(lix_schema::Value::Text),
         "lixcol_created_at" => Some(lix_schema::Value::Text(side.created_at.clone())),
@@ -1725,7 +1714,6 @@ mod tests {
         assert!(field_is_row_ref(
             relation.schema.field_with_name("row_ref").unwrap()
         ));
-        assert!(!names.contains(&"lixcol_row_pk"));
         assert!(!names.contains(&"from_key"));
         assert!(!names.contains(&"to_key"));
         assert_eq!(names.last(), Some(&"row_count"));

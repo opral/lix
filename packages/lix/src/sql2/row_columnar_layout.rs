@@ -29,7 +29,7 @@ pub(crate) const ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
 pub(crate) const ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
     "lix.row_columnar.base_coordinates.v1";
 pub(crate) use crate::hot_state::{
-    ROW_COLUMNAR_ROW_PK_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
+    ROW_COLUMNAR_IDENTITY_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
 };
 pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
 const LOW_CARDINALITY_CLUSTER_MAX_BUCKETS: usize = 8;
@@ -204,7 +204,7 @@ pub(crate) fn encode_unclustered_registered_row_groups(
 
     let mut fields = row_visible_fields(spec);
     fields.push(Field::new(
-        ROW_COLUMNAR_ROW_PK_FIELD,
+        ROW_COLUMNAR_IDENTITY_FIELD,
         DataType::Utf8,
         false,
     ));
@@ -241,7 +241,7 @@ where
 {
     let mut fields = row_visible_fields(spec);
     fields.push(Field::new(
-        ROW_COLUMNAR_ROW_PK_FIELD,
+        ROW_COLUMNAR_IDENTITY_FIELD,
         DataType::Utf8,
         false,
     ));
@@ -484,7 +484,7 @@ mod tests {
             .manifest
             .fields
             .iter()
-            .position(|field| field.name == ROW_COLUMNAR_ROW_PK_FIELD)
+            .position(|field| field.name == ROW_COLUMNAR_IDENTITY_FIELD)
             .expect("hidden identity field");
         assert_eq!(
             encoded.manifest.fields[identity_index].data_type.to_arrow(),
@@ -695,7 +695,7 @@ mod tests {
             .manifest
             .fields
             .iter()
-            .position(|field| field.name == ROW_COLUMNAR_ROW_PK_FIELD)
+            .position(|field| field.name == ROW_COLUMNAR_IDENTITY_FIELD)
             .expect("hidden identity field");
 
         assert_eq!(encoded.input_locations.len(), identities.len());
