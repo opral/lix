@@ -3,6 +3,13 @@
 FROM rust:1.93-bookworm AS builder
 WORKDIR /app
 
+# The repository Cargo configuration selects mold for Linux builds. Keep the
+# container builder aligned with CI so release builds have the configured
+# linker available.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends mold \
+    && rm -rf /var/lib/apt/lists/*
+
 # The build context is the Lix repository root. The reference server links the
 # exact protocol and SlateDB implementation from the same revision.
 COPY . .
