@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "packages/server",
   "packages/collaboration-test-support",
   "packages/js-sdk",
   "packages/lix",

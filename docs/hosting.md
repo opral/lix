@@ -69,9 +69,27 @@ locally. See [Collaboration and Sync](./collaboration-and-sync.md).
 ## Host it yourself
 
 Companies that must keep repositories on their own infrastructure can run their
-own host. The `lix` crate contains the server implementation, so a host does not
-implement the protocol. It provides HTTP and authentication and forwards
-requests.
+own host. There are three interoperable approaches:
+
+1. Deploy the ready-made [Lix reference server](../packages/server/README.md)
+   behind your authentication gateway.
+2. Embed the `lix` crate's protocol handler in a custom Rust host.
+3. Implement the documented Lix Server Protocol independently in another
+   language or architecture.
+
+The reference server is a supported example, not the protocol authority. Every
+compatible implementation exposes the same wire contract to clients.
+
+### Deploy the reference server
+
+The reference server uses SlateDB and S3-compatible object storage and is
+published as `ghcr.io/opral/lix-server`. It provides runtime pooling, caching,
+stream leases, timeouts, and graceful recovery. Authentication, authorization,
+and resource-existence policy remain the responsibility of a trusted gateway.
+See its [README](../packages/server/README.md) for configuration and security
+requirements.
+
+### Embed the Rust handler
 
 Enable the feature:
 

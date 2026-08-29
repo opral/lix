@@ -21,8 +21,10 @@ client works against it unchanged. Point a client at a different server and
 nothing in the client changes but the connection URL. The OpenAPI document plus
 the normative behavior below is the complete per-Lix contract.
 
-The `lix` crate contains the reference implementation, so a server provides HTTP
-and authentication and forwards requests to it. See [Hosting](./hosting.md).
+The `lix` crate contains a reusable Rust handler and this repository ships a
+[reference server](../packages/server/README.md). A host can run or customize
+that server, embed the Rust handler, or independently implement the same wire
+contract in another language. See [Hosting](./hosting.md).
 
 ## Surface
 
@@ -135,6 +137,8 @@ The machine-readable surface is
 
 Behavior that OpenAPI cannot express — session pinning, transaction ownership,
 idempotency replay, observation ordering, and terminal storage semantics — is
-normative in the reference implementation and its tests.
+specified by the behavioral requirements in this documentation. The Rust
+implementation and its tests demonstrate those requirements; they do not make
+the implementation itself part of the protocol.
 
 To run a server, see [Hosting](./hosting.md).

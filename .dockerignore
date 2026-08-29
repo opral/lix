@@ -1,0 +1,14 @@
+.git
+**/.env
+**/.env.*
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.pem
+**/node_modules
+**/target
+**/.turbo
+**/.wrangler
+**/.dev.vars
+packages/js-sdk/npm
+packages/js-sdk/lix-js-sdk-*
