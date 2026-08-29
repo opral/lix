@@ -15,7 +15,7 @@ pub(crate) mod visibility;
 /// below both state planes; this facade only exists so the move did not have to
 /// touch every call site at once and can be dropped as those are migrated.
 pub(crate) use crate::row_columnar::{
-    ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, ROW_COLUMNAR_ROW_PK_FIELD, RowColumnarWriteSets,
+    ROW_COLUMNAR_IDENTITY_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, RowColumnarWriteSets,
     row_group_set_id,
 };
 #[allow(unused_imports)]

@@ -4026,7 +4026,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
-            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_row_pk")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_schema_key")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_change_id")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_created_at")?;
@@ -4678,12 +4677,6 @@ fn lix_file_record_batch_from_path_selection(
             "content" => Arc::new(LargeBinaryArray::from(
                 entries.iter().map(|_| Some(&[][..])).collect::<Vec<_>>(),
             )),
-            "lixcol_row_pk" => Arc::new(StringArray::from(
-                entries
-                    .iter()
-                    .map(|entry| file_id_row_pk(entry.id())?.as_json_array_text().map(Some))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
             "lixcol_schema_key" => {
                 Arc::new(StringArray::from(vec![
                     Some(FILE_DESCRIPTOR_SCHEMA_KEY);
@@ -4762,7 +4755,6 @@ struct LixFileRecordBatchRow {
     directory_id: Option<String>,
     name: String,
     data: Option<Vec<u8>>,
-    row_pk: String,
     file_id: Option<String>,
     global: bool,
     change_id: Option<String>,
@@ -4780,7 +4772,6 @@ struct LixFileRecordBatchColumns {
     directory_ids: Vec<Option<String>>,
     names: Vec<Option<String>>,
     data_values: Vec<Option<Vec<u8>>>,
-    row_pks: Vec<Option<String>>,
     schema_keys: Vec<Option<String>>,
     file_ids: Vec<Option<String>>,
     globals: Vec<Option<bool>>,
@@ -4799,7 +4790,6 @@ impl LixFileRecordBatchColumns {
         self.directory_ids.push(row.directory_id);
         self.names.push(Some(row.name));
         self.data_values.push(row.data);
-        self.row_pks.push(Some(row.row_pk));
         self.schema_keys
             .push(Some(FILE_DESCRIPTOR_SCHEMA_KEY.to_string()));
         self.file_ids.push(row.file_id);
@@ -4820,7 +4810,6 @@ impl LixFileRecordBatchColumns {
             directory_ids,
             names,
             data_values,
-            row_pks,
             schema_keys,
             file_ids,
             globals,
@@ -4841,7 +4830,6 @@ impl LixFileRecordBatchColumns {
                 .map(|value| value.as_deref())
                 .collect::<Vec<_>>(),
         ));
-        let row_pks: ArrayRef = Arc::new(StringArray::from(row_pks));
         let schema_keys: ArrayRef = Arc::new(StringArray::from(schema_keys));
         let file_ids: ArrayRef = Arc::new(StringArray::from(file_ids));
         let globals: ArrayRef = Arc::new(BooleanArray::from(globals));
@@ -4860,7 +4848,6 @@ impl LixFileRecordBatchColumns {
                 "directory_id" => Arc::clone(&directory_ids),
                 "name" => Arc::clone(&names),
                 "content" => Arc::clone(&data_values),
-                "lixcol_row_pk" => Arc::clone(&row_pks),
                 "lixcol_schema_key" => Arc::clone(&schema_keys),
                 "lixcol_file_id" => Arc::clone(&file_ids),
                 "lixcol_global" => Arc::clone(&globals),
@@ -4975,7 +4962,6 @@ async fn lix_file_record_batch_from_prepared(
             directory_id,
             name,
             data,
-            row_pk: live.row_pk().as_json_array_text()?,
             file_id: live.file_id().map(str::to_owned),
             global: live.global(),
             change_id: projected_change_id.map(|id| id.to_string()),
@@ -6878,7 +6864,6 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
         Field::new("content", DataType::LargeBinary, false),
-        json_field("lixcol_row_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
@@ -7538,7 +7523,6 @@ mod tests {
             "path",
             "directory_id",
             "name",
-            "lixcol_row_pk",
             "lixcol_schema_key",
             "lixcol_commit_id",
             "lixcol_metadata",
@@ -7577,10 +7561,6 @@ mod tests {
             "01920000-0000-7000-8000-0000000000d3"
         );
         assert_eq!(string_value("name"), "readme.md");
-        assert_eq!(
-            string_value("lixcol_row_pk"),
-            "[\"01920000-0000-7000-8000-0000000000d2\"]"
-        );
         assert_eq!(
             string_value("lixcol_schema_key"),
             super::FILE_DESCRIPTOR_SCHEMA_KEY

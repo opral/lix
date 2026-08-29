@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
 use datafusion::common::{DataFusionError, Result};
@@ -159,20 +159,6 @@ where
                 "lix_state_at does not support relation '{relation_name}'"
             ))
         })?;
-        // Historical relation state has the same typed relation columns as the
-        // live surface. The durable JSON row key is an engine implementation
-        // detail, however, and must not reappear through this table function.
-        // Callers can construct a universal address from the typed key columns
-        // with `lix_row_ref(relation, ...)` when they need one.
-        let schema = Arc::new(Schema::new_with_metadata(
-            schema
-                .fields()
-                .iter()
-                .filter(|field| field.name() != "lixcol_row_pk")
-                .map(|field| field.as_ref().clone())
-                .collect::<Vec<_>>(),
-            schema.metadata().clone(),
-        ));
         let kind = match &surface.kind {
             PublicSurfaceKind::SchemaBase { schema_key } => StateRelationKind::Schema {
                 schema_key: schema_key.clone(),

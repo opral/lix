@@ -2640,7 +2640,7 @@ fn is_identity_json_bound_expr(expr: &BoundExpr) -> bool {
     matches!(
         expr,
         BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)
-            if matches!(column.name.as_str(), "row_pk" | "lixcol_row_pk")
+            if column.name == "row_pk"
     )
 }
 
