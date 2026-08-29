@@ -58,13 +58,27 @@ sync against shallow-history, deep-history, and wider-row fixtures. It asserts:
 Run the focused scorecard with:
 
 ```sh
-LIX_HOT_STATE_PROFILE_OUTPUT=target/hot-state-profile.json \
+LIX_HOT_STATE_PROFILE_OUTPUT="$PWD/target/hot-state-profile.json" \
   cargo +nightly-2026-05-21 -Z bindeps test \
   --manifest-path tooling/Cargo.toml \
   -p lix_e2e --features sdk-tests,server-protocol \
   --test sync_mode certified_hot_state_profile_scorecard \
   -- --ignored --exact --nocapture
 ```
+
+The 2026-08-29 reference run against this implementation passed every
+cardinality, request-count, and allocator-growth assertion:
+
+| Case | Live / dirty / history rows | Bootstrap allocated / peak-live bytes | Working diff allocated / peak-live bytes | History requests from working diff |
+| --- | ---: | ---: | ---: | ---: |
+| Shallow history | 256 / 32 / 2 | 138,251,167 / 11,029,211 | 768,376 / 308,751 | 0 |
+| Deep history | 256 / 32 / 64 | 138,120,058 / 11,008,280 | 768,240 / 308,751 | 0 |
+| Wide rows | 768 / 96 / 2 | 377,900,618 / 28,949,372 | 1,044,303 / 358,014 | 0 |
+
+Shallow and deep history used the same six snapshot-row pulls and four
+topology/history endpoint calls during bootstrap despite a 32x increase in
+cold history depth. Timings and RSS are intentionally omitted from the
+contract because they are machine- and allocator-dependent.
 
 The artifact schema is `lix.certified-hot-state-profile-artifact.v1`. Each case
 records its dimensions, elapsed time, allocation count/bytes, peak live bytes,
