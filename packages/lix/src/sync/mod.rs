@@ -72,17 +72,44 @@ pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-// v2 fences the v77 engine-authoritative built-in schema semantics. Repository
-// format markers are local storage metadata and do not cross the sync wire, so
-// the sync handshake must reject v76 peers explicitly.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 2;
+// v3 adds required authority live-state roots to headed delta ref events. It
+// deliberately hard-cuts v2 peers because they cannot certify an incremental
+// replica publication before advancing its receipt cursor.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 3;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str =
     "LIX_SYNC_REPOSITORY_ID_MISMATCH";
 pub(crate) const SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE: &str =
     "LIX_SYNC_IMMUTABLE_OBJECT_MISMATCH";
+pub(crate) const AUTHORITY_EXECUTION_REQUIRED_CODE: &str =
+    "LIX_AUTHORITY_EXECUTION_REQUIRED";
 const MAX_SYNC_REMOTE_ID_BYTES: usize = 4 * 1024;
+
+pub(crate) fn authority_execution_required(
+    route: crate::sql2::StatementAuthorityRoute,
+) -> LixError {
+    let kind = match route {
+        crate::sql2::StatementAuthorityRoute::HotRead => "hot-read",
+        crate::sql2::StatementAuthorityRoute::AuthorityRead => "history",
+        crate::sql2::StatementAuthorityRoute::AuthorityWrite => "mutation",
+    };
+    LixError::new(
+        AUTHORITY_EXECUTION_REQUIRED_CODE,
+        match route {
+            crate::sql2::StatementAuthorityRoute::HotRead => {
+                "certified hot reads execute on the replica"
+            }
+            crate::sql2::StatementAuthorityRoute::AuthorityRead => {
+                "historical queries execute on the repository authority"
+            }
+            crate::sql2::StatementAuthorityRoute::AuthorityWrite => {
+                "connected replica mutations execute on the repository authority"
+            }
+        },
+    )
+    .with_details(serde_json::json!({ "executionKind": kind }))
+}
 
 pub(crate) fn sync_server_protocol_mismatch(server_version: Option<u32>) -> LixError {
     let server = server_version
