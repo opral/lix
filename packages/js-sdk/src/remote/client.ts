@@ -1,4 +1,4 @@
-import type { LixBinding } from "../binding-types.js";
+import type { LixBinding, SnapshotExportBinding } from "../binding-types.js";
 import { initializeBrowserWasm } from "../browser-wasm-init.js";
 import type { RemoteLixServerOptions } from "../types.js";
 
@@ -67,14 +67,118 @@ export async function openRemoteLixBinding(
 	) {
 		throw new TypeError("initialActiveBranchId must be a non-empty string");
 	}
-	const protocolLocator = connectionUrl(options.url).toString();
+	const locator = connectionUrl(options.url);
+	const protocolLocator = locator.toString();
 	await initializeWasm();
-	return openRemote(
+	const binding = (await openRemote(
 		protocolLocator,
 		remoteFetch,
 		options.headers,
 		clientOptions.initialActiveBranchId,
-	) as Promise<LixBinding>;
+	)) as LixBinding;
+	binding.exportSnapshot = () =>
+		remoteSnapshotExport({
+			url: snapshotUrl(locator),
+			fetch: remoteFetch,
+			headers: options.headers,
+		});
+	return binding;
+}
+
+function remoteSnapshotExport({
+	url,
+	fetch,
+	headers: headerSource,
+}: {
+	readonly url: URL;
+	readonly fetch: typeof globalThis.fetch;
+	readonly headers: RemoteLixServerOptions["headers"];
+}): SnapshotExportBinding {
+	const controller = new AbortController();
+	let canceled = false;
+	let readerPromise: Promise<ReadableStreamDefaultReader<Uint8Array>> | undefined;
+	const reader = () =>
+		(readerPromise ??= (async () => {
+			const resolvedHeaders =
+				typeof headerSource === "function" ? await headerSource() : headerSource;
+			const headers = new Headers(resolvedHeaders);
+			headers.delete("lix-session-id");
+			headers.delete("content-encoding");
+			headers.set("accept", "application/vnd.lix.snapshot");
+			const response = await fetch(url, {
+				headers,
+				signal: controller.signal,
+			});
+			if (!response.ok) throw await remoteSnapshotHttpError(response);
+			if (response.body === null) {
+				throw remoteSnapshotError(
+					"LIX_REMOTE_REQUEST_FAILED",
+					"Remote snapshot response did not contain a body",
+					{ httpStatus: response.status },
+				);
+			}
+			return response.body.getReader();
+		})());
+	return {
+		next: async () => {
+			if (canceled) return undefined;
+			const result = await (await reader()).read();
+			return result.done ? undefined : result.value;
+		},
+		cancel: async () => {
+			if (canceled) return;
+			canceled = true;
+			controller.abort();
+			const activeReader = await readerPromise?.catch(() => undefined);
+			await activeReader?.cancel().catch(() => undefined);
+		},
+	};
+}
+
+function snapshotUrl(locator: URL): URL {
+	const url = new URL(locator);
+	const lixId = url.pathname.slice("/lix/".length);
+	url.pathname = `/lix/v1/${lixId}/snapshot`;
+	return url;
+}
+
+async function remoteSnapshotHttpError(response: Response): Promise<Error> {
+	let body: {
+		error?: {
+			code?: string;
+			message?: string;
+			hint?: string;
+			details?: unknown;
+		};
+	} = {};
+	try {
+		body = (await response.json()) as typeof body;
+	} catch {
+		// A non-JSON proxy response still becomes a structured remote error.
+	}
+	const error = remoteSnapshotError(
+		body.error?.code ?? "LIX_REMOTE_REQUEST_FAILED",
+		body.error?.message ?? `Remote Lix request failed with status ${response.status}`,
+		{ httpStatus: response.status, remote: body.error?.details },
+	);
+	if (body.error?.hint !== undefined) error.hint = body.error.hint;
+	return error;
+}
+
+function remoteSnapshotError(
+	code: string,
+	message: string,
+	details: unknown,
+): Error & { code: string; details: unknown; hint?: string } {
+	const error = new Error(message) as Error & {
+		code: string;
+		details: unknown;
+		hint?: string;
+	};
+	error.name = "LixError";
+	error.code = code;
+	error.details = details;
+	return error;
 }
 
 function connectionUrl(value: string | URL): URL {
