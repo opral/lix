@@ -38,6 +38,54 @@ test.each([
 	await binding.close();
 });
 
+test("remote exportSnapshot streams the canonical authenticated endpoint", async () => {
+	const requests: Request[] = [];
+	let headerCalls = 0;
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+			headers: () => ({
+				Authorization: `Bearer token-${++headerCalls}`,
+				"Lix-Session-Id": "caller-session",
+			}),
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
+					return handshakeResponse();
+				}
+				if (pathname.endsWith("/snapshot")) {
+					return new Response(new Uint8Array([0x4c, 0x49, 0x58]), {
+						headers: {
+							"content-type": "application/vnd.lix.snapshot",
+						},
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				throw new Error(`Unexpected request: ${request.url}`);
+			},
+		},
+	});
+
+	const snapshot = lix.exportSnapshot();
+	expect(requests).toHaveLength(1);
+	expect(new Uint8Array(await new Response(snapshot).arrayBuffer())).toEqual(
+		new Uint8Array([0x4c, 0x49, 0x58]),
+	);
+	expect(new URL(requests[1]!.url).pathname).toBe(
+		"/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/snapshot",
+	);
+	expect(requests[1]!.headers.get("authorization")).toBe("Bearer token-2");
+	expect(requests[1]!.headers.has("lix-session-id")).toBe(false);
+	expect(requests[1]!.headers.get("accept")).toBe("application/vnd.lix.snapshot");
+
+	await lix.close();
+});
+
 test("Lix Server Protocol handshake requests a restored initial active branch", async () => {
 	const accountId = "01920000-0000-7000-8000-000000000601";
 	const requests: Request[] = [];
