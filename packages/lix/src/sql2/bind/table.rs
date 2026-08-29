@@ -237,6 +237,7 @@ mod tests {
             "lix_restore",
             "lix_revert",
             "lix_state_at",
+            "lix_working_diff",
         ];
 
         assert_eq!(actual, expected);

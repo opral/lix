@@ -50,10 +50,7 @@ use tokio::{
     sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch},
     task::JoinHandle,
 };
-use tokio_util::{
-    compat::TokioAsyncWriteCompatExt as _,
-    io::ReaderStream,
-};
+use tokio_util::{compat::TokioAsyncWriteCompatExt as _, io::ReaderStream};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
 const MAX_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -1570,9 +1567,12 @@ fn targeted_protocol_request(
     } else {
         format!("{PROTOCOL_PATH}/{operation}")
     };
-    let path_and_query = request.uri().query().map_or(operation_path.clone(), |query| {
-        format!("{operation_path}?{query}")
-    });
+    let path_and_query = request
+        .uri()
+        .query()
+        .map_or(operation_path.clone(), |query| {
+            format!("{operation_path}?{query}")
+        });
     let mut parts = request.uri().clone().into_parts();
     parts.path_and_query = Some(path_and_query.parse().expect("canonical protocol URI"));
     *request.uri_mut() = http::Uri::from_parts(parts).expect("canonical protocol URI parts");
@@ -1696,7 +1696,9 @@ where
         options: ServerProtocolOptions,
         lix_id: String,
     ) -> Self {
-        engine.sync_mode().set_role(crate::sync::SyncRole::Authority);
+        engine
+            .sync_mode()
+            .set_role(crate::sync::SyncRole::Authority);
         let (close_result, _) = watch::channel(None);
         Self {
             inner: Arc::new(ServerInner {
@@ -1978,9 +1980,7 @@ where
             (&Method::POST, "/lix/v1/observe/multiplex") => result_response(
                 observe_multiplex(lease, json_request!(MultiplexObserveRequest)).await,
             ),
-            (_, known) if is_known_operation_path(known) => {
-                method_not_allowed()
-            }
+            (_, known) if is_known_operation_path(known) => method_not_allowed(),
             _ => not_found(),
         }
     }
@@ -2113,16 +2113,14 @@ where
                     .await
             })
         };
-        tokio::spawn(
-            opening.instrument(parent).with_current_subscriber(),
-        )
-        .await
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("join Lix protocol session open: {error}"),
-            )
-        })?
+        tokio::spawn(opening.instrument(parent).with_current_subscriber())
+            .await
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("join Lix protocol session open: {error}"),
+                )
+            })?
     }
 
     async fn create_session_tracked(
@@ -5239,9 +5237,7 @@ mod tests {
         MemoryWrite, PutBatch, ReadDurability, ReadOptions, ScanCursor, SpaceId, Storage,
         StorageError, StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
-    use lix::telemetry::{
-        CallbackTelemetrySink, CompletedTelemetrySpan, OpenTelemetryTracingSink,
-    };
+    use lix::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, OpenTelemetryTracingSink};
     use lix::{Blob, Memory, open_lix};
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -5340,7 +5336,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("OpenAPI is missing {operation_id}"))
                 .1
                 .split_once("operationId:")
-                .map_or_else(|| openapi.split_once(&marker).unwrap().1, |(operation, _)| operation);
+                .map_or_else(
+                    || openapi.split_once(&marker).unwrap().1,
+                    |(operation, _)| operation,
+                );
             assert!(
                 operation.contains("$ref: \"#/components/parameters/SyncProtocolVersion\""),
                 "OpenAPI operation {operation_id} is missing the sync protocol header",
@@ -5414,6 +5413,8 @@ mod tests {
                 expected_checkpoint_commit_id: None,
                 head_commit_id: None,
                 checkpoint_commit_id: None,
+                head_state_root_id: None,
+                checkpoint_state_root_id: None,
             }],
             inline_blobs: Vec::new(),
         };
@@ -5467,9 +5468,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.0.acquire_session().await
         }
 
@@ -5529,9 +5528,12 @@ mod tests {
             return;
         };
         let targeted_path = format!("{PROTOCOL_PATH}/{lix_id}{suffix}");
-        let path_and_query = request.uri().query().map_or(targeted_path.clone(), |query| {
-            format!("{targeted_path}?{query}")
-        });
+        let path_and_query = request
+            .uri()
+            .query()
+            .map_or(targeted_path.clone(), |query| {
+                format!("{targeted_path}?{query}")
+            });
         let mut parts = request.uri().clone().into_parts();
         parts.path_and_query = Some(path_and_query.parse().expect("test protocol URI"));
         *request.uri_mut() = http::Uri::from_parts(parts).expect("test protocol URI parts");
@@ -5745,9 +5747,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -5832,9 +5832,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -5921,9 +5919,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6043,9 +6039,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6073,12 +6067,9 @@ mod tests {
             &self,
             requests: &[GetManyRequest<'_>],
         ) -> Result<GetManyResult, StorageError> {
-            let reads_branch_control = requests
-                .iter()
-                .any(|request| {
-                    SpaceId(request.space.id.0 & !EPOCH_BANK_MASK)
-                        == BRANCH_HEAD_CONTROL_SPACE_ID
-                });
+            let reads_branch_control = requests.iter().any(|request| {
+                SpaceId(request.space.id.0 & !EPOCH_BANK_MASK) == BRANCH_HEAD_CONTROL_SPACE_ID
+            });
             if reads_branch_control
                 && self
                     .gate
@@ -6141,9 +6132,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6253,9 +6242,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6310,9 +6297,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6344,7 +6329,8 @@ mod tests {
         storage.expire_next_read();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve should retry repository admission");
         assert_eq!(storage.expired_reads.load(Ordering::Acquire), 1);
@@ -6356,7 +6342,8 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server.clone());
@@ -6400,7 +6387,8 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6441,7 +6429,8 @@ mod tests {
         lix.close().await.expect("close setup session");
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6473,7 +6462,8 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let lease = server
@@ -6619,9 +6609,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6668,7 +6656,8 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6719,7 +6708,8 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6800,7 +6790,8 @@ mod tests {
         let storage = FailOneBlockedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6888,7 +6879,8 @@ mod tests {
         let storage = FailOneBlockedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6967,7 +6959,8 @@ mod tests {
 
     async fn app_with_options(options: ServerProtocolOptions) -> TestApp {
         let server = open_lix()
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(options)
             .await
             .expect("serve lix");
@@ -6981,7 +6974,8 @@ mod tests {
     {
         let server = open_lix()
             .with_storage(storage)
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         handler(server)
@@ -7241,12 +7235,9 @@ mod tests {
         }
 
         let storage = DurableMemoryStorage::new();
-        Engine::initialize_with_main_branch_id(
-            storage.clone(),
-            Some(default_branch_id),
-        )
-        .await
-        .expect("initialize sparse replica storage");
+        Engine::initialize_with_main_branch_id(storage.clone(), Some(default_branch_id))
+            .await
+            .expect("initialize sparse replica storage");
         let mut replica = open_lix()
             .with_storage(storage)
             .await
@@ -7381,7 +7372,8 @@ mod tests {
         let storage = PostCommitUnknownStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -7434,7 +7426,8 @@ mod tests {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let server = open_lix()
             .with_telemetry(Arc::new(OpenTelemetryTracingSink::new(dispatch)))
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -7878,7 +7871,8 @@ mod tests {
             .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
                 captured.lock().expect("spans").push(span);
             })))
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -11796,7 +11790,10 @@ mod tests {
     fn assert_info_plane(spans: &[CapturedSpan]) {
         use crate::telemetry::{FORBIDDEN_PRODUCTION_NAMES, PRODUCTION_NAMES};
         assert_eq!(PRODUCTION_NAMES.len(), 11);
-        for span in spans.iter().filter(|span| span.level == tracing::Level::INFO) {
+        for span in spans
+            .iter()
+            .filter(|span| span.level == tracing::Level::INFO)
+        {
             assert!(
                 PRODUCTION_NAMES.contains(&span.name) || span.name == "lix.protocol.request",
                 "unexpected INFO production span {}",
@@ -11987,7 +11984,8 @@ mod tests {
         );
         let server = open_lix()
             .with_telemetry(Arc::new(OpenTelemetryTracingSink::new(dispatch)))
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let app = TestApp {
@@ -12190,7 +12188,8 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 ..ServerProtocolOptions::default()
@@ -12250,7 +12249,8 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 ..ServerProtocolOptions::default()
@@ -12427,7 +12427,8 @@ mod tests {
         lix.close().await.expect("close setup session");
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: SESSION_COUNT,
                 ..ServerProtocolOptions::default()
@@ -12671,7 +12672,8 @@ mod tests {
         let storage = BlockingReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
@@ -12736,7 +12738,8 @@ mod tests {
         let storage = BlockingReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -12768,7 +12771,8 @@ mod tests {
         let storage = BlockingReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -12817,7 +12821,8 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
@@ -12891,7 +12896,8 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
@@ -13069,7 +13075,8 @@ mod tests {
         let storage = BlockingFencedBranchControlReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -13166,7 +13173,8 @@ mod tests {
     #[tokio::test]
     async fn zero_capacity_is_rejected() {
         let result = open_lix()
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 0,
                 session_idle_timeout: Duration::from_secs(1),
@@ -13179,7 +13187,8 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = open_lix()
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_request_blob_cache_bytes: 0,
                 ..ServerProtocolOptions::default()
@@ -13194,8 +13203,11 @@ mod tests {
     #[tokio::test]
     async fn sync_replica_configuration_cannot_be_served_as_an_authority() {
         let result = open_lix()
-            .with_server(lix::ServerOptions::sync("https://example.invalid/repository"))
-            .serve().with_embedded_lix_id()
+            .with_server(lix::ServerOptions::sync(
+                "https://example.invalid/repository",
+            ))
+            .serve()
+            .with_embedded_lix_id()
             .await;
         let Err(error) = result else {
             panic!("sync replica configuration must not open as an authority");
@@ -13225,7 +13237,11 @@ mod tests {
             .await
             .expect("persist replica identity");
 
-        let result = open_lix().with_storage(storage).serve().with_embedded_lix_id().await;
+        let result = open_lix()
+            .with_storage(storage)
+            .serve()
+            .with_embedded_lix_id()
+            .await;
         let Err(error) = result else {
             panic!("persisted sync replica must not be promoted to authority");
         };

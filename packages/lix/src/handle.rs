@@ -512,6 +512,8 @@ where
         // the Sync session; storage handles are Send by the Storage contract.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
+                let route = self.lix.session.statement_authority_route(&self.sql)?;
+                self.lix.require_authority_execution(route)?;
                 self.lix
                     .retry_sync_demands(|| {
                         self.lix.session.execute_with_options(
@@ -560,6 +562,8 @@ where
         // only the Sync session across suspension.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
+                let route = self.lix.session.batch_authority_route(&self.statements)?;
+                self.lix.require_authority_execution(route)?;
                 self.lix
                     .retry_sync_demands(|| {
                         self.lix
@@ -1075,6 +1079,7 @@ where
         path: impl Into<String>,
         content: impl Into<Blob>,
     ) -> Result<u64, LixError> {
+        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.session
             .upsert_file_content(path.into(), content.into())
             .await
@@ -1090,6 +1095,7 @@ where
         total_size: u64,
         content: impl Into<Blob>,
     ) -> Result<lix::FileUploadProgress, LixError> {
+        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.session
             .upsert_file_content_part(
                 upload_id.into(),
@@ -1111,6 +1117,7 @@ where
         &self,
         writes: Vec<(String, Blob)>,
     ) -> Result<u64, LixError> {
+        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.session.upsert_file_content_batch(writes).await
     }
 
@@ -1142,6 +1149,8 @@ where
         // an already committed attempt replays its durable receipt.
         unsafe {
             crate::session::AssumeSendFuture::new(async move {
+                let route = self.session.statement_authority_route(&sql)?;
+                self.require_authority_execution(route)?;
                 self.retry_sync_demands(|| {
                     Arc::clone(&self.session).execute_with_idempotency_and_options_and_metadata(
                         sql.clone(),
@@ -1208,6 +1217,8 @@ where
         // caller's original key.
         unsafe {
             crate::session::AssumeSendFuture::new(async move {
+                let route = self.session.batch_authority_route(&statements)?;
+                self.require_authority_execution(route)?;
                 self.retry_sync_demands(|| {
                     Arc::clone(&self.session)
                         .execute_batch_with_idempotency_and_options_and_metadata(
@@ -1235,6 +1246,7 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ObserveEvents<StorageImpl>, LixError> {
+        self.require_authority_execution(self.session.statement_authority_route(sql)?)?;
         self.session
             .observe(sql, params)
             .map(|events| ObserveEvents {
@@ -1243,6 +1255,7 @@ where
     }
 
     pub async fn begin_transaction(&self) -> Result<LixTransaction<StorageImpl>, LixError> {
+        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         Ok(LixTransaction {
             inner: self.session.begin_transaction().await?,
         })
@@ -1300,6 +1313,7 @@ where
         &self,
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
+        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.retry_sync_demands(|| self.session.create_branch(options.clone()))
             .await
     }
@@ -1309,16 +1323,19 @@ where
     pub(crate) async fn create_checkpoint(
         &self,
     ) -> Result<crate::session::CreateCheckpointReceipt, LixError> {
+        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.session.create_checkpoint().await
     }
 
     /// Reverses the latest undoable tracked commit on this handle's active branch.
     pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
+        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.retry_sync_demands(|| self.session.undo()).await
     }
 
     /// Replays the latest tracked commit abandoned by undo on this handle's active branch.
     pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
+        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.retry_sync_demands(|| self.session.redo()).await
     }
 
@@ -1344,6 +1361,7 @@ where
         &self,
         options: MergeBranchOptions,
     ) -> Result<MergeBranchReceipt, LixError> {
+        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.retry_sync_demands(|| self.session.merge_branch(options.clone()))
             .await
     }
@@ -1352,8 +1370,21 @@ where
         &self,
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
+        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityRead)?;
         self.retry_sync_demands(|| self.session.merge_branch_preview(options.clone()))
             .await
+    }
+
+    fn require_authority_execution(
+        &self,
+        route: crate::sql2::StatementAuthorityRoute,
+    ) -> Result<(), LixError> {
+        if route != crate::sql2::StatementAuthorityRoute::HotRead
+            && self.engine.sync_mode().role() == crate::sync::SyncRole::Replica
+        {
+            return Err(crate::sync::authority_execution_required(route));
+        }
+        Ok(())
     }
 
     pub async fn close(&self) -> Result<(), LixError> {

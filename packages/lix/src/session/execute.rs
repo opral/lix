@@ -936,6 +936,39 @@ where
         execution_disposition(&statement)
     }
 
+    pub(crate) fn statement_authority_route(
+        &self,
+        sql: &str,
+    ) -> Result<sql2::StatementAuthorityRoute, LixError> {
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        sql2::statement_authority_route(&statement)
+    }
+
+    pub(crate) fn batch_authority_route(
+        &self,
+        statements: &[ExecuteBatchStatement],
+    ) -> Result<sql2::StatementAuthorityRoute, LixError> {
+        let mut route = sql2::StatementAuthorityRoute::HotRead;
+        for (statement_index, statement) in statements.iter().enumerate() {
+            let parsed = self
+                .sql_planning_cache
+                .parse_statement(&statement.sql)
+                .map_err(|error| with_batch_statement_index(error, statement_index))?;
+            match sql2::statement_authority_route(&parsed)
+                .map_err(|error| with_batch_statement_index(error, statement_index))?
+            {
+                sql2::StatementAuthorityRoute::AuthorityWrite => {
+                    return Ok(sql2::StatementAuthorityRoute::AuthorityWrite);
+                }
+                sql2::StatementAuthorityRoute::AuthorityRead => {
+                    route = sql2::StatementAuthorityRoute::AuthorityRead;
+                }
+                sql2::StatementAuthorityRoute::HotRead => {}
+            }
+        }
+        Ok(route)
+    }
+
     /// Classifies an atomic SQL batch for a caller that owns its transport
     /// lifecycle.
     ///

@@ -64,6 +64,15 @@ pub struct SyncRefUpdate {
     /// The branch-specific checkpoint against which working changes are read.
     /// It is null only when `head_commit_id` is null for a ref deletion.
     pub checkpoint_commit_id: Option<String>,
+    /// Authority-certified BLAKE3 root of the live, tombstone-filtered row
+    /// stream at `head_commit_id`. Authority delta events must carry this for
+    /// every headed ref; client push requests leave it null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_state_root_id: Option<String>,
+    /// Authority-certified live-row root at `checkpoint_commit_id`. It follows
+    /// the same event-only rule as `head_state_root_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_state_root_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +83,10 @@ struct SyncRefUpdateWire {
     expected_checkpoint_commit_id: RequiredOption<String>,
     head_commit_id: Option<String>,
     checkpoint_commit_id: RequiredOption<String>,
+    #[serde(default)]
+    head_state_root_id: Option<String>,
+    #[serde(default)]
+    checkpoint_state_root_id: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SyncRefUpdate {
@@ -98,6 +111,8 @@ impl<'de> Deserialize<'de> for SyncRefUpdate {
             expected_checkpoint_commit_id: wire.expected_checkpoint_commit_id.0,
             head_commit_id: wire.head_commit_id,
             checkpoint_commit_id: wire.checkpoint_commit_id.0,
+            head_state_root_id: wire.head_state_root_id,
+            checkpoint_state_root_id: wire.checkpoint_state_root_id,
         })
     }
 }
@@ -403,6 +418,8 @@ mod tests {
             expected_checkpoint_commit_id: Some("old-checkpoint".to_owned()),
             head_commit_id: Some("head".to_owned()),
             checkpoint_commit_id: Some("checkpoint".to_owned()),
+            head_state_root_id: Some("0".repeat(64)),
+            checkpoint_state_root_id: Some("1".repeat(64)),
         };
         let value = serde_json::to_value(&update).expect("serialize ref update");
         assert_eq!(value["checkpointCommitId"], "checkpoint");
@@ -465,6 +482,8 @@ mod tests {
             expected_checkpoint_commit_id: Some("old-checkpoint".to_owned()),
             head_commit_id: Some("head".to_owned()),
             checkpoint_commit_id: Some("checkpoint".to_owned()),
+            head_state_root_id: Some("0".repeat(64)),
+            checkpoint_state_root_id: Some("1".repeat(64)),
         }];
         let expected = serde_json::to_vec(&SyncRepositoryPullResponse::Delta {
             cursor: 3,

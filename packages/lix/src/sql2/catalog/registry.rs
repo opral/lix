@@ -158,9 +158,9 @@ impl PublicCatalog {
             | PublicSurfaceKind::CommitAncestryFunction => {
                 return None;
             }
-            PublicSurfaceKind::Revert | PublicSurfaceKind::Apply => Arc::new(Schema::new(vec![
-                row_ref_field("row_ref", false),
-            ])),
+            PublicSurfaceKind::Revert | PublicSurfaceKind::Apply => {
+                Arc::new(Schema::new(vec![row_ref_field("row_ref", false)]))
+            }
             PublicSurfaceKind::Restore => Arc::new(Schema::new(vec![Field::new(
                 "commit_id",
                 DataType::Utf8,
@@ -281,6 +281,13 @@ impl PublicCatalog {
         ))?;
         self.insert(surface(
             "lix_diff",
+            PublicSurfaceClass::TableFunction,
+            PublicSurfaceKind::DiffFunction,
+            Vec::new(),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_working_diff",
             PublicSurfaceClass::TableFunction,
             PublicSurfaceKind::DiffFunction,
             Vec::new(),
@@ -679,11 +686,11 @@ mod tests {
     use crate::LixError;
     use crate::sql2::catalog::TRACKED_ROW_SYSTEM_COLUMN_NAMES;
     use crate::sql2::history_route::{
-        HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT,
-        HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH,
-        HISTORY_COL_FILE_ID, HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA,
-        HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY, HISTORY_COL_ROW_PK,
-        HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
+        HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
+        HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_FILE_ID,
+        HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
+        HISTORY_COL_ORIGIN_KEY, HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY,
+        HISTORY_COL_SOURCE_CHANGES,
     };
 
     #[test]

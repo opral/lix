@@ -1,4 +1,5 @@
 mod bind;
+mod authority_route;
 mod branch_ref;
 mod branch_scope;
 mod catalog;
@@ -48,6 +49,7 @@ pub(crate) use bind::{
     BoundStatementRoute, bind_read_statement, bind_statement_route, bind_statement_with_catalog,
     statement_has_durable_runtime_function,
 };
+pub(crate) use authority_route::{StatementAuthorityRoute, statement_authority_route};
 pub(crate) use catalog::{
     PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec,
     derive_schema_surface_spec_from_schema, row_visible_fields,

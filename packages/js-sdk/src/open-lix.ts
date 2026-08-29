@@ -89,16 +89,15 @@ async function openLixInternal(
 	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
-		return new Lix(
-			await openLixWorkerBinding(
-				{ kind: "memory" },
-				undefined,
-				options.telemetry,
-				syncServer,
-				options.onProgress,
-				snapshot,
-			),
+		const binding = await openLixWorkerBinding(
+			{ kind: "memory" },
+			undefined,
+			options.telemetry,
+			syncServer,
+			options.onProgress,
+			snapshot,
 		);
+		return new Lix(await attachAuthority(binding, syncServer));
 	}
 	if (isJsProviderLixStorage(options.storage)) {
 		return openJsProviderStorage(
@@ -135,7 +134,7 @@ async function openLixInternal(
 					routed.current().importFilesystemPaths(paths),
 				syncDiskToLix: () => routed.current().syncDiskToLix(),
 			});
-			return new Lix(routed.binding);
+			return new Lix(await attachAuthority(routed.binding, syncServer));
 		} catch (error) {
 			disconnect();
 			await binding?.close().catch(() => undefined);
@@ -213,10 +212,34 @@ async function openJsProviderStorage(
 			snapshot,
 		);
 		binding = opened;
-		return new Lix(opened);
+		return new Lix(await attachAuthority(opened, syncServer));
 	} catch (error) {
 		openStorages.delete(storage);
 		await binding?.close().catch(() => undefined);
+		throw error;
+	}
+}
+
+async function attachAuthority(
+	local: LixBinding,
+	server: Omit<SyncLixServerOptions, "mode"> | undefined,
+): Promise<LixBinding> {
+	if (server === undefined) return local;
+	try {
+		const [{ authoritativeHotBinding }, { openRemoteLixBinding }] =
+			await Promise.all([
+				import("./authoritative-hot-binding.js"),
+				import("./remote/client.js"),
+			]);
+		const authority = await openRemoteLixBinding({
+			mode: "remote",
+			url: server.url,
+			headers: server.headers,
+			fetch: server.fetch,
+		});
+		return authoritativeHotBinding(local, authority);
+	} catch (error) {
+		await local.close().catch(() => undefined);
 		throw error;
 	}
 }

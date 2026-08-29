@@ -788,6 +788,7 @@ simulation_test!(history_discovery_has_no_suffix_surfaces, |sim| async move {
             vec![Value::Text("lix_diff".to_string())],
             vec![Value::Text("lix_history".to_string())],
             vec![Value::Text("lix_state_at".to_string())],
+            vec![Value::Text("lix_working_diff".to_string())],
         ],
     );
 });

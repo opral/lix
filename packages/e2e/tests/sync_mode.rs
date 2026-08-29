@@ -1,5 +1,8 @@
 #![recursion_limit = "256"]
 
+#[allow(dead_code)]
+mod benchmark_metrics;
+
 use std::convert::Infallible;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,8 +30,11 @@ use serde_json::{Value as JsonValue, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
+use benchmark_metrics::AllocationScope;
+
 const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const OFFLINE_COMMIT_COUNT: usize = 513;
+const HOT_STATE_PROFILE_RECORD_PREFIX: &str = "LIX_HOT_STATE_PROFILE_JSON=";
 
 #[derive(Debug, Default)]
 struct HttpProbe {
@@ -50,6 +56,293 @@ struct HttpProbe {
     one_way_delay_millis: AtomicU64,
     gated_pushes: AtomicU64,
     push_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+}
+
+#[derive(Debug)]
+struct HotStateProfileCase {
+    label: &'static str,
+    live_rows: usize,
+    dirty_rows: usize,
+    history_commits: usize,
+    authority_commits: i64,
+    bootstrap_elapsed: Duration,
+    bootstrap_allocations: benchmark_metrics::AllocationMetrics,
+    working_diff_elapsed: Duration,
+    working_diff_allocations: benchmark_metrics::AllocationMetrics,
+    snapshot_row_pulls: u64,
+    bootstrap_history_gets: u64,
+    working_diff_history_gets: u64,
+}
+
+impl HotStateProfileCase {
+    fn json(&self) -> JsonValue {
+        json!({
+            "schema": "lix.certified-hot-state-profile.v1",
+            "case": self.label,
+            "dimensions": {
+                "live_rows": self.live_rows,
+                "dirty_rows": self.dirty_rows,
+                "history_commits_requested": self.history_commits,
+                "authority_commits_observed": self.authority_commits,
+                "branches": 2,
+            },
+            "bootstrap": {
+                "elapsed_ns": duration_nanos(self.bootstrap_elapsed),
+                "allocation_count": self.bootstrap_allocations.allocation_count,
+                "allocated_bytes": self.bootstrap_allocations.allocated_bytes,
+                "live_bytes_delta": self.bootstrap_allocations.live_bytes_delta,
+                "peak_live_bytes_delta": self.bootstrap_allocations.peak_live_bytes_delta,
+                "process_rss_start_bytes": self.bootstrap_allocations.process_rss_start_bytes,
+                "process_rss_end_bytes": self.bootstrap_allocations.process_rss_end_bytes,
+                "snapshot_row_pulls": self.snapshot_row_pulls,
+                "history_gets": self.bootstrap_history_gets,
+            },
+            "working_diff": {
+                "elapsed_ns": duration_nanos(self.working_diff_elapsed),
+                "allocation_count": self.working_diff_allocations.allocation_count,
+                "allocated_bytes": self.working_diff_allocations.allocated_bytes,
+                "live_bytes_delta": self.working_diff_allocations.live_bytes_delta,
+                "peak_live_bytes_delta": self.working_diff_allocations.peak_live_bytes_delta,
+                "process_rss_start_bytes": self.working_diff_allocations.process_rss_start_bytes,
+                "process_rss_end_bytes": self.working_diff_allocations.process_rss_end_bytes,
+                "history_gets": self.working_diff_history_gets,
+            },
+        })
+    }
+}
+
+/// Deterministic architecture scorecard for the certified HOT serving plane.
+///
+/// This is ignored because it deliberately constructs three non-trivial remote
+/// repositories and owns a process-global allocation window. Run only this
+/// exact test; optional JSON output is controlled by
+/// `LIX_HOT_STATE_PROFILE_OUTPUT`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual certified HOT bootstrap/allocation scorecard"]
+async fn certified_hot_state_profile_scorecard() {
+    let shallow = profile_certified_hot_case("history-shallow", 256, 32, 2).await;
+    let deep = profile_certified_hot_case("history-deep", 256, 32, 64).await;
+    let wide = profile_certified_hot_case("rows-wide", 768, 96, 2).await;
+
+    assert_eq!(
+        shallow.snapshot_row_pulls, deep.snapshot_row_pulls,
+        "bootstrap page count must be independent of cold history depth"
+    );
+    assert_eq!(
+        shallow.bootstrap_history_gets, deep.bootstrap_history_gets,
+        "bootstrap topology requests must be independent of cold history depth"
+    );
+    assert_eq!(shallow.working_diff_history_gets, 0);
+    assert_eq!(deep.working_diff_history_gets, 0);
+    assert_eq!(wide.working_diff_history_gets, 0);
+
+    // Allocation ratios intentionally have generous envelopes: the exact
+    // network/count assertions above are the blocking complexity proof, while
+    // the allocator includes the in-process HTTP authority and background
+    // protocol tasks. These bounds catch super-linear explosions without
+    // pretending to be a machine-independent latency benchmark.
+    assert_bounded_growth(
+        "bootstrap history-depth allocated bytes",
+        shallow.bootstrap_allocations.allocated_bytes,
+        deep.bootstrap_allocations.allocated_bytes,
+        2,
+        1024 * 1024,
+    );
+    assert_bounded_growth(
+        "bootstrap history-depth peak live bytes",
+        shallow.bootstrap_allocations.peak_live_bytes_delta,
+        deep.bootstrap_allocations.peak_live_bytes_delta,
+        2,
+        1024 * 1024,
+    );
+    assert_bounded_growth(
+        "bootstrap row scaling allocated bytes",
+        shallow.bootstrap_allocations.allocated_bytes,
+        wide.bootstrap_allocations.allocated_bytes,
+        6,
+        2 * 1024 * 1024,
+    );
+    assert_bounded_growth(
+        "working-diff dirty-row scaling peak live bytes",
+        shallow.working_diff_allocations.peak_live_bytes_delta,
+        wide.working_diff_allocations.peak_live_bytes_delta,
+        6,
+        1024 * 1024,
+    );
+
+    let cases = [&shallow, &deep, &wide];
+    let case_records = cases.iter().map(|case| case.json()).collect::<Vec<_>>();
+    for record in &case_records {
+        eprintln!(
+            "{HOT_STATE_PROFILE_RECORD_PREFIX}{}",
+            serde_json::to_string(record).expect("HOT profile record serializes")
+        );
+    }
+    let artifact = json!({
+        "schema": "lix.certified-hot-state-profile-artifact.v1",
+        "contract": {
+            "bootstrap": "O(live head rows + distinct checkpoint rows + branch metadata), independent of cold history depth",
+            "working_diff": "O(dirty identities), with no cold-history request",
+            "memory": "O(transferred HOT payload + dirty identity metadata)",
+            "measurement_boundary": "in-process sync client plus HTTP authority",
+        },
+        "assertions": {
+            "history_independent_snapshot_pages": true,
+            "history_independent_bootstrap_topology_requests": true,
+            "working_diff_history_requests": 0,
+            "allocator_growth_envelopes_passed": true,
+        },
+        "cases": case_records,
+    });
+    if let Some(output) = std::env::var_os("LIX_HOT_STATE_PROFILE_OUTPUT") {
+        let output = Path::new(&output);
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create HOT profile output directory");
+        }
+        std::fs::write(
+            output,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&artifact).expect("HOT profile artifact serializes")
+            ),
+        )
+        .expect("write HOT profile artifact");
+    }
+}
+
+async fn profile_certified_hot_case(
+    label: &'static str,
+    live_rows: usize,
+    dirty_rows: usize,
+    history_commits: usize,
+) -> HotStateProfileCase {
+    assert!(dirty_rows <= live_rows);
+    let (authority_storage, authority) = open_authority().await;
+    seed_hot_profile_rows(&authority, live_rows).await;
+    for history_index in 0..history_commits {
+        put_value(
+            &authority,
+            "hot-profile-history-probe",
+            &format!("history-{history_index:05}"),
+        )
+        .await;
+    }
+    authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .expect("checkpoint HOT profile baseline");
+    let updates = (0..dirty_rows)
+        .map(|index| ExecuteBatchStatement {
+            label: None,
+            sql: "UPDATE lix_file SET content = $1 WHERE path = $2".to_owned(),
+            params: vec![
+                Value::Blob(format!("dirty-{index:05}").into_bytes().into()),
+                Value::Text(format!("/hot-profile-row-{index:05}.txt")),
+            ],
+        })
+        .collect::<Vec<_>>();
+    authority
+        .execute_batch(&updates)
+        .await
+        .expect("dirty HOT profile rows");
+    let authority_commits = commit_count(&authority).await;
+    authority
+        .close()
+        .await
+        .expect("close HOT profile authority setup");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage, Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("HOT profile replica tempdir");
+    let bootstrap_scope = AllocationScope::start();
+    let bootstrap_started = Instant::now();
+    let replica = open_replica(replica_dir.path(), &url).await;
+    let bootstrap_elapsed = bootstrap_started.elapsed();
+    let bootstrap_allocations = bootstrap_scope.finish();
+
+    let replicated_rows = replica
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_file WHERE path LIKE '/hot-profile-row-%'",
+            &[],
+        )
+        .await
+        .expect("count certified HOT rows")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("HOT row count is integer");
+    assert_eq!(replicated_rows, live_rows as i64);
+
+    let history_before_diff = probe.history_gets.load(Ordering::Acquire);
+    let diff_scope = AllocationScope::start();
+    let diff_started = Instant::now();
+    let diff = replica
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_working_diff('lix_file')",
+            &[],
+        )
+        .await
+        .expect("query certified HOT working diff");
+    let working_diff_elapsed = diff_started.elapsed();
+    let working_diff_allocations = diff_scope.finish();
+    let diff_count = diff.rows()[0]
+        .get::<i64>("count")
+        .expect("working diff count is integer");
+    assert_eq!(diff_count, dirty_rows as i64);
+    let working_diff_history_gets = probe
+        .history_gets
+        .load(Ordering::Acquire)
+        .saturating_sub(history_before_diff);
+
+    let case = HotStateProfileCase {
+        label,
+        live_rows,
+        dirty_rows,
+        history_commits,
+        authority_commits,
+        bootstrap_elapsed,
+        bootstrap_allocations,
+        working_diff_elapsed,
+        working_diff_allocations,
+        snapshot_row_pulls: probe.snapshot_row_pulls.load(Ordering::Acquire),
+        bootstrap_history_gets: history_before_diff,
+        working_diff_history_gets,
+    };
+    replica.close().await.expect("close HOT profile replica");
+    stop_server(server_task).await;
+    case
+}
+
+async fn seed_hot_profile_rows(authority: &Lix<Memory>, live_rows: usize) {
+    const BATCH_ROWS: usize = 256;
+    for batch_start in (0..live_rows).step_by(BATCH_ROWS) {
+        let batch_end = (batch_start + BATCH_ROWS).min(live_rows);
+        let statements = (batch_start..batch_end)
+            .map(|index| ExecuteBatchStatement {
+                label: None,
+                sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)".to_owned(),
+                params: vec![
+                    Value::Text(format!("/hot-profile-row-{index:05}.txt")),
+                    Value::Blob(format!("baseline-{index:05}").into_bytes().into()),
+                ],
+            })
+            .collect::<Vec<_>>();
+        authority
+            .execute_batch(&statements)
+            .await
+            .expect("seed HOT profile row batch");
+    }
+}
+
+fn assert_bounded_growth(label: &str, baseline: u64, candidate: u64, multiple: u64, slack: u64) {
+    let maximum = baseline.saturating_mul(multiple).saturating_add(slack);
+    assert!(
+        candidate <= maximum,
+        "{label}: {candidate} exceeds {multiple} * {baseline} + {slack} = {maximum}"
+    );
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
