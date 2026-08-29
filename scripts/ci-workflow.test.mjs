@@ -13,6 +13,10 @@ const releasePrWorkflow = readFileSync(
 	resolve(repositoryRoot, ".github/workflows/release-pr.yml"),
 	"utf8",
 );
+const publishWorkflow = readFileSync(
+	resolve(repositoryRoot, ".github/workflows/publish-packages.yml"),
+	"utf8",
+);
 
 test("superseded CI runs are cancelled per pull request or branch", () => {
 	assert.match(
@@ -66,6 +70,33 @@ test("JS SDK native CI is right-sized without changing browser architecture cove
 		/- name: Browser\n\s+runtime: browser\n\s+runner: blacksmith-32vcpu-ubuntu-2404/,
 	);
 	assert.match(workflow, /name: JS SDK \$\{\{ matrix\.name \}\} Test[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/);
+});
+
+test("green SDK jobs retain exact-revision artifacts for submodule consumers", () => {
+	assert.match(
+		workflow,
+		/LIX_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/,
+	);
+	assert.match(workflow, /ref: \$\{\{ env\.LIX_SOURCE_SHA \}\}/);
+	assert.match(workflow, /name: lix-browser-sdk-\$\{\{ env\.LIX_SOURCE_SHA \}\}/);
+	assert.match(
+		workflow,
+		/name: lix-native-sdk-linux-x64-\$\{\{ env\.LIX_SOURCE_SHA \}\}/,
+	);
+	assert.match(workflow, /retention-days: 90/);
+	assert.doesNotMatch(workflow, /CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"/);
+});
+
+test("server-changing pull requests retain one reusable preview image", () => {
+	assert.match(workflow, /preview-artifact-changes:/);
+	assert.match(workflow, /preview-server-image:/);
+	assert.match(workflow, /file: packages\/server\/Dockerfile/);
+	assert.match(
+		workflow,
+		/name: lix-server-image-linux-x64-\$\{\{ env\.LIX_SOURCE_SHA \}\}/,
+	);
+	assert.match(workflow, /retention-days: 14/);
+	assert.match(publishWorkflow, /lix-server:content-\$server_inputs/);
 });
 
 test("release PR automation reuses same-SHA pull request CI with a dispatch fallback", () => {
