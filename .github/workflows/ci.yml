@@ -295,6 +295,11 @@ jobs:
     name: JS SDK ${{ matrix.name }} Test
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ matrix.runner }}
+    env:
+      # Pull request workflows normally check out GitHub's synthetic merge
+      # commit. Consumers pin the real source commit as a submodule, so build
+      # reusable artifacts from that exact commit instead.
+      LIX_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     strategy:
       fail-fast: false
       matrix:
@@ -309,6 +314,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.LIX_SOURCE_SHA }}
 
       - name: set envs
         run: |
@@ -429,10 +436,8 @@ jobs:
       - name: Build browser JS SDK
         if: matrix.runtime == 'browser'
         working-directory: packages/js-sdk
-        # Generic CI favors fast feedback. Production builds leave this unset
-        # and use the single codegen unit configured by build-wasm.js for size.
-        env:
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+        # This is also the artifact consumed by LixRay. Build and test the
+        # production-sized WASM once here instead of recompiling it downstream.
         run: npm run build:browser
 
       - name: Build and check OPFS storage package
@@ -458,3 +463,131 @@ jobs:
           npm run test:browser:production
           npm run benchmark
           npm run benchmark:multi-tab
+
+      - name: Describe reusable browser SDK artifact
+        if: matrix.runtime == 'browser'
+        run: |
+          mkdir -p ci-artifact
+          node --input-type=module - <<'EOF' > ci-artifact/browser.json
+          console.log(JSON.stringify({
+            schemaVersion: 1,
+            kind: "lix-browser-sdk",
+            sourceRevision: process.env.LIX_SOURCE_SHA,
+            target: "wasm32-unknown-unknown",
+          }, null, 2));
+          EOF
+
+      - name: Upload tested browser SDK for submodule consumers
+        if: matrix.runtime == 'browser'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lix-browser-sdk-${{ env.LIX_SOURCE_SHA }}
+          path: |
+            packages/js-sdk/dist
+            packages/storage-opfs/dist
+            ci-artifact/browser.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+  preview-artifact-changes:
+    name: Select preview artifacts
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    outputs:
+      server: ${{ steps.changes.outputs.server }}
+
+    steps:
+      - name: Checkout feature revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Detect reference server inputs
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            .cargo \
+            .github/workflows/ci.yml \
+            Cargo.lock \
+            Cargo.toml \
+            rust-toolchain.toml \
+            packages/lix \
+            packages/lix-schema \
+            packages/server \
+            packages/storage-slatedb \
+            plugins; then
+            echo 'server=false' >> "$GITHUB_OUTPUT"
+            echo 'Reference server inputs are unchanged; no preview image is needed.'
+          else
+            echo 'server=true' >> "$GITHUB_OUTPUT"
+            echo 'Reference server inputs changed; building one reusable preview image.'
+          fi
+
+  preview-server-image:
+    name: Lix server preview artifact
+    if: needs.preview-artifact-changes.outputs.server == 'true'
+    needs: preview-artifact-changes
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    env:
+      LIX_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+
+    steps:
+      - name: Checkout feature revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.LIX_SOURCE_SHA }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build reusable reference server image once
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packages/server/Dockerfile
+          tags: lix-server-ci:${{ env.LIX_SOURCE_SHA }}
+          outputs: type=docker,dest=${{ runner.temp }}/lix-server-image.tar
+          labels: |
+            org.opencontainers.image.revision=${{ env.LIX_SOURCE_SHA }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=lix-server-preview
+          cache-to: type=gha,mode=max,scope=lix-server-preview
+
+      - name: Verify reusable server image metadata
+        run: |
+          docker load --input "$RUNNER_TEMP/lix-server-image.tar"
+          revision="$(docker image inspect \
+            "lix-server-ci:$LIX_SOURCE_SHA" \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          test "$revision" = "$LIX_SOURCE_SHA"
+          echo "Built reusable Lix server image for $revision"
+
+      - name: Describe reusable server image artifact
+        run: |
+          mkdir -p ci-artifact
+          cp "$RUNNER_TEMP/lix-server-image.tar" ci-artifact/lix-server-image.tar
+          node --input-type=module - <<'EOF' > ci-artifact/server-linux-x64.json
+          console.log(JSON.stringify({
+            schemaVersion: 1,
+            kind: "lix-server-image",
+            sourceRevision: process.env.LIX_SOURCE_SHA,
+            target: "linux-x64",
+            image: `lix-server-ci:${process.env.LIX_SOURCE_SHA}`,
+          }, null, 2));
+          EOF
+
+      - name: Upload tested server image for preview consumers
+        uses: actions/upload-artifact@v4
+        with:
+          name: lix-server-image-linux-x64-${{ env.LIX_SOURCE_SHA }}
+          path: |
+            ci-artifact/lix-server-image.tar
+            ci-artifact/server-linux-x64.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

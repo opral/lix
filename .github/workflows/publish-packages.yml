@@ -151,9 +151,25 @@ jobs:
           RELEASE_TAG: ${{ needs.release-version.outputs.tag }}
           HAS_RELEASE: ${{ needs.release-version.outputs.has_release }}
         run: |
+          server_inputs="$(
+            {
+              git ls-tree HEAD -- \
+                .cargo \
+                Cargo.lock \
+                Cargo.toml \
+                rust-toolchain.toml
+              git ls-tree -r HEAD -- \
+                packages/lix \
+                packages/lix-schema \
+                packages/server \
+                packages/storage-slatedb \
+                plugins
+            } | git hash-object --stdin
+          )"
           {
             echo 'tags<<EOF'
             echo "ghcr.io/opral/lix-server:sha-$RELEASE_SHA"
+            echo "ghcr.io/opral/lix-server:content-$server_inputs"
             if [ "${{ github.event_name }}" = push ]; then
               echo 'ghcr.io/opral/lix-server:main'
             fi
