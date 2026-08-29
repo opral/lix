@@ -79,11 +79,8 @@ test("green SDK jobs retain exact-revision artifacts for submodule consumers", (
 	);
 	assert.match(workflow, /ref: \$\{\{ env\.LIX_SOURCE_SHA \}\}/);
 	assert.match(workflow, /name: lix-browser-sdk-\$\{\{ env\.LIX_SOURCE_SHA \}\}/);
-	assert.match(
-		workflow,
-		/name: lix-native-sdk-linux-x64-\$\{\{ env\.LIX_SOURCE_SHA \}\}/,
-	);
 	assert.match(workflow, /retention-days: 90/);
+	assert.doesNotMatch(workflow, /name: lix-native-sdk-/);
 	assert.doesNotMatch(workflow, /CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"/);
 });
 

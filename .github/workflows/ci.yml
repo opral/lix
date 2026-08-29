@@ -490,31 +490,6 @@ jobs:
           compression-level: 0
           retention-days: 90
 
-      - name: Describe reusable native SDK artifact
-        if: matrix.runtime == 'native'
-        run: |
-          mkdir -p ci-artifact
-          node --input-type=module - <<'EOF' > ci-artifact/native-linux-x64.json
-          console.log(JSON.stringify({
-            schemaVersion: 1,
-            kind: "lix-native-sdk",
-            sourceRevision: process.env.LIX_SOURCE_SHA,
-            target: "linux-x64",
-          }, null, 2));
-          EOF
-
-      - name: Upload tested Linux native SDK for submodule consumers
-        if: matrix.runtime == 'native'
-        uses: actions/upload-artifact@v4
-        with:
-          name: lix-native-sdk-linux-x64-${{ env.LIX_SOURCE_SHA }}
-          path: |
-            packages/js-sdk/lix_js_sdk.node
-            ci-artifact/native-linux-x64.json
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 90
-
   preview-artifact-changes:
     name: Select preview artifacts
     if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
