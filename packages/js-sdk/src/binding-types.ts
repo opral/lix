@@ -48,6 +48,8 @@ export type BindingObserveEvent = {
 
 export type BindingParam = NativeLixValue;
 
+export type BindingExecutionRoute = "hot" | "history" | "mutation";
+
 export type SnapshotExportBinding = {
 	next(): Promise<Uint8Array | null | undefined>;
 	cancel(): void | Promise<void>;
@@ -79,6 +81,8 @@ export type LixBinding = {
 		statements: BindingBatchStatement[],
 		options?: LixBatchOptions,
 	): Promise<BindingExecuteResult[]>;
+	/** @internal Parser-derived route used by the authoritative hot composite. */
+	executionRoute?(statements: string[]): Promise<BindingExecutionRoute>;
 	observe(sql: string, params: BindingParam[]): Promise<ObserveEventsBinding>;
 	beginTransaction(): Promise<LixTransactionBinding>;
 	activeBranchId(): Promise<string>;

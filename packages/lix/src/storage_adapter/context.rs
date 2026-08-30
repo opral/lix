@@ -1,4 +1,6 @@
 use std::ops::Bound;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use tracing::Instrument as _;
@@ -23,6 +25,7 @@ use super::spaces::{
 pub struct StorageAdapter<StorageImpl = Memory> {
     storage: StorageImpl,
     routing: EpochRouting,
+    authority_writer: Arc<AtomicBool>,
 }
 
 #[expect(missing_debug_implementations)]
@@ -42,6 +45,7 @@ where
         Self {
             storage,
             routing: EpochRouting::legacy(),
+            authority_writer: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -56,6 +60,7 @@ where
         Self {
             storage,
             routing: EpochRouting::unfenced(bank),
+            authority_writer: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -69,6 +74,7 @@ where
         Self {
             storage,
             routing: EpochRouting::fenced(bank, expected_pointer),
+            authority_writer: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -83,11 +89,20 @@ where
         Self {
             storage,
             routing: EpochRouting::migration(bank, expected_pointer),
+            authority_writer: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub(crate) fn epoch_bank(&self) -> EpochBank {
         self.routing.bank()
+    }
+
+    /// Grants this engine's adapter clones the authority write lane after the
+    /// durable authority marker has been installed or verified. Only server
+    /// admission calls this; another plain engine over the same backend owns a
+    /// distinct flag and remains fenced by the marker.
+    pub(crate) fn admit_sync_authority_writer(&self) {
+        self.authority_writer.store(true, Ordering::Release);
     }
 
     pub async fn begin_read(
@@ -154,11 +169,66 @@ where
             .map_err(StorageWriteSetError::Storage)
     }
 
+    /// Commits storage produced by the certified replica installer. This is
+    /// intentionally crate-private: ordinary engine writers must retain the
+    /// durable receipt fence even when they open the same backend through a
+    /// second process-local engine.
+    pub(crate) async fn commit_certified_replica_write_set(
+        &self,
+        _capability: crate::sync::CertifiedReplicaWriteCapability,
+        write_set: StorageWriteSet,
+        opts: WriteOptions,
+    ) -> Result<(CommitResult, StorageWriteSetStats), StorageWriteSetError> {
+        let prepared = self
+            .prepare_write_set_with_replica_capability(write_set, opts, true)
+            .await?;
+        prepared
+            .commit()
+            .await
+            .map_err(StorageWriteSetError::Storage)
+    }
+
     pub async fn prepare_write_set(
         &self,
         write_set: StorageWriteSet,
-        mut opts: WriteOptions,
+        opts: WriteOptions,
     ) -> Result<PreparedStorageCommit<'_, StorageImpl>, StorageWriteSetError> {
+        self.prepare_write_set_with_replica_capability(write_set, opts, false)
+            .await
+    }
+
+    async fn prepare_write_set_with_replica_capability(
+        &self,
+        write_set: StorageWriteSet,
+        mut opts: WriteOptions,
+        certified_replica_write: bool,
+    ) -> Result<PreparedStorageCommit<'_, StorageImpl>, StorageWriteSetError> {
+        if !certified_replica_write {
+            // This atomic absence precondition closes the race between an
+            // ordinary writer's coherent read and initial receipt install.
+            // Once receipt-bound, every engine sharing this storage is
+            // read-only unless it holds the crate-private certified installer
+            // capability above.
+            opts.preconditions.push(Precondition::KeyAbsent {
+                space: crate::sync::SYNC_REPLICA_STATE_SPACE,
+                key: crate::sync::replica_state_key(),
+            });
+        }
+        if self.authority_writer.load(Ordering::Acquire) {
+            opts.preconditions.push(Precondition::KeyValueEquals {
+                space: crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                key: crate::sync::authority_state_key(),
+                expected: Bytes::from_static(crate::sync::AUTHORITY_STATE_VALUE),
+            });
+        } else {
+            // Authority ownership is durable, while admission is process-local.
+            // A plain second engine therefore cannot publish tracked state
+            // without the repository event that connected replicas consume.
+            opts.preconditions.push(Precondition::KeyAbsent {
+                space: crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                key: crate::sync::authority_state_key(),
+            });
+        }
         opts.batch_capacity_hint_bytes = opts
             .batch_capacity_hint_bytes
             .max(write_set.backend_batch_capacity_hint_bytes());

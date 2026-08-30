@@ -10,9 +10,6 @@ use crate::branch::BranchRefReader;
 use crate::common::{ExecuteStatementMetadata, ExpiredReadRetryState};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
-use crate::telemetry::{
-    ActiveTelemetrySpan, CHECKPOINT_CREATE, Status, TelemetryAttribute,
-};
 use crate::sql2;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::Storage;
@@ -20,6 +17,7 @@ use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
     StorageReadDurability, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
+use crate::telemetry::{ActiveTelemetrySpan, CHECKPOINT_CREATE, Status, TelemetryAttribute};
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{Blob, LixError, LixNotice, ResultColumnType, RowRef, SqlQueryResult, Value};
 use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
@@ -36,10 +34,10 @@ use futures_util::TryStreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::Instrument as _;
 
+use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::{SessionTransaction, transaction_state_error};
-use super::ExecuteIdempotency;
 use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
@@ -227,15 +225,13 @@ impl ExecuteResult {
             checkpoint_telemetry,
         } = result;
         let mut result = match returning {
-            Some(result) => {
-                Self::from_query_parts(
-                    result.columns,
-                    result.column_types,
-                    result.rows,
-                    rows_affected,
-                    result.notices,
-                )
-            }
+            Some(result) => Self::from_query_parts(
+                result.columns,
+                result.column_types,
+                result.rows,
+                rows_affected,
+                result.notices,
+            ),
             None => Self::from_rows_affected(rows_affected),
         };
         result.checkpoint_telemetry = checkpoint_telemetry;
@@ -1096,6 +1092,7 @@ where
                         functions: FunctionProviderHandle::system(),
                         plugin_host: self.plugin_host.clone(),
                         file_views: None,
+                        sync_role: self.sync_mode.role(),
                     };
                     let read_session =
                         sql2::prepare_read_session(&ctx, std::slice::from_ref(&statement)).await?;
@@ -1530,10 +1527,7 @@ where
                         if let Some(span) = checkpoint_span {
                             span.finish(
                                 Status::error(error.code.clone()),
-                                vec![TelemetryAttribute::string(
-                                    "error.type",
-                                    error.code.clone(),
-                                )],
+                                vec![TelemetryAttribute::string("error.type", error.code.clone())],
                             );
                         }
                         Err(error)
@@ -1837,7 +1831,10 @@ where
         if self.base_refresh_generation.load(Ordering::SeqCst) == invalidation_generation {
             return Ok(());
         }
-        let read = self.storage.begin_read(StorageReadOptions::default()).await?;
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await?;
         let active_branch_id = self.active_branch_id_from_reader(&read).await?;
         if active_branch_id == crate::GLOBAL_BRANCH_ID {
             if let Some(global_head) = self
@@ -1898,18 +1895,24 @@ where
                 .store(invalidation_generation, Ordering::SeqCst);
             return Ok(());
         }
+        if self.sync_mode.role() == crate::sync::SyncRole::Replica {
+            return Err(crate::sync::authority_execution_required(
+                sql2::StatementAuthorityRoute::AuthorityWrite,
+            ));
+        }
         drop(read);
 
         let write_access = self.begin_session_write_access().await?;
-        let result = self.with_write_transaction_reserved_lending(
-            write_access,
-            async move |transaction| {
-                transaction.stage_base_refresh_if_needed().await?;
-                Ok(())
-            },
-            |_| Ok(()),
-        )
-        .await;
+        let result = self
+            .with_write_transaction_reserved_lending(
+                write_access,
+                async move |transaction| {
+                    transaction.stage_base_refresh_if_needed().await?;
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .await;
         if result.is_ok() {
             *self.observed_global_head.write().map_err(|_| {
                 LixError::new(
@@ -1938,8 +1941,8 @@ where
         idempotency: ExecuteIdempotency,
     ) -> Result<ExecuteResult, LixError> {
         let mut expired_read_retries = ExpiredReadRetryState::default();
-        if let IdempotencyReceiptResolution::Replay(receipt) =
-            self.resolve_idempotency_receipt_with_expired_read_retry(
+        if let IdempotencyReceiptResolution::Replay(receipt) = self
+            .resolve_idempotency_receipt_with_expired_read_retry(
                 &idempotency,
                 &mut expired_read_retries,
             )
@@ -2391,11 +2394,8 @@ where
                         Ok(results) => return Ok(results),
                         Err(error)
                             if error.code == LixError::CODE_STORAGE_READ_EXPIRED
-                                && retry_expired_auto_commit(
-                                    &mut expired_read_retries,
-                                    &error,
-                                )
-                                .await =>
+                                && retry_expired_auto_commit(&mut expired_read_retries, &error)
+                                    .await =>
                         {
                             continue;
                         }
@@ -2413,17 +2413,17 @@ where
                                 )
                                 .await
                             {
-                            Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
-                                // See the single-statement recovery path:
-                                // positive receipt proof means a commit
-                                // happened after its normal invalidation
-                                // callback was bypassed by an ambiguous error.
-                                self.observe_invalidation.bump();
-                                self.file_views.clear();
-                                receipt.into_results()
-                            }
-                            Ok(IdempotencyReceiptResolution::Absent) => Err(error),
-                            Err(recovery_error) => Err(recovery_error),
+                                Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
+                                    // See the single-statement recovery path:
+                                    // positive receipt proof means a commit
+                                    // happened after its normal invalidation
+                                    // callback was bypassed by an ambiguous error.
+                                    self.observe_invalidation.bump();
+                                    self.file_views.clear();
+                                    receipt.into_results()
+                                }
+                                Ok(IdempotencyReceiptResolution::Absent) => Err(error),
+                                Err(recovery_error) => Err(recovery_error),
                             };
                         }
                         Err(error) => return Err(error),
@@ -2657,6 +2657,7 @@ where
                             functions: FunctionProviderHandle::system(),
                             plugin_host: self.plugin_host.clone(),
                             file_views: file_view_collector.clone(),
+                            sync_role: self.sync_mode.role(),
                         };
                         let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
                         let mut results = Vec::with_capacity(statements.len());
@@ -2871,6 +2872,7 @@ where
                             functions: FunctionProviderHandle::system(),
                             plugin_host: self.plugin_host.clone(),
                             file_views: file_view_collector.clone(),
+                            sync_role: self.sync_mode.role(),
                         };
                         let read_session =
                             sql2::prepare_read_session_at_head(&ctx, active_branch_head, &parsed)
@@ -3169,6 +3171,7 @@ where
                 functions: FunctionProviderHandle::system(),
                 plugin_host: self.plugin_host.clone(),
                 file_views: None,
+                sync_role: self.sync_mode.role(),
             };
             let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
             if let Some((spec, row_pk)) = resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
@@ -3209,6 +3212,7 @@ where
                 functions: FunctionProviderHandle::system(),
                 plugin_host: self.plugin_host.clone(),
                 file_views: None,
+                sync_role: self.sync_mode.role(),
             };
             let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
             if let Some((spec, identities)) =
@@ -3269,6 +3273,7 @@ where
             functions: functions.clone(),
             plugin_host: self.plugin_host.clone(),
             file_views: file_view_collector.clone(),
+            sync_role: self.sync_mode.role(),
         };
 
         let read_session =
@@ -5803,9 +5808,7 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
     use crate::row_pk::RowPk;
-    use crate::storage_adapter::{
-        MemoryRead, MemoryWrite, StorageError, StorageSessionToken,
-    };
+    use crate::storage_adapter::{MemoryRead, MemoryWrite, StorageError, StorageSessionToken};
     use crate::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, TelemetryValue};
     use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
     use crate::{
@@ -5849,11 +5852,10 @@ mod tests {
 
         fn expire_after_reads(&self, reads_until_expiry: usize, count: usize) {
             assert!(count > 0);
-            *self.schedule.lock().expect("expiry schedule should lock") =
-                Some(ExpirySchedule {
-                    reads_until_expiry,
-                    remaining_expiries: count,
-                });
+            *self.schedule.lock().expect("expiry schedule should lock") = Some(ExpirySchedule {
+                reads_until_expiry,
+                remaining_expiries: count,
+            });
         }
 
         fn remaining_expiries(&self) -> usize {
@@ -8384,37 +8386,37 @@ mod tests {
                     Value::Text(format!("packed-{row_index:04}")),
                     Value::Text(format!("{row_index:04}")),
                 ],
-        })
-        .collect::<Vec<_>>();
-        session.execute_batch(&replacement_statements).await.unwrap();
+            })
+            .collect::<Vec<_>>();
+        session
+            .execute_batch(&replacement_statements)
+            .await
+            .unwrap();
         assert_current_head_uses_packed_delta_without_columnar_sidecar(
             &session,
             "packed_replacement_working_diff_probe",
             ROW_COUNT as u64,
         )
         .await;
-		let branch_id = session.active_branch_id().await.unwrap();
-		let read = session
-			.storage
-			.begin_read(StorageReadOptions::default())
-			.await
-			.unwrap();
-		let control = crate::branch::BranchHeadControlContext::new()
-			.reader(&read)
-			.load(&branch_id)
-			.await
-			.unwrap()
-			.unwrap();
-		drop(read);
-		let checkpoint_commit_id = control
-			.working_diff_checkpoint_commit_id
-			.expect("working checkpoint should be active")
-			.to_string();
-		let head_commit_id = control.head_commit_id.to_string();
-		crate::tracked_state::arm_diff_commits_test_probe(
-			&checkpoint_commit_id,
-			&head_commit_id,
-		);
+        let branch_id = session.active_branch_id().await.unwrap();
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(read);
+        let checkpoint_commit_id = control
+            .working_diff_checkpoint_commit_id
+            .expect("working checkpoint should be active")
+            .to_string();
+        let head_commit_id = control.head_commit_id.to_string();
+        crate::tracked_state::arm_diff_commits_test_probe(&checkpoint_commit_id, &head_commit_id);
 
         let diff = session
             .execute(
@@ -8428,15 +8430,18 @@ mod tests {
             )
             .await
             .expect("ambiguous packed payload comparison should resolve locally");
-        assert_eq!(diff.rows()[0].get::<i64>("count").unwrap(), ROW_COUNT as i64);
-		assert_eq!(
-			crate::tracked_state::take_diff_commits_test_probe(
-				&checkpoint_commit_id,
-				&head_commit_id,
-			),
-			0,
-			"packed replacements over clean HOT rows must remain local",
-		);
+        assert_eq!(
+            diff.rows()[0].get::<i64>("count").unwrap(),
+            ROW_COUNT as i64
+        );
+        assert_eq!(
+            crate::tracked_state::take_diff_commits_test_probe(
+                &checkpoint_commit_id,
+                &head_commit_id,
+            ),
+            0,
+            "packed replacements over clean HOT rows must remain local",
+        );
     }
 
     #[tokio::test]
@@ -8738,7 +8743,8 @@ mod tests {
                 },
                 ExecuteBatchStatement {
                     label: None,
-                    sql: "INSERT INTO mixed_batch_second (id, value, enabled) VALUES ($1, $2, $3)".to_owned(),
+                    sql: "INSERT INTO mixed_batch_second (id, value, enabled) VALUES ($1, $2, $3)"
+                        .to_owned(),
                     params: vec![
                         Value::Text("second".to_owned()),
                         Value::Text("two".to_owned()),
@@ -11366,10 +11372,10 @@ mod tests {
         );
         let row = &result.rows()[0];
 
-		assert_eq!(
-			result.column_types(),
-			&[ResultColumnType::Text, ResultColumnType::Boolean]
-		);
+        assert_eq!(
+            result.column_types(),
+            &[ResultColumnType::Text, ResultColumnType::Boolean]
+        );
         assert_eq!(row.get::<String>("title").unwrap(), "Hello");
         assert!(row.get::<bool>("done").unwrap());
         assert_eq!(
@@ -11396,10 +11402,10 @@ mod tests {
         let result = ExecuteResult::from_columnar_result(fields, batches, Vec::new());
 
         assert_eq!(result.columns(), ["id", "title"]);
-		assert_eq!(
-			result.column_types(),
-			&[ResultColumnType::Integer, ResultColumnType::Text]
-		);
+        assert_eq!(
+            result.column_types(),
+            &[ResultColumnType::Integer, ResultColumnType::Text]
+        );
         assert!(
             result
                 .backing
@@ -11483,13 +11489,8 @@ mod tests {
     #[test]
     fn mutation_result_equality_is_independent_of_empty_backing_representation() {
         let inline = ExecuteResult::from_rows_affected(7);
-        let materialized = ExecuteResult::from_query_parts(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            7,
-            Vec::new(),
-        );
+        let materialized =
+            ExecuteResult::from_query_parts(Vec::new(), Vec::new(), Vec::new(), 7, Vec::new());
 
         assert_eq!(inline, materialized);
     }

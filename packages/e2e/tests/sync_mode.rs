@@ -22,7 +22,8 @@ use lix::server_protocol::{
 };
 use lix::storage::Storage;
 use lix::{
-    CreateBranchOptions, ExecuteBatchStatement, Lix, Memory, MergeBranchOptions, ServerOptions,
+    CreateBranchOptions, ExecuteBatchStatement, InternalSyncCacheOptions, Lix, Memory,
+    MergeBranchOptions,
     SwitchBranchOptions, Value, WireValue, open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
@@ -69,6 +70,9 @@ struct HotStateProfileCase {
     bootstrap_allocations: benchmark_metrics::AllocationMetrics,
     working_diff_elapsed: Duration,
     working_diff_allocations: benchmark_metrics::AllocationMetrics,
+    selected_content_bytes: usize,
+    selected_content_elapsed: Duration,
+    selected_content_allocations: benchmark_metrics::AllocationMetrics,
     snapshot_row_pulls: u64,
     bootstrap_history_gets: u64,
     working_diff_history_gets: u64,
@@ -107,6 +111,16 @@ impl HotStateProfileCase {
                 "process_rss_end_bytes": self.working_diff_allocations.process_rss_end_bytes,
                 "history_gets": self.working_diff_history_gets,
             },
+            "selected_working_file": {
+                "payload_bytes": self.selected_content_bytes,
+                "elapsed_ns": duration_nanos(self.selected_content_elapsed),
+                "allocation_count": self.selected_content_allocations.allocation_count,
+                "allocated_bytes": self.selected_content_allocations.allocated_bytes,
+                "live_bytes_delta": self.selected_content_allocations.live_bytes_delta,
+                "peak_live_bytes_delta": self.selected_content_allocations.peak_live_bytes_delta,
+                "process_rss_start_bytes": self.selected_content_allocations.process_rss_start_bytes,
+                "process_rss_end_bytes": self.selected_content_allocations.process_rss_end_bytes,
+            },
         })
     }
 }
@@ -123,6 +137,7 @@ async fn certified_hot_state_profile_scorecard() {
     let shallow = profile_certified_hot_case("history-shallow", 256, 32, 2).await;
     let deep = profile_certified_hot_case("history-deep", 256, 32, 64).await;
     let wide = profile_certified_hot_case("rows-wide", 768, 96, 2).await;
+    let tombstone_checkpoint = profile_net_zero_tombstone_checkpoint(128).await;
 
     assert_eq!(
         shallow.snapshot_row_pulls, deep.snapshot_row_pulls,
@@ -181,9 +196,10 @@ async fn certified_hot_state_profile_scorecard() {
     let artifact = json!({
         "schema": "lix.certified-hot-state-profile-artifact.v1",
         "contract": {
-            "bootstrap": "O(live head rows + distinct checkpoint rows + branch metadata), independent of cold history depth",
-            "working_diff": "O(dirty identities), with no cold-history request",
-            "memory": "O(transferred HOT payload + dirty identity metadata)",
+            "bootstrap": "O(M log M + (B + Q)M), independent of cold history depth H",
+            "working_diff": "O(D log D), with no cold-history request",
+            "selected_working_file": "O(S + A_f log A_f + P_f) exact HOT file-id read; O(A_f + P_f) transient memory",
+            "memory": "O(transferred HOT payload P + distinct bootstrap rows M)",
             "measurement_boundary": "in-process sync client plus HTTP authority",
         },
         "assertions": {
@@ -193,6 +209,7 @@ async fn certified_hot_state_profile_scorecard() {
             "allocator_growth_envelopes_passed": true,
         },
         "cases": case_records,
+        "net_zero_tombstone_checkpoint": tombstone_checkpoint,
     });
     if let Some(output) = std::env::var_os("LIX_HOT_STATE_PROFILE_OUTPUT") {
         let output = Path::new(&output);
@@ -208,6 +225,105 @@ async fn certified_hot_state_profile_scorecard() {
         )
         .expect("write HOT profile artifact");
     }
+}
+
+async fn profile_net_zero_tombstone_checkpoint(churn_rows: usize) -> JsonValue {
+    let (authority_storage, authority) = open_authority().await;
+    authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .expect("checkpoint tombstone profile baseline");
+    for index in 0..churn_rows {
+        let path = format!("/net-zero-profile-{index:05}.txt");
+        authority
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    label: None,
+                    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)".to_owned(),
+                    params: vec![
+                        Value::Text(path.clone()),
+                        Value::Blob(b"temporary".to_vec().into()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    label: None,
+                    sql: "DELETE FROM lix_file WHERE path = $1".to_owned(),
+                    params: vec![Value::Text(path)],
+                },
+            ])
+            .await
+            .expect("create net-zero retained tombstone");
+    }
+    authority.close().await.expect("close churn authority");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
+    let pre_dir = TempDir::new().expect("pre-checkpoint replica tempdir");
+    let pre = open_replica(pre_dir.path(), &url).await;
+    let pre_scope = AllocationScope::start();
+    let pre_count = pre
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_working_diff('lix_file')",
+            &[],
+        )
+        .await
+        .expect("query net-zero working diff before checkpoint")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("working diff count is integer");
+    let pre_allocations = pre_scope.finish();
+    assert_eq!(pre_count, 0);
+    pre.close().await.expect("close pre-checkpoint replica");
+    stop_server(server_task).await;
+
+    let (_, checkpoint_server_task, checkpoint_authority) =
+        serve_with_authority_session(authority_storage.clone(), Arc::default()).await;
+    checkpoint_authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await;
+    drop(checkpoint_authority);
+    stop_server(checkpoint_server_task).await;
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage, Arc::clone(&probe)).await;
+    let post_dir = TempDir::new().expect("post-checkpoint replica tempdir");
+    let post = open_replica(post_dir.path(), &url).await;
+    let post_scope = AllocationScope::start();
+    let post_count = post
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_working_diff('lix_file')",
+            &[],
+        )
+        .await
+        .expect("query working diff after tombstone checkpoint")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("working diff count is integer");
+    let post_allocations = post_scope.finish();
+    assert_eq!(post_count, 0);
+    assert_bounded_growth(
+        "post-checkpoint net-zero tombstone peak live bytes",
+        pre_allocations.peak_live_bytes_delta,
+        post_allocations.peak_live_bytes_delta,
+        2,
+        1024 * 1024,
+    );
+    post.close().await.expect("close post-checkpoint replica");
+    stop_server(server_task).await;
+
+    json!({
+        "churn_rows": churn_rows,
+        "working_diff_rows_before_checkpoint": pre_count,
+        "working_diff_rows_after_checkpoint": post_count,
+        "before_checkpoint": {
+            "allocated_bytes": pre_allocations.allocated_bytes,
+            "peak_live_bytes_delta": pre_allocations.peak_live_bytes_delta,
+        },
+        "after_checkpoint": {
+            "allocated_bytes": post_allocations.allocated_bytes,
+            "peak_live_bytes_delta": post_allocations.peak_live_bytes_delta,
+        },
+    })
 }
 
 async fn profile_certified_hot_case(
@@ -236,7 +352,11 @@ async fn profile_certified_hot_case(
             label: None,
             sql: "UPDATE lix_file SET content = $1 WHERE path = $2".to_owned(),
             params: vec![
-                Value::Blob(format!("dirty-{index:05}").into_bytes().into()),
+                Value::Blob(if index == 0 {
+                    vec![b'x'; 1024 * 1024].into()
+                } else {
+                    format!("dirty-{index:05}").into_bytes().into()
+                }),
                 Value::Text(format!("/hot-profile-row-{index:05}.txt")),
             ],
         })
@@ -293,6 +413,42 @@ async fn profile_certified_hot_case(
         .load(Ordering::Acquire)
         .saturating_sub(history_before_diff);
 
+    let selected_file_id = replica
+        .execute(
+            "SELECT id FROM lix_file WHERE path = '/hot-profile-row-00000.txt'",
+            &[],
+        )
+        .await
+        .expect("load selected HOT profile file id")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("selected HOT profile file id is text");
+    let selected_scope = AllocationScope::start();
+    let selected_started = Instant::now();
+    let selected = replica
+        .execute(
+            "SELECT from_content, to_content FROM lix_working_diff('lix_file') WHERE id = $1",
+            &[Value::Text(selected_file_id)],
+        )
+        .await
+        .expect("load one selected certified working payload");
+    let selected_content_elapsed = selected_started.elapsed();
+    let selected_content_allocations = selected_scope.finish();
+    assert_eq!(selected.rows().len(), 1);
+    let selected_content_bytes = selected.rows()[0]
+        .get::<Value>("to_content")
+        .expect("selected payload exists");
+    let selected_content_bytes = match selected_content_bytes {
+        Value::Blob(bytes) => bytes.len(),
+        other => panic!("selected payload must be bytes, got {other:?}"),
+    };
+    assert_eq!(selected_content_bytes, 1024 * 1024);
+    assert_eq!(
+        probe.history_gets.load(Ordering::Acquire),
+        history_before_diff,
+        "selected working payload must not request cold history",
+    );
+
     let case = HotStateProfileCase {
         label,
         live_rows,
@@ -303,6 +459,9 @@ async fn profile_certified_hot_case(
         bootstrap_allocations,
         working_diff_elapsed,
         working_diff_allocations,
+        selected_content_bytes,
+        selected_content_elapsed,
+        selected_content_allocations,
         snapshot_row_pulls: probe.snapshot_row_pulls.load(Ordering::Acquire),
         bootstrap_history_gets: history_before_diff,
         working_diff_history_gets,
@@ -1569,13 +1728,15 @@ async fn binary_chunks_remain_lazy_until_file_content_is_read() {
 }
 
 async fn open_replica(path: &Path, url: &str) -> Lix<FilesystemStorage> {
-    open_lix()
+    // SAFETY: E2E fixtures intentionally exercise the raw cache worker; tests
+    // assert authority publication before observing application-visible state.
+    unsafe { open_lix()
         .with_storage(
             FilesystemStorage::new(path)
                 .open()
                 .expect("open filesystem storage"),
         )
-        .with_server(ServerOptions::sync(url))
+        .with_internal_sync_cache(InternalSyncCacheOptions::sync(url)) }
         .await
         .expect("open sync replica")
 }

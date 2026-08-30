@@ -27,7 +27,7 @@ rocksdb = ["dep:lix_storage_rocksdb"]
 slatedb = ["dep:lix_storage_slatedb", "dep:object_store", "dep:slatedb", "dep:ulid"]
 storage-benches = ["lix/storage-benches", "rocksdb", "lix_storage_rocksdb/storage-benches"]
 root-replay-trace = ["lix/root-replay-trace", "storage-benches"]
-server-protocol = ["lix/server-protocol"]
+server-protocol = ["lix/server-protocol", "lix/unsafe-internal-sync-cache"]
 tpch = ["dep:duckdb", "dep:tpchgen"]
 # Turns on `lix/default_wasm_runtime` for the SDK tests folded in from the
 # former `lix_tests` crate, which ran with it enabled. It is deliberately not

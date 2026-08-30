@@ -511,6 +511,12 @@ where
                     validate_server_lix_id(lix_id)?;
                 }
                 let engine = self.open.open_protocol_engine().await?;
+                let expected_mutation_revision = engine
+                    .ensure_sync_authority_has_only_synchronized_rows()
+                    .await?;
+                engine
+                    .admit_sync_authority_storage(expected_mutation_revision)
+                    .await?;
                 let lix_id = match identity {
                     ServeLixIdentity::Host(lix_id) => lix_id,
                     ServeLixIdentity::Embedded => engine.lix_id().to_owned(),
@@ -1696,9 +1702,6 @@ where
         options: ServerProtocolOptions,
         lix_id: String,
     ) -> Self {
-        engine
-            .sync_mode()
-            .set_role(crate::sync::SyncRole::Authority);
         let (close_result, _) = watch::channel(None);
         Self {
             inner: Arc::new(ServerInner {
@@ -6338,6 +6341,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_rejects_preexisting_unsynchronized_untracked_rows() {
+        let storage = Memory::new();
+        let lix = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("initialize Lix before serving");
+        lix.execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+             VALUES ('local-only-before-serve', 'forbidden', true)",
+            &[],
+        )
+        .await
+        .expect("non-authority setup may contain untracked state");
+        lix.close().await.expect("close setup Lix");
+
+        let result = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_embedded_lix_id()
+            .await;
+        let Err(error) = result else {
+            panic!("server admission must reject state omitted from sync");
+        };
+        assert_eq!(error.code, "LIX_AUTHORITY_UNTRACKED_UNSUPPORTED");
+
+        let cleanup = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("failed admission must leave ordinary repository writes available");
+        cleanup
+            .execute(
+                "DELETE FROM lix_key_value WHERE key = 'local-only-before-serve'",
+                &[],
+            )
+            .await
+            .expect("the unsupported row should remain recoverable after failed admission");
+        cleanup.close().await.expect("close cleanup engine");
+
+        let recovered = open_lix()
+            .with_storage(storage)
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .expect("serving should succeed after the unsupported row is removed");
+        recovered.close().await.expect("close recovered server");
+    }
+
+    #[tokio::test]
+    async fn durable_authority_marker_fences_a_second_plain_engine() {
+        let storage = Memory::new();
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .expect("authority should claim the shared storage");
+        let plain = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("a second read-capable engine should open");
+
+        let error = plain
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('bypass', 'forbidden')",
+                &[],
+            )
+            .await
+            .expect_err("plain writers must not bypass authority publication");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+        assert!(
+            plain
+                .execute("SELECT * FROM lix_key_value WHERE key = 'bypass'", &[])
+                .await
+                .expect("rejected row absence should query")
+                .rows()
+                .is_empty()
+        );
+
+        plain.close().await.expect("plain engine should close");
+        server.close().await.expect("authority should close");
+        let reopened = open_lix()
+            .with_storage(storage)
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .expect("the exact durable authority claim should reopen");
+        reopened.close().await.expect("reopened authority should close");
+    }
+
+    #[tokio::test]
     async fn fenced_storage_does_not_affect_resumed_cached_handshake() {
         let storage = FencedReadStorage::new();
         let server = open_lix()
@@ -7122,7 +7215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_hydrates_sparse_history_before_applying_its_write() {
+    async fn replica_batch_mixing_history_and_write_requires_the_authority() {
         let authority = open_lix().await.expect("open history authority");
         authority
             .execute(
@@ -7342,16 +7435,13 @@ mod tests {
                 label: None,
             },
         ];
-        let first = replica
+        let error = replica
             .execute_batch(&statements)
             .await
-            .expect("sparse history batch should hydrate and commit");
-        assert!(
-            first[0].rows()[0].get::<i64>("versions").unwrap_or(0) >= 2,
-            "sparse history response: {:?}",
-            first[0]
-        );
-        hydration.await.expect("history hydration task");
+            .expect_err("a replica cannot hydrate history and publish a local write");
+        assert_eq!(error.code, crate::sync::AUTHORITY_EXECUTION_REQUIRED_CODE);
+        hydration.abort();
+        let _ = hydration.await;
 
         let count = replica
             .execute(
@@ -7359,11 +7449,11 @@ mod tests {
                 &[],
             )
             .await
-            .expect("read hydrated batch write");
+            .expect("read rejected batch state");
         assert_eq!(
             count.rows()[0].get::<i64>("count"),
-            Ok(1),
-            "the write runs once after hydration"
+            Ok(0),
+            "the authority-only batch must not publish a replica write"
         );
     }
 
@@ -9850,8 +9940,27 @@ mod tests {
         assert_eq!(second_alive.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn pinned_protocol_sessions_switch_branches_independently() {
+    #[test]
+    fn pinned_protocol_sessions_switch_branches_independently() {
+        // Keep this unusually large straight-line fixture off libtest's small
+        // thread stack. A dedicated stack also makes the fixture independent of
+        // nextest's test-thread stack setting.
+        std::thread::Builder::new()
+            .name("pinned-protocol-session-fixture".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(pinned_protocol_sessions_switch_branches_independently_case());
+            })
+            .expect("fixture thread")
+            .join()
+            .expect("fixture thread should not panic");
+    }
+
+    async fn pinned_protocol_sessions_switch_branches_independently_case() {
         let app = app().await;
         let (first_session, before) = new_session(&app.router).await;
         let (second_session, _) = new_session(&app.router).await;
@@ -13202,10 +13311,11 @@ mod tests {
 
     #[tokio::test]
     async fn sync_replica_configuration_cannot_be_served_as_an_authority() {
-        let result = open_lix()
-            .with_server(lix::ServerOptions::sync(
+        let result = unsafe {
+            open_lix().with_internal_sync_cache(lix::InternalSyncCacheOptions::sync(
                 "https://example.invalid/repository",
             ))
+        }
             .serve()
             .with_embedded_lix_id()
             .await;

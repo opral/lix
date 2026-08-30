@@ -1586,7 +1586,8 @@ async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Si
     )
     .unwrap();
     adapter
-        .commit_write_set(
+        .commit_certified_replica_write_set(
+            super::certified_replica_write_capability(),
             writes,
             crate::storage_adapter::StorageWriteOptions::default(),
         )
@@ -1832,7 +1833,8 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
 		},
 	);
 	adapter
-		.commit_write_set(
+		.commit_certified_replica_write_set(
+			super::certified_replica_write_capability(),
 			writes,
 			crate::storage_adapter::StorageWriteOptions::default(),
 		)

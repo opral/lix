@@ -135,7 +135,7 @@ async fn inspect_tier(
 }
 
 pub(crate) async fn prepare_sync_bootstrap(
-    server: &crate::ServerOptions,
+    server: &crate::InternalSyncCacheOptions,
 ) -> Result<PreparedSyncBootstrap, LixError> {
     let remote_id = server.url.as_str();
     let transport = HttpSyncTransport::connect(remote_id, &server.headers).await?;
@@ -157,7 +157,7 @@ pub(crate) async fn prepare_sync_bootstrap(
 
 pub(crate) async fn install_sync_bootstrap<StorageImpl>(
     lix: &mut Lix<StorageImpl>,
-    server: &crate::ServerOptions,
+    server: &crate::InternalSyncCacheOptions,
     prepared: PreparedSyncBootstrap,
 ) -> Result<HttpSyncTransport, LixError>
 where
@@ -391,7 +391,11 @@ mod tests {
             value,
         );
         adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
+            .commit_certified_replica_write_set(
+                crate::sync::certified_replica_write_capability(),
+                writes,
+                StorageWriteOptions::default(),
+            )
             .await
             .expect("replica state should commit");
     }

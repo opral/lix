@@ -15,10 +15,10 @@ use lix::telemetry::{CallbackTelemetrySink, SpanContext, TelemetrySink, instrume
 use lix::{
     BROWSER_TRANSPORT_CONFIG_HEADER, CreateBranchOptions as RsCreateBranchOptions,
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
-    Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
+    InternalSyncCacheOptions, Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreviewOptions,
     ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
-    ServerOptions, SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
+    StatementAuthorityRoute, SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
     register_browser_sync_transport, unregister_browser_sync_transport,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -581,7 +581,7 @@ async fn open_browser_storage(
                     .push((BROWSER_TRANSPORT_CONFIG_HEADER.to_owned(), id.clone()));
                 browser_sync_transport_id = Some(id);
             }
-            Some(ServerOptions::sync(parsed.url).with_headers(parsed.headers))
+            Some(InternalSyncCacheOptions::sync(parsed.url).with_headers(parsed.headers))
         }
         None => None,
     };
@@ -594,7 +594,10 @@ async fn open_browser_storage(
             builder = builder.with_open_progress_sink(open_progress);
         }
         match (server, snapshot) {
-            (Some(server), None) => builder.with_server(server).await,
+            // SAFETY: the worker never exposes this raw sync binding. The JS
+            // open path immediately wraps it with the paired authority binding
+            // and its publication/alignment gates.
+            (Some(server), None) => unsafe { builder.with_internal_sync_cache(server) }.await,
             (None, Some(snapshot)) => builder.from_snapshot(snapshot).await,
             (None, None) => builder.await,
             (Some(_), Some(_)) => Err(LixError::new(
@@ -741,6 +744,14 @@ fn open_phase_name(phase: OpenPhase) -> &'static str {
     }
 }
 
+fn authority_route_name(route: StatementAuthorityRoute) -> &'static str {
+    match route {
+        StatementAuthorityRoute::HotRead => "hot",
+        StatementAuthorityRoute::AuthorityRead => "history",
+        StatementAuthorityRoute::AuthorityWrite => "mutation",
+    }
+}
+
 #[wasm_bindgen]
 impl WasmLix {
     #[wasm_bindgen(js_name = openReport)]
@@ -869,6 +880,16 @@ impl WasmLix {
             .collect::<Result<Vec<_>, _>>()
             .map_err(lix_error_to_js)?;
         to_js(&results)
+    }
+
+    #[wasm_bindgen(js_name = executionRoute)]
+    pub async fn execution_route(&self, statements: JsValue) -> Result<String, JsValue> {
+        let statements = from_js::<Vec<String>>(statements)?;
+        self.inner
+            .execution_authority_route(&statements)
+            .map(authority_route_name)
+            .map(str::to_owned)
+            .map_err(lix_error_to_js)
     }
 
     #[wasm_bindgen(js_name = observe)]

@@ -2,13 +2,13 @@ use lix::telemetry::{CallbackTelemetrySink, SpanContext, TelemetrySink, instrume
 use lix::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
-    Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
+    InternalSyncCacheOptions, Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
     ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
-    RedoReceipt, ServerOptions, SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt,
-    UndoReceipt, Value, open_lix,
+    RedoReceipt, StatementAuthorityRoute, SwitchBranchOptions as RsSwitchBranchOptions,
+    SwitchBranchReceipt, UndoReceipt, Value, open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
 use napi::JsDeferred;
@@ -187,6 +187,14 @@ fn open_phase_name(phase: OpenPhase) -> &'static str {
     }
 }
 
+fn authority_route_name(route: StatementAuthorityRoute) -> &'static str {
+    match route {
+        StatementAuthorityRoute::HotRead => "hot",
+        StatementAuthorityRoute::AuthorityRead => "history",
+        StatementAuthorityRoute::AuthorityWrite => "mutation",
+    }
+}
+
 #[napi(object)]
 #[expect(missing_debug_implementations)]
 pub struct NativeExecuteBatchStatement {
@@ -282,6 +290,10 @@ enum LixCommand {
         statements: Vec<RsExecuteBatchStatement>,
         options: Option<String>,
         deferred: NativeExecuteBatchDeferred,
+    },
+    ExecutionRoute {
+        statements: Vec<String>,
+        deferred: NativeStringDeferred,
     },
     BeginTransaction {
         transaction_id: u64,
@@ -904,6 +916,7 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
                 deferred.reject(to_napi_error(&error))
             }
             LixCommand::ExecuteBatch { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::ExecutionRoute { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::BeginTransaction { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveAccountId(deferred) => deferred.reject(to_napi_error(&error)),
@@ -983,6 +996,18 @@ fn handle_lix_command(
                         .map(ExecuteResult::try_from)
                         .collect::<std::result::Result<Vec<_>, _>>()
                 });
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::ExecutionRoute {
+            statements,
+            deferred,
+        } => {
+            let result = state
+                .lix
+                .execution_authority_route(&statements)
+                .map(authority_route_name)
+                .map(str::to_owned);
             settle_deferred(deferred, result);
             false
         }
@@ -1238,6 +1263,9 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::ExecuteBatch { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::ExecutionRoute { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
         LixCommand::BeginTransaction { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -1348,6 +1376,16 @@ impl NativeLixInner {
                     None => execution.await,
                 }
             }
+        }
+    }
+
+    fn execution_authority_route(
+        &self,
+        statements: &[String],
+    ) -> std::result::Result<StatementAuthorityRoute, LixError> {
+        match self {
+            Self::Memory(lix) => lix.execution_authority_route(statements),
+            Self::FilesystemStorage(lix, _, _) => lix.execution_authority_route(statements),
         }
     }
 
@@ -1706,7 +1744,15 @@ fn open_memory_native(
         builder = builder.with_open_progress_sink(open_progress_sink(dispatch));
     }
     if let Some(url) = server_url {
-        builder = builder.with_server(ServerOptions::sync(url).with_headers(server_headers));
+        // SAFETY: this binding is not returned directly for sync mode. The JS
+        // open path immediately pairs it with an authority session and wraps
+        // it in `authoritativeHotBinding`, which enforces the cursor barrier,
+        // authority-only routes, session alignment, and terminal close rules.
+        builder = unsafe {
+            builder.with_internal_sync_cache(
+                InternalSyncCacheOptions::sync(url).with_headers(server_headers),
+            )
+        };
     }
     let lix = rt.block_on(instrument_remote_parent(telemetry_parent, async move {
         match snapshot {
@@ -1728,6 +1774,12 @@ fn open_filesystem_storage_native(
     server_headers: Vec<(String, String)>,
     snapshot: Option<NativeSnapshotSource>,
 ) -> std::result::Result<NativeLix, LixError> {
+    if server_url.is_some() {
+        return Err(LixError::new(
+            "LIX_AUTHORITY_FILESYSTEM_UNSUPPORTED",
+            "server sync mode does not support filesystem storage because disk-to-Lix imports cannot bypass the authoritative server",
+        ));
+    }
     let rt = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1746,7 +1798,13 @@ fn open_filesystem_storage_native(
         builder = builder.with_open_progress_sink(open_progress_sink(dispatch));
     }
     if let Some(url) = server_url {
-        builder = builder.with_server(ServerOptions::sync(url).with_headers(server_headers));
+        // SAFETY: see the memory-storage sync open above; filesystem imports
+        // are additionally rejected by the JS sync-mode entry point.
+        builder = unsafe {
+            builder.with_internal_sync_cache(
+                InternalSyncCacheOptions::sync(url).with_headers(server_headers),
+            )
+        };
     }
     let lix = rt.block_on(instrument_remote_parent(telemetry_parent, async move {
         match snapshot {
@@ -1974,6 +2032,21 @@ impl NativeLix {
             .send_with_deferred(deferred, |deferred| LixCommand::ExecuteBatch {
                 statements,
                 options,
+                deferred,
+            });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "executionRoute")]
+    pub fn execution_route<'env>(
+        &self,
+        env: &'env Env,
+        statements: Vec<String>,
+    ) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeStringDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::ExecutionRoute {
+                statements,
                 deferred,
             });
         Ok(promise)

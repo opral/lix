@@ -437,6 +437,17 @@ simulation_test!(
             assert_eq!(rows[index][3], Value::Text("added".to_string()));
         }
 
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT from_content, to_content FROM lix_working_diff('lix_file') \
+                 WHERE to_path = '/one.txt'",
+            )
+            .await,
+            vec![vec![Value::Null, Value::Blob(b"one".to_vec().into())]],
+            "working review content must come from the certified HOT payload",
+        );
+
         let error = session
             .execute("SELECT * FROM lix_working_diff('lix_file', 'a', 'b')", &[])
             .await
@@ -444,6 +455,38 @@ simulation_test!(
         assert!(
             error.message.contains("exactly one relation argument"),
             "unexpected error: {error:?}"
+        );
+
+        session
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("file content baseline checkpoint should succeed");
+        session
+            .execute(
+                "UPDATE lix_file SET content = CAST('updated' AS BYTEA) WHERE path = '/one.txt'",
+                &[],
+            )
+            .await
+            .expect("file content update should succeed");
+        session
+            .execute("DELETE FROM lix_file WHERE path = '/two.txt'", &[])
+            .await
+            .expect("file removal should succeed");
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT from_content, to_content FROM lix_working_diff('lix_file') \
+                 ORDER BY coalesce(to_path, from_path)",
+            )
+            .await,
+            vec![
+                vec![
+                    Value::Blob(b"one".to_vec().into()),
+                    Value::Blob(b"updated".to_vec().into()),
+                ],
+                vec![Value::Blob(b"two".to_vec().into()), Value::Null],
+            ],
+            "modified and removed working files must retain both certified content sides",
         );
     }
 );

@@ -48,6 +48,23 @@ test("parseSqlScript is not part of the JavaScript SDK export surface", async ()
 	expect("SqlScriptStatement" in sdk).toBe(false);
 });
 
+test("connected sync mode rejects filesystem storage before disk imports can bypass authority", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "lix-authority-filesystem-"));
+	const storage = new FilesystemStorage({ path: dir, syncAllFiles: true });
+	try {
+		await expect(
+			openLix({
+				storage,
+				server: { mode: "sync", url: "https://authority.invalid" },
+			}),
+		).rejects.toThrow(
+			"sync mode does not support filesystem storage because disk-to-Lix imports cannot bypass the authoritative server",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("snapshot streams restore a complete Lix deterministically", async () => {
 	const source = await openLix();
 	await source.execute(

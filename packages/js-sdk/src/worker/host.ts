@@ -223,6 +223,16 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 					operation.statements,
 					operation.options,
 				);
+			case "executionRoute": {
+				const binding = requiredLix(sessionId);
+				const executionRoute = binding.executionRoute;
+				if (!executionRoute) {
+					throw workerStateError(
+						"this Lix binding cannot classify authoritative execution",
+					);
+				}
+				return executionRoute.call(binding, operation.statements);
+			}
 			case "beginTransaction": {
 				const transaction = await requiredLix(sessionId).beginTransaction();
 				const transactionId = nextTransactionId++;

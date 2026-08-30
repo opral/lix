@@ -1,6 +1,6 @@
 pub(crate) mod common;
-pub(crate) mod execution_slots;
 mod current_timestamp;
+pub(crate) mod execution_slots;
 mod lix_active_account_id;
 mod lix_active_branch_commit_id;
 mod lix_active_branch_id;
@@ -12,6 +12,7 @@ mod lix_latest_checkpoint_commit_id;
 mod lix_octet_length;
 mod lix_root_commit_id;
 mod lix_row_ref;
+mod lix_sync_publication_cursor;
 mod uuidv7;
 
 use std::sync::Arc;
@@ -77,15 +78,20 @@ pub(crate) fn register_execution_sql2_functions(ctx: &SessionContext, slots: Arc
         lix_active_branch_commit_id::LixActiveBranchCommitId::new(Arc::clone(&slots)),
     ));
     ctx.register_udf(ScalarUDF::from(
-        lix_latest_checkpoint_commit_id::LixLatestCheckpointCommitId::new(Arc::clone(&slots)),
+        lix_sync_publication_cursor::LixSyncPublicationCursor::new(Arc::clone(&slots)),
     ));
     ctx.register_udf(ScalarUDF::from(
-        lix_root_commit_id::LixRootCommitId::new(Arc::clone(&slots)),
+        lix_latest_checkpoint_commit_id::LixLatestCheckpointCommitId::new(Arc::clone(&slots)),
     ));
+    ctx.register_udf(ScalarUDF::from(lix_root_commit_id::LixRootCommitId::new(
+        Arc::clone(&slots),
+    )));
     ctx.register_udf(ScalarUDF::from(uuidv7::UuidV7 {
         slots: Arc::clone(&slots),
     }));
-    ctx.register_udf(ScalarUDF::from(current_timestamp::CurrentTimestamp { slots }));
+    ctx.register_udf(ScalarUDF::from(current_timestamp::CurrentTimestamp {
+        slots,
+    }));
 }
 
 /// Points the session's execution functions at this statement's facts.
@@ -95,6 +101,7 @@ pub(crate) fn bind_execution_sql2_functions(
     active_account_id: &str,
     active_branch_id: Option<&str>,
     active_branch_commit_id: Option<&str>,
+    sync_publication_cursor: Option<&str>,
     latest_checkpoint_commit_id: Option<&str>,
     root_commit_id: Option<&str>,
 ) {
@@ -103,6 +110,7 @@ pub(crate) fn bind_execution_sql2_functions(
         active_account_id,
         active_branch_id,
         active_branch_commit_id,
+        sync_publication_cursor,
         latest_checkpoint_commit_id,
         root_commit_id,
     );
@@ -120,6 +128,7 @@ pub(super) mod test_support {
             &ctx,
             system_sql2_function_provider(),
             crate::ANONYMOUS_ACCOUNT_ID,
+            None,
             None,
             None,
             None,

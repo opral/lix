@@ -7,6 +7,8 @@ use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
 use crate::hot_state::HotStateContext;
+#[cfg(feature = "server-protocol")]
+use crate::hot_state::{HotStateFilter, HotStateScanRequest};
 use crate::hot_state::HotStateRowRequest;
 use crate::init::InitReceipt;
 use crate::observe_coordinator::ObserveCoordinator;
@@ -282,6 +284,52 @@ where
 
     pub(crate) fn lix_id(&self) -> &str {
         &self.lix_id
+    }
+
+    #[cfg(feature = "server-protocol")]
+    pub(crate) async fn ensure_sync_authority_has_only_synchronized_rows(
+        &self,
+    ) -> Result<Option<bytes::Bytes>, LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let rows = self
+            .hot_state
+            .reader(read.clone())
+            .scan_batch(&HotStateScanRequest {
+                filter: HotStateFilter {
+                    untracked: Some(true),
+                    ..HotStateFilter::default()
+                },
+                ..HotStateScanRequest::default()
+            })
+            .await?;
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row.schema_key() != crate::branch::BRANCH_REF_SCHEMA_KEY)
+        {
+            return Err(LixError::new(
+                "LIX_AUTHORITY_UNTRACKED_UNSUPPORTED",
+                format!(
+                    "repository authority contains unsynchronized untracked row '{}'; track or remove it before serving",
+                    row.schema_key()
+                ),
+            ));
+        }
+        Ok(crate::storage_adapter::load_repository_mutation_revision(&read).await?)
+    }
+
+    #[cfg(feature = "server-protocol")]
+    pub(crate) async fn admit_sync_authority_storage(
+        &self,
+        expected_mutation_revision: Option<bytes::Bytes>,
+    ) -> Result<(), LixError> {
+        crate::sync::admit_sync_authority_storage(&self.storage, expected_mutation_revision)
+            .await?;
+        self.sync_mode.set_role(crate::sync::SyncRole::Authority);
+        Ok(())
     }
 
     pub(crate) fn set_lix_id_for_sync(&mut self, lix_id: String) {

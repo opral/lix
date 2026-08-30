@@ -717,7 +717,6 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// uses this lane for its completed manifest and upload receipt.
     atomic_metadata_writes: Option<StorageWriteSet>,
     atomic_metadata_preconditions: Vec<StoragePrecondition>,
-    suppress_ordinary_sync_event: bool,
     sync_role: crate::sync::SyncRole,
     sync_replica_remote_id: Option<Arc<str>>,
     await_durable_commit: bool,
@@ -1694,7 +1693,6 @@ where
                     idempotency_receipt: None,
                     atomic_metadata_writes: None,
                     atomic_metadata_preconditions: Vec::new(),
-                    suppress_ordinary_sync_event: false,
                     sync_role: crate::sync::SyncRole::Disabled,
                     sync_replica_remote_id: None,
                     await_durable_commit: false,
@@ -1784,6 +1782,10 @@ where
                 || !prepared_writes.extra_commit_parents_by_branch.is_empty();
             let has_untracked_state_writes =
                 prepared_writes.state_rows.iter().any(|row| row.untracked);
+            let has_unsynchronized_untracked_state_writes = prepared_writes
+                .state_rows
+                .iter()
+                .any(|row| row.untracked && row.schema_key != BRANCH_REF_SCHEMA_KEY);
             // Untracked rows are mutable current state, but their validation can read
             // tracked schemas, parents, uniqueness owners, or filesystem state.
             // Fence that snapshot without rotating the tracked revision: normal
@@ -1812,6 +1814,32 @@ where
             // current coherent snapshot, while user statements above observed the
             // snapshot retained from transaction open.
             transaction.opening_read = read.clone();
+            // A durable authority receipt turns this storage into a certified
+            // replica cache. The fence is deliberately storage-derived rather
+            // than process-local: a second engine or process which opens the
+            // same adapter without selecting replica mode must still be unable
+            // to publish ordinary local state. Certified sync installation is
+            // the only crate-internal path allowed to suppress this guard.
+            if crate::sync::has_any_sync_replica_state(&read).await? {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(LixError::new(
+                    "LIX_REPLICA_CACHE_READ_ONLY",
+                    "a certified sync replica cache can only be changed by the authoritative server",
+                ));
+            }
+            if transaction.sync_role == crate::sync::SyncRole::Authority
+                && has_unsynchronized_untracked_state_writes
+            {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(LixError::new(
+                    "LIX_AUTHORITY_UNTRACKED_UNSUPPORTED",
+                    "repository authorities require synchronized tracked rows; untracked state is unsupported",
+                ));
+            }
             if let Err(error) = transaction
                 .reconcile_stale_disjoint_writes(&read, &mut prepared_writes)
                 .instrument(tracing::debug_span!(
@@ -1902,11 +1930,9 @@ where
             let previous_filesystem_revision = loaded_filesystem_revision.flatten();
             let mut automatic_sync_writes = transaction.storage.new_write_set();
             let mut automatic_sync_preconditions = Vec::new();
-            let capture_sync_commits = !transaction.suppress_ordinary_sync_event
-                && transaction.sync_role == crate::sync::SyncRole::Authority;
-            if !transaction.suppress_ordinary_sync_event
-                && transaction.sync_role == crate::sync::SyncRole::Replica
-            {
+            let capture_sync_commits =
+                transaction.sync_role == crate::sync::SyncRole::Authority;
+            if transaction.sync_role == crate::sync::SyncRole::Replica {
                 // The immutable commit and ref are the durable outbox.
                 // `build_sync_push` discovers unpublished local heads; no second
                 // row-pack queue is maintained.
@@ -7291,10 +7317,6 @@ where
         }
         self.idempotency_receipt = Some(encode_receipt(idempotency, receipt)?);
         Ok(())
-    }
-
-    pub(crate) fn suppress_ordinary_sync_event(&mut self) {
-        self.suppress_ordinary_sync_event = true;
     }
 
     /// Returns the content identity of the SQL schema catalog captured when

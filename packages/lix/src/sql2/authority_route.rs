@@ -9,10 +9,14 @@ use datafusion::sql::sqlparser::ast::{TableFactor, Visit, Visitor};
 /// local serving plane. Mutations and historical reads belong to the
 /// authority; keeping this classification beside the SQL parser avoids a
 /// second, text-based dialect in clients.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StatementAuthorityRoute {
+pub enum StatementAuthorityRoute {
+    /// A certified current-state read which may execute on the hot replica.
     HotRead,
+    /// A historical read which must execute on the authority.
     AuthorityRead,
+    /// A mutation which must execute on the authority.
     AuthorityWrite,
 }
 
@@ -20,6 +24,9 @@ pub(crate) fn statement_authority_route(
     statement: &DataFusionStatement,
 ) -> Result<StatementAuthorityRoute, crate::LixError> {
     if super::bind_statement_route(statement)? == super::BoundStatementRoute::Write {
+        return Ok(StatementAuthorityRoute::AuthorityWrite);
+    }
+    if super::statement_has_durable_runtime_function(statement) {
         return Ok(StatementAuthorityRoute::AuthorityWrite);
     }
 
@@ -36,8 +43,8 @@ pub(crate) fn statement_authority_route(
                 && ["lix_change", "lix_checkpoint", "lix_commit"]
                     .iter()
                     .any(|surface| {
-                    crate::sql2::parse::object_name_is_public_function(name, surface)
-                });
+                        crate::sql2::parse::object_name_is_public_function(name, surface)
+                    });
             let historical_function = args.is_some()
                 && [
                     "lix_commit_ancestry",
@@ -46,9 +53,7 @@ pub(crate) fn statement_authority_route(
                     "lix_state_at",
                 ]
                 .iter()
-                .any(|surface| {
-                    crate::sql2::parse::object_name_is_public_function(name, surface)
-                });
+                .any(|surface| crate::sql2::parse::object_name_is_public_function(name, surface));
             if historical_table || historical_function {
                 ControlFlow::Break(())
             } else {
@@ -86,7 +91,10 @@ mod tests {
 
     #[test]
     fn routes_only_certified_current_surfaces_to_the_hot_plane() {
-        assert_eq!(route("SELECT * FROM lix_file"), StatementAuthorityRoute::HotRead);
+        assert_eq!(
+            route("SELECT * FROM lix_file"),
+            StatementAuthorityRoute::HotRead
+        );
         assert_eq!(
             route("SELECT * FROM lix_working_diff('lix_file')"),
             StatementAuthorityRoute::HotRead
@@ -110,5 +118,8 @@ mod tests {
             route("UPDATE lix_file SET path = '/b' WHERE path = '/a'"),
             StatementAuthorityRoute::AuthorityWrite
         );
+        for sql in ["SELECT uuidv7()", "SELECT current_timestamp"] {
+            assert_eq!(route(sql), StatementAuthorityRoute::AuthorityWrite, "{sql}");
+        }
     }
 }

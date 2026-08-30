@@ -87,6 +87,11 @@ async function openLixInternal(
 			"openLix() sync mode requires a durability-capable storage adapter",
 		);
 	}
+	if (syncServer !== undefined && isLixStorage(options.storage)) {
+		throw new TypeError(
+			"openLix() sync mode does not support filesystem storage because disk-to-Lix imports cannot bypass the authoritative server",
+		);
+	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
 		const binding = await openLixWorkerBinding(
@@ -225,21 +230,31 @@ async function attachAuthority(
 	server: Omit<SyncLixServerOptions, "mode"> | undefined,
 ): Promise<LixBinding> {
 	if (server === undefined) return local;
+	let authority: LixBinding | undefined;
 	try {
-		const [{ authoritativeHotBinding }, { openRemoteLixBinding }] =
+		const [
+			{
+				authoritativeHotBinding,
+				assertAuthoritySessionAlignment,
+				waitForAuthorityPublication,
+			},
+			{ openRemoteLixBinding },
+		] =
 			await Promise.all([
 				import("./authoritative-hot-binding.js"),
 				import("./remote/client.js"),
 			]);
-		const authority = await openRemoteLixBinding({
+		authority = await openRemoteLixBinding({
 			mode: "remote",
 			url: server.url,
 			headers: server.headers,
 			fetch: server.fetch,
 		});
+		await waitForAuthorityPublication(local, authority);
+		await assertAuthoritySessionAlignment(local, authority);
 		return authoritativeHotBinding(local, authority);
 	} catch (error) {
-		await local.close().catch(() => undefined);
+		await Promise.allSettled([local.close(), authority?.close()]);
 		throw error;
 	}
 }
