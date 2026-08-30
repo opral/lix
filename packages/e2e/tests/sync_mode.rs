@@ -505,6 +505,7 @@ fn duration_nanos(duration: Duration) -> u64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn synced_partial_file_checkpoint_stays_off_cold_history() {
     let (authority_storage, authority) = open_authority().await;
     for index in 0..50 {
@@ -627,6 +628,7 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn first_local_write_pushes_before_deferred_history_is_read() {
     let (authority_storage, authority) = open_authority().await;
     authority
@@ -667,6 +669,7 @@ async fn first_local_write_pushes_before_deferred_history_is_read() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn sync_runtime_outlives_the_primary_session() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "seed", "authority").await;
@@ -764,6 +767,7 @@ impl HttpProbe {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
     let (authority_storage, authority) = open_authority().await;
     let authority_lix_id = authority.lix_id().to_owned();
@@ -856,6 +860,7 @@ async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_pages() {
     let (authority_storage, authority) = open_authority().await;
     authority
@@ -966,6 +971,7 @@ async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_p
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
     let (authority_storage, authority) = open_authority().await;
     let inserted = authority
@@ -1060,6 +1066,7 @@ async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn sparse_checkpoint_history_hydrates_missing_bodies_concurrently() {
     let (authority_storage, authority) = open_authority().await;
     let inserted = authority
@@ -1169,6 +1176,7 @@ async fn fresh_bootstrap_pages_more_than_one_window_of_hot_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn warm_filesystem_replica_reopens_and_writes_while_offline() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "cached", "durable").await;
@@ -1206,6 +1214,7 @@ async fn warm_filesystem_replica_reopens_and_writes_while_offline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn authenticated_identity_survives_fresh_push_and_offline_reopen() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "authenticated-seed", "server").await;
@@ -1263,6 +1272,7 @@ async fn authenticated_identity_survives_fresh_push_and_offline_reopen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn more_than_one_offline_push_window_drains_after_reconnect() {
     let (authority_storage, authority) = open_authority().await;
     let commits_before = commit_count(&authority).await;
@@ -1329,6 +1339,7 @@ async fn more_than_one_offline_push_window_drains_after_reconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn offline_restore_survives_reopen_and_resets_the_authority() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "restore-reopen", "target").await;
@@ -1427,6 +1438,7 @@ async fn offline_restore_survives_reopen_and_resets_the_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn two_clients_receive_remote_writes_through_a_held_long_poll() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "seed", "ready").await;
@@ -1471,6 +1483,7 @@ async fn two_clients_receive_remote_writes_through_a_held_long_poll() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
     let (authority_storage, authority) = open_authority().await;
     authority
@@ -1550,6 +1563,7 @@ async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn small_file_observer_receives_remote_edit_without_a_chunk_round_trip() {
     let (authority_storage, authority) = open_authority().await;
     authority
@@ -1628,6 +1642,7 @@ async fn small_file_observer_receives_remote_edit_without_a_chunk_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn held_long_poll_stays_realtime_with_one_hundred_millisecond_rtt() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "seed", "ready").await;
@@ -1664,6 +1679,7 @@ async fn held_long_poll_stays_realtime_with_one_hundred_millisecond_rtt() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn lost_push_ack_retries_the_same_commit_idempotently() {
     let (authority_storage, authority) = open_authority().await;
     let commits_before = commit_count(&authority).await;
@@ -2290,6 +2306,7 @@ async fn stop_server(task: tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn fresh_replica_reads_point_in_time_filesystem_state() {
     // Regression: a freshly bootstrapped replica holds hot state plus
     // deferred history payloads. lix_state_at and lix_diff at an old
@@ -2465,6 +2482,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn sparse_replica_observer_hydrates_root_history_past_a_merge_frontier() {
     // A bounded bootstrap can retain a recent linear head and a merge in its
     // jump/base closure while deferring the merge's direct first parent. Root
@@ -2587,6 +2605,7 @@ async fn sparse_replica_observer_hydrates_root_history_past_a_merge_frontier() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn partially_hydrated_replica_reads_point_in_time_filesystem_state() {
     // The live-repository shape behind the "filesystem descriptor references
     // missing directory" failure: a bounded history read hydrates ONLY the
@@ -2671,6 +2690,7 @@ async fn partially_hydrated_replica_reads_point_in_time_filesystem_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica() {
     // Full lineage of the failing live repository: authored on the v71
     // engine, migrated and partial-checkpointed on the v72 engine
