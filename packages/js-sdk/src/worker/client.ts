@@ -368,6 +368,8 @@ export function workerBinding(
 			request({ kind: "execute", sql, params, options }),
 		executeBatch: (statements, options) =>
 			request({ kind: "executeBatch", statements, options }),
+		executionRoute: (statements) =>
+			request({ kind: "executionRoute", statements }),
 		observe: async (sql, params) => {
 			const observeId = await request<number>({
 				kind: "observe",

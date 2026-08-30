@@ -298,7 +298,7 @@ impl Drop for SyncRuntime {
 
 pub(crate) async fn activate_sync_mode<StorageImpl>(
     lix: &mut Lix<StorageImpl>,
-    server: &crate::ServerOptions,
+    server: &crate::InternalSyncCacheOptions,
     initial_transport: Option<HttpSyncTransport>,
 ) -> Result<Arc<SyncRuntime>, LixError>
 where
@@ -316,7 +316,7 @@ where
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
     let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(64);
     let worker_lix = lix
-        .open_internal_session_suppressed(lix.active_branch_id().await?, lix.active_account_id())
+        .open_internal_session(lix.active_branch_id().await?, lix.active_account_id())
         .await?;
     let task = spawn_sync_task(async move {
         let result = run_sync_worker(
@@ -1715,6 +1715,14 @@ mod tests {
             cursor: 1,
             events: vec![super::super::SyncEvent {
                 cursor: 1,
+                certificate_root_id:
+                    super::super::protocol::sync_event_certificate_root_id(
+                        1,
+                        &[inline_commit.clone()],
+                        &[],
+                        &[inline.clone()],
+                    )
+                    .expect("certify inline event"),
                 commits: vec![inline_commit],
                 ref_updates: Vec::new(),
                 inline_blobs: vec![inline],
@@ -1733,6 +1741,14 @@ mod tests {
                 cursor: 2,
                 events: vec![super::super::SyncEvent {
                     cursor: 2,
+                    certificate_root_id:
+                        super::super::protocol::sync_event_certificate_root_id(
+                            2,
+                            &[empty_commit.clone()],
+                            &[],
+                            &[empty.clone()],
+                        )
+                        .expect("certify empty-blob event"),
                     commits: vec![empty_commit],
                     ref_updates: Vec::new(),
                     inline_blobs: vec![empty],
@@ -1757,6 +1773,14 @@ mod tests {
                 cursor: 2,
                 events: vec![super::super::SyncEvent {
                     cursor: 2,
+                    certificate_root_id:
+                        super::super::protocol::sync_event_certificate_root_id(
+                            2,
+                            &[large_commit.clone()],
+                            &[],
+                            &[],
+                        )
+                        .expect("certify large-blob event"),
                     commits: vec![large_commit],
                     ref_updates: Vec::new(),
                     inline_blobs: Vec::new(),
@@ -1807,6 +1831,14 @@ mod tests {
                     cursor: after + 1,
                     events: vec![super::super::SyncEvent {
                         cursor: after + 1,
+                        certificate_root_id:
+                            super::super::protocol::sync_event_certificate_root_id(
+                                after + 1,
+                                &[],
+                                &[],
+                                &[],
+                            )
+                            .expect("certify capped empty event"),
                         commits: Vec::new(),
                         ref_updates: Vec::new(),
                         inline_blobs: Vec::new(),
@@ -2232,6 +2264,14 @@ mod tests {
                 cursor: 11,
                 events: vec![super::super::SyncEvent {
                     cursor: 11,
+                    certificate_root_id:
+                        super::super::protocol::sync_event_certificate_root_id(
+                            11,
+                            &[],
+                            &[],
+                            &[],
+                        )
+                        .expect("certify cursor-gap event"),
                     commits: Vec::new(),
                     ref_updates: Vec::new(),
                     inline_blobs: Vec::new(),

@@ -89,7 +89,12 @@ where
         .surface("lix_diff")
         .is_some_and(|surface| selection.includes(surface))
     {
-        diff::register_diff_function(session, ctx.changelog_query_source(), Arc::clone(&catalog));
+        diff::register_diff_function(
+            session,
+            ctx.changelog_query_source(),
+            Arc::clone(&catalog),
+            ctx.blob_reader(),
+        );
     }
     if catalog
         .surface("lix_working_diff")
@@ -99,6 +104,7 @@ where
             session,
             ctx.changelog_query_source(),
             Arc::clone(&catalog),
+            ctx.blob_reader(),
         );
     }
     if catalog
@@ -722,6 +728,7 @@ where
             session,
             read_ctx.changelog_query_source(),
             Arc::clone(&catalog),
+            read_ctx.blob_reader(),
         );
     }
     if catalog
@@ -732,6 +739,7 @@ where
             session,
             read_ctx.changelog_query_source(),
             Arc::clone(&catalog),
+            read_ctx.blob_reader(),
         );
     }
     if catalog

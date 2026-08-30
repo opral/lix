@@ -2,9 +2,9 @@ use lix::plugin::runtime::WasmRuntime;
 use lix::storage::{Storage, StorageSession};
 use lix::telemetry::TelemetrySink;
 use lix::{
-    Blob, CreateBranchOptions, CreateBranchReceipt, ExecuteBatchStatement,
-    ExecuteIdempotency, ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, LixError,
-    Memory, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    Blob, CreateBranchOptions, CreateBranchReceipt, ExecuteBatchStatement, ExecuteIdempotency,
+    ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, LixError, Memory,
+    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     ObserveEvent, RedoReceipt, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
 };
 use std::{
@@ -16,8 +16,8 @@ use std::{
     },
 };
 
-use crate::engine::{Engine, EngineOptions};
 use crate::common::ExpiredReadRetryState;
+use crate::engine::{Engine, EngineOptions};
 use crate::open_types::{
     OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport, emit_open_progress,
 };
@@ -96,28 +96,18 @@ impl OpenProgressSink for RetainingOpenProgressSink {
     }
 }
 
-/// Server behavior for an opened local Lix repository.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ServerMode {
-    /// Execute against local storage and continuously synchronize the active
-    /// branch with the server.
-    Sync,
-}
-
-/// Configures the server associated with a local Lix repository.
+/// Configures the raw internal cache behind the official authoritative JS
+/// composite.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ServerOptions {
-    pub mode: ServerMode,
+pub struct InternalSyncCacheOptions {
     pub url: String,
     /// HTTP headers included on browser sync protocol requests.
     pub headers: Vec<(String, String)>,
 }
 
-impl ServerOptions {
+impl InternalSyncCacheOptions {
     pub fn sync(url: impl Into<String>) -> Self {
         Self {
-            mode: ServerMode::Sync,
             url: url.into(),
             headers: Vec::new(),
         }
@@ -139,7 +129,7 @@ pub struct OpenLixBuilder<StorageImpl = Memory> {
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
-    server: Option<ServerOptions>,
+    server: Option<InternalSyncCacheOptions>,
     open_progress: Option<Arc<dyn OpenProgressSink>>,
 }
 
@@ -191,12 +181,41 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
         self
     }
 
-    /// Runs this repository as a local replica of `server`.
+    /// Constructs the raw local cache used behind the official authoritative
+    /// JS composite.
     ///
-    /// Sync replicas require a storage adapter that implements durable reads.
-    /// The default in-memory adapter is intentionally not supported because it
-    /// cannot prove that a bootstrap snapshot survived its publication fence.
-    pub fn with_server(mut self, server: ServerOptions) -> Self {
+    /// Safe Rust clients deliberately have no connected-cache constructor;
+    /// use the server protocol client as the authoritative session instead.
+    ///
+    /// # Safety
+    ///
+    /// The returned raw replica must never be exposed to application code. The
+    /// caller must immediately wrap it with an authority session that pins the
+    /// authority publication cursor before every local HOT read, routes history,
+    /// mutations, observations, and transactions to the authority, pairs branch
+    /// and account selection, and terminally closes both sessions after any
+    /// barrier or alignment failure.
+    ///
+    /// ```compile_fail
+    /// let _ = lix::open_lix().with_internal_sync_cache(
+    ///     lix::InternalSyncCacheOptions::sync("https://example.invalid/lix"),
+    /// );
+    /// ```
+    #[cfg(feature = "unsafe-internal-sync-cache")]
+    #[doc(hidden)]
+    pub unsafe fn with_internal_sync_cache(
+        mut self,
+        server: InternalSyncCacheOptions,
+    ) -> Self {
+        self.server = Some(server);
+        self
+    }
+
+    #[cfg(not(feature = "unsafe-internal-sync-cache"))]
+    pub(crate) unsafe fn with_internal_sync_cache(
+        mut self,
+        server: InternalSyncCacheOptions,
+    ) -> Self {
         self.server = Some(server);
         self
     }
@@ -254,8 +273,7 @@ where
             let wasm_runtime = self.wasm_runtime.clone();
             let telemetry = self.telemetry.clone();
             async move {
-                let admission =
-                    ensure_current_repository(&storage, Some(&open_progress)).await?;
+                let admission = ensure_current_repository(&storage, Some(&open_progress)).await?;
                 let migrated_from = admission
                     .report
                     .migration
@@ -666,7 +684,7 @@ async fn open_lix_inner<StorageImpl>(
     storage: StorageSession<StorageImpl>,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
-    server: Option<ServerOptions>,
+    server: Option<InternalSyncCacheOptions>,
     retained_progress: Arc<RetainingOpenProgressSink>,
 ) -> Result<Lix<StorageImpl>, LixError>
 where
@@ -683,9 +701,7 @@ where
     let admission = ensure_current_repository(&storage, Some(&open_progress)).await?;
     let mut open_report = admission.report;
     retained_progress.retain_initialized(open_report.initialized);
-    let migrated_from = open_report
-        .migration
-        .map(|migration| migration.from_format);
+    let migrated_from = open_report.migration.map(|migration| migration.from_format);
     emit_open_progress(
         Some(&open_progress),
         OpenProgress {
@@ -701,18 +717,14 @@ where
     // can be bound to the authority's account. Reopens with durable state for
     // this repository remain entirely local even when its transport URL changes.
     let (reopened_sync_account_id, mut prepared_sync) = if let Some(server) = server.as_ref() {
-        match crate::sync::inspect_sync_bootstrap_with_adapter(
-            &admission.adapter,
-            &server.url,
-        )
-        .await?
+        match crate::sync::inspect_sync_bootstrap_with_adapter(&admission.adapter, &server.url)
+            .await?
         {
-            crate::sync::SyncBootstrapAdmission::Prepare => {
-                (None, Some(crate::sync::prepare_sync_bootstrap(server).await?))
-            }
-            crate::sync::SyncBootstrapAdmission::Ready { account_id } => {
-                (Some(account_id), None)
-            }
+            crate::sync::SyncBootstrapAdmission::Prepare => (
+                None,
+                Some(crate::sync::prepare_sync_bootstrap(server).await?),
+            ),
+            crate::sync::SyncBootstrapAdmission::Ready { account_id } => (Some(account_id), None),
         }
     } else {
         (None, None)
@@ -745,28 +757,14 @@ where
         open_report: Arc::new(open_report),
     };
     if let Some(server) = server {
-        match server.mode {
-            ServerMode::Sync => {
-                let initial_transport = if let Some(prepared) = prepared_sync.take() {
-                    Some(crate::sync::install_sync_bootstrap(
-                        &mut lix,
-                        &server,
-                        prepared,
-                    )
-                    .await?)
-                } else {
-                    None
-                };
-                let runtime = crate::sync::activate_sync_mode(
-                    &mut lix,
-                    &server,
-                    initial_transport,
-                )
-                .await?;
-                lix.sync_demand_tx = Some(runtime.demand_tx.clone());
-                lix.sync_lease = Some(SyncSessionLease::root(runtime));
-            }
-        }
+        let initial_transport = if let Some(prepared) = prepared_sync.take() {
+            Some(crate::sync::install_sync_bootstrap(&mut lix, &server, prepared).await?)
+        } else {
+            None
+        };
+        let runtime = crate::sync::activate_sync_mode(&mut lix, &server, initial_transport).await?;
+        lix.sync_demand_tx = Some(runtime.demand_tx.clone());
+        lix.sync_lease = Some(SyncSessionLease::root(runtime));
     }
     lix.bind_session();
     emit_open_progress(
@@ -844,11 +842,7 @@ where
                     .open_session_at_with_account(active_branch_id, active_account_id)
                     .await?
             }
-            None => {
-                engine
-                    .open_session_with_account(active_account_id)
-                    .await?
-            }
+            None => engine.open_session_with_account(active_account_id).await?,
         };
         Ok(Self {
             engine,
@@ -971,25 +965,6 @@ where
         active_branch_id: impl Into<String>,
         active_account_id: impl Into<String>,
     ) -> Result<Self, LixError> {
-        self.open_internal_session_with_sync_suppression(active_branch_id, active_account_id, false)
-            .await
-    }
-
-    pub(crate) async fn open_internal_session_suppressed(
-        &self,
-        active_branch_id: impl Into<String>,
-        active_account_id: impl Into<String>,
-    ) -> Result<Self, LixError> {
-        self.open_internal_session_with_sync_suppression(active_branch_id, active_account_id, true)
-            .await
-    }
-
-    async fn open_internal_session_with_sync_suppression(
-        &self,
-        active_branch_id: impl Into<String>,
-        active_account_id: impl Into<String>,
-        suppress_sync_outbox: bool,
-    ) -> Result<Self, LixError> {
         if self.session.is_closed() {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
@@ -1013,8 +988,6 @@ where
             .engine
             .open_session_at_with_account(active_branch_id, active_account_id)
             .await?;
-        let mut session = session;
-        session.set_sync_outbox_suppressed(suppress_sync_outbox);
         Ok(Self {
             engine: self.engine.clone(),
             session: Arc::new(session),
@@ -1054,6 +1027,29 @@ where
             params: params.to_vec(),
             options: ExecuteOptions::default(),
         }
+    }
+
+    /// Returns the parsed authority route for one atomic execution request.
+    ///
+    /// This is exposed for official bindings which compose a certified local
+    /// hot cache with an authoritative protocol session. It deliberately uses
+    /// Lix's parser and binder instead of duplicating SQL-text heuristics in a
+    /// transport. An empty request is a hot no-op; mutation dominates history,
+    /// and history dominates hot reads for mixed batches.
+    #[doc(hidden)]
+    pub fn execution_authority_route(
+        &self,
+        statements: &[String],
+    ) -> Result<crate::StatementAuthorityRoute, LixError> {
+        let statements = statements
+            .iter()
+            .map(|sql| ExecuteBatchStatement {
+                sql: sql.clone(),
+                params: Vec::new(),
+                label: None,
+            })
+            .collect::<Vec<_>>();
+        self.session.batch_authority_route(&statements)
     }
 
     /// Classifies one SQL execution for a caller that owns its transport
@@ -1192,8 +1188,24 @@ where
         let statements = statements
             .iter()
             .map(|(sql, params)| ((*sql).to_owned(), (*params).to_vec()))
-            .collect();
-        Arc::clone(&self.session).execute_coherent_read_batch_owned(statements)
+            .collect::<Vec<_>>();
+        let routed = statements
+            .iter()
+            .map(|(sql, params)| ExecuteBatchStatement {
+                sql: sql.clone(),
+                params: params.clone(),
+                label: None,
+            })
+            .collect::<Vec<_>>();
+        let authority = self
+            .session
+            .batch_authority_route(&routed)
+            .and_then(|route| self.require_authority_execution(route));
+        let session = Arc::clone(&self.session);
+        async move {
+            authority?;
+            session.execute_coherent_read_batch_owned(statements).await
+        }
     }
 
     /// Classifies an atomic SQL batch for a caller that owns its transport
@@ -1483,7 +1495,6 @@ where
         close_result?;
         Ok(())
     }
-
 }
 
 #[expect(missing_debug_implementations)]
@@ -1709,10 +1720,14 @@ mod tests {
     #[tokio::test]
     async fn invalid_sync_locator_is_rejected_before_storage_initialization() {
         let storage = Memory::new();
-        let result = open_lix()
-            .with_storage(storage.clone())
-            .with_server(ServerOptions::sync("https://example.test/not-a-lix"))
-            .await;
+        let result = unsafe {
+            open_lix()
+                .with_storage(storage.clone())
+                .with_internal_sync_cache(InternalSyncCacheOptions::sync(
+                    "https://example.test/not-a-lix",
+                ))
+        }
+        .await;
         let Err(error) = result else {
             panic!("invalid sync locator must fail");
         };

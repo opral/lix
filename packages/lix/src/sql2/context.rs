@@ -104,6 +104,9 @@ pub(crate) trait SqlExecutionContext: Sync {
     fn active_account_id(&self) -> &str {
         crate::ANONYMOUS_ACCOUNT_ID
     }
+    async fn sync_publication_cursor(&self) -> Result<Option<u64>, LixError> {
+        Ok(None)
+    }
     fn hot_state(&self) -> Arc<dyn HotStateReader>;
     /// Supplies the committed tracked-head row snapshot capability when the
     /// read context can prove it is scoped to one immutable storage snapshot.

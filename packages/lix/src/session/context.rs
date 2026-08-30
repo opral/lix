@@ -181,9 +181,6 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) base_refresh_generation: Arc<AtomicU64>,
     pub(super) observed_global_head: Arc<RwLock<Option<CommitId>>>,
     pub(super) sync_mode: SyncModeState,
-    /// Internal sync sessions apply canonical rows and must not enqueue those
-    /// maintenance writes as new client proposals.
-    pub(super) sync_outbox_suppressed: bool,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     transaction_manager: SessionTransactionManager,
@@ -276,7 +273,6 @@ where
             base_refresh_generation,
             observed_global_head: Arc::new(RwLock::new(None)),
             sync_mode,
-            sync_outbox_suppressed: false,
             plugin_host,
             telemetry,
             transaction_manager,
@@ -293,10 +289,6 @@ where
 
     pub fn is_closed(&self) -> bool {
         self.transaction_manager.is_closed()
-    }
-
-    pub(crate) fn set_sync_outbox_suppressed(&mut self, suppressed: bool) {
-        self.sync_outbox_suppressed = suppressed;
     }
 
     /// Returns the immutable account that authors every change from this session.
@@ -519,9 +511,6 @@ where
             .then(|| self.sync_mode.replica_remote_id())
             .flatten();
         transaction.set_sync_mode(sync_role, replica_remote_id);
-        if self.sync_outbox_suppressed {
-            transaction.suppress_ordinary_sync_event();
-        }
         transaction.attach_commit_boundary(self.transaction_commit_boundary());
         if planner_validation_is_serialized {
             transaction.trust_serialized_filesystem_planner();
@@ -599,11 +588,7 @@ where
         // The server sync endpoint long-polls on canonical-head movement.
         // Notify only after the storage commit has crossed its boundary so a
         // woken pull can always observe the event it was waiting for.
-        // Suppressed internal replica sessions must not wake their own worker
-        // while applying a pull.
-        if !self.sync_outbox_suppressed {
-            self.sync_mode.notify_sync_change();
-        }
+        self.sync_mode.notify_sync_change();
         drop(_entered);
         if let Some(span) = span {
             span.finish(Status::Unset, Vec::new());
@@ -665,6 +650,7 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) functions: FunctionProviderHandle,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) file_views: Option<SessionFileViews>,
+    pub(super) sync_role: crate::sync::SyncRole,
 }
 
 impl<R> SessionSqlExecutionContext<'_, R>
@@ -726,6 +712,10 @@ where
 
     fn active_account_id(&self) -> &str {
         self.active_account_id
+    }
+
+    async fn sync_publication_cursor(&self) -> Result<Option<u64>, LixError> {
+        crate::sync::load_sync_publication_cursor(&self.read_store, self.sync_role).await
     }
 
     #[expect(trivial_casts)]

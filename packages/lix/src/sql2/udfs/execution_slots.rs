@@ -25,6 +25,7 @@ struct ExecutionSlotValues {
     active_account_id: Option<String>,
     active_branch_id: Option<String>,
     active_branch_commit_id: Option<String>,
+    sync_publication_cursor: Option<String>,
     latest_checkpoint_commit_id: Option<String>,
     root_commit_id: Option<String>,
     functions: Option<FunctionProviderHandle>,
@@ -52,6 +53,7 @@ impl ExecutionSlots {
         active_account_id: &str,
         active_branch_id: Option<&str>,
         active_branch_commit_id: Option<&str>,
+        sync_publication_cursor: Option<&str>,
         latest_checkpoint_commit_id: Option<&str>,
         root_commit_id: Option<&str>,
     ) {
@@ -59,6 +61,7 @@ impl ExecutionSlots {
         assign(&mut values.active_account_id, Some(active_account_id));
         assign(&mut values.active_branch_id, active_branch_id);
         assign(&mut values.active_branch_commit_id, active_branch_commit_id);
+        assign(&mut values.sync_publication_cursor, sync_publication_cursor);
         assign(
             &mut values.latest_checkpoint_commit_id,
             latest_checkpoint_commit_id,
@@ -78,6 +81,10 @@ impl ExecutionSlots {
 
     pub(crate) fn active_branch_commit_id(&self) -> Option<String> {
         self.lock().active_branch_commit_id.clone()
+    }
+
+    pub(crate) fn sync_publication_cursor(&self) -> Option<String> {
+        self.lock().sync_publication_cursor.clone()
     }
 
     pub(crate) fn latest_checkpoint_commit_id(&self) -> Option<String> {

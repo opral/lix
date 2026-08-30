@@ -19,6 +19,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use serde_json::Value as JsonValue;
 
 use crate::NullableKeyFilter;
+use crate::binary_cas::{BlobDataReader, BlobId};
 use crate::branch::BranchHeadControlContext;
 use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::hot_state::TrackedHeadContext;
@@ -44,12 +45,14 @@ use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters}
 use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 pub(super) fn register_diff_function<S>(
     session: &datafusion::prelude::SessionContext,
     query_source: SqlChangelogQuerySource<S>,
     catalog: Arc<PublicCatalog>,
+    blob_reader: Arc<dyn BlobDataReader>,
 ) where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -60,6 +63,7 @@ pub(super) fn register_diff_function<S>(
             catalog,
             slots: execution_slots(session),
             mode: DiffMode::General,
+            blob_reader,
         }),
     );
 }
@@ -68,6 +72,7 @@ pub(super) fn register_working_diff_function<S>(
     session: &datafusion::prelude::SessionContext,
     query_source: SqlChangelogQuerySource<S>,
     catalog: Arc<PublicCatalog>,
+    blob_reader: Arc<dyn BlobDataReader>,
 ) where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -78,6 +83,7 @@ pub(super) fn register_working_diff_function<S>(
             catalog,
             slots: execution_slots(session),
             mode: DiffMode::WorkingHot,
+            blob_reader,
         }),
     );
 }
@@ -93,6 +99,7 @@ struct DiffFunction<S> {
     catalog: Arc<PublicCatalog>,
     slots: Arc<ExecutionSlots>,
     mode: DiffMode,
+    blob_reader: Arc<dyn BlobDataReader>,
 }
 
 impl<S> fmt::Debug for DiffFunction<S> {
@@ -170,6 +177,7 @@ where
             to_commit_id,
             active_branch_id: self.slots.active_branch_id(),
             mode: self.mode,
+            blob_reader: Arc::clone(&self.blob_reader),
         }))))
     }
 }
@@ -288,9 +296,11 @@ impl DiffRelation {
             fields.push(Field::new("before_commit_id", DataType::Utf8, false));
             fields.push(Field::new("after_commit_id", DataType::Utf8, false));
         }
-        for column in surface.columns.iter().filter(|column| {
-            column.is_public() && !primary_key_columns.contains(&column.name)
-        }) {
+        for column in surface
+            .columns
+            .iter()
+            .filter(|column| column.is_public() && !primary_key_columns.contains(&column.name))
+        {
             let field = source_schema
                 .field_with_name(&column.name)
                 .map_err(|error| {
@@ -328,6 +338,7 @@ struct DiffSpec<S> {
     to_commit_id: String,
     active_branch_id: Option<String>,
     mode: DiffMode,
+    blob_reader: Arc<dyn BlobDataReader>,
 }
 
 #[async_trait]
@@ -373,7 +384,8 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.relation.schema, projection);
-        if self.relation.kind == DiffRelationKind::File
+        if self.mode == DiffMode::General
+            && self.relation.kind == DiffRelationKind::File
             && schema
                 .fields()
                 .iter()
@@ -399,6 +411,7 @@ where
                     self.to_commit_id.clone(),
                     self.active_branch_id.clone(),
                     self.mode,
+                    Arc::clone(&self.blob_reader),
                 ),
                 move |(
                     store,
@@ -409,6 +422,7 @@ where
                     to_commit_id,
                     active_branch_id,
                     mode,
+                    blob_reader,
                 )| async move {
                     let coordinates =
                         (mode == DiffMode::WorkingHot).then_some(WorkingDiffCoordinates {
@@ -538,9 +552,10 @@ where
                     // replay commits. A sparse replica therefore either has
                     // the locally installed endpoint snapshot or fails with a
                     // HOT-unavailable error that cannot trigger history demand.
-                    let (from_descriptor, to_descriptor) = if let Some(descriptors) = generic_descriptors {
-                        descriptors
-                    } else if working_needs_endpoint_descriptors {
+                    let (from_descriptor, to_descriptor) =
+                        if let Some(descriptors) = generic_descriptors {
+                            descriptors
+                        } else if working_needs_endpoint_descriptors {
                             let descriptor_result = async {
                                 Ok::<_, DataFusionError>((
                                     commit_state_descriptor(&store, &from_commit_id).await?,
@@ -548,10 +563,13 @@ where
                                 ))
                             }
                             .await;
-                        descriptor_result.map_err(hot_only_diff_error)?
-                    } else {
-                        (CommitStateDescriptor::default(), CommitStateDescriptor::default())
-                    };
+                            descriptor_result.map_err(hot_only_diff_error)?
+                        } else {
+                            (
+                                CommitStateDescriptor::default(),
+                                CommitStateDescriptor::default(),
+                            )
+                        };
                     let (diff, from_global_rows, to_global_rows) = effective_diff(
                         &mut tracked,
                         &from_commit_id,
@@ -580,6 +598,7 @@ where
                                 &to_commit_id,
                                 &from_descriptor,
                                 &to_descriptor,
+                                &blob_reader,
                             )
                             .await;
                             if mode == DiffMode::WorkingHot {
@@ -710,8 +729,7 @@ impl DiffRoute {
                 .any(|(_, column)| {
                     !matches!(
                         column,
-                        "id"
-                            | "lixcol_schema_key"
+                        "id" | "lixcol_schema_key"
                             | "lixcol_file_id"
                             | "lixcol_created_at"
                             | "lixcol_updated_at"
@@ -764,6 +782,12 @@ struct WorkingDiffCoordinates {
 
 fn hot_only_diff_error(error: DataFusionError) -> DataFusionError {
     let error = datafusion_error_to_lix_error(error);
+    // Pinned HOT file values may be represented by deferred binary-CAS chunks.
+    // Fetching those exact content-addressed bytes is not history fallback, so
+    // preserve the demand code for the replica retry loop.
+    if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {
+        return lix_error_to_datafusion_error(error);
+    }
     let message = if error.code == "LIX_SYNC_HISTORY_REQUIRED" {
         "lix_working_diff requires the certified local HOT checkpoint snapshot; canonical history fallback is forbidden"
             .to_string()
@@ -798,6 +822,7 @@ struct DiffSide {
     metadata: Option<JsonValue>,
     snapshot: Option<Arc<WasmTypedRow>>,
     path: Option<String>,
+    content: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -1190,6 +1215,7 @@ fn diff_side(
         metadata,
         snapshot,
         path: None,
+        content: None,
     }))
 }
 
@@ -1224,6 +1250,7 @@ async fn file_diff_rows<S>(
     to_commit_id: &str,
     from_descriptor: &CommitStateDescriptor,
     to_descriptor: &CommitStateDescriptor,
+    blob_reader: &Arc<dyn BlobDataReader>,
 ) -> Result<Vec<DiffSqlRow>>
 where
     S: StorageAdapterRead,
@@ -1268,6 +1295,18 @@ where
     } else {
         Vec::new()
     };
+    let needs_content = projection
+        .fields()
+        .iter()
+        .any(|field| matches!(field.name().as_str(), "from_content" | "to_content"));
+    let blob_keys = if needs_content {
+        groups
+            .keys()
+            .map(|file_id| descriptor_key(BLOB_REF_SCHEMA_KEY, file_id, Some(file_id)))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     let needs_snapshot = projection
         .fields()
         .iter()
@@ -1275,8 +1314,7 @@ where
         .any(|(_, column)| {
             !matches!(
                 column,
-                "id"
-                    | "lixcol_schema_key"
+                "id" | "lixcol_schema_key"
                     | "lixcol_file_id"
                     | "lixcol_created_at"
                     | "lixcol_updated_at"
@@ -1335,6 +1373,62 @@ where
         &descriptor_keys,
     )
     .await?;
+    let blob_projection = ChangeRecordProjection {
+        snapshot_content: false,
+        metadata: false,
+        snapshot: needs_content,
+        raw_snapshot: false,
+    };
+    let from_blobs = tracked
+        .load_projected_batch_at_commit(from_commit_id, &blob_keys, &blob_projection)
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+    let to_blobs = tracked
+        .load_projected_batch_at_commit(to_commit_id, &blob_keys, &blob_projection)
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+    let from_base_blobs =
+        load_base_rows(tracked, from_descriptor, &blob_keys, &blob_projection).await?;
+    let to_base_blobs =
+        load_base_rows(tracked, to_descriptor, &blob_keys, &blob_projection).await?;
+    let from_blob_replacements = load_local_replacement_scopes_for_keys(
+        tracked,
+        from_commit_id,
+        from_descriptor,
+        &blob_keys,
+    )
+    .await?;
+    let to_blob_replacements =
+        load_local_replacement_scopes_for_keys(tracked, to_commit_id, to_descriptor, &blob_keys)
+            .await?;
+    let from_blob_ids = blob_keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let (row, _) = effective_row(
+                from_blobs.row(index),
+                from_base_blobs.as_ref().and_then(|rows| rows.row(index)),
+                from_descriptor.global_scope,
+                base_key_suppressed(key, &from_blob_replacements),
+            );
+            blob_id_from_materialized_row(row)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let to_blob_ids = blob_keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let (row, _) = effective_row(
+                to_blobs.row(index),
+                to_base_blobs.as_ref().and_then(|rows| rows.row(index)),
+                to_descriptor.global_scope,
+                base_key_suppressed(key, &to_blob_replacements),
+            );
+            blob_id_from_materialized_row(row)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let from_contents = load_working_diff_blob_bytes(blob_reader, &from_blob_ids).await?;
+    let to_contents = load_working_diff_blob_bytes(blob_reader, &to_blob_ids).await?;
     let needs_paths = projection
         .fields()
         .iter()
@@ -1384,9 +1478,15 @@ where
         };
         if let Some(side) = from.as_mut() {
             side.global = from_global;
+            if needs_content {
+                side.content = Some(from_contents[index].clone().unwrap_or_default());
+            }
         }
         if let Some(side) = to.as_mut() {
             side.global = to_global;
+            if needs_content {
+                side.content = Some(to_contents[index].clone().unwrap_or_default());
+            }
         }
         if needs_paths {
             if let Some(side) = from.as_mut() {
@@ -1525,7 +1625,74 @@ fn materialized_side(row: Option<MaterializedTrackedStateRowRef<'_>>) -> Result<
         metadata,
         snapshot: row.decoded_snapshot().cloned(),
         path: None,
+        content: None,
     }))
+}
+
+fn blob_id_from_materialized_row(
+    row: Option<MaterializedTrackedStateRowRef<'_>>,
+) -> Result<Option<BlobId>> {
+    let Some(row) = row.filter(|row| !row.deleted()) else {
+        return Ok(None);
+    };
+    let snapshot = row.decoded_snapshot().ok_or_else(|| {
+        DataFusionError::Execution(
+            "working file blob reference is missing its certified snapshot".to_string(),
+        )
+    })?;
+    let hash = typed_string(snapshot, "blob_hash")?.ok_or_else(|| {
+        DataFusionError::Execution(
+            "working file blob reference is missing its blob hash".to_string(),
+        )
+    })?;
+    BlobId::from_hex(&hash)
+        .map(Some)
+        .map_err(lix_error_to_datafusion_error)
+}
+
+async fn load_working_diff_blob_bytes(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    ids: &[Option<BlobId>],
+) -> Result<Vec<Option<Vec<u8>>>> {
+    let unique = ids.iter().flatten().copied().collect::<BTreeSet<_>>();
+    if unique.is_empty() {
+        return Ok(vec![None; ids.len()]);
+    }
+    let request = unique.iter().copied().collect::<Vec<_>>();
+    let loaded = blob_reader
+        .load_bytes_many(&request)
+        .await
+        .map_err(lix_error_to_datafusion_error)?
+        .into_vec();
+    if loaded.len() != request.len() {
+        return Err(DataFusionError::Execution(format!(
+            "working file blob reader returned {} values for {} certified hashes",
+            loaded.len(),
+            request.len()
+        )));
+    }
+    let mut by_id = BTreeMap::new();
+    for (id, bytes) in request.into_iter().zip(loaded) {
+        let bytes = bytes.ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "certified working file blob '{}' is unavailable locally",
+                id.to_hex()
+            ))
+        })?;
+        by_id.insert(id, bytes);
+    }
+    ids.iter()
+        .map(|id| {
+            id.map(|id| {
+                by_id.get(&id).cloned().ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "working file blob batch omitted a requested hash".to_string(),
+                    )
+                })
+            })
+            .transpose()
+        })
+        .collect()
 }
 
 async fn filesystem_path<S>(
@@ -1707,6 +1874,20 @@ fn diff_column_array(
             let (after, column) = side_column(name).ok_or_else(|| {
                 DataFusionError::Execution(format!("unsupported diff column '{name}'"))
             })?;
+            if column == "content" {
+                return Ok(Arc::new(LargeBinaryArray::from(
+                    rows.iter()
+                        .map(|row| {
+                            let side = if after {
+                                row.to.as_ref()
+                            } else {
+                                row.from.as_ref()
+                            };
+                            side.and_then(|side| side.content.as_deref())
+                        })
+                        .collect::<Vec<_>>(),
+                )));
+            }
             let values = rows
                 .iter()
                 .map(|row| {
@@ -1983,6 +2164,20 @@ mod tests {
         let error = datafusion_error_to_lix_error(error);
         assert_eq!(error.code, "LIX_WORKING_DIFF_HOT_UNAVAILABLE");
         assert!(!error.message.contains("history is deferred"));
+    }
+
+    #[test]
+    fn working_diff_preserves_exact_hot_content_chunk_demand() {
+        let error = hot_only_diff_error(lix_error_to_datafusion_error(
+            crate::LixError::new("LIX_SYNC_CHUNKS_REQUIRED", "chunks are deferred")
+                .with_details(serde_json::json!({ "chunkIds": ["a".repeat(64)] })),
+        ));
+        let error = datafusion_error_to_lix_error(error);
+        assert_eq!(error.code, "LIX_SYNC_CHUNKS_REQUIRED");
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({ "chunkIds": ["a".repeat(64)] }))
+        );
     }
 
     #[test]

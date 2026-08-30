@@ -69,6 +69,7 @@ export type WorkerOperation =
 			statements: BindingBatchStatement[];
 			options?: LixBatchOptions;
 	  }
+	| { kind: "executionRoute"; statements: string[] }
 	| { kind: "beginTransaction" }
 	| {
 			kind: "transaction.execute";

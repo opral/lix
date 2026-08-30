@@ -148,9 +148,13 @@ pub use plugin::runtime::default::runtime as default_wasm_runtime;
 pub use handle::{
     CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
     ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder,
-    ServerMode, ServerOptions,
     TransactionExecuteBuilder, open_lix,
 };
+#[cfg(feature = "unsafe-internal-sync-cache")]
+#[doc(hidden)]
+pub use handle::InternalSyncCacheOptions;
+#[cfg(not(feature = "unsafe-internal-sync-cache"))]
+pub(crate) use handle::InternalSyncCacheOptions;
 pub use open_types::{
     OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
 };
@@ -189,6 +193,8 @@ pub use session::{
 pub use session::{
     ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row, TryFromValue,
 };
+#[doc(hidden)]
+pub use sql2::StatementAuthorityRoute;
 #[doc(hidden)]
 pub use session::CoherentReadBatch;
 pub(crate) use session::{

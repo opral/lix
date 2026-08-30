@@ -102,9 +102,6 @@ where
         opened
             .transaction
             .set_sync_mode(sync_role, replica_remote_id);
-        if self.sync_outbox_suppressed {
-            opened.transaction.suppress_ordinary_sync_event();
-        }
         opened
             .transaction
             .attach_commit_boundary(self.transaction_commit_boundary());
@@ -205,12 +202,8 @@ where
                 .bump_if_storage_changed(&outcome.storage_stats);
             // Explicit transactions publish the same canonical event lane as
             // automatic writes. Wake server long-polls only after the durable
-            // commit so readers never race a still-staged event. Suppressed
-            // internal replica transactions are excluded for the same reason as
-            // automatic sync-apply sessions.
-            if !self.session.sync_outbox_suppressed {
-                self.sync_mode.notify_sync_change();
-            }
+            // commit so readers never race a still-staged event.
+            self.sync_mode.notify_sync_change();
             drop(_entered);
             if let Some(notify) = notify {
                 notify.finish(Status::Unset, Vec::new());

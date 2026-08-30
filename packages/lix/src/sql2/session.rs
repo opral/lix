@@ -92,12 +92,22 @@ where
     } else {
         None
     };
+    let sync_publication_cursor = if statements.iter().any(|statement| {
+        statement_uses_execution_function(statement, "lix_sync_publication_cursor")
+    }) {
+        ctx.sync_publication_cursor()
+            .await?
+            .map(|cursor| cursor.to_string())
+    } else {
+        None
+    };
     bind_execution_sql2_functions(
         session,
         ctx.functions(),
         ctx.active_account_id(),
         Some(ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
+        sync_publication_cursor.as_deref(),
         latest_checkpoint_commit_id.as_deref(),
         root_commit_id.as_deref(),
     );
@@ -146,12 +156,22 @@ where
         } else {
             None
         };
+    let sync_publication_cursor =
+        if statement_uses_execution_function(statement, "lix_sync_publication_cursor") {
+            read_ctx
+                .sync_publication_cursor()
+                .await?
+                .map(|cursor| cursor.to_string())
+        } else {
+            None
+        };
     bind_execution_sql2_functions(
         session,
         read_ctx.functions(),
         read_ctx.active_account_id(),
         Some(read_ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
+        sync_publication_cursor.as_deref(),
         latest_checkpoint_commit_id.as_deref(),
         root_commit_id.as_deref(),
     );
@@ -235,6 +255,7 @@ pub(crate) async fn build_write_session_with_options(
         Some(&active_branch_commit_id.commit_id.to_string()),
         None,
         None,
+        None,
     );
     providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
 
@@ -269,7 +290,11 @@ fn statement_uses_execution_function(statement: &DataFusionStatement, function_n
 
         fn pre_visit_table_factor(&mut self, table: &TableFactor) -> ControlFlow<Self::Break> {
             if self.function_name == "lix_root_commit_id"
-                && let TableFactor::Table { name, args: Some(_), .. } = table
+                && let TableFactor::Table {
+                    name,
+                    args: Some(_),
+                    ..
+                } = table
                 && crate::sql2::parse::object_name_is_public_function(name, "lix_state_at")
             {
                 return ControlFlow::Break(());
@@ -277,12 +302,13 @@ fn statement_uses_execution_function(statement: &DataFusionStatement, function_n
             if matches!(
                 self.function_name,
                 "lix_latest_checkpoint_commit_id" | "lix_active_branch_commit_id"
-            ) && let TableFactor::Table { name, args: Some(arguments), .. } = table
+            ) && let TableFactor::Table {
+                name,
+                args: Some(arguments),
+                ..
+            } = table
                 && (crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
-                    || crate::sql2::parse::object_name_is_public_function(
-                        name,
-                        "lix_working_diff",
-                    ))
+                    || crate::sql2::parse::object_name_is_public_function(name, "lix_working_diff"))
                 && arguments.args.len() == 1
             {
                 return ControlFlow::Break(());
@@ -361,9 +387,10 @@ where
         })?;
     let mut commit_graph = context.commit_graph();
     loop {
-        let node = commit_graph.load_node(&current).await?.ok_or_else(|| {
-            crate::commit_graph::missing_commit_graph_error(&current)
-        })?;
+        let node = commit_graph
+            .load_node(&current)
+            .await?
+            .ok_or_else(|| crate::commit_graph::missing_commit_graph_error(&current))?;
         let Some(first_parent) = node.parent_commit_ids.first().copied() else {
             return Ok(Some(node.commit_id.to_string()));
         };

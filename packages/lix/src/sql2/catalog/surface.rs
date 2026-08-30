@@ -40,13 +40,14 @@ pub(crate) struct PublicScalarFunctionContract {
     pub(crate) class: PublicSurfaceClass,
 }
 
-pub(crate) const PUBLIC_SCALAR_FUNCTION_NAMES: [&str; 7] = [
+pub(crate) const PUBLIC_SCALAR_FUNCTION_NAMES: [&str; 8] = [
     "lix_active_account_id",
     "lix_active_branch_commit_id",
     "lix_active_branch_id",
     "lix_latest_checkpoint_commit_id",
     "lix_root_commit_id",
     "lix_row_ref",
+    "lix_sync_publication_cursor",
     "uuidv7",
 ];
 
@@ -108,9 +109,7 @@ impl PublicSurfaceKind {
             | Self::CheckpointFunction
             | Self::StateAtFunction
             | Self::CommitAncestryFunction => class == PublicSurfaceClass::TableFunction,
-            Self::Revert | Self::Apply | Self::Restore => {
-                class == PublicSurfaceClass::CommandSink
-            }
+            Self::Revert | Self::Apply | Self::Restore => class == PublicSurfaceClass::CommandSink,
         }
     }
 }

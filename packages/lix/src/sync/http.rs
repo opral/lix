@@ -386,10 +386,18 @@ fn raw_request(method: Method, url: String, operation: &'static str) -> RawHttpR
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "retained with the authority write operations on the complete sync transport"
+)]
 fn json_content_type() -> (String, String) {
     ("content-type".to_owned(), "application/json".to_owned())
 }
 
+#[allow(
+    dead_code,
+    reason = "retained with the authority write operations on the complete sync transport"
+)]
 fn json_body(value: &impl serde::Serialize, operation: &str) -> Result<Vec<u8>, LixError> {
     serde_json::to_vec(value).map_err(|error| {
         LixError::new(
