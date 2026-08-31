@@ -7341,7 +7341,7 @@ mod tests {
             .await
             .expect("initialize sparse replica storage");
         let mut replica = open_lix()
-            .with_storage(storage)
+            .with_storage(storage.clone())
             .await
             .expect("open sparse replica");
         replica
@@ -7452,7 +7452,11 @@ mod tests {
         hydration.abort();
         let _ = hydration.await;
 
-        let count = replica
+        let offline_reader = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("open an offline reader over the rejected replica state");
+        let count = offline_reader
             .execute(
                 "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'history-hydrated'",
                 &[],
