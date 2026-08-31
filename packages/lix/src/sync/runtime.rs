@@ -839,84 +839,106 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    let remote_id = lix.sync_mode_state().replica_remote_id().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "sync publication fence has no replica authority",
-        )
-    })?;
-    let mut limit = super::MAX_SYNC_REQUEST_ITEMS;
-    let mut cursor = lix
-        .load_sync_repository_cursor(remote_id.as_ref())
-        .await?
+    let remote_id = lix
+        .sync_mode_state()
+        .replica_remote_id()
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "sync repository cursor disappeared before publication fence",
+                "sync publication fence has no replica authority",
             )
         })?;
-    let probe = pull_delta_now_adaptive(transport, cursor, &mut limit).await?;
-    validate_delta_after(cursor, &probe)?;
-    let probe_empty = matches!(
-        &probe,
-        SyncRepositoryPullResponse::Delta { events, .. } if events.is_empty()
-    );
-    if probe_empty && lix.sync_repository_cursor_is_certified(cursor).await? {
-        return Ok(());
-    }
-    if !probe_empty {
-        prepare_pull(lix, transport, &probe).await?;
-        lix.apply_sync_repository_pull(remote_id.as_ref(), &probe)
-            .await?;
-        cursor = lix
+
+    // Durable OPFS stores can briefly have two workers while an old page is
+    // closing. Re-pin if that sibling publishes beyond this fence's snapshot
+    // or wins the certification CAS; a fence must certify the durable receipt
+    // it actually returns, never a cursor cached before an overlapping apply.
+    'pin: loop {
+        let mut limit = super::MAX_SYNC_REQUEST_ITEMS;
+        let mut cursor = lix
             .load_sync_repository_cursor(remote_id.as_ref())
             .await?
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "sync repository cursor disappeared during publication fence",
+                    "sync repository cursor disappeared before publication fence",
                 )
             })?;
-    }
+        let probe = pull_delta_now_adaptive(transport, cursor, &mut limit).await?;
+        validate_delta_after(cursor, &probe)?;
+        let probe_empty = matches!(
+            &probe,
+            SyncRepositoryPullResponse::Delta { events, .. } if events.is_empty()
+        );
+        if probe_empty && lix.sync_repository_cursor_is_certified(cursor).await? {
+            return Ok(());
+        }
+        if !probe_empty {
+            prepare_pull(lix, transport, &probe).await?;
+            lix.apply_sync_repository_pull(remote_id.as_ref(), &probe)
+                .await?;
+            cursor = lix
+                .load_sync_repository_cursor(remote_id.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "sync repository cursor disappeared during publication fence",
+                    )
+                })?;
+        }
 
-    // Pin the authority coordinate only after observing uncertified state.
-    // Snapshot metadata already carries the complete branch coordinates and
-    // roots required to certify the private replica receipt.
-    let snapshot = transport
-        .pull(None, super::MAX_SYNC_REQUEST_ITEMS)
-        .await
-        .map_err(snapshot_pull_error)?;
-    let target = match &snapshot {
-        SyncRepositoryPullResponse::Snapshot { cursor, .. } => *cursor,
-        SyncRepositoryPullResponse::Delta { .. } => {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "sync publication fence did not receive snapshot metadata",
-            ));
+        // Pin the authority coordinate only after observing uncertified state.
+        // Snapshot metadata already carries the complete branch coordinates and
+        // roots required to certify the private replica receipt.
+        let snapshot = transport
+            .pull(None, super::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .map_err(snapshot_pull_error)?;
+        let target = match &snapshot {
+            SyncRepositoryPullResponse::Snapshot { cursor, .. } => *cursor,
+            SyncRepositoryPullResponse::Delta { .. } => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync publication fence did not receive snapshot metadata",
+                ));
+            }
+        };
+        if cursor > target {
+            continue 'pin;
         }
-    };
-    if cursor > target {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "sync publication fence advanced beyond its pinned snapshot",
-        ));
-    }
-    while cursor < target {
-        let response = pull_delta_adaptive(transport, cursor, &mut limit).await?;
-        let response = truncate_delta_at_cursor(response, target)?;
-        let next = validate_delta_after(cursor, &response)?;
-        if next <= cursor {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "sync publication fence did not advance toward its pinned snapshot",
-            ));
+        while cursor < target {
+            let response = pull_delta_adaptive(transport, cursor, &mut limit).await?;
+            let response = truncate_delta_at_cursor(response, target)?;
+            let next = validate_delta_after(cursor, &response)?;
+            if next <= cursor {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync publication fence did not advance toward its pinned snapshot",
+                ));
+            }
+            prepare_pull(lix, transport, &response).await?;
+            lix.apply_sync_repository_pull(remote_id.as_ref(), &response)
+                .await?;
+            cursor = lix
+                .load_sync_repository_cursor(remote_id.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "sync repository cursor disappeared during publication catch-up",
+                    )
+                })?;
+            if cursor > target {
+                continue 'pin;
+            }
         }
-        prepare_pull(lix, transport, &response).await?;
-        lix.apply_sync_repository_pull(remote_id.as_ref(), &response)
-            .await?;
-        cursor = next;
+        match lix.validate_sync_publication_snapshot(&snapshot).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => continue 'pin,
+            Err(error) => return Err(error),
+        }
     }
-    lix.validate_sync_publication_snapshot(&snapshot).await
 }
 
 fn truncate_delta_at_cursor(

@@ -3332,7 +3332,7 @@ where
                 LixError::CODE_INVALID_PARAM,
                 "sync snapshot metadata must be completed with commit bodies, headers, and row pages",
             )),
-            SyncRepositoryPullResponse::Delta { cursor, events } => {
+            SyncRepositoryPullResponse::Delta { cursor, events } => 'admit: loop {
                 let (mut state, expected_state_raw) = {
                     let adapter = self.storage_adapter();
                     let read = adapter.begin_read(StorageReadOptions::default()).await?;
@@ -3351,12 +3351,34 @@ where
                 // so do not rescan branches or durably rewrite identical
                 // replica state every time an idle poll expires.
                 if events.is_empty() {
-                    if state.cursor != *cursor {
+                    if *cursor > state.cursor {
                         return Err(LixError::new(
                             LixError::CODE_INVALID_PARAM,
                             "sync delta cursor does not match its final event",
                         ));
                     }
+                    return Ok(());
+                }
+
+                if events
+                    .windows(2)
+                    .any(|pair| pair[0].cursor.checked_add(1) != Some(pair[1].cursor))
+                    || events.last().is_none_or(|event| event.cursor != *cursor)
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync delta event cursor is not contiguous",
+                    ));
+                }
+
+                // More than one live handle can momentarily share a durable
+                // browser replica while an old page is closing. Their pulls
+                // can overlap even though each individual worker serializes
+                // its own long poll and publication barriers. Drop the prefix
+                // another worker already published; never replay it against a
+                // newer certified coordinate or move the durable cursor back.
+                let events = &events[events.partition_point(|event| event.cursor <= state.cursor)..];
+                if events.is_empty() {
                     return Ok(());
                 }
 
@@ -3406,6 +3428,24 @@ where
                     if (local.0.as_deref(), local.1.as_deref())
                         != (authoritative_head, authoritative_checkpoint)
                     {
+                        let adapter = self.storage_adapter();
+                        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+                        let (latest_state, latest_raw) = load_replica_state(&read).await?;
+                        if latest_raw.as_ref() != Some(&expected_state_raw) {
+                            let latest_state = latest_state.ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    "sync replica state disappeared during delta admission",
+                                )
+                            })?;
+                            if latest_state.cursor < expected_cursor {
+                                return Err(LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    "sync replica cursor regressed during delta admission",
+                                ));
+                            }
+                            continue 'admit;
+                        }
                         return Err(LixError::new(
                             super::SYNC_PROTOCOL_MISMATCH_CODE,
                             format!(
@@ -3564,7 +3604,7 @@ where
                     }
                 }
                 drop(read);
-                Box::pin(self.import_sync_repository(
+                let publication = Box::pin(self.import_sync_repository(
                     &SyncPushRequest {
                         commits,
                         ref_updates: applicable_refs,
@@ -3578,9 +3618,37 @@ where
                         state: &state,
                     }),
                 ))
-                .await?;
-                Ok(())
-            }
+                .await;
+                match publication {
+                    Ok(_) => return Ok(()),
+                    // A sibling worker may have won the durable receipt CAS
+                    // after this iteration loaded it. Re-read the receipt and
+                    // trim the now-redundant prefix instead of terminating the
+                    // sync runtime with a false cursor-gap error.
+                    Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => {
+                        let adapter = self.storage_adapter();
+                        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+                        let (latest_state, latest_raw) = load_replica_state(&read).await?;
+                        if latest_raw.as_ref() == Some(&expected_state_raw) {
+                            return Err(error);
+                        }
+                        let latest_state = latest_state.ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "sync replica state disappeared after publication conflict",
+                            )
+                        })?;
+                        if latest_state.cursor < expected_cursor {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "sync replica cursor regressed after publication conflict",
+                            ));
+                        }
+                        continue 'admit;
+                    }
+                    Err(error) => return Err(error),
+                }
+            },
         }
     }
 
@@ -6835,6 +6903,16 @@ mod tests {
             };
             if let Some(barrier) = bootstrap_commit_barrier {
                 barrier.wait().await;
+                let mut configured = self
+                    .bootstrap_commit_barrier
+                    .lock()
+                    .expect("bootstrap gate should lock");
+                if configured
+                    .as_ref()
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &barrier))
+                {
+                    *configured = None;
+                }
             }
             if self.touches_replica_state
                 && self.fail_next_replica_receipt.swap(0, Ordering::Relaxed) != 0
@@ -7045,6 +7123,163 @@ mod tests {
                 .get::<serde_json::Value>("value")
                 .expect("observed value decodes"),
             serde_json::json!("after"),
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_sync_pulls_trim_an_already_published_prefix() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("authority snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+
+        write_key_value(&authority, "overlapping-pull", "first").await;
+        let first = authority
+            .pull_sync_repository(Some(cursor), 1)
+            .await
+            .expect("first authority delta should load");
+        write_key_value(&authority, "overlapping-pull", "second").await;
+        let overlapping = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("overlapping authority delta should load");
+
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &first)
+            .await
+            .expect("first worker should publish its delta");
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &overlapping)
+            .await
+            .expect("second worker should trim the published prefix");
+        // A fully redundant response is the other ordering of the same race.
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &overlapping)
+            .await
+            .expect("an already published delta should be idempotent");
+        replica
+            .apply_sync_repository_pull(
+                TEST_REMOTE,
+                &SyncRepositoryPullResponse::Delta {
+                    cursor,
+                    events: Vec::new(),
+                },
+            )
+            .await
+            .expect("a stale heartbeat should not move the receipt backwards");
+
+        let mut malformed = overlapping.clone();
+        let SyncRepositoryPullResponse::Delta { cursor, events } = &mut malformed else {
+            panic!("incremental pull should be a delta");
+        };
+        events[1].cursor = events[1]
+            .cursor
+            .checked_add(1)
+            .expect("test cursor should not overflow");
+        *cursor = events[1].cursor;
+        let error = replica
+            .apply_sync_repository_pull(TEST_REMOTE, &malformed)
+            .await
+            .expect_err("a gapped overlap must still be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+
+        assert_eq!(
+            read_key_value(&replica, "overlapping-pull").await,
+            "second"
+        );
+        let SyncRepositoryPullResponse::Delta {
+            cursor: final_cursor,
+            ..
+        } = overlapping
+        else {
+            panic!("incremental pull should be a delta");
+        };
+        assert_eq!(
+            replica
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .expect("replica cursor should load"),
+            Some(final_cursor),
+            "a stale pull must never move the durable receipt backwards",
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_overlapping_sync_pulls_converge_after_the_receipt_cas() {
+        let authority = open_lix().await.expect("authority should open");
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .expect("authority role should install");
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("authority snapshot should load");
+        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
+            panic!("initial pull should be a snapshot");
+        };
+        let storage = SyncAccountingStorage::default();
+        let replica = accounting_replica_from_snapshot(&authority, &snapshot, storage.clone()).await;
+        let sibling = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("sibling replica handle should open");
+        sibling
+            .set_sync_role(super::super::SyncRole::Replica)
+            .expect("sibling replica role should install");
+        sibling
+            .set_sync_replica_remote_id(TEST_REMOTE)
+            .expect("sibling should bind to the same authority");
+
+        write_key_value(&authority, "concurrent-overlap", "first").await;
+        let first = authority
+            .pull_sync_repository(Some(cursor), 1)
+            .await
+            .expect("first authority delta should load");
+        write_key_value(&authority, "concurrent-overlap", "second").await;
+        let overlapping = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("overlapping authority delta should load");
+
+        storage.reset();
+        storage.gate_bootstrap_commits(2);
+        let (first_result, overlapping_result) = tokio::join!(
+            replica.apply_sync_repository_pull(TEST_REMOTE, &first),
+            sibling.apply_sync_repository_pull(TEST_REMOTE, &overlapping),
+        );
+        first_result.expect("short overlapping worker should converge");
+        overlapping_result.expect("long overlapping worker should converge");
+
+        assert_eq!(
+            read_key_value(&replica, "concurrent-overlap").await,
+            "second"
+        );
+        let SyncRepositoryPullResponse::Delta {
+            cursor: final_cursor,
+            ..
+        } = overlapping
+        else {
+            panic!("incremental pull should be a delta");
+        };
+        assert_eq!(
+            replica
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .expect("replica cursor should load"),
+            Some(final_cursor),
+        );
+        assert_eq!(
+            storage.branch_publication_without_receipt_count(),
+            0,
+            "every winning ref publication must include its durable receipt",
         );
     }
 

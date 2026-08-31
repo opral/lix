@@ -12,6 +12,8 @@ Let:
 - `N` be the live rows in the published branch head;
 - `C` be distinct live rows in its latest-checkpoint baseline;
 - `D` be identities changed since that checkpoint;
+- `E` be repository events in one received delta;
+- `U` be the unapplied suffix of an overlapping delta (`U <= E`);
 - `B` be published branch descriptors;
 - `H` be cold commit-history depth; and
 - `P` be transferred snapshot and metadata bytes;
@@ -26,7 +28,7 @@ The intended bounds are:
 | Operation | Time / transfer | Peak owned memory |
 | --- | --- | --- |
 | Certified bootstrap | `O(M log M + (B + Q)M)`, independent of `H` | `O(P + M)` |
-| Certified live delta | `O(N log N)` per distinct head/checkpoint value root today | `O(N)` transient keys/digests |
+| Certified live delta | `O(E)` cursor admission plus `O(N log N)` per distinct head/checkpoint value root in the unapplied suffix today | `O(N)` transient keys/digests; overlapping-prefix trimming is a borrowed slice and adds `O(1)` memory |
 | Working-diff identity scan | `O(D log D)` after the certified index is installed | `O(D)` |
 | Selected working-file payload | `O(S + A_f log A_f + P_f)` via exact HOT file-ID pushdown | `O(A_f + P_f)` transient rows and payload copies |
 | Working file rendering | `O(D log F + F * h)` for `F` changed files and directory depth `h` | `O(D + F + directories)` |
@@ -48,6 +50,13 @@ The `O(N log N)` live-value-root build is the main remaining optimization
 target. It is correctness-complete and bounded independently of cold history
 `H`, but an incrementally maintained authenticated root would reduce
 steady-state delta certification to the changed-row frontier.
+
+Overlapping pulls from two handles sharing one durable browser store never
+replay already-published events. Admission validates all `E` cursors, borrows
+the `U`-event unapplied suffix without copying it, and retries only after the
+durable receipt CAS proves that another publisher made progress. The normal
+single-worker path therefore adds one linear cursor scan and no prefix-sized
+allocation; contention work is proportional to successful receipt advances.
 
 ## Regression evidence
 
