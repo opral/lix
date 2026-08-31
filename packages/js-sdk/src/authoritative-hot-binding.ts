@@ -1,21 +1,20 @@
 import type {
-	BindingExecutionRoute,
+	BindingExecuteResult,
 	LixBinding,
 	LixTransactionBinding,
 } from "./binding-types.js";
 
 const AUTHORITY_REQUIRED = "LIX_AUTHORITY_EXECUTION_REQUIRED";
-const PUBLICATION_CURSOR_SQL =
-	"SELECT lix_sync_publication_cursor() AS cursor";
-const CATCH_UP_TIMEOUT_MS = 30_000;
+const PUBLICATION_FENCE_SQL =
+	"SELECT lix_active_branch_commit_id() AS active_commit_id";
 
 type AuthorityExecutionKind = "history" | "mutation";
 
 /**
  * One connected Lix surface with a deliberately asymmetric data path:
  * certified current reads stay on the local hot replica, while history and
- * mutations execute on the authority. Every local read is preceded by a
- * pinned authority publication-cursor barrier.
+ * mutations execute on the authority. The local Rust execution path fences
+ * hot reads against the current authority publication before serving rows.
  */
 export function authoritativeHotBinding(
 	local: LixBinding,
@@ -36,26 +35,20 @@ export function authoritativeHotBinding(
 			requireOpen();
 			return operation();
 		});
-	const executionRoute = async (statements: string[]) => {
-		const classify = local.executionRoute;
-		if (!classify) {
-			throw protocolError(
-				"certified local binding cannot classify authoritative execution",
-			);
-		}
-		return classify.call(local, statements);
-	};
 	const executeRouted = async <T>(
-		route: BindingExecutionRoute,
 		localExecution: () => Promise<T>,
 		authorityExecution: () => Promise<T>,
 	): Promise<T> => {
-		if (route === "history") return authorityExecution();
-		if (route === "mutation") {
-			return waitAfterMutation(authorityExecution());
+		try {
+			return await localExecution();
+		} catch (error) {
+			const kind = authorityExecutionKind(error);
+			if (kind === "history") return authorityExecution();
+			if (kind === "mutation") {
+				return waitAfterMutation(authorityExecution());
+			}
+			throw error;
 		}
-		await waitForAuthorityPublication(local, authority);
-		return localExecution();
 	};
 
 	return {
@@ -68,7 +61,6 @@ export function authoritativeHotBinding(
 			const authoritySession = await authority.openAnotherSession(options);
 			let localSession: LixBinding | undefined;
 			try {
-				await waitForAuthorityPublication(local, authoritySession);
 				localSession = await local.openAnotherSession(options);
 				await waitForAuthorityPublication(localSession, authoritySession);
 				await assertAuthoritySessionAlignment(localSession, authoritySession);
@@ -81,17 +73,14 @@ export function authoritativeHotBinding(
 				throw error;
 			}
 		}),
-		executionRoute,
 		execute: (sql, params, options) => withStableBranch(async () =>
 			executeRouted(
-				await executionRoute([sql]),
 				() => local.execute(sql, params, options),
 				() => authority.execute(sql, params, options),
 			),
 		),
 		executeBatch: (statements, options) => withStableBranch(async () =>
 			executeRouted(
-				await executionRoute(statements.map((statement) => statement.sql)),
 				() => local.executeBatch(statements, options),
 				() => authority.executeBatch(statements, options),
 			),
@@ -157,14 +146,12 @@ export function authoritativeHotBinding(
 			}
 			try {
 				const result = await authority.switchBranch(options);
-				await waitForAuthorityPublication(local, authority);
 				await local.switchBranch(options);
 				await waitForAuthorityPublication(local, authority);
 				return result;
 			} catch (error) {
 				try {
 					await authority.switchBranch({ branchId: previousAuthorityBranch });
-					await waitForAuthorityPublication(local, authority);
 					await local.switchBranch({ branchId: previousLocalBranch });
 					await waitForAuthorityPublication(local, authority);
 					const [localBranch, authorityBranch] = await Promise.all([
@@ -265,23 +252,14 @@ function authorityExecutionKind(error: unknown): AuthorityExecutionKind | null {
 
 export async function waitForAuthorityPublication(
 	local: LixBinding,
-	authority: LixBinding,
+	_authority: LixBinding,
 ): Promise<void> {
-	// This authority read is the linearization point for the following local
-	// hot read. Pin it once: a replica that has advanced farther is also safe,
-	// and an unrelated later authority mutation must not move this wait target.
-	const target = await readPublicationCursor(authority);
-	await waitUntil(async () => {
-		try {
-			return (await readPublicationCursor(local)) >= target;
-		} catch (error) {
-			// A stale global-base refresh is itself authority-only. The authority
-			// cursor query above has already caused the corresponding publication;
-			// retry until the certified installer has consumed it.
-			if (authorityExecutionKind(error) === "mutation") return false;
-			throw error;
-		}
-	});
+	// Every hot execution on a connected Rust/worker binding starts with the
+	// private sync publication fence. One ordinary existing scalar query is
+	// therefore sufficient to wait until the local serving plane has consumed
+	// the authority head; no JS-visible cursor or routing API is needed.
+	const result = await local.execute(PUBLICATION_FENCE_SQL, []);
+	readTextCoordinate(result, 0, "active commit id");
 }
 
 export async function assertAuthoritySessionAlignment(
@@ -302,31 +280,16 @@ export async function assertAuthoritySessionAlignment(
 	}
 }
 
-async function readPublicationCursor(binding: LixBinding): Promise<bigint> {
-	const result = await binding.execute(PUBLICATION_CURSOR_SQL, []);
-	const row = result.rows[0];
-	const cursor = row?.[0];
-	if (cursor?.kind !== "text" || !/^(0|[1-9][0-9]*)$/.test(cursor.value)) {
-		throw protocolError(
-			"repository authority returned an invalid publication cursor",
-		);
+function readTextCoordinate(
+	result: BindingExecuteResult,
+	column: number,
+	name: string,
+): string {
+	const value = result.rows[0]?.[column];
+	if (value?.kind !== "text" || value.value.length === 0) {
+		throw protocolError(`repository authority returned an invalid ${name}`);
 	}
-	return BigInt(cursor.value);
-}
-
-async function waitUntil(predicate: () => Promise<boolean>): Promise<void> {
-	const deadline = Date.now() + CATCH_UP_TIMEOUT_MS;
-	let delayMs = 1;
-	for (;;) {
-		if (await predicate()) return;
-		if (Date.now() >= deadline) {
-			throw protocolError(
-				"authority publication was observed, but the certified local hot state did not catch up",
-			);
-		}
-		await new Promise((resolve) => setTimeout(resolve, delayMs));
-		delayMs = Math.min(delayMs * 2, 100);
-	}
+	return value.value;
 }
 
 function authorityOnlyFilesystemError(

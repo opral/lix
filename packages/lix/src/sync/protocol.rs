@@ -8,65 +8,6 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use super::commit::SyncCommit;
 
-pub(crate) fn sync_event_certificate_root_id(
-    cursor: u64,
-    commits: &[SyncCommit],
-    ref_updates: &[SyncRefUpdate],
-    inline_blobs: &[SyncBlobManifest],
-) -> Result<String, crate::LixError> {
-    sync_event_certificate_root_id_from_refs(cursor, commits.iter(), ref_updates, inline_blobs)
-}
-
-fn sync_event_certificate_root_id_from_refs<'a>(
-    cursor: u64,
-    commits: impl IntoIterator<Item = &'a SyncCommit>,
-    ref_updates: &[SyncRefUpdate],
-    inline_blobs: &[SyncBlobManifest],
-) -> Result<String, crate::LixError> {
-    let commits = commits.into_iter().collect::<Vec<_>>();
-    let mut root = blake3::Hasher::new();
-    root.update(b"lix.sync.event.certificate.v1\0");
-    root.update(&cursor.to_be_bytes());
-    root.update(
-        &u64::try_from(commits.len())
-            .unwrap_or(u64::MAX)
-            .to_be_bytes(),
-    );
-    for commit in commits {
-        let encoded = serde_json::to_vec(commit).map_err(|error| {
-            crate::LixError::new(
-                crate::LixError::CODE_INTERNAL_ERROR,
-                format!("encode sync immutable commit certificate: {error}"),
-            )
-        })?;
-        root.update(
-            &u64::try_from(encoded.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
-        root.update(&encoded);
-    }
-    for (kind, values) in [
-        (b"ref-updates".as_slice(), serde_json::to_vec(ref_updates)),
-        (b"inline-blobs".as_slice(), serde_json::to_vec(inline_blobs)),
-    ] {
-        let encoded = values.map_err(|error| {
-            crate::LixError::new(
-                crate::LixError::CODE_INTERNAL_ERROR,
-                format!("encode sync event {kind:?} certificate: {error}"),
-            )
-        })?;
-        root.update(kind);
-        root.update(
-            &u64::try_from(encoded.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
-        root.update(&encoded);
-    }
-    Ok(root.finalize().to_hex().to_string())
-}
-
 /// Returns the exact JSON size of a one-event delta response without cloning
 /// commit payloads. Both HTTP admission and ordinary Authority transactions
 /// use this single wire projection so an accepted event is always pullable.
@@ -82,7 +23,6 @@ pub(crate) fn encoded_delta_event_len(
         commits: &'a [&'a SyncCommit],
         ref_updates: &'a [SyncRefUpdate],
         inline_blobs: &'a [SyncBlobManifest],
-        certificate_root_id: String,
     }
 
     #[derive(Serialize)]
@@ -101,12 +41,6 @@ pub(crate) fn encoded_delta_event_len(
             commits,
             ref_updates,
             inline_blobs: &[],
-            certificate_root_id: sync_event_certificate_root_id_from_refs(
-                cursor,
-                commits.iter().copied(),
-                ref_updates,
-                &[],
-            )?,
         }],
     })
     .map(|encoded| encoded.len())
@@ -130,17 +64,6 @@ pub struct SyncRefUpdate {
     /// The branch-specific checkpoint against which working changes are read.
     /// It is null only when `head_commit_id` is null for a ref deletion.
     pub checkpoint_commit_id: Option<String>,
-    /// Authority-certified BLAKE3 root of every live row identity, commit/change
-    /// coordinate, lifecycle and authored-change provenance, snapshot, and
-    /// metadata value at `head_commit_id`.
-    /// Authority delta events must carry this for every headed ref; client push
-    /// requests leave it null.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head_state_root_id: Option<String>,
-    /// Authority-certified live-row root at `checkpoint_commit_id`. It follows
-    /// the same event-only rule as `head_state_root_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint_state_root_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -151,10 +74,6 @@ struct SyncRefUpdateWire {
     expected_checkpoint_commit_id: RequiredOption<String>,
     head_commit_id: Option<String>,
     checkpoint_commit_id: RequiredOption<String>,
-    #[serde(default)]
-    head_state_root_id: Option<String>,
-    #[serde(default)]
-    checkpoint_state_root_id: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SyncRefUpdate {
@@ -179,8 +98,6 @@ impl<'de> Deserialize<'de> for SyncRefUpdate {
             expected_checkpoint_commit_id: wire.expected_checkpoint_commit_id.0,
             head_commit_id: wire.head_commit_id,
             checkpoint_commit_id: wire.checkpoint_commit_id.0,
-            head_state_root_id: wire.head_state_root_id,
-            checkpoint_state_root_id: wire.checkpoint_state_root_id,
         })
     }
 }
@@ -266,10 +183,9 @@ pub struct SyncBranchHead {
     /// The branch-specific checkpoint against which working changes are read.
     /// It is null only when `head_commit_id` is null.
     pub checkpoint_commit_id: Option<String>,
-    /// BLAKE3 root binding every live checkpoint row and its complete values.
+    /// BLAKE3 root of the live checkpoint row stream.
     pub checkpoint_state_root_id: String,
-    /// BLAKE3 root binding every live, tombstone-filtered row and its complete
-    /// snapshot/metadata values at this head.
+    /// BLAKE3 root of the live, tombstone-filtered row stream at this head.
     /// This is distinct from a commit header's physical state root.
     pub hot_state_root_id: String,
 }
@@ -339,10 +255,6 @@ pub struct SyncEvent {
     pub ref_updates: Vec<SyncRefUpdate>,
     /// Self-contained small blobs referenced by `commits`.
     pub inline_blobs: Vec<SyncBlobManifest>,
-    /// Authority certificate over this event's cursor, ordered immutable
-    /// commits/changes, ordered ref updates, and ordered inline blob manifests.
-    /// The certificate field itself is the only excluded event member.
-    pub certificate_root_id: String,
 }
 
 /// Bootstrap is hot state plus lightweight topology; delta pages contain
@@ -491,8 +403,6 @@ mod tests {
             expected_checkpoint_commit_id: Some("old-checkpoint".to_owned()),
             head_commit_id: Some("head".to_owned()),
             checkpoint_commit_id: Some("checkpoint".to_owned()),
-            head_state_root_id: Some("0".repeat(64)),
-            checkpoint_state_root_id: Some("1".repeat(64)),
         };
         let value = serde_json::to_value(&update).expect("serialize ref update");
         assert_eq!(value["checkpointCommitId"], "checkpoint");
@@ -555,8 +465,6 @@ mod tests {
             expected_checkpoint_commit_id: Some("old-checkpoint".to_owned()),
             head_commit_id: Some("head".to_owned()),
             checkpoint_commit_id: Some("checkpoint".to_owned()),
-            head_state_root_id: Some("0".repeat(64)),
-            checkpoint_state_root_id: Some("1".repeat(64)),
         }];
         let expected = serde_json::to_vec(&SyncRepositoryPullResponse::Delta {
             cursor: 3,
@@ -565,8 +473,6 @@ mod tests {
                 commits: Vec::new(),
                 ref_updates: ref_updates.clone(),
                 inline_blobs: Vec::new(),
-                certificate_root_id: sync_event_certificate_root_id(3, &[], &ref_updates, &[])
-                    .expect("certify empty event"),
             }],
         })
         .expect("serialize delta response")

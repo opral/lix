@@ -136,6 +136,14 @@ mod tests {
             .expect("query restored state");
         assert_eq!(result.rows().len(), 1);
 
+        restored
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('restored-write', 'allowed')",
+                &[],
+            )
+            .await
+            .expect("authority admission marker must not escape into an exported snapshot");
+
         restored.close().await.expect("close restored Lix");
         server.close().await.expect("close protocol server");
     }

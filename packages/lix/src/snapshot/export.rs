@@ -26,6 +26,7 @@ where
 {
     storage: StorageAdapter<StorageSession<StorageImpl>>,
     durability: ReadDurability,
+    preflight_error: Option<LixError>,
 }
 
 impl<StorageImpl> SnapshotExportBuilder<StorageImpl>
@@ -36,7 +37,16 @@ where
         Self {
             storage,
             durability: ReadDurability::Visible,
+            preflight_error: None,
         }
+    }
+
+    pub(crate) fn reject_connected_replica(mut self) -> Self {
+        self.preflight_error = Some(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "a connected replica is a sparse cache and cannot export a canonical repository snapshot; export from the authority",
+        ));
+        self
     }
 
     /// Selects the minimum persistence boundary of the source read.
@@ -53,6 +63,9 @@ where
     where
         W: AsyncWrite + Unpin + Send + ?Sized,
     {
+        if let Some(error) = self.preflight_error {
+            return Err(error);
+        }
         let read = self
             .storage
             .begin_read(StorageReadOptions {
@@ -60,6 +73,12 @@ where
                 ..StorageReadOptions::default()
             })
             .await?;
+        if crate::sync::has_any_sync_replica_state(&read).await? {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "a persisted replica is a sparse cache and cannot export a canonical repository snapshot; export from the authority",
+            ));
+        }
         let mut encoder =
             SnapshotEncoder::new(writer, crate::init::CURRENT_FORMAT_VERSION).await?;
         for space in super::snapshot_spaces() {
@@ -82,6 +101,14 @@ where
                     .await?
                     .into_parts();
                 for entry in entries {
+                    // Authority admission is a host-local write fence, not
+                    // repository data. Exporting it would make a restored
+                    // standalone snapshot permanently reject ordinary writes.
+                    if space == crate::sync::SYNC_AUTHORITY_STATE_SPACE
+                        && entry.key == crate::sync::authority_state_key()
+                    {
+                        continue;
+                    }
                     let StorageProjectedValue::FullValue(value) = entry.value else {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,

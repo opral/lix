@@ -2182,7 +2182,7 @@ async fn drop_tombstones_named(storage: &Memory, needle: &str) -> usize {
 /// The readers, one arm each:
 ///
 /// - the collection answer and the point answer, cold;
-/// - `lix_working_diff`, before and after;
+/// - one-argument `lix_diff`, before and after;
 /// - the commit graph, which is what history is derived from;
 /// - a branch forked *mid-interval*, while the identity was still alive - the
 ///   case where the removed key could plausibly have been serving somebody

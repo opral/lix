@@ -63,7 +63,6 @@ use super::protocol::{
     SyncBlobManifest, SyncBranchHead, SyncCommitHeader, SyncEvent, SyncHistoryBoundary,
     SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRefUpdate,
     SyncRepositoryPullResponse, SyncSnapshotRow, SyncSnapshotRowPage,
-    sync_event_certificate_root_id,
 };
 
 fn immutable_object_mismatch(kind: &str, id: impl ToString) -> LixError {
@@ -564,15 +563,14 @@ pub(crate) const SYNC_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::declare(
     ValueSemantics::Mutable,
 );
 
-pub(crate) const SYNC_AUTHORITY_STATE_SPACE: StorageSpace = StorageSpace::declare(
-    StorageSpaceId(0x0007_0016),
-    "sync.authority_state.v4",
-    ValueSemantics::Mutable,
-);
+// Authority admission and replica receipts are mutually exclusive repository
+// roles, so their distinct keys share the existing private sync-control space.
+// Keeping the marker here avoids expanding the public registered-space list.
+pub(crate) const SYNC_AUTHORITY_STATE_SPACE: StorageSpace = SYNC_REPLICA_STATE_SPACE;
 
 const SEQUENCE_KEY: &[u8] = b"repository";
 const REPLICA_STATE_KEY: &[u8] = b"repository";
-const AUTHORITY_STATE_KEY: &[u8] = b"repository";
+const AUTHORITY_STATE_KEY: &[u8] = b"authority";
 pub(crate) const AUTHORITY_STATE_VALUE: &[u8] = b"certified-authority-v4";
 const AMBIGUOUS_REPLICA_STATE_CODE: &str = "LIX_ERROR_SYNC_REPLICA_STATE_AMBIGUOUS";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -589,6 +587,14 @@ struct SyncReplicaState {
     active_account_id: String,
     cursor: u64,
     authoritative_branches: BTreeMap<String, AuthoritativeBranchCoordinate>,
+    /// Locally computed complete-value roots at each installed authority ref.
+    /// This is private cache metadata, never part of the sync wire.
+    #[serde(default)]
+    certified_branch_roots: BTreeMap<String, CertifiedBranchRoots>,
+    /// Last cursor whose locally computed roots were compared with an
+    /// authority Snapshot response.
+    #[serde(default)]
+    snapshot_certified_cursor: Option<u64>,
     /// Restore operations are branch intent, not graph-shape inference. They
     /// are recorded in the same atomic commit as `lix_restore` so reconnect,
     /// crash recovery, and post-restore local commits preserve the exact CAS
@@ -602,6 +608,13 @@ struct SyncReplicaState {
     /// their final ref update. Remembering those acknowledgements makes the
     /// next batch advance instead of rebuilding the same first 512 commits.
     authority_known_commit_ids: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CertifiedBranchRoots {
+    head_state_root_id: String,
+    checkpoint_state_root_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -838,6 +851,7 @@ async fn load_replica_state(
         .transpose()?;
     let state = raw
         .as_ref()
+        .filter(|raw| raw.as_ref() != AUTHORITY_STATE_VALUE)
         .map(|raw| {
             serde_json::from_slice(raw).map_err(|error| {
                 LixError::new(
@@ -1006,12 +1020,25 @@ pub(crate) async fn has_any_sync_replica_state(
             SYNC_REPLICA_STATE_SPACE,
             range,
             StorageBeginScanOptions {
-                projection: StorageCoreProjection::KeyOnly,
+                projection: StorageCoreProjection::FullValue,
                 ..StorageBeginScanOptions::default()
             },
         )
         .await?;
-    Ok(!cursor.next_page(1).await?.is_empty())
+    while let Some(entries) = cursor.next_chunk().await? {
+        for entry in entries {
+            let StorageProjectedValue::FullValue(value) = entry.value else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync replica-state scan omitted its value",
+                ));
+            };
+            if entry.key != authority_state_key() || value.as_ref() != AUTHORITY_STATE_VALUE {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Commit bodies named by retained repository events remain part of the
@@ -1092,6 +1119,9 @@ pub(crate) async fn load_pending_sync_export_commit_ids(
                     "sync replica-state retention scan omitted its value",
                 ));
             };
+            if entry.key == authority_state_key() && value.as_ref() == AUTHORITY_STATE_VALUE {
+                continue;
+            }
             states.push(
                 serde_json::from_slice::<SyncReplicaState>(&value).map_err(|error| {
                     LixError::new(
@@ -1431,28 +1461,6 @@ async fn load_sequence(
         }
     };
     Ok((cursor, raw))
-}
-
-pub(crate) async fn load_sync_publication_cursor(
-    read: &(impl StorageAdapterRead + ?Sized),
-    role: super::SyncRole,
-) -> Result<Option<u64>, LixError> {
-    match role {
-        super::SyncRole::Authority => Ok(Some(load_sequence(read).await?.0)),
-        super::SyncRole::Replica => {
-            let (state, _) = load_replica_state(read).await?;
-            state
-                .map(|state| state.cursor)
-                .ok_or_else(|| {
-                    LixError::new(
-                        "LIX_REPLICA_RECEIPT_MISSING",
-                        "connected replica has no certified authority receipt",
-                    )
-                })
-                .map(Some)
-        }
-        super::SyncRole::Disabled => Ok(None),
-    }
 }
 
 struct ParsedMember {
@@ -2127,7 +2135,7 @@ async fn load_sync_live_value_rows_at_commit(
         .await?;
     let mut rows = BTreeMap::new();
     for row in tracked_rows.iter() {
-        let change = load_change_record_by_id(read, row.change_id())
+        let change = load_existing_sync_change(read, row.change_id())
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -2489,8 +2497,6 @@ where
                     .map(|checkpoint| checkpoint.to_string()),
                 head_commit_id: after.map(|control| control.head_commit_id.to_string()),
                 checkpoint_commit_id: checkpoint_commit_id.map(|checkpoint| checkpoint.to_string()),
-                head_state_root_id: None,
-                checkpoint_state_root_id: None,
             }))
         })
         .collect::<Result<Vec<_>, LixError>>()?;
@@ -2538,18 +2544,7 @@ pub(crate) fn validate_repository_transaction_event_transfer(
             "authority sync preflight materialized a commit outside its repository event",
         ));
     }
-    // Repository records store semantic ref coordinates. Pull adds the two
-    // fixed-width live-root certificates, so reserve those bytes at admission
-    // rather than accepting an event that cannot fit its eventual response.
-    let mut certified_ref_updates = event.ref_updates.clone();
-    for update in &mut certified_ref_updates {
-        if update.head_commit_id.is_some() {
-            update.head_state_root_id = Some("0".repeat(64));
-            update.checkpoint_state_root_id = Some("0".repeat(64));
-        }
-    }
-    let encoded_len =
-        super::encoded_delta_event_len(event.cursor, &commits, &certified_ref_updates)?;
+    let encoded_len = super::encoded_delta_event_len(event.cursor, &commits, &event.ref_updates)?;
     let transfer_limit = repository_transaction_event_transfer_limit();
     if encoded_len > transfer_limit {
         return Err(LixError::new(
@@ -2660,6 +2655,18 @@ where
         Ok(load_replica_state(&read).await?.0.map(|state| state.cursor))
     }
 
+    pub(crate) async fn sync_repository_cursor_is_certified(
+        &self,
+        cursor: u64,
+    ) -> Result<bool, LixError> {
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        Ok(load_replica_state(&read)
+            .await?
+            .0
+            .is_some_and(|state| state.cursor == cursor && state.snapshot_certified_cursor == Some(cursor)))
+    }
+
     pub(crate) async fn validate_sync_repository_account(
         &self,
         _remote_id: &str,
@@ -2683,8 +2690,8 @@ where
     /// Rejects a persisted replica whose visible branch coordinates contain
     /// work that was never acknowledged by its authority.
     ///
-    /// Protocol v3 is a hard cut: replicas are certified serving caches, not
-    /// peers with an upload outbox. A divergent pre-v3 cache must be discarded
+    /// Protocol v6 is a hard cut: replicas are certified serving caches, not
+    /// peers with an upload outbox. A divergent pre-v6 cache must be discarded
     /// and bootstrapped again instead of being merged or published.
     pub(crate) async fn validate_sync_hot_state_authoritative(&self) -> Result<(), LixError> {
         let adapter = self.storage_adapter();
@@ -2720,6 +2727,15 @@ where
                 matches!(coordinate, AuthoritativeBranchCoordinate::Headed { .. })
             })
             .collect::<BTreeMap<_, _>>();
+        if state.certified_branch_roots.len() != authoritative.len() {
+            return Err(LixError::new(
+                super::SYNC_PROTOCOL_MISMATCH_CODE,
+                "persisted sync replica predates certified HOT receipts",
+            )
+            .with_hint(
+                "discard this pre-v6 replica cache and bootstrap a certified HOT snapshot from the authority",
+            ));
+        }
         if local == authoritative {
             return Ok(());
         }
@@ -2728,8 +2744,130 @@ where
             "persisted sync replica contains unacknowledged local state",
         )
         .with_hint(
-            "discard this pre-v3 replica cache and bootstrap a certified HOT snapshot from the authority",
+            "discard this pre-v6 replica cache and bootstrap a certified HOT snapshot from the authority",
         ))
+    }
+
+    /// Verifies the installed replica receipt against one immutable authority
+    /// snapshot. Complete-value roots were computed when each delta was
+    /// installed, so an already-caught-up fence reads only O(branches)
+    /// metadata and never rescans current rows.
+    pub(crate) async fn validate_sync_publication_snapshot(
+        &self,
+        snapshot: &SyncRepositoryPullResponse,
+    ) -> Result<(), LixError> {
+        let SyncRepositoryPullResponse::Snapshot {
+            cursor, branches, ..
+        } = snapshot
+        else {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync publication fence requires snapshot metadata",
+            ));
+        };
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        let (state, previous) = load_replica_state(&read).await?;
+        let Some(mut state) = state else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync publication fence lost its replica receipt",
+            ));
+        };
+        if state.cursor != *cursor {
+            return Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "sync publication fence cursor changed before certification",
+            ));
+        }
+        let branch_ids = branches
+            .iter()
+            .map(|branch| branch.branch_id.clone())
+            .collect::<Vec<_>>();
+        let local = BranchHeadControlContext::new()
+            .reader(&read)
+            .load_many(&branch_ids)
+            .await?;
+        let headed_branch_count = state
+            .authoritative_branches
+            .values()
+            .filter(|coordinate| {
+                matches!(coordinate, AuthoritativeBranchCoordinate::Headed { .. })
+            })
+            .count();
+        if branches.len() != headed_branch_count
+            || branches.len() != state.certified_branch_roots.len()
+        {
+            return Err(LixError::new(
+                super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
+                "sync publication fence branch set differs from its local certificate",
+            ));
+        }
+        for (branch, local) in branches.iter().zip(local) {
+            let expected = AuthoritativeBranchCoordinate::from_wire(
+                branch.head_commit_id.clone(),
+                branch.checkpoint_commit_id.clone(),
+                "sync publication snapshot branch",
+            )?;
+            if state.authoritative_branches.get(&branch.branch_id) != Some(&expected) {
+                return Err(LixError::new(
+                    super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
+                    format!(
+                        "sync publication fence branch '{}' coordinate is not installed",
+                        branch.branch_id
+                    ),
+                ));
+            }
+            let local_coordinate = local.map(|control| {
+                AuthoritativeBranchCoordinate::Headed {
+                    head_commit_id: control.head_commit_id.to_string(),
+                    checkpoint_commit_id: control
+                        .working_diff_checkpoint_commit_id
+                        .unwrap_or(control.head_commit_id)
+                        .to_string(),
+                }
+            });
+            if local_coordinate.as_ref() != Some(&expected) {
+                return Err(LixError::new(
+                    super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
+                    format!(
+                        "sync publication fence branch '{}' local control diverged",
+                        branch.branch_id
+                    ),
+                ));
+            }
+            let expected_roots = CertifiedBranchRoots {
+                head_state_root_id: branch.hot_state_root_id.clone(),
+                checkpoint_state_root_id: branch.checkpoint_state_root_id.clone(),
+            };
+            if state.certified_branch_roots.get(&branch.branch_id) != Some(&expected_roots) {
+                return Err(LixError::new(
+                    super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
+                    format!(
+                        "sync publication fence branch '{}' live-state roots diverged",
+                        branch.branch_id
+                    ),
+                ));
+            }
+        }
+        let previous = previous.expect("decoded sync replica state has source bytes");
+        state.snapshot_certified_cursor = Some(*cursor);
+        let mut writes = adapter.new_write_set();
+        let mut preconditions = Vec::new();
+        stage_replica_state(&mut writes, &mut preconditions, &state, Some(previous))?;
+        drop(read);
+        adapter
+            .commit_certified_replica_write_set(
+                super::certified_replica_write_capability(),
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    await_durable: true,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2970,8 +3108,6 @@ where
                         .map(str::to_owned),
                     head_commit_id: local.map(|head| head.to_string()),
                     checkpoint_commit_id: local_checkpoint.map(|checkpoint| checkpoint.to_string()),
-                    head_state_root_id: None,
-                    checkpoint_state_root_id: None,
                 });
             }
             if ref_updates.is_empty() {
@@ -3253,10 +3389,10 @@ where
                         })
                         .collect::<BTreeMap<_, _>>()
                 };
-                // A v3 replica is a certified serving cache. It must still be
+                // A v6 replica is a certified serving cache. It must still be
                 // at the exact authority coordinate named by its durable
                 // receipt before the next certified delta can be installed.
-                // Divergence is evidence of an incompatible/pre-v3 cache, not
+                // Divergence is evidence of an incompatible/pre-v6 cache, not
                 // a merge input.
                 for branch_id in &branch_ids {
                     let local = local_coordinates
@@ -3283,31 +3419,9 @@ where
                 }
                 let mut commits = BTreeMap::new();
                 let mut inline_blobs = BTreeMap::new();
-                let mut branch_chains = BTreeMap::<
-                    String,
-                    (
-                        Option<String>,
-                        Option<String>,
-                        Option<String>,
-                        Option<String>,
-                    ),
-                >::new();
+                let mut branch_chains =
+                    BTreeMap::<String, (Option<String>, Option<String>)>::new();
                 for event in events {
-                    let actual_event_root = sync_event_certificate_root_id(
-                        event.cursor,
-                        &event.commits,
-                        &event.ref_updates,
-                        &event.inline_blobs,
-                    )?;
-                    if event.certificate_root_id != actual_event_root {
-                        return Err(LixError::new(
-                            super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
-                            format!(
-                                "sync delta event '{}' immutable object certificate does not match its commit wire",
-                                event.cursor
-                            ),
-                        ));
-                    }
                     let next_cursor = state
                         .cursor
                         .checked_add(1)
@@ -3338,35 +3452,6 @@ where
                         }
                     }
                     for update in &event.ref_updates {
-                        match (
-                            update.head_commit_id.as_ref(),
-                            update.head_state_root_id.as_ref(),
-                            update.checkpoint_state_root_id.as_ref(),
-                        ) {
-                            (Some(_), Some(head_root), Some(checkpoint_root)) => {
-                                parse_sync_live_value_root_id(head_root)?;
-                                parse_sync_live_value_root_id(checkpoint_root)?;
-                            }
-                            (Some(_), _, _) => {
-                                return Err(LixError::new(
-                                    LixError::CODE_INVALID_PARAM,
-                                    format!(
-                                        "sync delta ref '{}' omits its authoritative live-state roots",
-                                        update.branch_id
-                                    ),
-                                ));
-                            }
-                            (None, None, None) => {}
-                            (None, _, _) => {
-                                return Err(LixError::new(
-                                    LixError::CODE_INVALID_PARAM,
-                                    format!(
-                                        "deleted sync delta ref '{}' carries live-state roots",
-                                        update.branch_id
-                                    ),
-                                ));
-                            }
-                        }
                         let authoritative_coordinate =
                             state.authoritative_branches.get(&update.branch_id);
                         let authoritative = authoritative_coordinate
@@ -3396,14 +3481,10 @@ where
                                 (
                                     update.head_commit_id.clone(),
                                     update.checkpoint_commit_id.clone(),
-                                    update.head_state_root_id.clone(),
-                                    update.checkpoint_state_root_id.clone(),
                                 )
                             });
                         chain.0 = update.head_commit_id.clone();
                         chain.1 = update.checkpoint_commit_id.clone();
-                        chain.2 = update.head_state_root_id.clone();
-                        chain.3 = update.checkpoint_state_root_id.clone();
                         state
                             .authoritative_branches
                             .insert(update.branch_id.clone(), next_authoritative);
@@ -3418,22 +3499,71 @@ where
                 }
 
                 let mut applicable_refs = Vec::new();
-                for (branch_id, (head, checkpoint, head_root, checkpoint_root)) in branch_chains {
+                for (branch_id, (head, checkpoint)) in &branch_chains {
                     let local = local_coordinates
-                        .get(&branch_id)
+                        .get(branch_id)
                         .expect("folded delta branch was loaded once");
                     applicable_refs.push(SyncRefUpdate {
-                        branch_id,
+                        branch_id: branch_id.clone(),
                         expected_head_commit_id: local.0.clone(),
                         expected_checkpoint_commit_id: local.1.clone(),
-                        head_commit_id: head,
-                        checkpoint_commit_id: checkpoint,
-                        head_state_root_id: head_root,
-                        checkpoint_state_root_id: checkpoint_root,
+                        head_commit_id: head.clone(),
+                        checkpoint_commit_id: checkpoint.clone(),
                     });
                 }
                 let commits = commits.into_values().collect::<Vec<_>>();
                 let inline_blobs = inline_blobs.into_values().collect::<Vec<_>>();
+                let parsed = commits
+                    .iter()
+                    .map(ParsedCommit::parse)
+                    .map(|result| result.map(|commit| (commit.commit_id, commit)))
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                let adapter = self.storage_adapter();
+                let read = adapter.begin_read(StorageReadOptions::default()).await?;
+                let mut roots = BTreeMap::<CommitId, SyncLiveValueRootId>::new();
+                for (branch_id, (head, checkpoint)) in &branch_chains {
+                    match (head.as_deref(), checkpoint.as_deref()) {
+                        (Some(head), Some(checkpoint)) => {
+                            let head = CommitId::parse_lix(head, "sync delta branch head")?;
+                            let checkpoint =
+                                CommitId::parse_lix(checkpoint, "sync delta branch checkpoint")?;
+                            let head_root = if let Some(root) = roots.get(&head) {
+                                root.clone()
+                            } else {
+                                let root = certified_sync_live_value_root_with_imports(
+                                    &read, &parsed, head,
+                                )
+                                .await?;
+                                roots.insert(head, root.clone());
+                                root
+                            };
+                            let checkpoint_root = if let Some(root) = roots.get(&checkpoint) {
+                                root.clone()
+                            } else {
+                                let root = certified_sync_live_value_root_with_imports(
+                                    &read, &parsed, checkpoint,
+                                )
+                                .await?;
+                                roots.insert(checkpoint, root.clone());
+                                root
+                            };
+                            state.certified_branch_roots.insert(
+                                branch_id.clone(),
+                                CertifiedBranchRoots {
+                                    head_state_root_id: format_sync_live_value_root_id(&head_root),
+                                    checkpoint_state_root_id: format_sync_live_value_root_id(
+                                        &checkpoint_root,
+                                    ),
+                                },
+                            );
+                        }
+                        (None, None) => {
+                            state.certified_branch_roots.remove(branch_id);
+                        }
+                        _ => unreachable!("sync coordinate validation already paired head/checkpoint"),
+                    }
+                }
+                drop(read);
                 Box::pin(self.import_sync_repository(
                     &SyncPushRequest {
                         commits,
@@ -3539,8 +3669,6 @@ where
                     expected_checkpoint_commit_id: Some(current_checkpoint),
                     head_commit_id: Some(expected_head_commit_id.to_owned()),
                     checkpoint_commit_id: Some(checkpoint_commit_id.to_owned()),
-                    head_state_root_id: None,
-                    checkpoint_state_root_id: None,
                 }],
                 inline_blobs: Vec::new(),
             },
@@ -4221,6 +4349,18 @@ where
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+        let certified_branch_roots = branches
+            .iter()
+            .map(|branch| {
+                (
+                    branch.branch_id.clone(),
+                    CertifiedBranchRoots {
+                        head_state_root_id: branch.hot_state_root_id.clone(),
+                        checkpoint_state_root_id: branch.checkpoint_state_root_id.clone(),
+                    },
+                )
+            })
+            .collect();
         stage_replica_state(
             &mut writes,
             &mut preconditions,
@@ -4228,6 +4368,8 @@ where
                 active_account_id: active_account_id.to_owned(),
                 cursor,
                 authoritative_branches,
+                certified_branch_roots,
+                snapshot_certified_cursor: Some(cursor),
                 pending_resets: BTreeMap::new(),
                 authority_known_commit_ids: BTreeSet::new(),
             },
@@ -5579,96 +5721,6 @@ where
         // control CAS publish commit, head, and replica receipt atomically.
         let certified_replica_delta =
             purpose == SyncImportPurpose::ReplicaDelta && replica_publication.is_some();
-        if certified_replica_delta {
-            // Validate the complete logical import while every new immutable
-            // object is still only staged in memory. A rejected certificate
-            // must not leave an unreachable object at a canonical immutable
-            // key, because a correct retry could not replace it.
-            let mut roots = BTreeMap::<CommitId, SyncLiveValueRootId>::new();
-            for (update, head, checkpoint) in &changed_refs {
-                match (*head, *checkpoint) {
-                    (Some(head), Some(checkpoint)) => {
-                        let expected_head = update
-                            .head_state_root_id
-                            .as_deref()
-                            .ok_or_else(|| {
-                                LixError::new(
-                                    LixError::CODE_INVALID_PARAM,
-                                    format!(
-                                        "sync delta ref '{}' omits headStateRootId",
-                                        update.branch_id
-                                    ),
-                                )
-                            })
-                            .and_then(parse_sync_live_value_root_id)?;
-                        let expected_checkpoint = update
-                            .checkpoint_state_root_id
-                            .as_deref()
-                            .ok_or_else(|| {
-                                LixError::new(
-                                    LixError::CODE_INVALID_PARAM,
-                                    format!(
-                                        "sync delta ref '{}' omits checkpointStateRootId",
-                                        update.branch_id
-                                    ),
-                                )
-                            })
-                            .and_then(parse_sync_live_value_root_id)?;
-                        let actual_head = if let Some(root) = roots.get(&head) {
-                            root.clone()
-                        } else {
-                            let root =
-                                certified_sync_live_value_root_with_imports(&read, &parsed, head)
-                                    .await?;
-                            roots.insert(head, root.clone());
-                            root
-                        };
-                        let actual_checkpoint = if let Some(root) = roots.get(&checkpoint) {
-                            root.clone()
-                        } else {
-                            let root = certified_sync_live_value_root_with_imports(
-                                &read, &parsed, checkpoint,
-                            )
-                            .await?;
-                            roots.insert(checkpoint, root.clone());
-                            root
-                        };
-                        if actual_head != expected_head || actual_checkpoint != expected_checkpoint
-                        {
-                            return Err(LixError::new(
-                                super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
-                                format!(
-                                    "sync delta ref '{}' live-state roots do not match the imported authoritative commits",
-                                    update.branch_id
-                                ),
-                            ));
-                        }
-                    }
-                    (None, None) => {
-                        if update.head_state_root_id.is_some()
-                            || update.checkpoint_state_root_id.is_some()
-                        {
-                            return Err(LixError::new(
-                                LixError::CODE_INVALID_PARAM,
-                                format!(
-                                    "deleted sync delta ref '{}' carries live-state roots",
-                                    update.branch_id
-                                ),
-                            ));
-                        }
-                    }
-                    _ => {
-                        return Err(LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            format!(
-                                "sync delta ref '{}' has an incomplete checkpoint coordinate",
-                                update.branch_id
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
         let atomic_fast_forward = !certified_replica_delta
             && !changed_refs.is_empty()
             && changed_refs.iter().all(|(update, head, checkpoint)| {
@@ -5730,7 +5782,6 @@ where
         };
 
         let mut published_ref_updates = Vec::new();
-        let mut certified_live_roots = BTreeMap::<CommitId, SyncLiveValueRootId>::new();
         for (update, head, checkpoint) in &changed_refs {
             let observation_index = branch_ids
                 .iter()
@@ -5741,94 +5792,6 @@ where
             let current_checkpoint = observation
                 .control
                 .and_then(|control| control.working_diff_checkpoint_commit_id);
-            if certified_replica_delta {
-                match (*head, *checkpoint) {
-                    (Some(certified_head), Some(certified_checkpoint)) => {
-                        let expected_head_root = update
-                            .head_state_root_id
-                            .as_deref()
-                            .ok_or_else(|| {
-                                LixError::new(
-                                    LixError::CODE_INVALID_PARAM,
-                                    format!(
-                                        "sync delta ref '{}' omits headStateRootId",
-                                        update.branch_id
-                                    ),
-                                )
-                            })
-                            .and_then(parse_sync_live_value_root_id)?;
-                        let expected_checkpoint_root = update
-                            .checkpoint_state_root_id
-                            .as_deref()
-                            .ok_or_else(|| {
-                                LixError::new(
-                                    LixError::CODE_INVALID_PARAM,
-                                    format!(
-                                        "sync delta ref '{}' omits checkpointStateRootId",
-                                        update.branch_id
-                                    ),
-                                )
-                            })
-                            .and_then(parse_sync_live_value_root_id)?;
-                        let actual_head_root =
-                            if let Some(root) = certified_live_roots.get(&certified_head) {
-                                root.clone()
-                            } else {
-                                let root = self
-                                    .complete_sync_live_value_root_at_commit(&read, certified_head)
-                                    .await?;
-                                certified_live_roots.insert(certified_head, root.clone());
-                                root
-                            };
-                        let actual_checkpoint_root =
-                            if let Some(root) = certified_live_roots.get(&certified_checkpoint) {
-                                root.clone()
-                            } else {
-                                let root = self
-                                    .complete_sync_live_value_root_at_commit(
-                                        &read,
-                                        certified_checkpoint,
-                                    )
-                                    .await?;
-                                certified_live_roots.insert(certified_checkpoint, root.clone());
-                                root
-                            };
-                        if actual_head_root != expected_head_root
-                            || actual_checkpoint_root != expected_checkpoint_root
-                        {
-                            return Err(LixError::new(
-                                super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
-                                format!(
-                                    "sync delta ref '{}' live-state roots do not match the imported authoritative commits",
-                                    update.branch_id
-                                ),
-                            ));
-                        }
-                    }
-                    (None, None) => {
-                        if update.head_state_root_id.is_some()
-                            || update.checkpoint_state_root_id.is_some()
-                        {
-                            return Err(LixError::new(
-                                LixError::CODE_INVALID_PARAM,
-                                format!(
-                                    "deleted sync delta ref '{}' carries live-state roots",
-                                    update.branch_id
-                                ),
-                            ));
-                        }
-                    }
-                    _ => {
-                        return Err(LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            format!(
-                                "sync delta ref '{}' has an incomplete checkpoint coordinate",
-                                update.branch_id
-                            ),
-                        ));
-                    }
-                }
-            }
             if current_head == *head && current_checkpoint == *checkpoint {
                 continue;
             }
@@ -6580,7 +6543,6 @@ where
         )
         .await?;
         let mut events = Vec::with_capacity(count);
-        let mut live_roots = BTreeMap::<CommitId, SyncLiveValueRootId>::new();
         for value in values.values {
             let Some(StorageProjectedValue::FullValue(value)) = value else {
                 return Err(LixError::new(
@@ -6604,53 +6566,7 @@ where
                     )
                 })?);
             }
-            let mut ref_updates = record.ref_updates;
-            for update in &mut ref_updates {
-                match (
-                    update.head_commit_id.as_deref(),
-                    update.checkpoint_commit_id.as_deref(),
-                ) {
-                    (Some(head), Some(checkpoint)) => {
-                        let head = CommitId::parse_lix(head, "sync event ref head")?;
-                        let checkpoint = CommitId::parse_lix(checkpoint, "sync event checkpoint")?;
-                        let head_root = if let Some(root) = live_roots.get(&head) {
-                            root.clone()
-                        } else {
-                            let root = self
-                                .complete_sync_live_value_root_at_commit(&read, head)
-                                .await?;
-                            live_roots.insert(head, root.clone());
-                            root
-                        };
-                        let checkpoint_root = if let Some(root) = live_roots.get(&checkpoint) {
-                            root.clone()
-                        } else {
-                            let root = self
-                                .complete_sync_live_value_root_at_commit(&read, checkpoint)
-                                .await?;
-                            live_roots.insert(checkpoint, root.clone());
-                            root
-                        };
-                        update.head_state_root_id =
-                            Some(format_sync_live_value_root_id(&head_root));
-                        update.checkpoint_state_root_id =
-                            Some(format_sync_live_value_root_id(&checkpoint_root));
-                    }
-                    (None, None) => {
-                        update.head_state_root_id = None;
-                        update.checkpoint_state_root_id = None;
-                    }
-                    _ => {
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "repository sync event ref '{}' has an incomplete checkpoint coordinate",
-                                update.branch_id
-                            ),
-                        ));
-                    }
-                }
-            }
+            let ref_updates = record.ref_updates;
             let commit_refs = commits.iter().collect::<Vec<_>>();
             let mut inline_blobs = Vec::new();
             let mut encoded_len =
@@ -6670,12 +6586,6 @@ where
             }
             events.push(SyncEvent {
                 cursor: record.cursor,
-                certificate_root_id: sync_event_certificate_root_id(
-                    record.cursor,
-                    &commits,
-                    &ref_updates,
-                    &inline_blobs,
-                )?,
                 commits,
                 ref_updates,
                 inline_blobs,
@@ -7133,46 +7043,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publication_cursor_sql_reports_authority_sequence_and_replica_receipt() {
-        let authority = open_lix().await.expect("authority should open");
-        authority
-            .set_sync_role(super::super::SyncRole::Authority)
-            .expect("authority role should install");
-        let initial = authority
-            .execute("SELECT lix_sync_publication_cursor() AS cursor", &[])
-            .await
-            .expect("authority cursor should query")
-            .rows()[0]
-            .get::<String>("cursor")
-            .expect("authority cursor should be text");
-        assert_eq!(initial, "0");
-
-        write_key_value(&authority, "cursor-publication", "one").await;
-        let published = authority
-            .execute("SELECT lix_sync_publication_cursor() AS cursor", &[])
-            .await
-            .expect("published cursor should query")
-            .rows()[0]
-            .get::<String>("cursor")
-            .expect("published cursor should be text");
-        assert_eq!(published, "1");
-
-        let snapshot = authority
-            .pull_sync_repository(None, 1)
-            .await
-            .expect("snapshot should load");
-        let replica = replica_from_snapshot(&authority, &snapshot).await;
-        let receipt = replica
-            .execute("SELECT lix_sync_publication_cursor() AS cursor", &[])
-            .await
-            .expect("replica receipt cursor should query")
-            .rows()[0]
-            .get::<String>("cursor")
-            .expect("replica cursor should be text");
-        assert_eq!(receipt, published);
-    }
-
-    #[tokio::test]
     async fn authority_rejects_unsynchronized_untracked_mutations() {
         let authority = open_lix().await.expect("authority should open");
         authority
@@ -7338,6 +7208,8 @@ mod tests {
                             checkpoint_commit_id: receipt.initial_commit_id,
                         },
                     )]),
+                    certified_branch_roots: BTreeMap::new(),
+                    snapshot_certified_cursor: None,
                     pending_resets: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
@@ -7482,454 +7354,6 @@ mod tests {
             .expect("published receipt should exist");
         assert_eq!(control.head_commit_id.to_string(), expected_head);
         assert_eq!(stored_state.cursor, *delta_cursor);
-    }
-
-    #[tokio::test]
-    async fn delta_live_state_roots_fail_closed_before_ref_and_cursor_publication() {
-        let authority = open_lix().await.expect("authority should open");
-        authority
-            .set_sync_role(super::super::SyncRole::Authority)
-            .expect("authority role should install");
-        write_key_value(&authority, "certified-delta", "before").await;
-        let snapshot = authority
-            .pull_sync_repository(None, 1)
-            .await
-            .expect("authority snapshot should load");
-        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
-            panic!("initial pull should be a snapshot");
-        };
-        let (_, old_head) = default_head(&snapshot);
-        let replica = replica_from_snapshot(&authority, &snapshot).await;
-
-        write_key_value(&authority, "certified-delta", "after").await;
-        let delta = authority
-            .pull_sync_repository(Some(cursor), 128)
-            .await
-            .expect("authority delta should load");
-        let SyncRepositoryPullResponse::Delta { cursor: next, .. } = &delta else {
-            panic!("incremental pull should return a delta");
-        };
-        let mut omitted = delta.clone();
-        let SyncRepositoryPullResponse::Delta { events, .. } = &mut omitted else {
-            unreachable!();
-        };
-        events[0].ref_updates[0].head_state_root_id = None;
-        let error = replica
-            .apply_sync_repository_pull(TEST_REMOTE, &omitted)
-            .await
-            .expect_err("an event with an omitted certified ref field must be rejected");
-        assert_eq!(
-            error.code,
-            super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
-        );
-        assert_eq!(read_key_value(&replica, "certified-delta").await, "before");
-        assert_eq!(
-            replica
-                .load_sync_repository_cursor(TEST_REMOTE)
-                .await
-                .expect("replica cursor should load"),
-            Some(cursor),
-        );
-
-        let mut tampered = delta.clone();
-        let SyncRepositoryPullResponse::Delta { events, .. } = &mut tampered else {
-            unreachable!();
-        };
-        let root = events[0].ref_updates[0]
-            .head_state_root_id
-            .as_mut()
-            .expect("authority event should certify its head root");
-        root.replace_range(0..1, if root.starts_with('0') { "1" } else { "0" });
-        let error = replica
-            .apply_sync_repository_pull(TEST_REMOTE, &tampered)
-            .await
-            .expect_err("a mismatched live-state root must be rejected");
-        assert_eq!(
-            error.code,
-            super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
-        );
-        assert_eq!(read_key_value(&replica, "certified-delta").await, "before");
-        assert_eq!(
-            replica
-                .execute("SELECT lix_active_branch_commit_id() AS id", &[])
-                .await
-                .expect("old replica head should remain readable")
-                .rows()[0]
-                .get::<String>("id")
-                .expect("old head should decode"),
-            old_head,
-        );
-        assert_eq!(
-            replica
-                .load_sync_repository_cursor(TEST_REMOTE)
-                .await
-                .expect("replica cursor should load"),
-            Some(cursor),
-        );
-
-        let stripped_replica = replica_from_snapshot(&authority, &snapshot).await;
-        let mut stripped_refs = delta.clone();
-        let SyncRepositoryPullResponse::Delta { events, .. } = &mut stripped_refs else {
-            unreachable!();
-        };
-        for event in events {
-            event.ref_updates.clear();
-        }
-        let error = stripped_replica
-            .apply_sync_repository_pull(TEST_REMOTE, &stripped_refs)
-            .await
-            .expect_err("stripping every certified ref must not advance the replica receipt");
-        assert_eq!(
-            error.code,
-            super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
-        );
-        assert_eq!(
-            stripped_replica
-                .load_sync_repository_cursor(TEST_REMOTE)
-                .await
-                .expect("stripped-ref replica cursor should load"),
-            Some(cursor),
-        );
-        assert_eq!(
-            read_key_value(&stripped_replica, "certified-delta").await,
-            "before"
-        );
-        stripped_replica
-            .apply_sync_repository_pull(TEST_REMOTE, &delta)
-            .await
-            .expect("the complete certified event must retry after stripped refs");
-
-        let ref_less_replica = replica_from_snapshot(&authority, &snapshot).await;
-        let mut ref_less = delta.clone();
-        let SyncRepositoryPullResponse::Delta { events, .. } = &mut ref_less else {
-            unreachable!();
-        };
-        for event in events {
-            event.ref_updates.clear();
-            event.certificate_root_id = sync_event_certificate_root_id(
-                event.cursor,
-                &event.commits,
-                &event.ref_updates,
-                &event.inline_blobs,
-            )
-            .expect("certify ref-less event fixture");
-        }
-        let mut tampered_ref_less = ref_less.clone();
-        let SyncRepositoryPullResponse::Delta { events, .. } = &mut tampered_ref_less else {
-            unreachable!();
-        };
-        events
-            .iter_mut()
-            .flat_map(|event| &mut event.commits)
-            .flat_map(|commit| &mut commit.members)
-            .find(|member| member.schema_key == "lix_key_value")
-            .expect("ref-less fixture should carry its immutable commit")
-            .origin_key = Some("tampered-ref-less-origin".to_owned());
-        let error = ref_less_replica
-            .apply_sync_repository_pull(TEST_REMOTE, &tampered_ref_less)
-            .await
-            .expect_err("a ref-less immutable object must retain event authentication");
-        assert_eq!(
-            error.code,
-            super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
-        );
-        assert_eq!(
-            ref_less_replica
-                .load_sync_repository_cursor(TEST_REMOTE)
-                .await
-                .expect("rejected ref-less cursor should load"),
-            Some(cursor),
-        );
-        ref_less_replica
-            .apply_sync_repository_pull(TEST_REMOTE, &ref_less)
-            .await
-            .expect("correct ref-less immutable objects must retry without poisoned keys");
-        assert_eq!(
-            ref_less_replica
-                .load_sync_repository_cursor(TEST_REMOTE)
-                .await
-                .expect("accepted ref-less cursor should load"),
-            Some(*next),
-        );
-        assert_eq!(
-            read_key_value(&ref_less_replica, "certified-delta").await,
-            "before",
-            "a ref-less event must not move the branch head"
-        );
-
-        // Use a fresh replica so malformed content is the first delivery of
-        // these immutable IDs. The rejection must not poison their canonical
-        // storage keys and prevent the correct retry below.
-        let content_replica = replica_from_snapshot(&authority, &snapshot).await;
-        let mut content_tampered = delta.clone();
-        let SyncRepositoryPullResponse::Delta { events, .. } = &mut content_tampered else {
-            unreachable!();
-        };
-        let member = events
-            .iter_mut()
-            .flat_map(|event| &mut event.commits)
-            .flat_map(|commit| &mut commit.members)
-            .find(|member| {
-                member.schema_key == "lix_key_value"
-                    && member
-                        .snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.get("key"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("certified-delta")
-            })
-            .expect("delta should contain the changed key-value member");
-        member.snapshot.as_mut().expect("live member has content")["value"] =
-            serde_json::json!("tampered");
-        let error = content_replica
-            .apply_sync_repository_pull(TEST_REMOTE, &content_tampered)
-            .await
-            .expect_err("content with unchanged IDs and live root must be rejected");
-        assert_eq!(
-            error.code,
-            super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
-        );
-        assert_eq!(
-            read_key_value(&content_replica, "certified-delta").await,
-            "before"
-        );
-        assert_eq!(
-            content_replica
-                .load_sync_repository_cursor(TEST_REMOTE)
-                .await
-                .expect("replica cursor should load"),
-            Some(cursor),
-        );
-        content_replica
-            .apply_sync_repository_pull(TEST_REMOTE, &delta)
-            .await
-            .expect("untampered content must retry after the first rejected delivery");
-        assert_eq!(
-            read_key_value(&content_replica, "certified-delta").await,
-            "after"
-        );
-        assert_eq!(
-            content_replica
-                .load_sync_repository_cursor(TEST_REMOTE)
-                .await
-                .expect("retried replica cursor should load"),
-            Some(*next),
-        );
-
-        replica
-            .apply_sync_repository_pull(TEST_REMOTE, &delta)
-            .await
-            .expect("the untampered certified delta should apply");
-        assert_eq!(read_key_value(&replica, "certified-delta").await, "after");
-        assert_eq!(
-            replica
-                .load_sync_repository_cursor(TEST_REMOTE)
-                .await
-                .expect("replica cursor should load"),
-            Some(*next),
-        );
-    }
-
-    #[tokio::test]
-    async fn delta_live_state_root_binds_change_provenance() {
-        let authority = open_lix().await.expect("authority should open");
-        authority
-            .set_sync_role(super::super::SyncRole::Authority)
-            .expect("authority role should install");
-        write_key_value(&authority, "certified-provenance", "before").await;
-        let snapshot = authority
-            .pull_sync_repository(None, 1)
-            .await
-            .expect("authority snapshot should load");
-        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
-            panic!("initial pull should be a snapshot");
-        };
-        write_key_value(&authority, "certified-provenance", "after").await;
-        let delta = authority
-            .pull_sync_repository(Some(cursor), 128)
-            .await
-            .expect("authority delta should load");
-        let SyncRepositoryPullResponse::Delta { cursor: next, .. } = &delta else {
-            panic!("incremental pull should return a delta");
-        };
-
-        for field in [
-            "changeAccountId",
-            "changeCreatedAt",
-            "originKey",
-            "rowCreatedAt",
-            "commitCreatedAt",
-        ] {
-            let replica = replica_from_snapshot(&authority, &snapshot).await;
-            let mut tampered = delta.clone();
-            let SyncRepositoryPullResponse::Delta { events, .. } = &mut tampered else {
-                unreachable!();
-            };
-            let (commit, member_index) = events
-                .iter_mut()
-                .flat_map(|event| &mut event.commits)
-                .find_map(|commit| {
-                    commit
-                        .members
-                        .iter()
-                        .position(|member| {
-                            member.schema_key == "lix_key_value"
-                                && member
-                                    .snapshot
-                                    .as_ref()
-                                    .and_then(|snapshot| snapshot.get("key"))
-                                    .and_then(serde_json::Value::as_str)
-                                    == Some("certified-provenance")
-                        })
-                        .map(|member_index| (commit, member_index))
-                })
-                .expect("delta should contain the changed key-value member");
-            match field {
-                "changeAccountId" => {
-                    commit.account_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
-                    commit.members[member_index].change_account_id =
-                        crate::SYSTEM_ACCOUNT_ID.to_owned();
-                }
-                "changeCreatedAt" => {
-                    commit.created_at = "2000-01-01T00:00:00Z".to_owned();
-                    commit.members[member_index].change_created_at =
-                        "2000-01-01T00:00:00Z".to_owned();
-                }
-                "originKey" => {
-                    commit.members[member_index].origin_key = Some("tampered-origin".to_owned());
-                }
-                "rowCreatedAt" => {
-                    commit.members[member_index].row_created_at = "2000-01-01T00:00:00Z".to_owned();
-                }
-                "commitCreatedAt" => {
-                    commit.created_at = "2000-01-01T00:00:00Z".to_owned();
-                }
-                _ => unreachable!(),
-            }
-
-            let error = replica
-                .apply_sync_repository_pull(TEST_REMOTE, &tampered)
-                .await
-                .expect_err("tampered change provenance must fail its live-state certificate");
-            assert_eq!(
-                error.code,
-                super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
-                "{field}",
-            );
-            assert_eq!(
-                replica
-                    .load_sync_repository_cursor(TEST_REMOTE)
-                    .await
-                    .expect("rejected replica cursor should load"),
-                Some(cursor),
-                "{field}",
-            );
-            replica
-                .apply_sync_repository_pull(TEST_REMOTE, &delta)
-                .await
-                .expect("correct provenance must retry after certificate rejection");
-            assert_eq!(
-                replica
-                    .load_sync_repository_cursor(TEST_REMOTE)
-                    .await
-                    .expect("retried replica cursor should load"),
-                Some(*next),
-                "{field}",
-            );
-            assert_eq!(
-                read_key_value(&replica, "certified-provenance").await,
-                "after",
-                "{field}",
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn delta_event_certificate_binds_deleted_change_provenance() {
-        let authority = open_lix().await.expect("authority should open");
-        authority
-            .set_sync_role(super::super::SyncRole::Authority)
-            .expect("authority role should install");
-        write_key_value(&authority, "certified-deletion", "present").await;
-        let snapshot = authority
-            .pull_sync_repository(None, 1)
-            .await
-            .expect("authority snapshot should load");
-        let SyncRepositoryPullResponse::Snapshot { cursor, .. } = snapshot.clone() else {
-            panic!("initial pull should be a snapshot");
-        };
-        authority
-            .execute(
-                "DELETE FROM lix_key_value WHERE key = 'certified-deletion'",
-                &[],
-            )
-            .await
-            .expect("authority deletion should commit");
-        let delta = authority
-            .pull_sync_repository(Some(cursor), 128)
-            .await
-            .expect("authority deletion delta should load");
-        let SyncRepositoryPullResponse::Delta { cursor: next, .. } = &delta else {
-            panic!("incremental pull should return a delta");
-        };
-        let replica = replica_from_snapshot(&authority, &snapshot).await;
-        let mut tampered = delta.clone();
-        let SyncRepositoryPullResponse::Delta { events, .. } = &mut tampered else {
-            unreachable!();
-        };
-        events
-            .iter_mut()
-            .flat_map(|event| &mut event.commits)
-            .flat_map(|commit| &mut commit.members)
-            .find(|member| {
-                member.deleted
-                    && member.schema_key == "lix_key_value"
-                    && member.row_pk
-                        == serde_json::json!([{
-                            "type": "string",
-                            "value": "certified-deletion"
-                        }])
-            })
-            .expect("deletion delta should carry its tombstone member")
-            .origin_key = Some("tampered-deletion-origin".to_owned());
-
-        let error = replica
-            .apply_sync_repository_pull(TEST_REMOTE, &tampered)
-            .await
-            .expect_err("deleted change provenance must be event-certified");
-        assert_eq!(
-            error.code,
-            super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
-        );
-        assert_eq!(
-            replica
-                .load_sync_repository_cursor(TEST_REMOTE)
-                .await
-                .expect("rejected deletion cursor should load"),
-            Some(cursor),
-        );
-        replica
-            .apply_sync_repository_pull(TEST_REMOTE, &delta)
-            .await
-            .expect("correct deletion must retry without poisoned immutable keys");
-        assert_eq!(
-            replica
-                .load_sync_repository_cursor(TEST_REMOTE)
-                .await
-                .expect("accepted deletion cursor should load"),
-            Some(*next),
-        );
-        assert!(
-            replica
-                .execute(
-                    "SELECT * FROM lix_key_value WHERE key = 'certified-deletion'",
-                    &[],
-                )
-                .await
-                .expect("deleted row absence should query")
-                .rows()
-                .is_empty()
-        );
     }
 
     #[tokio::test]
@@ -10440,8 +9864,6 @@ mod tests {
                 expected_checkpoint_commit_id: None,
                 head_commit_id: Some(source_head.clone()),
                 checkpoint_commit_id: Some(source_head.clone()),
-                head_state_root_id: None,
-                checkpoint_state_root_id: None,
             }],
             inline_blobs: Vec::new(),
         };
@@ -10646,8 +10068,6 @@ mod tests {
                     expected_checkpoint_commit_id: None,
                     head_commit_id: Some(source_head.clone()),
                     checkpoint_commit_id: Some(source_head.clone()),
-                    head_state_root_id: None,
-                    checkpoint_state_root_id: None,
                 }],
                 inline_blobs: Vec::new(),
             })
@@ -10683,8 +10103,6 @@ mod tests {
                     expected_checkpoint_commit_id: Some(default_head_id.clone()),
                     head_commit_id: None,
                     checkpoint_commit_id: None,
-                    head_state_root_id: None,
-                    checkpoint_state_root_id: None,
                 }],
                 inline_blobs: Vec::new(),
             })
@@ -11938,6 +11356,8 @@ mod tests {
             active_account_id: "account-a".to_owned(),
             cursor: 7,
             authoritative_branches: BTreeMap::new(),
+            certified_branch_roots: BTreeMap::new(),
+            snapshot_certified_cursor: None,
             pending_resets: BTreeMap::new(),
             authority_known_commit_ids: BTreeSet::new(),
         };
@@ -12126,6 +11546,8 @@ mod tests {
                     active_account_id: local.active_account_id().to_owned(),
                     cursor: 1,
                     authoritative_branches,
+                    certified_branch_roots: BTreeMap::new(),
+                    snapshot_certified_cursor: None,
                     pending_resets: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
@@ -12239,6 +11661,8 @@ mod tests {
                     active_account_id: local.active_account_id().to_owned(),
                     cursor: 1,
                     authoritative_branches,
+                    certified_branch_roots: BTreeMap::new(),
+                    snapshot_certified_cursor: None,
                     pending_resets: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },
@@ -12343,6 +11767,8 @@ mod tests {
                     active_account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
                     cursor: 7,
                     authoritative_branches: BTreeMap::new(),
+                    certified_branch_roots: BTreeMap::new(),
+                    snapshot_certified_cursor: None,
                     pending_resets: BTreeMap::new(),
                     authority_known_commit_ids: BTreeSet::new(),
                 },

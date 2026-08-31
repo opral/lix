@@ -1092,7 +1092,6 @@ where
                         functions: FunctionProviderHandle::system(),
                         plugin_host: self.plugin_host.clone(),
                         file_views: None,
-                        sync_role: self.sync_mode.role(),
                     };
                     let read_session =
                         sql2::prepare_read_session(&ctx, std::slice::from_ref(&statement)).await?;
@@ -2657,7 +2656,6 @@ where
                             functions: FunctionProviderHandle::system(),
                             plugin_host: self.plugin_host.clone(),
                             file_views: file_view_collector.clone(),
-                            sync_role: self.sync_mode.role(),
                         };
                         let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
                         let mut results = Vec::with_capacity(statements.len());
@@ -2872,7 +2870,6 @@ where
                             functions: FunctionProviderHandle::system(),
                             plugin_host: self.plugin_host.clone(),
                             file_views: file_view_collector.clone(),
-                            sync_role: self.sync_mode.role(),
                         };
                         let read_session =
                             sql2::prepare_read_session_at_head(&ctx, active_branch_head, &parsed)
@@ -3171,7 +3168,6 @@ where
                 functions: FunctionProviderHandle::system(),
                 plugin_host: self.plugin_host.clone(),
                 file_views: None,
-                sync_role: self.sync_mode.role(),
             };
             let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
             if let Some((spec, row_pk)) = resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
@@ -3212,7 +3208,6 @@ where
                 functions: FunctionProviderHandle::system(),
                 plugin_host: self.plugin_host.clone(),
                 file_views: None,
-                sync_role: self.sync_mode.role(),
             };
             let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
             if let Some((spec, identities)) =
@@ -3273,7 +3268,6 @@ where
             functions: functions.clone(),
             plugin_host: self.plugin_host.clone(),
             file_views: file_view_collector.clone(),
-            sync_role: self.sync_mode.role(),
         };
 
         let read_session =

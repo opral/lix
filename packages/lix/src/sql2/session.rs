@@ -92,22 +92,12 @@ where
     } else {
         None
     };
-    let sync_publication_cursor = if statements.iter().any(|statement| {
-        statement_uses_execution_function(statement, "lix_sync_publication_cursor")
-    }) {
-        ctx.sync_publication_cursor()
-            .await?
-            .map(|cursor| cursor.to_string())
-    } else {
-        None
-    };
     bind_execution_sql2_functions(
         session,
         ctx.functions(),
         ctx.active_account_id(),
         Some(ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
-        sync_publication_cursor.as_deref(),
         latest_checkpoint_commit_id.as_deref(),
         root_commit_id.as_deref(),
     );
@@ -156,22 +146,12 @@ where
         } else {
             None
         };
-    let sync_publication_cursor =
-        if statement_uses_execution_function(statement, "lix_sync_publication_cursor") {
-            read_ctx
-                .sync_publication_cursor()
-                .await?
-                .map(|cursor| cursor.to_string())
-        } else {
-            None
-        };
     bind_execution_sql2_functions(
         session,
         read_ctx.functions(),
         read_ctx.active_account_id(),
         Some(read_ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
-        sync_publication_cursor.as_deref(),
         latest_checkpoint_commit_id.as_deref(),
         root_commit_id.as_deref(),
     );
@@ -255,7 +235,6 @@ pub(crate) async fn build_write_session_with_options(
         Some(&active_branch_commit_id.commit_id.to_string()),
         None,
         None,
-        None,
     );
     providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
 
@@ -307,8 +286,7 @@ fn statement_uses_execution_function(statement: &DataFusionStatement, function_n
                 args: Some(arguments),
                 ..
             } = table
-                && (crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
-                    || crate::sql2::parse::object_name_is_public_function(name, "lix_working_diff"))
+                && crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
                 && arguments.args.len() == 1
             {
                 return ControlFlow::Break(());

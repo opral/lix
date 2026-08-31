@@ -1901,7 +1901,17 @@ where
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
-                result_response(sync_pull(lease, query).await)
+                let wait = parts
+                    .headers
+                    .get("prefer")
+                    .and_then(|value| value.to_str().ok())
+                    .is_none_or(|value| {
+                        !value
+                            .split(',')
+                            .map(str::trim)
+                            .any(|preference| preference.eq_ignore_ascii_case("wait=0"))
+                    });
+                result_response(sync_pull(lease, query, wait).await)
             }
             (&Method::GET, "/lix/v1/sync/history") => {
                 let query = match decode_query::<SyncHistoryQuery>(parts.uri.query()) {
@@ -2692,6 +2702,7 @@ fn ensure_sync_push_event_fits(
 async fn sync_pull<S>(
     lease: SessionLease<S>,
     request: SyncPullRequest,
+    wait: bool,
 ) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -2770,7 +2781,7 @@ where
         );
         // Omitting `after` is a finite hot-state snapshot. A delta request is
         // the mandatory long-poll form.
-        if request.after.is_none() || !at_head {
+        if request.after.is_none() || !at_head || !wait {
             break response;
         }
         tokio::select! {
@@ -5416,8 +5427,6 @@ mod tests {
                 expected_checkpoint_commit_id: None,
                 head_commit_id: None,
                 checkpoint_commit_id: None,
-                head_state_root_id: None,
-                checkpoint_state_root_id: None,
             }],
             inline_blobs: Vec::new(),
         };
@@ -13311,11 +13320,10 @@ mod tests {
 
     #[tokio::test]
     async fn sync_replica_configuration_cannot_be_served_as_an_authority() {
-        let result = unsafe {
-            open_lix().with_internal_sync_cache(lix::InternalSyncCacheOptions::sync(
+        let result = open_lix()
+            .with_server(lix::ServerOptions::sync(
                 "https://example.invalid/repository",
             ))
-        }
             .serve()
             .with_embedded_lix_id()
             .await;

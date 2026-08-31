@@ -37,6 +37,17 @@ pub trait SyncTransport: SyncTransportBounds {
         limit: usize,
     ) -> SyncTransportFuture<'_, SyncRepositoryPullResponse>;
 
+    /// Performs the same pull without waiting when `after` is already the
+    /// authority head. This is private transport behavior; the wire body and
+    /// public protocol schema remain unchanged.
+    fn pull_now(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> SyncTransportFuture<'_, SyncRepositoryPullResponse> {
+        self.pull(after, limit)
+    }
+
     /// Loads one bounded hot-row page at an immutable branch head.
     fn snapshot_rows<'a>(
         &'a self,

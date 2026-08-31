@@ -61,6 +61,7 @@ impl SyncDemand {
 enum SyncDemandRequest {
     History(Vec<String>),
     Chunks(Vec<String>),
+    PublicationBarrier,
 }
 
 #[derive(Debug)]
@@ -244,6 +245,12 @@ async fn send_sync_demand(
     Ok(())
 }
 
+pub(crate) async fn fence_hot_state(
+    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+) -> Result<(), LixError> {
+    send_sync_demand(demand_tx, SyncDemandRequest::PublicationBarrier).await
+}
+
 fn is_sparse_commit_graph_miss(error: &LixError) -> bool {
     error.code == LixError::CODE_COMMIT_NOT_FOUND
         && error.details.as_ref().is_some_and(|details| {
@@ -298,7 +305,7 @@ impl Drop for SyncRuntime {
 
 pub(crate) async fn activate_sync_mode<StorageImpl>(
     lix: &mut Lix<StorageImpl>,
-    server: &crate::InternalSyncCacheOptions,
+    server: &crate::ServerOptions,
     initial_transport: Option<HttpSyncTransport>,
 ) -> Result<Arc<SyncRuntime>, LixError>
 where
@@ -444,6 +451,7 @@ where
                                         hydrate_chunk_ids(&lix, current, ids.into_iter().collect())
                                             .await
                                     }
+                                    SyncDemandRequest::PublicationBarrier => Ok(()),
                                 }
                             }
                             .fuse();
@@ -580,6 +588,20 @@ where
 {
     fetch_adaptive(limit, "repository event", |limit| {
         transport.pull(Some(after), limit)
+    })
+    .await
+}
+
+async fn pull_delta_now_adaptive<Transport>(
+    transport: &Transport,
+    after: u64,
+    limit: &mut usize,
+) -> Result<SyncRepositoryPullResponse, LixError>
+where
+    Transport: SyncTransport,
+{
+    fetch_adaptive(limit, "repository event", |limit| {
+        transport.pull_now(Some(after), limit)
     })
     .await
 }
@@ -754,10 +776,14 @@ where
 {
     let mut history_ids = BTreeSet::new();
     let mut chunk_ids = BTreeSet::new();
+    let publication_barrier_requested = demands
+        .iter()
+        .any(|demand| matches!(&demand.request, SyncDemandRequest::PublicationBarrier));
     for demand in &demands {
         match &demand.request {
             SyncDemandRequest::History(ids) => history_ids.extend(ids),
             SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
+            SyncDemandRequest::PublicationBarrier => {}
         }
     }
     let history_ids = history_ids.into_iter().cloned().collect::<BTreeSet<_>>();
@@ -772,6 +798,11 @@ where
     } else {
         hydrate_chunk_ids(lix, transport, chunk_ids).await
     };
+    let barrier_result = if publication_barrier_requested {
+        fence_replica_to_authority_head(lix, transport).await
+    } else {
+        Ok(())
+    };
     let mut retry = Vec::new();
     let mut retry_error = None;
     for demand in demands {
@@ -781,6 +812,7 @@ where
         let result = match &demand.request {
             SyncDemandRequest::History(_) => history_result.clone(),
             SyncDemandRequest::Chunks(_) => chunk_result.clone(),
+            SyncDemandRequest::PublicationBarrier => barrier_result.clone(),
         };
         match result {
             Err(error) if is_retryable_sync_transport_error(&error) => {
@@ -793,6 +825,117 @@ where
         }
     }
     (retry, retry_error)
+}
+
+async fn fence_replica_to_authority_head<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let remote_id = lix.sync_mode_state().replica_remote_id().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync publication fence has no replica authority",
+        )
+    })?;
+    let mut limit = super::MAX_SYNC_REQUEST_ITEMS;
+    let mut cursor = lix
+        .load_sync_repository_cursor(remote_id.as_ref())
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync repository cursor disappeared before publication fence",
+            )
+        })?;
+    let probe = pull_delta_now_adaptive(transport, cursor, &mut limit).await?;
+    validate_delta_after(cursor, &probe)?;
+    let probe_empty = matches!(
+        &probe,
+        SyncRepositoryPullResponse::Delta { events, .. } if events.is_empty()
+    );
+    if probe_empty && lix.sync_repository_cursor_is_certified(cursor).await? {
+        return Ok(());
+    }
+    if !probe_empty {
+        prepare_pull(lix, transport, &probe).await?;
+        lix.apply_sync_repository_pull(remote_id.as_ref(), &probe)
+            .await?;
+        cursor = lix
+            .load_sync_repository_cursor(remote_id.as_ref())
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync repository cursor disappeared during publication fence",
+                )
+            })?;
+    }
+
+    // Pin the authority coordinate only after observing uncertified state.
+    // Snapshot metadata already carries the complete branch coordinates and
+    // roots required to certify the private replica receipt.
+    let snapshot = transport
+        .pull(None, super::MAX_SYNC_REQUEST_ITEMS)
+        .await
+        .map_err(snapshot_pull_error)?;
+    let target = match &snapshot {
+        SyncRepositoryPullResponse::Snapshot { cursor, .. } => *cursor,
+        SyncRepositoryPullResponse::Delta { .. } => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync publication fence did not receive snapshot metadata",
+            ));
+        }
+    };
+    if cursor > target {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync publication fence advanced beyond its pinned snapshot",
+        ));
+    }
+    while cursor < target {
+        let response = pull_delta_adaptive(transport, cursor, &mut limit).await?;
+        let response = truncate_delta_at_cursor(response, target)?;
+        let next = validate_delta_after(cursor, &response)?;
+        if next <= cursor {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync publication fence did not advance toward its pinned snapshot",
+            ));
+        }
+        prepare_pull(lix, transport, &response).await?;
+        lix.apply_sync_repository_pull(remote_id.as_ref(), &response)
+            .await?;
+        cursor = next;
+    }
+    lix.validate_sync_publication_snapshot(&snapshot).await
+}
+
+fn truncate_delta_at_cursor(
+    response: SyncRepositoryPullResponse,
+    target: u64,
+) -> Result<SyncRepositoryPullResponse, LixError> {
+    let SyncRepositoryPullResponse::Delta { cursor, mut events } = response else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync publication catch-up received snapshot metadata",
+        ));
+    };
+    if cursor <= target {
+        return Ok(SyncRepositoryPullResponse::Delta { cursor, events });
+    }
+    events.retain(|event| event.cursor <= target);
+    let cursor = events.last().map(|event| event.cursor).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync publication catch-up omitted its pinned target event",
+        )
+    })?;
+    Ok(SyncRepositoryPullResponse::Delta { cursor, events })
 }
 
 async fn hydrate_history_ids<StorageImpl, Transport>(
@@ -1171,6 +1314,7 @@ where
         Some(SyncDemandRequest::Chunks(ids)) => {
             hydrate_chunk_ids(lix, transport, ids.into_iter().collect()).await
         }
+        Some(SyncDemandRequest::PublicationBarrier) => Ok(()),
         None => Err(error),
     }
 }
@@ -1715,14 +1859,6 @@ mod tests {
             cursor: 1,
             events: vec![super::super::SyncEvent {
                 cursor: 1,
-                certificate_root_id:
-                    super::super::protocol::sync_event_certificate_root_id(
-                        1,
-                        &[inline_commit.clone()],
-                        &[],
-                        &[inline.clone()],
-                    )
-                    .expect("certify inline event"),
                 commits: vec![inline_commit],
                 ref_updates: Vec::new(),
                 inline_blobs: vec![inline],
@@ -1741,14 +1877,6 @@ mod tests {
                 cursor: 2,
                 events: vec![super::super::SyncEvent {
                     cursor: 2,
-                    certificate_root_id:
-                        super::super::protocol::sync_event_certificate_root_id(
-                            2,
-                            &[empty_commit.clone()],
-                            &[],
-                            &[empty.clone()],
-                        )
-                        .expect("certify empty-blob event"),
                     commits: vec![empty_commit],
                     ref_updates: Vec::new(),
                     inline_blobs: vec![empty],
@@ -1773,14 +1901,6 @@ mod tests {
                 cursor: 2,
                 events: vec![super::super::SyncEvent {
                     cursor: 2,
-                    certificate_root_id:
-                        super::super::protocol::sync_event_certificate_root_id(
-                            2,
-                            &[large_commit.clone()],
-                            &[],
-                            &[],
-                        )
-                        .expect("certify large-blob event"),
                     commits: vec![large_commit],
                     ref_updates: Vec::new(),
                     inline_blobs: Vec::new(),
@@ -1831,14 +1951,6 @@ mod tests {
                     cursor: after + 1,
                     events: vec![super::super::SyncEvent {
                         cursor: after + 1,
-                        certificate_root_id:
-                            super::super::protocol::sync_event_certificate_root_id(
-                                after + 1,
-                                &[],
-                                &[],
-                                &[],
-                            )
-                            .expect("certify capped empty event"),
                         commits: Vec::new(),
                         ref_updates: Vec::new(),
                         inline_blobs: Vec::new(),
@@ -2264,14 +2376,6 @@ mod tests {
                 cursor: 11,
                 events: vec![super::super::SyncEvent {
                     cursor: 11,
-                    certificate_root_id:
-                        super::super::protocol::sync_event_certificate_root_id(
-                            11,
-                            &[],
-                            &[],
-                            &[],
-                        )
-                        .expect("certify cursor-gap event"),
                     commits: Vec::new(),
                     ref_updates: Vec::new(),
                     inline_blobs: Vec::new(),
@@ -2280,6 +2384,29 @@ mod tests {
         )
         .expect_err("delta must start at the next repository cursor");
         assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn publication_fence_truncates_a_delta_at_its_pinned_snapshot_cursor() {
+        let event = |cursor| super::super::SyncEvent {
+            cursor,
+            commits: Vec::new(),
+            ref_updates: Vec::new(),
+            inline_blobs: Vec::new(),
+        };
+        let truncated = truncate_delta_at_cursor(
+            SyncRepositoryPullResponse::Delta {
+                cursor: 10,
+                events: vec![event(8), event(9), event(10)],
+            },
+            9,
+        )
+        .expect("pinned cursor should truncate a later authority page");
+        let SyncRepositoryPullResponse::Delta { cursor, events } = truncated else {
+            unreachable!();
+        };
+        assert_eq!(cursor, 9);
+        assert_eq!(events.iter().map(|event| event.cursor).collect::<Vec<_>>(), vec![8, 9]);
     }
 
     #[test]
