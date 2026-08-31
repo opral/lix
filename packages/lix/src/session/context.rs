@@ -650,7 +650,6 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) functions: FunctionProviderHandle,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) file_views: Option<SessionFileViews>,
-    pub(super) sync_role: crate::sync::SyncRole,
 }
 
 impl<R> SessionSqlExecutionContext<'_, R>
@@ -712,10 +711,6 @@ where
 
     fn active_account_id(&self) -> &str {
         self.active_account_id
-    }
-
-    async fn sync_publication_cursor(&self) -> Result<Option<u64>, LixError> {
-        crate::sync::load_sync_publication_cursor(&self.read_store, self.sync_role).await
     }
 
     #[expect(trivial_casts)]

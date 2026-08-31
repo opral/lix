@@ -22,9 +22,8 @@ use lix::server_protocol::{
 };
 use lix::storage::Storage;
 use lix::{
-    CreateBranchOptions, ExecuteBatchStatement, InternalSyncCacheOptions, Lix, Memory,
-    MergeBranchOptions,
-    SwitchBranchOptions, Value, WireValue, open_lix,
+    CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions,
+    ServerOptions, SwitchBranchOptions, Value, WireValue, open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
 use serde_json::{Value as JsonValue, json};
@@ -43,6 +42,7 @@ struct HttpProbe {
     pushes: AtomicU64,
     push_conflicts: AtomicU64,
     delta_pulls: AtomicU64,
+    publication_fences: AtomicU64,
     snapshot_row_pulls: AtomicU64,
     history_gets: AtomicU64,
     active_history_gets: AtomicU64,
@@ -263,7 +263,7 @@ async fn profile_net_zero_tombstone_checkpoint(churn_rows: usize) -> JsonValue {
     let pre_scope = AllocationScope::start();
     let pre_count = pre
         .execute(
-            "SELECT COUNT(*) AS count FROM lix_working_diff('lix_file')",
+            "SELECT COUNT(*) AS count FROM lix_diff('lix_file')",
             &[],
         )
         .await
@@ -291,7 +291,7 @@ async fn profile_net_zero_tombstone_checkpoint(churn_rows: usize) -> JsonValue {
     let post_scope = AllocationScope::start();
     let post_count = post
         .execute(
-            "SELECT COUNT(*) AS count FROM lix_working_diff('lix_file')",
+            "SELECT COUNT(*) AS count FROM lix_diff('lix_file')",
             &[],
         )
         .await
@@ -397,7 +397,7 @@ async fn profile_certified_hot_case(
     let diff_started = Instant::now();
     let diff = replica
         .execute(
-            "SELECT COUNT(*) AS count FROM lix_working_diff('lix_file')",
+            "SELECT COUNT(*) AS count FROM lix_diff('lix_file')",
             &[],
         )
         .await
@@ -427,7 +427,7 @@ async fn profile_certified_hot_case(
     let selected_started = Instant::now();
     let selected = replica
         .execute(
-            "SELECT from_content, to_content FROM lix_working_diff('lix_file') WHERE id = $1",
+            "SELECT content FROM lix_file WHERE id = $1",
             &[Value::Text(selected_file_id)],
         )
         .await
@@ -436,7 +436,7 @@ async fn profile_certified_hot_case(
     let selected_content_allocations = selected_scope.finish();
     assert_eq!(selected.rows().len(), 1);
     let selected_content_bytes = selected.rows()[0]
-        .get::<Value>("to_content")
+        .get::<Value>("content")
         .expect("selected payload exists");
     let selected_content_bytes = match selected_content_bytes {
         Value::Blob(bytes) => bytes.len(),
@@ -490,6 +490,101 @@ async fn seed_hot_profile_rows(authority: &Lix<Memory>, live_rows: usize) {
             .await
             .expect("seed HOT profile row batch");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connected_hot_reads_fence_to_authority_and_non_hot_work_fails_closed() {
+    let (authority_storage, authority) = open_authority().await;
+    put_value(&authority, "authority-fence", "before").await;
+    authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .expect("checkpoint authoritative baseline");
+    authority.close().await.expect("close authority setup");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage, Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+
+    protocol_authority
+        .put_value("authority-fence", "after")
+        .await;
+    let fences_before_read = probe.publication_fences.load(Ordering::Acquire);
+    assert_eq!(
+        read_value(&replica, "authority-fence").await.as_deref(),
+        Some("after"),
+        "the first connected read after an authority commit must not expose stale rows",
+    );
+    assert_eq!(
+        probe.publication_fences.load(Ordering::Acquire),
+        fences_before_read + 1,
+        "one connected hot read must use exactly one finite publication pull",
+    );
+
+    let history_gets = probe.history_gets.load(Ordering::Acquire);
+    let diff_count = replica
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_diff('lix_key_value') WHERE key = 'authority-fence'",
+            &[],
+        )
+        .await
+        .expect("one-argument lix_diff uses certified HOT state")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("working diff count is integer");
+    assert_eq!(diff_count, 1);
+    assert_eq!(
+        probe.history_gets.load(Ordering::Acquire),
+        history_gets,
+        "working diff must not request cold history",
+    );
+
+    let mutation_error = replica
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('replica-write', 'forbidden')",
+            &[],
+        )
+        .await
+        .expect_err("raw connected replicas must not mutate local state");
+    assert_eq!(mutation_error.code, "LIX_AUTHORITY_EXECUTION_REQUIRED");
+    assert_eq!(read_value(&replica, "replica-write").await, None);
+
+    let history_error = replica
+        .execute("SELECT * FROM lix_history('lix_key_value')", &[])
+        .await
+        .expect_err("raw connected replicas must not serve history locally");
+    assert_eq!(history_error.code, "LIX_AUTHORITY_EXECUTION_REQUIRED");
+
+    let export_error = replica
+        .export_snapshot()
+        .write_to(&mut Vec::new())
+        .await
+        .expect_err("a sparse connected cache must not export as a canonical snapshot");
+    assert_eq!(export_error.code, LixError::CODE_INVALID_PARAM);
+
+    replica.close().await.expect("close replica");
+
+    let reopened_without_server = open_lix()
+        .with_storage(
+            FilesystemStorage::new(replica_dir.path())
+                .open()
+                .expect("reopen persisted replica storage"),
+        )
+        .await
+        .expect("open persisted replica without a server");
+    let persisted_export_error = reopened_without_server
+        .export_snapshot()
+        .write_to(&mut Vec::new())
+        .await
+        .expect_err("persisted sparse cache must not export through a standalone handle");
+    assert_eq!(persisted_export_error.code, LixError::CODE_INVALID_PARAM);
+    reopened_without_server
+        .close()
+        .await
+        .expect("close standalone replica handle");
+    stop_server(server_task).await;
 }
 
 fn assert_bounded_growth(label: &str, baseline: u64, candidate: u64, multiple: u64, slack: u64) {
@@ -1744,15 +1839,13 @@ async fn binary_chunks_remain_lazy_until_file_content_is_read() {
 }
 
 async fn open_replica(path: &Path, url: &str) -> Lix<FilesystemStorage> {
-    // SAFETY: E2E fixtures intentionally exercise the raw cache worker; tests
-    // assert authority publication before observing application-visible state.
-    unsafe { open_lix()
+    open_lix()
         .with_storage(
             FilesystemStorage::new(path)
                 .open()
                 .expect("open filesystem storage"),
         )
-        .with_internal_sync_cache(InternalSyncCacheOptions::sync(url)) }
+        .with_server(ServerOptions::sync(url))
         .await
         .expect("open sync replica")
 }
@@ -2207,6 +2300,17 @@ where
             .uri
             .query()
             .is_some_and(|query| query.split('&').any(|part| part.starts_with("after=")));
+    let is_publication_fence = is_delta_pull
+        && parts
+            .headers
+            .get("prefer")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|preference| preference.eq_ignore_ascii_case("wait=0"))
+            });
     let is_snapshot_row_pull = parts.method == Method::GET
         && path.ends_with("/sync/pull")
         && parts.uri.query().is_some_and(|query| {
@@ -2220,6 +2324,9 @@ where
     }
     if is_delta_pull {
         probe.delta_pulls.fetch_add(1, Ordering::Release);
+    }
+    if is_publication_fence {
+        probe.publication_fences.fetch_add(1, Ordering::Release);
     }
     if is_snapshot_row_pull {
         probe.snapshot_row_pulls.fetch_add(1, Ordering::Release);

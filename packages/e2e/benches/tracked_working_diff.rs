@@ -4,7 +4,7 @@
 //! Two-phase populated tracked-working-diff benchmark for storage adapters.
 //!
 //! The fixture deliberately remains *between* checkpoints. The old checkpoint
-//! scale harness only measured `lix_working_diff` after a checkpoint, when
+//! scale harness only measured one-argument `lix_diff` after a checkpoint, when
 //! there is no interval to diff. This harness records the real common shapes:
 //! repeated edits to a small working set and disjoint edits across a large
 //! working set.
@@ -515,7 +515,7 @@ async fn measure<StorageImpl>(
     );
 }
 
-/// Measures the cold historical diff path rather than `lix_working_diff`'s
+/// Measures the cold historical diff path rather than one-argument `lix_diff`'s
 /// serving-head accelerator. The setup checkpoint is a durable root and the
 /// later ordinary commits are rootless, which makes this a populated
 /// first-parent replay interval.

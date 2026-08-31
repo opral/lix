@@ -60,7 +60,7 @@ pub(crate) use repository::{
     SYNC_REPOSITORY_EVENT_SPACE,
     SYNC_SEQUENCE_SPACE, authority_state_key,
     load_pending_sync_export_commit_ids, load_replayable_repository_event_commit_ids,
-    load_sync_publication_cursor, replica_state_key,
+    replica_state_key,
     stage_repository_transaction_event, stage_sync_restore_intents,
     validate_repository_transaction_event_transfer,
 };
@@ -68,7 +68,7 @@ pub(crate) use repository::{
 pub(crate) use repository::admit_sync_authority_storage;
 pub(crate) use repository::has_any_sync_replica_state;
 pub(crate) use runtime::{
-    SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode,
+    SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode, fence_hot_state,
 };
 
 pub(crate) const MAX_SYNC_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -76,10 +76,10 @@ pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-// v5 adds an event-level certificate over the complete immutable commit/change
-// wire. It deliberately hard-cuts v4 peers whose live-row roots could not bind
-// tombstones, ref-less commits, or non-materialized commit metadata.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 5;
+// v6 hard-cuts v5 and older peers that still permit replica-local mutations.
+// The JSON request/response shape remains the one published on main; this is a
+// semantic compatibility boundary, not a new public protocol surface.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 6;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str =

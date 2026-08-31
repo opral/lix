@@ -287,13 +287,6 @@ impl PublicCatalog {
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
-            "lix_working_diff",
-            PublicSurfaceClass::TableFunction,
-            PublicSurfaceKind::DiffFunction,
-            Vec::new(),
-            SurfaceCapabilities::read_only(),
-        ))?;
-        self.insert(surface(
             "lix_create_checkpoint",
             PublicSurfaceClass::TableFunction,
             PublicSurfaceKind::CheckpointFunction,

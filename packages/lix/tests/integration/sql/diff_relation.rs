@@ -398,15 +398,13 @@ simulation_test!(
 );
 
 simulation_test!(
-    working_diff_pins_certified_hot_epoch_with_every_file_row,
+    default_range_diff_uses_certified_hot_epoch_without_changing_its_schema,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine.open_session().await.expect("session should open"),
             &engine,
         );
-        let checkpoint = sim.initial_commit_id().to_string();
-
         session
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES \
@@ -415,78 +413,25 @@ simulation_test!(
             )
             .await
             .expect("file inserts should succeed");
-        let head = engine
-            .load_branch_head_commit_id(sim.main_branch_id())
-            .await
-            .expect("working head should load")
-            .expect("working head should exist")
-            .to_string();
-
         let rows = select_rows(
             &session,
-            "SELECT before_commit_id, after_commit_id, \
-                    coalesce(to_path, from_path) AS path, diff_type \
-         FROM lix_working_diff('lix_file') ORDER BY coalesce(to_path, from_path)",
+            "SELECT coalesce(to_path, from_path) AS path, diff_type \
+             FROM lix_diff('lix_file') ORDER BY coalesce(to_path, from_path)",
         )
         .await;
         assert_eq!(rows.len(), 2);
         for (index, path) in ["/one.txt", "/two.txt"].into_iter().enumerate() {
-            assert_eq!(rows[index][0], Value::Text(checkpoint.clone()));
-            assert_eq!(rows[index][1], Value::Text(head.clone()));
-            assert_eq!(rows[index][2], Value::Text(path.to_string()));
-            assert_eq!(rows[index][3], Value::Text("added".to_string()));
+            assert_eq!(rows[index][0], Value::Text(path.to_string()));
+            assert_eq!(rows[index][1], Value::Text("added".to_string()));
         }
 
-        assert_eq!(
-            select_rows(
-                &session,
-                "SELECT from_content, to_content FROM lix_working_diff('lix_file') \
-                 WHERE to_path = '/one.txt'",
-            )
-            .await,
-            vec![vec![Value::Null, Value::Blob(b"one".to_vec().into())]],
-            "working review content must come from the certified HOT payload",
-        );
-
         let error = session
-            .execute("SELECT * FROM lix_working_diff('lix_file', 'a', 'b')", &[])
+            .execute("SELECT from_content, to_content FROM lix_diff('lix_file')", &[])
             .await
-            .expect_err("working diff must not accept caller-selected cold coordinates");
+            .expect_err("the existing diff schema must keep file content unsupported");
         assert!(
-            error.message.contains("exactly one relation argument"),
+            error.message.contains("does not support content projection"),
             "unexpected error: {error:?}"
-        );
-
-        session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
-            .await
-            .expect("file content baseline checkpoint should succeed");
-        session
-            .execute(
-                "UPDATE lix_file SET content = CAST('updated' AS BYTEA) WHERE path = '/one.txt'",
-                &[],
-            )
-            .await
-            .expect("file content update should succeed");
-        session
-            .execute("DELETE FROM lix_file WHERE path = '/two.txt'", &[])
-            .await
-            .expect("file removal should succeed");
-        assert_eq!(
-            select_rows(
-                &session,
-                "SELECT from_content, to_content FROM lix_working_diff('lix_file') \
-                 ORDER BY coalesce(to_path, from_path)",
-            )
-            .await,
-            vec![
-                vec![
-                    Value::Blob(b"one".to_vec().into()),
-                    Value::Blob(b"updated".to_vec().into()),
-                ],
-                vec![Value::Blob(b"two".to_vec().into()), Value::Null],
-            ],
-            "modified and removed working files must retain both certified content sides",
         );
     }
 );
@@ -519,7 +464,7 @@ simulation_test!(
         assert!(
             select_rows(
                 &session,
-                "SELECT id, diff_type FROM lix_working_diff('lix_file')",
+                "SELECT id, diff_type FROM lix_diff('lix_file')",
             )
             .await
             .is_empty(),

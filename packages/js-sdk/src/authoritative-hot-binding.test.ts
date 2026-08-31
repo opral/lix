@@ -13,71 +13,127 @@ const result = (value: string): BindingExecuteResult => ({
 	notices: [],
 });
 
-const cursor = (value: string | number): BindingExecuteResult => ({
-	columns: [{ name: "cursor", type: "text" }],
-	rows: [[{ kind: "text", value: String(value) }]],
+const fence = (commitId = "active-1"): BindingExecuteResult => ({
+	columns: [{ name: "active_commit_id", type: "text" }],
+	rows: [[{ kind: "text", value: commitId }]],
 	rowsAffected: 0,
 	notices: [],
 });
 
-test("keeps hot reads local and routes history authority-first", async () => {
-	const localExecute = vi.fn(async (sql: string) => {
-		if (sql.includes("lix_sync_publication_cursor")) return cursor(7);
-		return result("local-hot");
+const authorityRequired = (executionKind: "history" | "mutation") =>
+	Object.assign(new Error("authority required"), {
+		code: "LIX_AUTHORITY_EXECUTION_REQUIRED",
+		details: { executionKind },
 	});
-	const executionRoute = vi.fn(async ([sql]: string[]) =>
-		sql.includes("lix_history") ? "history" as const : "hot" as const,
-	);
-	const authorityExecute = vi.fn(async (sql: string) =>
-		sql.includes("lix_sync_publication_cursor")
-			? cursor(7)
-			: result("authority-history"),
-	);
+
+test("a hot read is one local execution with no authority probe", async () => {
+	const localExecute = vi.fn(async () => result("local-hot"));
+	const authorityExecute = vi.fn();
 	const binding = authoritativeHotBinding(
-		{ execute: localExecute, executionRoute } as unknown as LixBinding,
+		{ execute: localExecute } as unknown as LixBinding,
 		{ execute: authorityExecute } as unknown as LixBinding,
 	);
 
 	await expect(binding.execute("SELECT * FROM lix_file", [])).resolves.toEqual(
 		result("local-hot"),
 	);
-	await expect(
-		binding.execute("SELECT * FROM lix_history('lix_file')", []),
-	).resolves.toEqual(result("authority-history"));
-	expect(authorityExecute).toHaveBeenCalledTimes(2);
-	expect(localExecute.mock.calls.map(([sql]) => sql)).toEqual([
-		expect.stringContaining("lix_sync_publication_cursor"),
+	expect(localExecute).toHaveBeenCalledOnce();
+	expect(localExecute).toHaveBeenCalledWith(
 		"SELECT * FROM lix_file",
-	]);
+		[],
+		undefined,
+	);
+	expect(authorityExecute).not.toHaveBeenCalled();
 });
 
-test("pins the authority cursor and accepts a replica that advances beyond it", async () => {
-	let localCursorReads = 0;
-	const localExecute = vi.fn(async (sql: string) => {
-		localCursorReads += 1;
-		return cursor(
-			localCursorReads < 3 ? 4 : "18446744073709551615",
-		);
+test("history is rejected locally and then executed once on the authority", async () => {
+	const localExecute = vi.fn(async () => {
+		throw authorityRequired("history");
 	});
-	let authorityCursorReads = 0;
-	const authorityExecute = vi.fn(async (sql: string) => {
-		if (sql.startsWith("UPDATE")) return result("updated");
-		authorityCursorReads += 1;
-		return cursor("18446744073709551614");
-	});
+	const authorityExecute = vi.fn(async () => result("authority-history"));
 	const binding = authoritativeHotBinding(
-		{
-			execute: localExecute,
-			executionRoute: vi.fn(async () => "mutation" as const),
-		} as unknown as LixBinding,
+		{ execute: localExecute } as unknown as LixBinding,
 		{ execute: authorityExecute } as unknown as LixBinding,
 	);
 
 	await expect(
-		binding.execute("UPDATE lix_file SET path = '/b' WHERE path = '/a'", []),
-	).resolves.toEqual(result("updated"));
-	expect(localCursorReads).toBe(3);
-	expect(authorityCursorReads).toBe(1);
+		binding.execute("SELECT * FROM lix_history('lix_file')", []),
+	).resolves.toEqual(result("authority-history"));
+	expect(localExecute).toHaveBeenCalledOnce();
+	expect(authorityExecute).toHaveBeenCalledOnce();
+});
+
+test("an authority mutation is followed by one local publication fence", async () => {
+	const calls: string[] = [];
+	const localExecute = vi.fn(async (sql: string) => {
+		calls.push(`local:${sql}`);
+		if (sql.startsWith("UPDATE")) throw authorityRequired("mutation");
+		return fence("active-2");
+	});
+	const authorityExecute = vi.fn(async (sql: string) => {
+		calls.push(`authority:${sql}`);
+		return result("updated");
+	});
+	const binding = authoritativeHotBinding(
+		{ execute: localExecute } as unknown as LixBinding,
+		{ execute: authorityExecute } as unknown as LixBinding,
+	);
+
+	const sql = "UPDATE lix_file SET path = '/b' WHERE path = '/a'";
+	await expect(binding.execute(sql, [])).resolves.toEqual(result("updated"));
+	expect(calls).toEqual([
+		`local:${sql}`,
+		`authority:${sql}`,
+		expect.stringMatching(/^local:SELECT lix_active_branch_commit_id\(\)/),
+	]);
+	expect(authorityExecute).toHaveBeenCalledOnce();
+});
+
+test("an authority-owned batch is fenced locally after authority execution", async () => {
+	const statements = [
+		{ sql: "SELECT * FROM lix_file", params: [] },
+		{ sql: "UPDATE lix_file SET path = '/b'", params: [] },
+	];
+	const localExecute = vi.fn(async () => fence("active-2"));
+	const localExecuteBatch = vi.fn(async () => {
+		throw authorityRequired("mutation");
+	});
+	const authorityExecuteBatch = vi.fn(async () => [result("read"), result("updated")]);
+	const authorityExecute = vi.fn();
+	const binding = authoritativeHotBinding(
+		{ execute: localExecute, executeBatch: localExecuteBatch } as unknown as LixBinding,
+		{
+			execute: authorityExecute,
+			executeBatch: authorityExecuteBatch,
+		} as unknown as LixBinding,
+	);
+
+	await expect(binding.executeBatch(statements)).resolves.toEqual([
+		result("read"),
+		result("updated"),
+	]);
+	expect(localExecuteBatch).toHaveBeenCalledOnce();
+	expect(authorityExecuteBatch).toHaveBeenCalledWith(statements, undefined);
+	expect(localExecute).toHaveBeenCalledOnce();
+	expect(localExecute.mock.calls[0]?.[0]).toContain("lix_active_branch_commit_id");
+	expect(authorityExecute).not.toHaveBeenCalled();
+});
+
+test("fails closed when the post-mutation local fence is malformed", async () => {
+	const malformed = fence();
+	malformed.rows[0]![0] = { kind: "null" };
+	const localExecute = vi.fn(async (sql: string) => {
+		if (sql.startsWith("UPDATE")) throw authorityRequired("mutation");
+		return malformed;
+	});
+	const binding = authoritativeHotBinding(
+		{ execute: localExecute } as unknown as LixBinding,
+		{ execute: vi.fn(async () => result("updated")) } as unknown as LixBinding,
+	);
+
+	await expect(binding.execute("UPDATE lix_file SET path = '/b'", [])).rejects.toMatchObject({
+		code: "LIX_AUTHORITY_PUBLICATION_FAILED",
+	});
 });
 
 test("routes observations to authority because a local stream has no freshness lease", async () => {
@@ -95,31 +151,16 @@ test("routes observations to authority because a local stream has no freshness l
 	expect(localObserve).not.toHaveBeenCalled();
 });
 
-test("fails closed when the authority publication cursor is malformed", async () => {
-	const binding = authoritativeHotBinding(
-		{
-			execute: vi.fn(),
-			executionRoute: vi.fn(async () => "hot" as const),
-		} as unknown as LixBinding,
-		{ execute: vi.fn(async () => cursor("01")) } as unknown as LixBinding,
-	);
-
-	await expect(binding.execute("SELECT * FROM lix_file", [])).rejects.toMatchObject({
-		code: "LIX_AUTHORITY_PUBLICATION_FAILED",
-	});
-});
-
 test("realigns both sessions when a local branch switch fails", async () => {
 	let localBranch = "main";
 	let authorityBranch = "main";
 	const local = {
 		activeBranchId: vi.fn(async () => localBranch),
 		execute: vi.fn(async (sql: string) =>
-			sql.includes("lix_sync_publication_cursor")
-				? cursor(3)
+			sql.includes("lix_active_branch_commit_id")
+				? fence()
 				: result(`local-${localBranch}`),
 		),
-		executionRoute: vi.fn(async () => "hot" as const),
 		switchBranch: vi.fn(async ({ branchId }: { branchId: string }) => {
 			if (branchId === "feature") throw new Error("local switch failed");
 			localBranch = branchId;
@@ -129,7 +170,6 @@ test("realigns both sessions when a local branch switch fails", async () => {
 	} as unknown as LixBinding;
 	const authority = {
 		activeBranchId: vi.fn(async () => authorityBranch),
-		execute: vi.fn(async () => cursor(3)),
 		switchBranch: vi.fn(async ({ branchId }: { branchId: string }) => {
 			authorityBranch = branchId;
 			return { branchId };
@@ -152,26 +192,19 @@ test("rejects and closes a child session whose authoritative selection differs",
 	const localChildClose = vi.fn(async () => undefined);
 	const authorityChildClose = vi.fn(async () => undefined);
 	const localChild = {
-		execute: vi.fn(async () => cursor(5)),
+		execute: vi.fn(async () => fence()),
 		activeBranchId: vi.fn(async () => "main"),
 		activeAccountId: vi.fn(async () => "account-a"),
 		close: localChildClose,
 	} as unknown as LixBinding;
 	const authorityChild = {
-		execute: vi.fn(async () => cursor(5)),
 		activeBranchId: vi.fn(async () => "feature"),
 		activeAccountId: vi.fn(async () => "account-a"),
 		close: authorityChildClose,
 	} as unknown as LixBinding;
 	const binding = authoritativeHotBinding(
-		{
-			execute: vi.fn(async () => cursor(5)),
-			executionRoute: vi.fn(async () => "hot" as const),
-			openAnotherSession: vi.fn(async () => localChild),
-		} as unknown as LixBinding,
-		{
-			openAnotherSession: vi.fn(async () => authorityChild),
-		} as unknown as LixBinding,
+		{ openAnotherSession: vi.fn(async () => localChild) } as unknown as LixBinding,
+		{ openAnotherSession: vi.fn(async () => authorityChild) } as unknown as LixBinding,
 	);
 
 	await expect(binding.openAnotherSession({})).rejects.toMatchObject({
@@ -181,38 +214,17 @@ test("rejects and closes a child session whose authoritative selection differs",
 	expect(authorityChildClose).toHaveBeenCalledOnce();
 });
 
-test("history reaches authority even when the replica cursor is stuck", async () => {
-	const localExecute = vi.fn(async () => cursor(1));
-	const authorityExecute = vi.fn(async (sql: string) =>
-		sql.includes("lix_history") ? result("authority-history") : cursor(99),
-	);
-	const binding = authoritativeHotBinding(
-		{
-			executionRoute: vi.fn(async () => "history" as const),
-			execute: localExecute,
-		} as unknown as LixBinding,
-		{ execute: authorityExecute } as unknown as LixBinding,
-	);
-
-	await expect(
-		binding.execute("SELECT * FROM lix_history('lix_file')", []),
-	).resolves.toEqual(result("authority-history"));
-	expect(localExecute).not.toHaveBeenCalled();
-	expect(authorityExecute).toHaveBeenCalledOnce();
-});
-
 test("a hot read cannot cross a partially applied composite branch switch", async () => {
 	let localBranch = "main";
 	let authorityBranch = "main";
 	const authoritySwitched = deferred<void>();
 	const finishAuthoritySwitch = deferred<void>();
 	const localExecute = vi.fn(async (sql: string) =>
-		sql.includes("lix_sync_publication_cursor")
-			? cursor(8)
+		sql.includes("lix_active_branch_commit_id")
+			? fence()
 			: result(`local-${localBranch}`),
 	);
 	const local = {
-		executionRoute: vi.fn(async () => "hot" as const),
 		execute: localExecute,
 		activeBranchId: vi.fn(async () => localBranch),
 		switchBranch: vi.fn(async ({ branchId }: { branchId: string }) => {
@@ -222,7 +234,6 @@ test("a hot read cannot cross a partially applied composite branch switch", asyn
 		close: vi.fn(async () => undefined),
 	} as unknown as LixBinding;
 	const authority = {
-		execute: vi.fn(async () => cursor(8)),
 		activeBranchId: vi.fn(async () => authorityBranch),
 		switchBranch: vi.fn(async ({ branchId }: { branchId: string }) => {
 			authorityBranch = branchId;
@@ -243,8 +254,6 @@ test("a hot read cannot cross a partially applied composite branch switch", asyn
 	finishAuthoritySwitch.resolve();
 	await expect(switching).resolves.toEqual({ branchId: "feature" });
 	await expect(reading).resolves.toEqual(result("local-feature"));
-	expect(localBranch).toBe("feature");
-	expect(authorityBranch).toBe("feature");
 });
 
 function deferred<T>() {

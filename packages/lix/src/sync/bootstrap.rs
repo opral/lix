@@ -135,7 +135,7 @@ async fn inspect_tier(
 }
 
 pub(crate) async fn prepare_sync_bootstrap(
-    server: &crate::InternalSyncCacheOptions,
+    server: &crate::ServerOptions,
 ) -> Result<PreparedSyncBootstrap, LixError> {
     let remote_id = server.url.as_str();
     let transport = HttpSyncTransport::connect(remote_id, &server.headers).await?;
@@ -157,7 +157,7 @@ pub(crate) async fn prepare_sync_bootstrap(
 
 pub(crate) async fn install_sync_bootstrap<StorageImpl>(
     lix: &mut Lix<StorageImpl>,
-    server: &crate::InternalSyncCacheOptions,
+    server: &crate::ServerOptions,
     prepared: PreparedSyncBootstrap,
 ) -> Result<HttpSyncTransport, LixError>
 where

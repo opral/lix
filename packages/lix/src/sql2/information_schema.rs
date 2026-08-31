@@ -228,9 +228,6 @@ impl LixInformationSchemaProvider {
                 PublicSurfaceKind::DiffFunction | PublicSurfaceKind::StateAtFunction
             ) {
                 for relation in self.public_catalog.surfaces().filter(|relation| {
-                    if surface.name == "lix_working_diff" && relation.name != "lix_file" {
-                        return false;
-                    }
                     matches!(
                         relation.kind,
                         PublicSurfaceKind::File
@@ -239,17 +236,10 @@ impl LixInformationSchemaProvider {
                     )
                 }) {
                     let provider_schema = if surface.kind == PublicSurfaceKind::DiffFunction {
-                        if surface.name == "lix_working_diff" {
-                            super::providers::relation_working_diff_schema(
-                                self.public_catalog.as_ref(),
-                                &relation.name,
-                            )?
-                        } else {
-                            super::providers::relation_diff_schema(
-                                self.public_catalog.as_ref(),
-                                &relation.name,
-                            )?
-                        }
+                        super::providers::relation_diff_schema(
+                            self.public_catalog.as_ref(),
+                            &relation.name,
+                        )?
                     } else {
                         self.public_catalog
                             .surface_schema(&relation.name)
@@ -265,9 +255,7 @@ impl LixInformationSchemaProvider {
                         function_schema.push(self.public_schema_name.clone());
                         function_name.push(surface.name.clone());
                         source_relation.push(Some(relation.name.clone()));
-                        argument_signature.push(if surface.name == "lix_working_diff" {
-                            "(relation TEXT)".to_string()
-                        } else if surface.kind == PublicSurfaceKind::DiffFunction {
+                        argument_signature.push(if surface.kind == PublicSurfaceKind::DiffFunction {
                             "(relation TEXT) | (relation TEXT, from_commit_id TEXT, to_commit_id TEXT)".to_string()
                         } else {
                             "(relation TEXT, commit_id TEXT)".to_string()

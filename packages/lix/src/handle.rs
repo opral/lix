@@ -96,18 +96,28 @@ impl OpenProgressSink for RetainingOpenProgressSink {
     }
 }
 
-/// Configures the raw internal cache behind the official authoritative JS
-/// composite.
+/// Server behavior for an opened local Lix repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServerMode {
+    /// Execute against local storage and continuously synchronize the active
+    /// branch with the server.
+    Sync,
+}
+
+/// Configures the server associated with a local Lix repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InternalSyncCacheOptions {
+pub struct ServerOptions {
+    pub mode: ServerMode,
     pub url: String,
     /// HTTP headers included on browser sync protocol requests.
     pub headers: Vec<(String, String)>,
 }
 
-impl InternalSyncCacheOptions {
+impl ServerOptions {
     pub fn sync(url: impl Into<String>) -> Self {
         Self {
+            mode: ServerMode::Sync,
             url: url.into(),
             headers: Vec::new(),
         }
@@ -129,7 +139,7 @@ pub struct OpenLixBuilder<StorageImpl = Memory> {
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
-    server: Option<InternalSyncCacheOptions>,
+    server: Option<ServerOptions>,
     open_progress: Option<Arc<dyn OpenProgressSink>>,
 }
 
@@ -181,41 +191,12 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
         self
     }
 
-    /// Constructs the raw local cache used behind the official authoritative
-    /// JS composite.
+    /// Runs this repository as a local replica of `server`.
     ///
-    /// Safe Rust clients deliberately have no connected-cache constructor;
-    /// use the server protocol client as the authoritative session instead.
-    ///
-    /// # Safety
-    ///
-    /// The returned raw replica must never be exposed to application code. The
-    /// caller must immediately wrap it with an authority session that pins the
-    /// authority publication cursor before every local HOT read, routes history,
-    /// mutations, observations, and transactions to the authority, pairs branch
-    /// and account selection, and terminally closes both sessions after any
-    /// barrier or alignment failure.
-    ///
-    /// ```compile_fail
-    /// let _ = lix::open_lix().with_internal_sync_cache(
-    ///     lix::InternalSyncCacheOptions::sync("https://example.invalid/lix"),
-    /// );
-    /// ```
-    #[cfg(feature = "unsafe-internal-sync-cache")]
-    #[doc(hidden)]
-    pub unsafe fn with_internal_sync_cache(
-        mut self,
-        server: InternalSyncCacheOptions,
-    ) -> Self {
-        self.server = Some(server);
-        self
-    }
-
-    #[cfg(not(feature = "unsafe-internal-sync-cache"))]
-    pub(crate) unsafe fn with_internal_sync_cache(
-        mut self,
-        server: InternalSyncCacheOptions,
-    ) -> Self {
+    /// Sync replicas require a storage adapter that implements durable reads.
+    /// The default in-memory adapter is intentionally not supported because it
+    /// cannot prove that a bootstrap snapshot survived its publication fence.
+    pub fn with_server(mut self, server: ServerOptions) -> Self {
         self.server = Some(server);
         self
     }
@@ -532,6 +513,7 @@ where
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.lix.session.statement_authority_route(&self.sql)?;
                 self.lix.require_authority_execution(route)?;
+                self.lix.fence_hot_state(route).await?;
                 self.lix
                     .retry_sync_demands(|| {
                         self.lix.session.execute_with_options(
@@ -582,6 +564,7 @@ where
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.lix.session.batch_authority_route(&self.statements)?;
                 self.lix.require_authority_execution(route)?;
+                self.lix.fence_hot_state(route).await?;
                 self.lix
                     .retry_sync_demands(|| {
                         self.lix
@@ -684,7 +667,7 @@ async fn open_lix_inner<StorageImpl>(
     storage: StorageSession<StorageImpl>,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
-    server: Option<InternalSyncCacheOptions>,
+    server: Option<ServerOptions>,
     retained_progress: Arc<RetainingOpenProgressSink>,
 ) -> Result<Lix<StorageImpl>, LixError>
 where
@@ -757,14 +740,19 @@ where
         open_report: Arc::new(open_report),
     };
     if let Some(server) = server {
-        let initial_transport = if let Some(prepared) = prepared_sync.take() {
-            Some(crate::sync::install_sync_bootstrap(&mut lix, &server, prepared).await?)
-        } else {
-            None
-        };
-        let runtime = crate::sync::activate_sync_mode(&mut lix, &server, initial_transport).await?;
-        lix.sync_demand_tx = Some(runtime.demand_tx.clone());
-        lix.sync_lease = Some(SyncSessionLease::root(runtime));
+        match server.mode {
+            ServerMode::Sync => {
+                let initial_transport = if let Some(prepared) = prepared_sync.take() {
+                    Some(crate::sync::install_sync_bootstrap(&mut lix, &server, prepared).await?)
+                } else {
+                    None
+                };
+                let runtime =
+                    crate::sync::activate_sync_mode(&mut lix, &server, initial_transport).await?;
+                lix.sync_demand_tx = Some(runtime.demand_tx.clone());
+                lix.sync_lease = Some(SyncSessionLease::root(runtime));
+            }
+        }
     }
     lix.bind_session();
     emit_open_progress(
@@ -816,7 +804,12 @@ where
 {
     /// Configures a deterministic, stream-first snapshot export.
     pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<StorageImpl> {
-        crate::snapshot::SnapshotExportBuilder::new(self.engine.storage())
+        let export = crate::snapshot::SnapshotExportBuilder::new(self.engine.storage());
+        if self.engine.sync_mode().role() == crate::sync::SyncRole::Replica {
+            export.reject_connected_replica()
+        } else {
+            export
+        }
     }
 
     #[cfg(feature = "server-protocol")]
@@ -1029,29 +1022,6 @@ where
         }
     }
 
-    /// Returns the parsed authority route for one atomic execution request.
-    ///
-    /// This is exposed for official bindings which compose a certified local
-    /// hot cache with an authoritative protocol session. It deliberately uses
-    /// Lix's parser and binder instead of duplicating SQL-text heuristics in a
-    /// transport. An empty request is a hot no-op; mutation dominates history,
-    /// and history dominates hot reads for mixed batches.
-    #[doc(hidden)]
-    pub fn execution_authority_route(
-        &self,
-        statements: &[String],
-    ) -> Result<crate::StatementAuthorityRoute, LixError> {
-        let statements = statements
-            .iter()
-            .map(|sql| ExecuteBatchStatement {
-                sql: sql.clone(),
-                params: Vec::new(),
-                label: None,
-            })
-            .collect::<Vec<_>>();
-        self.session.batch_authority_route(&statements)
-    }
-
     /// Classifies one SQL execution for a caller that owns its transport
     /// lifecycle.
     ///
@@ -1126,6 +1096,8 @@ where
         path: impl Into<String>,
         range: Option<std::ops::Range<u64>>,
     ) -> Result<Option<lix::FileRead>, LixError> {
+        self.fence_hot_state(crate::sql2::StatementAuthorityRoute::HotRead)
+            .await?;
         let path = path.into();
         self.retry_sync_demands(|| self.session.read_file_content(path.clone(), range.clone()))
             .await
@@ -1147,6 +1119,7 @@ where
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.session.statement_authority_route(&sql)?;
                 self.require_authority_execution(route)?;
+                self.fence_hot_state(route).await?;
                 self.retry_sync_demands(|| {
                     Arc::clone(&self.session).execute_with_idempotency_and_options_and_metadata(
                         sql.clone(),
@@ -1200,10 +1173,24 @@ where
         let authority = self
             .session
             .batch_authority_route(&routed)
-            .and_then(|route| self.require_authority_execution(route));
+            .and_then(|route| {
+                self.require_authority_execution(route)?;
+                Ok(route)
+            });
+        let demand_tx = self.sync_demand_tx.clone();
+        let is_replica = self.engine.sync_mode().role() == crate::sync::SyncRole::Replica;
         let session = Arc::clone(&self.session);
         async move {
-            authority?;
+            let route = authority?;
+            if is_replica && route == crate::sql2::StatementAuthorityRoute::HotRead {
+                let demand_tx = demand_tx.as_ref().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "sync replica has no publication fence worker",
+                    )
+                })?;
+                crate::sync::fence_hot_state(demand_tx).await?;
+            }
             session.execute_coherent_read_batch_owned(statements).await
         }
     }
@@ -1231,6 +1218,7 @@ where
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.session.batch_authority_route(&statements)?;
                 self.require_authority_execution(route)?;
+                self.fence_hot_state(route).await?;
                 self.retry_sync_demands(|| {
                     Arc::clone(&self.session)
                         .execute_batch_with_idempotency_and_options_and_metadata(
@@ -1258,7 +1246,13 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ObserveEvents<StorageImpl>, LixError> {
-        self.require_authority_execution(self.session.statement_authority_route(sql)?)?;
+        let route = self.session.statement_authority_route(sql)?;
+        self.require_authority_execution(route)?;
+        if self.engine.sync_mode().role() == crate::sync::SyncRole::Replica {
+            return Err(crate::sync::authority_execution_required(
+                crate::sql2::StatementAuthorityRoute::AuthorityRead,
+            ));
+        }
         self.session
             .observe(sql, params)
             .map(|events| ObserveEvents {
@@ -1397,6 +1391,24 @@ where
             return Err(crate::sync::authority_execution_required(route));
         }
         Ok(())
+    }
+
+    async fn fence_hot_state(
+        &self,
+        route: crate::sql2::StatementAuthorityRoute,
+    ) -> Result<(), LixError> {
+        if route != crate::sql2::StatementAuthorityRoute::HotRead
+            || self.engine.sync_mode().role() != crate::sync::SyncRole::Replica
+        {
+            return Ok(());
+        }
+        let demand_tx = self.sync_demand_tx.as_ref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync replica has no publication fence worker",
+            )
+        })?;
+        crate::sync::fence_hot_state(demand_tx).await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
@@ -1720,13 +1732,9 @@ mod tests {
     #[tokio::test]
     async fn invalid_sync_locator_is_rejected_before_storage_initialization() {
         let storage = Memory::new();
-        let result = unsafe {
-            open_lix()
-                .with_storage(storage.clone())
-                .with_internal_sync_cache(InternalSyncCacheOptions::sync(
-                    "https://example.test/not-a-lix",
-                ))
-        }
+        let result = open_lix()
+            .with_storage(storage.clone())
+            .with_server(ServerOptions::sync("https://example.test/not-a-lix"))
         .await;
         let Err(error) = result else {
             panic!("invalid sync locator must fail");

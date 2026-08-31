@@ -8756,7 +8756,7 @@ enum HotTombstoneMaskKind {
 /// carries `BeforeAbsent` for the currently active checkpoint: that baseline
 /// means "the first mutation after the checkpoint created this identity", so a
 /// delete of it is net-absent against the interval baseline. Phase 12 measured
-/// the consequence directly - `lix_working_diff` reports **nothing** for such
+/// the consequence directly - one-argument `lix_diff` reports **nothing** for such
 /// an identity while its tombstone exists - which is what makes the tombstone
 /// owed to nobody.
 ///

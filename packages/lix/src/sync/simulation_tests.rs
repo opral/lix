@@ -412,7 +412,7 @@ macro_rules! sync_simulation_test {
     ($name:ident, $scenario:ident) => {
         paste::paste! {
             #[test]
-            #[ignore = "pre-v3 peer-authored sync scenarios were removed by authoritative HOT replicas"]
+            #[ignore = "pre-v6 peer-authored sync scenarios were removed by authoritative HOT replicas"]
             fn [<$name _base>]() {
                 run_sync_simulation(
                     concat!(module_path!(), "::", stringify!($name)),

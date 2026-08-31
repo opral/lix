@@ -16,7 +16,7 @@ pub(crate) use commit_ancestry::commit_ancestry_schema;
 mod diff;
 mod directory;
 mod directory_history;
-pub(crate) use diff::{relation_diff_schema, relation_working_diff_schema};
+pub(crate) use diff::relation_diff_schema;
 mod diff_command;
 mod file;
 mod file_history;
@@ -93,18 +93,6 @@ where
             session,
             ctx.changelog_query_source(),
             Arc::clone(&catalog),
-            ctx.blob_reader(),
-        );
-    }
-    if catalog
-        .surface("lix_working_diff")
-        .is_some_and(|surface| selection.includes(surface))
-    {
-        diff::register_working_diff_function(
-            session,
-            ctx.changelog_query_source(),
-            Arc::clone(&catalog),
-            ctx.blob_reader(),
         );
     }
     if catalog
@@ -396,7 +384,6 @@ fn collect_dynamic_relation_literals(
                 return ControlFlow::Continue(());
             };
             if !crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
-                && !crate::sql2::parse::object_name_is_public_function(name, "lix_working_diff")
                 && !crate::sql2::parse::object_name_is_public_function(name, "lix_state_at")
             {
                 return ControlFlow::Continue(());
@@ -728,18 +715,6 @@ where
             session,
             read_ctx.changelog_query_source(),
             Arc::clone(&catalog),
-            read_ctx.blob_reader(),
-        );
-    }
-    if catalog
-        .surface("lix_working_diff")
-        .is_some_and(|surface| selection.includes(surface))
-    {
-        diff::register_working_diff_function(
-            session,
-            read_ctx.changelog_query_source(),
-            Arc::clone(&catalog),
-            read_ctx.blob_reader(),
         );
     }
     if catalog
@@ -1101,7 +1076,6 @@ mod tests {
                 "lix_diff",
                 "lix_history",
                 "lix_state_at",
-                "lix_working_diff",
             ]
         );
         assert_eq!(
@@ -1117,8 +1091,8 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 21, "construction count");
-        assert_eq!(read_only.len() + writable.len(), 14, "surface count");
+        assert_eq!(all_read + writable.len(), 20, "construction count");
+        assert_eq!(read_only.len() + writable.len(), 13, "surface count");
     }
 
     #[test]

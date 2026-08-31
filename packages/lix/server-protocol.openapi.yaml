@@ -492,7 +492,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 5 }
+      schema: { type: integer, const: 6 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -550,7 +550,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 6 }
-        syncProtocolVersion: { type: integer, const: 5 }
+        syncProtocolVersion: { type: integer, const: 6 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -675,14 +675,6 @@ components:
         checkpointCommitId:
           type: [string, "null"]
           description: Branch working-diff checkpoint at headCommitId. Required and non-null for a headed update; null only when deleting the branch.
-        headStateRootId:
-          type: string
-          pattern: "^[0-9a-f]{64}$"
-          description: Authority-certified complete live-value root at headCommitId. Present on pull events and omitted from client pushes.
-        checkpointStateRootId:
-          type: string
-          pattern: "^[0-9a-f]{64}$"
-          description: Authority-certified complete live-value root at checkpointCommitId. Present on pull events and omitted from client pushes.
     SyncPushRequest:
       type: object
       required: [commits, refUpdates, inlineBlobs]
@@ -753,7 +745,7 @@ components:
         continuation: { type: [string, "null"], maxLength: 4096 }
     SyncEvent:
       type: object
-      required: [cursor, commits, refUpdates, inlineBlobs, certificateRootId]
+      required: [cursor, commits, refUpdates, inlineBlobs]
       properties:
         cursor: { type: integer, minimum: 1 }
         commits: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncCommit" } }
@@ -761,10 +753,6 @@ components:
         inlineBlobs:
           type: array
           items: { $ref: "#/components/schemas/SyncBlobManifest" }
-        certificateRootId:
-          type: string
-          pattern: "^[0-9a-f]{64}$"
-          description: Domain-separated BLAKE3 certificate over the cursor and exact ordered commits, ref updates, and inline manifests in this event.
     SyncPullResponse:
       oneOf:
         - type: object

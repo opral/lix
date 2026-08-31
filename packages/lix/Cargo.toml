@@ -40,11 +40,6 @@ server-protocol-client = [
   "dep:futures-core",
   "tokio/sync",
 ]
-# Unsafe bridge used only by the JS SDK's certified local-cache worker. Safe
-# Rust clients cannot construct a raw connected cache; they use the server
-# protocol directly.
-unsafe-internal-sync-cache = []
-
 [[test]]
 name = "preimage_route_census"
 path = "tests/preimage_route_census.rs"

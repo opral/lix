@@ -19,7 +19,6 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use serde_json::Value as JsonValue;
 
 use crate::NullableKeyFilter;
-use crate::binary_cas::{BlobDataReader, BlobId};
 use crate::branch::BranchHeadControlContext;
 use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::hot_state::TrackedHeadContext;
@@ -45,14 +44,12 @@ use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters}
 use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 pub(super) fn register_diff_function<S>(
     session: &datafusion::prelude::SessionContext,
     query_source: SqlChangelogQuerySource<S>,
     catalog: Arc<PublicCatalog>,
-    blob_reader: Arc<dyn BlobDataReader>,
 ) where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -62,28 +59,6 @@ pub(super) fn register_diff_function<S>(
             store: query_source.store,
             catalog,
             slots: execution_slots(session),
-            mode: DiffMode::General,
-            blob_reader,
-        }),
-    );
-}
-
-pub(super) fn register_working_diff_function<S>(
-    session: &datafusion::prelude::SessionContext,
-    query_source: SqlChangelogQuerySource<S>,
-    catalog: Arc<PublicCatalog>,
-    blob_reader: Arc<dyn BlobDataReader>,
-) where
-    S: StorageAdapterRead + Clone + Send + Sync + 'static,
-{
-    session.register_udtf(
-        "lix_working_diff",
-        Arc::new(DiffFunction {
-            store: query_source.store,
-            catalog,
-            slots: execution_slots(session),
-            mode: DiffMode::WorkingHot,
-            blob_reader,
         }),
     );
 }
@@ -98,8 +73,6 @@ struct DiffFunction<S> {
     store: S,
     catalog: Arc<PublicCatalog>,
     slots: Arc<ExecutionSlots>,
-    mode: DiffMode,
-    blob_reader: Arc<dyn BlobDataReader>,
 }
 
 impl<S> fmt::Debug for DiffFunction<S> {
@@ -115,26 +88,9 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        let (relation, from_commit_id, to_commit_id) = match (self.mode, args) {
-            (DiffMode::WorkingHot, [relation]) => (
-                relation,
-                self.slots.latest_checkpoint_commit_id().ok_or_else(|| {
-                    DataFusionError::Plan(
-                        "lix_working_diff requires an active checkpoint".to_string(),
-                    )
-                })?,
-                self.slots.active_branch_commit_id().ok_or_else(|| {
-                    DataFusionError::Plan(
-                        "lix_working_diff requires an active branch head".to_string(),
-                    )
-                })?,
-            ),
-            (DiffMode::WorkingHot, _) => {
-                return Err(DataFusionError::Plan(
-                    "lix_working_diff requires exactly one relation argument".to_string(),
-                ));
-            }
-            (DiffMode::General, [relation]) => (
+        let (mode, relation, from_commit_id, to_commit_id) = match args {
+            [relation] => (
+                DiffMode::WorkingHot,
                 relation,
                 self.slots.latest_checkpoint_commit_id().ok_or_else(|| {
                     DataFusionError::Plan(
@@ -147,12 +103,13 @@ where
                     )
                 })?,
             ),
-            (DiffMode::General, [relation, from_commit_id, to_commit_id]) => (
+            [relation, from_commit_id, to_commit_id] => (
+                DiffMode::General,
                 relation,
                 text_argument(from_commit_id, 2, "commit ID", Some(&self.slots))?,
                 text_argument(to_commit_id, 3, "commit ID", Some(&self.slots))?,
             ),
-            (DiffMode::General, _) => {
+            _ => {
                 return Err(DataFusionError::Plan(
                     "lix_diff requires a relation and either zero or two commit ID arguments"
                         .to_string(),
@@ -160,24 +117,14 @@ where
             }
         };
         let relation_name = text_argument(relation, 1, "relation name", None)?;
-        if self.mode == DiffMode::WorkingHot && relation_name != "lix_file" {
-            return Err(DataFusionError::Plan(
-                "lix_working_diff only supports the lix_file working-review relation".to_string(),
-            ));
-        }
-        let relation = DiffRelation::from_catalog(
-            &self.catalog,
-            &relation_name,
-            self.mode == DiffMode::WorkingHot,
-        )?;
+        let relation = DiffRelation::from_catalog(&self.catalog, &relation_name)?;
         Ok(Arc::new(SpecTableProvider::new(Arc::new(DiffSpec {
             store: self.store.clone(),
             relation,
             from_commit_id,
             to_commit_id,
             active_branch_id: self.slots.active_branch_id(),
-            mode: self.mode,
-            blob_reader: Arc::clone(&self.blob_reader),
+            mode,
         }))))
     }
 }
@@ -234,11 +181,7 @@ enum DiffRelationKind {
 }
 
 impl DiffRelation {
-    fn from_catalog(
-        catalog: &PublicCatalog,
-        name: &str,
-        include_coordinates: bool,
-    ) -> Result<Self> {
+    fn from_catalog(catalog: &PublicCatalog, name: &str) -> Result<Self> {
         let surface = catalog.surface(name).ok_or_else(|| {
             DataFusionError::Plan(format!("lix_diff does not support relation '{name}'"))
         })?;
@@ -292,10 +235,6 @@ impl DiffRelation {
             );
         }
         fields.push(Field::new("diff_type", DataType::Utf8, false));
-        if include_coordinates {
-            fields.push(Field::new("before_commit_id", DataType::Utf8, false));
-            fields.push(Field::new("after_commit_id", DataType::Utf8, false));
-        }
         for column in surface
             .columns
             .iter()
@@ -338,7 +277,6 @@ struct DiffSpec<S> {
     to_commit_id: String,
     active_branch_id: Option<String>,
     mode: DiffMode,
-    blob_reader: Arc<dyn BlobDataReader>,
 }
 
 #[async_trait]
@@ -347,10 +285,7 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     fn table_name(&self) -> &str {
-        match self.mode {
-            DiffMode::General => "lix_diff",
-            DiffMode::WorkingHot => "lix_working_diff",
-        }
+        "lix_diff"
     }
 
     fn schema(&self) -> SchemaRef {
@@ -384,8 +319,7 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.relation.schema, projection);
-        if self.mode == DiffMode::General
-            && self.relation.kind == DiffRelationKind::File
+        if self.relation.kind == DiffRelationKind::File
             && schema
                 .fields()
                 .iter()
@@ -411,7 +345,6 @@ where
                     self.to_commit_id.clone(),
                     self.active_branch_id.clone(),
                     self.mode,
-                    Arc::clone(&self.blob_reader),
                 ),
                 move |(
                     store,
@@ -422,15 +355,9 @@ where
                     to_commit_id,
                     active_branch_id,
                     mode,
-                    blob_reader,
                 )| async move {
-                    let coordinates =
-                        (mode == DiffMode::WorkingHot).then_some(WorkingDiffCoordinates {
-                            before_commit_id: from_commit_id.clone(),
-                            after_commit_id: to_commit_id.clone(),
-                        });
                     if limit == Some(0) || route.contradictory || from_commit_id == to_commit_id {
-                        return diff_record_batch(schema, &[], &relation, coordinates.as_ref());
+                        return diff_record_batch(schema, &[], &relation);
                     }
                     let mut tracked = TrackedStateContext::new().reader(store.clone());
                     // A pinned base that is identical at both endpoints cannot
@@ -467,16 +394,16 @@ where
                     let direct_candidates = if mode == DiffMode::WorkingHot {
                         let branch_id = active_branch_id.as_deref().ok_or_else(|| {
                             hot_only_diff_error(DataFusionError::Execution(
-                                "lix_working_diff requires an active branch".to_string(),
+                                "lix_diff default range requires an active branch".to_string(),
                             ))
                         })?;
                         let from_commit = CommitId::parse_lix(
                             &from_commit_id,
-                            "lix_working_diff checkpoint commit ID",
+                            "lix_diff checkpoint commit ID",
                         )
                         .map_err(lix_error_to_datafusion_error)?;
                         let to_commit =
-                            CommitId::parse_lix(&to_commit_id, "lix_working_diff head commit ID")
+                            CommitId::parse_lix(&to_commit_id, "lix_diff head commit ID")
                                 .map_err(lix_error_to_datafusion_error)?;
                         let control = BranchHeadControlContext::new()
                             .reader(store.clone())
@@ -485,14 +412,14 @@ where
                             .map_err(lix_error_to_datafusion_error)?
                             .ok_or_else(|| {
                                 hot_only_diff_error(DataFusionError::Execution(format!(
-                                    "lix_working_diff has no HOT control for branch '{branch_id}'"
+                                    "lix_diff default range has no HOT control for branch '{branch_id}'"
                                 )))
                             })?;
                         if control.head_commit_id != to_commit
                             || control.working_diff_checkpoint_commit_id != Some(from_commit)
                         {
                             return Err(hot_only_diff_error(DataFusionError::Execution(
-                                "lix_working_diff execution coordinates no longer match the certified HOT epoch"
+                                "lix_diff default-range coordinates no longer match the certified HOT epoch"
                                     .to_string(),
                             )));
                         }
@@ -505,7 +432,7 @@ where
                                 .map_err(hot_only_diff_error)?
                                 .ok_or_else(|| {
                                     hot_only_diff_error(DataFusionError::Execution(
-                                        "lix_working_diff certified HOT index is unavailable"
+                                        "lix_diff certified HOT index is unavailable"
                                             .to_string(),
                                     ))
                                 })?
@@ -598,7 +525,6 @@ where
                                 &to_commit_id,
                                 &from_descriptor,
                                 &to_descriptor,
-                                &blob_reader,
                             )
                             .await;
                             if mode == DiffMode::WorkingHot {
@@ -630,7 +556,7 @@ where
                     if let Some(limit) = limit {
                         rows.truncate(limit);
                     }
-                    diff_record_batch(schema, &rows, &relation, coordinates.as_ref())
+                    diff_record_batch(schema, &rows, &relation)
                 },
             ),
         })
@@ -765,19 +691,7 @@ fn optional_values(conjuncts: &[Expr], column: &'static str) -> Option<Vec<Strin
 }
 
 pub(crate) fn relation_diff_schema(catalog: &PublicCatalog, relation: &str) -> Result<SchemaRef> {
-    DiffRelation::from_catalog(catalog, relation, false).map(|relation| relation.schema)
-}
-
-pub(crate) fn relation_working_diff_schema(
-    catalog: &PublicCatalog,
-    relation: &str,
-) -> Result<SchemaRef> {
-    DiffRelation::from_catalog(catalog, relation, true).map(|relation| relation.schema)
-}
-
-struct WorkingDiffCoordinates {
-    before_commit_id: String,
-    after_commit_id: String,
+    DiffRelation::from_catalog(catalog, relation).map(|relation| relation.schema)
 }
 
 fn hot_only_diff_error(error: DataFusionError) -> DataFusionError {
@@ -789,13 +703,13 @@ fn hot_only_diff_error(error: DataFusionError) -> DataFusionError {
         return lix_error_to_datafusion_error(error);
     }
     let message = if error.code == "LIX_SYNC_HISTORY_REQUIRED" {
-        "lix_working_diff requires the certified local HOT checkpoint snapshot; canonical history fallback is forbidden"
+        "lix_diff default range requires the certified local HOT checkpoint snapshot; canonical history fallback is forbidden"
             .to_string()
     } else {
         error.message
     };
     lix_error_to_datafusion_error(crate::LixError::new(
-        "LIX_WORKING_DIFF_HOT_UNAVAILABLE",
+        "LIX_DIFF_HOT_UNAVAILABLE",
         message,
     ))
 }
@@ -822,7 +736,6 @@ struct DiffSide {
     metadata: Option<JsonValue>,
     snapshot: Option<Arc<WasmTypedRow>>,
     path: Option<String>,
-    content: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -1215,7 +1128,6 @@ fn diff_side(
         metadata,
         snapshot,
         path: None,
-        content: None,
     }))
 }
 
@@ -1250,7 +1162,6 @@ async fn file_diff_rows<S>(
     to_commit_id: &str,
     from_descriptor: &CommitStateDescriptor,
     to_descriptor: &CommitStateDescriptor,
-    blob_reader: &Arc<dyn BlobDataReader>,
 ) -> Result<Vec<DiffSqlRow>>
 where
     S: StorageAdapterRead,
@@ -1291,18 +1202,6 @@ where
         groups
             .keys()
             .map(|file_id| descriptor_key(FILE_DESCRIPTOR_SCHEMA_KEY, file_id, Some(file_id)))
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        Vec::new()
-    };
-    let needs_content = projection
-        .fields()
-        .iter()
-        .any(|field| matches!(field.name().as_str(), "from_content" | "to_content"));
-    let blob_keys = if needs_content {
-        groups
-            .keys()
-            .map(|file_id| descriptor_key(BLOB_REF_SCHEMA_KEY, file_id, Some(file_id)))
             .collect::<Result<Vec<_>>>()?
     } else {
         Vec::new()
@@ -1373,62 +1272,6 @@ where
         &descriptor_keys,
     )
     .await?;
-    let blob_projection = ChangeRecordProjection {
-        snapshot_content: false,
-        metadata: false,
-        snapshot: needs_content,
-        raw_snapshot: false,
-    };
-    let from_blobs = tracked
-        .load_projected_batch_at_commit(from_commit_id, &blob_keys, &blob_projection)
-        .await
-        .map_err(lix_error_to_datafusion_error)?;
-    let to_blobs = tracked
-        .load_projected_batch_at_commit(to_commit_id, &blob_keys, &blob_projection)
-        .await
-        .map_err(lix_error_to_datafusion_error)?;
-    let from_base_blobs =
-        load_base_rows(tracked, from_descriptor, &blob_keys, &blob_projection).await?;
-    let to_base_blobs =
-        load_base_rows(tracked, to_descriptor, &blob_keys, &blob_projection).await?;
-    let from_blob_replacements = load_local_replacement_scopes_for_keys(
-        tracked,
-        from_commit_id,
-        from_descriptor,
-        &blob_keys,
-    )
-    .await?;
-    let to_blob_replacements =
-        load_local_replacement_scopes_for_keys(tracked, to_commit_id, to_descriptor, &blob_keys)
-            .await?;
-    let from_blob_ids = blob_keys
-        .iter()
-        .enumerate()
-        .map(|(index, key)| {
-            let (row, _) = effective_row(
-                from_blobs.row(index),
-                from_base_blobs.as_ref().and_then(|rows| rows.row(index)),
-                from_descriptor.global_scope,
-                base_key_suppressed(key, &from_blob_replacements),
-            );
-            blob_id_from_materialized_row(row)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let to_blob_ids = blob_keys
-        .iter()
-        .enumerate()
-        .map(|(index, key)| {
-            let (row, _) = effective_row(
-                to_blobs.row(index),
-                to_base_blobs.as_ref().and_then(|rows| rows.row(index)),
-                to_descriptor.global_scope,
-                base_key_suppressed(key, &to_blob_replacements),
-            );
-            blob_id_from_materialized_row(row)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let from_contents = load_working_diff_blob_bytes(blob_reader, &from_blob_ids).await?;
-    let to_contents = load_working_diff_blob_bytes(blob_reader, &to_blob_ids).await?;
     let needs_paths = projection
         .fields()
         .iter()
@@ -1478,15 +1321,9 @@ where
         };
         if let Some(side) = from.as_mut() {
             side.global = from_global;
-            if needs_content {
-                side.content = Some(from_contents[index].clone().unwrap_or_default());
-            }
         }
         if let Some(side) = to.as_mut() {
             side.global = to_global;
-            if needs_content {
-                side.content = Some(to_contents[index].clone().unwrap_or_default());
-            }
         }
         if needs_paths {
             if let Some(side) = from.as_mut() {
@@ -1625,74 +1462,7 @@ fn materialized_side(row: Option<MaterializedTrackedStateRowRef<'_>>) -> Result<
         metadata,
         snapshot: row.decoded_snapshot().cloned(),
         path: None,
-        content: None,
     }))
-}
-
-fn blob_id_from_materialized_row(
-    row: Option<MaterializedTrackedStateRowRef<'_>>,
-) -> Result<Option<BlobId>> {
-    let Some(row) = row.filter(|row| !row.deleted()) else {
-        return Ok(None);
-    };
-    let snapshot = row.decoded_snapshot().ok_or_else(|| {
-        DataFusionError::Execution(
-            "working file blob reference is missing its certified snapshot".to_string(),
-        )
-    })?;
-    let hash = typed_string(snapshot, "blob_hash")?.ok_or_else(|| {
-        DataFusionError::Execution(
-            "working file blob reference is missing its blob hash".to_string(),
-        )
-    })?;
-    BlobId::from_hex(&hash)
-        .map(Some)
-        .map_err(lix_error_to_datafusion_error)
-}
-
-async fn load_working_diff_blob_bytes(
-    blob_reader: &Arc<dyn BlobDataReader>,
-    ids: &[Option<BlobId>],
-) -> Result<Vec<Option<Vec<u8>>>> {
-    let unique = ids.iter().flatten().copied().collect::<BTreeSet<_>>();
-    if unique.is_empty() {
-        return Ok(vec![None; ids.len()]);
-    }
-    let request = unique.iter().copied().collect::<Vec<_>>();
-    let loaded = blob_reader
-        .load_bytes_many(&request)
-        .await
-        .map_err(lix_error_to_datafusion_error)?
-        .into_vec();
-    if loaded.len() != request.len() {
-        return Err(DataFusionError::Execution(format!(
-            "working file blob reader returned {} values for {} certified hashes",
-            loaded.len(),
-            request.len()
-        )));
-    }
-    let mut by_id = BTreeMap::new();
-    for (id, bytes) in request.into_iter().zip(loaded) {
-        let bytes = bytes.ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "certified working file blob '{}' is unavailable locally",
-                id.to_hex()
-            ))
-        })?;
-        by_id.insert(id, bytes);
-    }
-    ids.iter()
-        .map(|id| {
-            id.map(|id| {
-                by_id.get(&id).cloned().ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "working file blob batch omitted a requested hash".to_string(),
-                    )
-                })
-            })
-            .transpose()
-        })
-        .collect()
 }
 
 async fn filesystem_path<S>(
@@ -1802,7 +1572,6 @@ fn diff_record_batch(
     schema: SchemaRef,
     rows: &[DiffSqlRow],
     relation: &DiffRelation,
-    coordinates: Option<&WorkingDiffCoordinates>,
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         return RecordBatch::try_new_with_options(
@@ -1815,7 +1584,7 @@ fn diff_record_batch(
     let arrays = schema
         .fields()
         .iter()
-        .map(|field| diff_column_array(field, rows, relation, coordinates))
+        .map(|field| diff_column_array(field, rows, relation))
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(schema, arrays).map_err(DataFusionError::from)
 }
@@ -1824,7 +1593,6 @@ fn diff_column_array(
     field: &Field,
     rows: &[DiffSqlRow],
     relation: &DiffRelation,
-    coordinates: Option<&WorkingDiffCoordinates>,
 ) -> Result<ArrayRef> {
     match field.name().as_str() {
         "row_ref" => Ok(Arc::new(StringArray::from(
@@ -1839,22 +1607,6 @@ fn diff_column_array(
         "diff_type" => Ok(Arc::new(StringArray::from_iter_values(
             rows.iter().map(|row| row.diff_type),
         ))),
-        "before_commit_id" => Ok(Arc::new(StringArray::from_iter_values(rows.iter().map(
-            |_| {
-                coordinates
-                    .expect("working diff coordinate columns require pinned coordinates")
-                    .before_commit_id
-                    .as_str()
-            },
-        )))),
-        "after_commit_id" => Ok(Arc::new(StringArray::from_iter_values(rows.iter().map(
-            |_| {
-                coordinates
-                    .expect("working diff coordinate columns require pinned coordinates")
-                    .after_commit_id
-                    .as_str()
-            },
-        )))),
         "row_count" => Ok(Arc::new(Int64Array::from_iter_values(
             rows.iter().map(|row| row.row_count),
         ))),
@@ -1874,20 +1626,6 @@ fn diff_column_array(
             let (after, column) = side_column(name).ok_or_else(|| {
                 DataFusionError::Execution(format!("unsupported diff column '{name}'"))
             })?;
-            if column == "content" {
-                return Ok(Arc::new(LargeBinaryArray::from(
-                    rows.iter()
-                        .map(|row| {
-                            let side = if after {
-                                row.to.as_ref()
-                            } else {
-                                row.from.as_ref()
-                            };
-                            side.and_then(|side| side.content.as_deref())
-                        })
-                        .collect::<Vec<_>>(),
-                )));
-            }
             let values = rows
                 .iter()
                 .map(|row| {
@@ -2087,7 +1825,7 @@ mod tests {
     #[test]
     fn relation_diff_schema_pairs_public_columns_and_retires_legacy_columns() {
         let relation =
-            DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value", false)
+            DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
                 .expect("key/value relation is registered");
         let names = relation
             .schema
@@ -2134,40 +1872,18 @@ mod tests {
     }
 
     #[test]
-    fn working_diff_schema_carries_the_pinned_epoch() {
-        let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_file", true)
-            .expect("file relation is registered");
-        let names = relation
-            .schema
-            .fields()
-            .iter()
-            .map(|field| field.name().as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            &names[..5],
-            &[
-                "row_ref",
-                "id",
-                "diff_type",
-                "before_commit_id",
-                "after_commit_id"
-            ]
-        );
-    }
-
-    #[test]
-    fn working_diff_never_surfaces_a_history_demand() {
+    fn default_range_diff_never_surfaces_a_history_demand() {
         let error = hot_only_diff_error(lix_error_to_datafusion_error(crate::LixError::new(
             "LIX_SYNC_HISTORY_REQUIRED",
             "history is deferred",
         )));
         let error = datafusion_error_to_lix_error(error);
-        assert_eq!(error.code, "LIX_WORKING_DIFF_HOT_UNAVAILABLE");
+        assert_eq!(error.code, "LIX_DIFF_HOT_UNAVAILABLE");
         assert!(!error.message.contains("history is deferred"));
     }
 
     #[test]
-    fn working_diff_preserves_exact_hot_content_chunk_demand() {
+    fn default_range_diff_preserves_exact_hot_chunk_demand() {
         let error = hot_only_diff_error(lix_error_to_datafusion_error(
             crate::LixError::new("LIX_SYNC_CHUNKS_REQUIRED", "chunks are deferred")
                 .with_details(serde_json::json!({ "chunkIds": ["a".repeat(64)] })),
@@ -2183,7 +1899,7 @@ mod tests {
     #[test]
     fn relation_diff_rejects_non_relations() {
         let error =
-            match DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_diff", false) {
+            match DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_diff") {
                 Ok(_) => panic!("table functions are not diffable relations"),
                 Err(error) => error,
             };
@@ -2193,7 +1909,7 @@ mod tests {
     #[test]
     fn relation_diff_pushes_schema_identity_without_loading_payloads() {
         let relation =
-            DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value", false)
+            DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
                 .expect("key/value relation is registered");
         let projection = Schema::new(vec![Field::new("row_count", DataType::Int64, false)]);
         let route = DiffRoute::from_filters(&[], &relation, &projection);
@@ -2205,7 +1921,7 @@ mod tests {
 
     #[test]
     fn relation_diff_pushes_typed_file_id_without_filtering_content_row_primary_keys() {
-        let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_file", false)
+        let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_file")
             .expect("file relation is registered");
         let projection = Schema::empty();
         let route = DiffRoute::from_filters(
@@ -2226,7 +1942,7 @@ mod tests {
 
     #[test]
     fn relation_diff_only_hydrates_projected_payload_columns() {
-        let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_file", false)
+        let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_file")
             .expect("file relation is registered");
         let identity = Schema::new(vec![Field::new("to_id", DataType::Utf8, true)]);
         let path = Schema::new(vec![Field::new("to_path", DataType::Utf8, true)]);

@@ -30,8 +30,8 @@ The intended bounds are:
 | Working-diff identity scan | `O(D log D)` after the certified index is installed | `O(D)` |
 | Selected working-file payload | `O(S + A_f log A_f + P_f)` via exact HOT file-ID pushdown | `O(A_f + P_f)` transient rows and payload copies |
 | Working file rendering | `O(D log F + F * h)` for `F` changed files and directory depth `h` | `O(D + F + directories)` |
-| Historical point/diff read | `O(server result/page)` | `O(server result/page)` with no unbounded replica growth |
-| Connected freshness barrier | `O(R)` receipt probes over `R` pull/poll attempts plus one authority cursor read | `O(1)` excluding transport buffers |
+| Historical point/diff read | `O(R)` result transfer for `R` returned bytes/rows today | `O(R)` client result materialization; no persistent replica-history growth |
+| Connected freshness barrier | One finite authority round trip and `O(1)` metadata when its private cursor is certified. When behind: `O(B + Δ)` transfer, authority `O((B + Q)M log M)` snapshot-root recertification, and client `O(N log N)` per distinct changed root | Authority `O(max branch live set)` plus client `O(B + page + N)` during changed-root certification |
 
 Payload bytes are part of these bounds. A result containing `K` one-megabyte
 rows cannot use `O(K)` bytes; it uses `O(K MiB)`. Content-addressed sharing may
@@ -57,8 +57,9 @@ sync against shallow-history, deep-history, and wider-row fixtures. It asserts:
 - identical bootstrap page and topology-request counts at equal `N`, `C`, `D`,
   and `B` when only `H` changes;
 - exact replica current-row and working-diff cardinality;
+- exactly one finite publication pull for one certified current read;
 - zero cold-history requests from the no-endpoint working-diff query; and
-- a measured one-megabyte exact working-file content read, including its allocation scope;
+- a measured one-megabyte exact current-file content read, including its allocation scope;
 - bounded allocation before and after checkpoint retirement of retained
   net-zero working tombstones; and
 - generous allocation high-water envelopes that catch super-linear growth
@@ -75,29 +76,31 @@ LIX_HOT_STATE_PROFILE_OUTPUT="$PWD/target/hot-state-profile.json" \
   -- --ignored --exact --nocapture
 ```
 
-The 2026-08-29 reference run against this implementation passed every
+The 2026-08-31 reference run against this implementation passed every
 cardinality, request-count, and allocator-growth assertion:
 
 | Case | Live / dirty / history rows | Bootstrap allocated / peak-live bytes | Working diff allocated / peak-live bytes | History requests from working diff |
 | --- | ---: | ---: | ---: | ---: |
-| Shallow history | 256 / 32 / 2 | 195,545,427 / 11,046,566 | 766,040 / 308,987 | 0 |
-| Deep history | 256 / 32 / 64 | 195,066,575 / 10,850,592 | 765,904 / 308,987 | 0 |
-| Wide rows | 768 / 96 / 2 | 542,994,967 / 28,863,628 | 1,037,871 / 358,250 | 0 |
+| Shallow history | 256 / 32 / 2 | 198,205,063 / 10,988,033 | 864,162 / 212,656 | 0 |
+| Deep history | 256 / 32 / 64 | 198,219,881 / 11,052,505 | 840,979 / 212,656 | 0 |
+| Wide rows | 768 / 96 / 2 | 551,364,548 / 28,820,964 | 1,141,113 / 229,151 | 0 |
 
 Shallow and deep history used the same six snapshot-row pulls and four
 topology/history endpoint calls during bootstrap despite a 32x increase in
 cold history depth. Timings and RSS are intentionally omitted from the
 contract because they are machine- and allocator-dependent.
 
-The exact selected-file probe returned a 1,048,576-byte `to_content` value in
-all three cases. It allocated 17,045,115 / 16,706,491 / 16,269,653 bytes with
-2,923,791 / 2,943,076 / 2,802,120 peak-live bytes for shallow / deep / wide,
+The exact selected-file probe returned a 1,048,576-byte current `content` value in
+all three cases. It allocated 18,491,287 / 18,240,350 / 28,992,135 bytes with
+3,726,576 / 3,508,440 / 4,885,244 peak-live bytes for shallow / deep / wide,
 respectively. The first read may fetch missing content-addressed chunks, but it
-does not hydrate commit history and remains bounded by `A_f + P_f`.
+does not hydrate commit history and remains bounded by `A_f + P_f`. Review UI
+before/after payloads use the existing server-first `lix_state_at` history
+surface and therefore do not add historical memory to the replica.
 
 For 128 retained net-zero tombstones, checkpoint retirement kept the working
-diff at zero rows and reduced the probe from 1,196,331 to 986,262 allocated
-bytes and from 315,113 to 230,139 peak-live bytes.
+diff at zero rows and reduced the probe from 1,268,863 to 1,058,794 allocated
+bytes and from 334,458 to 250,675 peak-live bytes.
 
 The artifact schema is `lix.certified-hot-state-profile-artifact.v1`. Each case
 records its dimensions, elapsed time, allocation count/bytes, peak live bytes,

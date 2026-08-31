@@ -6,7 +6,7 @@
 //! `storage::conformance::model_based` already runs a reference model against
 //! the raw key/value storage adapters, and `merge_fuzz` already replays random
 //! branch traffic. Neither models the surfaces that make lix *unlike* a
-//! key/value store: what `lix_working_diff` reports relative to the last
+//! key/value store: what one-argument `lix_diff` reports relative to the last
 //! checkpoint, what `lix_history('<schema>')` reports per commit, what survives
 //! a reboot that replays the commit log, and what survives checkpoint GC.
 //! Those are the surfaces a physical-layout break silently gets wrong, so
@@ -18,7 +18,7 @@
 //!
 //! - `state` is what `SELECT ... FROM lix_key_value` must return.
 //! - `checkpoint_state` is the branch state as of the last checkpoint, which is
-//!   the basis `lix_working_diff` compares the working state against.
+//!   the basis one-argument `lix_diff` compares the working state against.
 //! - `history` is, per key, the newest-first sequence of values the key took at
 //!   the checkpoints where it changed. The engine collapses a whole
 //!   un-checkpointed interval into one commit, so a checkpoint contributes at
@@ -166,7 +166,7 @@ impl BranchModel {
         self.checkpoint_state = self.state.clone();
     }
 
-    /// The rows `lix_working_diff` must report, as `(key, diff_type)` sorted by
+    /// The rows one-argument `lix_diff` must report, as `(key, diff_type)` sorted by
     /// key.
     fn working_diff(&self) -> Vec<(String, &'static str)> {
         let mut diff = Vec::new();
