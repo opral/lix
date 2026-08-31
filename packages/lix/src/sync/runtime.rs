@@ -52,6 +52,10 @@ pub(crate) struct SyncDemand {
 
 #[cfg(test)]
 impl SyncDemand {
+    pub(crate) fn is_publication_barrier_for_test(&self) -> bool {
+        matches!(self.request, SyncDemandRequest::PublicationBarrier)
+    }
+
     pub(crate) fn succeed_for_test(self) {
         let _ = self.response.send(Ok(()));
     }

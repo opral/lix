@@ -7010,9 +7010,15 @@ mod tests {
         };
         let replica = replica_from_snapshot(&authority, &snapshot).await;
         let params = [Value::Text("observed-sync-value".to_owned())];
+        replica
+            .set_sync_role(super::super::SyncRole::Disabled)
+            .expect("local observer fixture should bypass public replica routing");
         let mut events = replica
             .observe("SELECT value FROM lix_key_value WHERE key = $1", &params)
             .expect("observe replica value");
+        replica
+            .set_sync_role(super::super::SyncRole::Replica)
+            .expect("replica role should be restored before applying the delta");
         events
             .next()
             .await
@@ -7450,9 +7456,15 @@ mod tests {
         let replica =
             accounting_replica_from_snapshot(&authority, &snapshot, storage.clone()).await;
         let params = [Value::Text("folded-chain".to_owned())];
+        replica
+            .set_sync_role(super::super::SyncRole::Disabled)
+            .expect("local observer fixture should bypass public replica routing");
         let mut observed = replica
             .observe("SELECT value FROM lix_key_value WHERE key = $1", &params)
             .expect("observe folded value");
+        replica
+            .set_sync_role(super::super::SyncRole::Replica)
+            .expect("replica role should be restored before applying the delta");
         observed
             .next()
             .await
@@ -8097,7 +8109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_replica_fence_makes_pre_v3_divergence_unconstructable() {
+    async fn durable_replica_fence_makes_pre_v6_divergence_unconstructable() {
         let authority = open_lix().await.expect("authority should open");
         authority
             .set_sync_role(super::super::SyncRole::Authority)
@@ -8326,6 +8338,23 @@ mod tests {
         (history, rows, checkpoint_roots)
     }
 
+    fn install_publication_fence_responder_for_test<StorageImpl>(lix: &mut Lix<StorageImpl>)
+    where
+        StorageImpl: Storage + Clone + Send + Sync + 'static,
+    {
+        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(8);
+        lix.set_sync_demand_sender_for_test(demand_tx);
+        tokio::spawn(async move {
+            while let Some(demand) = demand_rx.recv().await {
+                assert!(
+                    demand.is_publication_barrier_for_test(),
+                    "the synthetic replica fixture only answers publication barriers",
+                );
+                demand.succeed_for_test();
+            }
+        });
+    }
+
     async fn replica_from_snapshot<AuthorityStorage>(
         authority: &Lix<AuthorityStorage>,
         snapshot: &SyncRepositoryPullResponse,
@@ -8339,7 +8368,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
-        let replica = open_lix()
+        let mut replica = open_lix()
             .with_storage(storage)
             .await
             .expect("replica should open");
@@ -8358,6 +8387,7 @@ mod tests {
             )
             .await
             .expect("snapshot should initialize replica");
+        install_publication_fence_responder_for_test(&mut replica);
         replica
     }
 
@@ -8531,7 +8561,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
-        let replica = open_lix()
+        let mut replica = open_lix()
             .with_storage(storage)
             .await
             .expect("replica should open");
@@ -8550,6 +8580,7 @@ mod tests {
             )
             .await
             .expect("snapshot should initialize replica");
+        install_publication_fence_responder_for_test(&mut replica);
         replica
     }
 
@@ -10388,6 +10419,9 @@ mod tests {
             .expect_err("snapshot must not orphan a locally advanced same-id branch");
         assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
         assert!(error.message.contains("locally advanced branch"));
+        local
+            .set_sync_role(super::super::SyncRole::Disabled)
+            .expect("a rejected bootstrap should return the fixture to standalone mode");
         assert_eq!(read_key_value(&local, "local-only").await, "must-survive");
         let local_head_after = local
             .execute("SELECT lix_active_branch_commit_id() AS id", &[])
