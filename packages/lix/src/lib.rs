@@ -53,6 +53,7 @@ pub(crate) mod account;
 mod binary_cas;
 pub(crate) mod branch;
 mod background_task;
+mod authority_client;
 pub(crate) mod catalog;
 #[cfg(feature = "storage-benches")]
 pub mod changelog;
@@ -107,6 +108,8 @@ mod schema;
 pub mod snapshot;
 #[cfg(any(feature = "server-protocol", feature = "server-protocol-client"))]
 pub mod server_protocol;
+#[cfg(not(any(feature = "server-protocol", feature = "server-protocol-client")))]
+mod server_protocol;
 mod session;
 #[doc(hidden)]
 mod sync;

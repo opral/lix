@@ -60,6 +60,9 @@ pub use observe::ObserveEvent;
 pub(crate) use observe::ObserveEvents as SessionObserveEvents;
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;
+pub(crate) use transaction::{
+    ConnectedTransactionStateLease, SessionOperationGuard,
+};
 pub use undo_redo::{RedoReceipt, UndoReceipt};
 
 /// Zero-cost adapter for futures that rustc cannot prove `Send` because an

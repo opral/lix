@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::io::Cursor;
 use http::header::CONTENT_TYPE;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt as _, Full};
-use futures_util::io::Cursor;
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -262,10 +262,7 @@ async fn profile_net_zero_tombstone_checkpoint(churn_rows: usize) -> JsonValue {
     let pre = open_replica(pre_dir.path(), &url).await;
     let pre_scope = AllocationScope::start();
     let pre_count = pre
-        .execute(
-            "SELECT COUNT(*) AS count FROM lix_diff('lix_file')",
-            &[],
-        )
+        .execute("SELECT COUNT(*) AS count FROM lix_diff('lix_file')", &[])
         .await
         .expect("query net-zero working diff before checkpoint")
         .rows()[0]
@@ -290,10 +287,7 @@ async fn profile_net_zero_tombstone_checkpoint(churn_rows: usize) -> JsonValue {
     let post = open_replica(post_dir.path(), &url).await;
     let post_scope = AllocationScope::start();
     let post_count = post
-        .execute(
-            "SELECT COUNT(*) AS count FROM lix_diff('lix_file')",
-            &[],
-        )
+        .execute("SELECT COUNT(*) AS count FROM lix_diff('lix_file')", &[])
         .await
         .expect("query working diff after tombstone checkpoint")
         .rows()[0]
@@ -396,10 +390,7 @@ async fn profile_certified_hot_case(
     let diff_scope = AllocationScope::start();
     let diff_started = Instant::now();
     let diff = replica
-        .execute(
-            "SELECT COUNT(*) AS count FROM lix_diff('lix_file')",
-            &[],
-        )
+        .execute("SELECT COUNT(*) AS count FROM lix_diff('lix_file')", &[])
         .await
         .expect("query certified HOT working diff");
     let working_diff_elapsed = diff_started.elapsed();
@@ -493,7 +484,7 @@ async fn seed_hot_profile_rows(authority: &Lix<Memory>, live_rows: usize) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connected_hot_reads_fence_to_authority_and_non_hot_work_fails_closed() {
+async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "authority-fence", "before").await;
     authority
@@ -503,24 +494,30 @@ async fn connected_hot_reads_fence_to_authority_and_non_hot_work_fails_closed() 
     authority.close().await.expect("close authority setup");
 
     let probe = Arc::new(HttpProbe::default());
+    let principal = ServerProtocolPrincipal::Authenticated {
+        account_id: lix::SYSTEM_ACCOUNT_ID.to_owned(),
+        idempotency_scope: "connected-api-e2e".to_owned(),
+    };
     let (url, server_task, protocol_authority) =
-        serve_with_authority_session(authority_storage, Arc::clone(&probe)).await;
+        serve_as_with_authority_session(authority_storage, Arc::clone(&probe), principal).await;
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
 
     protocol_authority
         .put_value("authority-fence", "after")
         .await;
+    wait_for_value(&replica, "authority-fence", "after").await;
     let fences_before_read = probe.publication_fences.load(Ordering::Acquire);
-    assert_eq!(
-        read_value(&replica, "authority-fence").await.as_deref(),
-        Some("after"),
-        "the first connected read after an authority commit must not expose stale rows",
-    );
+    for _ in 0..100 {
+        assert_eq!(
+            read_value(&replica, "authority-fence").await.as_deref(),
+            Some("after"),
+        );
+    }
     assert_eq!(
         probe.publication_fences.load(Ordering::Acquire),
-        fences_before_read + 1,
-        "one connected hot read must use exactly one finite publication pull",
+        fences_before_read,
+        "certified HOT reads must not issue finite publication pulls",
     );
 
     let history_gets = probe.history_gets.load(Ordering::Acquire);
@@ -541,28 +538,272 @@ async fn connected_hot_reads_fence_to_authority_and_non_hot_work_fails_closed() 
         "working diff must not request cold history",
     );
 
-    let mutation_error = replica
+    replica
         .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('replica-write', 'forbidden')",
+            "INSERT INTO lix_key_value (key, value) VALUES ('replica-write', 'authoritative')",
             &[],
         )
         .await
-        .expect_err("raw connected replicas must not mutate local state");
-    assert_eq!(mutation_error.code, "LIX_AUTHORITY_EXECUTION_REQUIRED");
-    assert_eq!(read_value(&replica, "replica-write").await, None);
+        .expect("connected mutation executes on the authority");
+    assert_eq!(
+        read_value(&replica, "replica-write").await.as_deref(),
+        Some("authoritative"),
+        "a successful authority mutation returns only after certified publication",
+    );
+    protocol_authority
+        .wait_for_value("replica-write", "authoritative")
+        .await;
 
-    let history_error = replica
+    replica
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-race', 'main')",
+            &[],
+        )
+        .await
+        .expect("seed main-branch race marker");
+    let main_branch_id = replica
+        .active_branch_id()
+        .await
+        .expect("load connected main branch");
+    let race_branch = replica
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "connected-switch-read-race".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create connected race branch");
+    replica
+        .switch_branch(SwitchBranchOptions {
+            branch_id: race_branch.id.clone(),
+        })
+        .await
+        .expect("switch to race branch");
+    replica
+        .execute(
+            "UPDATE lix_key_value SET value = 'child' WHERE key = 'branch-race'",
+            &[],
+        )
+        .await
+        .expect("seed child-branch race marker");
+    replica
+        .switch_branch(SwitchBranchOptions {
+            branch_id: main_branch_id.clone(),
+        })
+        .await
+        .expect("return to connected main branch");
+
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        tokio::try_join!(
+            async {
+                for _ in 0..8 {
+                    replica
+                        .switch_branch(SwitchBranchOptions {
+                            branch_id: race_branch.id.clone(),
+                        })
+                        .await?;
+                    tokio::task::yield_now().await;
+                    replica
+                        .switch_branch(SwitchBranchOptions {
+                            branch_id: main_branch_id.clone(),
+                        })
+                        .await?;
+                }
+                Ok::<(), LixError>(())
+            },
+            async {
+                for _ in 0..64 {
+                    let result = replica
+                        .execute(
+                            "SELECT lix_active_branch_id() AS branch_id, value \
+                             FROM lix_key_value WHERE key = 'branch-race'",
+                            &[],
+                        )
+                        .await?;
+                    let branch_id = result.rows()[0].get::<String>("branch_id")?;
+                    let value = match result.rows()[0].get::<Value>("value")? {
+                        Value::Jsonb(value) => value.as_json_string().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "branch race marker must be a JSON string",
+                            )
+                        })?,
+                        Value::Text(value) => value,
+                        value => {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!("branch race marker has unexpected value {value:?}"),
+                            ));
+                        }
+                    };
+                    let expected = if branch_id == main_branch_id {
+                        "main"
+                    } else if branch_id == race_branch.id {
+                        "child"
+                    } else {
+                        panic!("read exposed unknown connected branch '{branch_id}'")
+                    };
+                    assert_eq!(value, expected, "branch selector and HOT row must be atomic");
+                    tokio::task::yield_now().await;
+                }
+                Ok::<(), LixError>(())
+            },
+        )
+    })
+    .await
+    .expect("concurrent connected switch/read must not deadlock")
+    .expect("concurrent connected switch/read should succeed");
+    assert_eq!(
+        replica.active_branch_id().await.expect("branch after race"),
+        main_branch_id,
+    );
+
+    let mut transaction = replica
+        .begin_transaction()
+        .await
+        .expect("connected transaction begins on the authority");
+    transaction
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('transaction-write', 'committed')",
+            &[],
+        )
+        .await
+        .expect("connected transaction stages on the authority");
+    let staged = transaction
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'transaction-write'",
+            &[],
+        )
+        .await
+        .expect("connected transaction preserves read-after-write");
+    assert_eq!(staged.rows().len(), 1);
+    transaction
+        .commit()
+        .await
+        .expect("connected transaction commits and publishes");
+    assert_eq!(
+        read_value(&replica, "transaction-write").await.as_deref(),
+        Some("committed"),
+    );
+
+    let guarded = replica
+        .begin_transaction()
+        .await
+        .expect("connected transaction reserves the ordinary session state");
+    for (label, result) in [
+        (
+            "read",
+            replica.execute("SELECT 1 AS value", &[]).await.map(|_| ()),
+        ),
+        (
+            "write",
+            replica
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ('outside-transaction', 'forbidden')",
+                    &[],
+                )
+                .await
+                .map(|_| ()),
+        ),
+    ] {
+        let error = result.expect_err("same-handle work must be blocked by connected transaction");
+        assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE", "{label}");
+    }
+    let observe_error = match replica.observe("SELECT 1 AS value", &[]) {
+        Err(error) => error,
+        Ok(mut observation) => {
+            observation.close();
+            panic!("same-handle observe must be blocked by connected transaction");
+        }
+    };
+    assert_eq!(observe_error.code, "LIX_INVALID_TRANSACTION_STATE");
+    let close_error = replica
+        .close()
+        .await
+        .expect_err("close must reject an active connected transaction");
+    assert_eq!(close_error.code, "LIX_INVALID_TRANSACTION_STATE");
+    let switch_error = tokio::time::timeout(
+        Duration::from_secs(5),
+        replica.switch_branch(SwitchBranchOptions {
+            branch_id: race_branch.id.clone(),
+        }),
+    )
+    .await
+    .expect("switch under connected transaction must not deadlock")
+    .expect_err("switch must reject an active connected transaction");
+    assert_eq!(switch_error.code, "LIX_INVALID_TRANSACTION_STATE");
+    guarded
+        .rollback()
+        .await
+        .expect("connected transaction rollback releases session state");
+    replica
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('after-failed-close', 'usable')",
+            &[],
+        )
+        .await
+        .expect("failed close must leave the connected handle usable");
+    assert_eq!(
+        read_value(&replica, "after-failed-close").await.as_deref(),
+        Some("usable"),
+    );
+
+    let mut abandoned = replica
+        .begin_transaction()
+        .await
+        .expect("connected transaction uses an isolated authority session");
+    abandoned
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('abandoned-write', 'never-committed')",
+            &[],
+        )
+        .await
+        .expect("stage abandoned authority write");
+    drop(abandoned);
+    replica
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('after-abandoned', 'available')",
+            &[],
+        )
+        .await
+        .expect("dropping a transaction must not wedge the shared authority session");
+    assert_eq!(
+        read_value(&replica, "after-abandoned").await.as_deref(),
+        Some("available"),
+    );
+    assert_eq!(
+        protocol_authority.read_value("abandoned-write").await,
+        None,
+        "closing the dedicated transaction session rolls back staged writes",
+    );
+
+    let history = replica
         .execute("SELECT * FROM lix_history('lix_key_value')", &[])
         .await
-        .expect_err("raw connected replicas must not serve history locally");
-    assert_eq!(history_error.code, "LIX_AUTHORITY_EXECUTION_REQUIRED");
-
-    let export_error = replica
-        .export_snapshot()
-        .write_to(&mut Vec::new())
+        .expect("connected history executes on the authority");
+    assert!(!history.rows().is_empty());
+    let coherent_history_statements: [(&str, &[Value]); 1] =
+        [("SELECT * FROM lix_history('lix_key_value')", &[])];
+    let coherent_history = replica
+        .execute_coherent_read_batch(&coherent_history_statements)
         .await
-        .expect_err("a sparse connected cache must not export as a canonical snapshot");
-    assert_eq!(export_error.code, LixError::CODE_INVALID_PARAM);
+        .expect("connected coherent history retains one authority snapshot");
+    assert!(!coherent_history.results[0].rows().is_empty());
+    assert_eq!(
+        coherent_history.active_branch_id,
+        replica.active_branch_id().await.expect("active branch"),
+    );
+    assert_eq!(
+        coherent_history.storage_mutation_revision, None,
+        "authority snapshots must not claim a local adapter revision",
+    );
+    let mut snapshot = Vec::new();
+    replica
+        .export_snapshot()
+        .write_to(&mut snapshot)
+        .await
+        .expect("connected snapshot export streams from the authority");
+    assert!(snapshot.starts_with(b"LIXSNAP\0"));
 
     replica.close().await.expect("close replica");
 
@@ -697,7 +938,9 @@ async fn synced_partial_file_checkpoint_stays_off_cold_history() {
                 "SELECT COUNT(*) AS count \
                  FROM lix_diff('lix_file', $1, lix_active_branch_commit_id()) \
                  WHERE to_path = '/remaining.md'",
-                &[Value::Text(checkpoint.rows()[0].get::<String>("commit_id").unwrap())],
+                &[Value::Text(
+                    checkpoint.rows()[0].get::<String>("commit_id").unwrap()
+                )],
             )
             .await
             .expect("unselected file remains dirty")
@@ -1523,7 +1766,10 @@ async fn offline_restore_survives_reopen_and_resets_the_authority() {
         "the authority lineage must not overwrite the local restore",
     );
     assert_eq!(
-        protocol_authority.read_value("restore-reopen").await.as_deref(),
+        protocol_authority
+            .read_value("restore-reopen")
+            .await
+            .as_deref(),
         Some("target"),
         "the local restore should reset the authority through a ref CAS",
     );
@@ -1807,7 +2053,7 @@ async fn lost_push_ack_retries_the_same_commit_idempotently() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn binary_chunks_remain_lazy_until_file_content_is_read() {
+async fn binary_chunks_are_hydrated_before_hot_state_is_certified() {
     let (authority_storage, authority) = open_authority().await;
     let payload = (0..5 * 1024 * 1024 + 19)
         .map(|index| (index % 251) as u8)
@@ -1826,13 +2072,260 @@ async fn binary_chunks_remain_lazy_until_file_content_is_read() {
     let replica = open_replica(replica_dir.path(), &url).await;
 
     assert!(probe.blob_gets.load(Ordering::Acquire) > 0);
-    assert_eq!(probe.chunk_gets.load(Ordering::Acquire), 0);
+    let chunk_gets_after_open = probe.chunk_gets.load(Ordering::Acquire);
+    assert!(
+        chunk_gets_after_open > 0,
+        "large live content must be hydrated before open returns"
+    );
     let result = replica
         .execute("SELECT content FROM lix_file WHERE path = '/lazy.bin'", &[])
         .await
-        .expect("first content read hydrates demanded chunks and retries");
+        .expect("first content read is served entirely from certified HOT state");
     assert_eq!(result.rows()[0].get::<Vec<u8>>("content").unwrap(), payload);
-    assert!(probe.chunk_gets.load(Ordering::Acquire) > 0);
+    assert_eq!(
+        probe.chunk_gets.load(Ordering::Acquire),
+        chunk_gets_after_open,
+        "HOT content reads must not make a chunk round trip"
+    );
+
+    replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delta_hydrates_only_final_hot_blob_payloads_after_large_churn() {
+    let (authority_storage, authority) = open_authority().await;
+    let original = vec![1_u8; 5 * 1024 * 1024 + 17];
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/stable.bin', $1)",
+            &[Value::Blob(original.clone().into())],
+        )
+        .await
+        .expect("seed stable authority blob");
+    authority.close().await.expect("close authority setup");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage, Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+    assert_eq!(
+        replica
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/stable.bin'",
+                &[],
+            )
+            .await
+            .expect("read certified stable blob")
+            .rows()[0]
+            .get::<Vec<u8>>("content")
+            .unwrap(),
+        original,
+    );
+
+    // Let the current long poll cross the offline boundary, then reject its
+    // replacement so all following authority events arrive in one catch-up
+    // page rather than being observed one by one.
+    wait_for_counter(&probe.delta_pulls, 1).await;
+    probe.set_offline(true);
+    protocol_authority
+        .put_value("blob-churn-boundary", "installed")
+        .await;
+    wait_for_value(&replica, "blob-churn-boundary", "installed").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let transient = vec![2_u8; 5 * 1024 * 1024 + 31];
+    let deleted = vec![3_u8; 5 * 1024 * 1024 + 47];
+    protocol_authority
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = '/stable.bin'",
+            &[Value::Blob(transient.into())],
+        )
+        .await;
+    protocol_authority
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = '/stable.bin'",
+            &[Value::Blob(original.clone().into())],
+        )
+        .await;
+    protocol_authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/deleted.bin', $1)",
+            &[Value::Blob(deleted.into())],
+        )
+        .await;
+    protocol_authority
+        .execute("DELETE FROM lix_file WHERE path = '/deleted.bin'", &[])
+        .await;
+    protocol_authority
+        .put_value("blob-churn-caught-up", "yes")
+        .await;
+
+    let chunks_before_catch_up = probe.chunk_gets.load(Ordering::Acquire);
+    probe.set_offline(false);
+    wait_for_value(&replica, "blob-churn-caught-up", "yes").await;
+    assert_eq!(
+        probe.chunk_gets.load(Ordering::Acquire),
+        chunks_before_catch_up,
+        "intermediate and deleted large blobs must retain only cold manifest metadata",
+    );
+    assert_eq!(
+        replica
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/stable.bin'",
+                &[],
+            )
+            .await
+            .expect("read unchanged final stable blob")
+            .rows()[0]
+            .get::<Vec<u8>>("content")
+            .unwrap(),
+        original,
+    );
+    assert!(
+        replica
+            .execute("SELECT id FROM lix_file WHERE path = '/deleted.bin'", &[],)
+            .await
+            .expect("read final deleted path")
+            .rows()
+            .is_empty()
+    );
+
+    replica.close().await.expect("close replica");
+    stop_server(server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delta_hydrates_external_blob_survivors_in_an_in_page_child() {
+    let (authority_storage, authority) = open_authority().await;
+    let default_branch_id = authority
+        .active_branch_id()
+        .await
+        .expect("load default authority branch");
+    // Each payload is just over the inline ceiling and remains one canonical
+    // chunk. One survives at the child head; the other survives only at the
+    // branch's pinned checkpoint after the child replaces it.
+    let inherited_head = vec![41_u8; 65 * 1024];
+    let inherited_checkpoint = vec![73_u8; 65 * 1024];
+    authority
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                label: None,
+                sql: "INSERT INTO lix_file (path, content) VALUES ('/inherited-head.bin', $1)"
+                    .to_owned(),
+                params: vec![Value::Blob(inherited_head.clone().into())],
+            },
+            ExecuteBatchStatement {
+                label: None,
+                sql:
+                    "INSERT INTO lix_file (path, content) VALUES ('/inherited-checkpoint.bin', $1)"
+                        .to_owned(),
+                params: vec![Value::Blob(inherited_checkpoint.clone().into())],
+            },
+        ])
+        .await
+        .expect("seed historical binary ancestor");
+    let ancestor = active_head(&authority).await;
+    authority
+        .execute(
+            "DELETE FROM lix_file WHERE path IN ('/inherited-head.bin', '/inherited-checkpoint.bin')",
+            &[],
+        )
+        .await
+        .expect("remove historical binaries from bootstrap HOT state");
+    authority.close().await.expect("close authority setup");
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task, protocol_authority) =
+        serve_with_authority_session(authority_storage, Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+    assert!(
+        replica
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/inherited-head.bin'",
+                &[],
+            )
+            .await
+            .expect("historical file is absent at bootstrap head")
+            .rows()
+            .is_empty(),
+    );
+
+    // Allow the held poll to publish one boundary, then keep the replacement
+    // poll offline so branch creation and its child arrive in one catch-up page.
+    probe.set_offline(true);
+    protocol_authority
+        .put_value("external-survivor-boundary", "installed")
+        .await;
+    wait_for_value(&replica, "external-survivor-boundary", "installed").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let inherited_branch_id = "01920000-0000-7000-8000-000000009041";
+    protocol_authority
+        .create_branch(inherited_branch_id, "inherited-survivors", &ancestor)
+        .await;
+    protocol_authority.switch_branch(inherited_branch_id).await;
+    protocol_authority
+        .execute(
+            "UPDATE lix_file SET content = CAST('new child payload' AS BYTEA) \
+             WHERE path = '/inherited-checkpoint.bin'",
+            &[],
+        )
+        .await;
+    protocol_authority.switch_branch(&default_branch_id).await;
+    protocol_authority
+        .put_value("external-survivor-caught-up", "yes")
+        .await;
+
+    let chunks_before_catch_up = probe.chunk_gets.load(Ordering::Acquire);
+    probe.set_offline(false);
+    wait_for_value(&replica, "external-survivor-caught-up", "yes").await;
+    assert_eq!(
+        probe
+            .chunk_gets
+            .load(Ordering::Acquire)
+            .saturating_sub(chunks_before_catch_up),
+        2,
+        "the inherited head payload and checkpoint-only payload must hydrate before publication",
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        replica.switch_branch(SwitchBranchOptions {
+            branch_id: inherited_branch_id.to_owned(),
+        }),
+    )
+    .await
+    .expect("connected switch_branch must not deadlock")
+    .expect("switch replica session to inherited branch");
+    let chunks_before_hot_read = probe.chunk_gets.load(Ordering::Acquire);
+    assert_eq!(
+        read_file_content(&replica, "/inherited-head.bin")
+            .await
+            .as_deref(),
+        Some(inherited_head.as_slice()),
+    );
+    assert_eq!(
+        replica
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_diff('lix_file') \
+                 WHERE coalesce(to_path, from_path) = '/inherited-checkpoint.bin'",
+                &[],
+            )
+            .await
+            .expect("checkpoint-backed working diff remains HOT")
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        1,
+    );
+    assert_eq!(
+        probe.chunk_gets.load(Ordering::Acquire),
+        chunks_before_hot_read,
+        "first inherited file and working-diff reads must remain zero-RTT",
+    );
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
@@ -1932,7 +2425,7 @@ where
         }
     })
     .await
-    .expect("timed out waiting for synchronized value");
+    .unwrap_or_else(|_| panic!("timed out waiting for synchronized value {key:?} = {expected:?}"));
 }
 
 async fn commit_count<S>(lix: &Lix<S>) -> i64
@@ -2003,7 +2496,8 @@ async fn serve_as(
 ) -> (String, tokio::task::JoinHandle<()>) {
     let protocol = open_lix()
         .with_storage(storage)
-        .serve().with_embedded_lix_id()
+        .serve()
+        .with_embedded_lix_id()
         .await
         .expect("serve authority");
     spawn_http_server(protocol, probe, principal).await
@@ -2023,7 +2517,8 @@ async fn serve_as_with_authority_session(
 ) -> (String, tokio::task::JoinHandle<()>, ProtocolAuthority) {
     let protocol = open_lix()
         .with_storage(storage)
-        .serve().with_embedded_lix_id()
+        .serve()
+        .with_embedded_lix_id()
         .await
         .expect("serve authority");
     let authority = ProtocolAuthority::open(protocol.clone(), principal.clone()).await;
@@ -2118,6 +2613,73 @@ impl ProtocolAuthority {
                     .expect("decode authority row values")
             })
             .collect()
+    }
+
+    async fn create_branch(&self, branch_id: &str, name: &str, from_commit_id: &str) {
+        let response = self
+            .protocol
+            .handle(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/lix/v1/{}/branch/create", self.protocol.lix_id()))
+                    .header("lix-session-id", &self.session_id)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(ServerProtocolBody::from(
+                        json!({
+                            "id": branch_id,
+                            "name": name,
+                            "fromCommitId": from_commit_id,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build authority create-branch request"),
+                self.context.clone(),
+            )
+            .await;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect authority create-branch response")
+            .to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "authority create branch failed: {}",
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    async fn switch_branch(&self, branch_id: &str) {
+        let response = self
+            .protocol
+            .handle(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/lix/v1/{}/branch/switch", self.protocol.lix_id()))
+                    .header("lix-session-id", &self.session_id)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(ServerProtocolBody::from(
+                        json!({ "branchId": branch_id }).to_string(),
+                    ))
+                    .expect("build authority switch-branch request"),
+                self.context.clone(),
+            )
+            .await;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect authority switch-branch response")
+            .to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "authority switch branch failed: {}",
+            String::from_utf8_lossy(&body),
+        );
     }
 
     async fn put_value(&self, key: &str, value: &str) {
@@ -2641,12 +3203,7 @@ async fn sparse_replica_observer_hydrates_root_history_past_a_merge_frontier() {
         "fixture requires a merge commit at the authority head"
     );
     for index in 0..3 {
-        put_value(
-            &authority,
-            &format!("after-merge-{index}"),
-            "after-merge",
-        )
-        .await;
+        put_value(&authority, &format!("after-merge-{index}"), "after-merge").await;
     }
     authority.close().await.expect("close authority setup");
 
@@ -2729,7 +3286,10 @@ async fn partially_hydrated_replica_reads_point_in_time_filesystem_state() {
         .await
         .expect("create /sales/playbook.md");
     let file_id = authority
-        .execute("SELECT id FROM lix_file WHERE path = '/sales/playbook.md'", &[])
+        .execute(
+            "SELECT id FROM lix_file WHERE path = '/sales/playbook.md'",
+            &[],
+        )
         .await
         .expect("read file id")
         .rows()[0]
@@ -2743,7 +3303,12 @@ async fn partially_hydrated_replica_reads_point_in_time_filesystem_state() {
         .get::<String>("commit_id")
         .expect("checkpoint commit id decodes");
     for index in 0..105 {
-        put_value(&authority, &format!("partial-hydration-{index:03}"), "value").await;
+        put_value(
+            &authority,
+            &format!("partial-hydration-{index:03}"),
+            "value",
+        )
+        .await;
     }
     authority.close().await.expect("close authority setup");
 
@@ -2908,7 +3473,10 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
         .await
         .expect("sparse replica reverts a working edit against the migrated checkpoint");
     let reverted = replica
-        .execute("SELECT path FROM lix_file WHERE path = '/brand/logo.md'", &[])
+        .execute(
+            "SELECT path FROM lix_file WHERE path = '/brand/logo.md'",
+            &[],
+        )
         .await
         .expect("reverted file resolves");
     assert_eq!(reverted.rows().len(), 1, "working edit was reverted");

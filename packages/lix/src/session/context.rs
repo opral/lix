@@ -327,12 +327,12 @@ where
             .await
     }
 
-    pub(super) fn ensure_observe_registration_allowed(&self) -> Result<(), LixError> {
+    pub(crate) fn ensure_observe_registration_allowed(&self) -> Result<(), LixError> {
         self.transaction_manager
             .ensure_observe_registration_allowed()
     }
 
-    pub(super) async fn begin_waitable_session_operation(
+    pub(crate) async fn begin_waitable_session_operation(
         &self,
     ) -> Result<SessionOperationGuard, LixError> {
         self.transaction_manager

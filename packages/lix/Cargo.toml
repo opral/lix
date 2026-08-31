@@ -27,17 +27,12 @@ storage-benches = []
 root-replay-trace = ["storage-benches"]
 default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
 server-protocol = [
-  "dep:async-stream",
-  "dep:futures-core",
   "dep:getrandom",
   "dep:http-body",
   "dep:serde_urlencoded",
   "tokio/time",
 ]
 server-protocol-client = [
-  "dep:async-stream",
-  "dep:flate2",
-  "dep:futures-core",
   "tokio/sync",
 ]
 [[test]]
@@ -182,9 +177,9 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }
 lz4_flex = "0.11"
-async-stream = { version = "0.3", optional = true }
-flate2 = { version = "1", optional = true }
-futures-core = { version = "0.3", optional = true }
+async-stream = "0.3"
+flate2 = "1"
+futures-core = "0.3"
 getrandom = { version = "0.3", optional = true }
 http = "1"
 http-body = { version = "1", optional = true }

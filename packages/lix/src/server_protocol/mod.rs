@@ -11,4 +11,6 @@ mod handler;
 pub use handler::*;
 
 #[cfg(feature = "server-protocol-client")]
-pub mod client;
+pub mod client {
+    pub use crate::authority_client::*;
+}

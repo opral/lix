@@ -10,9 +10,9 @@ const CONTAINER_VERSION: u16 = 1;
 const CHECKSUM_BLAKE3: u8 = 1;
 const ENTRY_TAG: u8 = 1;
 const TRAILER_TAG: u8 = 0xff;
-const HEADER_BYTES: usize = MAGIC.len() + 2 + 1 + 1 + 4;
+pub(crate) const HEADER_BYTES: usize = MAGIC.len() + 2 + 1 + 1 + 4;
 const ENTRY_HEADER_BYTES: usize = 1 + 4 + 4 + 4;
-const TRAILER_BYTES: usize = 1 + 8 + 8 + 32 + TRAILER_MAGIC.len();
+pub(crate) const TRAILER_BYTES: usize = 1 + 8 + 8 + 32 + TRAILER_MAGIC.len();
 
 // Wire-level resource budgets. Binary content is chunked well below the value
 // ceiling before reaching storage. Changing these does not change the encoding,
@@ -41,6 +41,77 @@ pub(crate) struct SnapshotTrailer {
     pub(crate) entry_count: u64,
     pub(crate) payload_bytes: u64,
     pub(crate) digest: [u8; 32],
+}
+
+pub(crate) fn decode_streamed_snapshot_header(
+    header: &[u8],
+) -> Result<SnapshotHeader, LixError> {
+    if header.len() != HEADER_BYTES {
+        return Err(invalid_snapshot("authority snapshot has an invalid header length"));
+    }
+    if &header[..MAGIC.len()] != MAGIC {
+        return Err(invalid_snapshot("unsupported snapshot magic"));
+    }
+    let mut offset = MAGIC.len();
+    let version = u16::from_be_bytes([header[offset], header[offset + 1]]);
+    offset += 2;
+    if version != CONTAINER_VERSION {
+        return Err(invalid_snapshot(format!(
+            "unsupported snapshot container version {version}"
+        )));
+    }
+    let checksum = header[offset];
+    offset += 1;
+    if checksum != CHECKSUM_BLAKE3 {
+        return Err(invalid_snapshot(format!(
+            "unsupported snapshot checksum algorithm {checksum}"
+        )));
+    }
+    let flags = header[offset];
+    offset += 1;
+    if flags != 0 {
+        return Err(invalid_snapshot(format!(
+            "unsupported snapshot flags 0x{flags:02x}"
+        )));
+    }
+    let lix_format_version = u32::from_be_bytes(
+        header[offset..offset + 4]
+            .try_into()
+            .expect("snapshot format version has a fixed width"),
+    );
+    Ok(SnapshotHeader { lix_format_version })
+}
+
+pub(crate) fn decode_streamed_snapshot_trailer(
+    total_bytes: u64,
+    digest: [u8; 32],
+    trailer: &[u8],
+) -> Result<SnapshotTrailer, LixError> {
+    if trailer.len() != TRAILER_BYTES
+        || trailer[0] != TRAILER_TAG
+        || trailer[49..] != *TRAILER_MAGIC
+    {
+        return Err(invalid_snapshot("authority snapshot has an invalid trailer"));
+    }
+    let entry_count = u64::from_be_bytes(trailer[1..9].try_into().expect("fixed trailer count"));
+    let payload_bytes =
+        u64::from_be_bytes(trailer[9..17].try_into().expect("fixed trailer byte count"));
+    let expected_digest: [u8; 32] = trailer[17..49]
+        .try_into()
+        .expect("fixed trailer digest");
+    let framing = u64::try_from(HEADER_BYTES + TRAILER_BYTES)
+        .expect("snapshot framing length fits u64");
+    if total_bytes.checked_sub(framing) != Some(payload_bytes) {
+        return Err(invalid_snapshot("authority snapshot payload length is invalid"));
+    }
+    if digest != expected_digest {
+        return Err(invalid_snapshot("authority snapshot digest does not match its payload"));
+    }
+    Ok(SnapshotTrailer {
+        entry_count,
+        payload_bytes,
+        digest,
+    })
 }
 
 pub(crate) struct SnapshotEncoder<'a, W: ?Sized> {
@@ -172,38 +243,9 @@ where
     pub(crate) async fn new(mut reader: R) -> Result<(SnapshotHeader, Self), LixError> {
         let mut header = [0_u8; HEADER_BYTES];
         read_exact(&mut reader, &mut header, "snapshot header").await?;
-        if &header[..MAGIC.len()] != MAGIC {
-            return Err(invalid_snapshot("unsupported snapshot magic"));
-        }
-        let mut offset = MAGIC.len();
-        let version = u16::from_be_bytes([header[offset], header[offset + 1]]);
-        offset += 2;
-        if version != CONTAINER_VERSION {
-            return Err(invalid_snapshot(format!(
-                "unsupported snapshot container version {version}"
-            )));
-        }
-        let checksum = header[offset];
-        offset += 1;
-        if checksum != CHECKSUM_BLAKE3 {
-            return Err(invalid_snapshot(format!(
-                "unsupported snapshot checksum algorithm {checksum}"
-            )));
-        }
-        let flags = header[offset];
-        offset += 1;
-        if flags != 0 {
-            return Err(invalid_snapshot(format!(
-                "unsupported snapshot flags 0x{flags:02x}"
-            )));
-        }
-        let lix_format_version = u32::from_be_bytes(
-            header[offset..offset + 4]
-                .try_into()
-                .expect("snapshot format version has a fixed width"),
-        );
+        let header = decode_streamed_snapshot_header(&header)?;
         Ok((
-            SnapshotHeader { lix_format_version },
+            header,
             Self {
                 reader,
                 hasher: blake3::Hasher::new(),

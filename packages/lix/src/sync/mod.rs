@@ -44,6 +44,7 @@ pub use platform::{
     unregister_browser_sync_transport,
 };
 pub(crate) use platform::{SyncTransportBounds, SyncTransportFuture};
+pub(crate) use platform::{AuthorityHttp, authority_http};
 pub(crate) use platform::sleep;
 #[cfg(feature = "server-protocol")]
 pub(crate) use protocol::SyncRefUpdate;

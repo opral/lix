@@ -264,7 +264,6 @@ impl ExecuteResult {
         Self::from_query_parts(columns, column_types, rows, rows_affected, notices)
     }
 
-    #[cfg(feature = "server-protocol-client")]
     pub(crate) fn from_protocol_response(
         statement_index: Option<usize>,
         label: Option<String>,
@@ -2749,7 +2748,7 @@ where
 
     pub(crate) fn execute_coherent_read_batch_owned(
         self: Arc<Self>,
-        statements: Vec<(String, Vec<Value>)>,
+        statements: Arc<Vec<(String, Vec<Value>)>>,
     ) -> impl Future<Output = Result<CoherentReadBatch, LixError>> + Send + 'static {
         // SAFETY: the future owns its Arc session and every SQL/parameter
         // payload. Storage read handles are Send by the Storage contract; the
@@ -6139,6 +6138,84 @@ mod tests {
                 .map(|commit_id| commit_id.to_string()),
             Some(restored_commit_id)
         );
+    }
+
+    #[tokio::test]
+    async fn one_argument_diff_uses_private_cursor_without_changing_public_latest_checkpoint() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('private-cursor', 'ancestor')",
+                &[],
+            )
+            .await
+            .expect("seed arbitrary non-checkpoint branch root");
+        let ancestor = session
+            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+            .await
+            .expect("ancestor head should read")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("ancestor head should be text");
+        let branch = session
+            .create_branch(crate::CreateBranchOptions {
+                id: None,
+                name: "private-working-diff-cursor".to_owned(),
+                from_commit_id: Some(ancestor),
+            })
+            .await
+            .expect("branch from arbitrary commit should be created");
+        session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: branch.id.clone(),
+            })
+            .await
+            .expect("branch should switch");
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'child' WHERE key = 'private-cursor'",
+                &[],
+            )
+            .await
+            .expect("child mutation should commit");
+
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch control read should open");
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch.id)
+            .await
+            .expect("branch control should read")
+            .expect("branch control should exist");
+        drop(read);
+        let private_cursor = control
+            .working_diff_checkpoint_commit_id
+            .expect("working diff cursor should exist")
+            .to_string();
+        let public_latest = session
+            .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
+            .await
+            .expect("public latest checkpoint should resolve")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("public latest checkpoint should be text");
+        assert_ne!(
+            public_latest, private_cursor,
+            "the public real checkpoint and private working cursor intentionally differ"
+        );
+
+        let diff = session
+            .execute(
+                "SELECT diff_type FROM lix_diff('lix_key_value') \
+                 WHERE key = 'private-cursor'",
+                &[],
+            )
+            .await
+            .expect("one-argument diff should bind the private cursor");
+        assert_eq!(diff.rows().len(), 1);
     }
 
     #[tokio::test]

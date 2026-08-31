@@ -87,11 +87,6 @@ async function openLixInternal(
 			"openLix() sync mode requires a durability-capable storage adapter",
 		);
 	}
-	if (syncServer !== undefined && isLixStorage(options.storage)) {
-		throw new TypeError(
-			"openLix() sync mode does not support filesystem storage because disk-to-Lix imports cannot bypass the authoritative server",
-		);
-	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
 		const binding = await openLixWorkerBinding(
@@ -102,7 +97,7 @@ async function openLixInternal(
 			options.onProgress,
 			snapshot,
 		);
-		return new Lix(await attachAuthority(binding, syncServer));
+		return new Lix(binding);
 	}
 	if (isJsProviderLixStorage(options.storage)) {
 		return openJsProviderStorage(
@@ -139,7 +134,7 @@ async function openLixInternal(
 					routed.current().importFilesystemPaths(paths),
 				syncDiskToLix: () => routed.current().syncDiskToLix(),
 			});
-			return new Lix(await attachAuthority(routed.binding, syncServer));
+			return new Lix(routed.binding);
 		} catch (error) {
 			disconnect();
 			await binding?.close().catch(() => undefined);
@@ -217,44 +212,10 @@ async function openJsProviderStorage(
 			snapshot,
 		);
 		binding = opened;
-		return new Lix(await attachAuthority(opened, syncServer));
+		return new Lix(opened);
 	} catch (error) {
 		openStorages.delete(storage);
 		await binding?.close().catch(() => undefined);
-		throw error;
-	}
-}
-
-async function attachAuthority(
-	local: LixBinding,
-	server: Omit<SyncLixServerOptions, "mode"> | undefined,
-): Promise<LixBinding> {
-	if (server === undefined) return local;
-	let authority: LixBinding | undefined;
-	try {
-		const [
-			{
-				authoritativeHotBinding,
-				assertAuthoritySessionAlignment,
-				waitForAuthorityPublication,
-			},
-			{ openRemoteLixBinding },
-		] =
-			await Promise.all([
-				import("./authoritative-hot-binding.js"),
-				import("./remote/client.js"),
-			]);
-		authority = await openRemoteLixBinding({
-			mode: "remote",
-			url: server.url,
-			headers: server.headers,
-			fetch: server.fetch,
-		});
-		await waitForAuthorityPublication(local, authority);
-		await assertAuthoritySessionAlignment(local, authority);
-		return authoritativeHotBinding(local, authority);
-	} catch (error) {
-		await Promise.allSettled([local.close(), authority?.close()]);
 		throw error;
 	}
 }

@@ -3,6 +3,10 @@
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
@@ -12,6 +16,11 @@ use super::super::http::{
 };
 use crate::LixError;
 use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
+use crate::authority_client::{
+    ProtocolByteStream, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse,
+    ProtocolHttpStream,
+};
+use bytes::Bytes;
 
 #[doc(hidden)]
 pub const BROWSER_TRANSPORT_CONFIG_HEADER: &str = "x-lix-internal-browser-transport";
@@ -51,10 +60,18 @@ pub fn unregister_browser_sync_transport(id: &str) {
     });
 }
 
+#[derive(Clone)]
 pub(crate) struct BrowserHttpClient {
     headers: Vec<(String, String)>,
     header_provider: Option<Function>,
     fetch: Option<Function>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AuthorityHttp(BrowserHttpClient);
+
+pub(crate) fn authority_http(headers: &[(String, String)]) -> Result<AuthorityHttp, LixError> {
+    Ok(AuthorityHttp(BrowserHttpClient::from_headers(headers)?))
 }
 
 impl std::fmt::Debug for BrowserHttpClient {
@@ -73,6 +90,13 @@ impl HttpSyncTransport<BrowserHttpClient> {
         repository_url: &str,
         headers: &[(String, String)],
     ) -> Result<Self, LixError> {
+        let client = BrowserHttpClient::from_headers(headers)?;
+        Self::connect_with(client, repository_url).await
+    }
+}
+
+impl BrowserHttpClient {
+    fn from_headers(headers: &[(String, String)]) -> Result<Self, LixError> {
         let config_id = headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(BROWSER_TRANSPORT_CONFIG_HEADER))
@@ -86,7 +110,7 @@ impl HttpSyncTransport<BrowserHttpClient> {
                 "browser sync transport callbacks are no longer registered",
             ));
         }
-        let client = BrowserHttpClient {
+        Ok(BrowserHttpClient {
             headers: headers
                 .iter()
                 .filter(|(name, _)| {
@@ -99,9 +123,192 @@ impl HttpSyncTransport<BrowserHttpClient> {
                 .as_ref()
                 .and_then(|value| value.header_provider.clone()),
             fetch: config.and_then(|value| value.fetch),
-        };
-        Self::connect_with(client, repository_url).await
+        })
     }
+}
+
+impl ProtocolHttp for AuthorityHttp {
+    async fn request(
+        &self,
+        request: ProtocolHttpRequest,
+    ) -> Result<ProtocolHttpResponse, LixError> {
+        let method = request.method.parse().map_err(|error| {
+            LixError::new(LixError::CODE_INVALID_PARAM, format!("invalid HTTP method: {error}"))
+        })?;
+        let response = self.0.send(RawHttpRequest {
+            method,
+            url: request.url,
+            headers: request.headers,
+            body: request.body.map(|body| body.to_vec()),
+            cache_immutable: false,
+            operation: "authority request",
+        }).await?;
+        Ok(ProtocolHttpResponse {
+            status: response.status,
+            headers: Vec::new(),
+            body: response.body.into(),
+        })
+    }
+
+    async fn request_stream(
+        &self,
+        request: ProtocolHttpRequest,
+    ) -> Result<ProtocolHttpStream, LixError> {
+        authority_stream(&self.0, request).await
+    }
+
+    async fn sleep(&self, duration: Duration) {
+        super::wasm::sleep(duration).await;
+    }
+
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()>>>) {
+        wasm_bindgen_futures::spawn_local(future);
+    }
+}
+
+async fn authority_stream(
+    client: &BrowserHttpClient,
+    request: ProtocolHttpRequest,
+) -> Result<ProtocolHttpStream, LixError> {
+    let mut headers = resolve_request_headers(&client.headers, client.header_provider.as_ref()).await?;
+    headers.retain(|(name, _)| !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name));
+    headers.extend(request.headers);
+
+    let init = Object::new();
+    Reflect::set(&init, &"method".into(), &request.method.into()).map_err(js_transport_error)?;
+    Reflect::set(&init, &"credentials".into(), &"include".into()).map_err(js_transport_error)?;
+    Reflect::set(&init, &"cache".into(), &"no-store".into()).map_err(js_transport_error)?;
+    let header_pairs = Array::new();
+    for (name, value) in &headers {
+        let pair = Array::new();
+        pair.push(&name.into());
+        pair.push(&value.into());
+        header_pairs.push(&pair);
+    }
+    Reflect::set(&init, &"headers".into(), &header_pairs).map_err(js_transport_error)?;
+    if let Some(body) = request.body {
+        Reflect::set(
+            &init,
+            &"body".into(),
+            &Uint8Array::from(body.as_ref()),
+        )
+        .map_err(js_transport_error)?;
+    }
+
+    let global = js_sys::global();
+    let controller_constructor = Reflect::get(&global, &"AbortController".into())
+        .map_err(js_transport_error)?
+        .dyn_into::<Function>()
+        .map_err(js_transport_error)?;
+    let controller =
+        Reflect::construct(&controller_constructor, &Array::new()).map_err(js_transport_error)?;
+    let signal = Reflect::get(&controller, &"signal".into()).map_err(js_transport_error)?;
+    Reflect::set(&init, &"signal".into(), &signal).map_err(js_transport_error)?;
+    let cancel_controller = controller.clone();
+    let cancel: Arc<dyn Fn()> = Arc::new(move || {
+        if let Ok(abort) = Reflect::get(&cancel_controller, &"abort".into())
+            && let Ok(abort) = abort.dyn_into::<Function>()
+        {
+            let _ = abort.call0(&cancel_controller);
+        }
+    });
+
+    let fetch = match client.fetch.as_ref() {
+        Some(fetch) => fetch.clone(),
+        None => Reflect::get(&global, &"fetch".into())
+            .map_err(js_transport_error)?
+            .dyn_into::<Function>()
+            .map_err(js_transport_error)?,
+    };
+    let this = if client.fetch.is_some() {
+        JsValue::UNDEFINED
+    } else {
+        global.into()
+    };
+    let promise = fetch
+        .call2(&this, &request.url.into(), &init)
+        .map_err(js_transport_error)?
+        .dyn_into::<Promise>()
+        .map_err(js_transport_error)?;
+    let response = JsFuture::from(promise).await.map_err(js_transport_error)?;
+    let status = Reflect::get(&response, &"status".into())
+        .map_err(js_transport_error)?
+        .as_f64()
+        .unwrap_or_default() as u16;
+    let response_headers = browser_response_headers(&response)?;
+    let body = Reflect::get(&response, &"body".into()).map_err(js_transport_error)?;
+    if body.is_null() || body.is_undefined() {
+        return Err(LixError::new(
+            "LIX_SERVER_PROTOCOL_ERROR",
+            "authority stream response has no body",
+        ));
+    }
+    let reader = Reflect::get(&body, &"getReader".into())
+        .map_err(js_transport_error)?
+        .dyn_into::<Function>()
+        .map_err(js_transport_error)?
+        .call0(&body)
+        .map_err(js_transport_error)?;
+    let stream: ProtocolByteStream = Box::pin(async_stream::stream! {
+        loop {
+            let read = match Reflect::get(&reader, &"read".into())
+                .ok()
+                .and_then(|value| value.dyn_into::<Function>().ok())
+            {
+                Some(read) => read,
+                None => break,
+            };
+            let result = match read.call0(&reader)
+                .ok()
+                .and_then(|value| value.dyn_into::<Promise>().ok())
+            {
+                Some(promise) => JsFuture::from(promise).await,
+                None => break,
+            };
+            match result {
+                Ok(chunk) => {
+                    if Reflect::get(&chunk, &"done".into())
+                        .ok()
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    let value = Reflect::get(&chunk, &"value".into()).unwrap_or(JsValue::UNDEFINED);
+                    yield Ok(Bytes::from(Uint8Array::new(&value).to_vec()));
+                }
+                Err(error) => {
+                    yield Err(js_transport_error(error));
+                    break;
+                }
+            }
+        }
+    });
+    Ok(ProtocolHttpStream {
+        status,
+        headers: response_headers,
+        body: stream,
+        cancel,
+    })
+}
+
+fn browser_response_headers(response: &JsValue) -> Result<Vec<(String, String)>, LixError> {
+    let headers = Reflect::get(response, &"headers".into()).map_err(js_transport_error)?;
+    if headers.is_null() || headers.is_undefined() {
+        return Ok(Vec::new());
+    }
+    let entries = Reflect::get(&headers, &"entries".into())
+        .ok()
+        .and_then(|value| value.dyn_into::<Function>().ok())
+        .and_then(|entries| entries.call0(&headers).ok())
+        .unwrap_or(headers);
+    Ok(Array::from(&entries)
+        .iter()
+        .filter_map(|entry| {
+            let pair = Array::from(&entry);
+            Some((pair.get(0).as_string()?, pair.get(1).as_string()?))
+        })
+        .collect())
 }
 
 impl RawHttpClient for BrowserHttpClient {
