@@ -11,10 +11,10 @@ use futures_util::{FutureExt, select_biased};
 use crate::storage_adapter::Storage;
 use crate::{Lix, LixError};
 
-use super::platform::{HttpSyncTransport, SyncTask, sleep, spawn_sync_task};
-use super::{SyncRepositoryPullResponse, SyncTransport};
 #[cfg(test)]
 use super::SyncPushRequest;
+use super::platform::{HttpSyncTransport, SyncTask, sleep, spawn_sync_task};
+use super::{SyncRepositoryPullResponse, SyncTransport};
 
 const SYNC_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const SYNC_MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
@@ -74,6 +74,9 @@ pub(super) struct PreparedRepositorySnapshot {
     pub(super) commits: Vec<super::SyncCommit>,
     pub(super) commit_headers: Vec<super::SyncCommitHeader>,
     pub(super) rows: Vec<super::SyncSnapshotRow>,
+    /// Binary payloads reachable from current branch heads or their pinned
+    /// working-diff checkpoints. Older history remains deliberately excluded.
+    pub(super) live_blob_ids: BTreeSet<String>,
     pub(super) checkpoint_roots: BTreeMap<String, String>,
 }
 
@@ -152,11 +155,19 @@ where
         );
     }
     rows.extend(fetch_snapshot_rows(transport, &checkpoint_targets).await?);
+    // The serving plane includes both current rows and the pinned checkpoint
+    // side of one-argument `lix_diff`. Certify both payload sets up front so a
+    // working-diff projection never turns into a foreground chunk request.
+    let live_blob_ids = blob_ids_from_rows(
+        rows.iter()
+            .map(|row| (row.schema_key.as_str(), row.snapshot.as_ref())),
+    )?;
     let snapshot = PreparedRepositorySnapshot {
         metadata,
         commits: history.commits,
         commit_headers: history.commit_headers,
         rows,
+        live_blob_ids,
         checkpoint_roots,
     };
     Ok((snapshot, lix_id, default_branch_id))
@@ -619,11 +630,11 @@ where
 {
     let mut rows = Vec::new();
     for target_batch in targets.chunks(SYNC_DEMAND_FETCH_CONCURRENCY) {
-        let batches = futures_util::future::try_join_all(
-            target_batch.iter().copied().map(|(branch_id, head_commit_id)| {
+        let batches = futures_util::future::try_join_all(target_batch.iter().copied().map(
+            |(branch_id, head_commit_id)| {
                 fetch_snapshot_target_rows(transport, branch_id, head_commit_id)
-            }),
-        )
+            },
+        ))
         .await?;
         rows.extend(batches.into_iter().flatten());
     }
@@ -839,15 +850,12 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    let remote_id = lix
-        .sync_mode_state()
-        .replica_remote_id()
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "sync publication fence has no replica authority",
-            )
-        })?;
+    let remote_id = lix.sync_mode_state().replica_remote_id().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync publication fence has no replica authority",
+        )
+    })?;
 
     // Durable OPFS stores can briefly have two workers while an old page is
     // closing. Re-pin if that sibling publishes beyond this fence's snapshot
@@ -1061,7 +1069,10 @@ fn validate_history_page_body_budget(
             "sync history response exceeds the requested page limit",
         ));
     }
-    for dependency_id in commits.keys().filter(|commit_id| !causal.contains(**commit_id)) {
+    for dependency_id in commits
+        .keys()
+        .filter(|commit_id| !causal.contains(**commit_id))
+    {
         if !dependency_ids.contains(dependency_id) {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -1106,9 +1117,9 @@ fn merge_fetched_history_response(
         ));
     }
     for boundary in response.boundaries {
-        let is_external_base = response_commits.iter().any(|commit| {
-            commit.base_commit_id.as_deref() == Some(boundary.commit_id.as_str())
-        });
+        let is_external_base = response_commits
+            .iter()
+            .any(|commit| commit.base_commit_id.as_deref() == Some(boundary.commit_id.as_str()));
         if !returned.contains(&boundary.commit_id) && !is_external_base {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -1193,9 +1204,11 @@ where
             break;
         }
         for missing_batch in missing.chunks(SYNC_DEMAND_FETCH_CONCURRENCY) {
-            let responses = futures_util::future::try_join_all(missing_batch.iter().map(|head| {
-                fetch_history_head(transport, head, 1, max_boundaries_per_page)
-            }))
+            let responses = futures_util::future::try_join_all(
+                missing_batch
+                    .iter()
+                    .map(|head| fetch_history_head(transport, head, 1, max_boundaries_per_page)),
+            )
             .await?;
             for (head, response) in missing_batch.iter().zip(responses) {
                 merge_fetched_history_response(
@@ -1297,6 +1310,33 @@ where
     ensure_blob_manifests(lix, transport, blob_ids).await
 }
 
+/// Registers every snapshot manifest and eagerly materializes only the binary
+/// payloads reachable from current branch heads. Snapshot installation happens
+/// after this returns, so a certified HOT row is never published before all
+/// chunks needed to serve its `lix_file.content` are local.
+pub(super) async fn register_hot_blob_manifests<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    commits: &[super::SyncCommit],
+    rows: &[super::SyncSnapshotRow],
+    live_blob_ids: BTreeSet<String>,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let mut deferred_blob_ids = super::repository::sync_commit_blob_ids(commits)?;
+    deferred_blob_ids.extend(blob_ids_from_rows(
+        rows.iter()
+            .map(|row| (row.schema_key.as_str(), row.snapshot.as_ref())),
+    )?);
+    for blob_id in &live_blob_ids {
+        deferred_blob_ids.remove(blob_id);
+    }
+    ensure_blob_manifests(lix, transport, deferred_blob_ids).await?;
+    hydrate_blob_ids(lix, transport, live_blob_ids).await
+}
+
 async fn hydrate_chunk_ids<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
@@ -1318,6 +1358,28 @@ where
         lix.put_sync_chunk(&chunk_id, &bytes).await?;
     }
     Ok(())
+}
+
+async fn hydrate_blob_ids<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    blob_ids: BTreeSet<String>,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let blob_ids = blob_ids.into_iter().collect::<Vec<_>>();
+    let mut missing_chunk_ids = BTreeSet::new();
+    for requested in blob_ids.chunks(super::MAX_SYNC_BLOB_BATCH_ITEMS) {
+        let manifests = transport.get_blobs(requested).await?;
+        validate_blob_manifest_batch(requested, &manifests)?;
+        for manifest in manifests {
+            let registration = lix.register_deferred_sync_blob_manifest(&manifest).await?;
+            missing_chunk_ids.extend(registration.missing_chunk_ids);
+        }
+    }
+    hydrate_chunk_ids(lix, transport, missing_chunk_ids).await
 }
 
 /// Drives the same lazy history/blob hydration path as a live sync worker.
@@ -1357,10 +1419,10 @@ where
     let SyncRepositoryPullResponse::Delta { events, .. } = response else {
         return Ok(());
     };
-    let mut blob_ids = BTreeSet::new();
+    let mut referenced_blob_ids = BTreeSet::new();
     let mut inline_blob_ids = BTreeSet::new();
     for event in events {
-        blob_ids.extend(super::repository::sync_commit_blob_ids(&event.commits)?);
+        referenced_blob_ids.extend(super::repository::sync_commit_blob_ids(&event.commits)?);
         inline_blob_ids.extend(
             event
                 .inline_blobs
@@ -1368,8 +1430,6 @@ where
                 .map(|manifest| manifest.blob_id.clone()),
         );
     }
-    blob_ids.retain(|blob_id| !inline_blob_ids.contains(blob_id));
-    ensure_blob_manifests(lix, transport, blob_ids).await?;
     let included = events
         .iter()
         .flat_map(|event| event.commits.iter().map(|commit| commit.commit_id.as_str()))
@@ -1387,7 +1447,31 @@ where
         .filter(|commit_id| !included.contains(commit_id.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
-    hydrate_history_ids(lix, transport, targets).await
+    // Ref resets and branch creation can name an older body that is not in the
+    // delta. Materialize those sparse boundaries before deriving final HOT
+    // reachability from the imported-state overlay.
+    hydrate_history_ids(lix, transport, targets).await?;
+
+    let hot = lix.sync_delta_hot_blob_plan(response).await?;
+    let mut eager_blob_ids = referenced_blob_ids
+        .intersection(&hot.live_blob_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    // A page-carried child can inherit a final-live payload from an external
+    // ancestor. That payload is not referenced by any page commit, so include
+    // surviving external row owners explicitly rather than keying this decision
+    // only on whether the final target commit itself was external.
+    eager_blob_ids.extend(hot.external_survivor_blob_ids);
+    eager_blob_ids.retain(|blob_id| !inline_blob_ids.contains(blob_id));
+
+    // Cold commit bodies retain authenticated manifest metadata for later
+    // history reads, but only payloads reachable from the page's final
+    // head/checkpoint coordinates cross the eager chunk lane.
+    let mut cold_blob_ids = referenced_blob_ids;
+    cold_blob_ids
+        .retain(|blob_id| !inline_blob_ids.contains(blob_id) && !eager_blob_ids.contains(blob_id));
+    ensure_blob_manifests(lix, transport, cold_blob_ids).await?;
+    hydrate_blob_ids(lix, transport, eager_blob_ids).await
 }
 
 async fn ensure_blob_manifests<StorageImpl, Transport>(
@@ -1408,23 +1492,34 @@ where
     }
     for requested in missing.chunks(super::MAX_SYNC_BLOB_BATCH_ITEMS) {
         let manifests = transport.get_blobs(requested).await?;
-        if manifests.len() != requested.len() {
+        validate_blob_manifest_batch(requested, &manifests)?;
+        for (blob_id, manifest) in requested.iter().zip(manifests) {
+            debug_assert_eq!(manifest.blob_id, *blob_id);
+            lix.register_deferred_sync_blob_manifest(&manifest).await?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_blob_manifest_batch(
+    requested: &[String],
+    manifests: &[super::SyncBlobManifest],
+) -> Result<(), LixError> {
+    if manifests.len() != requested.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync blob batch response omitted or added manifests",
+        ));
+    }
+    for (blob_id, manifest) in requested.iter().zip(manifests) {
+        if manifest.blob_id != *blob_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "sync blob batch response omitted or added manifests",
+                format!(
+                    "sync blob request '{blob_id}' returned manifest '{}'",
+                    manifest.blob_id
+                ),
             ));
-        }
-        for (blob_id, manifest) in requested.iter().zip(manifests) {
-            if manifest.blob_id != *blob_id {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "sync blob request '{blob_id}' returned manifest '{}'",
-                        manifest.blob_id
-                    ),
-                ));
-            }
-            lix.register_deferred_sync_blob_manifest(&manifest).await?;
         }
     }
     Ok(())
@@ -1741,6 +1836,7 @@ mod tests {
     #[derive(Debug)]
     struct BlobCallTransport {
         manifests: BTreeMap<String, super::super::SyncBlobManifest>,
+        chunks: BTreeMap<String, Vec<u8>>,
         get_calls: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
@@ -1807,9 +1903,9 @@ mod tests {
 
         fn get_chunk<'a>(
             &'a self,
-            _chunk_id: &'a str,
+            chunk_id: &'a str,
         ) -> super::super::SyncTransportFuture<'a, Option<Vec<u8>>> {
-            Box::pin(async { Err(LixError::unknown("unused blob-call chunk get")) })
+            Box::pin(async move { Ok(self.chunks.get(chunk_id).cloned()) })
         }
 
         fn put_chunk<'a>(
@@ -1879,6 +1975,7 @@ mod tests {
         let get_calls = Arc::new(Mutex::new(Vec::new()));
         let transport = BlobCallTransport {
             manifests: BTreeMap::new(),
+            chunks: BTreeMap::new(),
             get_calls: Arc::clone(&get_calls),
         };
         let inline_delta = SyncRepositoryPullResponse::Delta {
@@ -1913,11 +2010,24 @@ mod tests {
         .expect("empty blob arrives inline without a manifest fetch");
         assert!(get_calls.lock().expect("get calls lock").is_empty());
 
-        let large = wire_blob(&vec![7_u8; 65 * 1024], false);
+        let large_bytes = vec![7_u8; 65 * 1024];
+        let large = wire_blob(&large_bytes, false);
         let large_commit = blob_ref_commit(&large.blob_id);
+        let mut offset = 0_usize;
+        let large_chunks = large
+            .chunks
+            .iter()
+            .map(|chunk| {
+                let end = offset + chunk.size_bytes as usize;
+                let bytes = large_bytes[offset..end].to_vec();
+                offset = end;
+                (chunk.chunk_id.clone(), bytes)
+            })
+            .collect();
         let large_get_calls = Arc::new(Mutex::new(Vec::new()));
         let large_transport = BlobCallTransport {
             manifests: BTreeMap::from([(large.blob_id.clone(), large)]),
+            chunks: large_chunks,
             get_calls: Arc::clone(&large_get_calls),
         };
         prepare_pull(
@@ -2432,7 +2542,10 @@ mod tests {
             unreachable!();
         };
         assert_eq!(cursor, 9);
-        assert_eq!(events.iter().map(|event| event.cursor).collect::<Vec<_>>(), vec![8, 9]);
+        assert_eq!(
+            events.iter().map(|event| event.cursor).collect::<Vec<_>>(),
+            vec![8, 9]
+        );
     }
 
     #[test]
@@ -2752,7 +2865,10 @@ mod tests {
             super::super::SYNC_PROTOCOL_MISMATCH_CODE,
             super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
         ] {
-            assert!(is_terminal_sync_error(&LixError::new(code, "terminal sync mismatch")));
+            assert!(is_terminal_sync_error(&LixError::new(
+                code,
+                "terminal sync mismatch"
+            )));
         }
     }
 
@@ -3260,10 +3376,7 @@ mod tests {
             Some(20),
             "a short checkpoint-dense tail shrinks from its returned size",
         );
-        assert_eq!(
-            smaller_history_demand_page_limit(20, 20, 19, 4),
-            Some(10),
-        );
+        assert_eq!(smaller_history_demand_page_limit(20, 20, 19, 4), Some(10),);
         assert_eq!(
             smaller_history_demand_page_limit(5, 5, 4, 4),
             None,

@@ -4,7 +4,7 @@ mod blobs;
 mod http;
 mod observe;
 mod sse;
-mod wire;
+pub(crate) mod wire;
 
 #[cfg(test)]
 mod tests;
@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     CreateBranchOptions, CreateBranchReceipt, ExecuteBatchStatement, ExecuteResult, LixError,
+    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     RedoReceipt, SwitchBranchReceipt, UndoReceipt, Value,
 };
 
@@ -29,17 +30,19 @@ use wire::{
     BLOB_BASE_MISSING_CODE, BeginTransactionResponse, CreateBranchRequestBody,
     CreateBranchResponseBody, EmptyBody, ErrorEnvelope,
     ExecuteBatchRequestBody, ExecuteBatchStatementBody, ExecuteOptionsBody, ExecuteRequestBody,
-    ExecuteResponseBody, HandshakeResponse, IDEMPOTENCY_KEY_HEADER, RedoResponseBody,
-    SESSION_HEADER, SERVER_PROTOCOL_VERSION, SwitchBranchRequestBody,
-    SwitchBranchResponseBody, TRANSACTION_HEADER, UndoResponseBody, closed_error, encode_engine_values,
-    is_recoverable_session_error, protocol_error, remote_error, unsupported_remote_operation,
-    validate_session_id,
+    ExecuteResponseBody, HandshakeResponse, IDEMPOTENCY_KEY_HEADER, MergeBranchPreviewRequestBody,
+    MergeBranchPreviewResponseBody, MergeBranchRequestBody, MergeBranchResponseBody,
+    RedoResponseBody, SESSION_HEADER, SERVER_PROTOCOL_VERSION, SwitchBranchRequestBody,
+    SwitchBranchResponseBody, TRANSACTION_HEADER, UndoResponseBody, closed_error,
+    encode_engine_values, is_recoverable_session_error, protocol_error, remote_error,
+    unsupported_remote_operation, validate_session_id,
 };
 
 pub use http::{
     ProtocolByteStream, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse, ProtocolHttpStream,
 };
 pub use observe::ProtocolObserveEvents;
+#[cfg(feature = "server-protocol-client")]
 pub use wire::{SERVER_CLOSED_CODE, SESSION_GONE_CODE};
 
 const MIN_COMPRESSIBLE_JSON_BYTES: usize = 32 * 1024;
@@ -58,6 +61,7 @@ struct ClientState {
     session_id: Option<String>,
     active_branch_id: Option<String>,
     active_account_id: Option<String>,
+    terminal_error: Option<LixError>,
     blobs: BlobCache,
 }
 
@@ -150,11 +154,12 @@ pub async fn open_protocol_client<H: ProtocolHttp + Clone + 'static>(
     let core = ClientCore {
         http: Arc::new(http),
         base_url: normalize_protocol_base_url(&base_url.into())?,
-        state: Arc::new(std::sync::Mutex::new(ClientState {
-            session_id: None,
-            active_branch_id: None,
-            active_account_id: None,
-            blobs: BlobCache::default(),
+            state: Arc::new(std::sync::Mutex::new(ClientState {
+                session_id: None,
+                active_branch_id: None,
+                active_account_id: None,
+                terminal_error: None,
+                blobs: BlobCache::default(),
         })),
         operation_lock: Arc::new(Mutex::new(())),
         accepting: Arc::new(AtomicBool::new(true)),
@@ -166,6 +171,10 @@ pub async fn open_protocol_client<H: ProtocolHttp + Clone + 'static>(
 }
 
 impl<H: ProtocolHttp> ClientCore<H> {
+    pub(crate) fn http(&self) -> &H {
+        &self.http
+    }
+
     pub fn session_id(&self) -> Option<String> {
         self.state
             .lock()
@@ -190,10 +199,24 @@ impl<H: ProtocolHttp> ClientCore<H> {
         Fut: Future<Output = Result<T, LixError>>,
     {
         let _guard = self.operation_lock.lock().await;
+        self.ensure_usable()?;
+        operation().await
+    }
+
+    pub(crate) fn ensure_usable(&self) -> Result<(), LixError> {
         if !self.accepting.load(Ordering::SeqCst) {
             return Err(closed_error());
         }
-        operation().await
+        if let Some(error) = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .terminal_error
+            .clone()
+        {
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn handshake_create(&self, active_branch_id: Option<&str>) -> Result<(), LixError> {
@@ -210,8 +233,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
             url.set_query(None);
         }
         let handshake = self.request_handshake(url.to_string(), false).await?;
-        self.apply_handshake(handshake);
-        Ok(())
+        self.apply_handshake(handshake)
     }
 
     async fn recover_session_once(&self) -> Result<(), LixError> {
@@ -257,11 +279,22 @@ impl<H: ProtocolHttp> ClientCore<H> {
         Ok(value)
     }
 
-    fn apply_handshake(&self, handshake: HandshakeResponse) {
+    fn apply_handshake(&self, handshake: HandshakeResponse) -> Result<(), LixError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(expected_account_id) = state.active_account_id.as_deref()
+            && handshake.active_account_id != expected_account_id
+        {
+            let error = protocol_error(format!(
+                "Lix Server Protocol session recovery changed activeAccountId from '{expected_account_id}' to '{}'",
+                handshake.active_account_id
+            ));
+            state.terminal_error = Some(error.clone());
+            return Err(error);
+        }
         state.session_id = Some(handshake.session_id);
         state.active_branch_id = Some(handshake.active_branch_id);
         state.active_account_id = Some(handshake.active_account_id);
+        Ok(())
     }
 
     pub async fn execute(
@@ -569,8 +602,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
                         "Lix Server Protocol handshake changed sessionId",
                     ));
                 }
-                self.apply_handshake(handshake);
-                Ok(())
+                self.apply_handshake(handshake)
             }
             Err(error) if is_recoverable_session_error(&error) => {
                 self.recover_session_once().await
@@ -705,6 +737,52 @@ impl<H: ProtocolHttp> ClientCore<H> {
         .await
     }
 
+    pub(crate) async fn merge_branch(
+        &self,
+        options: MergeBranchOptions,
+    ) -> Result<MergeBranchReceipt, LixError> {
+        self.enqueue(|| async {
+            self.with_session_recovery(|| async {
+                let response = self
+                    .request_json::<MergeBranchResponseBody, _>(
+                        "POST",
+                        self.join_path("branch/merge")?,
+                        true,
+                        None,
+                        Some(MergeBranchRequestBody::from(options.clone())),
+                        "json",
+                    )
+                    .await?;
+                Ok(response.into())
+            })
+            .await
+        })
+        .await
+    }
+
+    pub(crate) async fn merge_branch_preview(
+        &self,
+        options: MergeBranchPreviewOptions,
+    ) -> Result<MergeBranchPreview, LixError> {
+        self.enqueue(|| async {
+            self.with_session_recovery(|| async {
+                let response = self
+                    .request_json::<MergeBranchPreviewResponseBody, _>(
+                        "POST",
+                        self.join_path("branch/merge-preview")?,
+                        true,
+                        None,
+                        Some(MergeBranchPreviewRequestBody::from(options.clone())),
+                        "json",
+                    )
+                    .await?;
+                Ok(response.into())
+            })
+            .await
+        })
+        .await
+    }
+
     pub fn unsupported(&self, operation: &str) -> LixError {
         let _ = self;
         unsupported_remote_operation(operation)
@@ -785,9 +863,7 @@ impl<H: ProtocolHttp + Clone + 'static> ProtocolClient<H> {
         sql: &str,
         params: Vec<Value>,
     ) -> Result<ProtocolObserveEvents<ClientCore<H>>, LixError> {
-        if !self.accepting.load(Ordering::SeqCst) {
-            return Err(closed_error());
-        }
+        self.core.ensure_usable()?;
         self.observe.observe(sql.to_owned(), params).await
     }
 

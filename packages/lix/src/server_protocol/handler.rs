@@ -29,6 +29,10 @@ use lix::{
     ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction, ObserveEvent,
     ObserveEvents, OpenLixBuilder, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
 };
+use lix::authority_client::wire::{
+    MergeBranchPreviewRequestBody, MergeBranchPreviewResponseBody, MergeBranchRequestBody,
+    MergeBranchResponseBody,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -1585,9 +1589,27 @@ fn targeted_protocol_request(
     Ok(request)
 }
 
+fn snapshot_read_durability(
+    headers: &HeaderMap,
+) -> Result<crate::storage_adapter::StorageReadDurability, ApiError> {
+    let Some(value) = headers.get("lix-snapshot-durability") else {
+        return Ok(crate::storage_adapter::StorageReadDurability::Visible);
+    };
+    match value.to_str().ok() {
+        Some("visible") => Ok(crate::storage_adapter::StorageReadDurability::Visible),
+        Some("durable") => Ok(crate::storage_adapter::StorageReadDurability::Durable),
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            LixError::CODE_INVALID_PARAM,
+            "lix-snapshot-durability must be 'visible' or 'durable'",
+        )),
+    }
+}
+
 async fn export_snapshot_response<S>(
     server: LixServerProtocol<S>,
     durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
+    durability: crate::storage_adapter::StorageReadDurability,
 ) -> Response
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1607,7 +1629,10 @@ where
     tokio::spawn(async move {
         let mut writer = writer.compat_write();
         let result = {
-            let export = server.export_snapshot().write_to(&mut writer);
+            let export = server
+                .export_snapshot()
+                .durability(durability)
+                .write_to(&mut writer);
             tokio::pin!(export);
             tokio::select! {
                 result = &mut export => result,
@@ -1784,9 +1809,14 @@ where
                 )
                 .into_response();
             }
+            let durability = match snapshot_read_durability(&parts.headers) {
+                Ok(durability) => durability,
+                Err(error) => return error.into_response(),
+            };
             return export_snapshot_response(
                 self,
                 context.durable_terminal_storage_notifier.clone(),
+                durability,
             )
             .await;
         }
@@ -1831,6 +1861,8 @@ where
                 | (&Method::POST, "/lix/v1/transaction/execute")
                 | (&Method::POST, "/lix/v1/branch/create")
                 | (&Method::POST, "/lix/v1/branch/switch")
+                | (&Method::POST, "/lix/v1/branch/merge")
+                | (&Method::POST, "/lix/v1/branch/merge-preview")
                 | (&Method::POST, "/lix/v1/observe")
                 | (&Method::POST, "/lix/v1/observe/multiplex")
         );
@@ -1987,6 +2019,12 @@ where
             (&Method::POST, "/lix/v1/branch/switch") => {
                 result_response(switch_branch(lease, json_request!(SwitchBranchRequest)).await)
             }
+            (&Method::POST, "/lix/v1/branch/merge") => {
+                result_response(merge_branch(lease, json_request!(MergeBranchRequestBody)).await)
+            }
+            (&Method::POST, "/lix/v1/branch/merge-preview") => result_response(
+                merge_branch_preview(lease, json_request!(MergeBranchPreviewRequestBody)).await,
+            ),
             (&Method::POST, "/lix/v1/observe") => {
                 result_response(observe(lease, json_request!(ObserveRequest)).await)
             }
@@ -3543,6 +3581,32 @@ where
     Ok(Json(SwitchBranchResponse {
         branch_id: receipt.branch_id,
     }))
+}
+
+async fn merge_branch<S>(
+    lease: SessionLease<S>,
+    Json(options): Json<MergeBranchRequestBody>,
+) -> Result<Json<MergeBranchResponseBody>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let receipt = lease
+        .run_durable(move |lix| async move { lix.merge_branch(options.into()).await })
+        .await?;
+    Ok(Json(receipt.into()))
+}
+
+async fn merge_branch_preview<S>(
+    lease: SessionLease<S>,
+    Json(options): Json<MergeBranchPreviewRequestBody>,
+) -> Result<Json<MergeBranchPreviewResponseBody>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let preview = lease
+        .run_cancellable_read(move |lix| async move { lix.merge_branch_preview(options.into()).await })
+        .await?;
+    Ok(Json(preview.into()))
 }
 
 async fn observe<S>(
@@ -8897,6 +8961,28 @@ mod tests {
             .await
             .expect("direct snapshot export");
         assert_eq!(streamed.as_ref(), direct);
+    }
+
+    #[test]
+    fn snapshot_route_preserves_the_requested_read_durability() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            snapshot_read_durability(&headers).expect("default durability"),
+            crate::storage_adapter::StorageReadDurability::Visible
+        );
+        headers.insert(
+            "lix-snapshot-durability",
+            "durable".parse().expect("durability header"),
+        );
+        assert_eq!(
+            snapshot_read_durability(&headers).expect("durable requirement"),
+            crate::storage_adapter::StorageReadDurability::Durable
+        );
+        headers.insert(
+            "lix-snapshot-durability",
+            "eventual".parse().expect("invalid durability header"),
+        );
+        assert!(snapshot_read_durability(&headers).is_err());
     }
 
     #[tokio::test]

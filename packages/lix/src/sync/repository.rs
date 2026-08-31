@@ -381,6 +381,46 @@ impl SyncLiveValueRow {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct SyncDeltaHotBlobPlan {
+    pub(super) live_blob_ids: BTreeSet<String>,
+    /// Final-live payloads whose owning row comes from outside this delta.
+    ///
+    /// This is deliberately row provenance rather than target provenance. A
+    /// final head/checkpoint can be carried by the page while inheriting a blob
+    /// from an older external parent. Such a payload may have only cold manifest
+    /// metadata locally and must be hydrated before the new ref is certified.
+    pub(super) external_survivor_blob_ids: BTreeSet<String>,
+}
+
+fn sync_live_value_blob_ids<'a>(
+    rows: impl IntoIterator<Item = &'a SyncLiveValueRow>,
+) -> Result<BTreeSet<String>, LixError> {
+    let mut ids = BTreeSet::new();
+    for row in rows {
+        if row.schema_key != "lix_binary_blob_ref" {
+            continue;
+        }
+        let blob_id = serde_json::from_str::<serde_json::Value>(&row.snapshot_json)
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .get("blob_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "live sync binary blob ref has no blob_hash",
+                )
+            })?;
+        super::validate_blake3_id(&blob_id, "sync binary blob ref blob_hash")?;
+        ids.insert(blob_id);
+    }
+    Ok(ids)
+}
+
 fn canonical_sync_jsonb(value: &str, context: &str) -> Result<Vec<u8>, LixError> {
     let value = serde_json::from_str(value).map_err(|error| {
         LixError::new(
@@ -2058,11 +2098,11 @@ fn parse_sync_timestamp(context: &str, value: &str) -> Result<LixTimestamp, LixE
     })
 }
 
-async fn certified_sync_live_value_root_with_imports(
+async fn materialize_sync_live_value_rows_with_imports(
     read: &(impl StorageAdapterRead + ?Sized),
     parsed: &BTreeMap<CommitId, ParsedCommit>,
     target: CommitId,
-) -> Result<SyncLiveValueRootId, LixError> {
+) -> Result<BTreeMap<Vec<u8>, SyncLiveValueRow>, LixError> {
     let mut pending = Vec::new();
     let mut cursor = target;
     let mut rows = loop {
@@ -2122,6 +2162,15 @@ async fn certified_sync_live_value_root_with_imports(
             );
         }
     }
+    Ok(rows)
+}
+
+async fn certified_sync_live_value_root_with_imports(
+    read: &(impl StorageAdapterRead + ?Sized),
+    parsed: &BTreeMap<CommitId, ParsedCommit>,
+    target: CommitId,
+) -> Result<SyncLiveValueRootId, LixError> {
+    let rows = materialize_sync_live_value_rows_with_imports(read, parsed, target).await?;
     sync_live_value_root(rows.values().map(SyncLiveValueRow::as_ref))
 }
 
@@ -2661,10 +2710,9 @@ where
     ) -> Result<bool, LixError> {
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        Ok(load_replica_state(&read)
-            .await?
-            .0
-            .is_some_and(|state| state.cursor == cursor && state.snapshot_certified_cursor == Some(cursor)))
+        Ok(load_replica_state(&read).await?.0.is_some_and(|state| {
+            state.cursor == cursor && state.snapshot_certified_cursor == Some(cursor)
+        }))
     }
 
     pub(crate) async fn validate_sync_repository_account(
@@ -2791,9 +2839,7 @@ where
         let headed_branch_count = state
             .authoritative_branches
             .values()
-            .filter(|coordinate| {
-                matches!(coordinate, AuthoritativeBranchCoordinate::Headed { .. })
-            })
+            .filter(|coordinate| matches!(coordinate, AuthoritativeBranchCoordinate::Headed { .. }))
             .count();
         if branches.len() != headed_branch_count
             || branches.len() != state.certified_branch_roots.len()
@@ -2818,14 +2864,12 @@ where
                     ),
                 ));
             }
-            let local_coordinate = local.map(|control| {
-                AuthoritativeBranchCoordinate::Headed {
-                    head_commit_id: control.head_commit_id.to_string(),
-                    checkpoint_commit_id: control
-                        .working_diff_checkpoint_commit_id
-                        .unwrap_or(control.head_commit_id)
-                        .to_string(),
-                }
+            let local_coordinate = local.map(|control| AuthoritativeBranchCoordinate::Headed {
+                head_commit_id: control.head_commit_id.to_string(),
+                checkpoint_commit_id: control
+                    .working_diff_checkpoint_commit_id
+                    .unwrap_or(control.head_commit_id)
+                    .to_string(),
             });
             if local_coordinate.as_ref() != Some(&expected) {
                 return Err(LixError::new(
@@ -3322,6 +3366,109 @@ where
         Ok(true)
     }
 
+    /// Computes binary payload reachability at the final authoritative
+    /// coordinates named by one delta page without publishing those refs.
+    ///
+    /// The same imported-state overlay used by root certification is reused
+    /// here so intermediate values and values deleted later in the page never
+    /// become eager chunk downloads.
+    pub(super) async fn sync_delta_hot_blob_plan(
+        &self,
+        response: &SyncRepositoryPullResponse,
+    ) -> Result<SyncDeltaHotBlobPlan, LixError> {
+        let SyncRepositoryPullResponse::Delta { events, .. } = response else {
+            return Ok(SyncDeltaHotBlobPlan {
+                live_blob_ids: BTreeSet::new(),
+                external_survivor_blob_ids: BTreeSet::new(),
+            });
+        };
+        let mut final_targets = BTreeMap::<String, (Option<String>, Option<String>)>::new();
+        for event in events {
+            for update in &event.ref_updates {
+                final_targets.insert(
+                    update.branch_id.clone(),
+                    (
+                        update.head_commit_id.clone(),
+                        update.checkpoint_commit_id.clone(),
+                    ),
+                );
+            }
+        }
+        if final_targets.is_empty() {
+            return Ok(SyncDeltaHotBlobPlan {
+                live_blob_ids: BTreeSet::new(),
+                external_survivor_blob_ids: BTreeSet::new(),
+            });
+        }
+        let mut parsed = BTreeMap::<CommitId, ParsedCommit>::new();
+        for wire in events.iter().flat_map(|event| &event.commits) {
+            let commit = ParsedCommit::parse(wire)?;
+            if let Some(existing) = parsed.get(&commit.commit_id) {
+                if existing.wire != commit.wire {
+                    return Err(immutable_object_mismatch("commit", commit.commit_id));
+                }
+            } else {
+                parsed.insert(commit.commit_id, commit);
+            }
+        }
+
+        // A final row owned by an external commit is not necessarily cold. If
+        // the touched branch's currently certified head/checkpoint already
+        // reaches that payload, its chunks are complete by construction. Keep
+        // those IDs out of the eager lane so an ordinary child commit neither
+        // rereads payloads nor refetches manifests merely because the owning row
+        // predates this delta page.
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        let mut previously_live_blob_ids = BTreeSet::new();
+        let no_imports = BTreeMap::new();
+        for branch_id in final_targets.keys() {
+            let Some(control) = BranchHeadControlContext::new()
+                .reader(&read)
+                .load(branch_id)
+                .await?
+            else {
+                continue;
+            };
+            let previous_targets = [
+                Some(control.head_commit_id),
+                control.working_diff_checkpoint_commit_id,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<BTreeSet<_>>();
+            for target in previous_targets {
+                let rows =
+                    materialize_sync_live_value_rows_with_imports(&read, &no_imports, target)
+                        .await?;
+                previously_live_blob_ids.extend(sync_live_value_blob_ids(rows.values())?);
+            }
+        }
+
+        let target_ids = final_targets
+            .into_values()
+            .flat_map(|(head, checkpoint)| [head, checkpoint])
+            .flatten()
+            .map(|target| CommitId::parse_lix(&target, "sync delta final HOT target"))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let mut live_blob_ids = BTreeSet::new();
+        let mut external_survivor_blob_ids = BTreeSet::new();
+        for target in target_ids {
+            let rows =
+                materialize_sync_live_value_rows_with_imports(&read, &parsed, target).await?;
+            live_blob_ids.extend(sync_live_value_blob_ids(rows.values())?);
+            external_survivor_blob_ids.extend(sync_live_value_blob_ids(
+                rows.values()
+                    .filter(|row| !parsed.contains_key(&row.commit_id)),
+            )?);
+        }
+        external_survivor_blob_ids.retain(|blob_id| !previously_live_blob_ids.contains(blob_id));
+        Ok(SyncDeltaHotBlobPlan {
+            live_blob_ids,
+            external_survivor_blob_ids,
+        })
+    }
+
     pub(crate) async fn apply_sync_repository_pull(
         &self,
         _remote_id: &str,
@@ -3377,7 +3524,8 @@ where
                 // its own long poll and publication barriers. Drop the prefix
                 // another worker already published; never replay it against a
                 // newer certified coordinate or move the durable cursor back.
-                let events = &events[events.partition_point(|event| event.cursor <= state.cursor)..];
+                let events =
+                    &events[events.partition_point(|event| event.cursor <= state.cursor)..];
                 if events.is_empty() {
                     return Ok(());
                 }
@@ -3459,8 +3607,7 @@ where
                 }
                 let mut commits = BTreeMap::new();
                 let mut inline_blobs = BTreeMap::new();
-                let mut branch_chains =
-                    BTreeMap::<String, (Option<String>, Option<String>)>::new();
+                let mut branch_chains = BTreeMap::<String, (Option<String>, Option<String>)>::new();
                 for event in events {
                     let next_cursor = state
                         .cursor
@@ -3600,7 +3747,9 @@ where
                         (None, None) => {
                             state.certified_branch_roots.remove(branch_id);
                         }
-                        _ => unreachable!("sync coordinate validation already paired head/checkpoint"),
+                        _ => unreachable!(
+                            "sync coordinate validation already paired head/checkpoint"
+                        ),
                     }
                 }
                 drop(read);
@@ -6635,32 +6784,45 @@ where
                 })?);
             }
             let ref_updates = record.ref_updates;
-            let commit_refs = commits.iter().collect::<Vec<_>>();
-            let mut inline_blobs = Vec::new();
-            let mut encoded_len =
-                super::encoded_delta_event_len(record.cursor, &commit_refs, &ref_updates)?;
-            for blob_id in sync_commit_blob_ids(&commits)? {
-                let manifest = self.get_sync_inline_blob_manifest(&blob_id).await?;
-                if let Some(manifest) = manifest {
-                    if !append_bounded_inline_blob(
-                        &mut inline_blobs,
-                        &mut encoded_len,
-                        manifest,
-                        "inline sync event blob",
-                    )? {
-                        break;
-                    }
-                }
-            }
             events.push(SyncEvent {
                 cursor: record.cursor,
                 commits,
                 ref_updates,
-                inline_blobs,
+                inline_blobs: Vec::new(),
             });
         }
         let cursor = events.last().map_or(after, |event| event.cursor);
-        Ok(SyncRepositoryPullResponse::Delta { cursor, events })
+        let mut response = SyncRepositoryPullResponse::Delta { cursor, events };
+        let hot_blob_ids = self
+            .sync_delta_hot_blob_plan(&response)
+            .await?
+            .live_blob_ids;
+        let SyncRepositoryPullResponse::Delta { events, .. } = &mut response else {
+            unreachable!("delta response was just constructed")
+        };
+        let mut emitted = BTreeSet::new();
+        for event in events {
+            let commit_refs = event.commits.iter().collect::<Vec<_>>();
+            let mut encoded_len =
+                super::encoded_delta_event_len(event.cursor, &commit_refs, &event.ref_updates)?;
+            for blob_id in sync_commit_blob_ids(&event.commits)? {
+                if !hot_blob_ids.contains(&blob_id) || !emitted.insert(blob_id.clone()) {
+                    continue;
+                }
+                let manifest = self.get_sync_inline_blob_manifest(&blob_id).await?;
+                if let Some(manifest) = manifest
+                    && !append_bounded_inline_blob(
+                        &mut event.inline_blobs,
+                        &mut encoded_len,
+                        manifest,
+                        "inline sync event blob",
+                    )?
+                {
+                    break;
+                }
+            }
+        }
+        Ok(response)
     }
 
     async fn build_sync_snapshot(&self) -> Result<SyncRepositoryPullResponse, LixError> {
@@ -7191,10 +7353,7 @@ mod tests {
             .expect_err("a gapped overlap must still be rejected");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
-        assert_eq!(
-            read_key_value(&replica, "overlapping-pull").await,
-            "second"
-        );
+        assert_eq!(read_key_value(&replica, "overlapping-pull").await, "second");
         let SyncRepositoryPullResponse::Delta {
             cursor: final_cursor,
             ..
@@ -7226,7 +7385,8 @@ mod tests {
             panic!("initial pull should be a snapshot");
         };
         let storage = SyncAccountingStorage::default();
-        let replica = accounting_replica_from_snapshot(&authority, &snapshot, storage.clone()).await;
+        let replica =
+            accounting_replica_from_snapshot(&authority, &snapshot, storage.clone()).await;
         let sibling = open_lix()
             .with_storage(storage.clone())
             .await
@@ -7639,14 +7799,7 @@ mod tests {
             )
             .await
             .expect_err("replica SQL writes must be authority-routed");
-        assert_eq!(error.code, super::super::AUTHORITY_EXECUTION_REQUIRED_CODE);
-        assert_eq!(
-            error
-                .details
-                .as_ref()
-                .and_then(|details| details["executionKind"].as_str()),
-            Some("mutation"),
-        );
+        assert_eq!(error.code, "LIX_REPLICA_CACHE_READ_ONLY");
         let checkpoint_error = replica
             .create_checkpoint()
             .await

@@ -52,6 +52,30 @@ impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    /// Reserves the ordinary explicit-transaction state machine for a
+    /// transaction whose execution lives on a connected authority session.
+    ///
+    /// No local storage transaction is opened. The lease exists solely to
+    /// preserve the public same-handle contract: session operations and close
+    /// are rejected until the connected transaction commits, rolls back, or
+    /// is dropped.
+    pub(crate) fn begin_connected_transaction_state(
+        &self,
+    ) -> Result<(String, ConnectedTransactionStateLease), LixError> {
+        self.ensure_open()?;
+        let write_lease = self.begin_explicit_session_write_lease()?;
+        let branch_id = self.bound_branch_id()?;
+        let manager = self.transaction_manager();
+        manager.mark_explicit_transaction_open()?;
+        Ok((
+            branch_id,
+            ConnectedTransactionStateLease {
+                manager,
+                write_lease: Some(write_lease),
+            },
+        ))
+    }
+
     pub async fn begin_transaction(&self) -> Result<SessionTransaction<StorageImpl>, LixError> {
         self.ensure_open()?;
         let mut write_access = self.begin_explicit_session_write_access().await?;
@@ -123,6 +147,40 @@ where
             prepared_literal_escape_scratch: SmallVec::new(),
             prepared_literal_shape: crate::sql2::CachedUpdateLiteralShape::default(),
         })
+    }
+}
+
+/// The local session-state half of a connected authority transaction.
+///
+/// This is crate-private plumbing, not a second transaction implementation.
+/// Dropping the retained write lease returns the session to `OpenIdle` using
+/// the same guards as an ordinary [`SessionTransaction`].
+pub(crate) struct ConnectedTransactionStateLease {
+    manager: SessionTransactionManager,
+    write_lease: Option<SessionWriteLease>,
+}
+
+impl ConnectedTransactionStateLease {
+    pub(crate) fn begin_commit(
+        &self,
+    ) -> Result<ConnectedTransactionCommitLease, LixError> {
+        Ok(ConnectedTransactionCommitLease {
+            operation_guard: Some(self.manager.begin_transaction_commit_operation()?),
+        })
+    }
+
+    pub(crate) fn release(mut self) {
+        drop(self.write_lease.take());
+    }
+}
+
+pub(crate) struct ConnectedTransactionCommitLease {
+    operation_guard: Option<SessionOperationGuard>,
+}
+
+impl ConnectedTransactionCommitLease {
+    pub(crate) fn release(mut self) {
+        drop(self.operation_guard.take());
     }
 }
 
@@ -756,7 +814,7 @@ impl Drop for SessionTransactionGuard {
     }
 }
 
-pub(super) struct SessionOperationGuard {
+pub(crate) struct SessionOperationGuard {
     manager: SessionTransactionManager,
 }
 

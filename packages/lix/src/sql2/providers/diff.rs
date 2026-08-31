@@ -92,11 +92,13 @@ where
             [relation] => (
                 DiffMode::WorkingHot,
                 relation,
-                self.slots.latest_checkpoint_commit_id().ok_or_else(|| {
-                    DataFusionError::Plan(
-                        "lix_diff default range requires an active checkpoint".to_string(),
-                    )
-                })?,
+                self.slots
+                    .working_diff_checkpoint_commit_id()
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "lix_diff default range requires an active checkpoint".to_string(),
+                        )
+                    })?,
                 self.slots.active_branch_commit_id().ok_or_else(|| {
                     DataFusionError::Plan(
                         "lix_diff default range requires an active branch head".to_string(),

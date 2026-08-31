@@ -98,6 +98,7 @@ pub(crate) fn bind_execution_sql2_functions(
     active_branch_id: Option<&str>,
     active_branch_commit_id: Option<&str>,
     latest_checkpoint_commit_id: Option<&str>,
+    working_diff_checkpoint_commit_id: Option<&str>,
     root_commit_id: Option<&str>,
 ) {
     execution_slots(ctx).bind(
@@ -106,6 +107,7 @@ pub(crate) fn bind_execution_sql2_functions(
         active_branch_id,
         active_branch_commit_id,
         latest_checkpoint_commit_id,
+        working_diff_checkpoint_commit_id,
         root_commit_id,
     );
 }
@@ -122,6 +124,7 @@ pub(super) mod test_support {
             &ctx,
             system_sql2_function_provider(),
             crate::ANONYMOUS_ACCOUNT_ID,
+            None,
             None,
             None,
             None,

@@ -21,10 +21,23 @@ use crate::engine::{Engine, EngineOptions};
 use crate::open_types::{
     OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport, emit_open_progress,
 };
+use crate::authority_client::{
+    ClientCore, ProtocolClient, ProtocolExecuteOptions, ProtocolObserveEvents,
+    ProtocolTransaction, open_protocol_client,
+};
 use crate::session::SessionContext;
-use crate::session::{CoherentReadBatch, ExecuteOptions};
+use crate::session::{
+    CoherentReadBatch, ConnectedTransactionStateLease, ExecuteOptions, SessionOperationGuard,
+};
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
+
+const DIFF_HOT_UNAVAILABLE_CODE: &str = "LIX_DIFF_HOT_UNAVAILABLE";
+
+fn connected_hot_read_needs_authority(error: &LixError) -> bool {
+    error.code == crate::sync::AUTHORITY_EXECUTION_REQUIRED_CODE
+        || error.code == DIFF_HOT_UNAVAILABLE_CODE
+}
 
 /// Adapts a Rust closure to [`OpenProgressSink`].
 #[expect(missing_debug_implementations)]
@@ -512,17 +525,52 @@ where
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.lix.session.statement_authority_route(&self.sql)?;
-                self.lix.require_authority_execution(route)?;
-                self.lix.fence_hot_state(route).await?;
-                self.lix
-                    .retry_sync_demands(|| {
-                        self.lix.session.execute_with_options(
-                            &self.sql,
-                            &self.params,
-                            self.options.clone(),
-                        )
+                // HOT session APIs own their lifecycle guard because a stale
+                // branch base may need write access before the read retries.
+                // Retain only the outer authority gate across that local path.
+                let _authority_operation = self
+                    .lix
+                    .begin_connected_authority_operation()
+                    .await?;
+                if route != crate::sql2::StatementAuthorityRoute::HotRead
+                    && self.lix.connected_authority.is_some()
+                {
+                    let _session_operation =
+                        self.lix.session.begin_waitable_session_operation().await?;
+                    return self
+                        .lix
+                        .execute_on_authority(&self.sql, &self.params, &self.options, route)
+                        .await;
+                }
+                let local = self.lix
+                    .retry_connected_hot_read(route, || {
+                        self.lix.retry_sync_demands(|| {
+                            self.lix.session.execute_with_options(
+                                &self.sql,
+                                &self.params,
+                                self.options.clone(),
+                            )
+                        })
                     })
-                    .await
+                    .await;
+                match local {
+                    Err(error)
+                        if connected_hot_read_needs_authority(&error)
+                            && self.lix.connected_authority.is_some() =>
+                    {
+                        let _session_operation =
+                            self.lix.session.begin_waitable_session_operation().await?;
+                        self.lix
+                            .execute_hot_read_fallback(
+                                &self.sql,
+                                &self.params,
+                                &self.options,
+                                None,
+                            )
+                            .await
+                    }
+                    result => result,
+                }
             })
         })
     }
@@ -563,15 +611,42 @@ where
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.lix.session.batch_authority_route(&self.statements)?;
-                self.lix.require_authority_execution(route)?;
-                self.lix.fence_hot_state(route).await?;
-                self.lix
-                    .retry_sync_demands(|| {
-                        self.lix
-                            .session
-                            .execute_batch_with_options(&self.statements, self.options.clone())
+                let _authority_operation = self
+                    .lix
+                    .begin_connected_authority_operation()
+                    .await?;
+                if route != crate::sql2::StatementAuthorityRoute::HotRead
+                    && self.lix.connected_authority.is_some()
+                {
+                    let _session_operation =
+                        self.lix.session.begin_waitable_session_operation().await?;
+                    return self
+                        .lix
+                        .execute_batch_on_authority(&self.statements, &self.options, route)
+                        .await;
+                }
+                let local = self.lix
+                    .retry_connected_hot_read(route, || {
+                        self.lix.retry_sync_demands(|| {
+                            self.lix
+                                .session
+                                .execute_batch_with_options(&self.statements, self.options.clone())
+                        })
                     })
-                    .await
+                    .await;
+                match local {
+                    Err(error)
+                        if connected_hot_read_needs_authority(&error)
+                            && self.lix.connected_authority.is_some() =>
+                    {
+                        let _session_operation =
+                            self.lix.session.begin_waitable_session_operation().await?;
+                        self.lix
+                            .execute_hot_batch_fallback(&self.statements, &self.options, None)
+                            .await
+                    }
+                    result => result,
+                }
             })
         })
     }
@@ -596,7 +671,118 @@ where
     primary_switch_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     sync_lease: Option<Arc<SyncSessionLease>>,
     sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    connected_authority: Option<Arc<ConnectedAuthority>>,
     open_report: Arc<OpenReport>,
+}
+
+type ConnectedProtocolClient = ProtocolClient<crate::sync::AuthorityHttp>;
+
+#[derive(Clone)]
+struct ConnectedAuthority {
+    client: ConnectedProtocolClient,
+    url: String,
+    headers: Vec<(String, String)>,
+    expected_account_id: String,
+    operation_gate: Arc<tokio::sync::Mutex<()>>,
+    poisoned: Arc<AtomicBool>,
+}
+
+// Browser protocol values are pinned to the single JavaScript event loop.
+// Lix's cross-target builders retain a Send output contract so callers do not
+// need target-specific signatures; this is the same wasm-only assertion made
+// by AssumeSendFuture for the futures that use this handle.
+#[cfg(target_family = "wasm")]
+unsafe impl Send for ConnectedAuthority {}
+#[cfg(target_family = "wasm")]
+unsafe impl Sync for ConnectedAuthority {}
+
+impl ConnectedAuthority {
+    async fn open(
+        url: String,
+        headers: Vec<(String, String)>,
+        active_branch_id: String,
+        expected_account_id: &str,
+    ) -> Result<Self, LixError> {
+        let http = crate::sync::authority_http(&headers)?;
+        let client = open_protocol_client(http, url.clone(), Some(active_branch_id)).await?;
+        let account_id = client.active_account_id().await?;
+        if account_id != expected_account_id {
+            let _ = client.close().await;
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync authority protocol session changed the authenticated account",
+            ));
+        }
+        Ok(Self {
+            client,
+            url,
+            headers,
+            expected_account_id: expected_account_id.to_owned(),
+            operation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            poisoned: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    async fn open_session(&self, active_branch_id: String) -> Result<Self, LixError> {
+        Self::open(
+            self.url.clone(),
+            self.headers.clone(),
+            active_branch_id,
+            &self.expected_account_id,
+        )
+        .await
+    }
+
+    async fn open_dedicated_client(
+        &self,
+        active_branch_id: String,
+    ) -> Result<ConnectedProtocolClient, LixError> {
+        Ok(Self::open(
+            self.url.clone(),
+            self.headers.clone(),
+            active_branch_id,
+            &self.expected_account_id,
+        )
+        .await?
+        .client)
+    }
+
+    async fn begin_operation(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, LixError> {
+        let guard = self.operation_gate.lock().await;
+        self.ensure_usable()?;
+        Ok(guard)
+    }
+
+    fn ensure_usable(&self) -> Result<(), LixError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_SESSION_STATE,
+                "connected authority branch selection could not be reconciled; reopen the Lix handle",
+            ));
+        }
+        self.client.ensure_usable()
+    }
+
+    fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+}
+
+/// Serializes one connected-handle operation against authority branch changes
+/// while preserving the ordinary local session lifecycle contract.
+///
+/// The authority gate is always acquired before session state. Keeping that
+/// one order prevents branch switching, HOT reads, and transaction opening
+/// from observing each other's half-completed state.
+struct ConnectedSessionOperation<'a> {
+    _authority_operation: tokio::sync::MutexGuard<'a, ()>,
+    session_operation: Option<SessionOperationGuard>,
+}
+
+impl ConnectedSessionOperation<'_> {
+    fn release_session(&mut self) {
+        drop(self.session_operation.take());
+    }
 }
 
 /// A live query observation bound to the storage session owned by its Lix
@@ -609,7 +795,35 @@ pub struct ObserveEvents<StorageImpl = Memory>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    inner: crate::session::SessionObserveEvents<StorageSession<StorageImpl>>,
+    inner: ObserveEventsInner<StorageImpl>,
+}
+
+enum ObserveEventsInner<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    Local {
+        events: crate::session::SessionObserveEvents<StorageSession<StorageImpl>>,
+        authority_fallback: Option<AuthorityObservationFallback<StorageImpl>>,
+    },
+    Authority {
+        authority: Arc<ConnectedAuthority>,
+        session: Arc<SessionContext<StorageSession<StorageImpl>>>,
+        sql: String,
+        params: Vec<Value>,
+        events: Option<ProtocolObserveEvents<ClientCore<crate::sync::AuthorityHttp>>>,
+        closed: bool,
+    },
+}
+
+struct AuthorityObservationFallback<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    authority: Arc<ConnectedAuthority>,
+    session: Arc<SessionContext<StorageSession<StorageImpl>>>,
+    sql: String,
+    params: Vec<Value>,
 }
 
 impl<StorageImpl> ObserveEvents<StorageImpl>
@@ -619,11 +833,111 @@ where
     pub fn next(
         &mut self,
     ) -> impl Future<Output = Result<Option<ObserveEvent>, LixError>> + Send + '_ {
-        self.inner.next()
+        // SAFETY: browser authority observations remain on the one JavaScript
+        // event loop, while native transports satisfy Send directly. The
+        // wrapper preserves the public cross-target future shape already used
+        // by session-backed observations.
+        unsafe { crate::session::AssumeSendFuture::new(async move {
+            loop {
+                let fallback = match &mut self.inner {
+                    ObserveEventsInner::Local {
+                        events,
+                        authority_fallback,
+                    } => {
+                        let observed_branch_id = if let Some(fallback) = authority_fallback.as_ref() {
+                            fallback.authority.ensure_usable()?;
+                            Some(fallback.session.bound_branch_id()?)
+                        } else {
+                            None
+                        };
+                        let result = events.next().await;
+                        if let (Some(fallback), Some(observed_branch_id)) =
+                            (authority_fallback.as_ref(), observed_branch_id)
+                        {
+                            // Do not hold the authority gate across the idle
+                            // observation wait. Acquire it after evaluation so
+                            // a branch switch must finish before validation;
+                            // discard an event evaluated on the old selector.
+                            let operation = fallback.authority.begin_operation().await?;
+                            fallback.session.ensure_observe_registration_allowed()?;
+                            let current_branch_id = fallback.session.bound_branch_id()?;
+                            drop(operation);
+                            if current_branch_id != observed_branch_id {
+                                continue;
+                            }
+                        }
+                        match result {
+                            Err(error)
+                                if connected_hot_read_needs_authority(&error) =>
+                            {
+                                events.close();
+                                authority_fallback.take().ok_or(error)?
+                            }
+                            result => return result,
+                        }
+                    }
+                    ObserveEventsInner::Authority {
+                        authority,
+                        session,
+                        sql,
+                        params,
+                        events,
+                        closed,
+                    } => {
+                        if *closed {
+                            return Ok(None);
+                        }
+                        // Do not retain a session operation while waiting on a
+                        // potentially idle remote stream: close must be able to
+                        // reach `authority.client.close()` and cancel it. The
+                        // registration/state check still gives transactions
+                        // the same deterministic rejection as local observe.
+                        if events.is_none() {
+                            let _operation = authority.begin_operation().await?;
+                            session.ensure_observe_registration_allowed()?;
+                            *events = Some(authority.client.observe(sql, params.clone()).await?);
+                        }
+                        let observed_branch_id = session.bound_branch_id()?;
+                        let result = events.as_ref().expect("initialized events").next().await;
+                        // A switch or terminal authority failure can happen
+                        // while the stream is idle. Revalidate after the await
+                        // without blocking the switch itself.
+                        let operation = authority.begin_operation().await?;
+                        session.ensure_observe_registration_allowed()?;
+                        let current_branch_id = session.bound_branch_id()?;
+                        drop(operation);
+                        if current_branch_id != observed_branch_id {
+                            if let Some(events) = events {
+                                events.close();
+                            }
+                            *events = None;
+                            continue;
+                        }
+                        return result;
+                    }
+                };
+                self.inner = ObserveEventsInner::Authority {
+                    authority: fallback.authority,
+                    session: fallback.session,
+                    sql: fallback.sql,
+                    params: fallback.params,
+                    events: None,
+                    closed: false,
+                };
+            }
+        }) }
     }
 
     pub fn close(&mut self) {
-        self.inner.close();
+        match &mut self.inner {
+            ObserveEventsInner::Local { events, .. } => events.close(),
+            ObserveEventsInner::Authority { events, closed, .. } => {
+                *closed = true;
+                if let Some(events) = events {
+                    events.close();
+                }
+            }
+        }
     }
 }
 
@@ -737,6 +1051,7 @@ where
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
         sync_lease: None,
         sync_demand_tx: None,
+        connected_authority: None,
         open_report: Arc::new(open_report),
     };
     if let Some(server) = server {
@@ -751,6 +1066,15 @@ where
                     crate::sync::activate_sync_mode(&mut lix, &server, initial_transport).await?;
                 lix.sync_demand_tx = Some(runtime.demand_tx.clone());
                 lix.sync_lease = Some(SyncSessionLease::root(runtime));
+                lix.connected_authority = Some(Arc::new(
+                    ConnectedAuthority::open(
+                        server.url.clone(),
+                        server.headers.clone(),
+                        lix.active_branch_id().await?,
+                        lix.active_account_id(),
+                    )
+                    .await?,
+                ));
             }
         }
     }
@@ -805,7 +1129,13 @@ where
     /// Configures a deterministic, stream-first snapshot export.
     pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<StorageImpl> {
         let export = crate::snapshot::SnapshotExportBuilder::new(self.engine.storage());
-        if self.engine.sync_mode().role() == crate::sync::SyncRole::Replica {
+        if let Some(authority) = &self.connected_authority {
+            export.from_connected_authority(
+                authority.client.http().clone(),
+                authority.client.join_path("snapshot"),
+                authority.client.session_id(),
+            )
+        } else if self.engine.sync_mode().role() == crate::sync::SyncRole::Replica {
             export.reject_connected_replica()
         } else {
             export
@@ -843,6 +1173,7 @@ where
             primary_switch_gate: None,
             sync_lease: None,
             sync_demand_tx: None,
+            connected_authority: None,
             open_report: Arc::new(OpenReport {
                 format: crate::init::CURRENT_FORMAT_VERSION,
                 initialized: false,
@@ -870,6 +1201,119 @@ where
                 result => return result,
             }
         }
+    }
+
+    async fn execute_on_authority(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: &ExecuteOptions,
+        route: crate::sql2::StatementAuthorityRoute,
+    ) -> Result<ExecuteResult, LixError> {
+        let authority = self
+            .connected_authority
+            .as_ref()
+            .ok_or_else(|| crate::sync::authority_execution_required(route))?;
+        authority.ensure_usable()?;
+        let result = authority
+            .client
+            .execute(sql, params, Some(protocol_execute_options(options, None)))
+            .await?;
+        self.publish_authority_result(route).await?;
+        Ok(result)
+    }
+
+    async fn execute_batch_on_authority(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: &ExecuteOptions,
+        route: crate::sql2::StatementAuthorityRoute,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        let authority = self
+            .connected_authority
+            .as_ref()
+            .ok_or_else(|| crate::sync::authority_execution_required(route))?;
+        authority.ensure_usable()?;
+        let result = authority
+            .client
+            .execute_batch(statements, Some(protocol_execute_options(options, None)))
+            .await?;
+        self.publish_authority_result(route).await?;
+        Ok(result)
+    }
+
+    /// A classified HOT read normally never reaches the network. The sole
+    /// fallback is the engine's automatic branch-base refresh: the sparse
+    /// replica cannot author that refresh, so let the authority perform the
+    /// read/refresh and then install its publication before returning. This
+    /// keeps the common path zero-RTT without leaking an internal routing
+    /// error on the rare stale-base path.
+    async fn execute_hot_read_fallback(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: &ExecuteOptions,
+        idempotency_key: Option<String>,
+    ) -> Result<ExecuteResult, LixError> {
+        let authority = self.connected_authority.as_ref().ok_or_else(|| {
+            crate::sync::authority_execution_required(
+                crate::sql2::StatementAuthorityRoute::AuthorityRead,
+            )
+        })?;
+        authority.ensure_usable()?;
+        let result = authority
+            .client
+            .execute(
+                sql,
+                params,
+                Some(protocol_execute_options(options, idempotency_key)),
+            )
+            .await?;
+        self.fence_connected_hot_state().await?;
+        Ok(result)
+    }
+
+    async fn execute_hot_batch_fallback(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: &ExecuteOptions,
+        idempotency_key: Option<String>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        let authority = self.connected_authority.as_ref().ok_or_else(|| {
+            crate::sync::authority_execution_required(
+                crate::sql2::StatementAuthorityRoute::AuthorityRead,
+            )
+        })?;
+        authority.ensure_usable()?;
+        let result = authority
+            .client
+            .execute_batch(
+                statements,
+                Some(protocol_execute_options(options, idempotency_key)),
+            )
+            .await?;
+        self.fence_connected_hot_state().await?;
+        Ok(result)
+    }
+
+    async fn fence_connected_hot_state(&self) -> Result<(), LixError> {
+        let demand_tx = self.sync_demand_tx.as_ref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "connected authority operation has no certified publication worker",
+            )
+        })?;
+        crate::sync::fence_hot_state(demand_tx).await
+    }
+
+    async fn publish_authority_result(
+        &self,
+        route: crate::sql2::StatementAuthorityRoute,
+    ) -> Result<(), LixError> {
+        if route != crate::sql2::StatementAuthorityRoute::AuthorityWrite {
+            return Ok(());
+        }
+        self.fence_connected_hot_state().await
     }
 
     #[cfg(feature = "storage-benches")]
@@ -941,15 +1385,26 @@ where
                 "cannot open another session from a closed Lix handle",
             ));
         }
+        let _connected_operation = self.begin_connected_session_operation().await?;
         let active_branch_id = match branch_id {
             Some(branch_id) => branch_id,
-            None => self.active_branch_id().await?,
+            None => Arc::clone(&self.session).active_branch_id_owned().await?,
         };
         let active_account_id = account_id.unwrap_or_else(|| self.active_account_id().to_owned());
+        if self.connected_authority.is_some() && active_account_id != self.active_account_id() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "connected sessions cannot override the authority-authenticated account",
+            ));
+        }
         let mut opened = self
-            .open_internal_session(active_branch_id, active_account_id)
+            .open_internal_session(active_branch_id.clone(), active_account_id)
             .await?;
         opened.sync_lease = self.sync_lease.as_ref().map(|lease| lease.child());
+        if let Some(authority) = &self.connected_authority {
+            opened.connected_authority =
+                Some(Arc::new(authority.open_session(active_branch_id).await?));
+        }
         Ok(opened)
     }
 
@@ -987,6 +1442,7 @@ where
             primary_switch_gate: None,
             sync_lease: None,
             sync_demand_tx: self.sync_demand_tx.clone(),
+            connected_authority: self.connected_authority.clone(),
             open_report: Arc::clone(&self.open_report),
         })
     }
@@ -1096,11 +1552,12 @@ where
         path: impl Into<String>,
         range: Option<std::ops::Range<u64>>,
     ) -> Result<Option<lix::FileRead>, LixError> {
-        self.fence_hot_state(crate::sql2::StatementAuthorityRoute::HotRead)
-            .await?;
         let path = path.into();
-        self.retry_sync_demands(|| self.session.read_file_content(path.clone(), range.clone()))
-            .await
+        let _authority_operation = self.begin_connected_authority_operation().await?;
+        self.retry_connected_hot_read(crate::sql2::StatementAuthorityRoute::HotRead, || {
+            self.retry_sync_demands(|| self.session.read_file_content(path.clone(), range.clone()))
+        })
+        .await
     }
 
     pub(crate) fn execute_with_idempotency_and_options_and_metadata(
@@ -1118,18 +1575,60 @@ where
         unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.session.statement_authority_route(&sql)?;
+                let _authority_operation = self.begin_connected_authority_operation().await?;
+                if route != crate::sql2::StatementAuthorityRoute::HotRead
+                    && self.connected_authority.is_some()
+                {
+                    let _session_operation =
+                        self.session.begin_waitable_session_operation().await?;
+                    let authority = self
+                        .connected_authority
+                        .as_ref()
+                        .expect("checked authority");
+                    let result = authority
+                        .client
+                        .execute(
+                            &sql,
+                            &params,
+                            Some(protocol_execute_options(
+                                &options,
+                                idempotency.as_ref().map(|value| value.key().to_owned()),
+                            )),
+                        )
+                        .await?;
+                    self.publish_authority_result(route).await?;
+                    return Ok(result);
+                }
                 self.require_authority_execution(route)?;
-                self.fence_hot_state(route).await?;
-                self.retry_sync_demands(|| {
-                    Arc::clone(&self.session).execute_with_idempotency_and_options_and_metadata(
-                        sql.clone(),
-                        params.clone(),
-                        options.clone(),
-                        metadata.clone(),
-                        idempotency.clone(),
-                    )
+                let local = self.retry_connected_hot_read(route, || {
+                    self.retry_sync_demands(|| {
+                        Arc::clone(&self.session).execute_with_idempotency_and_options_and_metadata(
+                            sql.clone(),
+                            params.clone(),
+                            options.clone(),
+                            metadata.clone(),
+                            idempotency.clone(),
+                        )
+                    })
                 })
-                .await
+                .await;
+                match local {
+                    Err(error)
+                        if connected_hot_read_needs_authority(&error)
+                            && self.connected_authority.is_some() =>
+                    {
+                        let _session_operation =
+                            self.session.begin_waitable_session_operation().await?;
+                        self.execute_hot_read_fallback(
+                            &sql,
+                            &params,
+                            &options,
+                            idempotency.as_ref().map(|value| value.key().to_owned()),
+                        )
+                        .await
+                    }
+                    result => result,
+                }
             })
         }
     }
@@ -1158,10 +1657,12 @@ where
         &self,
         statements: &[(&str, &[Value])],
     ) -> impl Future<Output = Result<CoherentReadBatch, LixError>> + Send + 'static {
-        let statements = statements
-            .iter()
-            .map(|(sql, params)| ((*sql).to_owned(), (*params).to_vec()))
-            .collect::<Vec<_>>();
+        let statements = Arc::new(
+            statements
+                .iter()
+                .map(|(sql, params)| ((*sql).to_owned(), (*params).to_vec()))
+                .collect::<Vec<_>>(),
+        );
         let routed = statements
             .iter()
             .map(|(sql, params)| ExecuteBatchStatement {
@@ -1170,29 +1671,131 @@ where
                 label: None,
             })
             .collect::<Vec<_>>();
-        let authority = self
-            .session
-            .batch_authority_route(&routed)
-            .and_then(|route| {
-                self.require_authority_execution(route)?;
-                Ok(route)
-            });
-        let demand_tx = self.sync_demand_tx.clone();
+        let authority = self.session.batch_authority_route(&routed);
         let is_replica = self.engine.sync_mode().role() == crate::sync::SyncRole::Replica;
         let session = Arc::clone(&self.session);
-        async move {
+        let connected_authority = self.connected_authority.clone();
+        let demand_tx = self.sync_demand_tx.clone();
+        // SAFETY: browser authority requests and the local storage session are
+        // pinned to the one JavaScript event loop. The wrapper preserves the
+        // cross-target Send shape already used by the public execute builders.
+        unsafe { crate::session::AssumeSendFuture::new(async move {
             let route = authority?;
+            let authority_operation = if let Some(connected) = connected_authority.as_ref() {
+                Some(connected.begin_operation().await?)
+            } else {
+                None
+            };
             if is_replica && route == crate::sql2::StatementAuthorityRoute::HotRead {
-                let demand_tx = demand_tx.as_ref().ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "sync replica has no publication fence worker",
-                    )
-                })?;
-                crate::sync::fence_hot_state(demand_tx).await?;
+                connected_authority
+                    .as_ref()
+                    .expect("connected replica has an authority client")
+                    .ensure_usable()?;
+                let local = retry_expired_read(|| {
+                    Arc::clone(&session).execute_coherent_read_batch_owned(Arc::clone(&statements))
+                })
+                .await;
+                match local {
+                    Ok(result) => return Ok(result),
+                    Err(error)
+                        if !connected_hot_read_needs_authority(&error)
+                            && error.code != LixError::CODE_STORAGE_READ_EXPIRED =>
+                    {
+                        return Err(error);
+                    }
+                    Err(_) => {}
+                }
+            } else if !is_replica {
+                return session.execute_coherent_read_batch_owned(statements).await;
             }
-            session.execute_coherent_read_batch_owned(statements).await
-        }
+
+            let connected = connected_authority
+                .as_ref()
+                .ok_or_else(|| crate::sync::authority_execution_required(route))?;
+            let session_operation = session.begin_waitable_session_operation().await?;
+            // These guards retain the authority gate across the
+            // local attempt, fallback, publication fence, and final serving
+            // decision. A branch switch therefore cannot splice two branches
+            // into one coherent read.
+            let _authority_operation = authority_operation;
+            let mut authority_routed = routed.clone();
+            authority_routed.push(ExecuteBatchStatement {
+                sql: "SELECT lix_active_branch_id() AS branch_id, \
+                      lix_active_branch_commit_id() AS commit_id"
+                    .to_owned(),
+                params: Vec::new(),
+                label: Some("__lix_coherent_metadata".to_owned()),
+            });
+            let mut authority_results = connected
+                .client
+                .execute_batch(&authority_routed, None)
+                .await?;
+            let metadata = authority_results.pop().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "authority coherent read omitted snapshot metadata",
+                )
+            })?;
+            if authority_results.len() != routed.len() || metadata.rows().len() != 1 {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "authority coherent read returned an invalid result shape",
+                ));
+            }
+            let authority_batch = CoherentReadBatch {
+                active_branch_id: metadata.rows()[0].get::<String>("branch_id")?,
+                active_branch_commit_id: metadata.rows()[0].get::<String>("commit_id")?,
+                // The authority cannot name this replica adapter's physical
+                // revision. `None` deliberately disables revision-based skip
+                // optimizations for the fail-safe result.
+                storage_mutation_revision: None,
+                results: authority_results,
+            };
+            crate::sync::fence_hot_state(demand_tx.as_ref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "connected coherent read has no certified publication worker",
+                )
+            })?)
+            .await?;
+            if route != crate::sql2::StatementAuthorityRoute::HotRead {
+                // History and other cold surfaces are deliberately not a
+                // certified local serving contract. Their authority batch is
+                // already coherent; do not turn a valid server-first read into
+                // a sparse-history demand by attempting it locally.
+                return Ok(authority_batch);
+            }
+            // The final HOT rerun owns its own session lifecycle and may need
+            // stale-base write access. Keep only the authority gate here.
+            drop(session_operation);
+            // The authority result and a later local metadata read are not one
+            // snapshot: another authority commit can land between them. Once
+            // the fallback has refreshed and fenced the serving plane, rerun
+            // the complete batch locally so rows and revision metadata are
+            // captured by the same certified storage read.
+            let local = retry_expired_read(|| {
+                Arc::clone(&session)
+                    .execute_coherent_read_batch_owned(Arc::clone(&statements))
+            })
+            .await;
+            match local {
+                Ok(local) => Ok(local),
+                Err(error)
+                    if error.code == LixError::CODE_STORAGE_READ_EXPIRED
+                        || connected_hot_read_needs_authority(&error) =>
+                {
+                    // The retained rows and branch/head were read in one
+                    // authority transaction at coordinate C. The publication
+                    // fence may legitimately advance the local cache to a
+                    // later D; that does not make C incoherent or unauthoritative.
+                    // Returning C is safer than splicing its rows with D's
+                    // local metadata, and avoids starvation when another OPFS
+                    // context continuously expires local snapshots.
+                    Ok(authority_batch)
+                }
+                Err(error) => Err(error),
+            }
+        }) }
     }
 
     /// Classifies an atomic SQL batch for a caller that owns its transport
@@ -1217,18 +1820,58 @@ where
         unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.session.batch_authority_route(&statements)?;
-                self.require_authority_execution(route)?;
-                self.fence_hot_state(route).await?;
-                self.retry_sync_demands(|| {
-                    Arc::clone(&self.session)
-                        .execute_batch_with_idempotency_and_options_and_metadata(
-                            statements.clone(),
-                            options.clone(),
-                            statement_metadata.clone(),
-                            idempotency.clone(),
+                let _authority_operation = self.begin_connected_authority_operation().await?;
+                if route != crate::sql2::StatementAuthorityRoute::HotRead
+                    && self.connected_authority.is_some()
+                {
+                    let _session_operation =
+                        self.session.begin_waitable_session_operation().await?;
+                    let authority = self
+                        .connected_authority
+                        .as_ref()
+                        .expect("checked authority");
+                    let result = authority
+                        .client
+                        .execute_batch(
+                            &statements,
+                            Some(protocol_execute_options(
+                                &options,
+                                idempotency.as_ref().map(|value| value.key().to_owned()),
+                            )),
                         )
+                        .await?;
+                    self.publish_authority_result(route).await?;
+                    return Ok(result);
+                }
+                self.require_authority_execution(route)?;
+                let local = self.retry_connected_hot_read(route, || {
+                    self.retry_sync_demands(|| {
+                        Arc::clone(&self.session)
+                            .execute_batch_with_idempotency_and_options_and_metadata(
+                                statements.clone(),
+                                options.clone(),
+                                statement_metadata.clone(),
+                                idempotency.clone(),
+                            )
+                    })
                 })
-                .await
+                .await;
+                match local {
+                    Err(error)
+                        if connected_hot_read_needs_authority(&error)
+                            && self.connected_authority.is_some() =>
+                    {
+                        let _session_operation =
+                            self.session.begin_waitable_session_operation().await?;
+                        self.execute_hot_batch_fallback(
+                            &statements,
+                            &options,
+                            idempotency.as_ref().map(|value| value.key().to_owned()),
+                        )
+                        .await
+                    }
+                    result => result,
+                }
             })
         }
     }
@@ -1247,30 +1890,90 @@ where
         params: &[Value],
     ) -> Result<ObserveEvents<StorageImpl>, LixError> {
         let route = self.session.statement_authority_route(sql)?;
-        self.require_authority_execution(route)?;
-        if self.engine.sync_mode().role() == crate::sync::SyncRole::Replica {
-            return Err(crate::sync::authority_execution_required(
-                crate::sql2::StatementAuthorityRoute::AuthorityRead,
-            ));
+        if let Some(authority) = &self.connected_authority {
+            authority.ensure_usable()?;
+            self.session.ensure_observe_registration_allowed()?;
         }
+        if route != crate::sql2::StatementAuthorityRoute::HotRead
+            && let Some(authority) = &self.connected_authority
+        {
+            return Ok(ObserveEvents {
+                inner: ObserveEventsInner::Authority {
+                    authority: Arc::clone(authority),
+                    session: Arc::clone(&self.session),
+                    sql: sql.to_owned(),
+                    params: params.to_vec(),
+                    events: None,
+                    closed: false,
+                },
+            });
+        }
+        self.require_authority_execution(route)?;
         self.session
             .observe(sql, params)
             .map(|events| ObserveEvents {
-                inner: events.with_sync_demand_sender(self.sync_demand_tx.clone()),
+                inner: ObserveEventsInner::Local {
+                    events: events.with_sync_demand_sender(self.sync_demand_tx.clone()),
+                    authority_fallback: self.connected_authority.as_ref().map(|authority| {
+                        AuthorityObservationFallback {
+                            authority: Arc::clone(authority),
+                            session: Arc::clone(&self.session),
+                            sql: sql.to_owned(),
+                            params: params.to_vec(),
+                        }
+                    }),
+                },
             })
     }
 
     pub async fn begin_transaction(&self) -> Result<LixTransaction<StorageImpl>, LixError> {
-        self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
+        if let Some(authority) = &self.connected_authority {
+            let _operation = authority.begin_operation().await?;
+            let demand_tx = self.sync_demand_tx.clone().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "connected authority transaction has no publication worker",
+                )
+            })?;
+            let (active_branch_id, session_state) =
+                self.session.begin_connected_transaction_state()?;
+            let client = authority
+                .open_dedicated_client(active_branch_id)
+                .await?;
+            let transaction = match client.begin_transaction().await {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    let _ = client.close().await;
+                    return Err(error);
+                }
+            };
+            return Ok(LixTransaction {
+                inner: LixTransactionInner::Authority {
+                    transaction: Some(transaction),
+                    client: Some(client),
+                    demand_tx,
+                    session_state: Some(session_state),
+                },
+            });
+        }
         Ok(LixTransaction {
-            inner: self.session.begin_transaction().await?,
+            inner: LixTransactionInner::Local(Some(self.session.begin_transaction().await?)),
         })
     }
 
     pub fn active_branch_id(
         &self,
     ) -> impl Future<Output = Result<String, LixError>> + Send + 'static {
-        Arc::clone(&self.session).active_branch_id_owned()
+        let session = Arc::clone(&self.session);
+        let connected_authority = self.connected_authority.clone();
+        async move {
+            let _authority_operation = if let Some(authority) = connected_authority.as_ref() {
+                Some(authority.begin_operation().await?)
+            } else {
+                None
+            };
+            session.active_branch_id_owned().await
+        }
     }
 
     pub fn active_account_id(&self) -> &str {
@@ -1319,6 +2022,13 @@ where
         &self,
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
+        if let Some(authority) = &self.connected_authority {
+            let _connected_operation = self.begin_connected_session_operation().await?;
+            let receipt = authority.client.create_branch(options).await?;
+            self.publish_authority_result(crate::sql2::StatementAuthorityRoute::AuthorityWrite)
+                .await?;
+            return Ok(receipt);
+        }
         self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.retry_sync_demands(|| self.session.create_branch(options.clone()))
             .await
@@ -1335,12 +2045,26 @@ where
 
     /// Reverses the latest undoable tracked commit on this handle's active branch.
     pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
+        if let Some(authority) = &self.connected_authority {
+            let _connected_operation = self.begin_connected_session_operation().await?;
+            let receipt = authority.client.undo().await?;
+            self.publish_authority_result(crate::sql2::StatementAuthorityRoute::AuthorityWrite)
+                .await?;
+            return Ok(receipt);
+        }
         self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.retry_sync_demands(|| self.session.undo()).await
     }
 
     /// Replays the latest tracked commit abandoned by undo on this handle's active branch.
     pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
+        if let Some(authority) = &self.connected_authority {
+            let _connected_operation = self.begin_connected_session_operation().await?;
+            let receipt = authority.client.redo().await?;
+            self.publish_authority_result(crate::sql2::StatementAuthorityRoute::AuthorityWrite)
+                .await?;
+            return Ok(receipt);
+        }
         self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.retry_sync_demands(|| self.session.redo()).await
     }
@@ -1358,6 +2082,66 @@ where
                     Some(gate) => Some(gate.lock().await),
                     None => None,
                 };
+                if let Some(authority) = &self.connected_authority {
+                    let mut connected_operation = self
+                        .begin_connected_session_operation()
+                        .await?
+                        .expect("connected authority has a connected operation guard");
+                    let previous_branch_id =
+                        Arc::clone(&self.session).active_branch_id_owned().await?;
+                    let receipt = match authority
+                        .client
+                        .switch_branch_and_restart(&options.branch_id)
+                        .await
+                    {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            return Err(self
+                                .recover_connected_authority_branch(
+                                authority,
+                                &previous_branch_id,
+                                error,
+                            )
+                                .await);
+                        }
+                    };
+                    // Branch refs are repository events. Install any outstanding
+                    // authority publication before moving the local selector.
+                    let demand_tx = self.sync_demand_tx.as_ref().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "connected branch switch has no publication worker",
+                        )
+                    })?;
+                    if let Err(error) = crate::sync::fence_hot_state(demand_tx).await {
+                        return Err(self
+                            .recover_connected_authority_branch(
+                                authority,
+                                &previous_branch_id,
+                                error,
+                            )
+                            .await);
+                    }
+                    // Local branch switching needs exclusive session write
+                    // access, so release only the outer read/operation state.
+                    // Retain the authority gate: concurrent HOT reads and
+                    // transactions cannot enter the remote-B/local-A window.
+                    connected_operation.release_session();
+                    if let Err(error) = self
+                        .session
+                        .switch_branch_to_certified_head(options)
+                        .await
+                    {
+                        return Err(self
+                            .recover_connected_authority_branch(
+                                authority,
+                                &previous_branch_id,
+                                error,
+                            )
+                            .await);
+                    }
+                    return Ok(receipt);
+                }
                 self.session.switch_branch(options).await
             })
         }
@@ -1367,6 +2151,15 @@ where
         &self,
         options: MergeBranchOptions,
     ) -> Result<MergeBranchReceipt, LixError> {
+        if let Some(authority) = &self.connected_authority {
+            let _connected_operation = self.begin_connected_session_operation().await?;
+            let receipt = authority.client.merge_branch(options).await?;
+            self.publish_authority_result(
+                crate::sql2::StatementAuthorityRoute::AuthorityWrite,
+            )
+            .await?;
+            return Ok(receipt);
+        }
         self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityWrite)?;
         self.retry_sync_demands(|| self.session.merge_branch(options.clone()))
             .await
@@ -1376,9 +2169,46 @@ where
         &self,
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
+        if let Some(authority) = &self.connected_authority {
+            let _connected_operation = self.begin_connected_session_operation().await?;
+            return authority.client.merge_branch_preview(options).await;
+        }
         self.require_authority_execution(crate::sql2::StatementAuthorityRoute::AuthorityRead)?;
         self.retry_sync_demands(|| self.session.merge_branch_preview(options.clone()))
             .await
+    }
+
+    async fn recover_connected_authority_branch(
+        &self,
+        authority: &ConnectedAuthority,
+        previous_branch_id: &str,
+        operation_error: LixError,
+    ) -> LixError {
+        match authority
+            .client
+            .switch_branch_and_restart(previous_branch_id)
+            .await
+        {
+            Ok(_) => operation_error,
+            Err(recovery_error) => {
+                authority.poison();
+                LixError::new(
+                    LixError::CODE_INVALID_SESSION_STATE,
+                    "connected authority branch selection could not be reconciled; reopen the Lix handle",
+                )
+                .with_details(serde_json::json!({
+                    "operationError": {
+                        "code": operation_error.code,
+                        "message": operation_error.message,
+                    },
+                    "recoveryError": {
+                        "code": recovery_error.code,
+                        "message": recovery_error.message,
+                    },
+                    "expectedBranchId": previous_branch_id,
+                }))
+            }
+        }
     }
 
     fn require_authority_execution(
@@ -1393,30 +2223,72 @@ where
         Ok(())
     }
 
-    async fn fence_hot_state(
+    async fn begin_connected_session_operation(
+        &self,
+    ) -> Result<Option<ConnectedSessionOperation<'_>>, LixError> {
+        let Some(authority) = &self.connected_authority else {
+            return Ok(None);
+        };
+        let authority_operation = authority.begin_operation().await?;
+        let session_operation = self.session.begin_waitable_session_operation().await?;
+        Ok(Some(ConnectedSessionOperation {
+            _authority_operation: authority_operation,
+            session_operation: Some(session_operation),
+        }))
+    }
+
+    async fn begin_connected_authority_operation(
+        &self,
+    ) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>, LixError> {
+        match &self.connected_authority {
+            Some(authority) => Ok(Some(authority.begin_operation().await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Restarts the complete local serving attempt when a certified replica
+    /// publication races its storage snapshot. Session reads already retry
+    /// individual coherent scopes; this outer boundary covers expiry between
+    /// sync-demand hydration and the final HOT read. Only classified reads on
+    /// connected replicas enter it, so retrying cannot duplicate a mutation.
+    async fn retry_connected_hot_read<T, Operation, OperationFuture>(
         &self,
         route: crate::sql2::StatementAuthorityRoute,
-    ) -> Result<(), LixError> {
-        if route != crate::sql2::StatementAuthorityRoute::HotRead
-            || self.engine.sync_mode().role() != crate::sync::SyncRole::Replica
+        mut operation: Operation,
+    ) -> Result<T, LixError>
+    where
+        Operation: FnMut() -> OperationFuture,
+        OperationFuture: Future<Output = Result<T, LixError>>,
+    {
+        if route == crate::sql2::StatementAuthorityRoute::HotRead
+            && self.engine.sync_mode().role() == crate::sync::SyncRole::Replica
         {
-            return Ok(());
+            if let Some(authority) = &self.connected_authority {
+                authority.ensure_usable()?;
+            }
+            retry_expired_read(operation).await
+        } else {
+            operation().await
         }
-        let demand_tx = self.sync_demand_tx.as_ref().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "sync replica has no publication fence worker",
-            )
-        })?;
-        crate::sync::fence_hot_state(demand_tx).await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
+        // Preserve the ordinary session contract before mutating any remote
+        // lifecycle. In particular, an active connected transaction must make
+        // close fail without closing the shared authority client underneath
+        // the still-live handle.
         self.session.close().await?;
+        let authority_result = match &self.connected_authority {
+            Some(authority) => {
+                let _operation = authority.operation_gate.lock().await;
+                authority.client.close().await
+            }
+            None => Ok(()),
+        };
         if let Some(lease) = &self.sync_lease {
             lease.release().await?;
         }
-        Ok(())
+        authority_result
     }
     pub(crate) fn set_sync_role(&self, role: crate::sync::SyncRole) -> Result<(), LixError> {
         self.engine.sync_mode().set_role(role);
@@ -1514,7 +2386,20 @@ pub struct LixTransaction<StorageImpl = Memory>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    inner: lix::SessionTransaction<StorageSession<StorageImpl>>,
+    inner: LixTransactionInner<StorageImpl>,
+}
+
+enum LixTransactionInner<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    Local(Option<lix::SessionTransaction<StorageSession<StorageImpl>>>),
+    Authority {
+        transaction: Option<ProtocolTransaction<crate::sync::AuthorityHttp>>,
+        client: Option<ConnectedProtocolClient>,
+        demand_tx: tokio::sync::mpsc::Sender<crate::sync::SyncDemand>,
+        session_state: Option<ConnectedTransactionStateLease>,
+    },
 }
 
 /// Configures one SQL statement inside an explicit transaction.
@@ -1548,12 +2433,32 @@ where
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            self.transaction
-                .inner
-                .execute_with_options(self.sql.to_owned(), self.params.to_vec(), self.options)
-                .await
-        })
+        Box::pin(unsafe { crate::session::AssumeSendFuture::new(async move {
+            match &mut self.transaction.inner {
+                LixTransactionInner::Local(transaction) => {
+                    transaction
+                        .as_mut()
+                        .ok_or_else(closed_transaction_error)?
+                        .execute_with_options(
+                            self.sql.to_owned(),
+                            self.params.to_vec(),
+                            self.options,
+                        )
+                        .await
+                }
+                LixTransactionInner::Authority { transaction, .. } => {
+                    transaction
+                        .as_ref()
+                        .ok_or_else(closed_transaction_error)?
+                        .execute(
+                            self.sql,
+                            self.params,
+                            Some(protocol_execute_options(&self.options, None)),
+                        )
+                        .await
+                }
+            }
+        }) })
     }
 }
 
@@ -1588,7 +2493,28 @@ where
         params: Vec<Value>,
         options: ExecuteOptions,
     ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + '_ {
-        self.inner.execute_with_options(sql, params, options)
+        unsafe { crate::session::AssumeSendFuture::new(async move {
+            match &mut self.inner {
+                LixTransactionInner::Local(transaction) => {
+                    transaction
+                        .as_mut()
+                        .ok_or_else(closed_transaction_error)?
+                        .execute_with_options(sql, params, options)
+                        .await
+                }
+                LixTransactionInner::Authority { transaction, .. } => {
+                    transaction
+                        .as_ref()
+                        .ok_or_else(closed_transaction_error)?
+                        .execute(
+                            &sql,
+                            &params,
+                            Some(protocol_execute_options(&options, None)),
+                        )
+                        .await
+                }
+            }
+        }) }
     }
 
     #[cfg(test)]
@@ -1596,15 +2522,124 @@ where
         &mut self,
         row: TransactionWriteRow,
     ) -> Result<(), LixError> {
-        self.inner.stage_test_row(row).await
+        match &mut self.inner {
+            LixTransactionInner::Local(transaction) => transaction
+                .as_mut()
+                .ok_or_else(closed_transaction_error)?
+                .stage_test_row(row)
+                .await,
+            LixTransactionInner::Authority { .. } => Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "test rows cannot be staged directly on a connected authority transaction",
+            )),
+        }
     }
 
-    pub async fn commit(self) -> Result<(), LixError> {
-        self.inner.commit().await
+    pub async fn commit(mut self) -> Result<(), LixError> {
+        match &mut self.inner {
+            LixTransactionInner::Local(transaction) => transaction
+                .take()
+                .ok_or_else(closed_transaction_error)?
+                .commit()
+                .await,
+            LixTransactionInner::Authority {
+                transaction,
+                client,
+                demand_tx,
+                session_state,
+            } => {
+                let transaction = transaction.take().ok_or_else(closed_transaction_error)?;
+                let commit_lease = session_state
+                    .as_ref()
+                    .ok_or_else(closed_transaction_error)?
+                    .begin_commit()?;
+                let commit_result = transaction.commit().await;
+                let publication_result = match &commit_result {
+                    Ok(()) => crate::sync::fence_hot_state(demand_tx).await,
+                    Err(_) => Ok(()),
+                };
+                let close_result = match client.take() {
+                    Some(client) => client.close().await,
+                    None => Ok(()),
+                };
+                commit_lease.release();
+                if let Some(session_state) = session_state.take() {
+                    session_state.release();
+                }
+                commit_result?;
+                publication_result?;
+                close_result
+            }
+        }
     }
 
-    pub async fn rollback(self) -> Result<(), LixError> {
-        self.inner.rollback().await
+    pub async fn rollback(mut self) -> Result<(), LixError> {
+        match &mut self.inner {
+            LixTransactionInner::Local(transaction) => transaction
+                .take()
+                .ok_or_else(closed_transaction_error)?
+                .rollback()
+                .await,
+            LixTransactionInner::Authority {
+                transaction,
+                client,
+                session_state,
+                ..
+            } => {
+                let transaction = transaction.take().ok_or_else(closed_transaction_error)?;
+                let rollback_result = transaction.rollback().await;
+                let close_result = match client.take() {
+                    Some(client) => client.close().await,
+                    None => Ok(()),
+                };
+                if let Some(session_state) = session_state.take() {
+                    session_state.release();
+                }
+                rollback_result?;
+                close_result
+            }
+        }
+    }
+}
+
+fn closed_transaction_error() -> LixError {
+    LixError::new(
+        LixError::CODE_INVALID_SESSION_STATE,
+        "Lix transaction is closed",
+    )
+}
+
+impl<StorageImpl> Drop for LixTransaction<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        let LixTransactionInner::Authority { client, .. } = &mut self.inner else {
+            return;
+        };
+        let Some(client) = client.take() else {
+            return;
+        };
+        let http = client.http().clone();
+        crate::authority_client::ProtocolHttp::spawn(
+            &http,
+            Box::pin(async move {
+                // Closing the dedicated protocol session rolls back any active
+                // transaction on the authority. It cannot affect the shared
+                // connected handle's serving session.
+                let _ = client.close().await;
+            }),
+        );
+    }
+}
+
+fn protocol_execute_options(
+    options: &ExecuteOptions,
+    idempotency_key: Option<String>,
+) -> ProtocolExecuteOptions {
+    ProtocolExecuteOptions {
+        origin_key: options.origin_key.clone(),
+        idempotency_key,
     }
 }
 
@@ -1735,7 +2770,7 @@ mod tests {
         let result = open_lix()
             .with_storage(storage.clone())
             .with_server(ServerOptions::sync("https://example.test/not-a-lix"))
-        .await;
+            .await;
         let Err(error) = result else {
             panic!("invalid sync locator must fail");
         };
@@ -1960,6 +2995,54 @@ mod tests {
         assert_eq!(result, "hydrated");
         assert_eq!(attempts.load(Ordering::Relaxed), 4);
         responder.await.expect("demand responder should finish");
+    }
+
+    #[tokio::test]
+    async fn connected_hot_read_restarts_after_publication_snapshot_expiry() {
+        let lix = open_lix().await.expect("open Lix");
+        lix.set_sync_role(crate::sync::SyncRole::Replica)
+            .expect("mark handle as a connected replica");
+        let attempts = AtomicUsize::new(0);
+
+        let result = lix
+            .retry_connected_hot_read(crate::sql2::StatementAuthorityRoute::HotRead, || {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(if attempt == 0 {
+                    Err(LixError::new(
+                        LixError::CODE_STORAGE_READ_EXPIRED,
+                        "authority publication invalidated the serving snapshot",
+                    ))
+                } else {
+                    Ok("certified")
+                })
+            })
+            .await
+            .expect("connected HOT reads should transparently restart");
+
+        assert_eq!(result, "certified");
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn connected_non_hot_operation_is_never_retried() {
+        let lix = open_lix().await.expect("open Lix");
+        lix.set_sync_role(crate::sync::SyncRole::Replica)
+            .expect("mark handle as a connected replica");
+        let attempts = AtomicUsize::new(0);
+
+        let error = lix
+            .retry_connected_hot_read(crate::sql2::StatementAuthorityRoute::AuthorityWrite, || {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Err::<(), _>(LixError::new(
+                    LixError::CODE_STORAGE_READ_EXPIRED,
+                    "mutation execution is not restartable at this boundary",
+                )))
+            })
+            .await
+            .expect_err("non-HOT operations must preserve the original error");
+
+        assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

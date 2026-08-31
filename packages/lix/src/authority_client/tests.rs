@@ -199,10 +199,22 @@ impl ProtocolHttp for ScriptHttp {
 }
 
 fn handshake(session_id: &str, branch_id: &str) -> serde_json::Value {
+    handshake_with_account(
+        session_id,
+        branch_id,
+        "00000000-0000-7000-8000-000000000002",
+    )
+}
+
+fn handshake_with_account(
+    session_id: &str,
+    branch_id: &str,
+    account_id: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "protocolVersion": SERVER_PROTOCOL_VERSION,
         "activeBranchId": branch_id,
-        "activeAccountId": "00000000-0000-7000-8000-000000000002",
+        "activeAccountId": account_id,
         "sessionId": session_id,
     })
 }
@@ -337,6 +349,41 @@ async fn execute_second_session_gone_fails_without_another_handshake() {
         .filter(|request| request.method == "GET")
         .count();
     assert_eq!(handshakes, 2);
+}
+
+#[tokio::test]
+async fn session_recovery_rejects_an_authenticated_account_change() {
+    let http = ScriptHttp::default();
+    http.push_json(200, handshake_with_account("session-1", "main", "account-a"));
+    http.push_json(410, protocol_error(SESSION_GONE_CODE, 410));
+    http.push_json(200, handshake_with_account("session-2", "main", "account-b"));
+
+    let client = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("open");
+    let error = client
+        .execute("SELECT 1", &[], None)
+        .await
+        .expect_err("recovery must not change authenticated account");
+    assert_eq!(error.code, "LIX_SERVER_PROTOCOL_ERROR");
+    assert!(error.message.contains("activeAccountId"));
+    let poisoned = client
+        .execute("SELECT 1", &[], None)
+        .await
+        .expect_err("an account-mismatched client must remain unusable");
+    assert_eq!(poisoned.code, "LIX_SERVER_PROTOCOL_ERROR");
+    assert_eq!(
+        http.requests()
+            .iter()
+            .filter(|request| request.url.ends_with("/execute"))
+            .count(),
+        1,
+        "the failed recovery must not retry under the new account"
+    );
 }
 
 #[tokio::test]

@@ -27,6 +27,25 @@ where
         &self,
         options: SwitchBranchOptions,
     ) -> Result<SwitchBranchReceipt, LixError> {
+        self.switch_branch_inner(options, true).await
+    }
+
+    /// Selects a branch whose authority switch and publication fence already
+    /// completed. Connected handles use this for the local serving selector;
+    /// the sparse replica must not attempt to author the stale-base refresh
+    /// that the authority has already performed.
+    pub(crate) async fn switch_branch_to_certified_head(
+        &self,
+        options: SwitchBranchOptions,
+    ) -> Result<SwitchBranchReceipt, LixError> {
+        self.switch_branch_inner(options, false).await
+    }
+
+    async fn switch_branch_inner(
+        &self,
+        options: SwitchBranchOptions,
+        refresh_stale_base: bool,
+    ) -> Result<SwitchBranchReceipt, LixError> {
         let branch_id = options.branch_id;
         // One switch at a time across session clones: the selector moves
         // before the boundary refresh below (its staleness gate keys off the
@@ -64,10 +83,12 @@ where
         // before the bump so the refresh's staleness gate sees the switch;
         // an error therefore restores the previous selector — a failed
         // switch must not leave the session silently on the target branch.
-        if let Err(error) = self.refresh_active_branch_base_if_stale().await {
-            self.branch.set(previous_branch_id)?;
-            self.observe_invalidation.bump();
-            return Err(error);
+        if refresh_stale_base {
+            if let Err(error) = self.refresh_active_branch_base_if_stale().await {
+                self.branch.set(previous_branch_id)?;
+                self.observe_invalidation.bump();
+                return Err(error);
+            }
         }
 
         Ok(SwitchBranchReceipt { branch_id })
