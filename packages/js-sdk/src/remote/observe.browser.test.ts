@@ -3,6 +3,7 @@ import { openLix } from "../index.js";
 
 test("adding an observation reconnects an established browser multiplex stream", async () => {
 	const observeRequests: Request[] = [];
+	let executeRequests = 0;
 	const lix = await openLix({
 		server: {
 			mode: "remote",
@@ -20,6 +21,7 @@ test("adding an observation reconnects an established browser multiplex stream",
 				}
 				if (request.method === "DELETE") return new Response(null, { status: 204 });
 				if (pathname.endsWith("/execute")) {
+					executeRequests += 1;
 					const body = (await request.json()) as { sql: string };
 					const value = body.sql.includes("second") ? "second" : "first";
 					return Response.json({
@@ -32,18 +34,25 @@ test("adding an observation reconnects an established browser multiplex stream",
 
 				observeRequests.push(request.clone());
 				const body = (await request.clone().json()) as {
-					subscriptions: Array<{ id: string }>;
+					subscriptions: Array<{ id: string; sql: string }>;
 				};
 				return heldSseResponse(
 					body.subscriptions
-						.map(({ id }) =>
+						.map(({ id, sql }) =>
 							frame({
 								subscriptionId: id,
 								sequence: 0,
 								mutationSequence: 0,
 								result: {
 									columns: [{ name: "value", type: "text" }],
-									rows: [[{ kind: "text", value: "transport" }]],
+									rows: [
+										[
+											{
+												kind: "text",
+												value: sql.includes("second") ? "second" : "first",
+											},
+										],
+									],
 									rowsAffected: 0,
 									notices: [],
 								},
@@ -60,6 +69,7 @@ test("adding an observation reconnects an established browser multiplex stream",
 	expect((await first.next())?.result.rows[0]?.value).toBe("first");
 	const second = lix.observe("SELECT 'second' AS value");
 	expect((await second.next())?.result.rows[0]?.value).toBe("second");
+	expect(executeRequests).toBe(0);
 
 	const activeRequests = observeRequests.filter(
 		(request) => !request.signal.aborted,

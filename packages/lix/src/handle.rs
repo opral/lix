@@ -706,6 +706,10 @@ struct ConnectedAuthority {
     headers: Vec<(String, String)>,
     expected_account_id: String,
     operation_gate: Arc<tokio::sync::Mutex<()>>,
+    // Protects only the authority/local branch selector transition. Unlike
+    // `operation_gate`, observation registration may take this without
+    // queueing behind unrelated writes that are waiting for HOT publication.
+    selector_gate: Arc<tokio::sync::Mutex<()>>,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -741,6 +745,7 @@ impl ConnectedAuthority {
             headers,
             expected_account_id: expected_account_id.to_owned(),
             operation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            selector_gate: Arc::new(tokio::sync::Mutex::new(())),
             poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -771,6 +776,14 @@ impl ConnectedAuthority {
 
     async fn begin_operation(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, LixError> {
         let guard = self.operation_gate.lock().await;
+        self.ensure_usable()?;
+        Ok(guard)
+    }
+
+    async fn begin_selector_operation(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, LixError> {
+        let guard = self.selector_gate.lock().await;
         self.ensure_usable()?;
         Ok(guard)
     }
@@ -909,25 +922,39 @@ where
                         if *closed {
                             return Ok(None);
                         }
-                        // Do not retain a session operation while waiting on a
-                        // potentially idle remote stream: close must be able to
-                        // reach `authority.client.close()` and cancel it. The
-                        // registration/state check still gives transactions
-                        // the same deterministic rejection as local observe.
-                        if events.is_none() {
-                            let _operation = authority.begin_operation().await?;
+                        // Take only the session lifecycle and branch-selector
+                        // guards around registration/snapshotting. Neither is
+                        // held across the idle stream wait, and neither queues
+                        // behind an unrelated authority write waiting for HOT
+                        // publication.
+                        let observed_branch_id = {
+                            let _selector_operation =
+                                authority.begin_selector_operation().await?;
+                            // Selector before session is deliberate: a branch
+                            // switch retains the selector while it drains
+                            // session operations for the local checkout.
+                            let _session_operation =
+                                session.begin_waitable_session_operation().await?;
                             session.ensure_observe_registration_allowed()?;
-                            *events = Some(authority.client.observe(sql, params.clone()).await?);
-                        }
-                        let observed_branch_id = session.bound_branch_id()?;
+                            let branch_id = session.bound_branch_id()?;
+                            if events.is_none() {
+                                *events =
+                                    Some(authority.client.observe(sql, params.clone()).await?);
+                            }
+                            branch_id
+                        };
                         let result = events.as_ref().expect("initialized events").next().await;
                         // A switch or terminal authority failure can happen
-                        // while the stream is idle. Revalidate after the await
-                        // without blocking the switch itself.
-                        let operation = authority.begin_operation().await?;
-                        session.ensure_observe_registration_allowed()?;
-                        let current_branch_id = session.bound_branch_id()?;
-                        drop(operation);
+                        // while the stream is idle. Revalidate against the same
+                        // narrow selector boundary after the await.
+                        let current_branch_id = {
+                            let _selector_operation =
+                                authority.begin_selector_operation().await?;
+                            let _session_operation =
+                                session.begin_waitable_session_operation().await?;
+                            session.ensure_observe_registration_allowed()?;
+                            session.bound_branch_id()?
+                        };
                         if current_branch_id != observed_branch_id {
                             if let Some(events) = events {
                                 events.close();
@@ -2131,6 +2158,11 @@ where
                         .begin_connected_session_operation()
                         .await?
                         .expect("connected authority has a connected operation guard");
+                    // Observation registration uses this narrow gate instead
+                    // of the broad authority-operation gate. Hold it across
+                    // both remote and local selector movement so an observer
+                    // can never register against a half-switched handle.
+                    let _selector_operation = authority.begin_selector_operation().await?;
                     let previous_branch_id =
                         Arc::clone(&self.session).active_branch_id_owned().await?;
                     let receipt = match authority
