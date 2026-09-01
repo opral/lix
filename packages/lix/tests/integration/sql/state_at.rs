@@ -190,6 +190,46 @@ simulation_test!(state_at_materializes_historical_file_content_and_path, |sim| a
     );
 });
 
+simulation_test!(state_at_reads_historical_empty_file_content, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine.open_session().await.expect("session should open"),
+        &engine,
+    );
+    let empty_id = "01991b1d-6d8b-7000-8000-000000000002";
+
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/empty.csv', CAST('' AS BYTEA))",
+            &[Value::Text(empty_id.into())],
+        )
+        .await
+        .expect("empty file should insert");
+    let commit = session
+        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .await
+        .expect("commit should load");
+    let [Value::Text(commit_id)] = commit.rows()[0].values() else {
+        panic!("expected commit id");
+    };
+
+    let result = session
+        .execute(
+            "SELECT id, path, content FROM lix_state_at('lix_file', $1) WHERE path = '/empty.csv'",
+            &[Value::Text(commit_id.clone())],
+        )
+        .await
+        .expect("historical empty file should load");
+    assert_rows_eq(
+        result,
+        vec![vec![
+            Value::Text(empty_id.into()),
+            Value::Text("/empty.csv".into()),
+            Value::Blob(Vec::new().into()),
+        ]],
+    );
+});
+
 simulation_test!(state_at_matches_live_columns_and_unchanged_row_metadata, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
