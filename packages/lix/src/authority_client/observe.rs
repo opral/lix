@@ -276,7 +276,12 @@ impl<T: ObserveTransport> ObservationHub<T> {
                 )
             };
 
-            let interrupted = self.interrupt.notified();
+            // Arm the waiter before the final generation check. `notify_waiters`
+            // does not retain a permit, so registering only inside `select!`
+            // leaves a gap where a membership change can invalidate this
+            // snapshot without waking the driver.
+            let mut interrupted = std::pin::pin!(self.interrupt.notified());
+            interrupted.as_mut().enable();
             if !self.is_current(generation).await {
                 continue;
             }
@@ -286,7 +291,7 @@ impl<T: ObserveTransport> ObservationHub<T> {
                     .map(|batch| self.open_stream_for_generation(batch.to_vec(), generation)),
             );
             let open_result = tokio::select! {
-                _ = interrupted => {
+                _ = interrupted.as_mut() => {
                     let mut state = self.state.lock().await;
                     abort_current_stream(&mut state);
                     continue;
@@ -418,12 +423,13 @@ impl<T: ObserveTransport> ObservationHub<T> {
             match delay {
                 None => continue,
                 Some(delay) => {
-                    let interrupted = self.interrupt.notified();
+                    let mut interrupted = std::pin::pin!(self.interrupt.notified());
+                    interrupted.as_mut().enable();
                     if !self.is_current(generation).await {
                         continue;
                     }
                     tokio::select! {
-                        _ = interrupted => continue,
+                        _ = interrupted.as_mut() => continue,
                         _ = self.transport.sleep(delay) => {}
                     }
                 }
@@ -585,12 +591,13 @@ impl<T: ObserveTransport> ObservationHub<T> {
             if !self.is_current(generation).await {
                 return ConsumeResult::Stop;
             }
-            let interrupted = self.interrupt.notified();
+            let mut interrupted = std::pin::pin!(self.interrupt.notified());
+            interrupted.as_mut().enable();
             if !self.is_current(generation).await {
                 return ConsumeResult::Stop;
             }
             let frame = tokio::select! {
-                _ = interrupted => return ConsumeResult::Stop,
+                _ = interrupted.as_mut() => return ConsumeResult::Stop,
                 frame = next_sse_event(
                     &mut stream.body,
                     &mut buffered,
@@ -834,7 +841,12 @@ impl<T: ObserveTransport> ProtocolObserveEvents<T> {
                     return Ok(None);
                 }
             }
-            let notified = self.subscription.notify.notified();
+            // Register before checking the queue again. An event or close can
+            // otherwise call `notify_waiters()` after the check but before the
+            // waiter is first polled, leaving this read asleep with durable
+            // state already queued.
+            let mut notified = std::pin::pin!(self.subscription.notify.notified());
+            notified.as_mut().enable();
             {
                 let mut events = self.subscription.events.lock().await;
                 if let Some(event) = events.pop_front() {

@@ -197,6 +197,63 @@ test("remote observe applies sequential row deltas before coalescing delivery", 
 	await lix.close();
 });
 
+test("adding an observation reconnects an established multiplex stream with the full membership", async () => {
+	const observeRequests: Request[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) return handshake();
+				if (request.method === "DELETE") return closedSession();
+				if (pathname.endsWith("/execute")) {
+					const body = (await request.json()) as { sql: string };
+					return executeValueResponse(body.sql.includes("second") ? "second" : "first");
+				}
+
+				observeRequests.push(request.clone());
+				const body = (await request.clone().json()) as {
+					subscriptions: Array<{ id: string }>;
+				};
+				return heldSseResponse(
+					body.subscriptions
+						.map((subscription) =>
+							sseFrame(
+								"next",
+								multiplexObservePayload(subscription.id, "transport", 0, 0),
+							),
+						)
+						.join(""),
+					request.signal,
+				);
+			},
+		},
+	});
+
+	const first = lix.observe("SELECT 'first' AS value");
+	expect((await first.next())?.result.rows[0]?.value).toBe("first");
+	const second = lix.observe("SELECT 'second' AS value");
+	expect((await second.next())?.result.rows[0]?.value).toBe("second");
+
+	const activeRequests = observeRequests.filter(
+		(request) => !request.signal.aborted,
+	);
+	expect(activeRequests).toHaveLength(1);
+	const activeBody = (await activeRequests[0]?.json()) as {
+		subscriptions: Array<{ id: string }>;
+	};
+	expect(activeBody.subscriptions.map(({ id }) => id)).toEqual([
+		"observe-1",
+		"observe-2",
+	]);
+
+	first.close();
+	second.close();
+	await lix.close();
+});
+
 test("remote observe shards more than 32 subscriptions without blocking execute", async () => {
 	const observeRequests: Request[] = [];
 	let headerResolutions = 0;
