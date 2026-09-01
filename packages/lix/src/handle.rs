@@ -522,6 +522,16 @@ where
         // SAFETY: the builder owns the SQL, parameters, and options. The only
         // borrowed value retained across suspension is a shared reference to
         // the Sync session; storage handles are Send by the Storage contract.
+        if self.lix.engine.sync_mode().role() != crate::sync::SyncRole::Replica {
+            return Box::pin(unsafe {
+                crate::session::AssumeSendFuture::new(async move {
+                    self.lix
+                        .session
+                        .execute_with_options(&self.sql, &self.params, self.options)
+                        .await
+                })
+            });
+        }
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.lix.session.statement_authority_route(&self.sql)?;
@@ -542,6 +552,7 @@ where
                         .execute_on_authority(&self.sql, &self.params, &self.options, route)
                         .await;
                 }
+                self.lix.require_authority_execution(route)?;
                 let local = self.lix
                     .retry_connected_hot_read(route, || {
                         self.lix.retry_sync_demands(|| {
@@ -608,6 +619,16 @@ where
     fn into_future(self) -> Self::IntoFuture {
         // SAFETY: as above, the builder owns every request value and borrows
         // only the Sync session across suspension.
+        if self.lix.engine.sync_mode().role() != crate::sync::SyncRole::Replica {
+            return Box::pin(unsafe {
+                crate::session::AssumeSendFuture::new(async move {
+                    self.lix
+                        .session
+                        .execute_batch_with_options(&self.statements, self.options)
+                        .await
+                })
+            });
+        }
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.lix.session.batch_authority_route(&self.statements)?;
@@ -625,6 +646,7 @@ where
                         .execute_batch_on_authority(&self.statements, &self.options, route)
                         .await;
                 }
+                self.lix.require_authority_execution(route)?;
                 let local = self.lix
                     .retry_connected_hot_read(route, || {
                         self.lix.retry_sync_demands(|| {
@@ -1567,12 +1589,23 @@ where
         options: ExecuteOptions,
         metadata: ExecuteStatementMetadata,
         idempotency: Option<ExecuteIdempotency>,
-    ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + 'static {
+    ) -> Pin<Box<dyn Future<Output = Result<ExecuteResult, LixError>> + Send + 'static>> {
+        if self.engine.sync_mode().role() != crate::sync::SyncRole::Replica {
+            return Box::pin(
+                Arc::clone(&self.session).execute_with_idempotency_and_options_and_metadata(
+                    sql,
+                    params,
+                    options,
+                    metadata,
+                    idempotency,
+                ),
+            );
+        }
         // SAFETY: the retry future owns the Lix handle and every request
         // value. Reusing the same idempotency identity on each attempt is the
         // required contract: a pre-commit history demand has no receipt, while
         // an already committed attempt replays its durable receipt.
-        unsafe {
+        Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.session.statement_authority_route(&sql)?;
                 let _authority_operation = self.begin_connected_authority_operation().await?;
@@ -1630,7 +1663,7 @@ where
                     result => result,
                 }
             })
-        }
+        })
     }
 
     /// Executes statements sequentially against one atomic snapshot.
@@ -1813,11 +1846,22 @@ where
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
-    ) -> impl Future<Output = Result<Vec<ExecuteResult>, LixError>> + Send + 'static {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ExecuteResult>, LixError>> + Send + 'static>> {
+        if self.engine.sync_mode().role() != crate::sync::SyncRole::Replica {
+            return Box::pin(
+                Arc::clone(&self.session)
+                    .execute_batch_with_idempotency_and_options_and_metadata(
+                        statements,
+                        options,
+                        statement_metadata,
+                        idempotency,
+                    ),
+            );
+        }
         // Preserve the exact request identity across lazy-history retries so a
         // commit-outcome-unknown response can still be retried safely with the
         // caller's original key.
-        unsafe {
+        Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.session.batch_authority_route(&statements)?;
                 let _authority_operation = self.begin_connected_authority_operation().await?;
@@ -1873,7 +1917,7 @@ where
                     result => result,
                 }
             })
-        }
+        })
     }
 
     #[cfg(test)]
