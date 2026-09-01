@@ -10220,6 +10220,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selective_checkpoint_is_captured_as_a_member_commit() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let inserted = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('selected', 'yes'), ('unselected', 'yes')"
+            })),
+        )
+        .await;
+        assert_eq!(inserted.status(), StatusCode::OK);
+
+        let created = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+                        SELECT row_ref \
+                        FROM lix_diff('lix_key_value') \
+                        WHERE key = 'selected'))"
+            })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let checkpoint_id = response_json(created).await["rows"][0][0]["value"]
+            .as_str()
+            .expect("checkpoint commit id")
+            .to_string();
+
+        let history = request(
+            &app.router,
+            "GET",
+            &format!("/lix/v1/sync/history?head={checkpoint_id}&limit=1"),
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(history.status(), StatusCode::OK);
+        let history = response_json(history).await;
+        let checkpoint = &history["commits"][0];
+        assert_eq!(checkpoint["stateAlias"], serde_json::Value::Null);
+        assert!(
+            checkpoint["members"]
+                .as_array()
+                .is_some_and(|members| members.iter().any(|member| member["authored"] == false)),
+            "a selective checkpoint must carry its selected members"
+        );
+    }
+
+    #[tokio::test]
     async fn undo_and_redo_mutate_the_pinned_branch() {
         let app = app().await;
         let (session_id, handshake) = new_session(&app.router).await;

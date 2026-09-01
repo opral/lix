@@ -2415,6 +2415,7 @@ fn materialize_staged_sync_commits(
             .then(|| staged.record.parent_commit_ids[1]);
         let state_alias = checkpoint_state_sources
             .get(commit_id)
+            .filter(|_| staged.selected_change_batches.is_empty())
             .map(|source_commit_id| {
                 let root = staged_snapshot_roots.get(commit_id).ok_or_else(|| {
                     LixError::new(
