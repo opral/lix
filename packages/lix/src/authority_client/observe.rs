@@ -192,19 +192,24 @@ impl<T: ObserveTransport> ObservationHub<T> {
         state.subscriptions.insert(id.clone(), subscription.clone());
         state.subscription_order.push(id);
         let should_start = !state.driver_running;
-        // A driver may be opening several bounded multiplex streams before any
-        // one of them becomes active. Invalidate that snapshot as soon as the
-        // membership changes so the new subscription cannot be stranded.
-        let should_restart = state.driver_running;
+        // A driver may be opening one or more multiplex streams while membership
+        // is changing. Invalidate that snapshot under the same
+        // lock as the membership update. Deferring invalidation to another
+        // spawned task lets observe() return a registered subscription that the
+        // active driver has not been told to serve yet.
         if should_start {
             state.driver_running = true;
             state.generation += 1;
+        } else {
+            state.generation += 1;
+            state.retry_attempt = 0;
+            state.server_retry_ms = None;
+            abort_current_stream(&mut state);
+            self.interrupt.notify_waiters();
         }
         drop(state);
         if should_start {
             self.start_driver();
-        } else if should_restart {
-            self.restart();
         }
         Ok(ProtocolObserveEvents {
             hub: self.clone(),
@@ -698,10 +703,22 @@ impl<T: ObserveTransport> ObservationHub<T> {
         let event = decode_observe_event(payload, bases.get(&subscription.id))?;
         bases.insert(subscription.id.clone(), event.clone());
         let publish = if initial.remove(&subscription.id) {
-            let rows = self
-                .transport
-                .refresh_observation(&subscription.sql, &subscription.params)
-                .await?;
+            // Initial rows are re-read through the authoritative execute lane.
+            // That read can be cold or blocked behind another operation. A
+            // membership change must still replace this generation immediately;
+            // otherwise `driver_running` remains true while the only driver is
+            // parked here and every newly added subscription is stranded.
+            let mut interrupted = std::pin::pin!(self.interrupt.notified());
+            interrupted.as_mut().enable();
+            if !self.is_current(generation).await {
+                return Ok(());
+            }
+            let rows = tokio::select! {
+                _ = interrupted.as_mut() => return Ok(()),
+                rows = self
+                    .transport
+                    .refresh_observation(&subscription.sql, &subscription.params) => rows?,
+            };
             if !self.is_current(generation).await {
                 return Ok(());
             }
@@ -867,14 +884,23 @@ impl<T: ObserveTransport> ProtocolObserveEvents<T> {
         let hub = self.hub.clone();
         let subscription = self.subscription.clone();
         self.hub.transport.spawn(Box::pin(async move {
-            {
-                let mut state = hub.state.lock().await;
-                state.subscriptions.remove(&subscription.id);
-                state.subscription_order.retain(|id| id != &subscription.id);
-                state.generation += 1;
+            let mut state = hub.state.lock().await;
+            state.subscriptions.remove(&subscription.id);
+            state.subscription_order.retain(|id| id != &subscription.id);
+            state.generation += 1;
+            state.retry_attempt = 0;
+            state.server_retry_ms = None;
+            abort_current_stream(&mut state);
+            hub.interrupt.notify_waiters();
+            let should_start = !state.driver_running && !state.subscriptions.is_empty();
+            if should_start {
+                state.driver_running = true;
             }
+            drop(state);
             close_subscription(&subscription, None).await;
-            hub.restart();
+            if should_start {
+                hub.drive().await;
+            }
         }));
     }
 }
@@ -1206,5 +1232,210 @@ where
     #[cfg(target_arch = "wasm32")]
     fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()>>>) {
         self.http.spawn(fut);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    use bytes::Bytes;
+    use futures_util::stream;
+
+    use super::*;
+    use crate::ResultColumnType;
+
+    #[derive(Clone, Default)]
+    struct HeldInitialRefreshTransport {
+        opens: Arc<StdMutex<Vec<Vec<String>>>>,
+        refresh_calls: Arc<AtomicUsize>,
+        first_refresh_started: Arc<AtomicBool>,
+        first_refresh_dropped: Arc<AtomicBool>,
+    }
+
+    struct MarkDropped(Arc<AtomicBool>);
+
+    impl Drop for MarkDropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl ObserveTransport for HeldInitialRefreshTransport {
+        async fn open_observe_stream(
+            &self,
+            subscriptions: Vec<MultiplexObserveSubscription>,
+        ) -> Result<super::super::http::ProtocolHttpStream, LixError> {
+            self.opens.lock().expect("opens").push(
+                subscriptions
+                    .iter()
+                    .map(|subscription| subscription.id.clone())
+                    .collect(),
+            );
+            let frames = subscriptions
+                .iter()
+                .map(|subscription| {
+                    let id = &subscription.id;
+                    format!(
+                        "event: next\ndata: {{\"subscriptionId\":\"{id}\",\"sequence\":0,\"mutationSequence\":0,\"result\":{{\"columns\":[{{\"name\":\"value\",\"type\":\"text\"}}],\"rows\":[[{{\"kind\":\"text\",\"value\":\"transport\"}}]],\"rowsAffected\":0,\"notices\":[]}}}}\n\n"
+                    )
+                })
+                .collect::<String>();
+            Ok(super::super::http::ProtocolHttpStream {
+                status: 200,
+                headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+                body: Box::pin(
+                    stream::once(async move { Ok(Bytes::from(frames)) })
+                        .chain(stream::pending()),
+                ),
+                cancel: Arc::new(|| {}),
+            })
+        }
+
+        async fn refresh_observation(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<ExecuteResult, LixError> {
+            if self.refresh_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_refresh_started.store(true, Ordering::SeqCst);
+                let _drop = MarkDropped(self.first_refresh_dropped.clone());
+                std::future::pending::<()>().await;
+            }
+            Ok(ExecuteResult::from_protocol_response(
+                None,
+                None,
+                vec!["value".to_owned()],
+                vec![ResultColumnType::Text],
+                vec![vec![Value::Text("authoritative".to_owned())]],
+                0,
+                Vec::new(),
+            ))
+        }
+
+        async fn recover_session(&self) -> Result<(), LixError> {
+            Ok(())
+        }
+
+        async fn sleep(&self, _duration: Duration) {}
+
+        fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) {
+            tokio::spawn(fut);
+        }
+    }
+
+    #[tokio::test]
+    async fn membership_restart_cancels_a_stalled_initial_refresh() {
+        let transport = HeldInitialRefreshTransport::default();
+        let hub = ObservationHub::new(transport.clone());
+        let first = hub.observe("SELECT 'first'", Vec::new()).await.expect("first");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !transport.first_refresh_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first refresh starts");
+
+        let second = hub
+            .observe("SELECT 'second'", Vec::new())
+            .await
+            .expect("second");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let latest = transport.opens.lock().expect("opens").last().cloned();
+                if latest == Some(vec!["observe-1".to_owned(), "observe-2".to_owned()])
+                    && transport.first_refresh_dropped.load(Ordering::SeqCst)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement generation opens with complete membership");
+
+        let second_event = tokio::time::timeout(Duration::from_secs(1), second.next())
+            .await
+            .expect("new subscription receives its first frame")
+            .expect("new subscription result")
+            .expect("new subscription remains open");
+        assert_eq!(
+            second_event.rows.rows()[0].values(),
+            &[Value::Text("authoritative".to_owned())]
+        );
+
+        first.close();
+        second.close();
+        hub.close().await;
+    }
+
+    #[tokio::test]
+    async fn history_shaped_add_remove_add_converges_to_latest_membership() {
+        let transport = HeldInitialRefreshTransport::default();
+        let hub = ObservationHub::new(transport.clone());
+        let checkpoints = hub
+            .observe("SELECT * FROM lix_checkpoint", Vec::new())
+            .await
+            .expect("checkpoints");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !transport.first_refresh_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("checkpoint refresh starts");
+
+        let empty_parent = hub
+            .observe("SELECT * FROM lix_commit WHERE id = ''", Vec::new())
+            .await
+            .expect("empty parent");
+        empty_parent.close();
+        let real_parent = hub
+            .observe("SELECT * FROM lix_commit WHERE id = 'oldest'", Vec::new())
+            .await
+            .expect("real parent");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let latest = transport.opens.lock().expect("opens").last().cloned();
+                if latest == Some(vec!["observe-1".to_owned(), "observe-3".to_owned()])
+                    && transport.first_refresh_dropped.load(Ordering::SeqCst)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("driver converges to checkpoint and real-parent membership");
+
+        tokio::time::timeout(Duration::from_secs(1), checkpoints.next())
+            .await
+            .expect("checkpoint frame")
+            .expect("checkpoint result")
+            .expect("checkpoint remains open");
+        tokio::time::timeout(Duration::from_secs(1), real_parent.next())
+            .await
+            .expect("real-parent frame")
+            .expect("real-parent result")
+            .expect("real parent remains open");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while empty_parent
+                .next()
+                .await
+                .expect("closed empty-parent read succeeds")
+                .is_some()
+            {}
+        })
+        .await
+        .expect("closed empty-parent read eventually settles");
+
+        checkpoints.close();
+        real_parent.close();
+        hub.close().await;
     }
 }
