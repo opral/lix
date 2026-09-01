@@ -79,6 +79,7 @@ use crate::{
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
 use crate::filesystem::{
     BlobRefRowInput, DirectoryPathRecord, DirectoryPathResolver, FileDeleteInput,
@@ -4386,7 +4387,7 @@ pub(super) async fn lix_file_state_record_batch(
         MaterializedHotStateBatch::from_rows(rows),
         &FilePathPredicate::All,
     )?;
-    if prepared.needs_plugin_render(load_data) {
+    if prepared.historical_plugin_materialization_is_missing(load_data) {
         return Err(invalid_plugin_read_state(
             "historical plugin-owned file is missing its durable materialization",
         ));
@@ -4398,6 +4399,7 @@ struct PreparedLixFileRows {
     live_rows: HotStateBatchOwners,
     file_rows: BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+    plugin_owner_file_keys: BTreeSet<FilesystemDescriptorKey>,
     file_paths: BTreeMap<FilesystemDescriptorKey, String>,
     path_ordered_file_keys: Option<Vec<FilesystemDescriptorKey>>,
 }
@@ -4407,6 +4409,16 @@ impl PreparedLixFileRows {
         needs_data
             && self.file_rows.values().any(|file| {
                 plugin_file_can_have_durable_owner(file)
+                    && !self
+                        .blob_rows
+                        .contains_key(&file.blob_ref_key(&self.live_rows))
+            })
+    }
+
+    fn historical_plugin_materialization_is_missing(&self, needs_data: bool) -> bool {
+        needs_data
+            && self.file_rows.values().any(|file| {
+                self.plugin_owner_file_keys.contains(&file.key)
                     && !self
                         .blob_rows
                         .contains_key(&file.blob_ref_key(&self.live_rows))
@@ -4460,6 +4472,7 @@ fn prepare_lix_file_rows(
     let batch = live_rows.push(rows.into());
     let mut file_rows = BTreeMap::<FilesystemDescriptorKey, FileDescriptorRecord>::new();
     let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
+    let mut plugin_owner_file_keys = BTreeSet::<FilesystemDescriptorKey>::new();
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
 
     for row_index in 0..live_rows.batch(batch).len() {
@@ -4499,6 +4512,19 @@ fn prepare_lix_file_rows(
                     parent_id: snapshot.parent_id,
                     name: snapshot.name,
                 });
+            }
+            KEY_VALUE_SCHEMA_KEY
+                if row.row_pk().as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
+                    && !row.deleted() =>
+            {
+                let file_id = row.file_id().ok_or_else(|| {
+                    invalid_plugin_read_state(
+                        "historical plugin owner is missing its file identity",
+                    )
+                })?;
+                plugin_owner_file_keys.insert(
+                    FilesystemDescriptorKey::from_file_descriptor_live_row_ref(row, file_id),
+                );
             }
             _ => {}
         }
@@ -4544,6 +4570,7 @@ fn prepare_lix_file_rows(
         live_rows,
         file_rows,
         blob_rows,
+        plugin_owner_file_keys,
         file_paths,
         path_ordered_file_keys: None,
     })
@@ -4633,6 +4660,7 @@ fn prepare_indexed_lix_file_rows(
         live_rows,
         file_rows,
         blob_rows,
+        plugin_owner_file_keys: BTreeSet::new(),
         file_paths,
         path_ordered_file_keys: Some(path_ordered_file_keys),
     })
@@ -4898,6 +4926,7 @@ async fn lix_file_record_batch_from_prepared(
         blob_rows,
         mut file_paths,
         path_ordered_file_keys,
+        ..
     } = prepared;
     let mut columns = LixFileRecordBatchColumns::default();
     let mut blob_bytes = if needs_data {
@@ -4988,6 +5017,7 @@ async fn exact_path_data_rows_from_prepared(
         blob_rows,
         mut file_paths,
         path_ordered_file_keys,
+        ..
     } = prepared;
     let mut blob_bytes = if data_range.is_none() {
         load_blob_bytes_for_files(blob_reader, &live_rows, &file_rows, &blob_rows).await?
@@ -9670,6 +9700,62 @@ mod tests {
         .unwrap();
         assert!(rendered.needs_plugin_render(true));
         assert!(!rendered.needs_plugin_render(false));
+    }
+
+    #[test]
+    fn historical_materialization_requires_blob_only_for_owned_files() {
+        let file_id = "01920000-0000-7000-8000-000000000522";
+        let branch_id = "01920000-0000-7000-8000-0000000000b1";
+        let descriptor = live_file_row(
+            file_id,
+            branch_id,
+            r#"{"id":"01920000-0000-7000-8000-000000000522","directory_id":null,"name":"empty.csv"}"#,
+        );
+
+        let raw = super::prepare_lix_file_rows(
+            vec![descriptor.clone()],
+            &super::FilePathPredicate::All,
+        )
+        .expect("raw empty file should prepare");
+        assert!(!raw.historical_plugin_materialization_is_missing(true));
+
+        let owned = super::prepare_lix_file_rows(
+            vec![
+                descriptor.clone(),
+                live_plugin_owner_row(
+                    branch_id,
+                    file_id,
+                    "plugin_sentinel",
+                    vec!["plugin_note".to_string()],
+                ),
+            ],
+            &super::FilePathPredicate::All,
+        )
+        .expect("owned empty file should prepare");
+        assert!(owned.historical_plugin_materialization_is_missing(true));
+        assert!(!owned.historical_plugin_materialization_is_missing(false));
+
+        let materialized = super::prepare_lix_file_rows(
+            vec![
+                descriptor,
+                live_plugin_owner_row(
+                    branch_id,
+                    file_id,
+                    "plugin_sentinel",
+                    vec!["plugin_note".to_string()],
+                ),
+                live_blob_ref_row(
+                    file_id,
+                    branch_id,
+                    file_id,
+                    &BlobId::from_content(b"materialized").to_hex(),
+                    b"materialized".len(),
+                ),
+            ],
+            &super::FilePathPredicate::All,
+        )
+        .expect("materialized plugin file should prepare");
+        assert!(!materialized.historical_plugin_materialization_is_missing(true));
     }
 
     #[tokio::test]

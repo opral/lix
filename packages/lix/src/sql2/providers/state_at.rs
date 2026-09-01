@@ -20,6 +20,7 @@ use crate::hot_state::{
     MaterializedHotStateBatchBuilder, MaterializedHotStateRow, VisibilityBranchScope,
     VisibilityRequest, resolve_visible_batch,
 };
+use crate::plugin::runtime::PLUGIN_OWNER_KEY;
 use crate::row_pk::{RowPk, RowPkComponentType};
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind, SchemaSurfaceSpec};
@@ -40,6 +41,7 @@ use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, s
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
 #[cfg(test)]
 static STATE_AT_TRAVERSAL_PROBES: OnceLock<
@@ -486,6 +488,7 @@ async fn load_relation_at_commit<S: StorageAdapterRead + Clone>(
                     .map(crate::NullableKeyFilter::Value)
                     .collect()
             });
+            let owner_file_ids = file_ids.clone();
             let mut file_schema_keys = vec![FILE_DESCRIPTOR_SCHEMA_KEY.into()];
             if ["content", "lixcol_change_id", "lixcol_updated_at"]
                 .iter()
@@ -498,8 +501,26 @@ async fn load_relation_at_commit<S: StorageAdapterRead + Clone>(
                 record_state_at_traversal_probe(commit_id, &file_request);
             }
             let file_batch = tracked.scan_batch_at_commit(commit_id, &file_request).await;
+            let owner_batch = if schema.index_of("content").is_ok() {
+                let owner_request = tracked_request(
+                    vec![KEY_VALUE_SCHEMA_KEY.into()],
+                    Some(vec![RowPk::single(PLUGIN_OWNER_KEY)]),
+                    owner_file_ids,
+                    None,
+                );
+                if record_probe {
+                    record_state_at_traversal_probe(commit_id, &owner_request);
+                }
+                Some(tracked.scan_batch_at_commit(commit_id, &owner_request).await)
+            } else {
+                None
+            };
+            let mut file_batches = vec![file_batch];
+            if let Some(owner_batch) = owner_batch {
+                file_batches.push(owner_batch);
+            }
             if row_pks.is_some() {
-                (vec![file_batch], Vec::new())
+                (file_batches, Vec::new())
             } else {
                 let directory_request = tracked_request(
                     vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.into()],
@@ -511,12 +532,14 @@ async fn load_relation_at_commit<S: StorageAdapterRead + Clone>(
                     record_state_at_traversal_probe(commit_id, &directory_request);
                 }
                 (
-                    vec![
-                        file_batch,
-                        tracked
-                            .scan_batch_at_commit(commit_id, &directory_request)
-                            .await,
-                    ],
+                    {
+                        file_batches.push(
+                            tracked
+                                .scan_batch_at_commit(commit_id, &directory_request)
+                                .await,
+                        );
+                        file_batches
+                    },
                     Vec::new(),
                 )
             }
