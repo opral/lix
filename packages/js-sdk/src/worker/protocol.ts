@@ -29,15 +29,19 @@ export type WorkerSyncFetchRequest = {
 	headers: [string, string][];
 	body?: string | Uint8Array;
 	credentials?: RequestCredentials;
-	responseLimit: number;
-};
+} & (
+	| { responseMode: "buffered"; responseLimit: number }
+	| { responseMode: "stream" }
+);
 
-export type WorkerSyncFetchResponse = {
+type WorkerSyncFetchResponseHead = {
 	status: number;
 	statusText: string;
 	headers: [string, string][];
-	body: Uint8Array;
 };
+
+export type WorkerSyncFetchResponse = WorkerSyncFetchResponseHead &
+	({ streaming: true } | { streaming?: false; body: Uint8Array });
 
 export type WorkerRequest = {
 	id: number;
@@ -113,6 +117,14 @@ export type WorkerNotification =
 			result:
 				| { ok: true; response: WorkerSyncFetchResponse }
 				| { ok: false; error: SerializedWorkerError };
+	  }
+	| {
+			kind: "sync.fetch.stream.result";
+			requestId: number;
+			result:
+				| { ok: true; done: true }
+				| { ok: true; done: false; chunk: Uint8Array }
+				| { ok: false; error: SerializedWorkerError };
 	  };
 
 export type WorkerInput = WorkerRequest | WorkerNotification;
@@ -147,6 +159,7 @@ export type WorkerResponse =
 	| { kind: "open.progress"; progress: LixOpenProgress }
 	| { kind: "sync.headers"; requestId: number }
 	| { kind: "sync.fetch"; requestId: number; request: WorkerSyncFetchRequest }
+	| { kind: "sync.fetch.stream.pull"; requestId: number }
 	| { kind: "sync.fetch.cancel"; requestId: number };
 
 export function serializeWorkerError(error: unknown): SerializedWorkerError {
