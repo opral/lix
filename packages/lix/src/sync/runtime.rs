@@ -497,6 +497,16 @@ where
                     terminal_error = Some(error);
                     break;
                 }
+                if retry_sync_iteration_without_reconnect(&error) {
+                    tracing::debug!(
+                        error = ?error,
+                        "sync publication raced another local storage client"
+                    );
+                    if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
+                        break;
+                    }
+                    continue;
+                }
                 tracing::warn!(error = ?error, "sync repository iteration failed");
                 transport = None;
                 if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
@@ -780,6 +790,21 @@ fn is_retryable_sync_transport_error(error: &LixError) -> bool {
     matches!(status, Some(408 | 429 | 500..=599))
 }
 
+fn is_retryable_sync_demand_error(error: &LixError) -> bool {
+    // A durable browser replica can briefly have two publication workers while
+    // an old page is closing. If the sibling commits first, this worker's
+    // coherent read expires. The authority operation is already identified and
+    // a publication barrier is idempotent, so retain the waiter and re-pin from
+    // the durable receipt instead of leaking a storage race through the public
+    // connected handle.
+    error.code == LixError::CODE_STORAGE_READ_EXPIRED
+        || is_retryable_sync_transport_error(error)
+}
+
+fn retry_sync_iteration_without_reconnect(error: &LixError) -> bool {
+    error.code == LixError::CODE_STORAGE_READ_EXPIRED
+}
+
 async fn hydrate_and_resolve_sync_demands<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
@@ -818,6 +843,20 @@ where
     } else {
         Ok(())
     };
+    resolve_sync_demand_results(
+        demands,
+        history_result,
+        chunk_result,
+        barrier_result,
+    )
+}
+
+fn resolve_sync_demand_results(
+    demands: Vec<SyncDemand>,
+    history_result: Result<(), LixError>,
+    chunk_result: Result<(), LixError>,
+    barrier_result: Result<(), LixError>,
+) -> (Vec<SyncDemand>, Option<LixError>) {
     let mut retry = Vec::new();
     let mut retry_error = None;
     for demand in demands {
@@ -830,7 +869,7 @@ where
             SyncDemandRequest::PublicationBarrier => barrier_result.clone(),
         };
         match result {
-            Err(error) if is_retryable_sync_transport_error(&error) => {
+            Err(error) if is_retryable_sync_demand_error(&error) => {
                 retry_error.get_or_insert(error);
                 retry.push(demand);
             }
@@ -3658,6 +3697,69 @@ mod tests {
             LixError::CODE_INTERNAL_ERROR,
             "missing chunk"
         ),));
+        assert!(is_retryable_sync_demand_error(&LixError::new(
+            LixError::CODE_STORAGE_READ_EXPIRED,
+            "a sibling published the certified receipt",
+        )));
+        assert!(!is_retryable_sync_demand_error(&LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "semantic conflict",
+        )));
+        assert!(retry_sync_iteration_without_reconnect(&LixError::new(
+            LixError::CODE_STORAGE_READ_EXPIRED,
+            "a sibling published the certified receipt",
+        )));
+        assert!(!retry_sync_iteration_without_reconnect(&LixError::new(
+            super::super::http::SYNC_TRANSPORT_ERROR_CODE,
+            "disconnected",
+        )));
+    }
+
+    #[tokio::test]
+    async fn publication_barrier_waiter_survives_repeated_local_read_expiry() {
+        let (response, mut done) = tokio::sync::oneshot::channel();
+        let demands = vec![SyncDemand {
+            request: SyncDemandRequest::PublicationBarrier,
+            response,
+        }];
+        let expired = || {
+            Err(LixError::new(
+                LixError::CODE_STORAGE_READ_EXPIRED,
+                "a sibling published the certified receipt",
+            ))
+        };
+
+        let (demands, first_error) =
+            resolve_sync_demand_results(demands, Ok(()), Ok(()), expired());
+        assert_eq!(demands.len(), 1);
+        assert_eq!(
+            first_error.expect("expiry enters retry path").code,
+            LixError::CODE_STORAGE_READ_EXPIRED,
+        );
+        assert!(matches!(
+            done.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let (demands, second_error) =
+            resolve_sync_demand_results(demands, Ok(()), Ok(()), expired());
+        assert_eq!(demands.len(), 1);
+        assert_eq!(
+            second_error.expect("repeated expiry remains retryable").code,
+            LixError::CODE_STORAGE_READ_EXPIRED,
+        );
+        assert!(matches!(
+            done.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let (demands, retry_error) =
+            resolve_sync_demand_results(demands, Ok(()), Ok(()), Ok(()));
+        assert!(demands.is_empty());
+        assert!(retry_error.is_none());
+        done.await
+            .expect("publication waiter remains connected")
+            .expect("later retry certifies the authority write");
     }
 
     #[tokio::test]
