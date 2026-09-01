@@ -178,6 +178,8 @@ async fn authority_stream(
     Reflect::set(&init, &"method".into(), &request.method.into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"credentials".into(), &"include".into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"cache".into(), &"no-store".into()).map_err(js_transport_error)?;
+    Reflect::set(&init, &"lixResponseStream".into(), &JsValue::TRUE)
+        .map_err(js_transport_error)?;
     let header_pairs = Array::new();
     for (name, value) in &headers {
         let pair = Array::new();
