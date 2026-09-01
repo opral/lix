@@ -206,6 +206,17 @@ async fn authority_stream(
         Reflect::construct(&controller_constructor, &Array::new()).map_err(js_transport_error)?;
     let signal = Reflect::get(&controller, &"signal".into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"signal".into(), &signal).map_err(js_transport_error)?;
+    // Dropping a `JsFuture` does not cancel its Promise. Observation membership
+    // changes deliberately drop an in-flight stream-open future, so retain an
+    // abort guard until the response body has been transferred to the returned
+    // `ProtocolHttpStream`. Without it, every superseded open remains a live SSE
+    // request and can exhaust the browser's per-origin connection budget.
+    let controller: Object = controller.into();
+    let mut abort_on_drop = AbortOnDrop {
+        controller: controller.clone(),
+        timeout: None,
+        armed: true,
+    };
     let cancel_controller = controller.clone();
     let cancel: Arc<dyn Fn()> = Arc::new(move || {
         if let Ok(abort) = Reflect::get(&cancel_controller, &"abort".into())
@@ -286,6 +297,7 @@ async fn authority_stream(
             }
         }
     });
+    abort_on_drop.disarm();
     Ok(ProtocolHttpStream {
         status,
         headers: response_headers,
