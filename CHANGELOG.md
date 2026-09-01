@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.15.0 - 2026-09-01
+
+### Minor
+
+- Added a deployable reference server for the Lix Server Protocol.
+
+  Hosts can run the provided S3-backed container, embed the Rust protocol handler, or provide an independent compatible implementation.
+- Removed the obsolete hidden JSON primary-key projection from current SQL relations.
+
+  Current relations now derive identity exclusively from their declared primary-key columns. Cross-relation addresses continue to use opaque row references, and derived columnar accelerators use a private physical identity field that is not part of any SQL schema.
+
 ## 0.14.0 - 2026-08-28
 
 ### Minor

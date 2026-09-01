@@ -3228,7 +3228,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "lix"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ahash",
  "async-executor",
@@ -3296,7 +3296,7 @@ dependencies = [
 
 [[package]]
 name = "lix-schema"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -3309,7 +3309,7 @@ dependencies = [
 
 [[package]]
 name = "lix-server"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3341,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-filesystem"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "futures-lite",
  "lix",
@@ -3353,7 +3353,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-rocksdb"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -3366,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-slatedb"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3382,7 +3382,7 @@ dependencies = [
 
 [[package]]
 name = "lix_collaboration_test_support"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "lix_js_sdk"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-channel",
  "async-stream",
@@ -4186,7 +4186,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_csv"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "base64",
  "lix",
@@ -4197,7 +4197,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_excalidraw"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "lix",
  "serde_json",
@@ -4206,7 +4206,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_json"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "base64",
  "blake3",
@@ -4217,7 +4217,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_markdown"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "base64",
  "chardetng",
@@ -4230,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_text"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "base64",
  "lix",
