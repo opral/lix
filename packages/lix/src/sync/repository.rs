@@ -7799,7 +7799,7 @@ mod tests {
             )
             .await
             .expect_err("replica SQL writes must be authority-routed");
-        assert_eq!(error.code, "LIX_REPLICA_CACHE_READ_ONLY");
+        assert_eq!(error.code, super::super::AUTHORITY_EXECUTION_REQUIRED_CODE);
         let checkpoint_error = replica
             .create_checkpoint()
             .await
