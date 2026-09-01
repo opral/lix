@@ -18,7 +18,10 @@ import {
 	type WorkerSyncServerOptions,
 } from "./protocol.js";
 
-export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
+export function startWorkerHost(
+	endpoint: WorkerHostEndpoint,
+	openBinding: typeof openLixBinding = openLixBinding,
+): void {
 	const sessions = new Map<number, LixBinding>();
 	let nextSessionId = 1;
 	let nextTransactionId = 1;
@@ -90,6 +93,21 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				const exportId = message.operation.exportId;
 				void respond(message, () => handleSnapshotCancel(exportId));
 			}
+			return;
+		}
+		if (message.operation.kind === "observe") {
+			const operation = message.operation;
+			// Observation setup is metadata-only. Keeping it behind the global
+			// finite-operation queue lets an authority mutation that is waiting for
+			// local publication block a newly mounted server-first History query.
+			// The live `next()` lane is already independent for the same reason.
+			void respond(message, () =>
+				handleObserveRegistration(
+					message.sessionId,
+					operation.sql,
+					operation.params,
+				),
+			);
 			return;
 		}
 		finiteQueue = finiteQueue.then(async () => {
@@ -213,7 +231,7 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 							? undefined
 							: requiredSnapshotInput(operation.snapshotId).readable;
 					try {
-					const opened = await openLixBinding(
+					const opened = await openBinding(
 						operation.storage,
 						operation.telemetryEnabled
 							? (span: LixTelemetrySpan) =>
@@ -317,15 +335,8 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				throw workerStateError("snapshot pulls bypass the finite operation queue");
 			case "exportSnapshot.cancel":
 				throw workerStateError("snapshot cancellation bypasses the finite operation queue");
-			case "observe": {
-				const events = await requiredLix(sessionId).observe(
-					operation.sql,
-					operation.params,
-				);
-				const observeId = nextObserveId++;
-				observations.set(observeId, events);
-				return observeId;
-			}
+			case "observe":
+				throw workerStateError("observe must use the observation lane");
 			case "close": {
 				const openLix = requiredLix(sessionId);
 				await openLix.close();
@@ -551,6 +562,20 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		if (!events) return undefined;
 		events.setTelemetryParent(telemetryParent);
 		return events.next();
+	}
+
+	async function handleObserveRegistration(
+		sessionId: number,
+		sql: string,
+		params: Parameters<LixBinding["observe"]>[1],
+	): Promise<number> {
+		// Do not touch the mutable Lix telemetry carrier here: it belongs to the
+		// serialized finite lane. Each `observe.next` supplies telemetry directly
+		// to its observation binding.
+		const events = await requiredLix(sessionId).observe(sql, params);
+		const observeId = nextObserveId++;
+		observations.set(observeId, events);
+		return observeId;
 	}
 
 	function requiredLix(sessionId: number): LixBinding {
