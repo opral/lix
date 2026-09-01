@@ -783,7 +783,11 @@ mod tests {
         stage_materialized_sync_state_alias(&mut writes, commit_id, &alias)
             .expect("stage sidecar");
         adapter
-            .commit_write_set(writes, crate::storage_adapter::StorageWriteOptions::default())
+            .commit_certified_replica_write_set(
+                crate::sync::certified_replica_write_capability(),
+                writes,
+                crate::storage_adapter::StorageWriteOptions::default(),
+            )
             .await
             .expect("publish sidecar");
         let read = adapter
@@ -801,7 +805,11 @@ mod tests {
         let mut writes = adapter.new_write_set();
         stage_delete_materialized_sync_state_alias(&mut writes, commit_id);
         adapter
-            .commit_write_set(writes, crate::storage_adapter::StorageWriteOptions::default())
+            .commit_certified_replica_write_set(
+                crate::sync::certified_replica_write_capability(),
+                writes,
+                crate::storage_adapter::StorageWriteOptions::default(),
+            )
             .await
             .expect("retire sidecar");
         let read = adapter

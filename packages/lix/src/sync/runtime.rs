@@ -11,8 +11,10 @@ use futures_util::{FutureExt, select_biased};
 use crate::storage_adapter::Storage;
 use crate::{Lix, LixError};
 
+#[cfg(test)]
+use super::SyncPushRequest;
 use super::platform::{HttpSyncTransport, SyncTask, sleep, spawn_sync_task};
-use super::{SyncPushRequest, SyncRepositoryPullResponse, SyncTransport};
+use super::{SyncRepositoryPullResponse, SyncTransport};
 
 const SYNC_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const SYNC_MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
@@ -50,6 +52,10 @@ pub(crate) struct SyncDemand {
 
 #[cfg(test)]
 impl SyncDemand {
+    pub(crate) fn is_publication_barrier_for_test(&self) -> bool {
+        matches!(self.request, SyncDemandRequest::PublicationBarrier)
+    }
+
     pub(crate) fn succeed_for_test(self) {
         let _ = self.response.send(Ok(()));
     }
@@ -59,6 +65,7 @@ impl SyncDemand {
 enum SyncDemandRequest {
     History(Vec<String>),
     Chunks(Vec<String>),
+    PublicationBarrier,
 }
 
 #[derive(Debug)]
@@ -67,6 +74,9 @@ pub(super) struct PreparedRepositorySnapshot {
     pub(super) commits: Vec<super::SyncCommit>,
     pub(super) commit_headers: Vec<super::SyncCommitHeader>,
     pub(super) rows: Vec<super::SyncSnapshotRow>,
+    /// Binary payloads reachable from current branch heads or their pinned
+    /// working-diff checkpoints. Older history remains deliberately excluded.
+    pub(super) live_blob_ids: BTreeSet<String>,
     pub(super) checkpoint_roots: BTreeMap<String, String>,
 }
 
@@ -145,11 +155,19 @@ where
         );
     }
     rows.extend(fetch_snapshot_rows(transport, &checkpoint_targets).await?);
+    // The serving plane includes both current rows and the pinned checkpoint
+    // side of one-argument `lix_diff`. Certify both payload sets up front so a
+    // working-diff projection never turns into a foreground chunk request.
+    let live_blob_ids = blob_ids_from_rows(
+        rows.iter()
+            .map(|row| (row.schema_key.as_str(), row.snapshot.as_ref())),
+    )?;
     let snapshot = PreparedRepositorySnapshot {
         metadata,
         commits: history.commits,
         commit_headers: history.commit_headers,
         rows,
+        live_blob_ids,
         checkpoint_roots,
     };
     Ok((snapshot, lix_id, default_branch_id))
@@ -242,6 +260,12 @@ async fn send_sync_demand(
     Ok(())
 }
 
+pub(crate) async fn fence_hot_state(
+    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+) -> Result<(), LixError> {
+    send_sync_demand(demand_tx, SyncDemandRequest::PublicationBarrier).await
+}
+
 fn is_sparse_commit_graph_miss(error: &LixError) -> bool {
     error.code == LixError::CODE_COMMIT_NOT_FOUND
         && error.details.as_ref().is_some_and(|details| {
@@ -314,7 +338,7 @@ where
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
     let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(64);
     let worker_lix = lix
-        .open_internal_session_suppressed(lix.active_branch_id().await?, lix.active_account_id())
+        .open_internal_session(lix.active_branch_id().await?, lix.active_account_id())
         .await?;
     let task = spawn_sync_task(async move {
         let result = run_sync_worker(
@@ -337,7 +361,7 @@ where
     }))
 }
 
-/// Shared bootstrap, outbox, long-poll, reconciliation, and retry policy.
+/// Shared bootstrap, certified pull, long-poll, demand, and retry policy.
 ///
 /// Platform adapters supply only task spawning, timers, HTTP, and cancellation.
 async fn run_sync_worker<StorageImpl>(
@@ -353,8 +377,6 @@ where
 {
     let mut retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
     let mut delta_pull_limit = super::MAX_SYNC_REQUEST_ITEMS;
-    let mut push_item_limit = super::MAX_SYNC_REQUEST_ITEMS;
-    let mut change_watcher = lix.sync_mode_state().change_watcher();
     let mut internal_demand_retry = SyncDemandRetry::default();
     let mut pending_demands = Vec::new();
 
@@ -401,17 +423,15 @@ where
         let Some(current) = transport.as_ref() else {
             continue;
         };
-        // This outer race covers every phase, including connect, CAS transfer,
-        // and push. Dropping an in-flight transport future invokes the
+        // This outer race covers every phase, including connect and certified
+        // pull. Dropping an in-flight transport future invokes the
         // adapter's cancellation mechanism.
         let result = {
             let iteration = sync_iteration(
                 &lix,
                 &remote_id,
                 current,
-                &mut push_item_limit,
                 &mut delta_pull_limit,
-                &mut change_watcher,
                 &mut demand_rx,
                 &mut pending_demands,
             )
@@ -446,6 +466,7 @@ where
                                         hydrate_chunk_ids(&lix, current, ids.into_iter().collect())
                                             .await
                                     }
+                                    SyncDemandRequest::PublicationBarrier => Ok(()),
                                 }
                             }
                             .fuse();
@@ -476,6 +497,16 @@ where
                     terminal_error = Some(error);
                     break;
                 }
+                if retry_sync_iteration_without_reconnect(&error) {
+                    tracing::debug!(
+                        error = ?error,
+                        "sync publication raced another local storage client"
+                    );
+                    if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
+                        break;
+                    }
+                    continue;
+                }
                 tracing::warn!(error = ?error, "sync repository iteration failed");
                 transport = None;
                 if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
@@ -484,20 +515,10 @@ where
             }
         }
     }
-    let result = if let Some(error) = terminal_error {
-        Err(error)
-    } else if *shutdown_rx.borrow() == SyncShutdown::Drain {
-        drain_sync_outbox(
-            &lix,
-            &remote_id,
-            transport.as_ref(),
-            &mut push_item_limit,
-            &mut delta_pull_limit,
-        )
-        .await
-    } else {
-        Ok(())
-    };
+    // Replica writes are authority-routed and their public promises wait for a
+    // certified pull. Closing a replica therefore has no local outbox to
+    // publish; Drain only waits for the current pull iteration to stop.
+    let result = terminal_error.map_or(Ok(()), Err);
     drop(pending_demands);
     drop(demand_rx);
     let close_result = lix.close().await;
@@ -514,7 +535,8 @@ where
 {
     validate_authority_lix_id(lix.lix_id(), transport.lix_id())?;
     lix.validate_sync_repository_account(remote_id, transport.active_account_id())
-        .await
+        .await?;
+    lix.validate_sync_hot_state_authoritative().await
 }
 
 fn validate_authority_lix_id(local: &str, authority: &str) -> Result<(), LixError> {
@@ -524,52 +546,11 @@ fn validate_authority_lix_id(local: &str, authority: &str) -> Result<(), LixErro
     Err(super::sync_repository_id_mismatch(local, authority))
 }
 
-async fn drain_sync_outbox<StorageImpl>(
-    lix: &Lix<StorageImpl>,
-    remote_id: &str,
-    transport: Option<&HttpSyncTransport>,
-    push_item_limit: &mut usize,
-    delta_pull_limit: &mut usize,
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    // A disconnected persistent replica already has a durable outbox. Do not
-    // turn close into an unbounded reconnect attempt; the next warm open will
-    // resume it. Fresh in-memory replicas retain their bootstrap transport, so
-    // their accepted work still takes this drain path before the store dies.
-    let Some(transport) = transport else {
-        return Ok(());
-    };
-    loop {
-        if !push_pending_outbox(lix, remote_id, transport, push_item_limit, delta_pull_limit)
-            .await?
-        {
-            return Ok(());
-        }
-        let cursor = lix
-            .load_sync_repository_cursor(remote_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "sync repository cursor disappeared while draining",
-                )
-            })?;
-        let response = pull_delta_adaptive(transport, cursor, delta_pull_limit).await?;
-        validate_delta_after(cursor, &response)?;
-        prepare_pull(lix, transport, &response).await?;
-        lix.apply_sync_repository_pull(remote_id, &response).await?;
-    }
-}
-
 pub(super) async fn sync_iteration<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     remote_id: &str,
     transport: &Transport,
-    push_item_limit: &mut usize,
     delta_pull_limit: &mut usize,
-    change_watcher: &mut tokio::sync::watch::Receiver<u64>,
     demand_rx: &mut tokio::sync::mpsc::Receiver<SyncDemand>,
     pending_demands: &mut Vec<SyncDemand>,
 ) -> Result<(), LixError>
@@ -593,16 +574,6 @@ where
         }
     }
 
-    // Establish the generation before inspecting the outbox. A commit racing
-    // with outbox construction then wakes the select below and cannot remain
-    // hidden behind an already-held long poll.
-    let _ = change_watcher.borrow_and_update();
-
-    // Publish completed local commits before waiting for remote work. Commit
-    // identity and ref compare-and-swap make retry after a lost response safe.
-    let ref_conflicted =
-        push_pending_outbox(lix, remote_id, transport, push_item_limit, delta_pull_limit).await?;
-
     let cursor = lix
         .load_sync_repository_cursor(remote_id)
         .await?
@@ -612,17 +583,9 @@ where
                 "sync repository cursor disappeared after bootstrap",
             )
         })?;
-    if ref_conflicted {
-        let response = pull_delta_adaptive(transport, cursor, delta_pull_limit).await?;
-        validate_delta_after(cursor, &response)?;
-        prepare_pull(lix, transport, &response).await?;
-        lix.apply_sync_repository_pull(remote_id, &response).await?;
-        return Ok(());
-    }
-    let local_changed = change_watcher.changed().fuse();
     let pull = pull_delta_adaptive(transport, cursor, delta_pull_limit).fuse();
     let demand = demand_rx.recv().fuse();
-    futures_util::pin_mut!(local_changed, pull, demand);
+    futures_util::pin_mut!(pull, demand);
     select_biased! {
         demand = demand => {
             pending_demands.push(demand.ok_or_else(|| {
@@ -630,7 +593,6 @@ where
             })?);
             Ok(())
         },
-        _ = local_changed => Ok(()),
         response = pull => {
             let response = response?;
             validate_delta_after(cursor, &response)?;
@@ -638,79 +600,6 @@ where
             lix.apply_sync_repository_pull(remote_id, &response).await?;
             Ok(())
         }
-    }
-}
-
-/// Publishes every currently admitted outbox batch. Returns `true` when a ref
-/// conflict requires one pull/reconciliation pass before publication resumes.
-async fn push_pending_outbox<StorageImpl, Transport>(
-    lix: &Lix<StorageImpl>,
-    remote_id: &str,
-    transport: &Transport,
-    push_item_limit: &mut usize,
-    delta_pull_limit: &mut usize,
-) -> Result<bool, LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-    Transport: SyncTransport,
-{
-    loop {
-        let Some(mut request) = lix.build_sync_push(remote_id, *push_item_limit).await? else {
-            return Ok(false);
-        };
-        let result = push_with_inline_fallback(lix, transport, &mut request).await;
-        match result {
-            Ok(receipt) => {
-                catch_up_to(lix, remote_id, transport, receipt.cursor, delta_pull_limit).await?;
-            }
-            // A ref moved concurrently. Pulling the authority's intervening
-            // events lets the importer reconcile local refs/outbox state; an
-            // immediate reconnect/re-push would repeat the same conflict.
-            Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => return Ok(true),
-            Err(error) if error.code == SYNC_REQUEST_TOO_LARGE_CODE => {
-                reduce_push_limit_after_too_large(push_item_limit, error)?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-async fn catch_up_to<StorageImpl, Transport>(
-    lix: &Lix<StorageImpl>,
-    remote_id: &str,
-    transport: &Transport,
-    target_cursor: u64,
-    delta_pull_limit: &mut usize,
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-    Transport: SyncTransport,
-{
-    loop {
-        let cursor = lix
-            .load_sync_repository_cursor(remote_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "sync repository cursor disappeared after push",
-                )
-            })?;
-        if cursor >= target_cursor {
-            return Ok(());
-        }
-        let response = pull_delta_adaptive(transport, cursor, delta_pull_limit).await?;
-        let next = validate_delta_after(cursor, &response)?;
-        if next <= cursor {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "sync push acknowledged cursor {target_cursor}, but pull remained at {cursor}"
-                ),
-            ));
-        }
-        prepare_pull(lix, transport, &response).await?;
-        lix.apply_sync_repository_pull(remote_id, &response).await?;
     }
 }
 
@@ -728,6 +617,20 @@ where
     .await
 }
 
+async fn pull_delta_now_adaptive<Transport>(
+    transport: &Transport,
+    after: u64,
+    limit: &mut usize,
+) -> Result<SyncRepositoryPullResponse, LixError>
+where
+    Transport: SyncTransport,
+{
+    fetch_adaptive(limit, "repository event", |limit| {
+        transport.pull_now(Some(after), limit)
+    })
+    .await
+}
+
 async fn fetch_snapshot_rows<Transport>(
     transport: &Transport,
     targets: &[(&str, &str)],
@@ -737,11 +640,11 @@ where
 {
     let mut rows = Vec::new();
     for target_batch in targets.chunks(SYNC_DEMAND_FETCH_CONCURRENCY) {
-        let batches = futures_util::future::try_join_all(
-            target_batch.iter().copied().map(|(branch_id, head_commit_id)| {
+        let batches = futures_util::future::try_join_all(target_batch.iter().copied().map(
+            |(branch_id, head_commit_id)| {
                 fetch_snapshot_target_rows(transport, branch_id, head_commit_id)
-            }),
-        )
+            },
+        ))
         .await?;
         rows.extend(batches.into_iter().flatten());
     }
@@ -836,15 +739,6 @@ fn is_response_too_large(error: &LixError) -> bool {
             && error.message.contains("response exceeds"))
 }
 
-fn reduce_push_limit_after_too_large(limit: &mut usize, error: LixError) -> Result<(), LixError> {
-    if *limit > 1 {
-        *limit = smaller_page_limit(*limit);
-        Ok(())
-    } else {
-        Err(sync_item_too_large_error("push item", error))
-    }
-}
-
 fn sync_item_too_large_error(kind: &str, source: LixError) -> LixError {
     LixError::new(
         SYNC_ITEM_TOO_LARGE_CODE,
@@ -896,6 +790,21 @@ fn is_retryable_sync_transport_error(error: &LixError) -> bool {
     matches!(status, Some(408 | 429 | 500..=599))
 }
 
+fn is_retryable_sync_demand_error(error: &LixError) -> bool {
+    // A durable browser replica can briefly have two publication workers while
+    // an old page is closing. If the sibling commits first, this worker's
+    // coherent read expires. The authority operation is already identified and
+    // a publication barrier is idempotent, so retain the waiter and re-pin from
+    // the durable receipt instead of leaking a storage race through the public
+    // connected handle.
+    error.code == LixError::CODE_STORAGE_READ_EXPIRED
+        || is_retryable_sync_transport_error(error)
+}
+
+fn retry_sync_iteration_without_reconnect(error: &LixError) -> bool {
+    error.code == LixError::CODE_STORAGE_READ_EXPIRED
+}
+
 async fn hydrate_and_resolve_sync_demands<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
@@ -907,10 +816,14 @@ where
 {
     let mut history_ids = BTreeSet::new();
     let mut chunk_ids = BTreeSet::new();
+    let publication_barrier_requested = demands
+        .iter()
+        .any(|demand| matches!(&demand.request, SyncDemandRequest::PublicationBarrier));
     for demand in &demands {
         match &demand.request {
             SyncDemandRequest::History(ids) => history_ids.extend(ids),
             SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
+            SyncDemandRequest::PublicationBarrier => {}
         }
     }
     let history_ids = history_ids.into_iter().cloned().collect::<BTreeSet<_>>();
@@ -925,6 +838,25 @@ where
     } else {
         hydrate_chunk_ids(lix, transport, chunk_ids).await
     };
+    let barrier_result = if publication_barrier_requested {
+        fence_replica_to_authority_head(lix, transport).await
+    } else {
+        Ok(())
+    };
+    resolve_sync_demand_results(
+        demands,
+        history_result,
+        chunk_result,
+        barrier_result,
+    )
+}
+
+fn resolve_sync_demand_results(
+    demands: Vec<SyncDemand>,
+    history_result: Result<(), LixError>,
+    chunk_result: Result<(), LixError>,
+    barrier_result: Result<(), LixError>,
+) -> (Vec<SyncDemand>, Option<LixError>) {
     let mut retry = Vec::new();
     let mut retry_error = None;
     for demand in demands {
@@ -934,9 +866,10 @@ where
         let result = match &demand.request {
             SyncDemandRequest::History(_) => history_result.clone(),
             SyncDemandRequest::Chunks(_) => chunk_result.clone(),
+            SyncDemandRequest::PublicationBarrier => barrier_result.clone(),
         };
         match result {
-            Err(error) if is_retryable_sync_transport_error(&error) => {
+            Err(error) if is_retryable_sync_demand_error(&error) => {
                 retry_error.get_or_insert(error);
                 retry.push(demand);
             }
@@ -946,6 +879,136 @@ where
         }
     }
     (retry, retry_error)
+}
+
+async fn fence_replica_to_authority_head<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let remote_id = lix.sync_mode_state().replica_remote_id().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync publication fence has no replica authority",
+        )
+    })?;
+
+    // Durable OPFS stores can briefly have two workers while an old page is
+    // closing. Re-pin if that sibling publishes beyond this fence's snapshot
+    // or wins the certification CAS; a fence must certify the durable receipt
+    // it actually returns, never a cursor cached before an overlapping apply.
+    'pin: loop {
+        let mut limit = super::MAX_SYNC_REQUEST_ITEMS;
+        let mut cursor = lix
+            .load_sync_repository_cursor(remote_id.as_ref())
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync repository cursor disappeared before publication fence",
+                )
+            })?;
+        let probe = pull_delta_now_adaptive(transport, cursor, &mut limit).await?;
+        validate_delta_after(cursor, &probe)?;
+        let probe_empty = matches!(
+            &probe,
+            SyncRepositoryPullResponse::Delta { events, .. } if events.is_empty()
+        );
+        if probe_empty && lix.sync_repository_cursor_is_certified(cursor).await? {
+            return Ok(());
+        }
+        if !probe_empty {
+            prepare_pull(lix, transport, &probe).await?;
+            lix.apply_sync_repository_pull(remote_id.as_ref(), &probe)
+                .await?;
+            cursor = lix
+                .load_sync_repository_cursor(remote_id.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "sync repository cursor disappeared during publication fence",
+                    )
+                })?;
+        }
+
+        // Pin the authority coordinate only after observing uncertified state.
+        // Snapshot metadata already carries the complete branch coordinates and
+        // roots required to certify the private replica receipt.
+        let snapshot = transport
+            .pull(None, super::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .map_err(snapshot_pull_error)?;
+        let target = match &snapshot {
+            SyncRepositoryPullResponse::Snapshot { cursor, .. } => *cursor,
+            SyncRepositoryPullResponse::Delta { .. } => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync publication fence did not receive snapshot metadata",
+                ));
+            }
+        };
+        if cursor > target {
+            continue 'pin;
+        }
+        while cursor < target {
+            let response = pull_delta_adaptive(transport, cursor, &mut limit).await?;
+            let response = truncate_delta_at_cursor(response, target)?;
+            let next = validate_delta_after(cursor, &response)?;
+            if next <= cursor {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync publication fence did not advance toward its pinned snapshot",
+                ));
+            }
+            prepare_pull(lix, transport, &response).await?;
+            lix.apply_sync_repository_pull(remote_id.as_ref(), &response)
+                .await?;
+            cursor = lix
+                .load_sync_repository_cursor(remote_id.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "sync repository cursor disappeared during publication catch-up",
+                    )
+                })?;
+            if cursor > target {
+                continue 'pin;
+            }
+        }
+        match lix.validate_sync_publication_snapshot(&snapshot).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => continue 'pin,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn truncate_delta_at_cursor(
+    response: SyncRepositoryPullResponse,
+    target: u64,
+) -> Result<SyncRepositoryPullResponse, LixError> {
+    let SyncRepositoryPullResponse::Delta { cursor, mut events } = response else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync publication catch-up received snapshot metadata",
+        ));
+    };
+    if cursor <= target {
+        return Ok(SyncRepositoryPullResponse::Delta { cursor, events });
+    }
+    events.retain(|event| event.cursor <= target);
+    let cursor = events.last().map(|event| event.cursor).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync publication catch-up omitted its pinned target event",
+        )
+    })?;
+    Ok(SyncRepositoryPullResponse::Delta { cursor, events })
 }
 
 async fn hydrate_history_ids<StorageImpl, Transport>(
@@ -1045,7 +1108,10 @@ fn validate_history_page_body_budget(
             "sync history response exceeds the requested page limit",
         ));
     }
-    for dependency_id in commits.keys().filter(|commit_id| !causal.contains(**commit_id)) {
+    for dependency_id in commits
+        .keys()
+        .filter(|commit_id| !causal.contains(**commit_id))
+    {
         if !dependency_ids.contains(dependency_id) {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -1090,9 +1156,9 @@ fn merge_fetched_history_response(
         ));
     }
     for boundary in response.boundaries {
-        let is_external_base = response_commits.iter().any(|commit| {
-            commit.base_commit_id.as_deref() == Some(boundary.commit_id.as_str())
-        });
+        let is_external_base = response_commits
+            .iter()
+            .any(|commit| commit.base_commit_id.as_deref() == Some(boundary.commit_id.as_str()));
         if !returned.contains(&boundary.commit_id) && !is_external_base {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -1177,9 +1243,11 @@ where
             break;
         }
         for missing_batch in missing.chunks(SYNC_DEMAND_FETCH_CONCURRENCY) {
-            let responses = futures_util::future::try_join_all(missing_batch.iter().map(|head| {
-                fetch_history_head(transport, head, 1, max_boundaries_per_page)
-            }))
+            let responses = futures_util::future::try_join_all(
+                missing_batch
+                    .iter()
+                    .map(|head| fetch_history_head(transport, head, 1, max_boundaries_per_page)),
+            )
             .await?;
             for (head, response) in missing_batch.iter().zip(responses) {
                 merge_fetched_history_response(
@@ -1281,6 +1349,33 @@ where
     ensure_blob_manifests(lix, transport, blob_ids).await
 }
 
+/// Registers every snapshot manifest and eagerly materializes only the binary
+/// payloads reachable from current branch heads. Snapshot installation happens
+/// after this returns, so a certified HOT row is never published before all
+/// chunks needed to serve its `lix_file.content` are local.
+pub(super) async fn register_hot_blob_manifests<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    commits: &[super::SyncCommit],
+    rows: &[super::SyncSnapshotRow],
+    live_blob_ids: BTreeSet<String>,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let mut deferred_blob_ids = super::repository::sync_commit_blob_ids(commits)?;
+    deferred_blob_ids.extend(blob_ids_from_rows(
+        rows.iter()
+            .map(|row| (row.schema_key.as_str(), row.snapshot.as_ref())),
+    )?);
+    for blob_id in &live_blob_ids {
+        deferred_blob_ids.remove(blob_id);
+    }
+    ensure_blob_manifests(lix, transport, deferred_blob_ids).await?;
+    hydrate_blob_ids(lix, transport, live_blob_ids).await
+}
+
 async fn hydrate_chunk_ids<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
@@ -1304,6 +1399,28 @@ where
     Ok(())
 }
 
+async fn hydrate_blob_ids<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    blob_ids: BTreeSet<String>,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let blob_ids = blob_ids.into_iter().collect::<Vec<_>>();
+    let mut missing_chunk_ids = BTreeSet::new();
+    for requested in blob_ids.chunks(super::MAX_SYNC_BLOB_BATCH_ITEMS) {
+        let manifests = transport.get_blobs(requested).await?;
+        validate_blob_manifest_batch(requested, &manifests)?;
+        for manifest in manifests {
+            let registration = lix.register_deferred_sync_blob_manifest(&manifest).await?;
+            missing_chunk_ids.extend(registration.missing_chunk_ids);
+        }
+    }
+    hydrate_chunk_ids(lix, transport, missing_chunk_ids).await
+}
+
 /// Drives the same lazy history/blob hydration path as a live sync worker.
 /// Kept test-only so deterministic simulations can advance without spawning
 /// background tasks or introducing a second demand implementation.
@@ -1324,84 +1441,9 @@ where
         Some(SyncDemandRequest::Chunks(ids)) => {
             hydrate_chunk_ids(lix, transport, ids.into_iter().collect()).await
         }
+        Some(SyncDemandRequest::PublicationBarrier) => Ok(()),
         None => Err(error),
     }
-}
-
-async fn push_request_blobs<StorageImpl, Transport>(
-    lix: &Lix<StorageImpl>,
-    transport: &Transport,
-    request: &SyncPushRequest,
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-    Transport: SyncTransport,
-{
-    let inline_blob_ids = request
-        .inline_blobs
-        .iter()
-        .map(|manifest| manifest.blob_id.as_str())
-        .collect::<BTreeSet<_>>();
-    for blob_id in super::repository::sync_commit_blob_ids(&request.commits)? {
-        if inline_blob_ids.contains(blob_id.as_str()) {
-            continue;
-        }
-        let manifest = lix.get_sync_blob_manifest(&blob_id).await?.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("local push references missing sync blob '{blob_id}'"),
-            )
-        })?;
-        let mut registration = transport.register_blob(&manifest).await?;
-        for chunk_id in registration
-            .missing_chunk_ids
-            .iter()
-            .collect::<BTreeSet<_>>()
-        {
-            let bytes = lix
-                .get_sync_chunk(chunk_id)
-                .await?
-                .ok_or_else(|| missing_chunk_error(chunk_id, &blob_id, "local push"))?;
-            transport.put_chunk(chunk_id, &bytes).await?;
-        }
-        if !registration.missing_chunk_ids.is_empty() {
-            registration = transport.register_blob(&manifest).await?;
-        }
-        if !registration.missing_chunk_ids.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "sync blob '{blob_id}' remained incomplete after uploading requested chunks"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn push_with_inline_fallback<StorageImpl, Transport>(
-    lix: &Lix<StorageImpl>,
-    transport: &Transport,
-    request: &mut SyncPushRequest,
-) -> Result<super::SyncPushResponse, LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-    Transport: SyncTransport,
-{
-    push_request_blobs(lix, transport, request).await?;
-    let first = transport.push(request).await;
-    let request_too_large = first
-        .as_ref()
-        .is_err_and(|error| error.code == SYNC_REQUEST_TOO_LARGE_CODE);
-    if request_too_large && !request.inline_blobs.is_empty() {
-        // A server may configure a lower request-body cap than the protocol
-        // default. Inline blobs are optional acceleration: retry the exact
-        // commit/ref request once through the ordinary manifest lane.
-        request.inline_blobs.clear();
-        push_request_blobs(lix, transport, request).await?;
-        return transport.push(request).await;
-    }
-    first
 }
 
 async fn prepare_pull<StorageImpl, Transport>(
@@ -1416,10 +1458,10 @@ where
     let SyncRepositoryPullResponse::Delta { events, .. } = response else {
         return Ok(());
     };
-    let mut blob_ids = BTreeSet::new();
+    let mut referenced_blob_ids = BTreeSet::new();
     let mut inline_blob_ids = BTreeSet::new();
     for event in events {
-        blob_ids.extend(super::repository::sync_commit_blob_ids(&event.commits)?);
+        referenced_blob_ids.extend(super::repository::sync_commit_blob_ids(&event.commits)?);
         inline_blob_ids.extend(
             event
                 .inline_blobs
@@ -1427,8 +1469,6 @@ where
                 .map(|manifest| manifest.blob_id.clone()),
         );
     }
-    blob_ids.retain(|blob_id| !inline_blob_ids.contains(blob_id));
-    ensure_blob_manifests(lix, transport, blob_ids).await?;
     let included = events
         .iter()
         .flat_map(|event| event.commits.iter().map(|commit| commit.commit_id.as_str()))
@@ -1446,7 +1486,31 @@ where
         .filter(|commit_id| !included.contains(commit_id.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
-    hydrate_history_ids(lix, transport, targets).await
+    // Ref resets and branch creation can name an older body that is not in the
+    // delta. Materialize those sparse boundaries before deriving final HOT
+    // reachability from the imported-state overlay.
+    hydrate_history_ids(lix, transport, targets).await?;
+
+    let hot = lix.sync_delta_hot_blob_plan(response).await?;
+    let mut eager_blob_ids = referenced_blob_ids
+        .intersection(&hot.live_blob_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    // A page-carried child can inherit a final-live payload from an external
+    // ancestor. That payload is not referenced by any page commit, so include
+    // surviving external row owners explicitly rather than keying this decision
+    // only on whether the final target commit itself was external.
+    eager_blob_ids.extend(hot.external_survivor_blob_ids);
+    eager_blob_ids.retain(|blob_id| !inline_blob_ids.contains(blob_id));
+
+    // Cold commit bodies retain authenticated manifest metadata for later
+    // history reads, but only payloads reachable from the page's final
+    // head/checkpoint coordinates cross the eager chunk lane.
+    let mut cold_blob_ids = referenced_blob_ids;
+    cold_blob_ids
+        .retain(|blob_id| !inline_blob_ids.contains(blob_id) && !eager_blob_ids.contains(blob_id));
+    ensure_blob_manifests(lix, transport, cold_blob_ids).await?;
+    hydrate_blob_ids(lix, transport, eager_blob_ids).await
 }
 
 async fn ensure_blob_manifests<StorageImpl, Transport>(
@@ -1467,23 +1531,34 @@ where
     }
     for requested in missing.chunks(super::MAX_SYNC_BLOB_BATCH_ITEMS) {
         let manifests = transport.get_blobs(requested).await?;
-        if manifests.len() != requested.len() {
+        validate_blob_manifest_batch(requested, &manifests)?;
+        for (blob_id, manifest) in requested.iter().zip(manifests) {
+            debug_assert_eq!(manifest.blob_id, *blob_id);
+            lix.register_deferred_sync_blob_manifest(&manifest).await?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_blob_manifest_batch(
+    requested: &[String],
+    manifests: &[super::SyncBlobManifest],
+) -> Result<(), LixError> {
+    if manifests.len() != requested.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "sync blob batch response omitted or added manifests",
+        ));
+    }
+    for (blob_id, manifest) in requested.iter().zip(manifests) {
+        if manifest.blob_id != *blob_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "sync blob batch response omitted or added manifests",
+                format!(
+                    "sync blob request '{blob_id}' returned manifest '{}'",
+                    manifest.blob_id
+                ),
             ));
-        }
-        for (blob_id, manifest) in requested.iter().zip(manifests) {
-            if manifest.blob_id != *blob_id {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "sync blob request '{blob_id}' returned manifest '{}'",
-                        manifest.blob_id
-                    ),
-                ));
-            }
-            lix.register_deferred_sync_blob_manifest(&manifest).await?;
         }
     }
     Ok(())
@@ -1800,10 +1875,8 @@ mod tests {
     #[derive(Debug)]
     struct BlobCallTransport {
         manifests: BTreeMap<String, super::super::SyncBlobManifest>,
+        chunks: BTreeMap<String, Vec<u8>>,
         get_calls: Arc<Mutex<Vec<Vec<String>>>>,
-        register_calls: Arc<Mutex<Vec<String>>>,
-        push_calls: Arc<Mutex<Vec<usize>>>,
-        reject_inline_push: bool,
     }
 
     impl SyncTransport for BlobCallTransport {
@@ -1813,22 +1886,9 @@ mod tests {
 
         fn push<'a>(
             &'a self,
-            request: &'a SyncPushRequest,
+            _request: &'a SyncPushRequest,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncPushResponse> {
-            Box::pin(async move {
-                self.push_calls
-                    .lock()
-                    .expect("push calls lock")
-                    .push(request.inline_blobs.len());
-                if self.reject_inline_push && !request.inline_blobs.is_empty() {
-                    Err(LixError::new(
-                        SYNC_REQUEST_TOO_LARGE_CODE,
-                        "test server inline body cap",
-                    ))
-                } else {
-                    Ok(super::super::SyncPushResponse { cursor: 1 })
-                }
-            })
+            Box::pin(async { Err(LixError::unknown("replica push is not used")) })
         }
 
         fn pull(
@@ -1875,24 +1935,16 @@ mod tests {
 
         fn register_blob<'a>(
             &'a self,
-            manifest: &'a super::super::SyncBlobManifest,
+            _manifest: &'a super::super::SyncBlobManifest,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncBlobRegistration> {
-            Box::pin(async move {
-                self.register_calls
-                    .lock()
-                    .expect("register calls lock")
-                    .push(manifest.blob_id.clone());
-                Ok(super::super::SyncBlobRegistration {
-                    missing_chunk_ids: Vec::new(),
-                })
-            })
+            Box::pin(async { Err(LixError::unknown("replica blob upload is not used")) })
         }
 
         fn get_chunk<'a>(
             &'a self,
-            _chunk_id: &'a str,
+            chunk_id: &'a str,
         ) -> super::super::SyncTransportFuture<'a, Option<Vec<u8>>> {
-            Box::pin(async { Err(LixError::unknown("unused blob-call chunk get")) })
+            Box::pin(async move { Ok(self.chunks.get(chunk_id).cloned()) })
         }
 
         fn put_chunk<'a>(
@@ -1955,29 +2007,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inline_blobs_skip_manifest_network_lanes_while_large_blobs_fall_back() {
+    async fn inline_blobs_skip_manifest_fetch_while_large_blobs_use_it() {
         let lix = open_lix().await.expect("runtime blob fixture opens");
         let inline = wire_blob(b"small inline runtime payload", true);
         let inline_commit = blob_ref_commit(&inline.blob_id);
         let get_calls = Arc::new(Mutex::new(Vec::new()));
-        let register_calls = Arc::new(Mutex::new(Vec::new()));
-        let push_calls = Arc::new(Mutex::new(Vec::new()));
         let transport = BlobCallTransport {
             manifests: BTreeMap::new(),
+            chunks: BTreeMap::new(),
             get_calls: Arc::clone(&get_calls),
-            register_calls: Arc::clone(&register_calls),
-            push_calls: Arc::clone(&push_calls),
-            reject_inline_push: false,
         };
-        let mut push = SyncPushRequest {
-            commits: vec![inline_commit.clone()],
-            ref_updates: Vec::new(),
-            inline_blobs: vec![inline.clone()],
-        };
-        push_with_inline_fallback(&lix, &transport, &mut push)
-            .await
-            .expect("embedded outbound blob pushes directly");
-        assert_eq!(*push_calls.lock().expect("push calls lock"), vec![1]);
         let inline_delta = SyncRepositoryPullResponse::Delta {
             cursor: 1,
             events: vec![super::super::SyncEvent {
@@ -1993,14 +2032,6 @@ mod tests {
 
         let empty = wire_blob(&[], true);
         let empty_commit = blob_ref_commit(&empty.blob_id);
-        let mut empty_push = SyncPushRequest {
-            commits: vec![empty_commit.clone()],
-            ref_updates: Vec::new(),
-            inline_blobs: vec![empty.clone()],
-        };
-        push_with_inline_fallback(&lix, &transport, &mut empty_push)
-            .await
-            .expect("empty blob pushes inline without a manifest request");
         prepare_pull(
             &lix,
             &transport,
@@ -2016,24 +2047,27 @@ mod tests {
         )
         .await
         .expect("empty blob arrives inline without a manifest fetch");
-        assert_eq!(*push_calls.lock().expect("push calls lock"), vec![1, 1]);
         assert!(get_calls.lock().expect("get calls lock").is_empty());
-        assert!(
-            register_calls
-                .lock()
-                .expect("register calls lock")
-                .is_empty()
-        );
 
-        let large = wire_blob(&vec![7_u8; 65 * 1024], false);
+        let large_bytes = vec![7_u8; 65 * 1024];
+        let large = wire_blob(&large_bytes, false);
         let large_commit = blob_ref_commit(&large.blob_id);
+        let mut offset = 0_usize;
+        let large_chunks = large
+            .chunks
+            .iter()
+            .map(|chunk| {
+                let end = offset + chunk.size_bytes as usize;
+                let bytes = large_bytes[offset..end].to_vec();
+                offset = end;
+                (chunk.chunk_id.clone(), bytes)
+            })
+            .collect();
         let large_get_calls = Arc::new(Mutex::new(Vec::new()));
         let large_transport = BlobCallTransport {
             manifests: BTreeMap::from([(large.blob_id.clone(), large)]),
+            chunks: large_chunks,
             get_calls: Arc::clone(&large_get_calls),
-            register_calls: Arc::new(Mutex::new(Vec::new())),
-            push_calls: Arc::new(Mutex::new(Vec::new())),
-            reject_inline_push: false,
         };
         prepare_pull(
             &lix,
@@ -2054,43 +2088,6 @@ mod tests {
             large_get_calls.lock().expect("large get calls lock").len(),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn lower_server_body_cap_retries_inline_push_through_manifest_lane() {
-        let lix = open_lix().await.expect("inline fallback fixture opens");
-        let bytes = b"inline fallback payload";
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-            &[
-                Value::Text("/inline-fallback.bin".to_owned()),
-                Value::Blob(bytes.to_vec().into()),
-            ],
-        )
-        .await
-        .expect("inline fallback blob should commit locally");
-        let inline = wire_blob(bytes, true);
-        let mut request = SyncPushRequest {
-            commits: vec![blob_ref_commit(&inline.blob_id)],
-            ref_updates: Vec::new(),
-            inline_blobs: vec![inline],
-        };
-        let register_calls = Arc::new(Mutex::new(Vec::new()));
-        let push_calls = Arc::new(Mutex::new(Vec::new()));
-        let transport = BlobCallTransport {
-            manifests: BTreeMap::new(),
-            get_calls: Arc::new(Mutex::new(Vec::new())),
-            register_calls: Arc::clone(&register_calls),
-            push_calls: Arc::clone(&push_calls),
-            reject_inline_push: true,
-        };
-        let response = push_with_inline_fallback(&lix, &transport, &mut request)
-            .await
-            .expect("manifest fallback should fit lower server body cap");
-        assert_eq!(response.cursor, 1);
-        assert!(request.inline_blobs.is_empty());
-        assert_eq!(*push_calls.lock().expect("push calls lock"), vec![1, 0]);
-        assert_eq!(register_calls.lock().expect("register calls lock").len(), 1);
     }
 
     #[derive(Debug)]
@@ -2565,6 +2562,32 @@ mod tests {
     }
 
     #[test]
+    fn publication_fence_truncates_a_delta_at_its_pinned_snapshot_cursor() {
+        let event = |cursor| super::super::SyncEvent {
+            cursor,
+            commits: Vec::new(),
+            ref_updates: Vec::new(),
+            inline_blobs: Vec::new(),
+        };
+        let truncated = truncate_delta_at_cursor(
+            SyncRepositoryPullResponse::Delta {
+                cursor: 10,
+                events: vec![event(8), event(9), event(10)],
+            },
+            9,
+        )
+        .expect("pinned cursor should truncate a later authority page");
+        let SyncRepositoryPullResponse::Delta { cursor, events } = truncated else {
+            unreachable!();
+        };
+        assert_eq!(cursor, 9);
+        assert_eq!(
+            events.iter().map(|event| event.cursor).collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+    }
+
+    #[test]
     fn retry_is_bounded() {
         assert_eq!(
             next_backoff(Duration::from_secs(20)),
@@ -2593,28 +2616,6 @@ mod tests {
             *calls.lock().expect("pull calls lock"),
             vec![512, 256, 128, 64, 32, 16]
         );
-    }
-
-    #[test]
-    fn push_request_cap_halves_then_reports_one_terminal_item() {
-        let request_too_large = || {
-            LixError::new(
-                SYNC_REQUEST_TOO_LARGE_CODE,
-                "sync push request exceeds the protocol body limit",
-            )
-        };
-        let mut limit = super::super::MAX_SYNC_REQUEST_ITEMS;
-        assert!(is_response_too_large(&request_too_large()));
-        reduce_push_limit_after_too_large(&mut limit, request_too_large())
-            .expect("a multi-item push should retry with a smaller batch");
-        assert_eq!(limit, super::super::MAX_SYNC_REQUEST_ITEMS / 2);
-
-        limit = 1;
-        let error = reduce_push_limit_after_too_large(&mut limit, request_too_large())
-            .expect_err("one oversized push item cannot be split further");
-        assert_eq!(error.code, SYNC_ITEM_TOO_LARGE_CODE);
-        assert!(error.message.contains("protocol transfer limit"));
-        assert!(is_terminal_sync_error(&error));
     }
 
     #[test]
@@ -2903,7 +2904,10 @@ mod tests {
             super::super::SYNC_PROTOCOL_MISMATCH_CODE,
             super::super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE,
         ] {
-            assert!(is_terminal_sync_error(&LixError::new(code, "terminal sync mismatch")));
+            assert!(is_terminal_sync_error(&LixError::new(
+                code,
+                "terminal sync mismatch"
+            )));
         }
     }
 
@@ -3309,6 +3313,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "public historical SQL is server-first in v3"]
     async fn one_history_demand_hydrates_and_retries_sql_while_deduping_callers() {
         let (replica, parent, head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture().await;
@@ -3410,10 +3415,7 @@ mod tests {
             Some(20),
             "a short checkpoint-dense tail shrinks from its returned size",
         );
-        assert_eq!(
-            smaller_history_demand_page_limit(20, 20, 19, 4),
-            Some(10),
-        );
+        assert_eq!(smaller_history_demand_page_limit(20, 20, 19, 4), Some(10),);
         assert_eq!(
             smaller_history_demand_page_limit(5, 5, 4, 4),
             None,
@@ -3499,6 +3501,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "public historical SQL is server-first in v3"]
     async fn history_hydration_waits_for_collaboration_read_quiescence() {
         let (replica, parent, head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture().await;
@@ -3593,17 +3596,13 @@ mod tests {
             response,
         }];
         let (_demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
-        let mut push_item_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
         let mut delta_pull_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
-        let mut change_watcher = replica.sync_mode_state().change_watcher();
 
         let error = sync_iteration(
             &replica,
             "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005",
             &transport,
-            &mut push_item_limit,
             &mut delta_pull_limit,
-            &mut change_watcher,
             &mut demand_rx,
             &mut demands,
         )
@@ -3623,9 +3622,7 @@ mod tests {
             &replica,
             "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005",
             &transport,
-            &mut push_item_limit,
             &mut delta_pull_limit,
-            &mut change_watcher,
             &mut demand_rx,
             &mut demands,
         )
@@ -3665,17 +3662,13 @@ mod tests {
             response,
         }];
         let (_demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
-        let mut push_item_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
         let mut delta_pull_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
-        let mut change_watcher = replica.sync_mode_state().change_watcher();
 
         let error = sync_iteration(
             &replica,
             "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005",
             &transport,
-            &mut push_item_limit,
             &mut delta_pull_limit,
-            &mut change_watcher,
             &mut demand_rx,
             &mut demands,
         )
@@ -3704,9 +3697,73 @@ mod tests {
             LixError::CODE_INTERNAL_ERROR,
             "missing chunk"
         ),));
+        assert!(is_retryable_sync_demand_error(&LixError::new(
+            LixError::CODE_STORAGE_READ_EXPIRED,
+            "a sibling published the certified receipt",
+        )));
+        assert!(!is_retryable_sync_demand_error(&LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "semantic conflict",
+        )));
+        assert!(retry_sync_iteration_without_reconnect(&LixError::new(
+            LixError::CODE_STORAGE_READ_EXPIRED,
+            "a sibling published the certified receipt",
+        )));
+        assert!(!retry_sync_iteration_without_reconnect(&LixError::new(
+            super::super::http::SYNC_TRANSPORT_ERROR_CODE,
+            "disconnected",
+        )));
     }
 
     #[tokio::test]
+    async fn publication_barrier_waiter_survives_repeated_local_read_expiry() {
+        let (response, mut done) = tokio::sync::oneshot::channel();
+        let demands = vec![SyncDemand {
+            request: SyncDemandRequest::PublicationBarrier,
+            response,
+        }];
+        let expired = || {
+            Err(LixError::new(
+                LixError::CODE_STORAGE_READ_EXPIRED,
+                "a sibling published the certified receipt",
+            ))
+        };
+
+        let (demands, first_error) =
+            resolve_sync_demand_results(demands, Ok(()), Ok(()), expired());
+        assert_eq!(demands.len(), 1);
+        assert_eq!(
+            first_error.expect("expiry enters retry path").code,
+            LixError::CODE_STORAGE_READ_EXPIRED,
+        );
+        assert!(matches!(
+            done.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let (demands, second_error) =
+            resolve_sync_demand_results(demands, Ok(()), Ok(()), expired());
+        assert_eq!(demands.len(), 1);
+        assert_eq!(
+            second_error.expect("repeated expiry remains retryable").code,
+            LixError::CODE_STORAGE_READ_EXPIRED,
+        );
+        assert!(matches!(
+            done.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let (demands, retry_error) =
+            resolve_sync_demand_results(demands, Ok(()), Ok(()), Ok(()));
+        assert!(demands.is_empty());
+        assert!(retry_error.is_none());
+        done.await
+            .expect("publication waiter remains connected")
+            .expect("later retry certifies the authority write");
+    }
+
+    #[tokio::test]
+    #[ignore = "public historical SQL is server-first in v3"]
     async fn missing_sparse_boundary_hydrates_through_shared_retry_path() {
         let (replica, _parent, _head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture_with_depth(32).await;
@@ -3848,6 +3905,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "replica transactions are authority-routed in v3"]
     async fn explicit_transaction_surfaces_structured_history_demand() {
         let (replica, parent, head, _commits, _commit_headers, _history_boundaries, _boundary_rows) =
             history_fixture().await;

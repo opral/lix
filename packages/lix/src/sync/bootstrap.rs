@@ -158,16 +158,17 @@ pub(crate) async fn prepare_sync_bootstrap(
 pub(crate) async fn install_sync_bootstrap<StorageImpl>(
     lix: &mut Lix<StorageImpl>,
     server: &crate::ServerOptions,
-    prepared: PreparedSyncBootstrap,
+    mut prepared: PreparedSyncBootstrap,
 ) -> Result<HttpSyncTransport, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    if let Err(error) = runtime::register_blob_manifests(
+    if let Err(error) = runtime::register_hot_blob_manifests(
         lix,
         &prepared.transport,
         &prepared.snapshot.commits,
         &prepared.snapshot.rows,
+        std::mem::take(&mut prepared.snapshot.live_blob_ids),
     )
     .await
     {
@@ -391,7 +392,11 @@ mod tests {
             value,
         );
         adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
+            .commit_certified_replica_write_set(
+                crate::sync::certified_replica_write_capability(),
+                writes,
+                StorageWriteOptions::default(),
+            )
             .await
             .expect("replica state should commit");
     }

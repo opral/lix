@@ -10,9 +10,6 @@ use crate::branch::BranchRefReader;
 use crate::common::{ExecuteStatementMetadata, ExpiredReadRetryState};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
-use crate::telemetry::{
-    ActiveTelemetrySpan, CHECKPOINT_CREATE, Status, TelemetryAttribute,
-};
 use crate::sql2;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::Storage;
@@ -20,6 +17,7 @@ use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
     StorageReadDurability, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
+use crate::telemetry::{ActiveTelemetrySpan, CHECKPOINT_CREATE, Status, TelemetryAttribute};
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{Blob, LixError, LixNotice, ResultColumnType, RowRef, SqlQueryResult, Value};
 use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
@@ -36,10 +34,10 @@ use futures_util::TryStreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::Instrument as _;
 
+use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::{SessionTransaction, transaction_state_error};
-use super::ExecuteIdempotency;
 use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
@@ -227,15 +225,13 @@ impl ExecuteResult {
             checkpoint_telemetry,
         } = result;
         let mut result = match returning {
-            Some(result) => {
-                Self::from_query_parts(
-                    result.columns,
-                    result.column_types,
-                    result.rows,
-                    rows_affected,
-                    result.notices,
-                )
-            }
+            Some(result) => Self::from_query_parts(
+                result.columns,
+                result.column_types,
+                result.rows,
+                rows_affected,
+                result.notices,
+            ),
             None => Self::from_rows_affected(rows_affected),
         };
         result.checkpoint_telemetry = checkpoint_telemetry;
@@ -268,7 +264,6 @@ impl ExecuteResult {
         Self::from_query_parts(columns, column_types, rows, rows_affected, notices)
     }
 
-    #[cfg(feature = "server-protocol-client")]
     pub(crate) fn from_protocol_response(
         statement_index: Option<usize>,
         label: Option<String>,
@@ -936,6 +931,39 @@ where
         execution_disposition(&statement)
     }
 
+    pub(crate) fn statement_authority_route(
+        &self,
+        sql: &str,
+    ) -> Result<sql2::StatementAuthorityRoute, LixError> {
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        sql2::statement_authority_route(&statement)
+    }
+
+    pub(crate) fn batch_authority_route(
+        &self,
+        statements: &[ExecuteBatchStatement],
+    ) -> Result<sql2::StatementAuthorityRoute, LixError> {
+        let mut route = sql2::StatementAuthorityRoute::HotRead;
+        for (statement_index, statement) in statements.iter().enumerate() {
+            let parsed = self
+                .sql_planning_cache
+                .parse_statement(&statement.sql)
+                .map_err(|error| with_batch_statement_index(error, statement_index))?;
+            match sql2::statement_authority_route(&parsed)
+                .map_err(|error| with_batch_statement_index(error, statement_index))?
+            {
+                sql2::StatementAuthorityRoute::AuthorityWrite => {
+                    return Ok(sql2::StatementAuthorityRoute::AuthorityWrite);
+                }
+                sql2::StatementAuthorityRoute::AuthorityRead => {
+                    route = sql2::StatementAuthorityRoute::AuthorityRead;
+                }
+                sql2::StatementAuthorityRoute::HotRead => {}
+            }
+        }
+        Ok(route)
+    }
+
     /// Classifies an atomic SQL batch for a caller that owns its transport
     /// lifecycle.
     ///
@@ -1497,10 +1525,7 @@ where
                         if let Some(span) = checkpoint_span {
                             span.finish(
                                 Status::error(error.code.clone()),
-                                vec![TelemetryAttribute::string(
-                                    "error.type",
-                                    error.code.clone(),
-                                )],
+                                vec![TelemetryAttribute::string("error.type", error.code.clone())],
                             );
                         }
                         Err(error)
@@ -1804,7 +1829,10 @@ where
         if self.base_refresh_generation.load(Ordering::SeqCst) == invalidation_generation {
             return Ok(());
         }
-        let read = self.storage.begin_read(StorageReadOptions::default()).await?;
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await?;
         let active_branch_id = self.active_branch_id_from_reader(&read).await?;
         if active_branch_id == crate::GLOBAL_BRANCH_ID {
             if let Some(global_head) = self
@@ -1865,18 +1893,24 @@ where
                 .store(invalidation_generation, Ordering::SeqCst);
             return Ok(());
         }
+        if self.sync_mode.role() == crate::sync::SyncRole::Replica {
+            return Err(crate::sync::authority_execution_required(
+                sql2::StatementAuthorityRoute::AuthorityWrite,
+            ));
+        }
         drop(read);
 
         let write_access = self.begin_session_write_access().await?;
-        let result = self.with_write_transaction_reserved_lending(
-            write_access,
-            async move |transaction| {
-                transaction.stage_base_refresh_if_needed().await?;
-                Ok(())
-            },
-            |_| Ok(()),
-        )
-        .await;
+        let result = self
+            .with_write_transaction_reserved_lending(
+                write_access,
+                async move |transaction| {
+                    transaction.stage_base_refresh_if_needed().await?;
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .await;
         if result.is_ok() {
             *self.observed_global_head.write().map_err(|_| {
                 LixError::new(
@@ -1905,8 +1939,8 @@ where
         idempotency: ExecuteIdempotency,
     ) -> Result<ExecuteResult, LixError> {
         let mut expired_read_retries = ExpiredReadRetryState::default();
-        if let IdempotencyReceiptResolution::Replay(receipt) =
-            self.resolve_idempotency_receipt_with_expired_read_retry(
+        if let IdempotencyReceiptResolution::Replay(receipt) = self
+            .resolve_idempotency_receipt_with_expired_read_retry(
                 &idempotency,
                 &mut expired_read_retries,
             )
@@ -2358,11 +2392,8 @@ where
                         Ok(results) => return Ok(results),
                         Err(error)
                             if error.code == LixError::CODE_STORAGE_READ_EXPIRED
-                                && retry_expired_auto_commit(
-                                    &mut expired_read_retries,
-                                    &error,
-                                )
-                                .await =>
+                                && retry_expired_auto_commit(&mut expired_read_retries, &error)
+                                    .await =>
                         {
                             continue;
                         }
@@ -2380,17 +2411,17 @@ where
                                 )
                                 .await
                             {
-                            Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
-                                // See the single-statement recovery path:
-                                // positive receipt proof means a commit
-                                // happened after its normal invalidation
-                                // callback was bypassed by an ambiguous error.
-                                self.observe_invalidation.bump();
-                                self.file_views.clear();
-                                receipt.into_results()
-                            }
-                            Ok(IdempotencyReceiptResolution::Absent) => Err(error),
-                            Err(recovery_error) => Err(recovery_error),
+                                Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
+                                    // See the single-statement recovery path:
+                                    // positive receipt proof means a commit
+                                    // happened after its normal invalidation
+                                    // callback was bypassed by an ambiguous error.
+                                    self.observe_invalidation.bump();
+                                    self.file_views.clear();
+                                    receipt.into_results()
+                                }
+                                Ok(IdempotencyReceiptResolution::Absent) => Err(error),
+                                Err(recovery_error) => Err(recovery_error),
                             };
                         }
                         Err(error) => return Err(error),
@@ -2717,7 +2748,7 @@ where
 
     pub(crate) fn execute_coherent_read_batch_owned(
         self: Arc<Self>,
-        statements: Vec<(String, Vec<Value>)>,
+        statements: Arc<Vec<(String, Vec<Value>)>>,
     ) -> impl Future<Output = Result<CoherentReadBatch, LixError>> + Send + 'static {
         // SAFETY: the future owns its Arc session and every SQL/parameter
         // payload. Storage read handles are Send by the Storage contract; the
@@ -5770,9 +5801,7 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
     use crate::row_pk::RowPk;
-    use crate::storage_adapter::{
-        MemoryRead, MemoryWrite, StorageError, StorageSessionToken,
-    };
+    use crate::storage_adapter::{MemoryRead, MemoryWrite, StorageError, StorageSessionToken};
     use crate::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, TelemetryValue};
     use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
     use crate::{
@@ -5816,11 +5845,10 @@ mod tests {
 
         fn expire_after_reads(&self, reads_until_expiry: usize, count: usize) {
             assert!(count > 0);
-            *self.schedule.lock().expect("expiry schedule should lock") =
-                Some(ExpirySchedule {
-                    reads_until_expiry,
-                    remaining_expiries: count,
-                });
+            *self.schedule.lock().expect("expiry schedule should lock") = Some(ExpirySchedule {
+                reads_until_expiry,
+                remaining_expiries: count,
+            });
         }
 
         fn remaining_expiries(&self) -> usize {
@@ -6110,6 +6138,84 @@ mod tests {
                 .map(|commit_id| commit_id.to_string()),
             Some(restored_commit_id)
         );
+    }
+
+    #[tokio::test]
+    async fn one_argument_diff_uses_private_cursor_without_changing_public_latest_checkpoint() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('private-cursor', 'ancestor')",
+                &[],
+            )
+            .await
+            .expect("seed arbitrary non-checkpoint branch root");
+        let ancestor = session
+            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+            .await
+            .expect("ancestor head should read")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("ancestor head should be text");
+        let branch = session
+            .create_branch(crate::CreateBranchOptions {
+                id: None,
+                name: "private-working-diff-cursor".to_owned(),
+                from_commit_id: Some(ancestor),
+            })
+            .await
+            .expect("branch from arbitrary commit should be created");
+        session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: branch.id.clone(),
+            })
+            .await
+            .expect("branch should switch");
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'child' WHERE key = 'private-cursor'",
+                &[],
+            )
+            .await
+            .expect("child mutation should commit");
+
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch control read should open");
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch.id)
+            .await
+            .expect("branch control should read")
+            .expect("branch control should exist");
+        drop(read);
+        let private_cursor = control
+            .working_diff_checkpoint_commit_id
+            .expect("working diff cursor should exist")
+            .to_string();
+        let public_latest = session
+            .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
+            .await
+            .expect("public latest checkpoint should resolve")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("public latest checkpoint should be text");
+        assert_ne!(
+            public_latest, private_cursor,
+            "the public real checkpoint and private working cursor intentionally differ"
+        );
+
+        let diff = session
+            .execute(
+                "SELECT diff_type FROM lix_diff('lix_key_value') \
+                 WHERE key = 'private-cursor'",
+                &[],
+            )
+            .await
+            .expect("one-argument diff should bind the private cursor");
+        assert_eq!(diff.rows().len(), 1);
     }
 
     #[tokio::test]
@@ -8351,37 +8457,37 @@ mod tests {
                     Value::Text(format!("packed-{row_index:04}")),
                     Value::Text(format!("{row_index:04}")),
                 ],
-        })
-        .collect::<Vec<_>>();
-        session.execute_batch(&replacement_statements).await.unwrap();
+            })
+            .collect::<Vec<_>>();
+        session
+            .execute_batch(&replacement_statements)
+            .await
+            .unwrap();
         assert_current_head_uses_packed_delta_without_columnar_sidecar(
             &session,
             "packed_replacement_working_diff_probe",
             ROW_COUNT as u64,
         )
         .await;
-		let branch_id = session.active_branch_id().await.unwrap();
-		let read = session
-			.storage
-			.begin_read(StorageReadOptions::default())
-			.await
-			.unwrap();
-		let control = crate::branch::BranchHeadControlContext::new()
-			.reader(&read)
-			.load(&branch_id)
-			.await
-			.unwrap()
-			.unwrap();
-		drop(read);
-		let checkpoint_commit_id = control
-			.working_diff_checkpoint_commit_id
-			.expect("working checkpoint should be active")
-			.to_string();
-		let head_commit_id = control.head_commit_id.to_string();
-		crate::tracked_state::arm_diff_commits_test_probe(
-			&checkpoint_commit_id,
-			&head_commit_id,
-		);
+        let branch_id = session.active_branch_id().await.unwrap();
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(read);
+        let checkpoint_commit_id = control
+            .working_diff_checkpoint_commit_id
+            .expect("working checkpoint should be active")
+            .to_string();
+        let head_commit_id = control.head_commit_id.to_string();
+        crate::tracked_state::arm_diff_commits_test_probe(&checkpoint_commit_id, &head_commit_id);
 
         let diff = session
             .execute(
@@ -8395,15 +8501,18 @@ mod tests {
             )
             .await
             .expect("ambiguous packed payload comparison should resolve locally");
-        assert_eq!(diff.rows()[0].get::<i64>("count").unwrap(), ROW_COUNT as i64);
-		assert_eq!(
-			crate::tracked_state::take_diff_commits_test_probe(
-				&checkpoint_commit_id,
-				&head_commit_id,
-			),
-			0,
-			"packed replacements over clean HOT rows must remain local",
-		);
+        assert_eq!(
+            diff.rows()[0].get::<i64>("count").unwrap(),
+            ROW_COUNT as i64
+        );
+        assert_eq!(
+            crate::tracked_state::take_diff_commits_test_probe(
+                &checkpoint_commit_id,
+                &head_commit_id,
+            ),
+            0,
+            "packed replacements over clean HOT rows must remain local",
+        );
     }
 
     #[tokio::test]
@@ -8705,7 +8814,8 @@ mod tests {
                 },
                 ExecuteBatchStatement {
                     label: None,
-                    sql: "INSERT INTO mixed_batch_second (id, value, enabled) VALUES ($1, $2, $3)".to_owned(),
+                    sql: "INSERT INTO mixed_batch_second (id, value, enabled) VALUES ($1, $2, $3)"
+                        .to_owned(),
                     params: vec![
                         Value::Text("second".to_owned()),
                         Value::Text("two".to_owned()),
@@ -11333,10 +11443,10 @@ mod tests {
         );
         let row = &result.rows()[0];
 
-		assert_eq!(
-			result.column_types(),
-			&[ResultColumnType::Text, ResultColumnType::Boolean]
-		);
+        assert_eq!(
+            result.column_types(),
+            &[ResultColumnType::Text, ResultColumnType::Boolean]
+        );
         assert_eq!(row.get::<String>("title").unwrap(), "Hello");
         assert!(row.get::<bool>("done").unwrap());
         assert_eq!(
@@ -11363,10 +11473,10 @@ mod tests {
         let result = ExecuteResult::from_columnar_result(fields, batches, Vec::new());
 
         assert_eq!(result.columns(), ["id", "title"]);
-		assert_eq!(
-			result.column_types(),
-			&[ResultColumnType::Integer, ResultColumnType::Text]
-		);
+        assert_eq!(
+            result.column_types(),
+            &[ResultColumnType::Integer, ResultColumnType::Text]
+        );
         assert!(
             result
                 .backing
@@ -11450,13 +11560,8 @@ mod tests {
     #[test]
     fn mutation_result_equality_is_independent_of_empty_backing_representation() {
         let inline = ExecuteResult::from_rows_affected(7);
-        let materialized = ExecuteResult::from_query_parts(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            7,
-            Vec::new(),
-        );
+        let materialized =
+            ExecuteResult::from_query_parts(Vec::new(), Vec::new(), Vec::new(), 7, Vec::new());
 
         assert_eq!(inline, materialized);
     }

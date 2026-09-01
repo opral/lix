@@ -205,11 +205,9 @@ struct Replica {
     lix: Lix<Memory>,
     storage: Memory,
     transport: AuthorityTransport,
-    change_watcher: tokio::sync::watch::Receiver<u64>,
     _demand_tx: tokio::sync::mpsc::Sender<super::runtime::SyncDemand>,
     demand_rx: tokio::sync::mpsc::Receiver<super::runtime::SyncDemand>,
     pending_demands: Vec<super::runtime::SyncDemand>,
-    push_item_limit: usize,
     pull_item_limit: usize,
 }
 
@@ -251,17 +249,14 @@ impl Replica {
     }
 
     fn from_open_lix(lix: Lix<Memory>, storage: Memory, transport: AuthorityTransport) -> Self {
-        let change_watcher = lix.sync_mode_state().change_watcher();
         let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(8);
         Self {
             lix,
             storage,
             transport,
-            change_watcher,
             _demand_tx: demand_tx,
             demand_rx,
             pending_demands: Vec::new(),
-            push_item_limit: super::MAX_SYNC_REQUEST_ITEMS,
             pull_item_limit: super::MAX_SYNC_REQUEST_ITEMS,
         }
     }
@@ -271,9 +266,7 @@ impl Replica {
             &self.lix,
             REMOTE_ID,
             &self.transport,
-            &mut self.push_item_limit,
             &mut self.pull_item_limit,
-            &mut self.change_watcher,
             &mut self.demand_rx,
             &mut self.pending_demands,
         )
@@ -419,6 +412,7 @@ macro_rules! sync_simulation_test {
     ($name:ident, $scenario:ident) => {
         paste::paste! {
             #[test]
+            #[ignore = "pre-v6 peer-authored sync scenarios were removed by authoritative HOT replicas"]
             fn [<$name _base>]() {
                 run_sync_simulation(
                     concat!(module_path!(), "::", stringify!($name)),
@@ -1592,7 +1586,8 @@ async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Si
     )
     .unwrap();
     adapter
-        .commit_write_set(
+        .commit_certified_replica_write_set(
+            super::certified_replica_write_capability(),
             writes,
             crate::storage_adapter::StorageWriteOptions::default(),
         )
@@ -1838,7 +1833,8 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
 		},
 	);
 	adapter
-		.commit_write_set(
+		.commit_certified_replica_write_set(
+			super::certified_replica_write_capability(),
 			writes,
 			crate::storage_adapter::StorageWriteOptions::default(),
 		)

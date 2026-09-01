@@ -25,12 +25,12 @@ use crate::hot_state::TrackedHeadContext;
 use crate::plugin::runtime::WasmTypedRow;
 use crate::row_pk::{RowPk, RowPkComponent, RowPkComponentType};
 use crate::sql2::SqlChangelogQuerySource;
-use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
 use crate::sql2::catalog::schema_surface::SchemaSurfaceSpec;
-use crate::sql2::error::lix_error_to_datafusion_error;
-use crate::sql2::result_metadata::{field_is_json, row_ref_field};
+use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
+use crate::sql2::error::{datafusion_error_to_lix_error, lix_error_to_datafusion_error};
 #[cfg(test)]
 use crate::sql2::result_metadata::field_is_row_ref;
+use crate::sql2::result_metadata::{field_is_json, row_ref_field};
 use crate::sql2::udfs::{ExecutionSlots, execution_slots};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -63,6 +63,12 @@ pub(super) fn register_diff_function<S>(
     );
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffMode {
+    General,
+    WorkingHot,
+}
+
 struct DiffFunction<S> {
     store: S,
     catalog: Arc<PublicCatalog>,
@@ -82,24 +88,35 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        let (relation, from_commit_id, to_commit_id) = match args {
+        let (mode, relation, from_commit_id, to_commit_id) = match args {
             [relation] => (
+                DiffMode::WorkingHot,
                 relation,
-                self.slots.latest_checkpoint_commit_id().ok_or_else(|| {
-                    DataFusionError::Plan("lix_diff default range requires an active checkpoint".to_string())
-                })?,
+                self.slots
+                    .working_diff_checkpoint_commit_id()
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "lix_diff default range requires an active checkpoint".to_string(),
+                        )
+                    })?,
                 self.slots.active_branch_commit_id().ok_or_else(|| {
-                    DataFusionError::Plan("lix_diff default range requires an active branch head".to_string())
+                    DataFusionError::Plan(
+                        "lix_diff default range requires an active branch head".to_string(),
+                    )
                 })?,
             ),
             [relation, from_commit_id, to_commit_id] => (
+                DiffMode::General,
                 relation,
                 text_argument(from_commit_id, 2, "commit ID", Some(&self.slots))?,
                 text_argument(to_commit_id, 3, "commit ID", Some(&self.slots))?,
             ),
-            _ => return Err(DataFusionError::Plan(
-                "lix_diff requires a relation and either zero or two commit ID arguments".to_string(),
-            )),
+            _ => {
+                return Err(DataFusionError::Plan(
+                    "lix_diff requires a relation and either zero or two commit ID arguments"
+                        .to_string(),
+                ));
+            }
         };
         let relation_name = text_argument(relation, 1, "relation name", None)?;
         let relation = DiffRelation::from_catalog(&self.catalog, &relation_name)?;
@@ -109,6 +126,7 @@ where
             from_commit_id,
             to_commit_id,
             active_branch_id: self.slots.active_branch_id(),
+            mode,
         }))))
     }
 }
@@ -213,13 +231,17 @@ impl DiffRelation {
                     "lix_diff relation '{name}' is missing primary-key column '{column}': {error}"
                 ))
             })?;
-            fields.push(Field::new(column, field.data_type().clone(), false)
-                .with_metadata(field.metadata().clone()));
+            fields.push(
+                Field::new(column, field.data_type().clone(), false)
+                    .with_metadata(field.metadata().clone()),
+            );
         }
         fields.push(Field::new("diff_type", DataType::Utf8, false));
-        for column in surface.columns.iter().filter(|column| {
-            column.is_public() && !primary_key_columns.contains(&column.name)
-        }) {
+        for column in surface
+            .columns
+            .iter()
+            .filter(|column| column.is_public() && !primary_key_columns.contains(&column.name))
+        {
             let field = source_schema
                 .field_with_name(&column.name)
                 .map_err(|error| {
@@ -256,6 +278,7 @@ struct DiffSpec<S> {
     from_commit_id: String,
     to_commit_id: String,
     active_branch_id: Option<String>,
+    mode: DiffMode,
 }
 
 #[async_trait]
@@ -323,6 +346,7 @@ where
                     self.from_commit_id.clone(),
                     self.to_commit_id.clone(),
                     self.active_branch_id.clone(),
+                    self.mode,
                 ),
                 move |(
                     store,
@@ -332,14 +356,12 @@ where
                     from_commit_id,
                     to_commit_id,
                     active_branch_id,
+                    mode,
                 )| async move {
                     if limit == Some(0) || route.contradictory || from_commit_id == to_commit_id {
                         return diff_record_batch(schema, &[], &relation);
                     }
                     let mut tracked = TrackedStateContext::new().reader(store.clone());
-                    let from_descriptor =
-                        commit_state_descriptor(&store, &from_commit_id).await?;
-                    let to_descriptor = commit_state_descriptor(&store, &to_commit_id).await?;
                     // A pinned base that is identical at both endpoints cannot
                     // contribute any effective changes. In that common
                     // checkpoint-to-head case, retain HOT_DIFF as the sparse
@@ -351,13 +373,80 @@ where
                             "from_lixcol_global" | "to_lixcol_global"
                         )
                     });
+                    let working_needs_endpoint_descriptors = match &relation.kind {
+                        DiffRelationKind::File => schema
+                            .fields()
+                            .iter()
+                            .any(|field| side_column(field.name()).is_some()),
+                        DiffRelationKind::Schema { .. } => false,
+                        DiffRelationKind::Directory => true,
+                    };
+                    let generic_descriptors = if mode == DiffMode::General {
+                        Some((
+                            commit_state_descriptor(&store, &from_commit_id).await?,
+                            commit_state_descriptor(&store, &to_commit_id).await?,
+                        ))
+                    } else {
+                        None
+                    };
                     // Global provenance must come from the composite overlay
                     // resolution: the HOT epoch diff carries effective rows
                     // but not which side an inherited global row supplied, so
                     // provenance projections take the cold route.
-                    let direct_candidates = if !route.request.retain_payloads
+                    let direct_candidates = if mode == DiffMode::WorkingHot {
+                        let branch_id = active_branch_id.as_deref().ok_or_else(|| {
+                            hot_only_diff_error(DataFusionError::Execution(
+                                "lix_diff default range requires an active branch".to_string(),
+                            ))
+                        })?;
+                        let from_commit = CommitId::parse_lix(
+                            &from_commit_id,
+                            "lix_diff checkpoint commit ID",
+                        )
+                        .map_err(lix_error_to_datafusion_error)?;
+                        let to_commit =
+                            CommitId::parse_lix(&to_commit_id, "lix_diff head commit ID")
+                                .map_err(lix_error_to_datafusion_error)?;
+                        let control = BranchHeadControlContext::new()
+                            .reader(store.clone())
+                            .load(branch_id)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                            .ok_or_else(|| {
+                                hot_only_diff_error(DataFusionError::Execution(format!(
+                                    "lix_diff default range has no HOT control for branch '{branch_id}'"
+                                )))
+                            })?;
+                        if control.head_commit_id != to_commit
+                            || control.working_diff_checkpoint_commit_id != Some(from_commit)
+                        {
+                            return Err(hot_only_diff_error(DataFusionError::Execution(
+                                "lix_diff default-range coordinates no longer match the certified HOT epoch"
+                                    .to_string(),
+                            )));
+                        }
+                        Some(
+                            TrackedHeadContext::new()
+                                .reader(store.clone())
+                                .working_diff_for_control(branch_id, control, &route.request)
+                                .await
+                                .map_err(lix_error_to_datafusion_error)
+                                .map_err(hot_only_diff_error)?
+                                .ok_or_else(|| {
+                                    hot_only_diff_error(DataFusionError::Execution(
+                                        "lix_diff certified HOT index is unavailable"
+                                            .to_string(),
+                                    ))
+                                })?
+                                .diff,
+                        )
+                    } else if !route.request.retain_payloads
                         && !needs_global_provenance
-                        && from_descriptor.base_commit_id == to_descriptor.base_commit_id
+                        && generic_descriptors.as_ref().is_some_and(
+                            |(from_descriptor, to_descriptor)| {
+                                from_descriptor.base_commit_id == to_descriptor.base_commit_id
+                            },
+                        )
                         && let Some(branch_id) = active_branch_id.as_deref()
                         && let (Ok(from_commit), Ok(to_commit)) = (
                             CommitId::parse(&from_commit_id),
@@ -387,6 +476,29 @@ where
                     } else {
                         None
                     };
+                    // Working diff may inspect exact checkpoint/head state to
+                    // render side columns, but it never asks generic diff to
+                    // replay commits. A sparse replica therefore either has
+                    // the locally installed endpoint snapshot or fails with a
+                    // HOT-unavailable error that cannot trigger history demand.
+                    let (from_descriptor, to_descriptor) =
+                        if let Some(descriptors) = generic_descriptors {
+                            descriptors
+                        } else if working_needs_endpoint_descriptors {
+                            let descriptor_result = async {
+                                Ok::<_, DataFusionError>((
+                                    commit_state_descriptor(&store, &from_commit_id).await?,
+                                    commit_state_descriptor(&store, &to_commit_id).await?,
+                                ))
+                            }
+                            .await;
+                            descriptor_result.map_err(hot_only_diff_error)?
+                        } else {
+                            (
+                                CommitStateDescriptor::default(),
+                                CommitStateDescriptor::default(),
+                            )
+                        };
                     let (diff, from_global_rows, to_global_rows) = effective_diff(
                         &mut tracked,
                         &from_commit_id,
@@ -404,15 +516,10 @@ where
                     };
                     let mut rows = match &relation.kind {
                         DiffRelationKind::Schema { .. } => {
-                            schema_diff_rows(
-                                diff,
-                                &schema,
-                                &from_global_rows,
-                                &to_global_rows,
-                            )?
+                            schema_diff_rows(diff, &schema, &from_global_rows, &to_global_rows)?
                         }
                         DiffRelationKind::File => {
-                            file_diff_rows(
+                            let result = file_diff_rows(
                                 &mut tracked,
                                 diff,
                                 &schema,
@@ -421,10 +528,15 @@ where
                                 &from_descriptor,
                                 &to_descriptor,
                             )
-                            .await?
+                            .await;
+                            if mode == DiffMode::WorkingHot {
+                                result.map_err(hot_only_diff_error)?
+                            } else {
+                                result?
+                            }
                         }
                         DiffRelationKind::Directory => {
-                            directory_diff_rows(
+                            let result = directory_diff_rows(
                                 &mut tracked,
                                 diff,
                                 &schema,
@@ -435,7 +547,12 @@ where
                                 &from_global_rows,
                                 &to_global_rows,
                             )
-                            .await?
+                            .await;
+                            if mode == DiffMode::WorkingHot {
+                                result.map_err(hot_only_diff_error)?
+                            } else {
+                                result?
+                            }
                         }
                     };
                     if let Some(limit) = limit {
@@ -540,8 +657,7 @@ impl DiffRoute {
                 .any(|(_, column)| {
                     !matches!(
                         column,
-                        "id"
-                            | "lixcol_schema_key"
+                        "id" | "lixcol_schema_key"
                             | "lixcol_file_id"
                             | "lixcol_created_at"
                             | "lixcol_updated_at"
@@ -578,6 +694,26 @@ fn optional_values(conjuncts: &[Expr], column: &'static str) -> Option<Vec<Strin
 
 pub(crate) fn relation_diff_schema(catalog: &PublicCatalog, relation: &str) -> Result<SchemaRef> {
     DiffRelation::from_catalog(catalog, relation).map(|relation| relation.schema)
+}
+
+fn hot_only_diff_error(error: DataFusionError) -> DataFusionError {
+    let error = datafusion_error_to_lix_error(error);
+    // Pinned HOT file values may be represented by deferred binary-CAS chunks.
+    // Fetching those exact content-addressed bytes is not history fallback, so
+    // preserve the demand code for the replica retry loop.
+    if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {
+        return lix_error_to_datafusion_error(error);
+    }
+    let message = if error.code == "LIX_SYNC_HISTORY_REQUIRED" {
+        "lix_diff default range requires the certified local HOT checkpoint snapshot; canonical history fallback is forbidden"
+            .to_string()
+    } else {
+        error.message
+    };
+    lix_error_to_datafusion_error(crate::LixError::new(
+        "LIX_DIFF_HOT_UNAVAILABLE",
+        message,
+    ))
 }
 
 #[derive(Clone)]
@@ -621,16 +757,18 @@ async fn commit_state_descriptor(
         .map_err(lix_error_to_datafusion_error)?
         .map(|manifest| manifest.global_scope())
         .ok_or_else(|| {
-            lix_error_to_datafusion_error(
-                crate::tracked_state::sync_history_required_for_commits(&[commit_id]),
-            )
+            lix_error_to_datafusion_error(crate::tracked_state::sync_history_required_for_commits(
+                &[commit_id],
+            ))
         })?;
     let node = crate::commit_graph::CommitGraphContext::new()
         .reader(store)
         .load_node(&commit_id)
         .await
         .map_err(lix_error_to_datafusion_error)?
-        .ok_or_else(|| DataFusionError::Execution(format!("commit '{commit_id}' does not exist")))?;
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("commit '{commit_id}' does not exist"))
+        })?;
     Ok(CommitStateDescriptor {
         base_commit_id: node.base_commit_id,
         global_scope,
@@ -645,7 +783,11 @@ async fn effective_diff<S: StorageAdapterRead>(
     to_descriptor: &CommitStateDescriptor,
     request: &TrackedStateDiffRequest,
     local_candidates: Option<TrackedStateDiff>,
-) -> Result<(TrackedStateDiff, HashSet<TrackedStateKey>, HashSet<TrackedStateKey>)> {
+) -> Result<(
+    TrackedStateDiff,
+    HashSet<TrackedStateKey>,
+    HashSet<TrackedStateKey>,
+)> {
     if let Some(diff) = local_candidates {
         // The HOT working-diff epoch is already an effective checkpoint-to-
         // head comparison. Its pinned base is identical at both endpoints,
@@ -690,34 +832,13 @@ async fn effective_diff<S: StorageAdapterRead>(
         .load_projected_batch_at_commit(to_commit_id, &keys, &projection)
         .await
         .map_err(lix_error_to_datafusion_error)?;
-    let from_base_rows = load_base_rows(
-        tracked,
-        from_descriptor,
-        &keys,
-        &projection,
-    )
-    .await?;
-    let to_base_rows = load_base_rows(
-        tracked,
-        to_descriptor,
-        &keys,
-        &projection,
-    )
-    .await?;
-    let from_replacement_scopes = load_local_replacement_scopes_for_keys(
-        tracked,
-        from_commit_id,
-        from_descriptor,
-        &keys,
-    )
-    .await?;
-    let to_replacement_scopes = load_local_replacement_scopes_for_keys(
-        tracked,
-        to_commit_id,
-        to_descriptor,
-        &keys,
-    )
-    .await?;
+    let from_base_rows = load_base_rows(tracked, from_descriptor, &keys, &projection).await?;
+    let to_base_rows = load_base_rows(tracked, to_descriptor, &keys, &projection).await?;
+    let from_replacement_scopes =
+        load_local_replacement_scopes_for_keys(tracked, from_commit_id, from_descriptor, &keys)
+            .await?;
+    let to_replacement_scopes =
+        load_local_replacement_scopes_for_keys(tracked, to_commit_id, to_descriptor, &keys).await?;
 
     let identities = TrackedStateDiffIdentity::from_key_batch(keys.clone())
         .map_err(lix_error_to_datafusion_error)?;
@@ -793,9 +914,11 @@ async fn load_local_replacement_scopes_for_keys<S: StorageAdapterRead>(
     let scopes = keys
         .iter()
         .flat_map(|key| {
-            std::iter::once((key.schema_key.clone(), None)).chain(key.file_id.as_ref().map(
-                |file_id| (key.schema_key.clone(), Some(file_id.clone())),
-            ))
+            std::iter::once((key.schema_key.clone(), None)).chain(
+                key.file_id
+                    .as_ref()
+                    .map(|file_id| (key.schema_key.clone(), Some(file_id.clone()))),
+            )
         })
         .collect::<BTreeSet<_>>();
     let marker_keys = scopes
@@ -831,10 +954,7 @@ async fn load_local_replacement_scopes_for_keys<S: StorageAdapterRead>(
         .collect())
 }
 
-fn base_key_suppressed(
-    key: &TrackedStateKey,
-    scopes: &BTreeSet<(String, Option<String>)>,
-) -> bool {
+fn base_key_suppressed(key: &TrackedStateKey, scopes: &BTreeSet<(String, Option<String>)>) -> bool {
     scopes.contains(&(key.schema_key.clone(), None))
         || key.file_id.as_ref().is_some_and(|file_id| {
             scopes.contains(&(key.schema_key.clone(), Some(file_id.clone())))
@@ -951,12 +1071,7 @@ fn schema_diff_rows(
                 diff_type: diff_type(entry.kind),
                 row_count: 1,
                 from: if needs_side {
-                    diff_side(
-                        entry,
-                        entry.visible_before(),
-                        &diff,
-                        from_global_rows,
-                    )?
+                    diff_side(entry, entry.visible_before(), &diff, from_global_rows)?
                 } else {
                     None
                 },
@@ -1100,8 +1215,7 @@ where
         .any(|(_, column)| {
             !matches!(
                 column,
-                "id"
-                    | "lixcol_schema_key"
+                "id" | "lixcol_schema_key"
                     | "lixcol_file_id"
                     | "lixcol_created_at"
                     | "lixcol_updated_at"
@@ -1179,15 +1293,19 @@ where
         };
         let (from_descriptor_row, from_global) = effective_row(
             from_descriptors.row(index),
-            from_base_descriptors.as_ref().and_then(|rows| rows.row(index)),
+            from_base_descriptors
+                .as_ref()
+                .and_then(|rows| rows.row(index)),
             from_descriptor.global_scope,
-            descriptor_keys.get(index).is_some_and(|key| {
-                base_key_suppressed(key, &from_descriptor_replacements)
-            }),
+            descriptor_keys
+                .get(index)
+                .is_some_and(|key| base_key_suppressed(key, &from_descriptor_replacements)),
         );
         let (to_descriptor_row, to_global) = effective_row(
             to_descriptors.row(index),
-            to_base_descriptors.as_ref().and_then(|rows| rows.row(index)),
+            to_base_descriptors
+                .as_ref()
+                .and_then(|rows| rows.row(index)),
             to_descriptor.global_scope,
             descriptor_keys
                 .get(index)
@@ -1233,7 +1351,7 @@ where
                         false,
                         &mut to_directory_cache,
                     )
-                        .await?,
+                    .await?,
                 );
             }
         }
@@ -1268,12 +1386,7 @@ where
         .fields()
         .iter()
         .any(|field| matches!(field.name().as_str(), "from_path" | "to_path"));
-    let mut rows = schema_diff_rows(
-        diff,
-        projection,
-        from_global_rows,
-        to_global_rows,
-    )?;
+    let mut rows = schema_diff_rows(diff, projection, from_global_rows, to_global_rows)?;
     if needs_paths {
         let mut from_directory_cache = HashMap::new();
         let mut to_directory_cache = HashMap::new();
@@ -1301,7 +1414,7 @@ where
                         true,
                         &mut to_directory_cache,
                     )
-                        .await?,
+                    .await?,
                 );
             }
         }
@@ -1327,9 +1440,7 @@ fn uuid_row_pk(id: &str) -> Result<RowPk> {
     })
 }
 
-fn materialized_side(
-    row: Option<MaterializedTrackedStateRowRef<'_>>,
-) -> Result<Option<DiffSide>> {
+fn materialized_side(row: Option<MaterializedTrackedStateRowRef<'_>>) -> Result<Option<DiffSide>> {
     let Some(row) = row.filter(|row| !row.deleted()) else {
         return Ok(None);
     };
@@ -1480,13 +1591,19 @@ fn diff_record_batch(
     RecordBatch::try_new(schema, arrays).map_err(DataFusionError::from)
 }
 
-fn diff_column_array(field: &Field, rows: &[DiffSqlRow], relation: &DiffRelation) -> Result<ArrayRef> {
+fn diff_column_array(
+    field: &Field,
+    rows: &[DiffSqlRow],
+    relation: &DiffRelation,
+) -> Result<ArrayRef> {
     match field.name().as_str() {
         "row_ref" => Ok(Arc::new(StringArray::from(
             rows.iter()
-                .map(|row| crate::row_ref::encode(&relation.name, &row.row_pk)
-                    .map(|value| value.as_str().to_owned())
-                    .map_err(lix_error_to_datafusion_error))
+                .map(|row| {
+                    crate::row_ref::encode(&relation.name, &row.row_pk)
+                        .map(|value| value.as_str().to_owned())
+                        .map_err(lix_error_to_datafusion_error)
+                })
                 .collect::<Result<Vec<_>>>()?,
         ))),
         "diff_type" => Ok(Arc::new(StringArray::from_iter_values(
@@ -1495,7 +1612,11 @@ fn diff_column_array(field: &Field, rows: &[DiffSqlRow], relation: &DiffRelation
         "row_count" => Ok(Arc::new(Int64Array::from_iter_values(
             rows.iter().map(|row| row.row_count),
         ))),
-        name if relation.primary_key_columns.iter().any(|column| column == name) => {
+        name if relation
+            .primary_key_columns
+            .iter()
+            .any(|column| column == name) =>
+        {
             let component_index = relation
                 .primary_key_columns
                 .iter()
@@ -1537,30 +1658,36 @@ fn primary_key_array(
     match field.data_type() {
         DataType::Utf8 => Ok(Arc::new(StringArray::from_iter_values(
             rows.iter()
-                .map(|row| match row.row_pk.components.as_slice().get(component_index) {
-                    Some(RowPkComponent::Uuid(value)) => {
-                        Ok(uuid::Uuid::from_bytes(*value).to_string())
-                    }
-                    Some(RowPkComponent::String(value)) => Ok(value.to_string()),
-                    component => Err(primary_key_component_error(field, component)),
-                })
+                .map(
+                    |row| match row.row_pk.components.as_slice().get(component_index) {
+                        Some(RowPkComponent::Uuid(value)) => {
+                            Ok(uuid::Uuid::from_bytes(*value).to_string())
+                        }
+                        Some(RowPkComponent::String(value)) => Ok(value.to_string()),
+                        component => Err(primary_key_component_error(field, component)),
+                    },
+                )
                 .collect::<Result<Vec<_>>>()?,
         ))),
         DataType::Int64 => Ok(Arc::new(Int64Array::from_iter_values(
             rows.iter()
-                .map(|row| match row.row_pk.components.as_slice().get(component_index) {
-                    Some(RowPkComponent::Integer(value)) => Ok(*value),
-                    component => Err(primary_key_component_error(field, component)),
-                })
+                .map(
+                    |row| match row.row_pk.components.as_slice().get(component_index) {
+                        Some(RowPkComponent::Integer(value)) => Ok(*value),
+                        component => Err(primary_key_component_error(field, component)),
+                    },
+                )
                 .collect::<Result<Vec<_>>>()?,
         ))),
         DataType::LargeBinary => {
             let values = rows
                 .iter()
-                .map(|row| match row.row_pk.components.as_slice().get(component_index) {
-                    Some(RowPkComponent::Bytes(value)) => Ok(value.as_ref()),
-                    component => Err(primary_key_component_error(field, component)),
-                })
+                .map(
+                    |row| match row.row_pk.components.as_slice().get(component_index) {
+                        Some(RowPkComponent::Bytes(value)) => Ok(value.as_ref()),
+                        component => Err(primary_key_component_error(field, component)),
+                    },
+                )
                 .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(LargeBinaryArray::from_iter_values(values)))
         }
@@ -1699,8 +1826,9 @@ mod tests {
 
     #[test]
     fn relation_diff_schema_pairs_public_columns_and_retires_legacy_columns() {
-        let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
-            .expect("key/value relation is registered");
+        let relation =
+            DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
+                .expect("key/value relation is registered");
         let names = relation
             .schema
             .fields()
@@ -1746,23 +1874,46 @@ mod tests {
     }
 
     #[test]
+    fn default_range_diff_never_surfaces_a_history_demand() {
+        let error = hot_only_diff_error(lix_error_to_datafusion_error(crate::LixError::new(
+            "LIX_SYNC_HISTORY_REQUIRED",
+            "history is deferred",
+        )));
+        let error = datafusion_error_to_lix_error(error);
+        assert_eq!(error.code, "LIX_DIFF_HOT_UNAVAILABLE");
+        assert!(!error.message.contains("history is deferred"));
+    }
+
+    #[test]
+    fn default_range_diff_preserves_exact_hot_chunk_demand() {
+        let error = hot_only_diff_error(lix_error_to_datafusion_error(
+            crate::LixError::new("LIX_SYNC_CHUNKS_REQUIRED", "chunks are deferred")
+                .with_details(serde_json::json!({ "chunkIds": ["a".repeat(64)] })),
+        ));
+        let error = datafusion_error_to_lix_error(error);
+        assert_eq!(error.code, "LIX_SYNC_CHUNKS_REQUIRED");
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({ "chunkIds": ["a".repeat(64)] }))
+        );
+    }
+
+    #[test]
     fn relation_diff_rejects_non_relations() {
-        let error = match DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_diff") {
-            Ok(_) => panic!("table functions are not diffable relations"),
-            Err(error) => error,
-        };
+        let error =
+            match DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_diff") {
+                Ok(_) => panic!("table functions are not diffable relations"),
+                Err(error) => error,
+            };
         assert!(error.to_string().contains("does not support relation"));
     }
 
     #[test]
     fn relation_diff_pushes_schema_identity_without_loading_payloads() {
-        let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
-            .expect("key/value relation is registered");
-        let projection = Schema::new(vec![Field::new(
-            "row_count",
-            DataType::Int64,
-            false,
-        )]);
+        let relation =
+            DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
+                .expect("key/value relation is registered");
+        let projection = Schema::new(vec![Field::new("row_count", DataType::Int64, false)]);
         let route = DiffRoute::from_filters(&[], &relation, &projection);
 
         assert_eq!(route.request.filter.schema_keys, vec!["lix_key_value"]);

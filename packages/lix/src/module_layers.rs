@@ -99,6 +99,10 @@ const MODULE_LAYERS: &[&[&str]] = &[
 /// of its own — into `sql2` and `collection_generation`.
 const UNLAYERED_MODULES: &[(&str, &str)] = &[
     (
+        "authority_client",
+        "private connected-session transport over engine API values",
+    ),
+    (
         "background_task",
         "executor-neutral engine worker plumbing, no repository semantics",
     ),

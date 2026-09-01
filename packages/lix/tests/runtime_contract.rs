@@ -8,7 +8,7 @@ use lix::plugin::runtime::{
     WasmRowTransition, WasmRowUpdate, WasmRuntime, WasmTransitionHandle, WasmTransitionLimits,
 };
 use lix::wasm::WasmLimits;
-use lix::{LixError, open_lix};
+use lix::{LixError, ServerMode, ServerOptions, open_lix};
 
 struct EmbeddingRuntime;
 struct EmbeddingFactory;
@@ -53,6 +53,16 @@ fn actor_contract_types_are_public(
     _: WasmChangePage,
     _: WasmEditPage,
 ) {
+}
+
+#[test]
+fn connected_server_builder_public_contract_remains_available() {
+    let options = ServerOptions {
+        mode: ServerMode::Sync,
+        url: "https://example.invalid/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc".to_owned(),
+        headers: vec![("authorization".to_owned(), "Bearer test".to_owned())],
+    };
+    let _builder = open_lix().with_server(options);
 }
 
 #[test]

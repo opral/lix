@@ -44,6 +44,7 @@ pub use platform::{
     unregister_browser_sync_transport,
 };
 pub(crate) use platform::{SyncTransportBounds, SyncTransportFuture};
+pub(crate) use platform::{AuthorityHttp, authority_http};
 pub(crate) use platform::sleep;
 #[cfg(feature = "server-protocol")]
 pub(crate) use protocol::SyncRefUpdate;
@@ -56,15 +57,19 @@ pub(crate) use commit::{
     SYNC_MATERIALIZED_STATE_ALIAS_SPACE, stage_delete_materialized_sync_state_alias,
 };
 pub(crate) use repository::{
-    SYNC_REPLICA_STATE_SPACE, SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE,
+    AUTHORITY_STATE_VALUE, SYNC_AUTHORITY_STATE_SPACE, SYNC_REPLICA_STATE_SPACE,
+    SYNC_REPOSITORY_EVENT_SPACE,
+    SYNC_SEQUENCE_SPACE, authority_state_key,
     load_pending_sync_export_commit_ids, load_replayable_repository_event_commit_ids,
+    replica_state_key,
     stage_repository_transaction_event, stage_sync_restore_intents,
     validate_repository_transaction_event_transfer,
 };
 #[cfg(feature = "server-protocol")]
+pub(crate) use repository::admit_sync_authority_storage;
 pub(crate) use repository::has_any_sync_replica_state;
 pub(crate) use runtime::{
-    SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode,
+    SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode, fence_hot_state,
 };
 
 pub(crate) const MAX_SYNC_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -72,17 +77,56 @@ pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-// v2 fences the v77 engine-authoritative built-in schema semantics. Repository
-// format markers are local storage metadata and do not cross the sync wire, so
-// the sync handshake must reject v76 peers explicitly.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 2;
+// v6 hard-cuts v5 and older peers that still permit replica-local mutations.
+// The JSON request/response shape remains the one published on main; this is a
+// semantic compatibility boundary, not a new public protocol surface.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 6;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str =
     "LIX_SYNC_REPOSITORY_ID_MISMATCH";
 pub(crate) const SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE: &str =
     "LIX_SYNC_IMMUTABLE_OBJECT_MISMATCH";
+pub(crate) const AUTHORITY_EXECUTION_REQUIRED_CODE: &str =
+    "LIX_AUTHORITY_EXECUTION_REQUIRED";
 const MAX_SYNC_REMOTE_ID_BYTES: usize = 4 * 1024;
+
+/// Unforgeable outside the sync module tree. Passing this token makes the
+/// durable replica-cache write bypass a compile-time capability, rather than a
+/// process-local role flag or a generally callable crate helper.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CertifiedReplicaWriteCapability {
+    _private: (),
+}
+
+fn certified_replica_write_capability() -> CertifiedReplicaWriteCapability {
+    CertifiedReplicaWriteCapability { _private: () }
+}
+
+pub(crate) fn authority_execution_required(
+    route: crate::sql2::StatementAuthorityRoute,
+) -> LixError {
+    let kind = match route {
+        crate::sql2::StatementAuthorityRoute::HotRead => "hot-read",
+        crate::sql2::StatementAuthorityRoute::AuthorityRead => "history",
+        crate::sql2::StatementAuthorityRoute::AuthorityWrite => "mutation",
+    };
+    LixError::new(
+        AUTHORITY_EXECUTION_REQUIRED_CODE,
+        match route {
+            crate::sql2::StatementAuthorityRoute::HotRead => {
+                "certified hot reads execute on the replica"
+            }
+            crate::sql2::StatementAuthorityRoute::AuthorityRead => {
+                "historical queries execute on the repository authority"
+            }
+            crate::sql2::StatementAuthorityRoute::AuthorityWrite => {
+                "connected replica mutations execute on the repository authority"
+            }
+        },
+    )
+    .with_details(serde_json::json!({ "executionKind": kind }))
+}
 
 pub(crate) fn sync_server_protocol_mismatch(server_version: Option<u32>) -> LixError {
     let server = server_version

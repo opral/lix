@@ -2182,7 +2182,7 @@ async fn drop_tombstones_named(storage: &Memory, needle: &str) -> usize {
 /// The readers, one arm each:
 ///
 /// - the collection answer and the point answer, cold;
-/// - `lix_working_diff`, before and after;
+/// - one-argument `lix_diff`, before and after;
 /// - the commit graph, which is what history is derived from;
 /// - a branch forked *mid-interval*, while the identity was still alive - the
 ///   case where the removed key could plausibly have been serving somebody
@@ -2528,18 +2528,20 @@ impl std::fmt::Display for ElisionCounters {
     }
 }
 
-/// PHASE 13 — the landed fix: an identity created and deleted inside one
-/// checkpoint interval never publishes a tombstone at all.
+/// PHASE 13 — a net-zero identity remains a certified tombstone until the
+/// checkpoint retires its dirty-index entry.
 ///
 /// Phase 11 measured why this is needed: with deletes confined to an interval
 /// the checkpoint's compaction route runs and is offered nothing
 /// (`routes=1 offered=0`), so tombstones accumulate 1:1 with deletes forever.
-/// Phase 12 measured that no reader depends on them.
+/// Phase 12 predated the certified HOT working-diff reader. That reader now
+/// deliberately depends on a primary row for every dirty-index identity so
+/// missing data cannot be mistaken for an intentional net-zero deletion.
 ///
 /// Engagement first, because every gate on this route is conservative and the
 /// failure mode is silent inertness.
 #[tokio::test]
-async fn interval_local_delete_publishes_no_tombstone() {
+async fn interval_local_delete_retains_certified_tombstone_until_checkpoint() {
     const N: usize = 200;
     let (storage, session) = open_session().await;
     register(&session, probe_schema("p13row")).await;
@@ -2587,12 +2589,12 @@ async fn interval_local_delete_publishes_no_tombstone() {
         counters.elided
     );
     assert_eq!(
-        census.tombstones, 0,
-        "an interval-local delete must publish no tombstone"
+        census.tombstones, N,
+        "every dirty-index identity must retain an authoritative primary tombstone"
     );
-    assert!(
-        census.entries < after_insert.entries,
-        "eliding must leave the serving view smaller than it was with the rows live"
+    assert_eq!(
+        census.entries, after_insert.entries,
+        "net-zero churn may not create an unauthenticated hole in the HOT primary plane"
     );
 
     // The answers, cold, so nothing passes off a warm cache.
@@ -2674,14 +2676,15 @@ async fn clean_pre_image_delete_still_publishes_a_tombstone() {
     );
 }
 
-/// INVERSION 2 — a forked local overlay can elide an interval-local no-op.
+/// INVERSION 2 — a forked local overlay retains the same certified tombstone.
 ///
 /// Composite commits no longer encode global inheritance as a HOT generation
 /// base. Rows inserted and deleted entirely after the local checkpoint are
-/// absent from both the local overlay and pinned global base, so retaining a
-/// tombstone would be redundant even though the branch has a commit base.
+/// They are absent from both the local overlay and pinned global base, but the
+/// dirty index still names them until checkpoint. The primary tombstone is the
+/// fail-closed proof that this absence is intentional.
 #[tokio::test]
-async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
+async fn interval_local_delete_over_a_base_retains_certified_tombstone() {
     const N: usize = 50;
     let (storage, session) = open_session().await;
     register(&session, probe_schema("p13base")).await;
@@ -2725,8 +2728,8 @@ async fn interval_local_delete_over_a_base_still_publishes_a_tombstone() {
         counters.candidates
     );
     assert_eq!(
-        census.tombstones, 0,
-        "a pinned commit base must not block interval-local no-op elision"
+        census.tombstones, N,
+        "a pinned commit base may not weaken the dirty-index primary-row invariant"
     );
 
     let session = reopen_session(&storage).await;

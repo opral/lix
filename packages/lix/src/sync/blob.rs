@@ -253,16 +253,22 @@ where
             }
             stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
             drop(read);
-            adapter
-                .commit_write_set(
-                    writes,
-                    StorageWriteOptions {
-                        preconditions,
-                        await_durable: true,
-                        ..StorageWriteOptions::default()
-                    },
-                )
-                .await?;
+            let options = StorageWriteOptions {
+                preconditions,
+                await_durable: true,
+                ..StorageWriteOptions::default()
+            };
+            if self.sync_mode_state().role() == super::SyncRole::Replica {
+                adapter
+                    .commit_certified_replica_write_set(
+                        super::certified_replica_write_capability(),
+                        writes,
+                        options,
+                    )
+                    .await?;
+            } else {
+                adapter.commit_write_set(writes, options).await?;
+            }
         }
         Ok(Some(manifest))
     }
@@ -288,16 +294,22 @@ where
         stage_verified_raw_chunk(&mut writes, chunk_id, bytes)?;
         stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
         drop(read);
-        adapter
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    await_durable: true,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await?;
+        let options = StorageWriteOptions {
+            preconditions,
+            await_durable: true,
+            ..StorageWriteOptions::default()
+        };
+        if self.sync_mode_state().role() == super::SyncRole::Replica {
+            adapter
+                .commit_certified_replica_write_set(
+                    super::certified_replica_write_capability(),
+                    writes,
+                    options,
+                )
+                .await?;
+        } else {
+            adapter.commit_write_set(writes, options).await?;
+        }
         Ok(())
     }
 
@@ -337,16 +349,22 @@ where
         stage_verified_canonical_manifest(&read, &mut writes, &manifest).await?;
         stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
         drop(read);
-        adapter
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    await_durable: true,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await?;
+        let options = StorageWriteOptions {
+            preconditions,
+            await_durable: true,
+            ..StorageWriteOptions::default()
+        };
+        if self.sync_mode_state().role() == super::SyncRole::Replica {
+            adapter
+                .commit_certified_replica_write_set(
+                    super::certified_replica_write_capability(),
+                    writes,
+                    options,
+                )
+                .await?;
+        } else {
+            adapter.commit_write_set(writes, options).await?;
+        }
         Ok(SyncBlobRegistration {
             missing_chunk_ids: Vec::new(),
         })
@@ -381,16 +399,22 @@ where
         };
         stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
         drop(read);
-        adapter
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    await_durable: true,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await?;
+        let options = StorageWriteOptions {
+            preconditions,
+            await_durable: true,
+            ..StorageWriteOptions::default()
+        };
+        if self.sync_mode_state().role() == super::SyncRole::Replica {
+            adapter
+                .commit_certified_replica_write_set(
+                    super::certified_replica_write_capability(),
+                    writes,
+                    options,
+                )
+                .await?;
+        } else {
+            adapter.commit_write_set(writes, options).await?;
+        }
         Ok(SyncBlobRegistration { missing_chunk_ids })
     }
 }

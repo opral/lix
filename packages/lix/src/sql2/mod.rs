@@ -1,9 +1,10 @@
+mod authority_route;
 mod bind;
 mod branch_ref;
 mod branch_scope;
 mod catalog;
-mod checkpoint_function;
 mod change_materialization;
+mod checkpoint_function;
 mod context;
 mod dialect;
 mod dml;
@@ -20,10 +21,9 @@ mod predicate_typecheck;
 mod providers;
 #[cfg(test)]
 pub(crate) use providers::{
-    arm_state_at_traversal_probe,
-    file_history_anchor_probe_census, file_history_bounded_frontier_census,
-    file_history_raw_probe_limit_census, reset_file_history_anchor_probe_census,
-    take_state_at_traversal_probe,
+    arm_state_at_traversal_probe, file_history_anchor_probe_census,
+    file_history_bounded_frontier_census, file_history_raw_probe_limit_census,
+    reset_file_history_anchor_probe_census, take_state_at_traversal_probe,
 };
 mod read_only;
 mod result_metadata;
@@ -42,6 +42,7 @@ mod write_normalization;
 #[cfg(feature = "storage-benches")]
 pub(crate) use error::datafusion_error_to_lix_error;
 
+pub(crate) use authority_route::{StatementAuthorityRoute, statement_authority_route};
 #[cfg(test)]
 pub(crate) use bind::bind_statement;
 pub(crate) use bind::{
@@ -55,9 +56,10 @@ pub(crate) use catalog::{
 pub(crate) use checkpoint_function::{CheckpointFunctionPlan, checkpoint_function_plan};
 pub(crate) use context::WriteContextLiveness;
 pub(crate) use context::{
-    ChangelogQuerySource, DiffCommand, DiffCommandOutcome, DiffCommandSelection, HistoryQuerySource,
-    SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource, SqlWriteContext,
-    SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader, WriteContextHotStateReader,
+    ChangelogQuerySource, DiffCommand, DiffCommandOutcome, DiffCommandSelection,
+    HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource,
+    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader,
+    WriteContextHotStateReader,
 };
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 #[cfg(feature = "storage-benches")]
@@ -66,7 +68,6 @@ pub(crate) use exec::{
     execute_read_statement_in_session_with_collected_batches,
 };
 pub(crate) use exec::{SessionReadResult, SessionReadSqlResult, SqlWriteResult};
-pub(crate) use result_metadata::result_column_type;
 #[allow(unused_imports)]
 pub(crate) use exec::{
     SqlLogicalPlan, append_path_value_replacement_snapshot,
@@ -108,12 +109,14 @@ pub(crate) use providers::{
     execute_exact_schema_point_read, execute_fast_lix_file_path_writes,
     execute_fast_lix_file_prepared_path_write,
 };
+pub(crate) use result_metadata::result_column_type;
 pub(crate) use row_batch::{CurrentRowSnapshotReader, RowSnapshotReader};
 pub(crate) use row_columnar_layout::{
     EncodedRowGroups, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
-    ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
-    ROW_COLUMNAR_IDENTITY_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, RowColumnarRowRef,
-    RowGroupLocations, encode_registered_row_groups, encode_unclustered_registered_row_groups,
+    ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ROW_COLUMNAR_IDENTITY_FIELD,
+    ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
+    RowColumnarRowRef, RowGroupLocations, encode_registered_row_groups,
+    encode_unclustered_registered_row_groups,
 };
 pub(crate) use row_projection::RowProjectionDecoder;
 mod aggregate_statistics;

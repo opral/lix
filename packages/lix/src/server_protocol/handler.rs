@@ -29,6 +29,10 @@ use lix::{
     ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction, ObserveEvent,
     ObserveEvents, OpenLixBuilder, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
 };
+use lix::authority_client::wire::{
+    MergeBranchPreviewRequestBody, MergeBranchPreviewResponseBody, MergeBranchRequestBody,
+    MergeBranchResponseBody,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -50,10 +54,7 @@ use tokio::{
     sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch},
     task::JoinHandle,
 };
-use tokio_util::{
-    compat::TokioAsyncWriteCompatExt as _,
-    io::ReaderStream,
-};
+use tokio_util::{compat::TokioAsyncWriteCompatExt as _, io::ReaderStream};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
 const MAX_SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -514,6 +515,12 @@ where
                     validate_server_lix_id(lix_id)?;
                 }
                 let engine = self.open.open_protocol_engine().await?;
+                let expected_mutation_revision = engine
+                    .ensure_sync_authority_has_only_synchronized_rows()
+                    .await?;
+                engine
+                    .admit_sync_authority_storage(expected_mutation_revision)
+                    .await?;
                 let lix_id = match identity {
                     ServeLixIdentity::Host(lix_id) => lix_id,
                     ServeLixIdentity::Embedded => engine.lix_id().to_owned(),
@@ -1570,18 +1577,39 @@ fn targeted_protocol_request(
     } else {
         format!("{PROTOCOL_PATH}/{operation}")
     };
-    let path_and_query = request.uri().query().map_or(operation_path.clone(), |query| {
-        format!("{operation_path}?{query}")
-    });
+    let path_and_query = request
+        .uri()
+        .query()
+        .map_or(operation_path.clone(), |query| {
+            format!("{operation_path}?{query}")
+        });
     let mut parts = request.uri().clone().into_parts();
     parts.path_and_query = Some(path_and_query.parse().expect("canonical protocol URI"));
     *request.uri_mut() = http::Uri::from_parts(parts).expect("canonical protocol URI parts");
     Ok(request)
 }
 
+fn snapshot_read_durability(
+    headers: &HeaderMap,
+) -> Result<crate::storage_adapter::StorageReadDurability, ApiError> {
+    let Some(value) = headers.get("lix-snapshot-durability") else {
+        return Ok(crate::storage_adapter::StorageReadDurability::Visible);
+    };
+    match value.to_str().ok() {
+        Some("visible") => Ok(crate::storage_adapter::StorageReadDurability::Visible),
+        Some("durable") => Ok(crate::storage_adapter::StorageReadDurability::Durable),
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            LixError::CODE_INVALID_PARAM,
+            "lix-snapshot-durability must be 'visible' or 'durable'",
+        )),
+    }
+}
+
 async fn export_snapshot_response<S>(
     server: LixServerProtocol<S>,
     durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
+    durability: crate::storage_adapter::StorageReadDurability,
 ) -> Response
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1601,7 +1629,10 @@ where
     tokio::spawn(async move {
         let mut writer = writer.compat_write();
         let result = {
-            let export = server.export_snapshot().write_to(&mut writer);
+            let export = server
+                .export_snapshot()
+                .durability(durability)
+                .write_to(&mut writer);
             tokio::pin!(export);
             tokio::select! {
                 result = &mut export => result,
@@ -1696,7 +1727,6 @@ where
         options: ServerProtocolOptions,
         lix_id: String,
     ) -> Self {
-        engine.sync_mode().set_role(crate::sync::SyncRole::Authority);
         let (close_result, _) = watch::channel(None);
         Self {
             inner: Arc::new(ServerInner {
@@ -1779,9 +1809,14 @@ where
                 )
                 .into_response();
             }
+            let durability = match snapshot_read_durability(&parts.headers) {
+                Ok(durability) => durability,
+                Err(error) => return error.into_response(),
+            };
             return export_snapshot_response(
                 self,
                 context.durable_terminal_storage_notifier.clone(),
+                durability,
             )
             .await;
         }
@@ -1826,6 +1861,8 @@ where
                 | (&Method::POST, "/lix/v1/transaction/execute")
                 | (&Method::POST, "/lix/v1/branch/create")
                 | (&Method::POST, "/lix/v1/branch/switch")
+                | (&Method::POST, "/lix/v1/branch/merge")
+                | (&Method::POST, "/lix/v1/branch/merge-preview")
                 | (&Method::POST, "/lix/v1/observe")
                 | (&Method::POST, "/lix/v1/observe/multiplex")
         );
@@ -1896,7 +1933,17 @@ where
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
-                result_response(sync_pull(lease, query).await)
+                let wait = parts
+                    .headers
+                    .get("prefer")
+                    .and_then(|value| value.to_str().ok())
+                    .is_none_or(|value| {
+                        !value
+                            .split(',')
+                            .map(str::trim)
+                            .any(|preference| preference.eq_ignore_ascii_case("wait=0"))
+                    });
+                result_response(sync_pull(lease, query, wait).await)
             }
             (&Method::GET, "/lix/v1/sync/history") => {
                 let query = match decode_query::<SyncHistoryQuery>(parts.uri.query()) {
@@ -1972,15 +2019,19 @@ where
             (&Method::POST, "/lix/v1/branch/switch") => {
                 result_response(switch_branch(lease, json_request!(SwitchBranchRequest)).await)
             }
+            (&Method::POST, "/lix/v1/branch/merge") => {
+                result_response(merge_branch(lease, json_request!(MergeBranchRequestBody)).await)
+            }
+            (&Method::POST, "/lix/v1/branch/merge-preview") => result_response(
+                merge_branch_preview(lease, json_request!(MergeBranchPreviewRequestBody)).await,
+            ),
             (&Method::POST, "/lix/v1/observe") => {
                 result_response(observe(lease, json_request!(ObserveRequest)).await)
             }
             (&Method::POST, "/lix/v1/observe/multiplex") => result_response(
                 observe_multiplex(lease, json_request!(MultiplexObserveRequest)).await,
             ),
-            (_, known) if is_known_operation_path(known) => {
-                method_not_allowed()
-            }
+            (_, known) if is_known_operation_path(known) => method_not_allowed(),
             _ => not_found(),
         }
     }
@@ -2113,16 +2164,14 @@ where
                     .await
             })
         };
-        tokio::spawn(
-            opening.instrument(parent).with_current_subscriber(),
-        )
-        .await
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("join Lix protocol session open: {error}"),
-            )
-        })?
+        tokio::spawn(opening.instrument(parent).with_current_subscriber())
+            .await
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("join Lix protocol session open: {error}"),
+                )
+            })?
     }
 
     async fn create_session_tracked(
@@ -2691,6 +2740,7 @@ fn ensure_sync_push_event_fits(
 async fn sync_pull<S>(
     lease: SessionLease<S>,
     request: SyncPullRequest,
+    wait: bool,
 ) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -2769,7 +2819,7 @@ where
         );
         // Omitting `after` is a finite hot-state snapshot. A delta request is
         // the mandatory long-poll form.
-        if request.after.is_none() || !at_head {
+        if request.after.is_none() || !at_head || !wait {
             break response;
         }
         tokio::select! {
@@ -3531,6 +3581,32 @@ where
     Ok(Json(SwitchBranchResponse {
         branch_id: receipt.branch_id,
     }))
+}
+
+async fn merge_branch<S>(
+    lease: SessionLease<S>,
+    Json(options): Json<MergeBranchRequestBody>,
+) -> Result<Json<MergeBranchResponseBody>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let receipt = lease
+        .run_durable(move |lix| async move { lix.merge_branch(options.into()).await })
+        .await?;
+    Ok(Json(receipt.into()))
+}
+
+async fn merge_branch_preview<S>(
+    lease: SessionLease<S>,
+    Json(options): Json<MergeBranchPreviewRequestBody>,
+) -> Result<Json<MergeBranchPreviewResponseBody>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let preview = lease
+        .run_cancellable_read(move |lix| async move { lix.merge_branch_preview(options.into()).await })
+        .await?;
+    Ok(Json(preview.into()))
 }
 
 async fn observe<S>(
@@ -5239,9 +5315,7 @@ mod tests {
         MemoryWrite, PutBatch, ReadDurability, ReadOptions, ScanCursor, SpaceId, Storage,
         StorageError, StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
-    use lix::telemetry::{
-        CallbackTelemetrySink, CompletedTelemetrySpan, OpenTelemetryTracingSink,
-    };
+    use lix::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, OpenTelemetryTracingSink};
     use lix::{Blob, Memory, open_lix};
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -5340,7 +5414,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("OpenAPI is missing {operation_id}"))
                 .1
                 .split_once("operationId:")
-                .map_or_else(|| openapi.split_once(&marker).unwrap().1, |(operation, _)| operation);
+                .map_or_else(
+                    || openapi.split_once(&marker).unwrap().1,
+                    |(operation, _)| operation,
+                );
             assert!(
                 operation.contains("$ref: \"#/components/parameters/SyncProtocolVersion\""),
                 "OpenAPI operation {operation_id} is missing the sync protocol header",
@@ -5467,9 +5544,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.0.acquire_session().await
         }
 
@@ -5529,9 +5604,12 @@ mod tests {
             return;
         };
         let targeted_path = format!("{PROTOCOL_PATH}/{lix_id}{suffix}");
-        let path_and_query = request.uri().query().map_or(targeted_path.clone(), |query| {
-            format!("{targeted_path}?{query}")
-        });
+        let path_and_query = request
+            .uri()
+            .query()
+            .map_or(targeted_path.clone(), |query| {
+                format!("{targeted_path}?{query}")
+            });
         let mut parts = request.uri().clone().into_parts();
         parts.path_and_query = Some(path_and_query.parse().expect("test protocol URI"));
         *request.uri_mut() = http::Uri::from_parts(parts).expect("test protocol URI parts");
@@ -5745,9 +5823,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -5832,9 +5908,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -5921,9 +5995,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6043,9 +6115,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6073,12 +6143,9 @@ mod tests {
             &self,
             requests: &[GetManyRequest<'_>],
         ) -> Result<GetManyResult, StorageError> {
-            let reads_branch_control = requests
-                .iter()
-                .any(|request| {
-                    SpaceId(request.space.id.0 & !EPOCH_BANK_MASK)
-                        == BRANCH_HEAD_CONTROL_SPACE_ID
-                });
+            let reads_branch_control = requests.iter().any(|request| {
+                SpaceId(request.space.id.0 & !EPOCH_BANK_MASK) == BRANCH_HEAD_CONTROL_SPACE_ID
+            });
             if reads_branch_control
                 && self
                     .gate
@@ -6141,9 +6208,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6253,9 +6318,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6310,9 +6373,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6344,7 +6405,8 @@ mod tests {
         storage.expire_next_read();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve should retry repository admission");
         assert_eq!(storage.expired_reads.load(Ordering::Acquire), 1);
@@ -6352,11 +6414,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_rejects_preexisting_unsynchronized_untracked_rows() {
+        let storage = Memory::new();
+        let lix = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("initialize Lix before serving");
+        lix.execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+             VALUES ('local-only-before-serve', 'forbidden', true)",
+            &[],
+        )
+        .await
+        .expect("non-authority setup may contain untracked state");
+        lix.close().await.expect("close setup Lix");
+
+        let result = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_embedded_lix_id()
+            .await;
+        let Err(error) = result else {
+            panic!("server admission must reject state omitted from sync");
+        };
+        assert_eq!(error.code, "LIX_AUTHORITY_UNTRACKED_UNSUPPORTED");
+
+        let cleanup = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("failed admission must leave ordinary repository writes available");
+        cleanup
+            .execute(
+                "DELETE FROM lix_key_value WHERE key = 'local-only-before-serve'",
+                &[],
+            )
+            .await
+            .expect("the unsupported row should remain recoverable after failed admission");
+        cleanup.close().await.expect("close cleanup engine");
+
+        let recovered = open_lix()
+            .with_storage(storage)
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .expect("serving should succeed after the unsupported row is removed");
+        recovered.close().await.expect("close recovered server");
+    }
+
+    #[tokio::test]
+    async fn durable_authority_marker_fences_a_second_plain_engine() {
+        let storage = Memory::new();
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .expect("authority should claim the shared storage");
+        let plain = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("a second read-capable engine should open");
+
+        let error = plain
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('bypass', 'forbidden')",
+                &[],
+            )
+            .await
+            .expect_err("plain writers must not bypass authority publication");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+        assert!(
+            plain
+                .execute("SELECT * FROM lix_key_value WHERE key = 'bypass'", &[])
+                .await
+                .expect("rejected row absence should query")
+                .rows()
+                .is_empty()
+        );
+
+        plain.close().await.expect("plain engine should close");
+        server.close().await.expect("authority should close");
+        let reopened = open_lix()
+            .with_storage(storage)
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .expect("the exact durable authority claim should reopen");
+        reopened.close().await.expect("reopened authority should close");
+    }
+
+    #[tokio::test]
     async fn fenced_storage_does_not_affect_resumed_cached_handshake() {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server.clone());
@@ -6400,7 +6553,8 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6441,7 +6595,8 @@ mod tests {
         lix.close().await.expect("close setup session");
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6473,7 +6628,8 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let lease = server
@@ -6619,9 +6775,7 @@ mod tests {
         where
             Self: 'a;
 
-        async fn acquire_session(
-            &self,
-        ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+        async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
         }
 
@@ -6668,7 +6822,8 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6719,7 +6874,8 @@ mod tests {
         let storage = FencedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6800,7 +6956,8 @@ mod tests {
         let storage = FailOneBlockedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6888,7 +7045,8 @@ mod tests {
         let storage = FailOneBlockedReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -6967,7 +7125,8 @@ mod tests {
 
     async fn app_with_options(options: ServerProtocolOptions) -> TestApp {
         let server = open_lix()
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(options)
             .await
             .expect("serve lix");
@@ -6981,7 +7140,8 @@ mod tests {
     {
         let server = open_lix()
             .with_storage(storage)
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         handler(server)
@@ -7128,7 +7288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_hydrates_sparse_history_before_applying_its_write() {
+    async fn replica_batch_mixing_history_and_write_requires_the_authority() {
         let authority = open_lix().await.expect("open history authority");
         authority
             .execute(
@@ -7241,14 +7401,11 @@ mod tests {
         }
 
         let storage = DurableMemoryStorage::new();
-        Engine::initialize_with_main_branch_id(
-            storage.clone(),
-            Some(default_branch_id),
-        )
-        .await
-        .expect("initialize sparse replica storage");
+        Engine::initialize_with_main_branch_id(storage.clone(), Some(default_branch_id))
+            .await
+            .expect("initialize sparse replica storage");
         let mut replica = open_lix()
-            .with_storage(storage)
+            .with_storage(storage.clone())
             .await
             .expect("open sparse replica");
         replica
@@ -7351,28 +7508,29 @@ mod tests {
                 label: None,
             },
         ];
-        let first = replica
+        let error = replica
             .execute_batch(&statements)
             .await
-            .expect("sparse history batch should hydrate and commit");
-        assert!(
-            first[0].rows()[0].get::<i64>("versions").unwrap_or(0) >= 2,
-            "sparse history response: {:?}",
-            first[0]
-        );
-        hydration.await.expect("history hydration task");
+            .expect_err("a replica cannot hydrate history and publish a local write");
+        assert_eq!(error.code, crate::sync::AUTHORITY_EXECUTION_REQUIRED_CODE);
+        hydration.abort();
+        let _ = hydration.await;
 
-        let count = replica
+        let offline_reader = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("open an offline reader over the rejected replica state");
+        let count = offline_reader
             .execute(
                 "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'history-hydrated'",
                 &[],
             )
             .await
-            .expect("read hydrated batch write");
+            .expect("read rejected batch state");
         assert_eq!(
             count.rows()[0].get::<i64>("count"),
-            Ok(1),
-            "the write runs once after hydration"
+            Ok(0),
+            "the authority-only batch must not publish a replica write"
         );
     }
 
@@ -7381,7 +7539,8 @@ mod tests {
         let storage = PostCommitUnknownStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve Lix");
         let router = handler(server);
@@ -7434,7 +7593,8 @@ mod tests {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let server = open_lix()
             .with_telemetry(Arc::new(OpenTelemetryTracingSink::new(dispatch)))
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -7878,7 +8038,8 @@ mod tests {
             .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
                 captured.lock().expect("spans").push(span);
             })))
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -8800,6 +8961,28 @@ mod tests {
             .await
             .expect("direct snapshot export");
         assert_eq!(streamed.as_ref(), direct);
+    }
+
+    #[test]
+    fn snapshot_route_preserves_the_requested_read_durability() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            snapshot_read_durability(&headers).expect("default durability"),
+            crate::storage_adapter::StorageReadDurability::Visible
+        );
+        headers.insert(
+            "lix-snapshot-durability",
+            "durable".parse().expect("durability header"),
+        );
+        assert_eq!(
+            snapshot_read_durability(&headers).expect("durable requirement"),
+            crate::storage_adapter::StorageReadDurability::Durable
+        );
+        headers.insert(
+            "lix-snapshot-durability",
+            "eventual".parse().expect("invalid durability header"),
+        );
+        assert!(snapshot_read_durability(&headers).is_err());
     }
 
     #[tokio::test]
@@ -9856,8 +10039,27 @@ mod tests {
         assert_eq!(second_alive.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn pinned_protocol_sessions_switch_branches_independently() {
+    #[test]
+    fn pinned_protocol_sessions_switch_branches_independently() {
+        // Keep this unusually large straight-line fixture off libtest's small
+        // thread stack. A dedicated stack also makes the fixture independent of
+        // nextest's test-thread stack setting.
+        std::thread::Builder::new()
+            .name("pinned-protocol-session-fixture".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(pinned_protocol_sessions_switch_branches_independently_case());
+            })
+            .expect("fixture thread")
+            .join()
+            .expect("fixture thread should not panic");
+    }
+
+    async fn pinned_protocol_sessions_switch_branches_independently_case() {
         let app = app().await;
         let (first_session, before) = new_session(&app.router).await;
         let (second_session, _) = new_session(&app.router).await;
@@ -10014,6 +10216,61 @@ mod tests {
         assert_eq!(
             response_json(head).await["rows"][0][0],
             json!({ "kind": "text", "value": checkpoint_id })
+        );
+    }
+
+    #[tokio::test]
+    async fn selective_checkpoint_is_captured_as_a_member_commit() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let inserted = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('selected', 'yes'), ('unselected', 'yes')"
+            })),
+        )
+        .await;
+        assert_eq!(inserted.status(), StatusCode::OK);
+
+        let created = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+                        SELECT row_ref \
+                        FROM lix_diff('lix_key_value') \
+                        WHERE key = 'selected'))"
+            })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let checkpoint_id = response_json(created).await["rows"][0][0]["value"]
+            .as_str()
+            .expect("checkpoint commit id")
+            .to_string();
+
+        let history = request(
+            &app.router,
+            "GET",
+            &format!("/lix/v1/sync/history?head={checkpoint_id}&limit=1"),
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(history.status(), StatusCode::OK);
+        let history = response_json(history).await;
+        let checkpoint = &history["commits"][0];
+        assert_eq!(checkpoint["stateAlias"], serde_json::Value::Null);
+        assert!(
+            checkpoint["members"]
+                .as_array()
+                .is_some_and(|members| members.iter().any(|member| member["authored"] == false)),
+            "a selective checkpoint must carry its selected members"
         );
     }
 
@@ -11796,7 +12053,10 @@ mod tests {
     fn assert_info_plane(spans: &[CapturedSpan]) {
         use crate::telemetry::{FORBIDDEN_PRODUCTION_NAMES, PRODUCTION_NAMES};
         assert_eq!(PRODUCTION_NAMES.len(), 11);
-        for span in spans.iter().filter(|span| span.level == tracing::Level::INFO) {
+        for span in spans
+            .iter()
+            .filter(|span| span.level == tracing::Level::INFO)
+        {
             assert!(
                 PRODUCTION_NAMES.contains(&span.name) || span.name == "lix.protocol.request",
                 "unexpected INFO production span {}",
@@ -11987,7 +12247,8 @@ mod tests {
         );
         let server = open_lix()
             .with_telemetry(Arc::new(OpenTelemetryTracingSink::new(dispatch)))
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let app = TestApp {
@@ -12190,7 +12451,8 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 ..ServerProtocolOptions::default()
@@ -12250,7 +12512,8 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 ..ServerProtocolOptions::default()
@@ -12427,7 +12690,8 @@ mod tests {
         lix.close().await.expect("close setup session");
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: SESSION_COUNT,
                 ..ServerProtocolOptions::default()
@@ -12671,7 +12935,8 @@ mod tests {
         let storage = BlockingReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
@@ -12736,7 +13001,8 @@ mod tests {
         let storage = BlockingReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -12768,7 +13034,8 @@ mod tests {
         let storage = BlockingReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -12817,7 +13084,8 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
@@ -12891,7 +13159,8 @@ mod tests {
         let storage = BlockingFencedWriteStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 1,
                 session_idle_timeout: Duration::from_mins(1),
@@ -13069,7 +13338,8 @@ mod tests {
         let storage = BlockingFencedBranchControlReadStorage::new();
         let server = open_lix()
             .with_storage(storage.clone())
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve lix");
         let router = handler(server.clone());
@@ -13166,7 +13436,8 @@ mod tests {
     #[tokio::test]
     async fn zero_capacity_is_rejected() {
         let result = open_lix()
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_sessions: 0,
                 session_idle_timeout: Duration::from_secs(1),
@@ -13179,7 +13450,8 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
 
         let result = open_lix()
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .with_options(ServerProtocolOptions {
                 max_request_blob_cache_bytes: 0,
                 ..ServerProtocolOptions::default()
@@ -13194,8 +13466,11 @@ mod tests {
     #[tokio::test]
     async fn sync_replica_configuration_cannot_be_served_as_an_authority() {
         let result = open_lix()
-            .with_server(lix::ServerOptions::sync("https://example.invalid/repository"))
-            .serve().with_embedded_lix_id()
+            .with_server(lix::ServerOptions::sync(
+                "https://example.invalid/repository",
+            ))
+            .serve()
+            .with_embedded_lix_id()
             .await;
         let Err(error) = result else {
             panic!("sync replica configuration must not open as an authority");
@@ -13225,7 +13500,11 @@ mod tests {
             .await
             .expect("persist replica identity");
 
-        let result = open_lix().with_storage(storage).serve().with_embedded_lix_id().await;
+        let result = open_lix()
+            .with_storage(storage)
+            .serve()
+            .with_embedded_lix_id()
+            .await;
         let Err(error) = result else {
             panic!("persisted sync replica must not be promoted to authority");
         };
