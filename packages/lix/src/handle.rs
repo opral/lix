@@ -1723,7 +1723,7 @@ where
                 .map(|(sql, params)| ((*sql).to_owned(), (*params).to_vec()))
                 .collect::<Vec<_>>(),
         );
-        let routed = statements
+        let mut routed = statements
             .iter()
             .map(|(sql, params)| ExecuteBatchStatement {
                 sql: sql.clone(),
@@ -1741,16 +1741,18 @@ where
         // cross-target Send shape already used by the public execute builders.
         unsafe { crate::session::AssumeSendFuture::new(async move {
             let route = authority?;
-            let authority_operation = if let Some(connected) = connected_authority.as_ref() {
+            if is_replica && route == crate::sql2::StatementAuthorityRoute::AuthorityWrite {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "execute_coherent_read_batch only accepts read statements without durable runtime functions",
+                ));
+            }
+            let _authority_operation = if let Some(connected) = connected_authority.as_ref() {
                 Some(connected.begin_operation().await?)
             } else {
                 None
             };
             if is_replica && route == crate::sql2::StatementAuthorityRoute::HotRead {
-                connected_authority
-                    .as_ref()
-                    .expect("connected replica has an authority client")
-                    .ensure_usable()?;
                 let local = retry_expired_read(|| {
                     Arc::clone(&session).execute_coherent_read_batch_owned(Arc::clone(&statements))
                 })
@@ -1772,14 +1774,9 @@ where
             let connected = connected_authority
                 .as_ref()
                 .ok_or_else(|| crate::sync::authority_execution_required(route))?;
-            let session_operation = session.begin_waitable_session_operation().await?;
-            // These guards retain the authority gate across the
-            // local attempt, fallback, publication fence, and final serving
-            // decision. A branch switch therefore cannot splice two branches
-            // into one coherent read.
-            let _authority_operation = authority_operation;
-            let mut authority_routed = routed.clone();
-            authority_routed.push(ExecuteBatchStatement {
+            let _session_operation = session.begin_waitable_session_operation().await?;
+            let result_count = routed.len();
+            routed.push(ExecuteBatchStatement {
                 sql: "SELECT lix_active_branch_id() AS branch_id, \
                       lix_active_branch_commit_id() AS commit_id"
                     .to_owned(),
@@ -1788,7 +1785,7 @@ where
             });
             let mut authority_results = connected
                 .client
-                .execute_batch(&authority_routed, None)
+                .execute_batch(&routed, None)
                 .await?;
             let metadata = authority_results.pop().ok_or_else(|| {
                 LixError::new(
@@ -1796,7 +1793,7 @@ where
                     "authority coherent read omitted snapshot metadata",
                 )
             })?;
-            if authority_results.len() != routed.len() || metadata.rows().len() != 1 {
+            if authority_results.len() != result_count || metadata.rows().len() != 1 {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "authority coherent read returned an invalid result shape",
@@ -1811,50 +1808,21 @@ where
                 storage_mutation_revision: None,
                 results: authority_results,
             };
-            crate::sync::fence_hot_state(demand_tx.as_ref().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "connected coherent read has no certified publication worker",
-                )
-            })?)
-            .await?;
-            if route != crate::sql2::StatementAuthorityRoute::HotRead {
-                // History and other cold surfaces are deliberately not a
-                // certified local serving contract. Their authority batch is
-                // already coherent; do not turn a valid server-first read into
-                // a sparse-history demand by attempting it locally.
-                return Ok(authority_batch);
+            if route == crate::sql2::StatementAuthorityRoute::HotRead {
+                // A HOT fallback can refresh a stale branch base on the authority.
+                // Publish that refresh before returning, as for ordinary HOT reads.
+                crate::sync::fence_hot_state(demand_tx.as_ref().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "connected coherent read has no certified publication worker",
+                    )
+                })?)
+                .await?;
             }
-            // The final HOT rerun owns its own session lifecycle and may need
-            // stale-base write access. Keep only the authority gate here.
-            drop(session_operation);
-            // The authority result and a later local metadata read are not one
-            // snapshot: another authority commit can land between them. Once
-            // the fallback has refreshed and fenced the serving plane, rerun
-            // the complete batch locally so rows and revision metadata are
-            // captured by the same certified storage read.
-            let local = retry_expired_read(|| {
-                Arc::clone(&session)
-                    .execute_coherent_read_batch_owned(Arc::clone(&statements))
-            })
-            .await;
-            match local {
-                Ok(local) => Ok(local),
-                Err(error)
-                    if error.code == LixError::CODE_STORAGE_READ_EXPIRED
-                        || connected_hot_read_needs_authority(&error) =>
-                {
-                    // The retained rows and branch/head were read in one
-                    // authority transaction at coordinate C. The publication
-                    // fence may legitimately advance the local cache to a
-                    // later D; that does not make C incoherent or unauthoritative.
-                    // Returning C is safer than splicing its rows with D's
-                    // local metadata, and avoids starvation when another OPFS
-                    // context continuously expires local snapshots.
-                    Ok(authority_batch)
-                }
-                Err(error) => Err(error),
-            }
+            // Rows and branch metadata already belong to one authority snapshot.
+            // A later local publication does not invalidate it, and cannot supply
+            // this result with a local storage revision.
+            Ok(authority_batch)
         }) }
     }
 
@@ -3071,6 +3039,38 @@ mod tests {
         assert_eq!(result, "hydrated");
         assert_eq!(attempts.load(Ordering::Relaxed), 4);
         responder.await.expect("demand responder should finish");
+    }
+
+    #[tokio::test]
+    async fn replica_coherent_reads_reject_mutations_before_authority_routing() {
+        let lix = open_lix().await.expect("open Lix");
+        lix.set_sync_role(crate::sync::SyncRole::Replica)
+            .expect("mark replica");
+        for sql in [
+            "INSERT INTO lix_key_value (key, value) VALUES ('read-only', 'unexpected')",
+            "SELECT uuidv7()",
+            "SELECT current_timestamp",
+        ] {
+            let error = lix
+                .execute_coherent_read_batch(&[("SELECT * FROM lix_checkpoint", &[]), (sql, &[])])
+                .await
+                .expect_err("coherent reads cannot mutate either engine");
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{sql}");
+        }
+        lix.close().await.expect("close replica");
+    }
+
+    #[tokio::test]
+    async fn replica_coherent_hot_read_without_authority_does_not_panic() {
+        let lix = open_lix().await.expect("open Lix");
+        lix.set_sync_role(crate::sync::SyncRole::Replica)
+            .expect("mark replica");
+        let batch = lix
+            .execute_coherent_read_batch(&[("SELECT 1 AS value", &[])])
+            .await
+            .expect("a local read does not require a connected authority client");
+        assert_eq!(batch.results[0].rows()[0].get::<i64>("value").unwrap(), 1);
+        lix.close().await.expect("close replica");
     }
 
     #[tokio::test]

@@ -782,6 +782,19 @@ async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() 
         .await
         .expect("connected history executes on the authority");
     assert!(!history.rows().is_empty());
+    for sql in [
+        "INSERT INTO lix_key_value (key, value) VALUES ('coherent-write', 'must-not-exist')",
+        "SELECT uuidv7()",
+        "SELECT current_timestamp",
+    ] {
+        let error = replica
+            .execute_coherent_read_batch(&[("SELECT * FROM lix_checkpoint", &[]), (sql, &[])])
+            .await
+            .expect_err("connected coherent batches must reject mutations");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{sql}");
+    }
+    assert_eq!(protocol_authority.read_value("coherent-write").await, None);
+    let fences_before_history = probe.publication_fences.load(Ordering::Acquire);
     let coherent_history_statements: [(&str, &[Value]); 1] =
         [("SELECT * FROM lix_history('lix_key_value')", &[])];
     let coherent_history = replica
@@ -796,6 +809,11 @@ async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() 
     assert_eq!(
         coherent_history.storage_mutation_revision, None,
         "authority snapshots must not claim a local adapter revision",
+    );
+    assert_eq!(
+        probe.publication_fences.load(Ordering::Acquire),
+        fences_before_history,
+        "an authority read does not need to republish the local cache",
     );
     let mut snapshot = Vec::new();
     replica
@@ -815,6 +833,14 @@ async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() 
         )
         .await
         .expect("open persisted replica without a server");
+    let offline_read = reopened_without_server
+        .execute_coherent_read_batch(&[(
+            "SELECT value FROM lix_key_value WHERE key = 'after-abandoned'",
+            &[],
+        )])
+        .await
+        .expect("a persisted certified HOT cache remains readable without a server");
+    assert_eq!(offline_read.results[0].rows().len(), 1);
     let persisted_export_error = reopened_without_server
         .export_snapshot()
         .write_to(&mut Vec::new())
