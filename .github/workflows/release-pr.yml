@@ -7,7 +7,6 @@ on:
       - main
 
 permissions:
-  actions: write
   contents: write
   pull-requests: write
 
@@ -39,6 +38,13 @@ jobs:
           echo "has_release=true" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Validate prepared release metadata
+        if: steps.prepare.outputs.has_release == 'true'
+        run: |
+          node scripts/validate-publish-surface.mjs
+          node --test scripts/release.test.mjs
+          git diff --check
+
       - name: Create or update release PR
         if: steps.prepare.outputs.has_release == 'true'
         id: release_pr
@@ -47,82 +53,17 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: release/v${{ steps.prepare.outputs.version }}
           delete-branch: true
+          draft: always-true
           commit-message: Release v${{ steps.prepare.outputs.version }}
           title: Release v${{ steps.prepare.outputs.version }}
           body: |
             This PR was generated from `.changenotes/*` fragments.
 
+            Mark this PR ready for review when the release is ready. This runs full CI.
+            Automated updates return it to draft; metadata is validated on every update.
+
             Merging this PR updates `CHANGELOG.md`, bumps lockstep package versions,
             and enables the release workflow to create `v${{ steps.prepare.outputs.version }}` and publish packages.
-
-      - name: Run CI for release changes
-        if: steps.prepare.outputs.has_release == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_SHA: ${{ steps.release_pr.outputs.pull-request-head-sha }}
-          TARGET_BRANCH: release/v${{ steps.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          # Creating or updating the release PR can already trigger ordinary
-          # pull_request CI. Reuse that run when GitHub accepted it instead of
-          # paying for a second full workflow_dispatch run for the same SHA.
-          # GITHUB_TOKEN-authored PR events can be approval-blocked, so retain
-          # workflow_dispatch as a fail-open fallback.
-          if [ -n "$RELEASE_SHA" ]; then
-            for attempt in 1 2 3 4 5 6; do
-              if ! runs="$(gh run list \
-                --workflow ci.yml \
-                --event pull_request \
-                --commit "$RELEASE_SHA" \
-                --limit 100 \
-                --json status,conclusion,url)"; then
-                echo "Could not inspect pull request CI; dispatching the fallback run."
-                break
-              fi
-
-              if jq -e 'def blocked:
-                  . == "action_required" or . == "cancelled" or
-                  . == "skipped" or . == "stale";
-                any(.[];
-                .status == "queued" or
-                .status == "in_progress" or
-                (.status == "completed" and
-                  (.conclusion | blocked | not)))' \
-                <<< "$runs" >/dev/null; then
-                echo "Reusing pull request CI for $RELEASE_SHA."
-                jq -r 'def blocked:
-                    . == "action_required" or . == "cancelled" or
-                    . == "skipped" or . == "stale";
-                  .[] | select(
-                  .status == "queued" or
-                  .status == "in_progress" or
-                  (.status == "completed" and
-                    (.conclusion | blocked | not))) |
-                  .url' <<< "$runs"
-                exit 0
-              fi
-
-              if jq -e 'def blocked:
-                  . == "action_required" or . == "cancelled" or
-                  . == "skipped" or . == "stale";
-                any(.[];
-                .status == "completed" and
-                (.conclusion | blocked))' \
-                <<< "$runs" >/dev/null; then
-                echo "Pull request CI cannot provide a reusable check; dispatching the fallback run."
-                break
-              fi
-
-              if [ "$attempt" -lt 6 ]; then
-                sleep 5
-              fi
-            done
-          else
-            echo "The release PR action did not return a head SHA; dispatching the fallback run."
-          fi
-
-          gh workflow run ci.yml --ref "$TARGET_BRANCH"
 
       - name: Close superseded release PRs
         if: steps.prepare.outputs.has_release == 'true'
