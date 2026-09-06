@@ -313,7 +313,7 @@ jobs:
           package_archive="$(find target/package -maxdepth 1 -type f -name 'lix-[0-9]*.crate' | head -n 1)"
           schema_archive="$(find target/package -maxdepth 1 -type f -name 'lix-schema-*.crate' | head -n 1)"
           tar -tf "$package_archive" |
-            rg '^[^/]+/wit/lix-plugin\.wit$'
+            grep -E '^[^/]+/wit/lix-plugin\.wit$'
           packaged_lix="$(mktemp -d)"
           packaged_schema="$(mktemp -d)"
           tar -xf "$package_archive" -C "$packaged_lix" --strip-components=1
