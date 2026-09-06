@@ -48,7 +48,11 @@ test("Rust test scopes run independently with workspace-specific caches", () => 
 	assert.match(workflow, /name: rust-cargo-timings-\$\{\{ matrix\.task \}\}/);
 	assert.match(
 		workflow,
-		/name: Cargo \$\{\{ matrix\.name \}\}[\s\S]*?runs-on: \$\{\{ inputs\.runner_provider == 'blacksmith' && matrix\.blacksmith_runner \|\| 'ubuntu-24\.04' \}\}/,
+		/name: Cargo \$\{\{ matrix\.name \}\}[\s\S]*?runs-on: \$\{\{ inputs\.runner_provider == 'blacksmith' && matrix\.blacksmith_runner \|\| matrix\.default_runner \|\| 'ubuntu-24\.04' \}\}/,
+	);
+	assert.match(
+		workflow,
+		/- name: Test\n\s+task: test[\s\S]*?default_runner: blacksmith-8vcpu-ubuntu-2404\n\s+blacksmith_runner: blacksmith-16vcpu-ubuntu-2404/,
 	);
 });
 

@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       runner_provider:
-        description: Standard GitHub runners by default; Blacksmith is an explicit compilation fallback
+        description: Use the smallest qualified runners by default; Blacksmith forces larger compilation runners
         type: choice
-        default: github
+        default: default
         options:
-          - github
+          - default
           - blacksmith
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
@@ -86,7 +86,7 @@ jobs:
     name: Cargo ${{ matrix.name }}
     needs: changelog
     if: needs.changelog.outputs.rust != 'false' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    runs-on: ${{ inputs.runner_provider == 'blacksmith' && matrix.blacksmith_runner || 'ubuntu-24.04' }}
+    runs-on: ${{ inputs.runner_provider == 'blacksmith' && matrix.blacksmith_runner || matrix.default_runner || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
       # The root Cargo config otherwise sends --manifest-path tooling builds
@@ -107,6 +107,9 @@ jobs:
             task: test
             workspace: .
             junit: target/nextest/ci/junit.xml
+            # The 16 GiB GitHub VM shut down twice during this compilation.
+            # Use 32 GiB here; the other Rust/SDK jobs passed on free runners.
+            default_runner: blacksmith-8vcpu-ubuntu-2404
             blacksmith_runner: blacksmith-16vcpu-ubuntu-2404
           - name: Tooling Test
             task: tooling
@@ -126,10 +129,10 @@ jobs:
       - name: Prepare Linux build runner
         uses: ./.github/actions/prepare-linux-runner
 
-      - name: Limit root test compilation concurrency on GitHub
+      - name: Limit root test compilation concurrency
         if: matrix.task == 'test' && inputs.runner_provider != 'blacksmith'
-        # Leave headroom for the large root test crate on the 16 GiB VM.
-        run: echo 'CARGO_BUILD_JOBS=2' >> "$GITHUB_ENV"
+        # Leave headroom for the large root test crate on the 32 GiB VM.
+        run: echo 'CARGO_BUILD_JOBS=4' >> "$GITHUB_ENV"
 
       - name: set envs
         run: |
