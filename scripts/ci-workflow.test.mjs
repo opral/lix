@@ -40,10 +40,32 @@ test("Rust test scopes run independently with workspace-specific caches", () => 
 			),
 		);
 	}
-	assert.match(workflow, /workspaces: \$\{\{ matrix\.workspace \}\}/);
+	assert.match(workflow, /workspaces: \$\{\{ matrix\.cache_workspaces \|\| matrix\.workspace \}\}/);
 	assert.match(workflow, /name: rust-nextest-junit-\$\{\{ matrix\.task \}\}/);
 	assert.match(workflow, /name: rust-cargo-timings-\$\{\{ matrix\.task \}\}/);
 	assert.match(workflow, /name: Cargo \$\{\{ matrix\.name \}\}[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/);
+});
+
+test("Rust scope gates only Rust jobs and keeps both SDK integration suites", () => {
+	const cargo = workflow.split("\n  cargo:\n")[1].split("\n  js-sdk-test:\n")[0];
+	assert.match(cargo, /needs: changelog/);
+	assert.match(cargo, /if: needs\.changelog\.outputs\.rust != 'false'/);
+	const sdk = workflow.split("\n  js-sdk-test:\n")[1].split("\n  preview-artifact-changes:\n")[0];
+	assert.doesNotMatch(sdk, /needs:|outputs\.rust/);
+	assert.match(workflow, /fetch-depth: 2/);
+	assert.match(workflow, /rust: \$\{\{ steps\.scope\.outputs\.rust \}\}/);
+	assert.match(workflow, /run: node scripts\/ci-rust-scope\.mjs/);
+});
+
+test("Clippy caches both workspaces and SDK build modes have separate main-seeded caches", () => {
+	assert.match(workflow, /cache_workspaces: \|\n\s+\. -> target\n\s+tooling -> target/);
+	assert.match(workflow, /shared-key: ci-js-\$\{\{ matrix\.runtime \}\}\n\s+save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/);
+});
+
+test("Cargo output directories match the workspace caches and timing uploads", () => {
+	assert.match(workflow, /CARGO_TARGET_DIR: \$\{\{ github\.workspace \}\}\/\$\{\{ matrix\.workspace \}\}\/target/);
+	assert.match(workflow, /export CARGO_TARGET_DIR="\$GITHUB_WORKSPACE\/tooling\/target"\n\s+cargo clippy/);
+	assert.match(workflow, /path: \$\{\{ matrix\.workspace \}\}\/target\/cargo-timings\/\*\.html/);
 });
 
 test("short support jobs use free standard runners for the public repository", () => {
