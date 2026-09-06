@@ -2,6 +2,14 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      runner_provider:
+        description: Standard GitHub runners by default; Blacksmith is an explicit compilation fallback
+        type: choice
+        default: github
+        options:
+          - github
+          - blacksmith
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
   push:
@@ -78,7 +86,8 @@ jobs:
     name: Cargo ${{ matrix.name }}
     needs: changelog
     if: needs.changelog.outputs.rust != 'false' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ inputs.runner_provider == 'blacksmith' && matrix.blacksmith_runner || 'ubuntu-24.04' }}
+    timeout-minutes: 45
     env:
       # The root Cargo config otherwise sends --manifest-path tooling builds
       # to root/target, while the cache and reports expect tooling/target.
@@ -93,26 +102,29 @@ jobs:
             cache_workspaces: |
               . -> target
               tooling -> target
-            runner: blacksmith-32vcpu-ubuntu-2404
+            blacksmith_runner: blacksmith-32vcpu-ubuntu-2404
           - name: Test
             task: test
             workspace: .
             junit: target/nextest/ci/junit.xml
-            runner: blacksmith-16vcpu-ubuntu-2404
+            blacksmith_runner: blacksmith-16vcpu-ubuntu-2404
           - name: Tooling Test
             task: tooling
             workspace: tooling
             junit: tooling/target/nextest/ci/junit.xml
-            runner: blacksmith-16vcpu-ubuntu-2404
+            blacksmith_runner: blacksmith-16vcpu-ubuntu-2404
           - name: E2E Test
             task: e2e
             workspace: tooling
             junit: tooling/target/nextest/ci-e2e/junit.xml
-            runner: blacksmith-16vcpu-ubuntu-2404
+            blacksmith_runner: blacksmith-16vcpu-ubuntu-2404
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Prepare Linux build runner
+        uses: ./.github/actions/prepare-linux-runner
 
       - name: set envs
         run: |
@@ -310,10 +322,17 @@ jobs:
           cp packages/lix/examples/plugin_minimal.rs "$downstream/src/lib.rs"
           cargo build --manifest-path "$downstream/Cargo.toml" --target wasm32-wasip2
 
+      - name: Report remaining runner resources
+        if: always()
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+
   js-sdk-test:
     name: JS SDK ${{ matrix.name }} Test
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ inputs.runner_provider == 'blacksmith' && matrix.blacksmith_runner || 'ubuntu-24.04' }}
+    timeout-minutes: 45
     env:
       # Pull request workflows normally check out GitHub's synthetic merge
       # commit. Consumers pin the real source commit as a submodule, so build
@@ -325,10 +344,10 @@ jobs:
         include:
           - name: Native
             runtime: native
-            runner: blacksmith-16vcpu-ubuntu-2404
+            blacksmith_runner: blacksmith-16vcpu-ubuntu-2404
           - name: Browser
             runtime: browser
-            runner: blacksmith-32vcpu-ubuntu-2404
+            blacksmith_runner: blacksmith-32vcpu-ubuntu-2404
 
     steps:
       - name: Checkout repository
@@ -371,6 +390,10 @@ jobs:
       - name: Validate restored SDK binaries
         id: binary-cache
         run: node scripts/ci-sdk-cache.mjs check '${{ matrix.runtime }}' '${{ steps.binary-key.outputs.key }}'
+
+      - name: Prepare Linux build runner
+        if: steps.binary-cache.outputs.reuse != 'true'
+        uses: ./.github/actions/prepare-linux-runner
 
       - name: Install LLVM build dependencies
         if: matrix.runtime == 'native' && steps.binary-cache.outputs.reuse != 'true'
@@ -544,6 +567,12 @@ jobs:
           path: .ci-sdk-cache/${{ matrix.runtime }}
           key: ${{ steps.binary-key.outputs.key }}
 
+      - name: Report remaining runner resources
+        if: always()
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+
   preview-artifact-changes:
     name: Select preview artifacts
     if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
@@ -586,7 +615,8 @@ jobs:
     name: Lix server preview artifact
     if: needs.preview-artifact-changes.outputs.server == 'true'
     needs: preview-artifact-changes
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ${{ inputs.runner_provider == 'blacksmith' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
     env:
       LIX_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
 
@@ -595,6 +625,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.LIX_SOURCE_SHA }}
+
+      - name: Prepare Linux build runner
+        uses: ./.github/actions/prepare-linux-runner
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -645,3 +678,9 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Report remaining runner resources
+        if: always()
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          free -h

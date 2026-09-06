@@ -1,0 +1,17 @@
+name: Prepare Linux build runner
+description: Free space for Rust and Docker outputs on standard GitHub runners.
+
+runs:
+  using: composite
+  steps:
+    - name: Reclaim unused preinstalled SDK space
+      if: runner.environment == 'github-hosted'
+      shell: bash
+      run: |
+        # Fresh, disposable GitHub VMs include SDKs this Rust/Node repository
+        # never uses. Keep Rust, LLVM, Node, browsers and Docker intact.
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/share/swift \
+          /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+        sudo apt-get clean
+        df -h "$GITHUB_WORKSPACE"
+        free -h

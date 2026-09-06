@@ -36,7 +36,7 @@ test("Rust test scopes run independently with workspace-specific caches", () => 
 		assert.match(
 			workflow,
 			new RegExp(
-				`- name: ${name}\\n\\s+task: ${task}\\n\\s+workspace: ${workspace === "." ? "\\." : workspace}[\\s\\S]*?runner: ${runner}`,
+				`- name: ${name}\\n\\s+task: ${task}\\n\\s+workspace: ${workspace === "." ? "\\." : workspace}[\\s\\S]*?blacksmith_runner: ${runner}`,
 			),
 		);
 	}
@@ -48,7 +48,7 @@ test("Rust test scopes run independently with workspace-specific caches", () => 
 	assert.match(workflow, /name: rust-cargo-timings-\$\{\{ matrix\.task \}\}/);
 	assert.match(
 		workflow,
-		/name: Cargo \$\{\{ matrix\.name \}\}[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/,
+		/name: Cargo \$\{\{ matrix\.name \}\}[\s\S]*?runs-on: \$\{\{ inputs\.runner_provider == 'blacksmith' && matrix\.blacksmith_runner \|\| 'ubuntu-24\.04' \}\}/,
 	);
 });
 
@@ -109,18 +109,18 @@ test("short support jobs use free standard runners for the public repository", (
 	}
 });
 
-test("JS SDK native CI is right-sized without changing browser architecture coverage", () => {
+test("SDK CI defaults to free GitHub runners with an explicit Blacksmith fallback", () => {
 	assert.match(
 		workflow,
-		/- name: Native\n\s+runtime: native\n\s+runner: blacksmith-16vcpu-ubuntu-2404/,
+		/- name: Native\n\s+runtime: native\n\s+blacksmith_runner: blacksmith-16vcpu-ubuntu-2404/,
 	);
 	assert.match(
 		workflow,
-		/- name: Browser\n\s+runtime: browser\n\s+runner: blacksmith-32vcpu-ubuntu-2404/,
+		/- name: Browser\n\s+runtime: browser\n\s+blacksmith_runner: blacksmith-32vcpu-ubuntu-2404/,
 	);
 	assert.match(
 		workflow,
-		/name: JS SDK \$\{\{ matrix\.name \}\} Test[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/,
+		/name: JS SDK \$\{\{ matrix\.name \}\} Test[\s\S]*?runs-on: \$\{\{ inputs\.runner_provider == 'blacksmith' && matrix\.blacksmith_runner \|\| 'ubuntu-24\.04' \}\}/,
 	);
 });
 
@@ -183,16 +183,20 @@ test("SDK binary reuse never skips TypeScript builds or integration tests", () =
 	}
 });
 
-test("server cache hits retag the immutable image on a small runner", () => {
+test("server publishing and SDK package tests use free GitHub runners", () => {
 	assert.match(
 		publishWorkflow,
-		/server_digest != '' && 'blacksmith-4vcpu-ubuntu-2404'/,
+		/name: Publish Lix reference server\n\s+runs-on: ubuntu-24\.04/,
 	);
 	assert.match(
 		publishWorkflow,
 		/id: publish\n\s+if: needs\.release-version\.outputs\.server_digest == ''/,
 	);
 	assert.match(publishWorkflow, /imagetools create --prefer-index=false/);
+	assert.match(
+		publishWorkflow,
+		/name: Test @lix-js\/sdk\n\s+runs-on: ubuntu-24\.04/,
+	);
 });
 
 test("nextest compiles test targets without building unused examples", () => {
