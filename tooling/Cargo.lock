@@ -3139,6 +3139,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "fastcdc",
+ "flate2",
  "futures-core",
  "futures-io",
  "futures-lite",

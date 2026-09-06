@@ -1,6 +1,6 @@
 pub(crate) mod common;
-pub(crate) mod execution_slots;
 mod current_timestamp;
+pub(crate) mod execution_slots;
 mod lix_active_account_id;
 mod lix_active_branch_commit_id;
 mod lix_active_branch_id;
@@ -79,13 +79,15 @@ pub(crate) fn register_execution_sql2_functions(ctx: &SessionContext, slots: Arc
     ctx.register_udf(ScalarUDF::from(
         lix_latest_checkpoint_commit_id::LixLatestCheckpointCommitId::new(Arc::clone(&slots)),
     ));
-    ctx.register_udf(ScalarUDF::from(
-        lix_root_commit_id::LixRootCommitId::new(Arc::clone(&slots)),
-    ));
+    ctx.register_udf(ScalarUDF::from(lix_root_commit_id::LixRootCommitId::new(
+        Arc::clone(&slots),
+    )));
     ctx.register_udf(ScalarUDF::from(uuidv7::UuidV7 {
         slots: Arc::clone(&slots),
     }));
-    ctx.register_udf(ScalarUDF::from(current_timestamp::CurrentTimestamp { slots }));
+    ctx.register_udf(ScalarUDF::from(current_timestamp::CurrentTimestamp {
+        slots,
+    }));
 }
 
 /// Points the session's execution functions at this statement's facts.
@@ -96,6 +98,7 @@ pub(crate) fn bind_execution_sql2_functions(
     active_branch_id: Option<&str>,
     active_branch_commit_id: Option<&str>,
     latest_checkpoint_commit_id: Option<&str>,
+    working_diff_checkpoint_commit_id: Option<&str>,
     root_commit_id: Option<&str>,
 ) {
     execution_slots(ctx).bind(
@@ -104,6 +107,7 @@ pub(crate) fn bind_execution_sql2_functions(
         active_branch_id,
         active_branch_commit_id,
         latest_checkpoint_commit_id,
+        working_diff_checkpoint_commit_id,
         root_commit_id,
     );
 }
@@ -120,6 +124,7 @@ pub(super) mod test_support {
             &ctx,
             system_sql2_function_provider(),
             crate::ANONYMOUS_ACCOUNT_ID,
+            None,
             None,
             None,
             None,

@@ -18,7 +18,10 @@ import {
 	type WorkerSyncServerOptions,
 } from "./protocol.js";
 
-export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
+export function startWorkerHost(
+	endpoint: WorkerHostEndpoint,
+	openBinding: typeof openLixBinding = openLixBinding,
+): void {
 	const sessions = new Map<number, LixBinding>();
 	let nextSessionId = 1;
 	let nextTransactionId = 1;
@@ -43,6 +46,15 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		number,
 		{ resolve(response: WorkerSyncFetchResponse): void; reject(error: unknown): void }
 	>();
+	const pendingSyncStreamPulls = new Map<
+		number,
+		{
+			controller: ReadableStreamDefaultController<Uint8Array>;
+			resolve(): void;
+			reject(error: unknown): void;
+		}
+	>();
+	const syncStreamCleanup = new Map<number, () => void>();
 	let finiteQueue = Promise.resolve();
 
 	endpoint.onMessage((message: WorkerInput) => {
@@ -81,6 +93,21 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				const exportId = message.operation.exportId;
 				void respond(message, () => handleSnapshotCancel(exportId));
 			}
+			return;
+		}
+		if (message.operation.kind === "observe") {
+			const operation = message.operation;
+			// Observation setup is metadata-only. Keeping it behind the global
+			// finite-operation queue lets an authority mutation that is waiting for
+			// local publication block a newly mounted server-first History query.
+			// The live `next()` lane is already independent for the same reason.
+			void respond(message, () =>
+				handleObserveRegistration(
+					message.sessionId,
+					operation.sql,
+					operation.params,
+				),
+			);
 			return;
 		}
 		finiteQueue = finiteQueue.then(async () => {
@@ -145,7 +172,32 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				else pending.reject(deserializeWorkerError(message.result.error));
 				break;
 			}
+			case "sync.fetch.stream.result": {
+				const pending = pendingSyncStreamPulls.get(message.requestId);
+				pendingSyncStreamPulls.delete(message.requestId);
+				if (!pending) break;
+				if (!message.result.ok) {
+					const error = deserializeWorkerError(message.result.error);
+					pending.controller.error(error);
+					pending.reject(error);
+					finishSyncStream(message.requestId);
+				} else if (message.result.done) {
+					pending.controller.close();
+					pending.resolve();
+					finishSyncStream(message.requestId);
+				} else {
+					pending.controller.enqueue(message.result.chunk);
+					pending.resolve();
+				}
+				break;
+			}
 		}
+	}
+
+	function finishSyncStream(requestId: number): void {
+		const cleanup = syncStreamCleanup.get(requestId);
+		syncStreamCleanup.delete(requestId);
+		cleanup?.();
 	}
 
 	async function respond(
@@ -179,7 +231,7 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 							? undefined
 							: requiredSnapshotInput(operation.snapshotId).readable;
 					try {
-					const opened = await openLixBinding(
+					const opened = await openBinding(
 						operation.storage,
 						operation.telemetryEnabled
 							? (span: LixTelemetrySpan) =>
@@ -283,15 +335,8 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				throw workerStateError("snapshot pulls bypass the finite operation queue");
 			case "exportSnapshot.cancel":
 				throw workerStateError("snapshot cancellation bypasses the finite operation queue");
-			case "observe": {
-				const events = await requiredLix(sessionId).observe(
-					operation.sql,
-					operation.params,
-				);
-				const observeId = nextObserveId++;
-				observations.set(observeId, events);
-				return observeId;
-			}
+			case "observe":
+				throw workerStateError("observe must use the observation lane");
 			case "close": {
 				const openLix = requiredLix(sessionId);
 				await openLix.close();
@@ -389,18 +434,24 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		input: RequestInfo | URL,
 		init?: RequestInit,
 	): Promise<Response> {
-		const responseLimit = (
-			init as (RequestInit & { lixResponseLimit?: unknown }) | undefined
-		)?.lixResponseLimit;
+		const extension = init as
+			| (RequestInit & {
+					lixResponseLimit?: unknown;
+					lixResponseStream?: unknown;
+			  })
+			| undefined;
+		const streaming = extension?.lixResponseStream === true;
+		const responseLimit = extension?.lixResponseLimit;
 		if (
-			typeof responseLimit !== "number" ||
-			!Number.isSafeInteger(responseLimit) ||
-			responseLimit <= 0
+			!streaming &&
+			(typeof responseLimit !== "number" ||
+				!Number.isSafeInteger(responseLimit) ||
+				responseLimit <= 0)
 		) {
 			throw new TypeError("Browser sync fetch has no valid response limit");
 		}
 		const requestId = nextSyncRequestId++;
-		const request: WorkerSyncFetchRequest = {
+		const requestBase = {
 			url:
 				typeof input === "string"
 					? input
@@ -411,8 +462,14 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			headers: headerEntries(init?.headers),
 			body: serializableBody(init?.body),
 			credentials: init?.credentials,
-			responseLimit,
 		};
+		const request: WorkerSyncFetchRequest = streaming
+			? { ...requestBase, responseMode: "stream" }
+			: {
+					...requestBase,
+					responseMode: "buffered",
+					responseLimit: responseLimit as number,
+			  };
 		const response = new Promise<WorkerSyncFetchResponse>((resolve, reject) => {
 			pendingSyncFetch.set(requestId, { resolve, reject });
 			endpoint.postMessage({ kind: "sync.fetch", requestId, request });
@@ -422,17 +479,78 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			pendingSyncFetch.delete(requestId);
 			if (pending) {
 				pending.reject(new DOMException("The operation was aborted", "AbortError"));
-				endpoint.postMessage({ kind: "sync.fetch.cancel", requestId });
 			}
+			const pull = pendingSyncStreamPulls.get(requestId);
+			pendingSyncStreamPulls.delete(requestId);
+			if (pull) {
+				const error = new DOMException("The operation was aborted", "AbortError");
+				pull.controller.error(error);
+				pull.reject(error);
+			}
+			endpoint.postMessage({ kind: "sync.fetch.cancel", requestId });
+			finishSyncStream(requestId);
 		};
 		if (init?.signal?.aborted) abort();
 		else init?.signal?.addEventListener("abort", abort, { once: true });
+		let streamEstablished = false;
 		try {
 			const resolved = await response;
+			if (resolved.streaming) {
+				const signal = init?.signal;
+				if (signal?.aborted) {
+					abort();
+					throw new DOMException("The operation was aborted", "AbortError");
+				}
+				if (
+					resolved.status === 204 ||
+					resolved.status === 205 ||
+					resolved.status === 304
+				) {
+					endpoint.postMessage({ kind: "sync.fetch.cancel", requestId });
+					return new Response(null, {
+						status: resolved.status,
+						statusText: resolved.statusText,
+						headers: resolved.headers,
+					});
+				}
+				syncStreamCleanup.set(requestId, () =>
+					signal?.removeEventListener("abort", abort),
+				);
+				const body = new ReadableStream<Uint8Array>({
+					pull: (controller) =>
+						new Promise<void>((resolve, reject) => {
+							pendingSyncStreamPulls.set(requestId, {
+								controller,
+								resolve,
+								reject,
+							});
+							endpoint.postMessage({
+								kind: "sync.fetch.stream.pull",
+								requestId,
+							});
+						}),
+					cancel: abort,
+				});
+				const streamedResponse = new Response(body, {
+					status: resolved.status,
+					statusText: resolved.statusText,
+					headers: resolved.headers,
+				});
+				streamEstablished = true;
+				return streamedResponse;
+			}
 			return responseFromSyncFetch(resolved);
+		} catch (error) {
+			if (streaming && !streamEstablished) {
+				endpoint.postMessage({ kind: "sync.fetch.cancel", requestId });
+				finishSyncStream(requestId);
+			}
+			throw error;
 		} finally {
-			init?.signal?.removeEventListener("abort", abort);
 			pendingSyncFetch.delete(requestId);
+			if (!streamEstablished) {
+				init?.signal?.removeEventListener("abort", abort);
+			}
 		}
 	}
 
@@ -444,6 +562,20 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 		if (!events) return undefined;
 		events.setTelemetryParent(telemetryParent);
 		return events.next();
+	}
+
+	async function handleObserveRegistration(
+		sessionId: number,
+		sql: string,
+		params: Parameters<LixBinding["observe"]>[1],
+	): Promise<number> {
+		// Do not touch the mutable Lix telemetry carrier here: it belongs to the
+		// serialized finite lane. Each `observe.next` supplies telemetry directly
+		// to its observation binding.
+		const events = await requiredLix(sessionId).observe(sql, params);
+		const observeId = nextObserveId++;
+		observations.set(observeId, events);
+		return observeId;
 	}
 
 	function requiredLix(sessionId: number): LixBinding {
@@ -466,6 +598,9 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 export function responseFromSyncFetch(
 	resolved: WorkerSyncFetchResponse,
 ): Response {
+	if (resolved.streaming) {
+		throw new TypeError("Streaming sync responses require the worker stream bridge");
+	}
 	const body =
 		resolved.status === 204 ||
 		resolved.status === 205 ||

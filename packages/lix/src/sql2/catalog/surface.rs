@@ -108,9 +108,7 @@ impl PublicSurfaceKind {
             | Self::CheckpointFunction
             | Self::StateAtFunction
             | Self::CommitAncestryFunction => class == PublicSurfaceClass::TableFunction,
-            Self::Revert | Self::Apply | Self::Restore => {
-                class == PublicSurfaceClass::CommandSink
-            }
+            Self::Revert | Self::Apply | Self::Restore => class == PublicSurfaceClass::CommandSink,
         }
     }
 }

@@ -329,6 +329,7 @@ test("browser sync custom fetch crosses the worker boundary", async () => {
 			method: "GET",
 			headers: [["authorization", "Bearer fresh"]],
 			credentials: "include",
+			responseMode: "buffered",
 			responseLimit: 1024,
 		},
 	});
@@ -358,6 +359,70 @@ test("browser sync custom fetch crosses the worker boundary", async () => {
 	expect(new Headers(result.result.response.headers).get("server-timing")).toBe(
 		"lix-server-protocol;dur=1",
 	);
+});
+
+test("browser authority streams cross the worker boundary with pull backpressure", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease(undefined, undefined, {
+		url: "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+		fetch: async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new Uint8Array([1, 2]));
+						controller.enqueue(new Uint8Array([3]));
+						controller.close();
+					},
+				}),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			),
+	});
+
+	transport.emit({
+		kind: "sync.fetch",
+		requestId: 10,
+		request: {
+			url: "https://example.test/lix/v1/repository/observe",
+			method: "POST",
+			headers: [],
+			responseMode: "stream",
+		},
+	});
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(transport.sent).toContainEqual({
+		kind: "sync.fetch.result",
+		requestId: 10,
+		result: {
+			ok: true,
+			response: {
+				status: 200,
+				statusText: "",
+				headers: [["content-type", "text/event-stream"]],
+				streaming: true,
+			},
+		},
+	});
+
+	for (const expected of [
+		{ ok: true, done: false, chunk: new Uint8Array([1, 2]) },
+		{ ok: true, done: false, chunk: new Uint8Array([3]) },
+		{ ok: true, done: true },
+	]) {
+		transport.emit({ kind: "sync.fetch.stream.pull", requestId: 10 });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const results = transport.sent.filter(
+			(message) =>
+				"kind" in message &&
+				message.kind === "sync.fetch.stream.result" &&
+				message.requestId === 10,
+		);
+		expect(results.at(-1)).toMatchObject({
+			kind: "sync.fetch.stream.result",
+			requestId: 10,
+			result: expected,
+		});
+	}
 });
 
 test("browser sync cancels a streamed response at the Rust byte limit", async () => {
@@ -392,6 +457,7 @@ test("browser sync cancels a streamed response at the Rust byte limit", async ()
 			url: "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/sync/pull",
 			method: "GET",
 			headers: [],
+			responseMode: "buffered",
 			responseLimit: 4,
 		},
 	});
@@ -444,6 +510,7 @@ test("browser sync cancellation aborts the bridged fetch", async () => {
 			url: "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/sync/pull",
 			method: "GET",
 			headers: [],
+			responseMode: "buffered",
 			responseLimit: 1024,
 		},
 	});
@@ -458,6 +525,83 @@ test("browser sync cancellation aborts the bridged fetch", async () => {
 				"kind" in message &&
 				message.kind === "sync.fetch.result" &&
 				message.requestId === 8,
+		),
+	).toBe(false);
+});
+
+test("browser sync ignores a fetch that resolves after cancellation", async () => {
+	const transport = fakeConnection();
+	const lateResponse = deferred<Response>();
+	let streamCancelled = false;
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease(undefined, undefined, {
+		url: "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+		fetch: async () => lateResponse.promise,
+	});
+
+	transport.emit({
+		kind: "sync.fetch",
+		requestId: 11,
+		request: {
+			url: "https://example.test/lix/v1/repository/observe",
+			method: "POST",
+			headers: [],
+			responseMode: "stream",
+		},
+	});
+	await Promise.resolve();
+	transport.emit({ kind: "sync.fetch.cancel", requestId: 11 });
+	lateResponse.resolve(
+		new Response(
+			new ReadableStream<Uint8Array>({
+				cancel() {
+					streamCancelled = true;
+				},
+			}),
+		),
+	);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+
+	expect(streamCancelled).toBe(true);
+	expect(
+		transport.sent.some(
+			(message) =>
+				"kind" in message &&
+				message.kind === "sync.fetch.result" &&
+				message.requestId === 11,
+		),
+	).toBe(false);
+});
+
+test("browser sync does not revive a bodyless stream after cancellation", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease(undefined, undefined, {
+		url: "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+		fetch: async () => new Response(null, { status: 204 }),
+	});
+
+	transport.emit({
+		kind: "sync.fetch",
+		requestId: 12,
+		request: {
+			url: "https://example.test/lix/v1/repository/observe",
+			method: "POST",
+			headers: [],
+			responseMode: "stream",
+		},
+	});
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	transport.emit({ kind: "sync.fetch.cancel", requestId: 12 });
+	transport.emit({ kind: "sync.fetch.stream.pull", requestId: 12 });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+
+	expect(
+		transport.sent.some(
+			(message) =>
+				"kind" in message &&
+				message.kind === "sync.fetch.stream.result" &&
+				message.requestId === 12,
 		),
 	).toBe(false);
 });

@@ -26,6 +26,7 @@ struct ExecutionSlotValues {
     active_branch_id: Option<String>,
     active_branch_commit_id: Option<String>,
     latest_checkpoint_commit_id: Option<String>,
+    working_diff_checkpoint_commit_id: Option<String>,
     root_commit_id: Option<String>,
     functions: Option<FunctionProviderHandle>,
     current_timestamp: Option<LixTimestamp>,
@@ -53,6 +54,7 @@ impl ExecutionSlots {
         active_branch_id: Option<&str>,
         active_branch_commit_id: Option<&str>,
         latest_checkpoint_commit_id: Option<&str>,
+        working_diff_checkpoint_commit_id: Option<&str>,
         root_commit_id: Option<&str>,
     ) {
         let mut values = self.lock();
@@ -62,6 +64,10 @@ impl ExecutionSlots {
         assign(
             &mut values.latest_checkpoint_commit_id,
             latest_checkpoint_commit_id,
+        );
+        assign(
+            &mut values.working_diff_checkpoint_commit_id,
+            working_diff_checkpoint_commit_id,
         );
         assign(&mut values.root_commit_id, root_commit_id);
         values.functions = Some(functions);
@@ -82,6 +88,10 @@ impl ExecutionSlots {
 
     pub(crate) fn latest_checkpoint_commit_id(&self) -> Option<String> {
         self.lock().latest_checkpoint_commit_id.clone()
+    }
+
+    pub(crate) fn working_diff_checkpoint_commit_id(&self) -> Option<String> {
+        self.lock().working_diff_checkpoint_commit_id.clone()
     }
 
     pub(crate) fn root_commit_id(&self) -> Option<String> {

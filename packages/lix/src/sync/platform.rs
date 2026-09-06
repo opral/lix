@@ -20,12 +20,16 @@ pub(super) use native::{SyncTask, spawn_sync_task};
 pub(crate) use native::sleep;
 #[cfg(not(target_family = "wasm"))]
 pub(super) type HttpSyncTransport = super::http::HttpSyncTransport<reqwest::Client>;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use native_http::{AuthorityHttp, authority_http};
 #[cfg(target_family = "wasm")]
 pub(super) use wasm::{SyncTask, spawn_sync_task};
 #[cfg(target_family = "wasm")]
 pub(crate) use wasm::sleep;
 #[cfg(target_family = "wasm")]
 pub(super) type HttpSyncTransport = super::http::HttpSyncTransport<wasm_http::BrowserHttpClient>;
+#[cfg(target_family = "wasm")]
+pub(crate) use wasm_http::{AuthorityHttp, authority_http};
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]
 pub use wasm_http::{

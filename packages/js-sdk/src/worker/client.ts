@@ -484,6 +484,10 @@ export class LixWorkerClient {
 	private onProgress?: (progress: LixOpenProgress) => void;
 	openReport: LixOpenReport | undefined;
 	private readonly syncFetchControllers = new Map<number, AbortController>();
+	private readonly syncFetchStreams = new Map<
+		number,
+		ReadableStreamDefaultReader<Uint8Array> | undefined
+	>();
 
 	constructor(
 		private readonly connection: WorkerConnection = createWorkerConnection(),
@@ -525,6 +529,10 @@ export class LixWorkerClient {
 		this.openReport = undefined;
 		for (const controller of this.syncFetchControllers.values()) controller.abort();
 		this.syncFetchControllers.clear();
+		for (const reader of this.syncFetchStreams.values()) {
+			void reader?.cancel().catch(() => undefined);
+		}
+		this.syncFetchStreams.clear();
 		onDisposed?.();
 	}
 
@@ -609,9 +617,11 @@ export class LixWorkerClient {
 			case "sync.fetch":
 				void this.resolveSyncFetch(message.requestId, message.request);
 				break;
+			case "sync.fetch.stream.pull":
+				void this.resolveSyncFetchStreamPull(message.requestId);
+				break;
 			case "sync.fetch.cancel":
-				this.syncFetchControllers.get(message.requestId)?.abort();
-				this.syncFetchControllers.delete(message.requestId);
+				this.cancelSyncFetch(message.requestId);
 				break;
 		}
 	}
@@ -652,6 +662,7 @@ export class LixWorkerClient {
 		}
 		const controller = new AbortController();
 		this.syncFetchControllers.set(requestId, controller);
+		let retainedStream = false;
 		try {
 			const response = await fetcher(request.url, {
 				method: request.method,
@@ -663,11 +674,32 @@ export class LixWorkerClient {
 				credentials: request.credentials,
 				signal: controller.signal,
 			});
-			const body = await readSyncResponseBody(
-				response,
-				request.responseLimit,
-				controller,
-			);
+			if (
+				this.syncFetchControllers.get(requestId) !== controller ||
+				controller.signal.aborted
+			) {
+				await response.body?.cancel().catch(() => undefined);
+				return;
+			}
+			if (request.responseMode === "stream") {
+				this.syncFetchStreams.set(requestId, response.body?.getReader());
+				retainedStream = true;
+				this.notify({
+					kind: "sync.fetch.result",
+					requestId,
+					result: {
+						ok: true,
+						response: {
+							status: response.status,
+							statusText: response.statusText,
+							headers: headerEntries(response.headers),
+							streaming: true,
+						},
+					},
+				});
+				return;
+			}
+			const body = await readSyncResponseBody(response, request.responseLimit, controller);
 			this.notify({
 				kind: "sync.fetch.result",
 				requestId,
@@ -690,8 +722,61 @@ export class LixWorkerClient {
 				});
 			}
 		} finally {
-			this.syncFetchControllers.delete(requestId);
+			if (!retainedStream) this.syncFetchControllers.delete(requestId);
 		}
+	}
+
+	private async resolveSyncFetchStreamPull(requestId: number): Promise<void> {
+		if (!this.syncFetchStreams.has(requestId)) return;
+		const reader = this.syncFetchStreams.get(requestId);
+		try {
+			const result = reader ? await reader.read() : { done: true as const };
+			if (
+				!this.syncFetchStreams.has(requestId) ||
+				this.syncFetchStreams.get(requestId) !== reader ||
+				this.syncFetchControllers.get(requestId)?.signal.aborted
+			) {
+				return;
+			}
+			this.notify({
+				kind: "sync.fetch.stream.result",
+				requestId,
+				result: result.done
+					? { ok: true, done: true }
+					: { ok: true, done: false, chunk: result.value.slice() },
+			});
+			if (result.done) {
+				reader?.releaseLock();
+				this.finishSyncFetchStream(requestId);
+			}
+		} catch (error) {
+			const controller = this.syncFetchControllers.get(requestId);
+			if (!controller?.signal.aborted) {
+				this.notify({
+					kind: "sync.fetch.stream.result",
+					requestId,
+					result: { ok: false, error: serializeWorkerError(error) },
+				});
+			}
+			try {
+				reader?.releaseLock();
+			} catch {
+				// A cancellation can leave the read pending until its rejection settles.
+			}
+			this.finishSyncFetchStream(requestId);
+		}
+	}
+
+	private cancelSyncFetch(requestId: number): void {
+		this.syncFetchControllers.get(requestId)?.abort();
+		const reader = this.syncFetchStreams.get(requestId);
+		void reader?.cancel().catch(() => undefined);
+		this.finishSyncFetchStream(requestId);
+	}
+
+	private finishSyncFetchStream(requestId: number): void {
+		this.syncFetchStreams.delete(requestId);
+		this.syncFetchControllers.delete(requestId);
 	}
 
 	private handleFatal(error: Error): void {

@@ -12,13 +12,12 @@ test("remote observe streams native Lix results", async () => {
 				requests.push(request.clone());
 				if (request.method === "DELETE") return closedSession();
 				const pathname = new URL(request.url).pathname;
-				if (pathname.endsWith("/execute")) return executeValueResponse("hello");
 				return pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")
 					? handshake()
 					: sseResponse(
 							sseFrame(
 								"next",
-								multiplexObservePayload("observe-1", "stale", 0, 7),
+								multiplexObservePayload("observe-1", "hello", 0, 7),
 							),
 						);
 			},
@@ -44,6 +43,9 @@ test("remote observe streams native Lix results", async () => {
 			},
 		],
 	});
+	expect(
+		requests.some((request) => new URL(request.url).pathname.endsWith("/execute")),
+	).toBe(false);
 
 	events.close();
 	expect(await events.next()).toBeUndefined();
@@ -197,6 +199,63 @@ test("remote observe applies sequential row deltas before coalescing delivery", 
 	await lix.close();
 });
 
+test("adding an observation reconnects an established multiplex stream with the full membership", async () => {
+	const observeRequests: Request[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) return handshake();
+				if (request.method === "DELETE") return closedSession();
+				observeRequests.push(request.clone());
+				const body = (await request.clone().json()) as {
+					subscriptions: Array<{ id: string; sql: string }>;
+				};
+				return heldSseResponse(
+					body.subscriptions
+						.map((subscription) =>
+							sseFrame(
+								"next",
+								multiplexObservePayload(
+									subscription.id,
+									subscription.sql.includes("second") ? "second" : "first",
+									0,
+									0,
+								),
+							),
+						)
+						.join(""),
+					request.signal,
+				);
+			},
+		},
+	});
+
+	const first = lix.observe("SELECT 'first' AS value");
+	expect((await first.next())?.result.rows[0]?.value).toBe("first");
+	const second = lix.observe("SELECT 'second' AS value");
+	expect((await second.next())?.result.rows[0]?.value).toBe("second");
+
+	const activeRequests = observeRequests.filter(
+		(request) => !request.signal.aborted,
+	);
+	expect(activeRequests).toHaveLength(1);
+	const activeBody = (await activeRequests[0]?.json()) as {
+		subscriptions: Array<{ id: string }>;
+	};
+	expect(activeBody.subscriptions.map(({ id }) => id)).toEqual([
+		"observe-1",
+		"observe-2",
+	]);
+
+	first.close();
+	second.close();
+	await lix.close();
+});
+
 test("remote observe shards more than 32 subscriptions without blocking execute", async () => {
 	const observeRequests: Request[] = [];
 	let headerResolutions = 0;
@@ -245,7 +304,7 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 					throw new DOMException("Aborted", "AbortError");
 				}
 				const body = (await request.clone().json()) as {
-					subscriptions: Array<{ id: string }>;
+					subscriptions: Array<{ id: string; sql: string }>;
 				};
 				if (body.subscriptions.length > 32) {
 					release();
@@ -261,17 +320,19 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 				}
 				return heldSseResponse(
 					body.subscriptions
-						.map((subscription, index) =>
-							sseFrame(
+						.map((subscription) => {
+							const value =
+								/SELECT (\d+) AS value/.exec(subscription.sql)?.[1] ?? "0";
+							return sseFrame(
 								"next",
 								multiplexObservePayload(
 									subscription.id,
-									`value-${index}`,
+									`${rebalanced ? "rebalanced" : "value"}-${value}`,
 									0,
-									0,
+									rebalanced ? 1 : 0,
 								),
-							),
-						)
+							);
+						})
 						.join(""),
 					request.signal,
 				);
@@ -295,7 +356,7 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 		(request) => !request.signal.aborted,
 	);
 	expect(activeObserveRequests).toHaveLength(2);
-	expect(headerResolutions).toBeGreaterThanOrEqual(35);
+	expect(headerResolutions).toBe(2);
 	let submittedSubscriptions = 0;
 	for (const request of activeObserveRequests) {
 		const body = (await request.clone().json()) as { subscriptions: unknown[] };
@@ -340,9 +401,9 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 	expect(rebalancedBody.subscriptions.map(({ id }) => id)).toContain(
 		"observe-33",
 	);
-	expect(
-		(await observations[32]?.next())?.result.rows[0]?.value,
-	).toBe("rebalanced-32");
+	const rebalancedEvent = await observations[32]?.next();
+	expect(rebalancedEvent?.result.rows[0]?.value).toBe("rebalanced-32");
+	expect(rebalancedEvent?.mutationSequence).toBe(1);
 
 	await lix.close();
 	expect(liveObserveRequests).toBe(0);
@@ -659,15 +720,12 @@ test("remote observe reconnects after a gone protocol session instead of failing
 					});
 				}
 				if (request.method === "DELETE") return closedSession();
-				if (pathname.endsWith("/execute")) {
-					return executeValueResponse("recovered");
-				}
 				observeCalls += 1;
 				if (observeCalls === 1) return protocolSessionGone();
 				return heldSseResponse(
 					sseFrame(
 						"next",
-						multiplexObservePayload("observe-1", "stale", 0, 1),
+						multiplexObservePayload("observe-1", "recovered", 0, 1),
 					),
 					request.signal,
 				);
@@ -727,14 +785,9 @@ test("remote observe recovers multiple expired shards with one handshake", async
 					});
 				}
 				if (request.method === "DELETE") return closedSession();
-				if (pathname.endsWith("/execute")) {
-					const body = (await request.json()) as { sql: string };
-					const value = /SELECT (\d+) AS value/.exec(body.sql)?.[1] ?? "0";
-					return executeValueResponse(`${valuePrefix}-${value}`);
-				}
 				observeCalls += 1;
 				const body = (await request.clone().json()) as {
-					subscriptions: Array<{ id: string }>;
+					subscriptions: Array<{ id: string; sql: string }>;
 				};
 				if (expiredShardResponses > 0) {
 					expiredShardResponses -= 1;
@@ -749,17 +802,19 @@ test("remote observe recovers multiple expired shards with one handshake", async
 				}
 				return heldSseResponse(
 					body.subscriptions
-						.map((subscription, index) =>
-							sseFrame(
+						.map((subscription) => {
+							const value =
+								/SELECT (\d+) AS value/.exec(subscription.sql)?.[1] ?? "0";
+							return sseFrame(
 								"next",
 								multiplexObservePayload(
 									subscription.id,
-									`stale-${index}`,
+									`${valuePrefix}-${value}`,
 									0,
-									1,
+									valuePrefix === "recovered" ? 2 : 1,
 								),
-							),
-						)
+							);
+						})
 						.join(""),
 					request.signal,
 				);
@@ -789,6 +844,9 @@ test("remote observe recovers multiple expired shards with one handshake", async
 	]);
 	expect(recovered.map((event) => event?.result.rows[0]?.value)).toEqual(
 		Array.from({ length: 33 }, (_, index) => `recovered-${index + 1}`),
+	);
+	expect(recovered.map((event) => event?.mutationSequence)).toEqual(
+		Array.from({ length: 33 }, () => 2),
 	);
 	expect(expiredShardResponses).toBe(0);
 	expect(observeCalls - observeCallsBeforeExpiry).toBe(4);
@@ -861,11 +919,6 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 						return handshake();
 					}
 				if (request.method === "DELETE") return closedSession();
-				if (new URL(request.url).pathname.endsWith("/execute")) {
-					return executeValueResponse(
-						observeRequests <= 1 ? "first" : "second",
-					);
-				}
 				observeRequests += 1;
 					observedAuthorization.push(request.headers.get("authorization"));
 					observedSessionIds.push(request.headers.get("lix-session-id"));
@@ -881,12 +934,7 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 					return heldSseResponse(
 						sseFrame(
 							"next",
-							multiplexObservePayload(
-								"observe-1",
-								"stale-after-reconnect",
-								0,
-								0,
-							),
+							multiplexObservePayload("observe-1", "second", 0, 1),
 						),
 						request.signal,
 					);
@@ -903,11 +951,11 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 		const reconnected = await afterReconnect;
 		expect(reconnected?.result.rows[0]?.value).toBe("second");
 		expect(reconnected?.sequence).toBe(1);
-		expect(reconnected?.mutationSequence).toBe(0);
+		expect(reconnected?.mutationSequence).toBe(1);
 		expect(observedAuthorization).toEqual([
 			"Bearer token-2",
+			"Bearer token-3",
 			"Bearer token-4",
-			"Bearer token-6",
 		]);
 		expect(observedSessionIds).toEqual(["session-1", "session-1", "session-1"]);
 

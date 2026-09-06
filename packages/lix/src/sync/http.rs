@@ -272,6 +272,24 @@ where
         })
     }
 
+    fn pull_now(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> SyncTransportFuture<'_, SyncRepositoryPullResponse> {
+        Box::pin(async move {
+            let path = match after {
+                Some(after) => format!("/sync/pull?after={after}&limit={limit}"),
+                None => format!("/sync/pull?limit={limit}"),
+            };
+            let mut request = self.request(Method::GET, &path, "fence sync publication");
+            request
+                .headers
+                .push(("prefer".to_owned(), "wait=0".to_owned()));
+            self.send_json(request).await
+        })
+    }
+
     fn snapshot_rows<'a>(
         &'a self,
         branch_id: &'a str,
@@ -386,10 +404,18 @@ fn raw_request(method: Method, url: String, operation: &'static str) -> RawHttpR
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "retained with the authority write operations on the complete sync transport"
+)]
 fn json_content_type() -> (String, String) {
     ("content-type".to_owned(), "application/json".to_owned())
 }
 
+#[allow(
+    dead_code,
+    reason = "retained with the authority write operations on the complete sync transport"
+)]
 fn json_body(value: &impl serde::Serialize, operation: &str) -> Result<Vec<u8>, LixError> {
     serde_json::to_vec(value).map_err(|error| {
         LixError::new(
@@ -491,11 +517,13 @@ fn encode_query(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::{
         HandshakeResponse, HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse,
         encode_query, normalize_sync_locator, response_error, validate_handshake,
     };
-    use crate::sync::SyncTransportFuture;
+    use crate::sync::{SyncTransport, SyncTransportFuture};
 
     #[test]
     fn sync_connection_locator_maps_to_the_targeted_protocol_root() {
@@ -618,6 +646,63 @@ mod tests {
             transport.lix_id(),
             "01936f4e-7b6c-7c3d-8f9a-123456789abc"
         );
+    }
+
+    #[derive(Debug)]
+    struct FenceHeaderClient {
+        requests: Arc<Mutex<Vec<RawHttpRequest>>>,
+    }
+
+    impl RawHttpClient for FenceHeaderClient {
+        fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async move {
+                let handshake = {
+                    let mut requests = self.requests.lock().expect("request log lock");
+                    let handshake = requests.is_empty();
+                    requests.push(request);
+                    handshake
+                };
+                let body = if handshake {
+                    serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                        "lixId": "01936f4e-7b6c-7c3d-8f9a-123456789abc",
+                        "sessionId": "session-from-server",
+                        "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
+                    })
+                } else {
+                    serde_json::json!({ "kind": "delta", "cursor": 7, "events": [] })
+                };
+                Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    body: serde_json::to_vec(&body).expect("encode response"),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_fence_uses_private_non_waiting_preference() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let transport = HttpSyncTransport::connect_with(
+            FenceHeaderClient {
+                requests: Arc::clone(&requests),
+            },
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        )
+        .await
+        .expect("matching handshake should connect");
+        transport
+            .pull_now(Some(7), 1)
+            .await
+            .expect("publication fence should return immediately");
+        let requests = requests.lock().expect("request log lock");
+        let fence = requests.last().expect("fence request should be recorded");
+        assert!(fence.url.ends_with("/sync/pull?after=7&limit=1"));
+        assert!(fence.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("prefer") && value.eq_ignore_ascii_case("wait=0")
+        }));
     }
 
     #[derive(Debug)]

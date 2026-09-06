@@ -155,7 +155,7 @@ from a 182.155 ms first-100 mean to a 418.514 ms last-100 mean.
 
 At depth 1,000, repeated optimized runs measured:
 
-- `lix_working_diff`: 2.567-3.273 ms.
+- one-argument `lix_diff`: 2.567-3.273 ms.
 - Full `lix_checkpoint` history: 3.504-4.923 ms.
 - Reopen plus full checkpoint history: 3.887-4.182 ms.
 - Peak RSS in the median wall-time run: 290,700 KiB.

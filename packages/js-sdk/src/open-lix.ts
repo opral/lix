@@ -89,16 +89,15 @@ async function openLixInternal(
 	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
-		return new Lix(
-			await openLixWorkerBinding(
-				{ kind: "memory" },
-				undefined,
-				options.telemetry,
-				syncServer,
-				options.onProgress,
-				snapshot,
-			),
+		const binding = await openLixWorkerBinding(
+			{ kind: "memory" },
+			undefined,
+			options.telemetry,
+			syncServer,
+			options.onProgress,
+			snapshot,
 		);
+		return new Lix(binding);
 	}
 	if (isJsProviderLixStorage(options.storage)) {
 		return openJsProviderStorage(

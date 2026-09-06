@@ -207,9 +207,9 @@ export type ObserveEvent = {
 	sequence: number;
 	mutationSequence: number;
 	/**
-	 * The current result of the observed query. Remote observations reconcile
-	 * the first frame of every stream through execute before publishing it, so
-	 * reconnects cannot expose a stale server snapshot to consumers.
+	 * The current result of the observed query. Remote rows and
+	 * `mutationSequence` come from the same authoritative observation frame;
+	 * reconnect frames are coalesced when their rows are unchanged.
 	 */
 	result: ExecuteResult;
 };

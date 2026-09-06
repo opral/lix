@@ -15,6 +15,10 @@ use super::{
 /// Commits and ref updates use one ordered repository cursor. Binary payloads
 /// use their independent BLAKE3/FastCDC CAS and are transferred only when a
 /// commit references content absent on the receiving side.
+#[allow(
+    dead_code,
+    reason = "the connected cache is read-only, while protocol transports retain authority write operations"
+)]
 pub trait SyncTransport: SyncTransportBounds {
     /// Account authenticated by the authority handshake for this session.
     fn active_account_id(&self) -> &str;
@@ -32,6 +36,17 @@ pub trait SyncTransport: SyncTransportBounds {
         after: Option<u64>,
         limit: usize,
     ) -> SyncTransportFuture<'_, SyncRepositoryPullResponse>;
+
+    /// Performs the same pull without waiting when `after` is already the
+    /// authority head. This is private transport behavior; the wire body and
+    /// public protocol schema remain unchanged.
+    fn pull_now(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> SyncTransportFuture<'_, SyncRepositoryPullResponse> {
+        self.pull(after, limit)
+    }
 
     /// Loads one bounded hot-row page at an immutable branch head.
     fn snapshot_rows<'a>(

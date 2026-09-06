@@ -7514,9 +7514,15 @@ where
                     ));
                 }
                 next_value_ranges.push(
-                    if delta.physically_deletes() || compacted_row || interval_local_row {
+                    if delta.physically_deletes() || compacted_row {
                         None
                     } else {
+                        // Retain interval-local tracked tombstones until the
+                        // checkpoint retires their dirty-index entries. The
+                        // sparse index may be packed, so removing this primary
+                        // row without an authenticated cancellation marker
+                        // would make intentional absence indistinguishable
+                        // from storage corruption to the fail-closed reader.
                         let mut value = delta.value_ref(*created_at, working_diff_baseline);
                         value.columnar_base_coordinate = next_columnar_base_coordinate(
                             reset_working_diff_baselines,
@@ -8750,7 +8756,7 @@ enum HotTombstoneMaskKind {
 /// carries `BeforeAbsent` for the currently active checkpoint: that baseline
 /// means "the first mutation after the checkpoint created this identity", so a
 /// delete of it is net-absent against the interval baseline. Phase 12 measured
-/// the consequence directly - `lix_working_diff` reports **nothing** for such
+/// the consequence directly - one-argument `lix_diff` reports **nothing** for such
 /// an identity while its tombstone exists - which is what makes the tombstone
 /// owed to nobody.
 ///

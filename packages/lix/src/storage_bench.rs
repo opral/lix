@@ -4097,6 +4097,7 @@ mod tests {
         assert_eq!(
             first.delete_counts_by_space,
             vec![
+                (crate::hot_state::ROW_SPACE.id.0, 1), // retired branch's certified current ref row
                 (crate::hot_state::DIFF_SPACE.id.0, 100), // retired checkpoint working-diff rows
                 (crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE.id.0, 1,), // retired checkpoint epoch marker
                 (
@@ -4144,15 +4145,23 @@ mod tests {
         // retires the fixture's fixed-width working-diff identities and the
         // branch-ref marker through their authenticated physical encodings.
         const UUID_KEY_BYTES: usize = 16;
+        const HOT_ROW_KEY_BYTES: usize = 175;
         const WORKING_DIFF_KEY_BYTES: usize = 121;
         const WORKING_DIFF_MARKER_KEY_BYTES: usize = 37;
+        let hot_row_deletes = 1;
         let working_diff_deletes = 100;
         let marker_deletes = 1;
-        let uuid_deletes = first.staged_deletes as usize - working_diff_deletes - marker_deletes;
-        assert_eq!(first.key_shared_buffers, uuid_deletes + 3);
+        let uuid_deletes = first.staged_deletes as usize
+            - hot_row_deletes
+            - working_diff_deletes
+            - marker_deletes;
+        // The certified branch-ref hot-row descriptor retains its encoded
+        // generation scope and row identity as two shared key buffers.
+        assert_eq!(first.key_shared_buffers, uuid_deletes + 5);
         assert_eq!(
             first.key_shared_bytes,
             uuid_deletes * UUID_KEY_BYTES
+                + hot_row_deletes * HOT_ROW_KEY_BYTES
                 + working_diff_deletes * WORKING_DIFF_KEY_BYTES
                 + marker_deletes * WORKING_DIFF_MARKER_KEY_BYTES
                 + FENCE_KEY_BYTES

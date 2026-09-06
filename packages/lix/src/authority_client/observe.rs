@@ -39,12 +39,6 @@ pub trait ObserveTransport: Clone + Send + Sync + 'static {
         subscriptions: Vec<MultiplexObserveSubscription>,
     ) -> impl Future<Output = Result<super::http::ProtocolHttpStream, LixError>> + Send;
 
-    fn refresh_observation(
-        &self,
-        sql: &str,
-        params: &[Value],
-    ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send;
-
     fn recover_session(&self) -> impl Future<Output = Result<(), LixError>> + Send;
 
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send;
@@ -58,12 +52,6 @@ pub trait ObserveTransport: Clone + 'static {
         &self,
         subscriptions: Vec<MultiplexObserveSubscription>,
     ) -> impl Future<Output = Result<super::http::ProtocolHttpStream, LixError>>;
-
-    fn refresh_observation(
-        &self,
-        sql: &str,
-        params: &[Value],
-    ) -> impl Future<Output = Result<ExecuteResult, LixError>>;
 
     fn recover_session(&self) -> impl Future<Output = Result<(), LixError>>;
 
@@ -192,19 +180,24 @@ impl<T: ObserveTransport> ObservationHub<T> {
         state.subscriptions.insert(id.clone(), subscription.clone());
         state.subscription_order.push(id);
         let should_start = !state.driver_running;
-        // A driver may be opening several bounded multiplex streams before any
-        // one of them becomes active. Invalidate that snapshot as soon as the
-        // membership changes so the new subscription cannot be stranded.
-        let should_restart = state.driver_running;
+        // A driver may be opening one or more multiplex streams while membership
+        // is changing. Invalidate that snapshot under the same
+        // lock as the membership update. Deferring invalidation to another
+        // spawned task lets observe() return a registered subscription that the
+        // active driver has not been told to serve yet.
         if should_start {
             state.driver_running = true;
             state.generation += 1;
+        } else {
+            state.generation += 1;
+            state.retry_attempt = 0;
+            state.server_retry_ms = None;
+            abort_current_stream(&mut state);
+            self.interrupt.notify_waiters();
         }
         drop(state);
         if should_start {
             self.start_driver();
-        } else if should_restart {
-            self.restart();
         }
         Ok(ProtocolObserveEvents {
             hub: self.clone(),
@@ -276,7 +269,12 @@ impl<T: ObserveTransport> ObservationHub<T> {
                 )
             };
 
-            let interrupted = self.interrupt.notified();
+            // Arm the waiter before the final generation check. `notify_waiters`
+            // does not retain a permit, so registering only inside `select!`
+            // leaves a gap where a membership change can invalidate this
+            // snapshot without waking the driver.
+            let mut interrupted = std::pin::pin!(self.interrupt.notified());
+            interrupted.as_mut().enable();
             if !self.is_current(generation).await {
                 continue;
             }
@@ -286,7 +284,7 @@ impl<T: ObserveTransport> ObservationHub<T> {
                     .map(|batch| self.open_stream_for_generation(batch.to_vec(), generation)),
             );
             let open_result = tokio::select! {
-                _ = interrupted => {
+                _ = interrupted.as_mut() => {
                     let mut state = self.state.lock().await;
                     abort_current_stream(&mut state);
                     continue;
@@ -343,15 +341,6 @@ impl<T: ObserveTransport> ObservationHub<T> {
                     .iter()
                     .map(|stream| stream.cancel.clone())
                     .collect::<Vec<_>>();
-                let stream_subscriptions = subscriptions
-                    .chunks(MAX_SUBSCRIPTIONS_PER_STREAM)
-                    .map(|batch| {
-                        batch
-                            .iter()
-                            .map(|subscription| subscription.id.clone())
-                            .collect::<std::collections::HashSet<_>>()
-                    })
-                    .collect::<Vec<_>>();
                 {
                     let mut state = self.state.lock().await;
                     if state.generation != generation
@@ -371,8 +360,8 @@ impl<T: ObserveTransport> ObservationHub<T> {
                 }
 
                 let mut consumers = Vec::<ConsumeFuture<'_>>::with_capacity(streams.len());
-                for (stream, initial) in streams.into_iter().zip(stream_subscriptions) {
-                    consumers.push(Box::pin(self.consume_stream(stream, generation, initial)));
+                for stream in streams {
+                    consumers.push(Box::pin(self.consume_stream(stream, generation)));
                 }
                 let (consume, _, remaining) = select_all(consumers).await;
                 drop(remaining);
@@ -418,12 +407,13 @@ impl<T: ObserveTransport> ObservationHub<T> {
             match delay {
                 None => continue,
                 Some(delay) => {
-                    let interrupted = self.interrupt.notified();
+                    let mut interrupted = std::pin::pin!(self.interrupt.notified());
+                    interrupted.as_mut().enable();
                     if !self.is_current(generation).await {
                         continue;
                     }
                     tokio::select! {
-                        _ = interrupted => continue,
+                        _ = interrupted.as_mut() => continue,
                         _ = self.transport.sleep(delay) => {}
                     }
                 }
@@ -500,7 +490,6 @@ impl<T: ObserveTransport> ObservationHub<T> {
         &self,
         mut stream: super::http::ProtocolHttpStream,
         generation: u64,
-        mut initial: std::collections::HashSet<String>,
     ) -> ConsumeResult {
         if !self.is_current(generation).await {
             return ConsumeResult::Stop;
@@ -585,12 +574,13 @@ impl<T: ObserveTransport> ObservationHub<T> {
             if !self.is_current(generation).await {
                 return ConsumeResult::Stop;
             }
-            let interrupted = self.interrupt.notified();
+            let mut interrupted = std::pin::pin!(self.interrupt.notified());
+            interrupted.as_mut().enable();
             if !self.is_current(generation).await {
                 return ConsumeResult::Stop;
             }
             let frame = tokio::select! {
-                _ = interrupted => return ConsumeResult::Stop,
+                _ = interrupted.as_mut() => return ConsumeResult::Stop,
                 frame = next_sse_event(
                     &mut stream.body,
                     &mut buffered,
@@ -617,7 +607,6 @@ impl<T: ObserveTransport> ObservationHub<T> {
                                 .handle_next_event(
                                     &frame.data,
                                     &mut bases,
-                                    &mut initial,
                                     generation,
                                 )
                                 .await
@@ -665,7 +654,6 @@ impl<T: ObserveTransport> ObservationHub<T> {
         &self,
         data: &str,
         bases: &mut HashMap<String, ObserveEvent>,
-        initial: &mut std::collections::HashSet<String>,
         generation: u64,
     ) -> Result<(), LixError> {
         let payload: MultiplexObserveNext = serde_json::from_str(data).map_err(|_| {
@@ -690,22 +678,11 @@ impl<T: ObserveTransport> ObservationHub<T> {
         let transport_delta = payload.delta.is_some();
         let event = decode_observe_event(payload, bases.get(&subscription.id))?;
         bases.insert(subscription.id.clone(), event.clone());
-        let publish = if initial.remove(&subscription.id) {
-            let rows = self
-                .transport
-                .refresh_observation(&subscription.sql, &subscription.params)
-                .await?;
-            if !self.is_current(generation).await {
-                return Ok(());
-            }
-            ObserveEvent {
-                sequence: event.sequence,
-                mutation_sequence: event.mutation_sequence,
-                rows,
-            }
-        } else {
-            event
-        };
+        // The first SSE frame is already evaluated in the authoritative server
+        // session and carries its mutation sequence. Re-executing the query on
+        // a separate request adds head-of-line blocking and can pair newer rows
+        // with the older frame's sequence.
+        let publish = event;
         let mut state = self.state.lock().await;
         if state.generation != generation || state.closed {
             return Ok(());
@@ -834,7 +811,12 @@ impl<T: ObserveTransport> ProtocolObserveEvents<T> {
                     return Ok(None);
                 }
             }
-            let notified = self.subscription.notify.notified();
+            // Register before checking the queue again. An event or close can
+            // otherwise call `notify_waiters()` after the check but before the
+            // waiter is first polled, leaving this read asleep with durable
+            // state already queued.
+            let mut notified = std::pin::pin!(self.subscription.notify.notified());
+            notified.as_mut().enable();
             {
                 let mut events = self.subscription.events.lock().await;
                 if let Some(event) = events.pop_front() {
@@ -855,14 +837,23 @@ impl<T: ObserveTransport> ProtocolObserveEvents<T> {
         let hub = self.hub.clone();
         let subscription = self.subscription.clone();
         self.hub.transport.spawn(Box::pin(async move {
-            {
-                let mut state = hub.state.lock().await;
-                state.subscriptions.remove(&subscription.id);
-                state.subscription_order.retain(|id| id != &subscription.id);
-                state.generation += 1;
+            let mut state = hub.state.lock().await;
+            state.subscriptions.remove(&subscription.id);
+            state.subscription_order.retain(|id| id != &subscription.id);
+            state.generation += 1;
+            state.retry_attempt = 0;
+            state.server_retry_ms = None;
+            abort_current_stream(&mut state);
+            hub.interrupt.notify_waiters();
+            let should_start = !state.driver_running && !state.subscriptions.is_empty();
+            if should_start {
+                state.driver_running = true;
             }
+            drop(state);
             close_subscription(&subscription, None).await;
-            hub.restart();
+            if should_start {
+                hub.drive().await;
+            }
         }));
     }
 }
@@ -1165,15 +1156,6 @@ where
             .await
     }
 
-    async fn refresh_observation(
-        &self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<ExecuteResult, LixError> {
-        self.enqueue(|| self.execute_raw(sql, params, None, None, false))
-            .await
-    }
-
     async fn recover_session(&self) -> Result<(), LixError> {
         let _guard = self.operation_lock.lock().await;
         if !self.accepting.load(Ordering::SeqCst) {
@@ -1194,5 +1176,176 @@ where
     #[cfg(target_arch = "wasm32")]
     fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()>>>) {
         self.http.spawn(fut);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicUsize;
+
+    use bytes::Bytes;
+    use futures_util::stream;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct HeldObserveTransport {
+        opens: Arc<StdMutex<Vec<Vec<String>>>>,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    impl ObserveTransport for HeldObserveTransport {
+        async fn open_observe_stream(
+            &self,
+            subscriptions: Vec<MultiplexObserveSubscription>,
+        ) -> Result<super::super::http::ProtocolHttpStream, LixError> {
+            self.opens.lock().expect("opens").push(
+                subscriptions
+                    .iter()
+                    .map(|subscription| subscription.id.clone())
+                    .collect(),
+            );
+            let frames = subscriptions
+                .iter()
+                .map(|subscription| {
+                    let id = &subscription.id;
+                    format!(
+                        "event: next\ndata: {{\"subscriptionId\":\"{id}\",\"sequence\":0,\"mutationSequence\":41,\"result\":{{\"columns\":[{{\"name\":\"value\",\"type\":\"text\"}}],\"rows\":[[{{\"kind\":\"text\",\"value\":\"transport\"}}]],\"rowsAffected\":0,\"notices\":[]}}}}\n\n"
+                    )
+                })
+                .collect::<String>();
+            let cancels = self.cancels.clone();
+            Ok(super::super::http::ProtocolHttpStream {
+                status: 200,
+                headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+                body: Box::pin(
+                    stream::once(async move { Ok(Bytes::from(frames)) })
+                        .chain(stream::pending()),
+                ),
+                cancel: Arc::new(move || {
+                    cancels.fetch_add(1, Ordering::SeqCst);
+                }),
+            })
+        }
+
+        async fn recover_session(&self) -> Result<(), LixError> {
+            Ok(())
+        }
+
+        async fn sleep(&self, _duration: Duration) {}
+
+        fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) {
+            tokio::spawn(fut);
+        }
+    }
+
+    #[tokio::test]
+    async fn membership_restart_cancels_an_active_stream() {
+        let transport = HeldObserveTransport::default();
+        let hub = ObservationHub::new(transport.clone());
+        let first = hub.observe("SELECT 'first'", Vec::new()).await.expect("first");
+        let first_event = tokio::time::timeout(Duration::from_secs(1), first.next())
+            .await
+            .expect("first subscription receives its frame")
+            .expect("first subscription result")
+            .expect("first subscription remains open");
+        assert_eq!(
+            first_event.rows.rows()[0].values(),
+            &[Value::Text("transport".to_owned())]
+        );
+        assert_eq!(first_event.mutation_sequence, 41);
+
+        let second = hub
+            .observe("SELECT 'second'", Vec::new())
+            .await
+            .expect("second");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let latest = transport.opens.lock().expect("opens").last().cloned();
+                if latest == Some(vec!["observe-1".to_owned(), "observe-2".to_owned()])
+                    && transport.cancels.load(Ordering::SeqCst) >= 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement generation opens with complete membership");
+
+        let second_event = tokio::time::timeout(Duration::from_secs(1), second.next())
+            .await
+            .expect("new subscription receives its first frame")
+            .expect("new subscription result")
+            .expect("new subscription remains open");
+        assert_eq!(
+            second_event.rows.rows()[0].values(),
+            &[Value::Text("transport".to_owned())]
+        );
+
+        first.close();
+        second.close();
+        hub.close().await;
+    }
+
+    #[tokio::test]
+    async fn history_shaped_add_remove_add_converges_to_latest_membership() {
+        let transport = HeldObserveTransport::default();
+        let hub = ObservationHub::new(transport.clone());
+        let checkpoints = hub
+            .observe("SELECT * FROM lix_checkpoint", Vec::new())
+            .await
+            .expect("checkpoints");
+        let empty_parent = hub
+            .observe("SELECT * FROM lix_commit WHERE id = ''", Vec::new())
+            .await
+            .expect("empty parent");
+
+        tokio::time::timeout(Duration::from_secs(1), checkpoints.next())
+            .await
+            .expect("checkpoint frame")
+            .expect("checkpoint result")
+            .expect("checkpoint remains open");
+
+        empty_parent.close();
+        let real_parent = hub
+            .observe("SELECT * FROM lix_commit WHERE id = 'oldest'", Vec::new())
+            .await
+            .expect("real parent");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let latest = transport.opens.lock().expect("opens").last().cloned();
+                if latest == Some(vec!["observe-1".to_owned(), "observe-3".to_owned()])
+                    && transport.cancels.load(Ordering::SeqCst) >= 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("driver converges to checkpoint and real-parent membership");
+
+        tokio::time::timeout(Duration::from_secs(1), real_parent.next())
+            .await
+            .expect("real-parent frame")
+            .expect("real-parent result")
+            .expect("real parent remains open");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while empty_parent
+                .next()
+                .await
+                .expect("closed empty-parent read succeeds")
+                .is_some()
+            {}
+        })
+        .await
+        .expect("closed empty-parent read eventually settles");
+
+        checkpoints.close();
+        real_parent.close();
+        hub.close().await;
     }
 }

@@ -241,12 +241,14 @@ impl LixInformationSchemaProvider {
                             &relation.name,
                         )?
                     } else {
-                        self.public_catalog.surface_schema(&relation.name).ok_or_else(|| {
-                            DataFusionError::Execution(format!(
-                                "state relation '{}' is missing its result schema",
-                                relation.name
-                            ))
-                        })?
+                        self.public_catalog
+                            .surface_schema(&relation.name)
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(format!(
+                                    "state relation '{}' is missing its result schema",
+                                    relation.name
+                                ))
+                            })?
                     };
                     for (position, field) in provider_schema.fields().iter().enumerate() {
                         function_catalog.push(self.public_catalog_name.clone());
@@ -263,9 +265,7 @@ impl LixInformationSchemaProvider {
                         is_nullable
                             .push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
                         data_type.push(public_sql_type(field.data_type()));
-                        lix_value_kind.push(
-                            field_value_kind(field),
-                        );
+                        lix_value_kind.push(field_value_kind(field));
                     }
                 }
                 continue;
@@ -284,8 +284,12 @@ impl LixInformationSchemaProvider {
                         false,
                     )])),
                 ),
-                PublicSurfaceKind::DiffFunction => unreachable!("relation-specific diffs handled above"),
-                PublicSurfaceKind::StateAtFunction => unreachable!("relation-specific state handled above"),
+                PublicSurfaceKind::DiffFunction => {
+                    unreachable!("relation-specific diffs handled above")
+                }
+                PublicSurfaceKind::StateAtFunction => {
+                    unreachable!("relation-specific state handled above")
+                }
                 _ => {
                     return Err(DataFusionError::Execution(format!(
                         "table function '{}' has a non-function semantic kind",
@@ -344,12 +348,8 @@ impl LixInformationSchemaProvider {
             surface_name.push(surface.name.clone());
             surface_class.push(surface.class.sql_name().to_string());
             relation_kind.push(match surface.class {
-                PublicSurfaceClass::Relation(PublicRelationKind::Base) => {
-                    Some("BASE".to_string())
-                }
-                PublicSurfaceClass::Relation(PublicRelationKind::View) => {
-                    Some("VIEW".to_string())
-                }
+                PublicSurfaceClass::Relation(PublicRelationKind::Base) => Some("BASE".to_string()),
+                PublicSurfaceClass::Relation(PublicRelationKind::View) => Some("VIEW".to_string()),
                 _ => None,
             });
             can_read.push(!matches!(surface.class, PublicSurfaceClass::CommandSink));
@@ -565,8 +565,7 @@ impl ColumnsRows {
             self.numeric_scale.push(numeric_scale);
             self.datetime_precision.push(None);
             self.interval_type.push(None);
-            self.lix_value_kind
-                .push(field_value_kind(field));
+            self.lix_value_kind.push(field_value_kind(field));
             self.lix_insert_policy
                 .push(insert_policy.as_str().to_string());
         }
