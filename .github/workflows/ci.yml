@@ -27,10 +27,19 @@ jobs:
     name: Changelog
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Include both parents of the tested PR merge for scope detection.
+          fetch-depth: 2
+
+      - name: Select Rust CI scope
+        id: scope
+        run: node scripts/ci-rust-scope.mjs
 
       - name: Validate change fragments
         run: node scripts/validate-changes.mjs
@@ -39,7 +48,7 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/ci-workflow.test.mjs
+        run: node --test scripts/ci-workflow.test.mjs scripts/ci-rust-scope.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
@@ -67,8 +76,13 @@ jobs:
 
   cargo:
     name: Cargo ${{ matrix.name }}
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: changelog
+    if: needs.changelog.outputs.rust != 'false' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ${{ matrix.runner }}
+    env:
+      # The root Cargo config otherwise sends --manifest-path tooling builds
+      # to root/target, while the cache and reports expect tooling/target.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/${{ matrix.workspace }}/target
     strategy:
       fail-fast: false
       matrix:
@@ -76,6 +90,9 @@ jobs:
           - name: Clippy
             task: clippy
             workspace: .
+            cache_workspaces: |
+              . -> target
+              tooling -> target
             runner: blacksmith-32vcpu-ubuntu-2404
           - name: Test
             task: test
@@ -128,14 +145,14 @@ jobs:
         with:
           tool: nextest
 
-      # Pull requests restore dependency artifacts seeded by main but never
-      # publish branch-specific target caches. Workspace crates remain
-      # excluded so source changes always rebuild Lix itself.
+      # Main seeds dependency caches; PRs only restore them. Clippy executes
+      # both workspaces, so retain tooling dependencies as well as root ones.
       - name: Restore Cargo dependency cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: cargo-${{ matrix.task }}
-          workspaces: ${{ matrix.workspace }}
+          key: explicit-targets-v1
+          workspaces: ${{ matrix.cache_workspaces || matrix.workspace }}
           cache-targets: true
           cache-workspace-crates: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -154,6 +171,8 @@ jobs:
         if: matrix.task == 'clippy'
         run: |
           cargo clippy --profile test --workspace --all-targets --all-features -- -D warnings
+          # Keep tooling artifacts in the second cached target directory.
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/tooling/target"
           cargo clippy --locked --manifest-path tooling/Cargo.toml --profile test --workspace --exclude lix_e2e --all-targets --all-features -- -D warnings
           cargo clippy --locked --manifest-path tooling/Cargo.toml --profile test -p lix_e2e --all-targets --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace,system-allocation-profiler -- -D warnings
 
@@ -353,7 +372,10 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci
+          # Native uses test/dev profiles; Browser uses release Wasm. A single
+          # immutable key lets the first writer seed only its own build modes.
+          shared-key: ci-js-${{ matrix.runtime }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Restore compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
