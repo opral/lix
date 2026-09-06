@@ -29,7 +29,7 @@ test("superseded CI runs are cancelled per pull request or branch", () => {
 test("Rust test scopes run independently with workspace-specific caches", () => {
 	for (const [name, task, workspace, runner] of [
 		["Clippy", "clippy", ".", "blacksmith-32vcpu-ubuntu-2404"],
-		["Test", "test", ".", "blacksmith-32vcpu-ubuntu-2404"],
+		["Test", "test", ".", "blacksmith-16vcpu-ubuntu-2404"],
 		["Tooling Test", "tooling", "tooling", "blacksmith-16vcpu-ubuntu-2404"],
 		["E2E Test", "e2e", "tooling", "blacksmith-16vcpu-ubuntu-2404"],
 	]) {
@@ -40,17 +40,27 @@ test("Rust test scopes run independently with workspace-specific caches", () => 
 			),
 		);
 	}
-	assert.match(workflow, /workspaces: \$\{\{ matrix\.cache_workspaces \|\| matrix\.workspace \}\}/);
+	assert.match(
+		workflow,
+		/workspaces: \$\{\{ matrix\.cache_workspaces \|\| matrix\.workspace \}\}/,
+	);
 	assert.match(workflow, /name: rust-nextest-junit-\$\{\{ matrix\.task \}\}/);
 	assert.match(workflow, /name: rust-cargo-timings-\$\{\{ matrix\.task \}\}/);
-	assert.match(workflow, /name: Cargo \$\{\{ matrix\.name \}\}[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/);
+	assert.match(
+		workflow,
+		/name: Cargo \$\{\{ matrix\.name \}\}[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/,
+	);
 });
 
 test("Rust scope gates only Rust jobs and keeps both SDK integration suites", () => {
-	const cargo = workflow.split("\n  cargo:\n")[1].split("\n  js-sdk-test:\n")[0];
+	const cargo = workflow
+		.split("\n  cargo:\n")[1]
+		.split("\n  js-sdk-test:\n")[0];
 	assert.match(cargo, /needs: changelog/);
 	assert.match(cargo, /if: needs\.changelog\.outputs\.rust != 'false'/);
-	const sdk = workflow.split("\n  js-sdk-test:\n")[1].split("\n  preview-artifact-changes:\n")[0];
+	const sdk = workflow
+		.split("\n  js-sdk-test:\n")[1]
+		.split("\n  preview-artifact-changes:\n")[0];
 	assert.doesNotMatch(sdk, /needs:|outputs\.rust/);
 	assert.match(workflow, /fetch-depth: 2/);
 	assert.match(workflow, /rust: \$\{\{ steps\.scope\.outputs\.rust \}\}/);
@@ -58,14 +68,29 @@ test("Rust scope gates only Rust jobs and keeps both SDK integration suites", ()
 });
 
 test("Clippy caches both workspaces and SDK build modes have separate main-seeded caches", () => {
-	assert.match(workflow, /cache_workspaces: \|\n\s+\. -> target\n\s+tooling -> target/);
-	assert.match(workflow, /shared-key: ci-js-\$\{\{ matrix\.runtime \}\}\n\s+save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/);
+	assert.match(
+		workflow,
+		/cache_workspaces: \|\n\s+\. -> target\n\s+tooling -> target/,
+	);
+	assert.match(
+		workflow,
+		/shared-key: ci-js-\$\{\{ matrix\.runtime \}\}\n\s+save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/,
+	);
 });
 
 test("Cargo output directories match the workspace caches and timing uploads", () => {
-	assert.match(workflow, /CARGO_TARGET_DIR: \$\{\{ github\.workspace \}\}\/\$\{\{ matrix\.workspace \}\}\/target/);
-	assert.match(workflow, /export CARGO_TARGET_DIR="\$GITHUB_WORKSPACE\/tooling\/target"\n\s+cargo clippy/);
-	assert.match(workflow, /path: \$\{\{ matrix\.workspace \}\}\/target\/cargo-timings\/\*\.html/);
+	assert.match(
+		workflow,
+		/CARGO_TARGET_DIR: \$\{\{ github\.workspace \}\}\/\$\{\{ matrix\.workspace \}\}\/target/,
+	);
+	assert.match(
+		workflow,
+		/export CARGO_TARGET_DIR="\$GITHUB_WORKSPACE\/tooling\/target"\n\s+cargo clippy/,
+	);
+	assert.match(
+		workflow,
+		/path: \$\{\{ matrix\.workspace \}\}\/target\/cargo-timings\/\*\.html/,
+	);
 });
 
 test("short support jobs use free standard runners for the public repository", () => {
@@ -77,7 +102,9 @@ test("short support jobs use free standard runners for the public repository", (
 	]) {
 		assert.match(
 			workflow,
-			new RegExp(`- name: ${name}\\n\\s+runner: ${runner.replaceAll(".", "\\.")}`),
+			new RegExp(
+				`- name: ${name}\\n\\s+runner: ${runner.replaceAll(".", "\\.")}`,
+			),
 		);
 	}
 });
@@ -91,7 +118,10 @@ test("JS SDK native CI is right-sized without changing browser architecture cove
 		workflow,
 		/- name: Browser\n\s+runtime: browser\n\s+runner: blacksmith-32vcpu-ubuntu-2404/,
 	);
-	assert.match(workflow, /name: JS SDK \$\{\{ matrix\.name \}\} Test[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/);
+	assert.match(
+		workflow,
+		/name: JS SDK \$\{\{ matrix\.name \}\} Test[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/,
+	);
 });
 
 test("green SDK jobs retain exact-revision artifacts for submodule consumers", () => {
@@ -100,7 +130,10 @@ test("green SDK jobs retain exact-revision artifacts for submodule consumers", (
 		/LIX_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/,
 	);
 	assert.match(workflow, /ref: \$\{\{ env\.LIX_SOURCE_SHA \}\}/);
-	assert.match(workflow, /name: lix-browser-sdk-\$\{\{ env\.LIX_SOURCE_SHA \}\}/);
+	assert.match(
+		workflow,
+		/name: lix-browser-sdk-\$\{\{ env\.LIX_SOURCE_SHA \}\}/,
+	);
 	assert.match(workflow, /retention-days: 90/);
 	assert.doesNotMatch(workflow, /name: lix-native-sdk-/);
 	assert.doesNotMatch(workflow, /CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"/);
@@ -115,20 +148,51 @@ test("server-changing pull requests retain one reusable preview image", () => {
 		/name: lix-server-image-linux-x64-\$\{\{ env\.LIX_SOURCE_SHA \}\}/,
 	);
 	assert.match(workflow, /retention-days: 14/);
-	assert.match(publishWorkflow, /lix-server:content-\$server_inputs/);
+	assert.match(publishWorkflow, /node scripts\/ci-server-image\.mjs/);
 });
 
-test("release PR automation reuses same-SHA pull request CI with a dispatch fallback", () => {
+test("release PR updates validate metadata and defer full CI until ready for review", () => {
+	assert.match(releasePrWorkflow, /draft: always-true/);
 	assert.match(
 		releasePrWorkflow,
-		/RELEASE_SHA: \$\{\{ steps\.release_pr\.outputs\.pull-request-head-sha \}\}/,
+		/node scripts\/validate-publish-surface\.mjs/,
 	);
-	assert.match(releasePrWorkflow, /--event pull_request/);
-	assert.match(releasePrWorkflow, /--commit "\$RELEASE_SHA"/);
-	for (const conclusion of ["action_required", "cancelled", "skipped", "stale"]) {
-		assert.match(releasePrWorkflow, new RegExp(`\\. == "${conclusion}"`));
+	assert.match(releasePrWorkflow, /node --test scripts\/release\.test\.mjs/);
+	assert.doesNotMatch(releasePrWorkflow, /gh workflow run|actions: write/);
+	assert.match(workflow, /ready_for_review/);
+});
+
+test("SDK binary reuse never skips TypeScript builds or integration tests", () => {
+	assert.match(workflow, /uses: actions\/cache\/restore@v4/);
+	assert.match(workflow, /uses: actions\/cache\/save@v4/);
+	assert.match(workflow, /node scripts\/ci-sdk-cache\.mjs check/);
+	assert.match(workflow, /fi\n\s+npm --prefix packages\/js-sdk run build:ts/);
+	assert.ok(
+		workflow.indexOf("name: Cache successfully tested SDK binaries") >
+			workflow.indexOf("name: Run OPFS storage browser tests"),
+	);
+	for (const name of [
+		"Run native JS SDK tests",
+		"Run browser JS SDK tests",
+		"Run OPFS storage browser tests",
+	]) {
+		const step = workflow
+			.split(`name: ${name}\n`)[1]
+			.split("\n      - name:")[0];
+		assert.doesNotMatch(step, /binary-cache|reuse/);
 	}
-	assert.match(releasePrWorkflow, /gh workflow run ci\.yml --ref "\$TARGET_BRANCH"/);
+});
+
+test("server cache hits retag the immutable image on a small runner", () => {
+	assert.match(
+		publishWorkflow,
+		/server_digest != '' && 'blacksmith-4vcpu-ubuntu-2404'/,
+	);
+	assert.match(
+		publishWorkflow,
+		/id: publish\n\s+if: needs\.release-version\.outputs\.server_digest == ''/,
+	);
+	assert.match(publishWorkflow, /imagetools create --prefer-index=false/);
 });
 
 test("nextest compiles test targets without building unused examples", () => {
@@ -152,7 +216,9 @@ test("tooling Clippy excludes the benchmark-only DuckDB feature", () => {
 	);
 	const e2eClippy = workflow
 		.split("\n")
-		.find((line) => line.includes("cargo clippy") && line.includes("-p lix_e2e"));
+		.find(
+			(line) => line.includes("cargo clippy") && line.includes("-p lix_e2e"),
+		);
 	assert.ok(e2eClippy);
 	assert.match(e2eClippy, /--all-targets --features /);
 	assert.doesNotMatch(e2eClippy, /\btpch\b|--all-features/);

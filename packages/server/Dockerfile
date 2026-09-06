@@ -12,7 +12,12 @@ RUN apt-get update \
 
 # The build context is the Lix repository root. The reference server links the
 # exact protocol and SlateDB implementation from the same revision.
-COPY . .
+# Cargo needs every workspace member manifest, but repository automation and
+# release notes must not invalidate the server compilation layer.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml README.md ./
+COPY .cargo .cargo
+COPY packages packages
+COPY plugins plugins
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \

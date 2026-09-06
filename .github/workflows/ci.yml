@@ -48,7 +48,7 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/ci-workflow.test.mjs scripts/ci-rust-scope.test.mjs
+        run: node --test scripts/ci-workflow.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-server-image.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
@@ -98,7 +98,7 @@ jobs:
             task: test
             workspace: .
             junit: target/nextest/ci/junit.xml
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: blacksmith-16vcpu-ubuntu-2404
           - name: Tooling Test
             task: tooling
             workspace: tooling
@@ -357,19 +357,35 @@ jobs:
           BINSTALL_NO_CONFIRM=true
           EOF
 
+      - name: Fingerprint SDK binary build inputs
+        id: binary-key
+        run: node scripts/ci-sdk-cache.mjs key '${{ matrix.runtime }}'
+
+      - name: Restore exact-input SDK binaries
+        id: binaries
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-sdk-cache/${{ matrix.runtime }}
+          key: ${{ steps.binary-key.outputs.key }}
+
+      - name: Validate restored SDK binaries
+        id: binary-cache
+        run: node scripts/ci-sdk-cache.mjs check '${{ matrix.runtime }}' '${{ steps.binary-key.outputs.key }}'
+
       - name: Install LLVM build dependencies
-        if: matrix.runtime == 'native'
+        if: matrix.runtime == 'native' && steps.binary-cache.outputs.reuse != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-dev libclang-dev clang mold
 
       - name: Install mold for WebAssembly host tooling
-        if: matrix.runtime == 'browser'
+        if: matrix.runtime == 'browser' && steps.binary-cache.outputs.reuse != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y mold
 
       - name: Restore Rust cache
+        if: steps.binary-cache.outputs.reuse != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           # Native uses test/dev profiles; Browser uses release Wasm. A single
@@ -378,9 +394,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Restore compiler cache
+        if: steps.binary-cache.outputs.reuse != 'true'
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Enable compiler cache
+        if: steps.binary-cache.outputs.reuse != 'true'
         run: |
           grep -v "^#" << "EOF" >> "$GITHUB_ENV"
           SCCACHE_GHA_ENABLED=true
@@ -388,12 +406,15 @@ jobs:
           EOF
 
       - name: Install plugin build target
+        if: steps.binary-cache.outputs.reuse != 'true'
         run: rustup target add wasm32-wasip2
 
       - name: Install WebAssembly build target
+        if: steps.binary-cache.outputs.reuse != 'true'
         run: rustup target add wasm32-unknown-unknown
 
       - name: Install wasm-bindgen CLI
+        if: steps.binary-cache.outputs.reuse != 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.122
@@ -427,15 +448,26 @@ jobs:
         working-directory: packages/js-sdk
         run: npx playwright install --with-deps chromium
 
-      - name: Build native JS SDK
-        if: matrix.runtime == 'native'
-        working-directory: packages/js-sdk
+      - name: Build JS SDK with exact-input binary reuse
+        env:
+          REUSE_BINARIES: ${{ steps.binary-cache.outputs.reuse }}
+          BINARY_KEY: ${{ steps.binary-key.outputs.key }}
+          SDK_RUNTIME: ${{ matrix.runtime }}
         run: |
-          npm run clean
-          npm run build:native
-          npm run build:wasm:dev
-          npm run build:ts
-          npm run build:plugins
+          npm --prefix packages/js-sdk run clean
+          if [ "$REUSE_BINARIES" = true ]; then
+            node scripts/ci-sdk-cache.mjs restore "$SDK_RUNTIME" "$BINARY_KEY"
+          else
+            if [ "$SDK_RUNTIME" = native ]; then
+              npm --prefix packages/js-sdk run build:native
+              npm --prefix packages/js-sdk run build:wasm:dev
+            else
+              npm --prefix packages/js-sdk run build:wasm
+            fi
+            npm --prefix packages/js-sdk run build:plugins
+            node scripts/ci-sdk-cache.mjs save "$SDK_RUNTIME" "$BINARY_KEY"
+          fi
+          npm --prefix packages/js-sdk run build:ts
 
       - name: Build and check filesystem storage package
         if: matrix.runtime == 'native'
@@ -454,13 +486,6 @@ jobs:
         if: matrix.runtime == 'native'
         working-directory: packages/js-sdk
         run: npm exec -- vitest run
-
-      - name: Build browser JS SDK
-        if: matrix.runtime == 'browser'
-        working-directory: packages/js-sdk
-        # This is also the artifact consumed by LixRay. Build and test the
-        # production-sized WASM once here instead of recompiling it downstream.
-        run: npm run build:browser
 
       - name: Build and check OPFS storage package
         if: matrix.runtime == 'browser'
@@ -512,6 +537,13 @@ jobs:
           compression-level: 0
           retention-days: 90
 
+      - name: Cache successfully tested SDK binaries
+        if: steps.binary-cache.outputs.reuse != 'true' && steps.binaries.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-sdk-cache/${{ matrix.runtime }}
+          key: ${{ steps.binary-key.outputs.key }}
+
   preview-artifact-changes:
     name: Select preview artifacts
     if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
@@ -534,7 +566,7 @@ jobs:
         run: |
           if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
             .cargo \
-            .github/workflows/ci.yml \
+            .dockerignore \
             Cargo.lock \
             Cargo.toml \
             rust-toolchain.toml \

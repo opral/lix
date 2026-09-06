@@ -27,6 +27,8 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       release_sha: ${{ steps.version.outputs.release_sha }}
       has_release: ${{ steps.version.outputs.has_release }}
+      server_tag: ${{ steps.server.outputs.tag }}
+      server_digest: ${{ steps.server.outputs.digest }}
 
     permissions:
       contents: write
@@ -120,9 +122,16 @@ jobs:
             echo "version=${tag#v}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Set up Docker Buildx for image lookup
+        uses: docker/setup-buildx-action@v3
+
+      - name: Look up server image before allocating a build runner
+        id: server
+        run: node scripts/ci-server-image.mjs
+
   publish-lix-server:
     name: Publish Lix reference server
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ${{ needs.release-version.outputs.server_digest != '' && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-32vcpu-ubuntu-2404' }}
     needs: release-version
     permissions:
       contents: read
@@ -149,27 +158,13 @@ jobs:
         env:
           RELEASE_SHA: ${{ needs.release-version.outputs.release_sha }}
           RELEASE_TAG: ${{ needs.release-version.outputs.tag }}
+          SERVER_TAG: ${{ needs.release-version.outputs.server_tag }}
           HAS_RELEASE: ${{ needs.release-version.outputs.has_release }}
         run: |
-          server_inputs="$(
-            {
-              git ls-tree HEAD -- \
-                .cargo \
-                Cargo.lock \
-                Cargo.toml \
-                rust-toolchain.toml
-              git ls-tree -r HEAD -- \
-                packages/lix \
-                packages/lix-schema \
-                packages/server \
-                packages/storage-slatedb \
-                plugins
-            } | git hash-object --stdin
-          )"
           {
             echo 'tags<<EOF'
             echo "ghcr.io/opral/lix-server:sha-$RELEASE_SHA"
-            echo "ghcr.io/opral/lix-server:content-$server_inputs"
+            echo "$SERVER_TAG"
             if [ "${{ github.event_name }}" = push ]; then
               echo 'ghcr.io/opral/lix-server:main'
             fi
@@ -181,6 +176,7 @@ jobs:
 
       - name: Build and publish immutable server image
         id: publish
+        if: needs.release-version.outputs.server_digest == ''
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -195,11 +191,28 @@ jobs:
           cache-from: type=gha,scope=lix-server-release
           cache-to: type=gha,mode=max,scope=lix-server-release
 
+      - name: Retag the existing immutable server image
+        if: needs.release-version.outputs.server_digest != ''
+        env:
+          SERVER_DIGEST: ${{ needs.release-version.outputs.server_digest }}
+          IMAGE_TAGS: ${{ steps.image-tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tags=()
+          while IFS= read -r tag; do
+            tags+=(--tag "$tag")
+          done <<< "$IMAGE_TAGS"
+          # Preserve the original build's revision label and manifest digest.
+          docker buildx imagetools create --prefer-index=false "${tags[@]}" \
+            "ghcr.io/opral/lix-server@$SERVER_DIGEST"
+
       - name: Verify the reference image is publicly pullable
+        env:
+          SERVER_DIGEST: ${{ steps.publish.outputs.digest || needs.release-version.outputs.server_digest }}
         run: |
           docker logout ghcr.io
           docker manifest inspect \
-            "ghcr.io/opral/lix-server@${{ steps.publish.outputs.digest }}"
+            "ghcr.io/opral/lix-server@$SERVER_DIGEST"
 
   build-js-sdk-native-packages:
     name: Build @lix-js/sdk native package (${{ matrix.suffix }})

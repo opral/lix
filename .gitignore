@@ -406,3 +406,6 @@ __pycache__/
 
 # Built plugin archive artifacts
 packages/*/*.lixplugin
+
+# Exact-input CI binary snapshots
+.ci-sdk-cache/
