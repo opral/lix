@@ -5,8 +5,8 @@ mod benchmark_metrics;
 
 use std::convert::Infallible;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::io::Cursor;
@@ -22,8 +22,8 @@ use lix::server_protocol::{
 };
 use lix::storage::Storage;
 use lix::{
-    CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions,
-    ServerOptions, SwitchBranchOptions, Value, WireValue, open_lix,
+    CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, ServerOptions,
+    SwitchBranchOptions, Value, WireValue, open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
 use serde_json::{Value as JsonValue, json};
@@ -33,30 +33,22 @@ use tokio::net::TcpListener;
 use benchmark_metrics::AllocationScope;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-const OFFLINE_COMMIT_COUNT: usize = 513;
+const BOOTSTRAP_ROW_COUNT: usize = 513;
 const HOT_STATE_PROFILE_RECORD_PREFIX: &str = "LIX_HOT_STATE_PROFILE_JSON=";
 
 #[derive(Debug, Default)]
 struct HttpProbe {
     handshakes: AtomicU64,
-    pushes: AtomicU64,
-    push_conflicts: AtomicU64,
     delta_pulls: AtomicU64,
     publication_fences: AtomicU64,
     snapshot_row_pulls: AtomicU64,
     history_gets: AtomicU64,
-    active_history_gets: AtomicU64,
-    max_concurrent_history_gets: AtomicU64,
     blob_gets: AtomicU64,
     chunk_gets: AtomicU64,
     chunk_puts: AtomicU64,
-    drop_next_push_ack: AtomicBool,
     reject_requests: AtomicBool,
-    reject_pushes: AtomicBool,
     mismatch_handshake_protocol: AtomicBool,
     one_way_delay_millis: AtomicU64,
-    gated_pushes: AtomicU64,
-    push_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 #[derive(Debug)]
@@ -643,7 +635,10 @@ async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() 
                     } else {
                         panic!("read exposed unknown connected branch '{branch_id}'")
                     };
-                    assert_eq!(value, expected, "branch selector and HOT row must be atomic");
+                    assert_eq!(
+                        value, expected,
+                        "branch selector and HOT row must be atomic"
+                    );
                     tokio::task::yield_now().await;
                 }
                 Ok::<(), LixError>(())
@@ -867,173 +862,6 @@ fn duration_nanos(duration: Duration) -> u64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn synced_partial_file_checkpoint_stays_off_cold_history() {
-    let (authority_storage, authority) = open_authority().await;
-    for index in 0..50 {
-        put_value(
-            &authority,
-            &format!("cold-owner-{index:02}"),
-            &format!("baseline-{index:02}"),
-        )
-        .await;
-    }
-    authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
-        .await
-        .expect("checkpoint cold snapshot baseline");
-    authority.close().await.expect("close authority setup");
-
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-    probe.set_push_offline(true);
-    let history_after_bootstrap = probe.history_gets.load(Ordering::Acquire);
-
-    for (path, content) in [
-        ("/selected.md", b"selected content".as_slice()),
-        ("/remaining.md", b"remaining content".as_slice()),
-    ] {
-        replica
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text(path.to_owned()),
-                    Value::Blob(content.to_vec().into()),
-                ],
-            )
-            .await
-            .expect("create local file");
-    }
-
-    let selected_file_id = replica
-        .execute("SELECT id FROM lix_file WHERE path = '/selected.md'", &[])
-        .await
-        .expect("load selected file id")
-        .rows()[0]
-        .get::<String>("id")
-        .expect("selected file id decodes");
-    assert_eq!(
-        probe.history_gets.load(Ordering::Acquire),
-        history_after_bootstrap,
-        "local file setup must not hydrate additional snapshot history",
-    );
-
-    let history_before_checkpoint = probe.history_gets.load(Ordering::Acquire);
-    let checkpoint = replica
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
-             SELECT row_ref \
-             FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
-             WHERE id = $1))",
-            &[Value::Text(selected_file_id.clone())],
-        )
-        .await
-        .expect("partial file checkpoint stays HOT");
-    assert!(
-        checkpoint.rows_affected() > 0,
-        "checkpoint must select the file diff",
-    );
-    assert_eq!(
-        probe.history_gets.load(Ordering::Acquire),
-        history_before_checkpoint,
-        "checkpoint must not reconstruct the snapshot's cold commit owners",
-    );
-    assert_eq!(
-        replica
-            .execute(
-                "SELECT COUNT(*) AS count \
-                 FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-                 WHERE id = $1",
-                &[
-                    Value::Text(selected_file_id.clone()),
-                    Value::Text(checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
-                ],
-            )
-            .await
-            .expect("first reactive working-diff read stays HOT")
-            .rows()[0]
-            .get::<i64>("count")
-            .unwrap(),
-        0,
-    );
-    assert!(
-        replica
-            .execute(
-                "SELECT COUNT(*) AS count \
-                 FROM lix_diff('lix_file', $1, lix_active_branch_commit_id()) \
-                 WHERE to_path = '/remaining.md'",
-                &[Value::Text(
-                    checkpoint.rows()[0].get::<String>("commit_id").unwrap()
-                )],
-            )
-            .await
-            .expect("unselected file remains dirty")
-            .rows()[0]
-            .get::<i64>("count")
-            .unwrap()
-            > 0,
-    );
-    assert_eq!(
-        read_file_content(&replica, "/selected.md").await.as_deref(),
-        Some(b"selected content".as_slice()),
-    );
-    assert_eq!(
-        probe.history_gets.load(Ordering::Acquire),
-        history_before_checkpoint,
-        "reactive refresh must not defer the same cold reconstruction",
-    );
-    // Clear the deliberately injected push failure before close drains the
-    // connected outbox.
-    probe.set_push_offline(false);
-    replica.close().await.expect("close replica");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn first_local_write_pushes_before_deferred_history_is_read() {
-    let (authority_storage, authority) = open_authority().await;
-    authority
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/shared.md', CAST('Hello world' AS BYTEA))",
-            &[],
-        )
-        .await
-        .expect("seed shared file");
-    put_value(&authority, "head", "visible").await;
-    authority.close().await.expect("close authority setup");
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task, protocol_authority) =
-        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-
-    replica
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/shared.md'",
-            &[],
-        )
-        .await
-        .expect("hydrate only the visible file");
-    replica
-        .execute(
-            "UPDATE lix_file SET content = CAST('Hello worlds' AS BYTEA) WHERE path = '/shared.md'",
-            &[],
-        )
-        .await
-        .expect("edit file before reading history");
-    protocol_authority
-        .wait_for_file_content("/shared.md", b"Hello worlds")
-        .await;
-
-    replica.close().await.expect("close replica");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn sync_runtime_outlives_the_primary_session() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "seed", "authority").await;
@@ -1095,25 +923,6 @@ async fn warm_runtime_protocol_mismatch_is_terminal_without_reconnect() {
 }
 
 impl HttpProbe {
-    fn gate_next_two_pushes(&self) {
-        *self.push_gate.lock().expect("push gate lock") =
-            Some(Arc::new(tokio::sync::Barrier::new(2)));
-        self.gated_pushes.store(2, Ordering::Release);
-    }
-
-    fn push_gate_slot(&self) -> Option<Arc<tokio::sync::Barrier>> {
-        self.gated_pushes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .ok()?;
-        self.push_gate.lock().expect("push gate lock").clone()
-    }
-
-    fn drop_next_push_ack(&self) {
-        self.drop_next_push_ack.store(true, Ordering::Release);
-    }
-
     fn set_round_trip_delay(&self, round_trip: Duration) {
         self.one_way_delay_millis.store(
             u64::try_from(round_trip.as_millis() / 2).expect("test delay fits u64"),
@@ -1124,385 +933,12 @@ impl HttpProbe {
     fn set_offline(&self, offline: bool) {
         self.reject_requests.store(offline, Ordering::Release);
     }
-
-    fn set_push_offline(&self, offline: bool) {
-        self.reject_pushes.store(offline, Ordering::Release);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn fresh_bootstrap_reads_authority_then_local_write_reaches_server() {
-    let (authority_storage, authority) = open_authority().await;
-    let authority_lix_id = authority.lix_id().to_owned();
-    put_value(&authority, "bootstrap-parent", "lazy-history").await;
-    let history_parent = active_head(&authority).await;
-    put_value(&authority, "bootstrap", "from-authority").await;
-    let history_head = active_head(&authority).await;
-    authority.close().await.expect("close authority setup");
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task, protocol_authority) =
-        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-
-    assert_eq!(
-        replica.lix_id(),
-        authority_lix_id,
-        "the first local session must bind to the authority repository identity",
-    );
-
-    assert_eq!(
-        read_value(&replica, "bootstrap").await.as_deref(),
-        Some("from-authority")
-    );
-    let history_gets_before_demand = probe.history_gets.load(Ordering::Acquire);
-    replica
-        .execute(
-            "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
-            &[Value::Text(history_parent), Value::Text(history_head)],
-        )
-        .await
-        .expect("deferred history hydrates through the real HTTP transport and retries");
-    assert_eq!(
-        probe.history_gets.load(Ordering::Acquire),
-        history_gets_before_demand + 1,
-        "one lazy commit body should require one bounded history request",
-    );
-    replica
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('local', 'from-replica')",
-            &[],
-        )
-        .await
-        .expect("local write should not wait for the network");
-    assert_eq!(
-        read_value(&replica, "local").await.as_deref(),
-        Some("from-replica")
-    );
-    replica
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/after-bootstrap.txt', CAST('works' AS BYTEA))",
-            &[],
-        )
-        .await
-        .expect("the first file creation after bootstrap has a checkpoint cursor");
-    replica
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
-        .await
-        .expect("the first checkpoint after sync bootstrap succeeds");
-    assert_eq!(
-        replica
-            .execute(
-                "SELECT content FROM lix_file WHERE path = '/after-bootstrap.txt'",
-                &[],
-            )
-            .await
-            .expect("new local file should read")
-            .rows()[0]
-            .get::<Vec<u8>>("content")
-            .expect("new file content should decode"),
-        b"works",
-    );
-    protocol_authority
-        .wait_for_value("local", "from-replica")
-        .await;
-    protocol_authority
-        .wait_for_file_content("/after-bootstrap.txt", b"works")
-        .await;
-
-    replica.close().await.expect("close replica");
-    drop(replica);
-    let reopened = open_replica(replica_dir.path(), &url).await;
-    assert_eq!(
-        reopened.lix_id(),
-        authority_lix_id,
-        "a warm reopen must retain the authority repository identity",
-    );
-    reopened.close().await.expect("close reopened replica");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn fresh_replica_lists_checkpoints_then_hydrates_file_history_in_bounded_pages() {
-    let (authority_storage, authority) = open_authority().await;
-    authority
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/gone.md', CAST('version one' AS BYTEA))",
-            &[],
-        )
-        .await
-        .expect("create historical file");
-    let file_id = authority
-        .execute("SELECT id FROM lix_file WHERE path = '/gone.md'", &[])
-        .await
-        .expect("read historical file id")
-        .rows()[0]
-        .get::<String>("id")
-        .expect("file id decodes");
-    authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
-        .await
-        .expect("checkpoint first file version");
-    authority
-        .execute(
-            "UPDATE lix_file SET content = CAST('version two' AS BYTEA) WHERE id = $1",
-            &[Value::Text(file_id.clone())],
-        )
-        .await
-        .expect("update historical file");
-    authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
-        .await
-        .expect("checkpoint second file version");
-    authority
-        .execute(
-            "DELETE FROM lix_file WHERE id = $1",
-            &[Value::Text(file_id.clone())],
-        )
-        .await
-        .expect("delete historical file");
-    authority
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/kept.md', CAST('kept' AS BYTEA))",
-            &[],
-        )
-        .await
-        .expect("create surviving file");
-    authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
-        .await
-        .expect("checkpoint deletion and surviving file");
-    for index in 0..105 {
-        put_value(&authority, &format!("history-page-{index:03}"), "value").await;
-    }
-    let head = active_head(&authority).await;
-    authority.close().await.expect("close authority setup");
-
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-
-    let history_before_timeline = probe.history_gets.load(Ordering::Acquire);
-    let checkpoints = replica
-        .execute("SELECT commit_id FROM lix_checkpoint", &[])
-        .await
-        .expect("hot checkpoint timeline renders without cold history");
-    assert!(checkpoints.len() >= 3);
-    assert_eq!(
-        probe.history_gets.load(Ordering::Acquire),
-        history_before_timeline,
-        "listing checkpoints must not fetch file history",
-    );
-
-    let history = replica
-        .execute(
-            "SELECT content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth",
-            &[Value::Text(head.clone()), Value::Text(file_id.clone())],
-        )
-        .await
-        .expect("cold file history hydrates through bounded pages");
-    let versions = history
-        .rows()
-        .iter()
-        .filter_map(|row| row.get::<Vec<u8>>("content").ok())
-        .collect::<Vec<_>>();
-    assert!(versions.iter().any(|bytes| bytes == b"version one"));
-    assert!(versions.iter().any(|bytes| bytes == b"version two"));
-    let page_requests = probe.history_gets.load(Ordering::Acquire) - history_before_timeline;
-    assert!(
-        (2..=5).contains(&page_requests),
-        "more than 100 cold commits plus checkpoint topology should hydrate in a few bounded pages, got {page_requests}",
-    );
-
-    replica
-        .execute(
-            "SELECT content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth",
-            &[Value::Text(head), Value::Text(file_id)],
-        )
-        .await
-        .expect("repeat history read is local");
-    assert_eq!(
-        probe.history_gets.load(Ordering::Acquire) - history_before_timeline,
-        page_requests,
-        "a repeated history query must issue zero network requests",
-    );
-
-    replica.close().await.expect("close replica");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn exact_checkpoint_file_history_hydrates_only_its_anchor_boundary() {
-    let (authority_storage, authority) = open_authority().await;
-    let inserted = authority
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/bounded.md', CAST('version-00' AS BYTEA)) RETURNING id",
-            &[],
-        )
-        .await
-        .expect("create checkpointed file");
-    let file_id = inserted.rows()[0]
-        .get::<String>("id")
-        .expect("file id decodes");
-    let mut target_checkpoint = None;
-    for index in 0..64 {
-        authority
-            .execute(
-                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
-                &[
-                    Value::Text(format!("version-{index:02}")),
-                    Value::Text(file_id.clone()),
-                ],
-            )
-            .await
-            .expect("update checkpointed file");
-        let checkpoint = authority
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
-            .await
-            .expect("create file checkpoint")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("checkpoint commit id decodes");
-        if index == 31 {
-            target_checkpoint = Some(checkpoint);
-        }
-    }
-    let target_checkpoint = target_checkpoint.expect("target checkpoint captured");
-    let authority_history = authority
-        .execute(
-            "SELECT content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
-            &[
-                Value::Text(target_checkpoint.clone()),
-                Value::Text(file_id.clone()),
-            ],
-        )
-        .await
-        .expect("authority retains exact checkpoint content");
-    assert_eq!(
-        authority_history.rows()[0]
-            .get::<Vec<u8>>("content")
-            .expect("authority history content decodes"),
-        b"version-31",
-    );
-    authority.close().await.expect("close authority setup");
-
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-    let history_before = probe.history_gets.load(Ordering::Acquire);
-
-    let history = replica
-        .execute(
-            "SELECT id, path, content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
-            &[
-                Value::Text(target_checkpoint),
-                Value::Text(file_id.clone()),
-            ],
-        )
-        .await
-        .expect("exact checkpoint file history hydrates");
-    assert_eq!(history.rows().len(), 1);
-    assert_eq!(
-        history.rows()[0]
-            .get::<String>("path")
-            .expect("history path decodes"),
-        "/bounded.md",
-    );
-    assert_eq!(
-        history.rows()[0]
-            .get::<Vec<u8>>("content")
-            .expect("history content decodes"),
-        b"version-31",
-    );
-    assert_eq!(
-        probe.history_gets.load(Ordering::Acquire) - history_before,
-        1,
-        "a depth-ordered point lookup should hydrate only the selected checkpoint",
-    );
-
-    replica.close().await.expect("close replica");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn sparse_checkpoint_history_hydrates_missing_bodies_concurrently() {
-    let (authority_storage, authority) = open_authority().await;
-    let inserted = authority
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/checkpoint.md', CAST('version-00' AS BYTEA)) RETURNING id",
-            &[],
-        )
-        .await
-        .expect("create checkpointed file");
-    let file_id = inserted.rows()[0]
-        .get::<String>("id")
-        .expect("file id decodes");
-    let mut latest_checkpoint = None;
-    for index in 0..12 {
-        authority
-            .execute(
-                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
-                &[
-                    Value::Text(format!("version-{index:02}")),
-                    Value::Text(file_id.clone()),
-                ],
-            )
-            .await
-            .expect("update checkpointed file");
-        latest_checkpoint = Some(
-            authority
-                .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
-                .await
-                .expect("create file checkpoint")
-                .rows()[0]
-                .get::<String>("commit_id")
-                .expect("checkpoint commit id decodes"),
-        );
-    }
-    let latest_checkpoint = latest_checkpoint.expect("latest checkpoint captured");
-    authority.close().await.expect("close authority setup");
-
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-    probe.set_round_trip_delay(Duration::from_millis(500));
-    let history_before = probe.history_gets.load(Ordering::Acquire);
-
-    let history = tokio::time::timeout(
-        WAIT_TIMEOUT,
-        replica.execute(
-            "SELECT content FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth",
-            &[Value::Text(latest_checkpoint), Value::Text(file_id)],
-        ),
-    )
-    .await
-    .expect("sparse checkpoint history must complete promptly")
-    .expect("sparse checkpoint history succeeds");
-    assert!(history.rows().len() >= 12);
-    assert!(
-        probe.history_gets.load(Ordering::Acquire) - history_before >= 8,
-        "fixture must retain enough cold checkpoint bodies to exercise batching",
-    );
-    assert!(
-        probe.max_concurrent_history_gets.load(Ordering::Acquire) > 1,
-        "one history attempt must hydrate its censused sparse bodies concurrently",
-    );
-
-    replica.close().await.expect("close replica");
-    stop_server(server_task).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_bootstrap_pages_more_than_one_window_of_hot_rows() {
     let (authority_storage, authority) = open_authority().await;
-    let statements = (0..OFFLINE_COMMIT_COUNT)
+    let statements = (0..BOOTSTRAP_ROW_COUNT)
         .map(|index| ExecuteBatchStatement {
             label: None,
             sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_owned(),
@@ -1540,272 +976,6 @@ async fn fresh_bootstrap_pages_more_than_one_window_of_hot_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn warm_filesystem_replica_reopens_and_writes_while_offline() {
-    let (authority_storage, authority) = open_authority().await;
-    put_value(&authority, "cached", "durable").await;
-    authority.close().await.expect("close authority setup");
-    let (url, server_task) = serve(authority_storage.clone(), Arc::default()).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-    assert_eq!(
-        read_value(&replica, "cached").await.as_deref(),
-        Some("durable")
-    );
-    replica.close().await.expect("close online replica");
-    drop(replica);
-    stop_server(server_task).await;
-
-    let opened_at = Instant::now();
-    let offline = tokio::time::timeout(
-        Duration::from_secs(2),
-        open_replica(replica_dir.path(), &url),
-    )
-    .await
-    .expect("warm reopen must not await an unavailable server");
-    assert!(opened_at.elapsed() < Duration::from_secs(2));
-    assert_eq!(
-        read_value(&offline, "cached").await.as_deref(),
-        Some("durable")
-    );
-    put_value(&offline, "offline", "queued").await;
-    assert_eq!(
-        read_value(&offline, "offline").await.as_deref(),
-        Some("queued")
-    );
-
-    offline.close().await.expect("close offline replica");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn authenticated_identity_survives_fresh_push_and_offline_reopen() {
-    let (authority_storage, authority) = open_authority().await;
-    put_value(&authority, "authenticated-seed", "server").await;
-    let principal = ServerProtocolPrincipal::Authenticated {
-        account_id: lix::SYSTEM_ACCOUNT_ID.to_owned(),
-        idempotency_scope: "sync-mode-authenticated-e2e".to_owned(),
-    };
-    authority.close().await.expect("close authority setup");
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task, protocol_authority) = serve_as_with_authority_session(
-        authority_storage.clone(),
-        Arc::clone(&probe),
-        principal.clone(),
-    )
-    .await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-
-    assert_eq!(active_account(&replica).await, lix::SYSTEM_ACCOUNT_ID);
-    put_value(&replica, "authenticated-fresh", "accepted").await;
-    protocol_authority
-        .wait_for_value("authenticated-fresh", "accepted")
-        .await;
-    assert!(
-        probe.pushes.load(Ordering::Acquire) > 0,
-        "authenticated fresh write should reach the authority through sync push",
-    );
-    replica.close().await.expect("close authenticated replica");
-    drop(replica);
-    stop_server(server_task).await;
-
-    let reopened = tokio::time::timeout(
-        Duration::from_secs(2),
-        open_replica(replica_dir.path(), &url),
-    )
-    .await
-    .expect("authenticated warm reopen must not await the offline authority");
-    assert_eq!(
-        active_account(&reopened).await,
-        lix::SYSTEM_ACCOUNT_ID,
-        "durable replica identity must be installed before the primary session opens",
-    );
-    put_value(&reopened, "authenticated-offline", "queued").await;
-    assert_eq!(
-        read_value(&reopened, "authenticated-offline")
-            .await
-            .as_deref(),
-        Some("queued"),
-    );
-
-    reopened
-        .close()
-        .await
-        .expect("close authenticated offline replica");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn more_than_one_offline_push_window_drains_after_reconnect() {
-    let (authority_storage, authority) = open_authority().await;
-    let commits_before = commit_count(&authority).await;
-    authority.close().await.expect("close authority setup");
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task, protocol_authority) =
-        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-    wait_for_counter(&probe.delta_pulls, 1).await;
-
-    probe.set_offline(true);
-    for index in 0..OFFLINE_COMMIT_COUNT {
-        put_value(&replica, "offline-window", &format!("value-{index}")).await;
-    }
-    let expected = format!("value-{}", OFFLINE_COMMIT_COUNT - 1);
-    assert_eq!(
-        read_value(&replica, "offline-window").await.as_deref(),
-        Some(expected.as_str()),
-    );
-    replica
-        .close()
-        .await
-        .expect("close replica with durable offline outbox");
-    drop(replica);
-    let replica = tokio::time::timeout(
-        Duration::from_secs(2),
-        open_replica(replica_dir.path(), &url),
-    )
-    .await
-    .expect("warm outbox reopen must not await the offline authority");
-    assert_eq!(
-        read_value(&replica, "offline-window").await.as_deref(),
-        Some(expected.as_str()),
-    );
-
-    probe.set_offline(false);
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            if protocol_authority
-                .read_value("offline-window")
-                .await
-                .as_deref()
-                == Some(expected.as_str())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("offline outbox should drain after reconnect");
-    assert_eq!(
-        protocol_authority.commit_count().await,
-        commits_before + OFFLINE_COMMIT_COUNT as i64,
-    );
-    assert!(
-        probe.pushes.load(Ordering::Acquire) >= 2,
-        "the outbox must cross at least two bounded pushes",
-    );
-
-    replica.close().await.expect("close replica");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn offline_restore_survives_reopen_and_resets_the_authority() {
-    let (authority_storage, authority) = open_authority().await;
-    put_value(&authority, "restore-reopen", "target").await;
-    let restore_target = active_head(&authority).await;
-    put_value(&authority, "restore-reopen", "later").await;
-    let authority_head_before_restore = active_head(&authority).await;
-    authority.close().await.expect("close authority setup");
-
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task, protocol_authority) =
-        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-    assert_eq!(
-        read_value(&replica, "restore-reopen").await.as_deref(),
-        Some("later"),
-    );
-    let historical = replica
-        .execute(
-            "SELECT value FROM lix_state_at('lix_key_value', $1) WHERE key = 'restore-reopen'",
-            &[Value::Text(restore_target.clone())],
-        )
-        .await
-        .expect("hydrate the historical restore target before going offline");
-    assert_eq!(historical.len(), 1);
-
-    // Keep the restore in the durable local outbox across close/reopen. This
-    // models a browser losing connectivity (or being terminated) immediately
-    // after the local-first restore commits.
-    probe.set_offline(true);
-    replica
-        .execute(
-            "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-            &[Value::Text(restore_target.clone())],
-        )
-        .await
-        .expect("restore local replica to an authority ancestor");
-    assert_eq!(active_head(&replica).await, restore_target);
-    assert_eq!(
-        read_value(&replica, "restore-reopen").await.as_deref(),
-        Some("target"),
-    );
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    replica
-        .close()
-        .await
-        .expect("close replica with an offline restore in its durable outbox");
-    drop(replica);
-
-    let reopened = tokio::time::timeout(
-        Duration::from_secs(2),
-        open_replica(replica_dir.path(), &url),
-    )
-    .await
-    .expect("warm restore reopen must not await the unavailable authority");
-    assert_eq!(active_head(&reopened).await, restore_target);
-    assert_eq!(
-        read_value(&reopened, "restore-reopen").await.as_deref(),
-        Some("target"),
-    );
-    assert_eq!(
-        protocol_authority
-            .execute("SELECT lix_active_branch_commit_id()", &[])
-            .await[0][0],
-        Value::Text(authority_head_before_restore),
-        "the rejected push must leave the authority at its later head",
-    );
-
-    probe.set_offline(false);
-    tokio::time::timeout(WAIT_TIMEOUT, async {
-        loop {
-            let head = protocol_authority
-                .execute("SELECT lix_active_branch_commit_id()", &[])
-                .await;
-            if head[0][0] == Value::Text(restore_target.clone()) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the reopened replica should push the historical ref reset");
-    assert_eq!(
-        read_value(&reopened, "restore-reopen").await.as_deref(),
-        Some("target"),
-        "the authority lineage must not overwrite the local restore",
-    );
-    assert_eq!(
-        protocol_authority
-            .read_value("restore-reopen")
-            .await
-            .as_deref(),
-        Some("target"),
-        "the local restore should reset the authority through a ref CAS",
-    );
-
-    reopened.close().await.expect("close reopened replica");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn two_clients_receive_remote_writes_through_a_held_long_poll() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "seed", "ready").await;
@@ -1850,87 +1020,6 @@ async fn two_clients_receive_remote_writes_through_a_held_long_poll() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn concurrent_file_insert_and_edit_reconcile_after_one_stale_push() {
-    let (authority_storage, authority) = open_authority().await;
-    authority
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/existing.md', CAST('base' AS BYTEA))",
-            &[],
-        )
-        .await
-        .expect("seed existing file");
-    authority.close().await.expect("close authority setup");
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task, protocol_authority) =
-        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
-    let alice_dir = TempDir::new().expect("alice tempdir");
-    let bob_dir = TempDir::new().expect("bob tempdir");
-    let alice = open_replica(alice_dir.path(), &url).await;
-    let bob = open_replica(bob_dir.path(), &url).await;
-
-    let (alice_content, bob_content) = tokio::join!(
-        read_file_content(&alice, "/existing.md"),
-        read_file_content(&bob, "/existing.md"),
-    );
-    assert_eq!(alice_content, Some(b"base".to_vec()));
-    assert_eq!(bob_content, Some(b"base".to_vec()));
-    wait_for_counter(&probe.delta_pulls, 2).await;
-
-    // Hold both publish requests until they have been built from the same
-    // authority head. Exactly one CAS must then lose with HTTP 409.
-    probe.gate_next_two_pushes();
-    let (created, edited) = tokio::join!(
-        alice.execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/created.md', CAST('created' AS BYTEA))",
-            &[],
-        ),
-        bob.execute(
-            "UPDATE lix_file SET content = CAST('edited' AS BYTEA) WHERE path = '/existing.md'",
-            &[],
-        ),
-    );
-    created.expect("Alice creates a file locally");
-    edited.expect("Bob edits the existing file locally");
-
-    protocol_authority
-        .wait_for_file_content("/created.md", b"created")
-        .await;
-    protocol_authority
-        .wait_for_file_content("/existing.md", b"edited")
-        .await;
-    wait_for_file_content(&alice, "/created.md", b"created").await;
-    wait_for_file_content(&alice, "/existing.md", b"edited").await;
-    wait_for_file_content(&bob, "/created.md", b"created").await;
-    wait_for_file_content(&bob, "/existing.md", b"edited").await;
-    assert_eq!(
-        probe.push_conflicts.load(Ordering::Acquire),
-        1,
-        "two publishes from one head must exercise exactly one stale ref CAS",
-    );
-
-    // Sync publishes pending work before it waits for a remote event. If both
-    // clients consume this authority-only event without another push, their
-    // durable outboxes were empty after reconciliation.
-    let pushes_after_convergence = probe.pushes.load(Ordering::Acquire);
-    protocol_authority
-        .put_value("outbox-sentinel", "authority-only")
-        .await;
-    wait_for_value(&alice, "outbox-sentinel", "authority-only").await;
-    wait_for_value(&bob, "outbox-sentinel", "authority-only").await;
-    assert_eq!(
-        probe.pushes.load(Ordering::Acquire),
-        pushes_after_convergence,
-        "converged replicas must not retain pending outbox work",
-    );
-
-    alice.close().await.expect("close alice");
-    bob.close().await.expect("close bob");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn small_file_observer_receives_remote_edit_without_a_chunk_round_trip() {
     let (authority_storage, authority) = open_authority().await;
     authority
@@ -1970,7 +1059,6 @@ async fn small_file_observer_receives_remote_edit_without_a_chunk_round_trip() {
 
     let chunk_gets_before_remote_edit = probe.chunk_gets.load(Ordering::Acquire);
     let chunk_puts_before_remote_edit = probe.chunk_puts.load(Ordering::Acquire);
-    let started = Instant::now();
     bob.execute(
         "UPDATE lix_file SET content = CAST('Hello worlds' AS BYTEA) WHERE path = '/shared.md'",
         &[],
@@ -1998,83 +1086,9 @@ async fn small_file_observer_receives_remote_edit_without_a_chunk_round_trip() {
         chunk_puts_before_remote_edit,
         "self-contained small manifests must not upload a separate chunk",
     );
-    assert!(
-        started.elapsed() < Duration::from_millis(700),
-        "small-file propagation should stay below 700 ms at 100 ms RTT",
-    );
 
     alice.close().await.expect("close alice");
     bob.close().await.expect("close bob");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn held_long_poll_stays_realtime_with_one_hundred_millisecond_rtt() {
-    let (authority_storage, authority) = open_authority().await;
-    put_value(&authority, "seed", "ready").await;
-    authority.close().await.expect("close authority setup");
-    let probe = Arc::new(HttpProbe::default());
-    probe.set_round_trip_delay(Duration::from_millis(100));
-    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
-    let alice_dir = TempDir::new().expect("alice tempdir");
-    let bob_dir = TempDir::new().expect("bob tempdir");
-    let alice = open_replica(alice_dir.path(), &url).await;
-    let bob = open_replica(bob_dir.path(), &url).await;
-    wait_for_counter(&probe.delta_pulls, 2).await;
-
-    let started = Instant::now();
-    put_value(&alice, "realtime", "local-first").await;
-    assert_eq!(
-        read_value(&alice, "realtime").await.as_deref(),
-        Some("local-first"),
-        "the originating client reads its write without a network round trip",
-    );
-    assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "the local interaction path must stay below the simulated RTT",
-    );
-    wait_for_value(&bob, "realtime", "local-first").await;
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "held long-poll propagation should remain comfortably below 500 ms at 100 ms RTT",
-    );
-
-    alice.close().await.expect("close alice");
-    bob.close().await.expect("close bob");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn lost_push_ack_retries_the_same_commit_idempotently() {
-    let (authority_storage, authority) = open_authority().await;
-    let commits_before = commit_count(&authority).await;
-    authority.close().await.expect("close authority setup");
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task, protocol_authority) =
-        serve_with_authority_session(authority_storage.clone(), Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-    wait_for_counter(&probe.delta_pulls, 1).await;
-
-    probe.drop_next_push_ack();
-    put_value(&replica, "lost-ack", "once").await;
-    protocol_authority.wait_for_value("lost-ack", "once").await;
-    replica
-        .close()
-        .await
-        .expect("close after the authority committed but before a durable acknowledgement");
-    drop(replica);
-    let replica = open_replica(replica_dir.path(), &url).await;
-    wait_for_counter(&probe.pushes, 2).await;
-    assert_eq!(protocol_authority.commit_count().await, commits_before + 1);
-    assert_eq!(
-        read_value(&replica, "lost-ack").await.as_deref(),
-        Some("once")
-    );
-
-    replica.close().await.expect("close replica");
     stop_server(server_task).await;
 }
 
@@ -2417,27 +1431,6 @@ where
     .and_then(|row| row.get::<Vec<u8>>("content").ok())
 }
 
-async fn wait_for_file_content<S>(lix: &Lix<S>, path: &str, expected: &[u8])
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    tokio::time::timeout(WAIT_TIMEOUT, async {
-        loop {
-            if read_file_content(lix, path).await.as_deref() == Some(expected) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "timed out waiting for synchronized file content at {path}: {:?}",
-            String::from_utf8_lossy(expected),
-        )
-    });
-}
-
 async fn wait_for_value<S>(lix: &Lix<S>, key: &str, expected: &str)
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -2476,18 +1469,6 @@ where
         .rows()[0]
         .get::<String>("id")
         .expect("active head id")
-}
-
-async fn active_account<S>(lix: &Lix<S>) -> String
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    lix.execute("SELECT lix_active_account_id() AS id", &[])
-        .await
-        .expect("read active account")
-        .rows()[0]
-        .get::<String>("id")
-        .expect("active account id")
 }
 
 async fn wait_for_counter(counter: &AtomicU64, expected: u64) {
@@ -2733,34 +1714,6 @@ impl ProtocolAuthority {
         })
     }
 
-    async fn read_file_content(&self, path: &str) -> Option<Vec<u8>> {
-        self.execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_owned())],
-        )
-        .await
-        .into_iter()
-        .next()
-        .and_then(|row| row.into_iter().next())
-        .and_then(|value| match value {
-            Value::Blob(value) => Some(value.to_vec()),
-            _ => None,
-        })
-    }
-
-    async fn commit_count(&self) -> i64 {
-        self.execute("SELECT COUNT(*) AS count FROM lix_commit", &[])
-            .await
-            .into_iter()
-            .next()
-            .and_then(|row| row.into_iter().next())
-            .and_then(|value| match value {
-                Value::Integer(value) => Some(value),
-                _ => None,
-            })
-            .expect("integer authority commit count")
-    }
-
     async fn wait_for_value(&self, key: &str, expected: &str) {
         tokio::time::timeout(WAIT_TIMEOUT, async {
             loop {
@@ -2772,24 +1725,6 @@ impl ProtocolAuthority {
         })
         .await
         .expect("timed out waiting for authoritative value");
-    }
-
-    async fn wait_for_file_content(&self, path: &str, expected: &[u8]) {
-        tokio::time::timeout(WAIT_TIMEOUT, async {
-            loop {
-                if self.read_file_content(path).await.as_deref() == Some(expected) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "timed out waiting for authoritative file content at {path}: {:?}",
-                String::from_utf8_lossy(expected),
-            )
-        });
     }
 }
 
@@ -2872,16 +1807,6 @@ where
                 .expect("build mismatched handshake"));
         }
     }
-    let is_push = parts.method == Method::POST && path.ends_with("/sync/push");
-    if is_push && probe.reject_pushes.load(Ordering::Acquire) {
-        return Ok(Response::builder()
-            .status(503)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from_static(
-                br#"{"error":{"code":"LIX_SYNC_TEST_PUSH_OFFLINE","message":"test push endpoint offline"}}"#,
-            )))
-            .expect("build push-offline response"));
-    }
     let is_delta_pull = parts.method == Method::GET
         && path.ends_with("/sync/pull")
         && parts
@@ -2907,9 +1832,6 @@ where
                 .any(|part| part.starts_with("snapshotBranchId="))
         });
     let is_history_get = parts.method == Method::GET && path.ends_with("/sync/history");
-    if is_push {
-        probe.pushes.fetch_add(1, Ordering::Release);
-    }
     if is_delta_pull {
         probe.delta_pulls.fetch_add(1, Ordering::Release);
     }
@@ -2924,10 +1846,6 @@ where
     }
     if is_history_get {
         probe.history_gets.fetch_add(1, Ordering::Release);
-        let active = probe.active_history_gets.fetch_add(1, Ordering::AcqRel) + 1;
-        probe
-            .max_concurrent_history_gets
-            .fetch_max(active, Ordering::AcqRel);
     }
     if parts.method == Method::GET && path.ends_with("/sync/chunk") {
         probe.chunk_gets.fetch_add(1, Ordering::Release);
@@ -2940,9 +1858,6 @@ where
         .await
         .expect("collect HTTP request body")
         .to_bytes();
-    if is_push && let Some(gate) = probe.push_gate_slot() {
-        gate.wait().await;
-    }
     let response = protocol
         .handle(
             Request::from_parts(parts, ServerProtocolBody::full(body)),
@@ -2952,12 +1867,6 @@ where
             },
         )
         .await;
-    if is_history_get {
-        probe.active_history_gets.fetch_sub(1, Ordering::AcqRel);
-    }
-    if is_push && response.status() == StatusCode::CONFLICT {
-        probe.push_conflicts.fetch_add(1, Ordering::Release);
-    }
     let (parts, body) = response.into_parts();
     let body = body
         .collect()
@@ -2965,15 +1874,6 @@ where
         .expect("collect protocol response")
         .to_bytes();
     tokio::time::sleep(one_way_delay).await;
-    if is_push && probe.drop_next_push_ack.swap(false, Ordering::AcqRel) {
-        return Ok(Response::builder()
-			.status(503)
-			.header(CONTENT_TYPE, "application/json")
-			.body(Full::new(Bytes::from_static(
-				br#"{"error":{"code":"LIX_SYNC_TEST_LOST_ACK","message":"test acknowledgement dropped"}}"#,
-			)))
-			.expect("build lost-ack response"));
-    }
     Ok(Response::from_parts(parts, Full::new(body)))
 }
 
@@ -3001,14 +1901,9 @@ async fn stop_server(task: tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn fresh_replica_reads_point_in_time_filesystem_state() {
-    // Regression: a freshly bootstrapped replica holds hot state plus
-    // deferred history payloads. lix_state_at and lix_diff at an old
-    // checkpoint must hydrate the missing payloads (like lix_history does)
-    // instead of reading a partial tree — which surfaced as
-    // "filesystem descriptor references missing directory" and empty
-    // directory trees on a repository whose server copy is consistent.
+    // Historical file and directory reads must resolve complete trees on the
+    // authority, including when the replica has only a bounded HOT bootstrap.
     let (authority_storage, authority) = open_authority().await;
     authority
         .execute(
@@ -3064,7 +1959,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
             &[Value::Text(commit_id.clone())],
         )
         .await
-        .expect("point-in-time file state hydrates on a fresh replica");
+        .expect("point-in-time file state executes on the authority");
     let file_names = files
         .rows()
         .iter()
@@ -3082,7 +1977,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
             &[Value::Text(commit_id.clone())],
         )
         .await
-        .expect("point-in-time directory state hydrates on a fresh replica");
+        .expect("point-in-time directory state executes on the authority");
     let directory_names = directories
         .rows()
         .iter()
@@ -3102,7 +1997,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
             &[Value::Text(commit_id)],
         )
         .await
-        .expect("root diff with paths hydrates on a fresh replica");
+        .expect("root diff with paths executes on the authority");
     let paths = diff
         .rows()
         .iter()
@@ -3130,7 +2025,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
             ],
         )
         .await
-        .expect("checkpoint-span diff hydrates on a fresh replica");
+        .expect("checkpoint-span diff executes on the authority");
     let span_rows = span
         .rows()
         .iter()
@@ -3155,7 +2050,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
             &[Value::Text(second_checkpoint.clone())],
         )
         .await
-        .expect("latest checkpoint directory state hydrates");
+        .expect("latest checkpoint directory state executes on the authority");
     let latest_names = latest_directories
         .rows()
         .iter()
@@ -3177,226 +2072,13 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn sparse_replica_observer_hydrates_root_history_past_a_merge_frontier() {
-    // A bounded bootstrap can retain a recent linear head and a merge in its
-    // jump/base closure while deferring the merge's direct first parent. Root
-    // resolution must expose that absence as a sparse graph demand so observe
-    // hydrates and retries.
-    let (authority_storage, authority) = open_authority().await;
-    let root_commit_id = authority
-        .execute("SELECT lix_root_commit_id() AS commit_id", &[])
-        .await
-        .expect("authority root should resolve")
-        .rows()[0]
-        .get::<String>("commit_id")
-        .expect("authority root id decodes");
-    let main_branch_id = authority
-        .active_branch_id()
-        .await
-        .expect("main branch id should load");
-    let source = authority
-        .create_branch(CreateBranchOptions {
-            id: None,
-            name: "sparse-root-source".to_owned(),
-            from_commit_id: None,
-        })
-        .await
-        .expect("source branch should be created");
-
-    put_value(&authority, "main-only", "main").await;
-    authority
-        .switch_branch(SwitchBranchOptions {
-            branch_id: source.id.clone(),
-        })
-        .await
-        .expect("source branch should become active");
-    put_value(&authority, "source-only", "source").await;
-    authority
-        .switch_branch(SwitchBranchOptions {
-            branch_id: main_branch_id,
-        })
-        .await
-        .expect("main branch should become active again");
-    let merge = authority
-        .merge_branch(MergeBranchOptions {
-            source_branch_id: source.id,
-        })
-        .await
-        .expect("diverged source should merge");
-    assert!(
-        merge.created_merge_commit_id.is_some(),
-        "fixture requires a merge commit at the authority head"
-    );
-    for index in 0..3 {
-        put_value(&authority, &format!("after-merge-{index}"), "after-merge").await;
-    }
-    authority.close().await.expect("close authority setup");
-
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(authority_storage, Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-    let bootstrap_history_gets = probe.history_gets.load(Ordering::Acquire);
-
-    let mut roots = replica
-        .observe("SELECT lix_root_commit_id() AS commit_id", &[])
-        .expect("root observer should open");
-    let first = tokio::time::timeout(WAIT_TIMEOUT, roots.next())
-        .await
-        .expect("timed out waiting for hydrated root")
-        .expect("root observer should hydrate sparse history")
-        .expect("root observer should yield a first event");
-    assert_eq!(
-        first.rows.rows()[0]
-            .get::<String>("commit_id")
-            .expect("replica root id decodes"),
-        root_commit_id,
-    );
-    assert_eq!(
-        probe.history_gets.load(Ordering::Acquire),
-        bootstrap_history_gets + 1,
-        "root traversal past the merge frontier should demand one bounded history page"
-    );
-
-    roots.close();
-    replica.close().await.expect("close replica");
-
-    // Write diff commands resolve their source commits in a transaction-local
-    // walker. A separate sparse replica ensures the read observer above has
-    // not already hydrated the missing merge parent for this code path.
-    let command_replica_dir = TempDir::new().expect("command replica tempdir");
-    let command_replica = open_replica(command_replica_dir.path(), &url).await;
-    let command_bootstrap_history_gets = probe.history_gets.load(Ordering::Acquire);
-    let applied = command_replica
-        .execute(
-            "INSERT INTO lix_apply (row_ref) \
-             SELECT row_ref \
-             FROM lix_diff(\
-               'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
-             ) \
-             WHERE false",
-            &[],
-        )
-        .await
-        .expect("root-based write diff should hydrate sparse history");
-    assert_eq!(applied.rows_affected(), 0, "empty apply should not mutate");
-    assert_eq!(
-        probe.history_gets.load(Ordering::Acquire),
-        command_bootstrap_history_gets + 1,
-        "write diff root traversal should demand one bounded history page"
-    );
-
-    command_replica
-        .close()
-        .await
-        .expect("close command replica");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
-async fn partially_hydrated_replica_reads_point_in_time_filesystem_state() {
-    // The live-repository shape behind the "filesystem descriptor references
-    // missing directory" failure: a bounded history read hydrates ONLY the
-    // checkpoint anchor commit, while the content commit that authored the
-    // file and directory rows stays deferred. lix_state_at at the hydrated
-    // anchor must then hydrate the owning commits it resolves rows from —
-    // not silently materialize a partial tree.
-    let (authority_storage, authority) = open_authority().await;
-    authority
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/sales/playbook.md', CAST('one' AS BYTEA))",
-            &[],
-        )
-        .await
-        .expect("create /sales/playbook.md");
-    let file_id = authority
-        .execute(
-            "SELECT id FROM lix_file WHERE path = '/sales/playbook.md'",
-            &[],
-        )
-        .await
-        .expect("read file id")
-        .rows()[0]
-        .get::<String>("id")
-        .expect("file id decodes");
-    let checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
-        .await
-        .expect("checkpoint seeded filesystem")
-        .rows()[0]
-        .get::<String>("commit_id")
-        .expect("checkpoint commit id decodes");
-    for index in 0..105 {
-        put_value(
-            &authority,
-            &format!("partial-hydration-{index:03}"),
-            "value",
-        )
-        .await;
-    }
-    authority.close().await.expect("close authority setup");
-
-    let probe = Arc::new(HttpProbe::default());
-    let (url, server_task) = serve(authority_storage.clone(), Arc::clone(&probe)).await;
-    let replica_dir = TempDir::new().expect("replica tempdir");
-    let replica = open_replica(replica_dir.path(), &url).await;
-
-    // Selective hydration: the bounded point lookup hydrates only the
-    // checkpoint anchor boundary, leaving the authoring commit deferred.
-    replica
-        .execute(
-            "SELECT path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
-            &[Value::Text(checkpoint.clone()), Value::Text(file_id.clone())],
-        )
-        .await
-        .expect("bounded anchor lookup hydrates");
-
-    // The point-in-time read at the now-hydrated anchor.
-    let files = replica
-        .execute(
-            "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
-            &[Value::Text(checkpoint.clone())],
-        )
-        .await
-        .expect("file state at the anchor hydrates its owning commits");
-    let directories = replica
-        .execute(
-            "SELECT id, name FROM lix_state_at('lix_directory', $1)",
-            &[Value::Text(checkpoint.clone())],
-        )
-        .await
-        .expect("directory state at the anchor hydrates its owning commits");
-    assert_eq!(directories.rows().len(), 1, "sales directory present");
-    assert_files_resolve_directories(&files, &directories);
-
-    let diff = replica
-        .execute(
-            "SELECT to_path FROM lix_diff('lix_file', lix_root_commit_id(), $1)",
-            &[Value::Text(checkpoint)],
-        )
-        .await
-        .expect("root diff with paths at the anchor hydrates");
-    assert_eq!(
-        diff.rows()[0].get::<String>("to_path").expect("path"),
-        "/sales/playbook.md",
-    );
-
-    replica.close().await.expect("close replica");
-    stop_server(server_task).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "legacy replica-local mutation/history semantics removed by the authority hard cut"]
 async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica() {
     // Full lineage of the failing live repository: authored on the v71
     // engine, migrated and partial-checkpointed on the v72 engine
     // (fixture generated from 4816fdba5, SHA-256
     // 634eefb12a96bbb656214d5f203fb2f0dbd0fc552379754e3c86eb9cb99b6f70),
     // migrated to the current format here, served, and read from a fresh
-    // sync replica after a bounded history lookup hydrated only the
-    // checkpoint anchor.
+    // sync replica using server-first history reads.
     const V72_PARTIAL_CHECKPOINTS: &[u8] =
         include_bytes!("fixtures/v72_partial_checkpoints.lixsnap");
     let authority_storage = Memory::new();
@@ -3439,7 +2121,7 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
     let replica_dir = TempDir::new().expect("replica tempdir");
     let replica = open_replica(replica_dir.path(), &url).await;
 
-    // Selective hydration of the checkpoint anchor only.
+    // Read the historical anchor through the connected authority handle.
     replica
         .execute(
             "SELECT path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
@@ -3449,7 +2131,7 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
             ],
         )
         .await
-        .expect("bounded anchor lookup hydrates");
+        .expect("bounded anchor lookup executes on the authority");
 
     let files = replica
         .execute(
@@ -3457,14 +2139,14 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
             &[Value::Text(last_checkpoint.clone())],
         )
         .await
-        .expect("file state at the migrated partial checkpoint hydrates");
+        .expect("file state at the migrated partial checkpoint executes on the authority");
     let directories = replica
         .execute(
             "SELECT id, name FROM lix_state_at('lix_directory', $1)",
             &[Value::Text(last_checkpoint.clone())],
         )
         .await
-        .expect("directory state at the migrated partial checkpoint hydrates");
+        .expect("directory state at the migrated partial checkpoint executes on the authority");
     assert_eq!(
         directories.rows().len(),
         4,
@@ -3479,7 +2161,9 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
             &[Value::Text(last_checkpoint)],
         )
         .await
-        .expect("root diff with paths at the migrated partial checkpoint hydrates");
+        .expect(
+            "root diff with paths at the migrated partial checkpoint executes on the authority",
+        );
     assert_eq!(diff.rows().len(), 4, "resolved paths for all four files");
 
     replica

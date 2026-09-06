@@ -1020,7 +1020,7 @@ impl SyncSessionLease {
             return Ok(());
         }
         if self.active_sessions.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.runtime.drain_and_join().await?;
+            self.runtime.stop_and_join().await?;
         }
         Ok(())
     }

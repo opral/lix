@@ -40,7 +40,6 @@ pub(crate) struct SyncRuntime {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyncShutdown {
     Running,
-    Drain,
     Stop,
 }
 
@@ -178,8 +177,8 @@ impl SyncRuntime {
         self.shutdown_tx.send_replace(SyncShutdown::Stop);
     }
 
-    pub(crate) async fn drain_and_join(&self) -> Result<(), LixError> {
-        self.shutdown_tx.send_replace(SyncShutdown::Drain);
+    pub(crate) async fn stop_and_join(&self) -> Result<(), LixError> {
+        self.stop();
         let completion = self
             .completion_rx
             .lock()
@@ -517,7 +516,7 @@ where
     }
     // Replica writes are authority-routed and their public promises wait for a
     // certified pull. Closing a replica therefore has no local outbox to
-    // publish; Drain only waits for the current pull iteration to stop.
+    // publish; shutdown only waits for the current pull iteration to stop.
     let result = terminal_error.map_or(Ok(()), Err);
     drop(pending_demands);
     drop(demand_rx);

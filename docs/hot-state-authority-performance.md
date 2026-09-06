@@ -66,13 +66,15 @@ sync against shallow-history, deep-history, and wider-row fixtures. It asserts:
 - identical bootstrap page and topology-request counts at equal `N`, `C`, `D`,
   and `B` when only `H` changes;
 - exact replica current-row and working-diff cardinality;
-- exactly one finite publication pull for one certified current read;
 - zero cold-history requests from the no-endpoint working-diff query; and
 - a measured one-megabyte exact current-file content read, including its allocation scope;
 - bounded allocation before and after checkpoint retirement of retained
   net-zero working tombstones; and
 - generous allocation high-water envelopes that catch super-linear growth
   without treating allocator/RSS noise as a latency benchmark.
+
+The regular connected-API test separately asserts zero finite publication
+pulls for certified current reads and verifies server-first coherent reads.
 
 Run the focused scorecard with:
 
@@ -102,10 +104,11 @@ contract because they are machine- and allocator-dependent.
 The exact selected-file probe returned a 1,048,576-byte current `content` value in
 all three cases. It allocated 18,491,287 / 18,240,350 / 28,992,135 bytes with
 3,726,576 / 3,508,440 / 4,885,244 peak-live bytes for shallow / deep / wide,
-respectively. The first read may fetch missing content-addressed chunks, but it
-does not hydrate commit history and remains bounded by `A_f + P_f`. Review UI
-before/after payloads use the existing server-first `lix_state_at` history
-surface and therefore do not add historical memory to the replica.
+respectively. Certified current reads and one-argument working diffs use
+payloads installed before publication, so they issue no foreground chunk or
+history requests. Explicit historical reads use the server-first `lix_state_at`
+and multi-argument `lix_diff` surfaces and do not add historical memory to the
+replica.
 
 For 128 retained net-zero tombstones, checkpoint retirement kept the working
 diff at zero rows and reduced the probe from 1,268,863 to 1,058,794 allocated
