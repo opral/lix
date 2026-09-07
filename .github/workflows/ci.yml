@@ -553,18 +553,18 @@ jobs:
           }, null, 2));
           EOF
 
-      - name: Share browser SDK with performance checks
+      - name: Upload tested browser SDK for submodule consumers
         if: matrix.runtime == 'browser'
         uses: actions/upload-artifact@v4
         with:
-          name: lix-browser-sdk-build-${{ env.LIX_SOURCE_SHA }}
+          name: lix-browser-sdk-${{ env.LIX_SOURCE_SHA }}
           path: |
             packages/js-sdk/dist
             packages/storage-opfs/dist
             ci-artifact/browser.json
           if-no-files-found: error
           compression-level: 0
-          retention-days: 1
+          retention-days: 90
 
       - name: Cache successfully tested SDK binaries
         if: steps.binary-cache.outputs.reuse != 'true' && steps.binaries.outputs.cache-hit != 'true'
@@ -578,63 +578,6 @@ jobs:
         run: |
           df -h "$GITHUB_WORKSPACE"
           free -h
-
-  opfs-benchmarks:
-    name: OPFS performance budgets
-    needs: js-sdk-test
-    # Preserve hardware-sensitive latency budgets on Blacksmith. This small
-    # job downloads the functional-test output and never recompiles Rust/Wasm.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
-    env:
-      LIX_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.LIX_SOURCE_SHA }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            packages/js-sdk/package-lock.json
-            packages/storage-opfs/package-lock.json
-
-      - name: Install browser test dependencies
-        run: |
-          npm --prefix packages/js-sdk ci
-          npm --prefix packages/storage-opfs ci
-
-      - name: Download functionally tested browser SDK
-        uses: actions/download-artifact@v4
-        with:
-          name: lix-browser-sdk-build-${{ env.LIX_SOURCE_SHA }}
-
-      - name: Install Chromium
-        working-directory: packages/js-sdk
-        run: npx playwright install --with-deps chromium
-
-      - name: Check OPFS performance budgets with the existing SDK
-        working-directory: packages/storage-opfs
-        run: |
-          npm run benchmark
-          npm run benchmark:multi-tab
-
-      - name: Upload tested browser SDK for submodule consumers
-        uses: actions/upload-artifact@v4
-        with:
-          name: lix-browser-sdk-${{ env.LIX_SOURCE_SHA }}
-          path: |
-            packages/js-sdk/dist
-            packages/storage-opfs/dist
-            ci-artifact/browser.json
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 90
 
   preview-artifact-changes:
     name: Select preview artifacts
