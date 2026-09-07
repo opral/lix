@@ -7,6 +7,423 @@ use lix::{
 };
 use serde_json::Value as JsonValue;
 
+simulation_test!(
+    shared_branch_refresh_preserves_dirty_rows_untracked_rows_and_global_visibility,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine.open_session_at(sim.main_branch_id()).await.unwrap(),
+            &engine,
+        );
+        let global = sim.wrap_session(
+            engine.open_session_at(lix::GLOBAL_BRANCH_ID).await.unwrap(),
+            &engine,
+        );
+        main.execute("INSERT INTO lix_key_value (key, value) VALUES ('owned', 'before'), ('deleted', 'before')", &[]).await.unwrap();
+        main.create_checkpoint().await.unwrap();
+        global.execute("INSERT INTO lix_key_value (key, value, lixcol_global) VALUES ('g-update', 'old', true), ('g-delete', 'old', true), ('g-shadow', 'old', true), ('g-tombstone', 'old', true)", &[]).await.unwrap();
+        let draft = create_draft(&engine, &main).await;
+        let draft_id = draft.active_branch_id().await.unwrap();
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'owned'",
+                &[],
+            )
+            .await
+            .unwrap();
+        draft
+            .execute("DELETE FROM lix_key_value WHERE key = 'deleted'", &[])
+            .await
+            .unwrap();
+        draft.execute("INSERT INTO lix_key_value (key, value) VALUES ('g-shadow', 'local'), ('g-tombstone', 'local') ON CONFLICT(key) DO UPDATE SET value = excluded.value", &[]).await.unwrap();
+        draft
+            .execute("DELETE FROM lix_key_value WHERE key = 'g-tombstone'", &[])
+            .await
+            .unwrap();
+        draft.execute("INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('private', 'untracked', true)", &[]).await.unwrap();
+        let diff_sql = format!(
+            "SELECT key, diff_type, from_value FROM {} WHERE key IN ('owned', 'deleted') ORDER BY key",
+            key_value_diff_relation(&draft).await
+        );
+        let before_diff = draft.execute(&diff_sql, &[]).await.unwrap();
+        assert_eq!(before_diff.len(), 2);
+        draft
+            .switch_branch(SwitchBranchOptions {
+                branch_id: sim.main_branch_id().to_owned(),
+            })
+            .await
+            .unwrap();
+        global.execute("UPDATE lix_key_value SET value = 'new' WHERE key IN ('g-update', 'g-shadow', 'g-tombstone')", &[]).await.unwrap();
+        global
+            .execute("DELETE FROM lix_key_value WHERE key = 'g-delete'", &[])
+            .await
+            .unwrap();
+        draft
+            .switch_branch(SwitchBranchOptions {
+                branch_id: draft_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_key_value(&draft, "owned", Some("\"after\"")).await;
+        assert_key_value(&draft, "deleted", None).await;
+        assert_key_value(&draft, "g-update", Some("\"new\"")).await;
+        assert_key_value(&draft, "g-delete", None).await;
+        assert_key_value(&draft, "g-shadow", Some("\"local\"")).await;
+        assert_key_value(&draft, "g-tombstone", None).await;
+        assert_key_value(&draft, "private", Some("\"untracked\"")).await;
+        let after_diff = draft.execute(&format!(
+            "SELECT key, diff_type, from_value FROM {} WHERE key IN ('owned', 'deleted') ORDER BY key",
+            key_value_diff_relation(&draft).await
+        ), &[]).await.unwrap();
+        assert_eq!(
+            before_diff, after_diff,
+            "base refresh must preserve private before images"
+        );
+        assert_key_value(&main, "owned", Some("\"before\"")).await;
+        assert_key_value(&main, "deleted", Some("\"before\"")).await;
+        assert_key_value(&main, "private", None).await;
+        assert_key_value(&global, "g-tombstone", Some("\"new\"")).await;
+        draft.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', 'owned')])", &[]).await.unwrap();
+        let remaining_sql = "SELECT key, diff_type, from_value FROM lix_diff('lix_key_value') WHERE key = 'deleted'";
+        let remaining = draft.execute(remaining_sql, &[]).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        draft
+            .switch_branch(SwitchBranchOptions {
+                branch_id: sim.main_branch_id().to_owned(),
+            })
+            .await
+            .unwrap();
+        global
+            .execute(
+                "UPDATE lix_key_value SET value = 'newer' WHERE key = 'g-update'",
+                &[],
+            )
+            .await
+            .unwrap();
+        draft
+            .switch_branch(SwitchBranchOptions {
+                branch_id: draft_id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            draft.execute(remaining_sql, &[]).await.unwrap(),
+            remaining,
+            "refresh after partial checkpoint must retain unselected before images"
+        );
+        draft.execute("INSERT INTO lix_revert (row_ref) SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'deleted'", &[]).await.unwrap();
+        assert_key_value(&draft, "deleted", Some("\"before\"")).await;
+        assert_key_value(&draft, "owned", Some("\"after\"")).await;
+        draft.create_checkpoint().await.unwrap();
+        let clean = draft
+            .execute(
+                &format!(
+                    "SELECT key FROM {} WHERE key IN ('owned', 'deleted')",
+                    key_value_diff_relation(&draft).await
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            clean.len(),
+            0,
+            "checkpoint must close the retained working interval"
+        );
+        assert_key_value(&draft, "owned", Some("\"after\"")).await;
+    }
+);
+
+simulation_test!(
+    shared_branch_refresh_updates_inherited_catalog_and_preserves_local_override,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine.open_session_at(sim.main_branch_id()).await.unwrap(),
+            &engine,
+        );
+        let global = sim.wrap_session(
+            engine.open_session_at(lix::GLOBAL_BRANCH_ID).await.unwrap(),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('local-root', 'present')",
+            &[],
+        )
+        .await
+        .unwrap();
+        let schema = |key: &str, extra: bool| {
+            let mut columns =
+                vec![serde_json::json!({"name":"id", "type":"text", "nullable":false})];
+            if extra {
+                columns.push(serde_json::json!({"name":"extra", "type":"text", "nullable":true}));
+            }
+            Value::Jsonb(serde_json::json!({"$schema":"https://lix.dev/schema-v1.json", "key":key, "columns":columns, "primary_key":["id"]}).into())
+        };
+        for key in ["shared_catalog", "overridden_catalog"] {
+            global
+                .execute(
+                    "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES ($1, true)",
+                    &[schema(key, false)],
+                )
+                .await
+                .unwrap();
+        }
+        let draft = create_draft(&engine, &main).await;
+        let draft_id = draft.active_branch_id().await.unwrap();
+        assert_eq!(draft.execute("SELECT schema_key FROM lix_registered_schema WHERE schema_key IN ('shared_catalog', 'overridden_catalog')", &[]).await.unwrap().len(), 2);
+        for key in ["overridden_catalog"] {
+            draft.execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1) ON CONFLICT(schema_key) DO UPDATE SET value = excluded.value",
+                &[schema(key, true)],
+            ).await.unwrap();
+        }
+        draft
+            .switch_branch(SwitchBranchOptions {
+                branch_id: sim.main_branch_id().to_owned(),
+            })
+            .await
+            .unwrap();
+        global
+            .execute(
+                "UPDATE lix_registered_schema SET value = $1 WHERE schema_key = 'shared_catalog'",
+                &[schema("shared_catalog", true)],
+            )
+            .await
+            .unwrap();
+        for key in ["overridden_catalog"] {
+            global
+                .execute(
+                    "UPDATE lix_registered_schema SET value = $1 WHERE schema_key = $2",
+                    &[schema(key, false), Value::Text(key.to_owned())],
+                )
+                .await
+                .unwrap();
+        }
+        draft
+            .switch_branch(SwitchBranchOptions {
+                branch_id: draft_id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(draft.execute("SELECT schema_key FROM lix_registered_schema WHERE schema_key = 'shared_catalog'", &[]).await.unwrap().len(), 1, "refreshed schema must be visible before any local write");
+        draft.execute("INSERT INTO shared_catalog (id, extra) VALUES ('probe', 'before-local-write')", &[]).await.expect("refreshed inherited schema validates before another local write");
+        draft
+            .execute(
+                "INSERT INTO overridden_catalog (id, extra) VALUES ('local', 'local-column')",
+                &[],
+            )
+            .await
+            .expect("local schema override must retain its extra column");
+        draft
+            .execute(
+                "INSERT INTO shared_catalog (id, extra) VALUES ('row', 'new-column')",
+                &[],
+            )
+            .await
+            .expect("new inherited schema must validate local writes");
+        assert_eq!(
+            draft
+                .execute("SELECT extra FROM shared_catalog WHERE id = 'row'", &[])
+                .await
+                .unwrap()
+                .rows()[0]
+                .values(),
+            &[Value::Text("new-column".to_owned())]
+        );
+        assert_eq!(
+            main.execute("SELECT id FROM shared_catalog", &[])
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "shared roots do not share local mutations"
+        );
+    }
+);
+
+simulation_test!(
+    shared_branch_refresh_from_global_root_preserves_private_untracked,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let global = sim.wrap_session(
+            engine.open_session_at(lix::GLOBAL_BRANCH_ID).await.unwrap(),
+            &engine,
+        );
+        global.execute("INSERT INTO lix_key_value (key, value, lixcol_global) VALUES ('inherited', 'v0', true)", &[]).await.unwrap();
+        let draft = create_draft(&engine, &global).await;
+        let draft_id = draft.active_branch_id().await.unwrap();
+        draft.execute("INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('private', 'retained', true)", &[]).await.unwrap();
+        for version in ["v1", "v2", "v3"] {
+            draft
+                .switch_branch(SwitchBranchOptions {
+                    branch_id: sim.main_branch_id().to_owned(),
+                })
+                .await
+                .unwrap();
+            global
+                .execute(
+                    "UPDATE lix_key_value SET value = $1 WHERE key = 'inherited'",
+                    &[Value::Text(version.to_owned())],
+                )
+                .await
+                .unwrap();
+            draft
+                .switch_branch(SwitchBranchOptions {
+                    branch_id: draft_id.clone(),
+                })
+                .await
+                .unwrap();
+            assert_key_value(&draft, "inherited", Some(&format!("\"{version}\""))).await;
+            assert_key_value(&draft, "private", Some("\"retained\"")).await;
+            if version == "v1" {
+                draft
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('owned', 'local')",
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                assert_key_value(&draft, "owned", Some("\"local\"")).await;
+            }
+            if version == "v2" {
+                draft.create_checkpoint().await.unwrap();
+            }
+        }
+        let reopened = sim.wrap_session(engine.open_session_at(&draft_id).await.unwrap(), &engine);
+        assert_key_value(&reopened, "inherited", Some("\"v3\"")).await;
+        assert_key_value(&reopened, "owned", Some("\"local\"")).await;
+        assert_key_value(&reopened, "private", Some("\"retained\"")).await;
+        assert_key_value(&global, "private", None).await;
+        assert_key_value(&global, "owned", None).await;
+    }
+);
+
+simulation_test!(
+    shared_branch_refresh_rejects_inherited_catalog_untracked_collision_atomically,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine.open_session_at(sim.main_branch_id()).await.unwrap(),
+            &engine,
+        );
+        let global = sim.wrap_session(
+            engine.open_session_at(lix::GLOBAL_BRANCH_ID).await.unwrap(),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('local-root', 'present')",
+            &[],
+        )
+        .await
+        .unwrap();
+        let draft = create_draft(&engine, &main).await;
+        let draft_id = draft.active_branch_id().await.unwrap();
+        let schema = Value::Jsonb(serde_json::json!({"$schema":"https://lix.dev/schema-v1.json", "key":"private_catalog", "columns":[{"name":"id", "type":"text", "nullable":false}], "primary_key":["id"]}).into());
+        draft
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_untracked) VALUES ($1, true)",
+                &[schema.clone()],
+            )
+            .await
+            .unwrap();
+        draft
+            .execute(
+                "INSERT INTO private_catalog (id, lixcol_untracked) VALUES ('private', true)",
+                &[],
+            )
+            .await
+            .unwrap();
+        let head = engine.load_branch_head_commit_id(&draft_id).await.unwrap();
+        draft
+            .switch_branch(SwitchBranchOptions {
+                branch_id: sim.main_branch_id().to_owned(),
+            })
+            .await
+            .unwrap();
+        global
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES ($1, true)",
+                &[schema],
+            )
+            .await
+            .unwrap();
+        draft
+            .switch_branch(SwitchBranchOptions {
+                branch_id: draft_id.clone(),
+            })
+            .await
+            .expect_err("inherited tracked catalog must not overwrite a private history-free row");
+        assert_eq!(
+            draft.active_branch_id().await.unwrap(),
+            sim.main_branch_id()
+        );
+        assert_eq!(
+            engine.load_branch_head_commit_id(&draft_id).await.unwrap(),
+            head,
+            "failed publication must preserve the target head"
+        );
+    }
+);
+
+simulation_test!(
+    shared_branch_refresh_preserves_collection_replacement_fence,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine.open_session_at(sim.main_branch_id()).await.unwrap(),
+            &engine,
+        );
+        let global = sim.wrap_session(
+            engine.open_session_at(lix::GLOBAL_BRANCH_ID).await.unwrap(),
+            &engine,
+        );
+        global.execute("INSERT INTO lix_key_value (key, value, lixcol_global) VALUES ('retired', 'v1', true)", &[]).await.unwrap();
+        main.execute("DELETE FROM lix_key_value", &[])
+            .await
+            .unwrap();
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('survivor', 'local')",
+            &[],
+        )
+        .await
+        .unwrap();
+        main.create_checkpoint().await.unwrap();
+        let draft = create_draft(&engine, &main).await;
+        let draft_id = draft.active_branch_id().await.unwrap();
+        draft
+            .switch_branch(SwitchBranchOptions {
+                branch_id: sim.main_branch_id().to_owned(),
+            })
+            .await
+            .unwrap();
+        global
+            .execute(
+                "UPDATE lix_key_value SET value = 'v2' WHERE key = 'retired'",
+                &[],
+            )
+            .await
+            .unwrap();
+        draft
+            .switch_branch(SwitchBranchOptions {
+                branch_id: draft_id,
+            })
+            .await
+            .unwrap();
+        assert_key_value(&draft, "retired", None).await;
+        assert_key_value(&draft, "survivor", Some("\"local\"")).await;
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'draft' WHERE key = 'survivor'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_key_value(&main, "survivor", Some("\"local\"")).await;
+    }
+);
+
 simulation_test!(create_branch_from_main, |sim| async move {
     let (engine, main, draft) = create_draft_from_main(&sim).await;
 

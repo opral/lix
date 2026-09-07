@@ -11396,6 +11396,18 @@ fn parse_prepared_timestamp(column: &str, timestamp: &str) -> Result<LixTimestam
 }
 
 fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
+    // An explicitly empty local commit refreshes its pinned global base.
+    // Its inherited serving catalog can change without a schema row in this
+    // transaction. Publish a new revision atomically: transaction opening may
+    // already have cached the old local catalog under the global writer's
+    // revision, and retaining that key would hide newly inherited schemas.
+    if prepared_writes
+        .commit_change_refs_by_branch
+        .iter()
+        .any(|(branch_id, changes)| branch_id != GLOBAL_BRANCH_ID && changes.allow_empty)
+    {
+        return true;
+    }
     prepared_writes.state_rows.iter().any(|row| {
         matches!(
             row.schema_key.as_str(),
