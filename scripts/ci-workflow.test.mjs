@@ -18,12 +18,13 @@ const publishWorkflow = readFileSync(
 	"utf8",
 );
 
-test("superseded CI runs are cancelled per pull request or branch", () => {
+test("draft reruns cannot cancel ready-candidate CI", () => {
 	assert.match(
 		workflow,
 		/group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/,
 	);
 	assert.match(workflow, /cancel-in-progress: true/);
+	assert.match(workflow, /github\.event\.pull_request\.draft && 'draft' \|\| 'ready'/);
 });
 
 test("Rust test scopes run independently with workspace-specific caches", () => {
@@ -188,7 +189,11 @@ test("server-changing pull requests retain one reusable preview image", () => {
 });
 
 test("release PR updates validate metadata and defer full CI until ready for review", () => {
-	assert.match(releasePrWorkflow, /draft: always-true/);
+	assert.match(releasePrWorkflow, /draft: true/);
+	assert.doesNotMatch(releasePrWorkflow, /draft: always-true/);
+	assert.match(releasePrWorkflow, /steps\.freeze\.outputs\.frozen != 'true'/);
+	assert.match(releasePrWorkflow, /steps\.recheck\.outputs\.frozen == 'false'/);
+	assert.match(releasePrWorkflow, /select\(\.isDraft == true/);
 	assert.match(
 		releasePrWorkflow,
 		/node scripts\/validate-publish-surface\.mjs/,
@@ -196,6 +201,21 @@ test("release PR updates validate metadata and defer full CI until ready for rev
 	assert.match(releasePrWorkflow, /node --test scripts\/release\.test\.mjs/);
 	assert.doesNotMatch(releasePrWorkflow, /gh workflow run|actions: write/);
 	assert.match(workflow, /ready_for_review/);
+});
+
+test("the readiness gate aggregates real results and draft runs have a distinct check name", () => {
+	const gate = workflow.split("\n  release-ready:\n")[1].split("\n  merge-reuse:\n")[0];
+	assert.match(gate, /always\(\)/);
+	assert.match(gate, /'Draft - full CI deferred' \|\| 'Release ready'/);
+	for (const job of ["merge-reuse", "promote-browser-sdk", "changelog", "cargo-config", "cargo", "js-sdk-test", "preview-artifact-changes", "preview-server-image"]) {
+		assert.ok(gate.split("    needs: ")[1].split("\n")[0].includes(job));
+	}
+	assert.match(gate, /github\.rest\.pulls\.get/);
+	assert.match(gate, /assertReleaseReady/);
+	const metadata = readFileSync(resolve(repositoryRoot, ".github/workflows/release-metadata.yml"), "utf8");
+	assert.match(metadata, /group: release-metadata-/);
+	assert.match(metadata, /converted_to_draft/);
+	assert.doesNotMatch(metadata, /cargo |build:wasm|build:native/);
 });
 
 test("SDK binary reuse never skips TypeScript builds or integration tests", () => {

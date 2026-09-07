@@ -1,0 +1,29 @@
+name: Release metadata
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, converted_to_draft]
+
+concurrency:
+  group: release-metadata-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Draft release metadata
+    if: github.event.pull_request.draft && startsWith(github.head_ref, 'release/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Validate release metadata without building the engine
+        run: |
+          node scripts/validate-publish-surface.mjs
+          node --test scripts/release.test.mjs scripts/release-candidate.test.mjs
+          git diff --check
