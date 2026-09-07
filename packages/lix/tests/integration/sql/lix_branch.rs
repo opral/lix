@@ -985,3 +985,89 @@ async fn count_rows(
         ref other => panic!("expected integer count for query {sql}, got {other:?}"),
     }
 }
+
+simulation_test!(
+    lix_branch_delete_reads_staged_default_branch,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_branch (id, name) VALUES ('01930000-0000-7000-8000-000000000018', 'New default')",
+                &[],
+            )
+            .await
+            .expect("branch should be created");
+        let mut protected_transaction = session.begin_transaction().await.unwrap();
+        protected_transaction
+            .execute(
+                "UPDATE lix_key_value SET value = $1 WHERE key = 'lix_default_branch_id'",
+                &[Value::Text(
+                    "01930000-0000-7000-8000-000000000018".to_string(),
+                )],
+            )
+            .await
+            .expect("new default branch should be staged");
+        let error = protected_transaction
+            .execute(
+                "DELETE FROM lix_branch WHERE id = '01930000-0000-7000-8000-000000000018'",
+                &[],
+            )
+            .await
+            .expect_err("the staged default branch must remain protected");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot delete repository default branch"),
+            "deletion must reject the new default, not a missing payload: {error}"
+        );
+        protected_transaction.rollback().await.unwrap();
+
+        let mut transaction = session.begin_transaction().await.unwrap();
+        transaction
+            .execute(
+                "UPDATE lix_key_value SET value = $1 WHERE key = 'lix_default_branch_id'",
+                &[Value::Text(
+                    "01930000-0000-7000-8000-000000000018".to_string(),
+                )],
+            )
+            .await
+            .expect("default branch should be staged");
+        let result = transaction
+            .execute(
+                "DELETE FROM lix_branch WHERE id = $1",
+                &[Value::Text(sim.main_branch_id().to_string())],
+            )
+            .await
+            .expect("branch deletion should read the staged default branch");
+        assert_eq!(result, ExecuteResult::from_rows_affected(1));
+        transaction.commit().await.expect("deletion should commit");
+        let old_branch = session
+            .execute(
+                "SELECT id FROM lix_branch WHERE id = $1",
+                &[Value::Text(sim.main_branch_id().to_string())],
+            )
+            .await
+            .unwrap();
+        assert!(
+            old_branch.is_empty(),
+            "old default branch should be deleted"
+        );
+        let reopened = engine
+            .open_session()
+            .await
+            .expect("new default should open");
+        let transaction = reopened.begin_transaction().await.unwrap();
+        assert_eq!(
+            transaction.active_branch_id().unwrap(),
+            "01930000-0000-7000-8000-000000000018"
+        );
+        transaction.rollback().await.unwrap();
+    }
+);
