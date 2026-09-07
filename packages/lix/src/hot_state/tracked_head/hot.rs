@@ -1584,18 +1584,15 @@ async fn restage_exact_closure_collection_control(
     stage_complete_collection_controls(writes, branch_id, generation, &rows)
 }
 
-fn stage_complete_collection_controls(
-    writes: &mut StorageWriteSet,
-    branch_id: &str,
+fn complete_collection_generation_controls(
     branch_generation: CommitId,
     rows: &HotRowMap,
-) -> Result<(), LixError> {
+) -> Result<BTreeMap<(String, Option<String>), HotCollectionControl>, LixError> {
     use crate::collection_generation::{
-        COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_from_row_pk,
+        COLLECTION_GENERATION_SCHEMA_KEY, collection_scope_from_row_pk,
     };
 
     let mut controls = BTreeMap::<(String, Option<String>), HotCollectionControl>::new();
-    let mut physical_buckets = BTreeMap::<(String, Option<String>), Vec<&HeadRowIdentity>>::new();
     for (identity, bytes) in rows {
         if identity.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
             let target = collection_scope_from_row_pk(&identity.row_pk)?;
@@ -1631,6 +1628,18 @@ fn stage_complete_collection_controls(
         }
     }
 
+    Ok(controls)
+}
+
+fn stage_complete_collection_controls(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    branch_generation: CommitId,
+    rows: &HotRowMap,
+) -> Result<(), LixError> {
+    use crate::collection_generation::{COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef};
+    let mut controls = complete_collection_generation_controls(branch_generation, rows)?;
+    let mut physical_buckets = BTreeMap::<(String, Option<String>), Vec<&HeadRowIdentity>>::new();
     for (identity, bytes) in rows {
         if identity.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
             continue;
@@ -1640,33 +1649,18 @@ fn stage_complete_collection_controls(
             continue;
         }
         let schema_scope = (identity.schema_key.clone(), None);
-        let schema_control = controls
-            .get(&schema_scope)
-            .expect("complete row schema control was initialized above");
-        let visible_after_schema_generation = schema_control.active_generation == branch_generation
-            || survives_collection_generation_fence(
-                value.untracked,
-                value.commit_id,
-                schema_control.active_generation,
-                false,
-            );
         let file_scope = identity
             .file_id
             .as_ref()
             .map(|file_id| (identity.schema_key.clone(), Some(file_id.clone())));
-        let visible_after_file_generation = file_scope
-            .as_ref()
-            .and_then(|scope| controls.get(scope))
-            .is_none_or(|control| {
-                control.active_generation == branch_generation
-                    || survives_collection_generation_fence(
-                        value.untracked,
-                        value.commit_id,
-                        control.active_generation,
-                        false,
-                    )
-            });
-        if !visible_after_schema_generation || !visible_after_file_generation {
+        if !row_belongs_to_active_collection_generation(
+            &controls,
+            branch_generation,
+            &identity.schema_key,
+            identity.file_id.as_deref(),
+            value.untracked,
+            value.commit_id,
+        ) {
             continue;
         }
         physical_buckets
@@ -5394,6 +5388,50 @@ enum WorkingDiffBaselineAction {
 }
 
 impl HotTrackedSnapshot {
+    /// Compares the proposed local-plus-inherited catalog with the actual
+    /// serving catalog read under the publication's branch control. Commit
+    /// identities, timestamps and working-diff baselines are not catalog facts.
+    /// Local tombstones mask inheritance just as local live definitions do.
+    pub(crate) fn inherited_catalog_differs_from(
+        &self,
+        previous: &MaterializedHotStateBatch,
+        local: &Self,
+        branch_generation: CommitId,
+    ) -> Result<bool, LixError> {
+        let mut rows = self.rows.clone();
+        rows.extend(local.rows.iter().map(|(key, value)| (key.clone(), value.clone())));
+        // Reuse the publisher's controls and visibility predicate before
+        // dropping commit identities. Equal payloads can cross a replacement
+        // fence, while an unchanged hidden row is not a visible catalog fact.
+        let controls = complete_collection_generation_controls(branch_generation, &rows)?;
+        let next = rows.iter()
+            .filter(|(key, _)| key.schema_key == "lix_registered_schema" && key.file_id.is_none())
+            .filter_map(|(key, bytes)| match decode_head_value(bytes) {
+                Ok(value) if value.deleted => None,
+                Ok(value) if !row_belongs_to_active_collection_generation(
+                    &controls, branch_generation, &key.schema_key, key.file_id.as_deref(),
+                    value.untracked, value.commit_id,
+                ) => None,
+                Ok(value) => Some(
+                    value
+                        .snapshot
+                        .map(|snapshot| (&key.row_pk, snapshot))
+                        .ok_or_else(|| head_value_error("live catalog row has no payload")),
+                ),
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+        let previous = previous
+            .iter()
+            .map(|row| {
+                row.raw_snapshot()
+                    .map(|snapshot| (row.row_pk(), snapshot.as_ref()))
+                    .ok_or_else(|| head_value_error("live serving catalog row has no payload"))
+            })
+            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+        Ok(next != previous)
+    }
+
     pub(crate) fn from_materialized_rows(
         tracked_rows: Vec<MaterializedTrackedStateRow>,
     ) -> Result<Self, LixError> {
@@ -13628,6 +13666,84 @@ mod tests {
             })
             .expect("closure fixture HOT value should encode"),
         )
+    }
+
+    #[tokio::test]
+    async fn inherited_catalog_visibility_compares_deletions_and_local_tombstones() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("catalog-visibility");
+        let identity = |key: &str| HeadRowIdentity {
+            schema_key: "lix_registered_schema".to_owned(),
+            row_pk: RowPk::single(key),
+            file_id: None,
+        };
+        let live = encoded_test_hot_value(generation, false, false);
+        let tombstone = encoded_test_hot_value(generation, false, true);
+        let mut writes = StorageWriteSet::new();
+        stage_complete_hot_rows(&mut writes, "branch", generation, HotRowMap::from([
+            (identity("closure-row"), live.clone()),
+        ]));
+        storage.commit_write_set(writes, StorageWriteOptions::default()).await.unwrap();
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let previous = TrackedHeadContext::new().reader(&read)
+            .scan_live_batch_for_generation("branch", generation, None, &TrackedStateScanRequest {
+                filter: TrackedStateFilter { schema_keys: vec!["lix_registered_schema".to_owned()], ..TrackedStateFilter::default() },
+                read_columns: TrackedStateReadColumns { columns: vec!["raw_snapshot".to_owned()] },
+                limit: None,
+            }).await.unwrap();
+        assert_eq!(previous.len(), 1);
+        let inherited = HotTrackedSnapshot { rows: HotRowMap::from([(identity("closure-row"), live)]) };
+        let local = HotTrackedSnapshot::default();
+        assert!(!inherited.inherited_catalog_differs_from(&previous, &local, generation).unwrap());
+        assert!(HotTrackedSnapshot::default().inherited_catalog_differs_from(&previous, &local, generation).unwrap(), "removing an inherited definition changes visibility");
+        let local = HotTrackedSnapshot { rows: HotRowMap::from([(identity("closure-row"), tombstone)]) };
+        let absent = MaterializedHotStateBatch::default();
+        assert!(!inherited.inherited_catalog_differs_from(&absent, &local, generation).unwrap(), "a local tombstone masks a new inherited definition");
+        assert!(!HotTrackedSnapshot::default().inherited_catalog_differs_from(&absent, &local, generation).unwrap(), "removing the masked inherited definition also leaves visibility unchanged");
+    }
+
+    #[tokio::test]
+    async fn inherited_catalog_visibility_reuses_publication_generation_fences() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("catalog-fence-serving");
+        let mut commits = [CommitId::for_test_label("catalog-fence-a"), CommitId::for_test_label("catalog-fence-b"), CommitId::for_test_label("catalog-fence-c")];
+        commits.sort();
+        let [old, fence, new] = commits;
+        assert_ne!(generation, fence);
+        let identity = HeadRowIdentity { schema_key: "lix_registered_schema".to_owned(), row_pk: RowPk::single("closure-row"), file_id: None };
+        let marker = HeadRowIdentity {
+            schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+            row_pk: RowPk::single(crate::collection_generation::collection_scope_key(crate::collection_generation::CollectionScopeRef { schema_key: "lix_registered_schema", file_id: None })),
+            file_id: None,
+        };
+        let local = HotTrackedSnapshot { rows: HotRowMap::from([(marker, encoded_test_hot_value(fence, false, false))]) };
+        let inherited = |commit| HotTrackedSnapshot { rows: HotRowMap::from([(identity.clone(), encoded_test_hot_value(commit, false, false))]) };
+        let old_catalog = inherited(old);
+        let mut rows = local.rows.clone();
+        rows.extend(old_catalog.rows.clone());
+        let mut writes = StorageWriteSet::new();
+        stage_complete_collection_controls(&mut writes, "branch", generation, &rows).unwrap();
+        stage_complete_hot_rows(&mut writes, "branch", generation, rows);
+        storage.commit_write_set(writes, StorageWriteOptions::default()).await.unwrap();
+        let request = TrackedStateScanRequest {
+            filter: TrackedStateFilter { schema_keys: vec!["lix_registered_schema".to_owned()], ..TrackedStateFilter::default() },
+            read_columns: TrackedStateReadColumns { columns: vec!["raw_snapshot".to_owned()] },
+            limit: None,
+        };
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let previous = TrackedHeadContext::new().reader(&read).scan_live_batch_for_generation("branch", generation, None, &request).await.unwrap();
+        assert_eq!(previous.len(), 0, "the publisher's fence hides the old schema");
+        assert!(!old_catalog.inherited_catalog_differs_from(&previous, &local, generation).unwrap(), "unchanged hidden schema must not invalidate on a data-only global refresh");
+        assert!(!inherited(fence).inherited_catalog_differs_from(&previous, &local, generation).unwrap(), "a row at the exclusive fence is still hidden");
+        let new_catalog = inherited(new);
+        assert_eq!(decode_head_value(&old_catalog.rows[&identity]).unwrap().snapshot, decode_head_value(&new_catalog.rows[&identity]).unwrap().snapshot);
+        assert!(new_catalog.inherited_catalog_differs_from(&previous, &local, generation).unwrap(), "identical payload newly crossing the fence changes visibility");
+        let mut writes = StorageWriteSet::new();
+        TrackedHeadContext::new().writer(&read, &mut writes).stage_inherited_catalog_refresh("branch", generation, local, new_catalog).await.unwrap();
+        storage.commit_write_set(writes, StorageWriteOptions::default()).await.unwrap();
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let published = TrackedHeadContext::new().reader(&read).scan_live_batch_for_generation("branch", generation, None, &request).await.unwrap();
+        assert_eq!(published.len(), 1, "the comparison agrees with the actual publication");
     }
 
     #[tokio::test]

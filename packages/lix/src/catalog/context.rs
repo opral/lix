@@ -40,6 +40,8 @@ pub(crate) struct CatalogContext {
         Mutex<HashMap<TransactionOpeningCatalogKey, Arc<CatalogSnapshot>>>,
     #[cfg(test)]
     sql_read_schema_loads: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) committed_catalog_warms: AtomicUsize,
 }
 
 /// Fingerprint of the raw catalog rows visible to a domain, hashed before any
@@ -63,6 +65,8 @@ impl CatalogContext {
             transaction_opening_catalogs: Mutex::new(HashMap::new()),
             #[cfg(test)]
             sql_read_schema_loads: AtomicUsize::new(0),
+            #[cfg(test)]
+            committed_catalog_warms: AtomicUsize::new(0),
         }
     }
 
