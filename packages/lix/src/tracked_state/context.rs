@@ -9415,13 +9415,22 @@ mod tests {
             .await
             .expect("genesis root should load")
             .expect("genesis root should exist");
-        drop(read);
         let root_bytes = *root_id.as_bytes();
-        let mut candidates = stored_tree_chunk_hashes_for_test(&storage)
+        // The fixture also stores the secondary identity catalog. Damage
+        // only this primary root's closure: unrelated catalog chunks do not
+        // determine whether primary-state replay can resume from this root.
+        let mut candidates = TrackedStateTree::new()
+            .reachable_chunk_hashes_with_overlay(
+                &read,
+                &storage::TrackedStateChunkOverlay::new(),
+                &root_id,
+            )
             .await
+            .expect("primary root closure should load")
             .into_iter()
             .filter(|chunk| chunk != &root_bytes)
             .collect::<Vec<_>>();
+        drop(read);
         // Sorted so the sweep order, and any failure message, is reproducible.
         candidates.sort_unstable();
         assert!(

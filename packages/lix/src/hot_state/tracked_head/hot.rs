@@ -2878,34 +2878,105 @@ async fn scan_packed_current_base_rows(
                 continue;
             }
         }
-        let compact = crate::tracked_state::scan_commit_delta_values(
-            store,
-            base_ref.commit_id,
-            &request.filter.schema_keys,
-        )
-        .await?;
-        let mut keys = Vec::new();
-        for row in compact.iter() {
-            let key = row.key_ref();
-            if row.value().deleted
-                || !packed_identity_matches_filter(
-                    key.schema_key,
-                    key.row_pk,
-                    key.file_id,
-                    &request.filter,
-                )
-            {
-                continue;
+        let catalog_lookup =
+            !request.filter.schema_keys.is_empty() && !request.filter.row_pks.is_empty();
+        let keys = if catalog_lookup {
+            // A logical PK does not identify its file scope. A certified
+            // single-partition inventory supplies that scope directly,
+            // including native columnar generations that do not duplicate
+            // their identities in the ordinary row-PK tree. Otherwise use
+            // the immutable catalog. Both routes produce candidates; exact
+            // delta reads below establish actual membership in this commit.
+            let mut keys = BTreeSet::new();
+            let mut next_owner = Some(base_ref.commit_id);
+            let mut visited = BTreeSet::new();
+            while let Some(owner) = next_owner {
+                if !visited.insert(owner) {
+                    return Err(head_value_error(
+                        "packed current-base selected-source cycle",
+                    ));
+                }
+                let manifest = crate::tracked_state::load_commit_state_manifest(store, owner)
+                    .await?
+                    .ok_or_else(|| {
+                        head_value_error("packed current-base has no commit-state manifest")
+                    })?;
+                if let Some(scope) = manifest.mutations.single_partition.as_ref() {
+                    for row_pk in &request.filter.row_pks {
+                        let key = TrackedStateKey {
+                            schema_key: scope.schema_key.clone(),
+                            file_id: scope.file_id.clone(),
+                            row_pk: row_pk.clone(),
+                        };
+                        if packed_identity_matches_filter(
+                            &key.schema_key,
+                            &key.row_pk,
+                            key.file_id.as_deref(),
+                            &request.filter,
+                        ) {
+                            keys.insert(key);
+                        }
+                    }
+                } else {
+                    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+                    for schema_key in &request.filter.schema_keys {
+                        for key in reader
+                            .enumerate_schema_row_pk_keys_at_commit(
+                                owner,
+                                schema_key,
+                                &request.filter.row_pks,
+                            )
+                            .await?
+                        {
+                            if packed_identity_matches_filter(
+                                &key.schema_key,
+                                &key.row_pk,
+                                key.file_id.as_deref(),
+                                &request.filter,
+                            ) {
+                                keys.insert(key);
+                            }
+                        }
+                    }
+                }
+                // A whole-source alias can supply additional scopes, including
+                // columnar identities absent from the ordinary catalog. Union
+                // its candidate identities, then resolve through the original
+                // owner below so local overrides retain precedence.
+                next_owner = manifest.mutations.selected_source_commit_id();
             }
-            keys.push(TrackedStateKey {
-                schema_key: key.schema_key.to_owned(),
-                row_pk: key.row_pk.clone(),
-                file_id: key.file_id.map(str::to_owned),
-            });
-            if single_base && limit.is_some_and(|limit| keys.len() >= limit) {
-                break;
+            keys.into_iter().collect::<Vec<_>>()
+        } else {
+            let compact = crate::tracked_state::scan_commit_delta_values(
+                store,
+                base_ref.commit_id,
+                &request.filter.schema_keys,
+            )
+            .await?;
+            let mut keys = Vec::new();
+            for row in compact.iter() {
+                let key = row.key_ref();
+                if row.value().deleted
+                    || !packed_identity_matches_filter(
+                        key.schema_key,
+                        key.row_pk,
+                        key.file_id,
+                        &request.filter,
+                    )
+                {
+                    continue;
+                }
+                keys.push(TrackedStateKey {
+                    schema_key: key.schema_key.to_owned(),
+                    row_pk: key.row_pk.clone(),
+                    file_id: key.file_id.map(str::to_owned),
+                });
+                if single_base && limit.is_some_and(|limit| keys.len() >= limit) {
+                    break;
+                }
             }
-        }
+            keys
+        };
         let requests = keys
             .iter()
             .cloned()
@@ -2915,10 +2986,18 @@ async fn scan_packed_current_base_rows(
             crate::tracked_state::load_owned_commit_delta_entries(store, &requests).await?;
         for (key, loaded_entry) in keys.into_iter().zip(loaded) {
             let Some(loaded_entry) = loaded_entry else {
+                if catalog_lookup {
+                    // An inherited identity need not occur in this packed
+                    // commit. It is not a missing certified delta member.
+                    continue;
+                }
                 return Err(head_value_error(
                     "packed current-base manifest lost an indexed commit member",
                 ));
             };
+            if loaded_entry.value.deleted {
+                continue;
+            }
             let identity = (
                 key.schema_key.clone(),
                 key.row_pk.clone(),
@@ -13061,6 +13140,346 @@ mod tests {
     struct JsonCountingRead<R> {
         inner: R,
         json_get_many_calls: Arc<AtomicUsize>,
+    }
+
+    struct PackedSegmentCountingRead<R> {
+        inner: R,
+        segments: Arc<AtomicUsize>,
+    }
+
+    impl<R: StorageAdapterRead> StorageAdapterRead for PackedSegmentCountingRead<R> {
+        async fn get_many(
+            &self,
+            requests: &[StorageGetManyRequest<'_>],
+        ) -> Result<StorageGetManyResult, crate::storage_adapter::StorageError> {
+            for request in requests {
+                if request.space == crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE {
+                    self.segments
+                        .fetch_add(request.keys.len(), Ordering::Relaxed);
+                }
+            }
+            self.inner.get_many(requests).await
+        }
+
+        async fn begin_scan(
+            &self,
+            space: StorageSpace,
+            range: StorageKeyRange,
+            opts: StorageBeginScanOptions,
+        ) -> Result<StorageScanCursor<'_>, crate::storage_adapter::StorageError> {
+            self.inner.begin_scan(space, range, opts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn packed_logical_pk_lookup_is_bounded_and_keeps_file_scopes() {
+        const BRANCH: &str = "01991b1d-6d8b-7000-8000-000000000071";
+        const FILE_A: &str = "01991b1d-6d8b-7000-8000-000000000072";
+        const FILE_B: &str = "01991b1d-6d8b-7000-8000-000000000073";
+        const FILE_C: &str = "01991b1d-6d8b-7000-8000-000000000074";
+        for row_count in [512, 5_000] {
+            let storage = StorageAdapter::new(Memory::new());
+            let label = format!("packed-pk-catalog-{row_count}");
+            let generation = CommitId::for_test_label(&label);
+            let selected = format!("row-{:05}", row_count / 2);
+            let make_row =
+                |key: String, file_id: Option<&str>, deleted: bool| MaterializedTrackedStateRow {
+                    row_pk: RowPk::single(key.clone()),
+                    schema_key: "lix_key_value".to_owned(),
+                    file_id: file_id.map(str::to_owned),
+                    snapshot_content: (!deleted).then(|| {
+                        serde_json::json!({"key": key, "value": "payload"})
+                            .to_string()
+                            .into()
+                    }),
+                    decoded_snapshot: None,
+                    metadata: None,
+                    deleted,
+                    created_at: timestamp().to_string(),
+                    updated_at: timestamp().to_string(),
+                    change_id: ChangeId::for_test_label(&format!("{label}-{key}-{file_id:?}")),
+                    commit_id: generation,
+                };
+            let mut rows = (0..row_count)
+                .map(|index| make_row(format!("row-{index:05}"), None, false))
+                .collect::<Vec<_>>();
+            rows.push(make_row(selected.clone(), Some(FILE_A), false));
+            rows.push(make_row(selected.clone(), Some(FILE_B), false));
+            rows.push(make_row(selected.clone(), Some(FILE_C), true));
+            rows.push(make_row("aab-deleted".to_owned(), None, true));
+            // An identity inherited from the first commit must not be mistaken
+            // for membership in the second commit's packed delta.
+            let parent_label = format!("{label}-parent");
+            let mut inherited = make_row("aaa-inherited-only".to_owned(), None, false);
+            inherited.commit_id = CommitId::for_test_label(&parent_label);
+            crate::test_support::seed_branch_head_with_rows(
+                storage.clone(),
+                BRANCH,
+                &parent_label,
+                &[inherited],
+            )
+            .await;
+            let mut read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            let mut writes = StorageWriteSet::new();
+            crate::test_support::stage_tracked_root_from_materialized(
+                &mut read,
+                &mut writes,
+                &crate::tracked_state::TrackedStateContext::new(),
+                &label,
+                Some(&parent_label),
+                &rows,
+            )
+            .await
+            .unwrap();
+            let mut base_key = hot_scope_prefix(BRANCH, generation);
+            base_key.extend_from_slice(generation.as_uuid().as_bytes());
+            writes.put(
+                PACKED_CURRENT_BASE_CONTROL_SPACE,
+                StorageKey(Bytes::from(hot_scope_prefix(BRANCH, generation))),
+                StorageValue {
+                    bytes: Bytes::from_static(&[1]),
+                },
+            );
+            writes.put(
+                PACKED_CURRENT_BASE_SPACE,
+                StorageKey(Bytes::from(base_key)),
+                StorageValue {
+                    bytes: Bytes::from_static(&[0; 16]),
+                },
+            );
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .unwrap();
+
+            let segments = Arc::new(AtomicUsize::new(0));
+            let counted = PackedSegmentCountingRead {
+                inner: storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .unwrap(),
+                segments: Arc::clone(&segments),
+            };
+            let request = TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec!["lix_key_value".to_owned()],
+                    row_pks: vec![
+                        RowPk::single("aaa-inherited-only"),
+                        RowPk::single("aab-deleted"),
+                        RowPk::single(selected.clone()),
+                        RowPk::single("zzz-missing"),
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let found = scan_packed_current_base_rows(&counted, BRANCH, generation, &request, None)
+                .await
+                .unwrap();
+            assert_eq!(found.len(), 3);
+            assert_eq!(
+                found
+                    .iter()
+                    .map(|row| row.file_id().map(str::to_owned))
+                    .collect::<Vec<_>>(),
+                vec![None, Some(FILE_A.to_owned()), Some(FILE_B.to_owned())]
+            );
+            assert!(
+                segments.load(Ordering::Relaxed) <= 8,
+                "finite PK lookup read {} packed segments for {row_count} unrelated rows",
+                segments.load(Ordering::Relaxed)
+            );
+            let mut null_only = request.clone();
+            null_only.filter.file_ids = vec![NullableKeyFilter::Null];
+            assert_eq!(
+                scan_packed_current_base_rows(&counted, BRANCH, generation, &null_only, None)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let limited =
+                scan_packed_current_base_rows(&counted, BRANCH, generation, &request, Some(1))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                limited.len(),
+                1,
+                "an absent inherited candidate must not consume LIMIT"
+            );
+            assert_eq!(
+                limited.iter().next().unwrap().row_pk(),
+                &RowPk::single(selected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn packed_logical_pk_lookup_unions_local_and_selected_source_scopes() {
+        const BRANCH: &str = "01991b1d-6d8b-7000-8000-000000000091";
+        const FILE_A: &str = "01991b1d-6d8b-7000-8000-000000000092";
+        const FILE_B: &str = "01991b1d-6d8b-7000-8000-000000000093";
+        const SCHEMA: &str = "packed_alias_scope_probe";
+        let storage = StorageAdapter::new(Memory::new());
+        let source = CommitId::for_test_label("packed-alias-scope-source");
+        let owner = CommitId::for_test_label("packed-alias-scope-owner");
+        let row_pk = RowPk::single("shared");
+        let source_payload =
+            native_snapshot_payload(&row_pk, serde_json::json!({"value": "source"}));
+        let local_payload = native_snapshot_payload(&row_pk, serde_json::json!({"value": "local"}));
+        let source_delta = crate::tracked_state::TrackedStateDeltaRef {
+            schema_key: SCHEMA,
+            file_id: Some(FILE_B),
+            row_pk: &row_pk,
+            change_id: ChangeId::for_test_label("packed-alias-scope-source-row"),
+            commit_id: source,
+            deleted: false,
+            created_at: timestamp(),
+            updated_at: timestamp(),
+        };
+        let local_delta = crate::tracked_state::TrackedStateDeltaRef {
+            file_id: Some(FILE_A),
+            change_id: ChangeId::for_test_label("packed-alias-scope-local-row"),
+            commit_id: owner,
+            ..source_delta
+        };
+        let packed_delta = |delta, snapshot| crate::tracked_state::TrackedStateCommitDeltaRef {
+            delta,
+            metadata: None,
+            snapshot: Some(snapshot),
+            origin_key: None,
+            base_coordinate: None,
+            authored: true,
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = StorageWriteSet::new();
+        let source_stage = crate::tracked_state::stage_addressable_commit_deltas(
+            &mut writes,
+            &[packed_delta(source_delta, source_payload.as_slice())],
+            &[false],
+        )
+        .unwrap();
+        let local_stage =
+            crate::tracked_state::stage_addressable_commit_deltas_with_selected_source(
+                &mut writes,
+                &[packed_delta(local_delta, local_payload.as_slice())],
+                &[false],
+                source,
+            )
+            .unwrap();
+        // Publish complete catalogs and immutable manifests once. The alias's
+        // local single-partition certificate must not hide its source scope.
+        // Native columnar inventories cannot represent file B (only null file).
+        for (commit_id, staged, deltas, file_id) in [
+            (source, source_stage, vec![source_delta], FILE_B),
+            (owner, local_stage, vec![source_delta, local_delta], FILE_A),
+        ] {
+            let mutations = staged.mutation_inventory().clone();
+            let scope = mutations.single_partition.as_ref().unwrap();
+            assert_eq!(scope.schema_key, SCHEMA);
+            assert_eq!(scope.file_id.as_deref(), Some(file_id));
+            let mut overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
+            let catalog = crate::tracked_state::stage_row_pk_index_from_deltas(
+                &read,
+                &mut writes,
+                &mut overlay,
+                deltas,
+                commit_id,
+            )
+            .await
+            .unwrap();
+            crate::tracked_state::stage_commit_state_manifest(
+                &mut writes,
+                &crate::tracked_state::CommitStateManifest {
+                    commit_id,
+                    change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                    replay_debt: crate::tracked_state::CommitStateReplayDebt {
+                        depth: 1,
+                        rows: u64::from(mutations.member_count),
+                        bytes: 0,
+                    },
+                    mutations,
+                    touched_scope_filter: Default::default(),
+                    global_scope: false,
+                    current_state_scoped_ranges: None,
+                    row_pk_index_root_id: catalog,
+                    snapshot_root: None,
+                },
+            )
+            .unwrap();
+        }
+        let scope_key = hot_scope_prefix(BRANCH, owner);
+        writes.put(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            StorageKey(Bytes::from(scope_key.clone())),
+            StorageValue {
+                bytes: Bytes::from_static(&[1]),
+            },
+        );
+        let mut base_key = scope_key;
+        base_key.extend_from_slice(owner.as_uuid().as_bytes());
+        writes.put(
+            PACKED_CURRENT_BASE_SPACE,
+            StorageKey(Bytes::from(base_key)),
+            StorageValue {
+                bytes: Bytes::from_static(&[0; 16]),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let request = TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: vec![SCHEMA.to_owned()],
+                row_pks: vec![row_pk.clone(), RowPk::single("missing")],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = scan_packed_current_base_rows(&read, BRANCH, owner, &request, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the selected source contributes a second file scope"
+        );
+        let keys = [FILE_A, FILE_B].map(|file_id| TrackedStateKeyRef {
+            schema_key: SCHEMA,
+            file_id: Some(file_id),
+            row_pk: &row_pk,
+        });
+        let refs = packed_current_base_refs(&read, BRANCH, owner)
+            .await
+            .unwrap();
+        let exact = load_packed_current_base_exact_entries_from_refs(&read, &refs, &keys, None)
+            .await
+            .unwrap();
+        for ((row, exact), expected_value) in rows.iter().zip(exact).zip(["local", "source"]) {
+            let (value, change, _, _) = exact.expect("exact identity must exist");
+            assert_eq!(row.file_id(), change.file_id.as_deref());
+            assert_eq!(
+                row.commit_id(),
+                Some(owner),
+                "source values resolve through the alias owner"
+            );
+            assert_eq!(row.change_id(), Some(value.change_id));
+            let snapshot: serde_json::Value =
+                serde_json::from_str(row.snapshot_content().unwrap()).unwrap();
+            assert_eq!(snapshot["value"], expected_value);
+        }
     }
 
     impl<R: StorageAdapterRead> StorageAdapterRead for JsonCountingRead<R> {

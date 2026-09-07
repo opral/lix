@@ -330,7 +330,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
         .stage_commit_root_with_absence_guards(
             &commit_id_text,
             parent_commit_id_text.as_deref(),
-            root_deltas,
+            root_deltas.iter().copied(),
             &BTreeSet::new(),
             certified_replacement_markers,
         )
@@ -343,7 +343,16 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
     drop(root_writer);
     let mutations = inventories.remove(&commit_id).unwrap_or_default();
     reject_unconsumed_test_inventories(&inventories, commit_id)?;
-    stage_test_commit_state_manifest(writes, &staged, mutations, Some(snapshot_root))?;
+    let catalog =
+        stage_test_identity_catalog(read, writes, parent_commit_id_text.as_deref(), &root_deltas)
+            .await?;
+    stage_test_commit_state_manifest(
+        writes,
+        &staged,
+        mutations,
+        Some(snapshot_root),
+        Some(catalog),
+    )?;
     Ok(())
 }
 
@@ -410,7 +419,14 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
     let mut inventories = stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
     let mutations = inventories.remove(&commit_id).unwrap_or_default();
     reject_unconsumed_test_inventories(&inventories, commit_id)?;
-    stage_test_commit_state_manifest(writes, &staged, mutations, None)
+    let catalog = stage_test_identity_catalog(
+        read,
+        writes,
+        parent_id_texts.first().map(String::as_str),
+        &root_deltas,
+    )
+    .await?;
+    stage_test_commit_state_manifest(writes, &staged, mutations, None, Some(catalog))
 }
 
 #[cfg(test)]
@@ -500,7 +516,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         .stage_commit_root(
             &commit_id_text,
             commit_root_parent_commit_id_text.as_deref(),
-            root_deltas,
+            root_deltas.iter().copied(),
         )
         .await?;
     let snapshot_root = root_writer
@@ -509,7 +525,20 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         .cloned()
         .ok_or_else(|| crate::LixError::unknown("test rooted commit did not stage a root"))?;
     drop(root_writer);
-    stage_test_commit_state_manifest(writes, &staged, mutations, Some(snapshot_root))?;
+    let catalog = stage_test_identity_catalog(
+        read,
+        writes,
+        commit_root_parent_commit_id_text.as_deref(),
+        &root_deltas,
+    )
+    .await?;
+    stage_test_commit_state_manifest(
+        writes,
+        &staged,
+        mutations,
+        Some(snapshot_root),
+        Some(catalog),
+    )?;
     Ok(())
 }
 
@@ -554,11 +583,115 @@ fn reject_unconsumed_test_inventories(
     )))
 }
 
+/// Publish the identity catalog with test commit authority, just as ordinary
+/// authoring does. Packed logical-PK readers must not need incomplete fixtures
+/// to select a different algorithm from production.
+#[cfg(test)]
+#[tokio::test]
+async fn identity_catalog_fixture_rejects_missing_parent_authority() {
+    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
+    let storage = StorageAdapter::new(Memory::new());
+    let mut read = storage
+        .begin_read(StorageReadOptions::default())
+        .await
+        .unwrap();
+    let mut writes = StorageWriteSet::new();
+    let error = stage_test_identity_catalog(&read, &mut writes, Some("missing-parent"), &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("parent has no catalog authority")
+    );
+
+    let parent = test_commit_id("parent-without-catalog").to_string();
+    let mut staged = stage_test_changelog_commit(&mut read, &mut writes, &parent, &[], &[], false)
+        .await
+        .unwrap();
+    staged.replay_debt.depth = 1;
+    stage_test_commit_state_manifest(
+        &mut writes,
+        &staged,
+        CommitStateMutationInventory::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await
+        .unwrap();
+    let read = storage
+        .begin_read(StorageReadOptions::default())
+        .await
+        .unwrap();
+    let error = stage_test_identity_catalog(&read, &mut StorageWriteSet::new(), Some(&parent), &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("parent has no catalog authority")
+    );
+}
+
+async fn stage_test_identity_catalog(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    parent: Option<&str>,
+    deltas: &[TrackedStateDeltaRef<'_>],
+) -> Result<crate::tracked_state::TrackedStateRootId, crate::LixError> {
+    let parent_root = if let Some(parent) = parent {
+        crate::tracked_state::load_commit_state_manifest(read, test_commit_id(parent))
+            .await?
+            .and_then(|manifest| manifest.row_pk_index_root_id)
+            .map(Some)
+            .ok_or_else(|| {
+                crate::LixError::unknown("test identity catalog parent has no catalog authority")
+            })?
+    } else {
+        None
+    };
+    let mut primary =
+        crate::tracked_state::TrackedStateMutationBatchBuilder::with_row_capacity(deltas.len());
+    for delta in deltas {
+        primary.push(
+            crate::tracked_state::TrackedStateKeyRef {
+                schema_key: delta.schema_key,
+                file_id: delta.file_id,
+                row_pk: delta.row_pk,
+            },
+            crate::tracked_state::TrackedStateIndexValueRef {
+                change_id: delta.change_id,
+                commit_id: delta.commit_id,
+                deleted: false,
+                created_at: delta.created_at,
+                updated_at: delta.updated_at,
+            },
+        );
+    }
+    let (_, secondary) = crate::tracked_state::with_row_pk_index_mutations(primary.finish())?;
+    let mut overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
+    Ok(crate::tracked_state::TrackedStateTree::new()
+        .apply_mutations_with_overlay(
+            read,
+            writes,
+            &mut overlay,
+            parent_root.as_ref(),
+            secondary,
+            None,
+        )
+        .await?
+        .root_id)
+}
+
 fn stage_test_commit_state_manifest(
     writes: &mut StorageWriteSet,
     staged: &TestStagedChangelogCommit,
     mutations: CommitStateMutationInventory,
     snapshot_root: Option<TrackedStateCommitRoot>,
+    row_pk_index_root_id: Option<crate::tracked_state::TrackedStateRootId>,
 ) -> Result<(), crate::LixError> {
     let replay_debt = if snapshot_root.is_some() {
         CommitStateReplayDebt::default()
@@ -573,7 +706,7 @@ fn stage_test_commit_state_manifest(
         touched_scope_filter: Default::default(),
         global_scope: false,
         current_state_scoped_ranges: None,
-        row_pk_index_root_id: None,
+        row_pk_index_root_id,
         snapshot_root: snapshot_root.map(Box::new),
     };
     crate::tracked_state::stage_commit_state_manifest(writes, &manifest)
@@ -605,11 +738,14 @@ pub(crate) async fn stage_empty_changelog_commit(
         .cloned()
         .ok_or_else(|| crate::LixError::unknown("empty test commit did not stage a root"))?;
     drop(root_writer);
+    let catalog =
+        stage_test_identity_catalog(read, writes, parent_commit_id_text.as_deref(), &[]).await?;
     stage_test_commit_state_manifest(
         writes,
         &staged,
         CommitStateMutationInventory::default(),
         Some(snapshot_root),
+        Some(catalog),
     )
 }
 
@@ -640,11 +776,13 @@ pub(crate) async fn stage_empty_changelog_commit_with_parents(
         .cloned()
         .ok_or_else(|| crate::LixError::unknown("empty test commit did not stage a root"))?;
     drop(root_writer);
+    let catalog = stage_test_identity_catalog(read, writes, first_parent, &[]).await?;
     stage_test_commit_state_manifest(
         writes,
         &staged,
         CommitStateMutationInventory::default(),
         Some(snapshot_root),
+        Some(catalog),
     )
 }
 

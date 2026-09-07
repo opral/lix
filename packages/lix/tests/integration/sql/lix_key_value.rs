@@ -2,6 +2,94 @@ use lix::ExecuteResult;
 use lix::LixError;
 use lix::Value;
 
+simulation_test!(
+    packed_pk_reads_match_full_state_across_publications,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let first_file = "01991b1d-6d8b-7000-8000-000000000081";
+        let second_file = "01991b1d-6d8b-7000-8000-000000000082";
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) VALUES \
+         ($1, '/packed-first', CAST('a' AS BYTEA)), \
+         ($2, '/packed-second', CAST('b' AS BYTEA))",
+                &[
+                    Value::Text(first_file.into()),
+                    Value::Text(second_file.into()),
+                ],
+            )
+            .await
+            .unwrap();
+        let values = (0..512)
+            .map(|index| format!("('packed-key-{index:04}', 'original')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
+                &[],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_file_id) VALUES \
+         ('packed-key-0010', 'first-file', $1), ('packed-key-0010', 'second-file', $2)",
+                &[
+                    Value::Text(first_file.into()),
+                    Value::Text(second_file.into()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let second_values = (0..512)
+            .map(|index| format!("('packed-later-{index:04}', 'later')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let phases = [
+        ("SELECT 1".to_owned(), 4),
+        ("UPDATE lix_key_value SET value = 'updated' WHERE key = 'packed-key-0010'".to_owned(), 4),
+        ("SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', 'packed-key-0010')])".to_owned(), 4),
+        ("DELETE FROM lix_key_value WHERE key = 'packed-key-0200'".to_owned(), 3),
+        ("SELECT commit_id FROM lix_create_checkpoint()".to_owned(), 3),
+        (format!("INSERT INTO lix_key_value (key, value) VALUES {second_values}"), 3),
+        ("DELETE FROM lix_key_value".to_owned(), 0),
+        ("INSERT INTO lix_key_value (key, value) VALUES ('packed-key-0010', 'recreated')".to_owned(), 1),
+        ("SELECT commit_id FROM lix_create_checkpoint()".to_owned(), 1),
+    ];
+        for (phase, (statement, expected_count)) in phases.into_iter().enumerate() {
+            session
+                .execute(&statement, &[])
+                .await
+                .unwrap_or_else(|error| panic!("phase {phase}: {error}"));
+            let full = session.execute(
+            "SELECT key, value, lixcol_file_id FROM lix_key_value ORDER BY key, lixcol_file_id",
+            &[],
+        ).await.unwrap();
+            let expected = full.rows().iter().filter(|row| {
+            matches!(&row.values()[0], Value::Text(key) if key == "packed-key-0010" || key == "packed-key-0200")
+        }).map(|row| row.values().to_vec()).collect::<Vec<_>>();
+            assert_eq!(
+                expected.len(),
+                expected_count,
+                "full state at phase {phase}"
+            );
+            let point = session
+                .execute(
+                    "SELECT key, value, lixcol_file_id FROM lix_key_value \
+             WHERE key IN ('packed-key-0010', 'packed-key-0200', 'packed-missing') \
+             ORDER BY key, lixcol_file_id",
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("point read at phase {phase}: {error}"));
+            super::assert_rows_eq(point, expected);
+        }
+    }
+);
+
 simulation_test!(lix_key_value_roundtrips_arbitrary_json, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
