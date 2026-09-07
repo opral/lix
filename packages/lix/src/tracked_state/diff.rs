@@ -371,6 +371,24 @@ impl TrackedStateDiff {
     pub(crate) fn payloads(&self) -> &TrackedStatePayloadBatch {
         &self.payloads
     }
+
+    /// Payload projections must distinguish an absent row from an unloaded
+    /// live row. Otherwise an identity-only result can silently become SQL NULL.
+    pub(crate) fn validate_live_payloads(&self) -> Result<(), LixError> {
+        for row in self.entries.iter().flat_map(|entry| {
+            [entry.visible_before(), entry.after.as_ref().filter(|row| !row.deleted)]
+                .into_iter()
+                .flatten()
+        }) {
+            if self.payloads.get(row.change_id).and_then(|payload| payload.snapshot).is_none() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("tracked-state diff is missing the requested live payload for change '{}'", row.change_id),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Diffs two tracked-state commit roots with hash-guided subtree skipping.
@@ -1395,6 +1413,44 @@ mod tests {
 
     fn change_id(label: &str) -> String {
         ChangeId::for_test_label(label).to_string()
+    }
+
+    #[test]
+    fn requested_payloads_reject_unloaded_live_rows_but_allow_absent_sides() {
+        let identity = TrackedStateDiffIdentity::from_key(TrackedStateKey {
+            schema_key: "test_schema".into(),
+            file_id: None,
+            row_pk: RowPk::single("row"),
+        });
+        let change_id = ChangeId::for_test_label("live-payload");
+        let row = TrackedStateDiffRow {
+            identity: identity.clone(),
+            deleted: false,
+            created_at: ts("2024-01-01T00:00:00.000Z"),
+            updated_at: ts("2024-01-01T00:00:00.000Z"),
+            change_id,
+            commit_id: CommitId::for_test_label("payload-commit"),
+        };
+        let entry = TrackedStateDiffEntry {
+            identity,
+            kind: TrackedStateDiffKind::Added,
+            before: None,
+            after: Some(row),
+        };
+        let missing = TrackedStateDiff::from_entries(vec![entry.clone()]);
+        assert!(missing.validate_live_payloads().is_err());
+        let tombstone_payload = TrackedStatePayloadBatch::from_payloads([(change_id, None, None)])
+            .expect("payload batch");
+        assert!(TrackedStateDiff::from_entries_with_payloads(vec![entry.clone()], tombstone_payload)
+            .validate_live_payloads().is_err());
+        let live_payload = TrackedStatePayloadBatch::from_payloads([(change_id, Some(vec![1]), None)])
+            .expect("payload batch with nullable metadata");
+        TrackedStateDiff::from_entries_with_payloads(vec![entry.clone()], live_payload)
+            .validate_live_payloads().expect("live snapshot is retained");
+        let mut deleted = entry;
+        deleted.after.as_mut().expect("after row").deleted = true;
+        TrackedStateDiff::from_entries(vec![deleted])
+            .validate_live_payloads().expect("absent sides need no live payload");
     }
 
     async fn stage_snapshot_authority_for_test(

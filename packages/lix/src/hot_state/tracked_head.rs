@@ -2749,7 +2749,10 @@ mod tests {
             delete_head,
             checkpoint,
             checkpoint,
-            &TrackedStateDiffRequest::default(),
+            &TrackedStateDiffRequest {
+                retain_payloads: false,
+                ..TrackedStateDiffRequest::default()
+            },
         )
         .await;
         assert!(
@@ -2784,7 +2787,10 @@ mod tests {
             reinsert_head,
             checkpoint,
             checkpoint,
-            &TrackedStateDiffRequest::default(),
+            &TrackedStateDiffRequest {
+                retain_payloads: false,
+                ..TrackedStateDiffRequest::default()
+            },
         )
         .await;
         assert_eq!(coverage.group_count, 1, "one identity stays dirty");
@@ -2889,7 +2895,10 @@ mod tests {
             segmented_head,
             checkpoint,
             checkpoint,
-            &TrackedStateDiffRequest::default(),
+            &TrackedStateDiffRequest {
+                retain_payloads: false,
+                ..TrackedStateDiffRequest::default()
+            },
         )
         .await;
         assert_eq!(coverage.group_count, 128);
@@ -2981,7 +2990,10 @@ mod tests {
             restore_head,
             checkpoint,
             checkpoint,
-            &TrackedStateDiffRequest::default(),
+            &TrackedStateDiffRequest {
+                retain_payloads: false,
+                ..TrackedStateDiffRequest::default()
+            },
         )
         .await;
         assert_eq!(
@@ -3051,7 +3063,10 @@ mod tests {
             update_head,
             checkpoint,
             checkpoint,
-            &TrackedStateDiffRequest::default(),
+            &TrackedStateDiffRequest {
+                retain_payloads: false,
+                ..TrackedStateDiffRequest::default()
+            },
         )
         .await;
         assert_eq!(diff.diff.entries.len(), 1);
@@ -3134,7 +3149,7 @@ mod tests {
                 file_ids: vec![NullableKeyFilter::Value(file_id.to_string())],
                 ..Default::default()
             },
-            ..Default::default()
+            retain_payloads: false,
         };
         let diff = read_working_diff(
             &storage,
@@ -3304,7 +3319,10 @@ mod tests {
             .working_diff_for_control(
                 branch_id,
                 control(first_head, checkpoint, checkpoint),
-                &TrackedStateDiffRequest::default(),
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
             )
             .await
             .expect("first direct diff should read")
@@ -3454,7 +3472,10 @@ mod tests {
             .working_diff_for_control(
                 branch_id,
                 control(no_op_checkpoint, checkpoint, no_op_checkpoint),
-                &TrackedStateDiffRequest::default(),
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
             )
             .await
             .expect("no-op checkpoint direct diff should read")
@@ -3475,7 +3496,7 @@ mod tests {
                         row_pks: vec![row_pk.clone()],
                         ..TrackedStateFilter::default()
                     },
-                    ..TrackedStateDiffRequest::default()
+                    retain_payloads: false,
                 },
             )
             .await
@@ -3548,7 +3569,10 @@ mod tests {
             .working_diff_for_control(
                 branch_id,
                 control(second_head, checkpoint, no_op_checkpoint),
-                &TrackedStateDiffRequest::default(),
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
             )
             .await
             .expect("second direct diff should read")
@@ -3589,13 +3613,16 @@ mod tests {
             .await
             .expect("commit same-generation stale epoch");
         for request in [
-            TrackedStateDiffRequest::default(),
+            TrackedStateDiffRequest {
+                retain_payloads: false,
+                ..TrackedStateDiffRequest::default()
+            },
             TrackedStateDiffRequest {
                 filter: TrackedStateFilter {
                     row_pks: vec![row_pk.clone()],
                     ..Default::default()
                 },
-                ..Default::default()
+                retain_payloads: false,
             },
         ] {
             let read = storage
@@ -3641,7 +3668,10 @@ mod tests {
             .working_diff_for_control(
                 branch_id,
                 control(second_head, checkpoint, no_op_checkpoint),
-                &TrackedStateDiffRequest::default(),
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
             )
             .await
             .expect("uncertified coverage should not error")

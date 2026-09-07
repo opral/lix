@@ -617,6 +617,101 @@ async fn lazy_history_and_binary_cas_scenarios(sim: Simulation) {
     assert!(!checkpoints.rows().is_empty());
 }
 
+#[test]
+fn sparse_working_diff_retains_payloads_without_authored_history_base() {
+    run_sync_simulation(
+        concat!(module_path!(), "::sparse_working_diff_retains_payloads_without_authored_history"),
+        sparse_working_diff_retains_payloads_without_authored_history,
+    );
+}
+
+async fn sparse_working_diff_retains_payloads_without_authored_history(_sim: Simulation) {
+    let authority = fresh_authority().await;
+    write_key_value(&authority, "modified", "before").await;
+    authority
+        .execute("INSERT INTO lix_directory (path) VALUES ('/docs/original')", &[])
+        .await
+        .expect("baseline directory should insert");
+    let checkpoint = authority.create_checkpoint().await.expect("checkpoint should commit").commit_id;
+    let mut authored_commits = Vec::new();
+    for sql in [
+        "UPDATE lix_key_value SET value = 'after' WHERE key = 'modified'",
+        "UPDATE lix_directory SET path = '/docs/renamed' WHERE path = '/docs/original'",
+    ] {
+        authority.execute(sql, &[]).await.expect("working edit should commit");
+        authored_commits.push(
+            authority
+                .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+                .await
+                .expect("authored owner should resolve")
+                .rows()[0]
+                .get::<String>("id")
+                .expect("authored owner should decode"),
+        );
+    }
+    // Keep both payload owners behind the exact head body included by snapshot
+    // bootstrap. The replica receives their live payloads, not authored history.
+    write_key_value(&authority, "tail", "head").await;
+    let replica = Replica::bootstrap(AuthorityTransport::connected(authority)).await;
+    replica.transport.set_offline(true);
+    let head = replica
+        .lix
+        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .expect("replica head should resolve")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("replica head should decode");
+    for owner in &authored_commits {
+        let error = replica.lix.sync_history(owner, 1).await
+            .expect_err("fixture must omit the authored payload owner body");
+        assert_eq!(error.code, "LIX_SYNC_HISTORY_REQUIRED");
+    }
+
+    crate::tracked_state::arm_diff_commits_test_probe(&checkpoint, &head);
+    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
+    let identities = replica.lix.execute(
+        "SELECT key FROM lix_diff('lix_key_value') WHERE key = 'modified'", &[],
+    ).await.expect("identity-only working diff should remain local");
+    assert_eq!(identities.rows().len(), 1);
+    assert!(
+        crate::tracked_state::take_point_replay_authority_batch_probe_for_test().is_empty(),
+        "identity-only working diff must not load cold payload owners",
+    );
+
+    crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
+    let values = replica.lix.execute(
+        "SELECT from_value, to_value FROM lix_diff('lix_key_value') WHERE key = 'modified'", &[],
+    ).await.expect("working values should use snapshot-local payloads while offline");
+    assert_eq!(values.rows().len(), 1);
+    assert_eq!(values.rows()[0].get::<serde_json::Value>("from_value").unwrap(), serde_json::json!("before"));
+    assert_eq!(values.rows()[0].get::<serde_json::Value>("to_value").unwrap(), serde_json::json!("after"));
+    assert!(
+        crate::tracked_state::take_point_replay_authority_batch_probe_for_test().is_empty(),
+        "snapshot-local generic payloads must not load their cold authored owners",
+    );
+
+    let directories = replica.lix.execute(
+        "SELECT from_name, to_name, from_path, to_path FROM lix_diff('lix_directory')", &[],
+    ).await.expect("working directory paths should use local endpoint snapshots while offline");
+    assert_eq!(directories.rows().len(), 1);
+    for (column, expected) in [
+        ("from_name", "original"), ("to_name", "renamed"),
+        ("from_path", "/docs/original"), ("to_path", "/docs/renamed"),
+    ] {
+        assert_eq!(directories.rows()[0].get::<String>(column).unwrap(), expected);
+    }
+    assert_eq!(
+        crate::tracked_state::take_diff_commits_test_probe(&checkpoint, &head), 0,
+        "payload projections must not reconstruct the certified working interval",
+    );
+    for owner in &authored_commits {
+        let error = replica.lix.sync_history(owner, 1).await
+            .expect_err("working payload reads must leave authored history cold");
+        assert_eq!(error.code, "LIX_SYNC_HISTORY_REQUIRED");
+    }
+}
+
 async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
     let authority = fresh_authority().await;
     write_key_value(&authority, "selected", "baseline").await;

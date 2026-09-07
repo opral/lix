@@ -9040,7 +9040,14 @@ mod tests {
             .expect("active branch control should exist");
         TrackedHeadContext::new()
             .reader(&read)
-            .working_diff_for_control(&branch_id, control, &TrackedStateDiffRequest::default())
+            .working_diff_for_control(
+                &branch_id,
+                control,
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
             .await
             .expect("working diff should remain readable")
             .expect("certified working diff should be installed")

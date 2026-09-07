@@ -5313,9 +5313,68 @@ where
         else {
             return Ok(None);
         };
+        // HOT_DIFF classifies changed identities without retaining payload bytes.
+        // Consumers projecting values need the exact live changes on both sides,
+        // not a replay of the checkpoint/head history. Use the same validated
+        // local-change/physical-owner lookup as working-diff comparisons.
+        let diff = if request.retain_payloads {
+            let mut changes: BTreeMap<
+                ChangeId,
+                crate::tracked_state::AuthoritativeLiveChangeRequest,
+            > = BTreeMap::new();
+            for row in entries.iter().flat_map(|entry| {
+                [
+                    entry.visible_before(),
+                    entry.after.as_ref().filter(|row| !row.deleted),
+                ]
+                .into_iter()
+                .flatten()
+            }) {
+                let key = TrackedStateKey {
+                    schema_key: row.identity.schema_key().to_owned(),
+                    file_id: row.identity.file_id().map(str::to_owned),
+                    row_pk: row.identity.row_pk().clone(),
+                };
+                if let Some(existing) = changes.get(&row.change_id) {
+                    if existing.key != key || existing.updated_at != row.updated_at {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "working diff contains conflicting identities or lifetimes for change '{}'",
+                                row.change_id
+                            ),
+                        ));
+                    }
+                } else {
+                    changes.insert(
+                        row.change_id,
+                        crate::tracked_state::AuthoritativeLiveChangeRequest {
+                            change_id: row.change_id,
+                            source_commit_id: row.commit_id,
+                            key,
+                            updated_at: row.updated_at,
+                        },
+                    );
+                }
+            }
+            let requests = changes.into_values().collect::<Vec<_>>();
+            let records = crate::tracked_state::load_authoritative_live_change_records(
+                &self.store,
+                &requests,
+            )
+            .await?;
+            let payloads = crate::tracked_state::TrackedStatePayloadBatch::from_payloads(
+                records
+                    .into_iter()
+                    .map(|record| (record.change_id, record.snapshot, record.metadata)),
+            )?;
+            TrackedStateDiff::from_entries_with_payloads(entries, payloads)
+        } else {
+            TrackedStateDiff::from_entries(entries)
+        };
         Ok(Some(TrackedWorkingDiff {
             checkpoint_commit_id: epoch.checkpoint_commit_id,
-            diff: TrackedStateDiff::from_entries(entries),
+            diff,
         }))
     }
 
