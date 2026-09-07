@@ -2042,8 +2042,9 @@ where
             } else {
                 Vec::new()
             };
-            let next_catalog_revision =
-                catalog_revision_changed.then(|| stage_catalog_revision(&mut writes));
+            let next_catalog_revision = (catalog_revision_changed
+                || materialized.inherited_catalog_changed)
+                .then(|| stage_catalog_revision(&mut writes));
             if tracked_state_changed {
                 StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
             }
@@ -2174,6 +2175,10 @@ where
                             &transaction.active_branch_id,
                             next_catalog_revision,
                         )
+                        .instrument(tracing::debug_span!(
+                            target: "lix_perf",
+                            "lix.perf.catalog.post_commit_warm"
+                        ))
                         .await;
                 }
             }
@@ -11396,18 +11401,9 @@ fn parse_prepared_timestamp(column: &str, timestamp: &str) -> Result<LixTimestam
 }
 
 fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
-    // An explicitly empty local commit refreshes its pinned global base.
-    // Its inherited serving catalog can change without a schema row in this
-    // transaction. Publish a new revision atomically: transaction opening may
-    // already have cached the old local catalog under the global writer's
-    // revision, and retaining that key would hide newly inherited schemas.
-    if prepared_writes
-        .commit_change_refs_by_branch
-        .iter()
-        .any(|(branch_id, changes)| branch_id != GLOBAL_BRANCH_ID && changes.allow_empty)
-    {
-        return true;
-    }
+    // Empty commits also represent checkpoints and merges, neither of which
+    // necessarily changes schema visibility. Materialization reports actual
+    // inherited-catalog changes separately from these explicit schema writes.
     prepared_writes.state_rows.iter().any(|row| {
         matches!(
             row.schema_key.as_str(),

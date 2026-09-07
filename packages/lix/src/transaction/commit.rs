@@ -174,6 +174,9 @@ pub(crate) async fn commit_prepared_writes(
 pub(crate) struct MaterializedCommit {
     pub(crate) writes: StorageWriteSet,
     pub(crate) preconditions: Vec<StoragePrecondition>,
+    /// A base refresh changed inherited schema facts without staging schema
+    /// rows. Determined from immutable authority under the commit snapshot.
+    pub(crate) inherited_catalog_changed: bool,
     /// Filesystem descriptor and blob-ref rows staged by this commit, carrying
     /// their **final** identities.
     ///
@@ -444,6 +447,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             filesystem_delta_rows: Vec::new(),
             sync_commits: Vec::new(),
             published_branch_controls: BTreeMap::new(),
+            inherited_catalog_changed: false,
         });
     }
 
@@ -741,6 +745,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         filesystem_delta_rows,
         sync_commits,
         published_branch_controls,
+        inherited_catalog_changed: staged_hot_heads.inherited_catalog_changed,
     })
 }
 
@@ -2939,6 +2944,7 @@ fn select_new_rootless_ordered_commits(
 
 struct StagedHotHeads {
     controls: BTreeMap<String, BranchHeadControl>,
+    inherited_catalog_changed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3704,6 +3710,7 @@ async fn stage_tracked_head(
         .collect::<BTreeSet<_>>();
     let tracked_head = TrackedHeadContext::new();
     let mut controls = BTreeMap::new();
+    let mut inherited_catalog_changed = false;
     let mut exclusive_certified_columnar_publication = false;
     let transaction_global_schema_keys = global_branch_schema_keys(
         state_rows,
@@ -3783,6 +3790,36 @@ async fn stage_tracked_head(
                 load_lifecycle_catalog(read, root.state_parent_commit_id, true).await?;
             let inherited_catalog =
                 load_lifecycle_catalog(read, staged.record.base_commit_id, false).await?;
+            let refreshed_generation = if root.state_parent_commit_id.is_some() {
+                parent_control.tracked_generation
+            } else {
+                lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id)
+            };
+            // A metadata-only publication is not itself a schema mutation.
+            // Compare with the actual serving view, including root-backed
+            // rows and collection fences, not a predicted old-base catalog.
+            // This catalog-only read is exclusive to an actual base refresh.
+            let previous_catalog = tracked_head
+                .reader(read)
+                .scan_live_batch_for_retention(
+                    &root.branch_id,
+                    parent_control,
+                    &TrackedStateScanRequest {
+                        filter: TrackedStateFilter {
+                            schema_keys: vec!["lix_registered_schema".to_owned()],
+                            file_ids: vec![NullableKeyFilter::Null],
+                            ..TrackedStateFilter::default()
+                        },
+                        read_columns: TrackedStateReadColumns {
+                            columns: vec!["raw_snapshot".to_owned()],
+                        },
+                        limit: None,
+                    },
+                    Some(false),
+                )
+                .await?;
+            inherited_catalog_changed |= inherited_catalog
+                .inherited_catalog_differs_from(&previous_catalog, &local_catalog, refreshed_generation)?;
             let checkpoint_commit_id = parent_control
                 .working_diff_checkpoint_commit_id
                 .unwrap_or(root.parent_commit_id.expect("refresh has a parent"));
@@ -4970,7 +5007,10 @@ async fn stage_tracked_head(
         control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
         insert_direct_branch_control(&mut controls, branch_id, control)?;
     }
-    Ok(StagedHotHeads { controls })
+    Ok(StagedHotHeads {
+        controls,
+        inherited_catalog_changed,
+    })
 }
 
 /// Builds the INSERT guards that still need current-state enforcement.

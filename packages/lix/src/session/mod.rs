@@ -15,6 +15,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 mod checkpoint;
+#[cfg(test)]
+mod catalog_visibility_tests;
 mod context;
 mod create_branch;
 mod execute;

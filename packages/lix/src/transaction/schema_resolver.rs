@@ -108,6 +108,10 @@ impl TransactionSchemaResolver {
         branch_id: &str,
         revision: &crate::catalog::CatalogRevision,
     ) -> Result<(), LixError> {
+        #[cfg(test)]
+        self.context
+            .committed_catalog_warms
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.context
             .compiled_catalog_for_transaction_open(
                 hot_state,
