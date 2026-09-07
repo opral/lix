@@ -71,7 +71,14 @@ struct FrontierRewrite {
     summaries: Vec<ChildSummary>,
     height: usize,
     changed: bool,
-    child_summaries: Option<Vec<ChildSummary>>,
+}
+
+/// Replacement of an inclusive range of old nodes at one tree level.
+struct FrontierSplice {
+    first_key: Bytes,
+    last_key: Bytes,
+    summaries: Vec<ChildSummary>,
+    whole_level: bool,
 }
 
 impl Default for TrackedStateTreeOptions {
@@ -92,6 +99,8 @@ impl Default for TrackedStateTreeOptions {
 pub(crate) struct TrackedStateTree {
     options: TrackedStateTreeOptions,
     node_cache: Arc<Mutex<TrackedStateNodeCache>>,
+    #[cfg(test)]
+    leaf_entries_encoded: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TrackedStateTree {
@@ -111,6 +120,8 @@ impl TrackedStateTree {
                 NonZeroUsize::new(TRACKED_STATE_NODE_CACHE_CAPACITY)
                     .expect("tracked-state node cache capacity must be non-zero"),
             ))),
+            #[cfg(test)]
+            leaf_entries_encoded: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -599,6 +610,7 @@ impl TrackedStateTree {
                 let mut summaries = self.build_leaf_level(entries, &mut chunks);
                 let mut height = 1usize;
                 while summaries.len() > 1 {
+                    ensure_internal_frontier_can_contract(&summaries, &self.options)?;
                     summaries = self.build_internal_level(summaries, height, &mut chunks);
                     height += 1;
                 }
@@ -643,6 +655,7 @@ impl TrackedStateTree {
                 let mut summaries = rewritten.summaries;
                 let mut new_height = rewritten.height;
                 while summaries.len() > 1 {
+                    ensure_internal_frontier_can_contract(&summaries, &self.options)?;
                     summaries = self.build_internal_level(summaries, new_height, &mut chunks);
                     new_height += 1;
                 }
@@ -678,118 +691,75 @@ impl TrackedStateTree {
         mut hash: [u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<usize, LixError> {
         let mut height = 1usize;
+        let mut expected = None;
         loop {
-            match self.load_node_with_overlay(store, overlay, &hash).await? {
+            let node = self.load_node_with_overlay(store, overlay, &hash).await?;
+            if let Some(expected) = expected.as_ref() {
+                validate_decoded_node_summary(&node, expected)?;
+            }
+            match node {
                 DecodedNode::Leaf(_) => return Ok(height),
                 DecodedNode::Internal(internal) => {
-                    hash = internal
-                        .children()
-                        .first()
-                        .ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                "tracked-state internal node has no children",
-                            )
-                        })?
-                        .child_hash;
+                    let child = internal.children().first().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "tracked-state internal node has no children",
+                        )
+                    })?;
+                    hash = child.child_hash;
+                    expected = Some(child.clone());
                     height = height.saturating_add(1);
                 }
             }
         }
     }
 
-    fn rewrite_frontier_node<'a, S>(
-        &'a self,
-        store: &'a S,
-        overlay: &'a storage::TrackedStateChunkOverlay,
+    /// Repair disjoint certified spans at each level. Keep the final chunk
+    /// open across parent boundaries; only an identical old tail certifies a
+    /// restart. The tail is excluded from the splice, so the next seek may
+    /// revisit it if a gap insertion invalidates its overflow boundary.
+    async fn rewrite_frontier_node(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        overlay: &storage::TrackedStateChunkOverlay,
         hash: [u8; TRACKED_STATE_HASH_BYTES],
         level: usize,
-        events: &'a [FrontierMutation],
-        chunks: &'a mut PendingChunkBatchBuilder,
-    ) -> Pin<Box<dyn Future<Output = Result<FrontierRewrite, LixError>> + Send + 'a>>
-    where
-        S: StorageAdapterRead + ?Sized + 'a,
-    {
-        Box::pin(async move {
+        events: &[FrontierMutation],
+        chunks: &mut PendingChunkBatchBuilder,
+    ) -> Result<FrontierRewrite, LixError> {
+        let mut splices = self
+            .rewrite_leaf_frontier_window(store, overlay, hash, level, events, chunks)
+            .await?;
+        let mut height = 1;
+        while !splices.is_empty()
+            && height <= level
+            && !(splices.len() == 1 && splices[0].whole_level && splices[0].summaries.len() == 1)
+        {
+            splices = self
+                .rewrite_internal_frontier_window(
+                    store, overlay, hash, level, height, splices, chunks,
+                )
+                .await?;
+            height += 1;
+        }
+        if splices.is_empty() {
             let node = self.load_node_with_overlay(store, overlay, &hash).await?;
-            match node {
-                DecodedNode::Leaf(leaf) => {
-                    let old_entries = leaf.clone().into_entries();
-                    let mut entries = Vec::with_capacity(old_entries.len() + events.len());
-                    let mut event_index = 0usize;
-                    let mut changed = false;
-                    for old in old_entries {
-                        while event_index < events.len()
-                            && events[event_index].key.as_ref() < old.key.as_ref()
-                        {
-                            let event = &events[event_index];
-                            entries.push(EncodedLeafEntry {
-                                key: event.key.clone(),
-                                value: event.value.clone(),
-                            });
-                            event_index += 1;
-                            changed = true;
-                        }
-                        if event_index < events.len()
-                            && events[event_index].key.as_ref() == old.key.as_ref()
-                        {
-                            let event = &events[event_index];
-                            changed |= event.value != old.value;
-                            entries.push(EncodedLeafEntry {
-                                key: old.key,
-                                value: event.value.clone(),
-                            });
-                            event_index += 1;
-                        } else {
-                            entries.push(old);
-                        }
-                    }
-                    while event_index < events.len() {
-                        let event = &events[event_index];
-                        entries.push(EncodedLeafEntry {
-                            key: event.key.clone(),
-                            value: event.value.clone(),
-                        });
-                        event_index += 1;
-                        changed = true;
-                    }
-                    if !changed {
-                        return Ok(FrontierRewrite {
-                            summaries: vec![decoded_leaf_summary(hash, &leaf)],
-                            height: 1,
-                            changed: false,
-                            child_summaries: None,
-                        });
-                    }
-                    Ok(FrontierRewrite {
-                        summaries: self.build_leaf_level(entries, chunks),
-                        height: 1,
-                        changed: true,
-                        child_summaries: None,
-                    })
-                }
-                DecodedNode::Internal(internal) => {
-                    let children = internal.into_children();
-                    if children.is_empty() {
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "tracked-state internal node has no children",
-                        ));
-                    }
-                    if level == 1 {
-                        return self
-                            .rewrite_leaf_frontier_window(
-                                store, overlay, hash, children, events, chunks,
-                            )
-                            .await;
-                    }
-                    return self
-                        .rewrite_internal_frontier_window(
-                            store, overlay, hash, level, children, events, chunks,
-                        )
-                        .await;
-                }
-            }
+            let summary = match node {
+                DecodedNode::Leaf(leaf) => decoded_leaf_summary(hash, &leaf),
+                DecodedNode::Internal(internal) => internal_summary(hash, internal.children())?,
+            };
+            return Ok(FrontierRewrite {
+                summaries: vec![summary],
+                height: level + 1,
+                changed: false,
+            });
+        }
+        debug_assert_eq!(splices.len(), 1, "root repair must coalesce all spans");
+        let summaries = splices.pop().expect("nonempty root repair").summaries;
+        Ok(FrontierRewrite {
+            changed: summaries.len() != 1 || summaries[0].child_hash != hash,
+            summaries,
+            height,
         })
     }
 
@@ -797,230 +767,229 @@ impl TrackedStateTree {
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
         overlay: &storage::TrackedStateChunkOverlay,
-        _hash: [u8; TRACKED_STATE_HASH_BYTES],
-        children: Vec<ChildSummary>,
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        root_level: usize,
         events: &[FrontierMutation],
         chunks: &mut PendingChunkBatchBuilder,
-    ) -> Result<FrontierRewrite, LixError> {
-        let first_key = events.first().map_or(&[][..], |event| event.key.as_ref());
-        let last_key = events.last().map_or(&[][..], |event| event.key.as_ref());
-        let start = children
-            .iter()
-            .position(|child| child.last_key.as_ref() >= first_key)
-            .unwrap_or_else(|| children.len().saturating_sub(1));
-        let mut window_entries = Vec::new();
-        let mut event_index = 0usize;
-        let mut child_index = start;
-        loop {
-            let child = children.get(child_index).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked-state leaf frontier ran past child summaries",
-                )
-            })?;
-            let leaf = self
-                .load_node_with_overlay(store, overlay, &child.child_hash)
-                .await?;
-            let leaf = match leaf {
-                DecodedNode::Leaf(leaf) => leaf,
-                DecodedNode::Internal(_) => {
+    ) -> Result<Vec<FrontierSplice>, LixError> {
+        let mut splices = Vec::new();
+        let mut event_index = 0;
+        while event_index < events.len() {
+            let span_event_start = event_index;
+            let mut cursor =
+                FrontierLevelCursor::new(hash, root_level, 0, events[event_index].key.clone());
+            let mut pending = Vec::new();
+            let mut summaries = Vec::new();
+            let mut first_key = None;
+            let mut previous_last = None;
+            loop {
+                let (old_hash, node) =
+                    cursor.next(self, store, overlay).await?.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "leaf frontier unexpectedly exhausted",
+                        )
+                    })?;
+                let DecodedNode::Leaf(leaf) = node else {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "tracked-state leaf frontier expected a leaf child",
+                        "leaf frontier expected leaf",
                     ));
-                }
-            };
-            window_entries.extend(leaf.into_entries());
-            if child_index + 1 == children.len() {
-                event_index = events.len();
-            } else {
-                while event_index < events.len()
-                    && events[event_index].key.as_ref() <= child.last_key.as_ref()
-                {
-                    event_index += 1;
-                }
-            }
-
-            if event_index == events.len() {
-                let mut merged = Vec::with_capacity(window_entries.len() + events.len());
-                let mut old_index = 0usize;
-                let mut incoming_index = 0usize;
-                while old_index < window_entries.len() {
-                    while incoming_index < events.len()
-                        && events[incoming_index].key.as_ref()
-                            < window_entries[old_index].key.as_ref()
-                    {
-                        merged.push(EncodedLeafEntry {
-                            key: events[incoming_index].key.clone(),
-                            value: events[incoming_index].value.clone(),
+                };
+                let old_first = Bytes::copy_from_slice(leaf.first_key().unwrap_or_default());
+                let old_last = Bytes::copy_from_slice(leaf.last_key().unwrap_or_default());
+                chunks.reused_hashes.insert(old_hash);
+                first_key.get_or_insert(old_first);
+                let old_entries = leaf.into_entries();
+                for old in &old_entries {
+                    while event_index < events.len() && events[event_index].key < old.key {
+                        let event = &events[event_index];
+                        pending.push(EncodedLeafEntry {
+                            key: event.key.clone(),
+                            value: event.value.clone(),
                         });
-                        incoming_index += 1;
+                        event_index += 1;
                     }
-                    if incoming_index < events.len()
-                        && events[incoming_index].key.as_ref()
-                            == window_entries[old_index].key.as_ref()
-                    {
-                        merged.push(EncodedLeafEntry {
-                            key: window_entries[old_index].key.clone(),
-                            value: events[incoming_index].value.clone(),
+                    if event_index < events.len() && events[event_index].key == old.key {
+                        pending.push(EncodedLeafEntry {
+                            key: old.key.clone(),
+                            value: events[event_index].value.clone(),
                         });
-                        incoming_index += 1;
+                        event_index += 1;
                     } else {
-                        merged.push(window_entries[old_index].clone());
+                        pending.push(old.clone());
                     }
-                    old_index += 1;
                 }
-                while incoming_index < events.len() {
-                    merged.push(EncodedLeafEntry {
-                        key: events[incoming_index].key.clone(),
-                        value: events[incoming_index].value.clone(),
-                    });
-                    incoming_index += 1;
-                }
-                let mut candidate_chunks = PendingChunkBatchBuilder::default();
-                let candidate = self.build_leaf_level(merged, &mut candidate_chunks);
-                if let Some((generated, existing)) =
-                    first_resync_index(&candidate, &children[start..], last_key)
-                {
-                    for summary in &candidate[..generated] {
-                        chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
+                let at_end = cursor.is_exhausted();
+                if at_end {
+                    for event in &events[event_index..] {
+                        pending.push(EncodedLeafEntry {
+                            key: event.key.clone(),
+                            value: event.value.clone(),
+                        });
                     }
-                    let mut output = children[..start].to_vec();
-                    output.extend(candidate.into_iter().take(generated));
-                    output.extend_from_slice(&children[start + existing..]);
-                    let child_summaries = output.clone();
-                    return Ok(FrontierRewrite {
-                        summaries: self.build_internal_level(output, 1, chunks),
-                        height: 2,
-                        changed: true,
-                        child_summaries: Some(child_summaries),
-                    });
+                    event_index = events.len();
                 }
-                if child_index + 1 == children.len() {
-                    chunks.extend(candidate_chunks);
-                    let mut output = children[..start].to_vec();
-                    output.extend(candidate);
-                    let child_summaries = output.clone();
-                    return Ok(FrontierRewrite {
-                        summaries: self.build_internal_level(output, 1, chunks),
-                        height: 2,
-                        changed: true,
-                        child_summaries: Some(child_summaries),
-                    });
+                let mut groups = chunk_leaf_entries(std::mem::take(&mut pending), &self.options);
+                let tail = groups.pop().expect("leaf chunking always produces a group");
+                for group in groups {
+                    summaries.extend(self.build_leaf_level(group.entries, chunks));
                 }
+                // Require progress through an event: a predecessor can match
+                // before the next gap insertion has even entered the stream.
+                // A prefix inserted before the first old node cannot be
+                // represented by an empty old-node replacement range. Keep
+                // that tail in this span instead of discarding the prefix.
+                let resynced = event_index > span_event_start
+                    && (previous_last.is_some() || summaries.is_empty())
+                    && tail.entries == old_entries;
+                if resynced {
+                    if let Some(last_key) = previous_last {
+                        splices.push(FrontierSplice {
+                            first_key: first_key.expect("frontier consumed a leaf"),
+                            last_key,
+                            summaries,
+                            whole_level: false,
+                        });
+                    }
+                    break;
+                }
+                if at_end {
+                    summaries.extend(self.build_leaf_level(tail.entries, chunks));
+                    splices.push(FrontierSplice {
+                        first_key: first_key.expect("frontier consumed a leaf"),
+                        last_key: old_last,
+                        summaries,
+                        whole_level: cursor.started_at_beginning,
+                    });
+                    break;
+                }
+                pending = tail.entries;
+                previous_last = Some(old_last);
             }
-            child_index += 1;
         }
+        Ok(splices)
     }
 
     async fn rewrite_internal_frontier_window(
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
         overlay: &storage::TrackedStateChunkOverlay,
-        _hash: [u8; TRACKED_STATE_HASH_BYTES],
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        root_level: usize,
         level: usize,
-        children: Vec<ChildSummary>,
-        events: &[FrontierMutation],
+        splices: Vec<FrontierSplice>,
         chunks: &mut PendingChunkBatchBuilder,
-    ) -> Result<FrontierRewrite, LixError> {
-        let first_key = events.first().map_or(&[][..], |event| event.key.as_ref());
-        let last_key = events.last().map_or(&[][..], |event| event.key.as_ref());
-        let start = children
-            .iter()
-            .position(|child| child.last_key.as_ref() >= first_key)
-            .unwrap_or_else(|| children.len().saturating_sub(1));
-        let mut window_children = Vec::new();
-        let mut event_index = 0usize;
-        let mut child_index = start;
-        loop {
-            let child = children.get(child_index).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked-state internal frontier ran past child summaries",
-                )
-            })?;
-            let event_end = if child_index + 1 == children.len() {
-                events.len()
-            } else {
-                let mut end = event_index;
-                while end < events.len() && events[end].key.as_ref() <= child.last_key.as_ref() {
-                    end += 1;
-                }
-                end
-            };
-            if event_index < event_end {
-                let rewritten = self
-                    .rewrite_frontier_node(
-                        store,
-                        overlay,
-                        child.child_hash,
-                        level.saturating_sub(1),
-                        &events[event_index..event_end],
-                        chunks,
-                    )
-                    .await?;
-                let child_summaries = rewritten.child_summaries.ok_or_else(|| {
-                    LixError::new(
+    ) -> Result<Vec<FrontierSplice>, LixError> {
+        let mut output = Vec::new();
+        let mut splice_index = 0;
+        while splice_index < splices.len() {
+            let span_splice_start = splice_index;
+            let mut cursor = FrontierLevelCursor::new(
+                hash,
+                root_level,
+                level,
+                splices[splice_index].first_key.clone(),
+            );
+            let mut inserted = false;
+            let mut pending = Vec::new();
+            let mut summaries = Vec::new();
+            let mut first_key = None;
+            let mut previous_last = None;
+            loop {
+                let (old_hash, node) =
+                    cursor.next(self, store, overlay).await?.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "internal frontier unexpectedly exhausted",
+                        )
+                    })?;
+                let DecodedNode::Internal(internal) = node else {
+                    return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "tracked-state changed internal child did not expose its frontier",
-                    )
-                })?;
-                window_children.extend(child_summaries);
-            } else {
-                let node = self
-                    .load_node_with_overlay(store, overlay, &child.child_hash)
-                    .await?;
-                let node_children = match node {
-                    DecodedNode::Internal(internal) => internal.into_children(),
-                    DecodedNode::Leaf(_) => {
+                        "internal frontier expected internal node",
+                    ));
+                };
+                let old_children = internal.into_children();
+                chunks.reused_hashes.insert(old_hash);
+                let old_first = old_children
+                    .first()
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "internal frontier has no children",
+                        )
+                    })?
+                    .first_key
+                    .clone();
+                let old_last = Bytes::copy_from_slice(
+                    &old_children.last().expect("nonempty children").last_key,
+                );
+                first_key.get_or_insert_with(|| Bytes::copy_from_slice(&old_first));
+                for child in &old_children {
+                    if let Some(splice) = splices.get(splice_index)
+                        && child.first_key >= splice.first_key
+                        && child.first_key <= splice.last_key
+                    {
+                        if !inserted {
+                            pending.extend(splice.summaries.iter().cloned());
+                            inserted = true;
+                        }
+                        if child.last_key >= splice.last_key {
+                            splice_index += 1;
+                            inserted = false;
+                        }
+                    } else {
+                        pending.push(child.clone());
+                    }
+                }
+                let at_end = cursor.is_exhausted();
+                let mut groups =
+                    chunk_internal_entries(std::mem::take(&mut pending), &self.options, level);
+                let tail = groups.pop();
+                for group in groups {
+                    summaries.extend(self.build_internal_level(group.children, level, chunks));
+                }
+                let resynced = splice_index > span_splice_start
+                    && !inserted
+                    && (previous_last.is_some() || summaries.is_empty())
+                    && tail
+                        .as_ref()
+                        .is_some_and(|tail| tail.children == old_children);
+                if resynced {
+                    if let Some(last_key) = previous_last {
+                        output.push(FrontierSplice {
+                            first_key: first_key.expect("frontier consumed an internal node"),
+                            last_key,
+                            summaries,
+                            whole_level: false,
+                        });
+                    }
+                    break;
+                }
+                if at_end {
+                    if splice_index != splices.len() || inserted {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
-                            "tracked-state internal frontier expected an internal child",
+                            "internal frontier did not consume replacements",
                         ));
                     }
-                };
-                window_children.extend(node_children);
-            }
-            event_index = event_end;
-            if event_index == events.len() {
-                let mut candidate_chunks = PendingChunkBatchBuilder::default();
-                let candidate = self.build_internal_level(
-                    window_children.iter().cloned().collect(),
-                    level - 1,
-                    &mut candidate_chunks,
-                );
-                if let Some((generated, existing)) =
-                    first_resync_index(&candidate, &children[start..], last_key)
-                {
-                    for summary in &candidate[..generated] {
-                        chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
+                    if let Some(tail) = tail {
+                        summaries.extend(self.build_internal_level(tail.children, level, chunks));
                     }
-                    let mut output = children[..start].to_vec();
-                    output.extend(candidate.into_iter().take(generated));
-                    output.extend_from_slice(&children[start + existing..]);
-                    let child_summaries = output.clone();
-                    return Ok(FrontierRewrite {
-                        summaries: self.build_internal_level(output, level, chunks),
-                        height: level + 1,
-                        changed: true,
-                        child_summaries: Some(child_summaries),
+                    output.push(FrontierSplice {
+                        first_key: first_key.expect("frontier consumed an internal node"),
+                        last_key: old_last,
+                        summaries,
+                        whole_level: cursor.started_at_beginning,
                     });
+                    break;
                 }
-                if child_index + 1 == children.len() {
-                    chunks.extend(candidate_chunks);
-                    let mut output = children[..start].to_vec();
-                    output.extend(candidate);
-                    let child_summaries = output.clone();
-                    return Ok(FrontierRewrite {
-                        summaries: self.build_internal_level(output, level, chunks),
-                        height: level + 1,
-                        changed: true,
-                        child_summaries: Some(child_summaries),
-                    });
-                }
+                pending = tail.map_or_else(Vec::new, |tail| tail.children);
+                previous_last = Some(old_last);
             }
-            child_index += 1;
         }
+        Ok(output)
     }
 
     /// Merges a full, primary-key-sorted mutation batch with a parent root in
@@ -1445,6 +1414,7 @@ impl TrackedStateTree {
         let mut summaries = self.build_leaf_level(entries, &mut chunks);
         let mut tree_height = 1usize;
         while summaries.len() > 1 {
+            ensure_internal_frontier_can_contract(&summaries, &self.options)?;
             summaries = self.build_internal_level(summaries, tree_height, &mut chunks);
             tree_height += 1;
         }
@@ -1492,6 +1462,7 @@ impl TrackedStateTree {
         let mut summaries = leaf_summaries;
         let mut tree_height = 1usize;
         while summaries.len() > 1 {
+            ensure_internal_frontier_can_contract(&summaries, &self.options)?;
             summaries = self.build_internal_level(summaries, tree_height, &mut chunks);
             tree_height += 1;
         }
@@ -1517,6 +1488,9 @@ impl TrackedStateTree {
         entries: Vec<EncodedLeafEntry>,
         chunks: &mut PendingChunkBatchBuilder,
     ) -> Vec<ChildSummary> {
+        #[cfg(test)]
+        self.leaf_entries_encoded
+            .fetch_add(entries.len(), std::sync::atomic::Ordering::Relaxed);
         let groups = chunk_leaf_entries(entries, &self.options);
         groups
             .into_iter()
@@ -1974,6 +1948,9 @@ struct PendingChunkSpan {
 struct PendingChunkBatchBuilder {
     data: Vec<u8>,
     chunks: BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkSpan>,
+    // Frontier repair can re-emit an unchanged predecessor while finding the
+    // next stable boundary. Such authenticated old nodes need no staged write.
+    reused_hashes: HashSet<[u8; TRACKED_STATE_HASH_BYTES]>,
 }
 
 impl PendingChunkBatchBuilder {
@@ -1981,6 +1958,7 @@ impl PendingChunkBatchBuilder {
         Self {
             data: Vec::with_capacity(data_bytes),
             chunks: BTreeMap::new(),
+            reused_hashes: HashSet::new(),
         }
     }
 
@@ -1992,44 +1970,19 @@ impl PendingChunkBatchBuilder {
         subtree_count: u64,
     ) -> ChildSummary {
         let hash = hash_bytes(&node);
-        if !self.chunks.contains_key(&hash) {
+        if !self.reused_hashes.contains(&hash) && !self.chunks.contains_key(&hash) {
             let start = self.data.len();
             let len = node.len();
             self.data.extend_from_slice(&node);
             self.chunks.insert(hash, PendingChunkSpan { start, len });
         }
         ChildSummary {
-            first_key,
-            last_key,
+            // Decoded boundary keys may slice an entire leaf arena. Retained
+            // summaries must not keep that arena's row payloads alive.
+            first_key: Bytes::copy_from_slice(&first_key),
+            last_key: Bytes::copy_from_slice(&last_key),
             child_hash: hash,
             subtree_count,
-        }
-    }
-
-    fn copy_chunk_from(&mut self, source: &Self, hash: &[u8; TRACKED_STATE_HASH_BYTES]) {
-        if self.chunks.contains_key(hash) {
-            return;
-        }
-        let span = source
-            .chunks
-            .get(hash)
-            .copied()
-            .expect("generated child summary must reference a pending chunk");
-        let start = self.data.len();
-        self.data
-            .extend_from_slice(&source.data[span.start..span.start + span.len]);
-        self.chunks.insert(
-            *hash,
-            PendingChunkSpan {
-                start,
-                len: span.len,
-            },
-        );
-    }
-
-    fn extend(&mut self, source: Self) {
-        for hash in source.chunks.keys() {
-            self.copy_chunk_from(&source, hash);
         }
     }
 
@@ -2063,6 +2016,106 @@ struct OrderedLeafCursor {
     frames: Vec<OrderedLeafCursorFrame>,
     leaf: Option<DecodedLeafNodeRef>,
     leaf_entry_index: usize,
+}
+
+/// A seekable cursor over nodes at a fixed level. The path retains unopened
+/// sibling summaries, so crossing a subtree boundary never scans earlier rows.
+struct FrontierLevelCursor {
+    pending: Option<([u8; TRACKED_STATE_HASH_BYTES], usize, Option<ChildSummary>)>,
+    frames: Vec<(Vec<ChildSummary>, usize, usize)>,
+    target_level: usize,
+    seek_key: Option<Bytes>,
+    started_at_beginning: bool,
+}
+
+impl FrontierLevelCursor {
+    fn new(
+        root: [u8; TRACKED_STATE_HASH_BYTES],
+        root_level: usize,
+        target_level: usize,
+        key: Bytes,
+    ) -> Self {
+        Self {
+            pending: Some((root, root_level, None)),
+            frames: Vec::new(),
+            target_level,
+            seek_key: Some(key),
+            started_at_beginning: true,
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.pending.is_none()
+            && self
+                .frames
+                .iter()
+                .all(|(children, next, _)| *next == children.len())
+    }
+
+    async fn next(
+        &mut self,
+        tree: &TrackedStateTree,
+        store: &(impl StorageAdapterRead + ?Sized),
+        overlay: &storage::TrackedStateChunkOverlay,
+    ) -> Result<Option<([u8; TRACKED_STATE_HASH_BYTES], DecodedNode)>, LixError> {
+        loop {
+            let pending = self.pending.take().or_else(|| {
+                while let Some((children, next, level)) = self.frames.last_mut() {
+                    if let Some(child) = children.get(*next) {
+                        *next += 1;
+                        return Some((child.child_hash, *level, Some(child.clone())));
+                    }
+                    self.frames.pop();
+                }
+                None
+            });
+            let Some((hash, level, expected)) = pending else {
+                return Ok(None);
+            };
+            let node = tree.load_node_with_overlay(store, overlay, &hash).await?;
+            if let Some(expected) = expected {
+                validate_decoded_node_summary(&node, &expected)?;
+            }
+            if matches!(&node, DecodedNode::Leaf(_)) != (level == 0) {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "frontier cursor encountered inconsistent tree height",
+                ));
+            }
+            if level == self.target_level {
+                self.seek_key = None;
+                return Ok(Some((hash, node)));
+            }
+            let DecodedNode::Internal(internal) = node else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "frontier cursor encountered a leaf above its target level",
+                ));
+            };
+            let children = internal.into_children();
+            if children.is_empty() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "frontier cursor encountered an empty internal node",
+                ));
+            }
+            // Strictly less selects the predecessor when a replacement starts
+            // at a node boundary, and the preceding node for a gap insertion.
+            // Its old end may have depended on the next item's encoded size.
+            let index = self.seek_key.as_ref().map_or(0, |key| {
+                children
+                    .partition_point(|child| child.first_key < *key)
+                    .saturating_sub(1)
+            });
+            self.started_at_beginning &= index == 0;
+            self.pending = Some((
+                children[index].child_hash,
+                level - 1,
+                Some(children[index].clone()),
+            ));
+            self.frames.push((children, index + 1, level - 1));
+        }
+    }
 }
 
 struct OrderedLeafCursorFrame {
@@ -2498,6 +2551,44 @@ fn chunk_leaf_entries(
     groups
 }
 
+/// Called only on a complete root frontier, never on a local repair window.
+/// If every adjacent pair is separated by a size-forced or probability-one
+/// boundary, every future level consists of the same singleton key ranges.
+/// Hash salts cannot make progress. Reject that unrepresentable legacy layout
+/// rather than silently changing the canonical policy of persisted roots.
+fn ensure_internal_frontier_can_contract(
+    children: &[ChildSummary],
+    options: &TrackedStateTreeOptions,
+) -> Result<(), LixError> {
+    if children.len() > 1
+        && children.windows(2).all(|pair| {
+            let left = &pair[0];
+            let right = &pair[1];
+            let single_size =
+                estimate_internal_chunk_size(1, left.first_key.len(), left.last_key.len());
+            let item_size = left.first_key.len()
+                + left.last_key.len()
+                + TRACKED_STATE_HASH_BYTES
+                + size_of::<u64>();
+            let forced_after_left = single_size >= options.min_chunk_bytes
+                && (single_size >= options.max_chunk_bytes
+                    || (options.target_chunk_bytes > 0 && item_size >= options.target_chunk_bytes));
+            let forced_before_right = estimate_internal_chunk_size(
+                2,
+                left.first_key.len() + right.first_key.len(),
+                left.last_key.len() + right.last_key.len(),
+            ) > options.max_chunk_bytes;
+            forced_after_left || forced_before_right
+        })
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked-state canonical internal frontier cannot contract with these key sizes",
+        ));
+    }
+    Ok(())
+}
+
 fn chunk_internal_entries(
     children: Vec<ChildSummary>,
     options: &TrackedStateTreeOptions,
@@ -2568,25 +2659,6 @@ fn estimate_internal_chunk_size(
     16 + child_count * (8 + TRACKED_STATE_HASH_BYTES + size_of::<u64>())
         + first_key_bytes
         + last_key_bytes
-}
-
-fn first_resync_index(
-    generated: &[ChildSummary],
-    existing: &[ChildSummary],
-    last_mutation_key: &[u8],
-) -> Option<(usize, usize)> {
-    for (generated_index, generated) in generated.iter().enumerate() {
-        // A matching old chunk before the final mutation key is only an
-        // unchanged gap within the frontier. Resync is valid only after every
-        // mutation in the batch has been emitted.
-        if generated.first_key.as_ref() <= last_mutation_key {
-            continue;
-        }
-        if let Some(existing_index) = existing.iter().position(|existing| generated == existing) {
-            return Some((generated_index, existing_index));
-        }
-    }
-    None
 }
 
 fn node_diff_frontier(
@@ -2721,7 +2793,6 @@ fn validate_decoded_node_summary(
     Ok(())
 }
 
-#[cfg(test)]
 fn internal_summary(
     hash: [u8; TRACKED_STATE_HASH_BYTES],
     children: &[ChildSummary],
@@ -4568,6 +4639,702 @@ mod tests {
             .expect("canonical root should build");
 
         assert_eq!(fast.root_id, canonical.root_id);
+    }
+
+    #[tokio::test]
+    async fn gap_insert_revisits_overflow_terminated_predecessor() {
+        let short_key = encode_key(&key("schema", None, "row-0000"));
+        // Eight short keys fit; the old long successor forces a pre-push
+        // overflow. A new short key in that gap still fits the preceding leaf.
+        let max_chunk_bytes = estimate_leaf_boundary_chunk_size(9, 9 * short_key.len()) + 2;
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: max_chunk_bytes,
+            min_chunk_bytes: max_chunk_bytes,
+            max_chunk_bytes,
+        });
+        let storage = StorageAdapter::new(Memory::new());
+        let initial = (0..9)
+            .map(|index| {
+                mutation_owned(
+                    key(
+                        "schema",
+                        None,
+                        &format!(
+                            "row-{index:04}{}",
+                            if index == 8 {
+                                "-long-successor-that-forces-size-overflow"
+                            } else {
+                                ""
+                            }
+                        ),
+                    ),
+                    value("initial", Some("{}")),
+                )
+            })
+            .collect();
+        let base = apply_mutations_for_test(&tree, &storage, None, initial, None)
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let entries = tree
+            .collect_leaf_entries(&read, &base.root_id)
+            .await
+            .unwrap();
+        let groups = chunk_leaf_entries(entries.clone(), &tree.options);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].entries.len(), 8);
+        let mutation = mutation_owned(key("schema", None, "row-0007b"), value("inserted", None));
+        let mut expected = entries;
+        expected.insert(
+            8,
+            EncodedLeafEntry {
+                key: mutation.encoded_key.clone(),
+                value: mutation.encoded_value.clone(),
+            },
+        );
+        assert_eq!(
+            chunk_leaf_entries(expected.clone(), &tree.options)[0]
+                .entries
+                .len(),
+            9
+        );
+        let result =
+            apply_mutations_for_test(&tree, &storage, Some(&base.root_id), vec![mutation], None)
+                .await
+                .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut physical = tree
+            .collect_leaf_entries(&read, &result.root_id)
+            .await
+            .unwrap();
+        physical.sort_by(|left, right| left.key.cmp(&right.key));
+        assert_eq!(
+            physical, expected,
+            "gap insertion must preserve physical entries"
+        );
+        let canonical = tree.build_tree_from_entries(expected).unwrap();
+        assert_eq!(result.root_id, canonical.root_id);
+        assert_eq!(result.tree_height, canonical.tree_height);
+        assert_eq!(result.row_count, canonical.row_count);
+    }
+
+    #[tokio::test]
+    async fn insertions_at_local_parent_tail_match_canonical_rebuild() {
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 128,
+            min_chunk_bytes: 64,
+            max_chunk_bytes: 256,
+        });
+        let storage = StorageAdapter::new(Memory::new());
+        let initial = (0..256)
+            .map(|index| {
+                mutation_owned(
+                    key("schema", None, &format!("row-{index:04}")),
+                    value("initial", Some("{}")),
+                )
+            })
+            .collect();
+        let base = apply_mutations_for_test(&tree, &storage, None, initial, None)
+            .await
+            .unwrap();
+        assert!(base.tree_height >= 3, "fixture needs sibling leaf parents");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let overlay = storage::TrackedStateChunkOverlay::new();
+        let mut hash = *base.root_id.as_bytes();
+        for _ in 0..base.tree_height - 2 {
+            let DecodedNode::Internal(node) = tree
+                .load_node_with_overlay(&read, &overlay, &hash)
+                .await
+                .unwrap()
+            else {
+                panic!("expected internal ancestor");
+            };
+            hash = node.children()[0].child_hash;
+        }
+        let DecodedNode::Internal(parent) = tree
+            .load_node_with_overlay(&read, &overlay, &hash)
+            .await
+            .unwrap()
+        else {
+            panic!("expected leaf parent");
+        };
+        let tail = parent.children().last().unwrap();
+        let DecodedNode::Leaf(leaf) = tree
+            .load_node_with_overlay(&read, &overlay, &tail.child_hash)
+            .await
+            .unwrap()
+        else {
+            panic!("expected tail leaf");
+        };
+        let mut expected = tree
+            .collect_leaf_entries(&read, &base.root_id)
+            .await
+            .unwrap();
+        assert!(
+            tail.last_key < expected.last().unwrap().key,
+            "local tail is not global end"
+        );
+        let mut mutations = Vec::new();
+        for entry in leaf.into_entries() {
+            let decoded = decode_key(&entry.key).unwrap();
+            let mutation = mutation_owned(
+                key(
+                    "schema",
+                    None,
+                    &format!(
+                        "{}-long-inserted-suffix",
+                        decoded
+                            .row_pk
+                            .as_single_string()
+                            .expect("fixture key is scalar"),
+                    ),
+                ),
+                value("inserted", None),
+            );
+            let index = expected
+                .binary_search_by(|entry| entry.key.cmp(&mutation.encoded_key))
+                .unwrap_err();
+            expected.insert(
+                index,
+                EncodedLeafEntry {
+                    key: mutation.encoded_key.clone(),
+                    value: mutation.encoded_value.clone(),
+                },
+            );
+            mutations.push(mutation);
+        }
+        let result =
+            apply_mutations_for_test(&tree, &storage, Some(&base.root_id), mutations, None)
+                .await
+                .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut physical = tree
+            .collect_leaf_entries(&read, &result.root_id)
+            .await
+            .unwrap();
+        physical.sort_by(|left, right| left.key.cmp(&right.key));
+        assert_eq!(
+            physical, expected,
+            "local-tail repair must preserve physical entries"
+        );
+        let canonical = tree.build_tree_from_entries(expected).unwrap();
+        assert_eq!(result.root_id, canonical.root_id);
+        assert_eq!(result.tree_height, canonical.tree_height);
+        assert_eq!(result.row_count, canonical.row_count);
+    }
+
+    #[tokio::test]
+    async fn frontier_cursor_rejects_mismatched_summary_and_height() {
+        let bytes = encode_leaf_node(&[]);
+        let hash = hash_bytes(&bytes);
+        let store = StorageAdapterReadScope::new(CountingChunkRead {
+            hash,
+            bytes,
+            storage_reads: Arc::new(AtomicUsize::new(0)),
+            corrupt_first_read: false,
+        });
+        let tree = TrackedStateTree::new();
+        let overlay = storage::TrackedStateChunkOverlay::new();
+        let mut cursor = FrontierLevelCursor::new(hash, 0, 0, Bytes::new());
+        cursor.pending = Some((
+            hash,
+            0,
+            Some(ChildSummary {
+                first_key: Bytes::new(),
+                last_key: Bytes::new(),
+                child_hash: hash,
+                subtree_count: 1,
+            }),
+        ));
+        let error = cursor.next(&tree, &store, &overlay).await.unwrap_err();
+        assert!(error.message.contains("child summary does not match"));
+        let mut cursor = FrontierLevelCursor::new(hash, 1, 0, Bytes::new());
+        let error = cursor.next(&tree, &store, &overlay).await.unwrap_err();
+        assert!(error.message.contains("inconsistent tree height"));
+    }
+
+    #[test]
+    fn retained_frontier_summaries_release_leaf_payload_arena() {
+        struct Arena {
+            bytes: Vec<u8>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl AsRef<[u8]> for Arena {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for Arena {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let encoded_key = encode_key(&key("schema", None, "retained-key"));
+        let encoded_value = encode_value(&value("retained-value", Some("{}")));
+        let mut bytes = vec![0; 1024 * 1024];
+        let value_end = encoded_key.len() + encoded_value.len();
+        bytes[..encoded_key.len()].copy_from_slice(&encoded_key);
+        bytes[encoded_key.len()..value_end].copy_from_slice(&encoded_value);
+        let arena = Bytes::from_owner(Arena {
+            bytes,
+            dropped: Arc::clone(&dropped),
+        });
+        let entries = vec![EncodedLeafEntry {
+            key: arena.slice(..encoded_key.len()),
+            value: arena.slice(encoded_key.len()..value_end),
+        }];
+        drop(arena);
+        let tree = TrackedStateTree::new();
+        let mut chunks = PendingChunkBatchBuilder::default();
+        let summaries = tree.build_leaf_level(entries, &mut chunks);
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "boundary summaries must not pin the decoded leaf arena"
+        );
+        assert_eq!(summaries[0].first_key.as_ref(), encoded_key);
+        assert_eq!(summaries[0].last_key.as_ref(), encoded_key);
+    }
+
+    #[test]
+    fn permanently_unary_root_frontier_is_rejected_without_changing_boundaries() {
+        let options = TrackedStateTreeOptions {
+            target_chunk_bytes: 128,
+            min_chunk_bytes: 64,
+            max_chunk_bytes: 256,
+        };
+        let children = (0..17)
+            .map(|index| {
+                let boundary = Bytes::from(format!("{index:04}-{}", "x".repeat(512)));
+                ChildSummary {
+                    first_key: boundary.clone(),
+                    last_key: boundary,
+                    child_hash: [index; TRACKED_STATE_HASH_BYTES],
+                    subtree_count: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let error = ensure_internal_frontier_can_contract(&children, &options).unwrap_err();
+        assert!(error.message.contains("cannot contract"));
+        for level in [1, 2, 63] {
+            let groups = chunk_internal_entries(children.clone(), &options, level);
+            assert_eq!(
+                groups.len(),
+                children.len(),
+                "legacy grouping must remain unchanged"
+            );
+            assert!(groups.iter().all(|group| group.children.len() == 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn first_node_resync_preserves_inserted_prefix_at_leaf_and_internal_levels() {
+        let options = TrackedStateTreeOptions {
+            target_chunk_bytes: 256,
+            min_chunk_bytes: 32,
+            max_chunk_bytes: 1024,
+        };
+        let prefix_key = (0..1024)
+            .map(|index| encode_key(&key("schema", None, &format!("prefix-{index:04}"))))
+            .find(|key| {
+                boundary_trigger(
+                    key,
+                    0,
+                    estimate_leaf_boundary_chunk_size(1, key.len()),
+                    estimate_leaf_boundary_entry_size(key.len()),
+                    options.target_chunk_bytes,
+                ) && boundary_trigger(
+                    key,
+                    1,
+                    estimate_internal_chunk_size(1, key.len(), key.len()),
+                    key.len() * 2 + TRACKED_STATE_HASH_BYTES + size_of::<u64>(),
+                    options.target_chunk_bytes,
+                )
+            })
+            .expect("fixture needs a prefix that closes chunks at both levels");
+        for row_count in [1, 256] {
+            let tree = TrackedStateTree::with_options(options.clone());
+            let storage = StorageAdapter::new(Memory::new());
+            let initial = (1000..1000 + row_count)
+                .map(|index| {
+                    mutation_owned(
+                        key("schema", None, &format!("row-{index:04}")),
+                        value("old", Some("{}")),
+                    )
+                })
+                .collect();
+            let base = apply_mutations_for_test(&tree, &storage, None, initial, None)
+                .await
+                .unwrap();
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            let overlay = storage::TrackedStateChunkOverlay::new();
+            let prefix = EncodedLeafEntry {
+                key: Bytes::copy_from_slice(&prefix_key),
+                value: encode_value(&value("prefix", None)).into(),
+            };
+            let mut cursor = FrontierLevelCursor::new(
+                *base.root_id.as_bytes(),
+                base.tree_height - 1,
+                0,
+                Bytes::new(),
+            );
+            let (_, DecodedNode::Leaf(first_leaf)) =
+                cursor.next(&tree, &read, &overlay).await.unwrap().unwrap()
+            else {
+                panic!("expected first leaf");
+            };
+            let old_entries = first_leaf.into_entries();
+            let mut merged = vec![prefix.clone()];
+            merged.extend(old_entries.clone());
+            let groups = chunk_leaf_entries(merged, &options);
+            assert_eq!(groups.len(), 2);
+            assert_eq!(
+                groups[1].entries, old_entries,
+                "first old leaf is the resync tail"
+            );
+            if row_count > 1 {
+                assert!(base.tree_height >= 3);
+                let mut cursor = FrontierLevelCursor::new(
+                    *base.root_id.as_bytes(),
+                    base.tree_height - 1,
+                    1,
+                    Bytes::new(),
+                );
+                let (_, DecodedNode::Internal(parent)) =
+                    cursor.next(&tree, &read, &overlay).await.unwrap().unwrap()
+                else {
+                    panic!("expected first leaf parent");
+                };
+                let old_children = parent.into_children();
+                let mut chunks = PendingChunkBatchBuilder::default();
+                let mut merged = tree.build_leaf_level(vec![prefix.clone()], &mut chunks);
+                merged.extend(old_children.clone());
+                let groups = chunk_internal_entries(merged, &options, 1);
+                assert_eq!(groups.len(), 2);
+                assert_eq!(
+                    groups[1].children, old_children,
+                    "first old internal node is the resync tail"
+                );
+            }
+            let mut expected = tree
+                .collect_leaf_entries(&read, &base.root_id)
+                .await
+                .unwrap();
+            expected.insert(0, prefix.clone());
+            let canonical = tree.build_tree_from_entries(expected.clone()).unwrap();
+            let result = apply_mutations_for_test(
+                &tree,
+                &storage,
+                Some(&base.root_id),
+                vec![TrackedStateMutation::from_shared(prefix.key, prefix.value)],
+                None,
+            )
+            .await
+            .unwrap();
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            let mut physical = tree
+                .collect_leaf_entries(&read, &result.root_id)
+                .await
+                .unwrap();
+            physical.sort_by(|left, right| left.key.cmp(&right.key));
+            assert_eq!(
+                physical, expected,
+                "prefix must survive for {row_count} old rows"
+            );
+            assert_eq!(result.root_id, canonical.root_id);
+            assert_eq!(result.row_count, canonical.row_count);
+            assert_eq!(result.tree_height, canonical.tree_height);
+        }
+    }
+
+    #[tokio::test]
+    async fn dense_batch_encodes_each_leaf_entry_once() {
+        let storage = StorageAdapter::new(Memory::new());
+        let builder = TrackedStateTree::new();
+        let row_count = 2_500;
+        let batch = |prefix: &str| {
+            (0..row_count)
+                .map(|index| {
+                    mutation_owned(
+                        key("schema", None, &format!("row-{index:05}")),
+                        value(&format!("{prefix}-{index}"), Some("{}")),
+                    )
+                })
+                .collect()
+        };
+        let base = apply_mutations_for_test(&builder, &storage, None, batch("initial"), None)
+            .await
+            .unwrap();
+        let tree = TrackedStateTree::new();
+        let updated =
+            apply_mutations_for_test(&tree, &storage, Some(&base.root_id), batch("updated"), None)
+                .await
+                .unwrap();
+        assert_eq!(updated.row_count, row_count);
+        assert_eq!(
+            tree.leaf_entries_encoded.load(Ordering::Relaxed),
+            row_count,
+            "dense batches must not repeatedly encode growing window prefixes"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_batch_reuses_unchanged_leaf_gaps() {
+        for row_count in [2_500usize, 10_000] {
+            let memory = Memory::new();
+            let storage = StorageAdapter::new(memory.clone());
+            let builder = TrackedStateTree::new();
+            let initial = (0..row_count)
+                .map(|index| {
+                    mutation_owned(
+                        key("schema", None, &format!("row-{index:05}")),
+                        value(&format!("c-{index}"), Some("{}")),
+                    )
+                })
+                .collect();
+            let base = apply_mutations_for_test(&builder, &storage, None, initial, None)
+                .await
+                .expect("base should build");
+            for insert in [false, true] {
+                let mutations = [10, row_count / 2, row_count - 10]
+                    .into_iter()
+                    .map(|index| {
+                        mutation_owned(
+                            key(
+                                "schema",
+                                None,
+                                &format!("row-{index:05}{}", if insert { "b" } else { "" }),
+                            ),
+                            value(&format!("changed-{index}"), Some("{}")),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let read = storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .unwrap();
+                let mut canonical_entries = builder
+                    .collect_leaf_entries(&read, &base.root_id)
+                    .await
+                    .unwrap();
+                for mutation in &mutations {
+                    match canonical_entries
+                        .binary_search_by(|entry| entry.key.cmp(&mutation.encoded_key))
+                    {
+                        Ok(index) => {
+                            canonical_entries[index].value = mutation.encoded_value.clone()
+                        }
+                        Err(index) => canonical_entries.insert(
+                            index,
+                            EncodedLeafEntry {
+                                key: mutation.encoded_key.clone(),
+                                value: mutation.encoded_value.clone(),
+                            },
+                        ),
+                    }
+                }
+                let batch = TrackedStateMutationBatch::from_shared(mutations);
+                let canonical = builder.build_tree_from_entries(canonical_entries).unwrap();
+                let tree_chunk_reads = Arc::new(AtomicUsize::new(0));
+                let store = StorageAdapterReadScope::new(CountingStorageRead {
+                    read: memory
+                        .begin_read(crate::storage::ReadOptions::default())
+                        .await
+                        .unwrap(),
+                    tree_chunk_reads: Arc::clone(&tree_chunk_reads),
+                });
+                let cold_tree = TrackedStateTree::new();
+                let mut writes = storage.new_write_set();
+                let result = cold_tree
+                    .apply_mutations(&store, &mut writes, Some(&base.root_id), batch, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.root_id, canonical.root_id,
+                    "rows={row_count} insert={insert}"
+                );
+                assert_eq!(result.row_count, canonical.row_count);
+                assert_eq!(result.tree_height, canonical.tree_height);
+                let reads = tree_chunk_reads.load(Ordering::Relaxed);
+                assert!(
+                    reads * 4 < base.chunk_count * 3,
+                    "sparse batch must skip unchanged gaps: rows={row_count} insert={insert} read {reads} of {} chunks",
+                    base.chunk_count,
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn randomized_sparse_and_dense_batches_match_canonical_rebuild() {
+        for target_chunk_bytes in [128, 1024] {
+            let storage = StorageAdapter::new(Memory::new());
+            let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+                target_chunk_bytes,
+                min_chunk_bytes: target_chunk_bytes / 2,
+                max_chunk_bytes: target_chunk_bytes * 2,
+            });
+            let initial = (0..256)
+                .map(|index| {
+                    mutation_owned(
+                        key("schema", None, &format!("row-{index:04}")),
+                        value(&format!("c-{index}"), Some("{}")),
+                    )
+                })
+                .collect();
+            let mut current = apply_mutations_for_test(&tree, &storage, None, initial, None)
+                .await
+                .unwrap()
+                .root_id;
+            let mut random = 0x7f4a_7c15_u64;
+            let mut rejected_batches = 0;
+            for step in 0..48 {
+                let read = storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .unwrap();
+                let mut expected = tree.collect_leaf_entries(&read, &current).await.unwrap();
+                let original = expected.clone();
+                let mut mutations = Vec::new();
+                for ordinal in 0..if step % 4 == 0 { 64 } else { 5 } {
+                    random ^= random << 7;
+                    random ^= random >> 9;
+                    random ^= random << 8;
+                    let index = if step % 4 == 0 {
+                        ordinal * 4
+                    } else {
+                        random as usize % 384
+                    };
+                    let suffix = if step % 3 == 0 {
+                        "-long-inserted-suffix"
+                    } else {
+                        ""
+                    };
+                    let encoded_key =
+                        encode_key(&key("schema", None, &format!("row-{index:04}{suffix}")));
+                    let encoded_value = encode_value(&value(
+                        &format!("batch-{step}-{ordinal}"),
+                        (ordinal % 3 != 0).then_some("{}"),
+                    ));
+                    let encoded = EncodedLeafEntry {
+                        key: encoded_key.into(),
+                        value: encoded_value.into(),
+                    };
+                    match expected.binary_search_by(|entry| entry.key.cmp(&encoded.key)) {
+                        Ok(index) => expected[index].value = encoded.value.clone(),
+                        Err(index) => expected.insert(index, encoded.clone()),
+                    }
+                    mutations.push(TrackedStateMutation::from_shared(
+                        encoded.key,
+                        encoded.value,
+                    ));
+                }
+                // Preserve last-write-wins order explicitly; the publication
+                // frontier requires unique keys in this canonical comparison.
+                let mut unique = BTreeMap::new();
+                for mutation in mutations {
+                    unique.insert(mutation.encoded_key.clone(), mutation);
+                }
+                let canonical = tree.build_tree_from_entries(expected.clone());
+                let result = apply_mutations_for_test(
+                    &tree,
+                    &storage,
+                    Some(&current),
+                    unique.into_values().collect(),
+                    None,
+                )
+                .await;
+                let canonical = match canonical {
+                    Ok(canonical) => canonical,
+                    Err(error) => {
+                        // The original policy has no finite canonical root
+                        // for some tiny-budget/long-key combinations. Reject
+                        // those batches atomically, never invent new grouping.
+                        assert!(error.message.contains("cannot contract"));
+                        assert_ne!(
+                            step, 0,
+                            "the original regression must have a finite canonical root"
+                        );
+                        let error =
+                            result.expect_err("unrepresentable canonical root must be rejected");
+                        assert!(error.message.contains("cannot contract"));
+                        let read = storage
+                            .begin_read(StorageReadOptions::default())
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            tree.collect_leaf_entries(&read, &current).await.unwrap(),
+                            original,
+                            "rejected batch must leave the durable parent unchanged"
+                        );
+                        rejected_batches += 1;
+                        continue;
+                    }
+                };
+                if target_chunk_bytes == 128 && step == 0 {
+                    // Canonical hash from the origin/main regression log:
+                    // pin the old policy, not merely agreement between paths.
+                    assert_eq!(
+                        canonical.root_id,
+                        TrackedStateRootId::new([
+                            225, 121, 165, 124, 156, 145, 159, 7, 211, 158, 225, 49, 234, 131, 73,
+                            175, 115, 231, 111, 210, 175, 164, 76, 152, 236, 167, 169, 49, 181,
+                            140, 226, 35,
+                        ])
+                    );
+                }
+                let result = result.unwrap();
+                let read = storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .unwrap();
+                let mut physical = tree
+                    .collect_leaf_entries(&read, &result.root_id)
+                    .await
+                    .unwrap();
+                physical.sort_by(|left, right| left.key.cmp(&right.key));
+                assert_eq!(
+                    physical, expected,
+                    "physical entries: target={target_chunk_bytes} step={step}"
+                );
+                assert_eq!(
+                    result.root_id, canonical.root_id,
+                    "target={target_chunk_bytes} step={step}"
+                );
+                assert_eq!(result.row_count, canonical.row_count);
+                assert_eq!(result.tree_height, canonical.tree_height);
+                current = result.root_id;
+            }
+            if target_chunk_bytes == 128 {
+                assert!(
+                    rejected_batches > 0,
+                    "tiny-budget fixture must exercise the non-contraction guard"
+                );
+            } else {
+                assert_eq!(
+                    rejected_batches, 0,
+                    "ordinary representable batches must all succeed"
+                );
+            }
+        }
     }
 
     #[tokio::test]
