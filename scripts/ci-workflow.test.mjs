@@ -65,7 +65,8 @@ test("Rust scope gates only Rust jobs and keeps both SDK integration suites", ()
 	const sdk = workflow
 		.split("\n  js-sdk-test:\n")[1]
 		.split("\n  preview-artifact-changes:\n")[0];
-	assert.doesNotMatch(sdk, /needs:|outputs\.rust/);
+	assert.match(sdk, /needs: merge-reuse/);
+	assert.doesNotMatch(sdk, /outputs\.rust/);
 	assert.match(workflow, /fetch-depth: 2/);
 	assert.match(workflow, /rust: \$\{\{ steps\.scope\.outputs\.rust \}\}/);
 	assert.match(workflow, /run: node scripts\/ci-rust-scope\.mjs/);
@@ -261,4 +262,20 @@ test("tooling Clippy excludes the benchmark-only DuckDB feature", () => {
 	assert.ok(e2eClippy);
 	assert.match(e2eClippy, /--all-targets --features /);
 	assert.doesNotMatch(e2eClippy, /\btpch\b|--all-features/);
+});
+
+test("tested merges skip validation but retain SDK artifacts for the landed revision", () => {
+	for (const job of ["changelog", "cargo-config", "js-sdk-test"]) {
+		const definition = workflow.split(`\n  ${job}:\n`)[1].split("\n    steps:")[0];
+		assert.match(definition, /needs: merge-reuse/);
+		assert.match(definition, /needs\.merge-reuse\.outputs\.reuse != 'true'/);
+	}
+	assert.match(workflow, /name: ci-tested-source/);
+	assert.match(workflow, /sourceTree: tree\(process\.env\.SOURCE_REVISION\)/);
+	assert.match(workflow, /testedTree: tree\('HEAD'\)/);
+	const promotion = workflow.split("\n  promote-browser-sdk:\n")[1].split("\n  changelog:\n")[0];
+	assert.match(promotion, /if: needs\.merge-reuse\.outputs\.reuse == 'true'/);
+	assert.match(promotion, /run-id: \$\{\{ needs\.merge-reuse\.outputs\.run_id \}\}/);
+	assert.match(promotion, /name: lix-browser-sdk-\$\{\{ github\.sha \}\}/);
+	assert.doesNotMatch(promotion, /\bcargo\b|\bnpm\b/);
 });
