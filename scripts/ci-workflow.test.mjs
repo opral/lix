@@ -313,3 +313,13 @@ test("consumer compatibility runs independently without requiring nextest artifa
 		assert.match(step, /if: matrix\.junit && !cancelled\(\)/);
 	}
 });
+
+// npm's OIDC exchange requires a GitHub-hosted runner even when preceding
+// build jobs can run elsewhere. This prevents a failure after crates.io upload.
+test("tokenless npm publishing retains a GitHub-hosted runner and OIDC permission", () => {
+	const publish = publishWorkflow.split("\n  publish-js-sdk:\n")[1].split("\n  create-github-release:\n")[0];
+	assert.match(publish, /runs-on: ubuntu-24\.04/);
+	assert.match(publish, /id-token: write/);
+	assert.match(publish, /npm publish .*--provenance --access public/);
+	assert.doesNotMatch(publish, /secrets\.(?:NPM_TOKEN|NODE_AUTH_TOKEN)/);
+});

@@ -519,7 +519,10 @@ jobs:
 
   publish-js-sdk:
     name: Publish @lix-js/sdk packages
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    # npm trusted publishing rejects self-hosted runners, including Ubicloud.
+    # Keep only the OIDC registry upload on GitHub; builds stay on Ubicloud.
+    # https://docs.npmjs.com/trusted-publishers/#supported-cicd-providers
+    runs-on: ubuntu-24.04
     environment: production
     needs:
       - release-version
