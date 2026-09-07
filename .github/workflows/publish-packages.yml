@@ -21,7 +21,7 @@ permissions:
 jobs:
   release-version:
     name: Validate release version
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2-ubuntu-2404
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -131,7 +131,7 @@ jobs:
 
   publish-lix-server:
     name: Publish Lix reference server
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-30-ubuntu-2404
     timeout-minutes: 45
     needs: release-version
     permissions:
@@ -229,9 +229,9 @@ jobs:
       matrix:
         include:
           - suffix: linux-x64
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ubicloud-standard-30-ubuntu-2404
           - suffix: linux-arm64
-            runner: blacksmith-32vcpu-ubuntu-2404-arm
+            runner: ubicloud-standard-30-arm-ubuntu-2404
           - suffix: darwin-arm64
             runner: blacksmith-12vcpu-macos-15
           - suffix: win32-x64
@@ -293,7 +293,7 @@ jobs:
 
   build-js-sdk:
     name: Build @lix-js/sdk
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubicloud-standard-30-ubuntu-2404
     needs: release-version
     if: needs.release-version.outputs.has_release == 'true'
 
@@ -384,7 +384,7 @@ jobs:
 
   test-js-sdk:
     name: Test @lix-js/sdk
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-8-ubuntu-2404
     needs:
       - release-version
       - build-js-sdk
@@ -459,7 +459,7 @@ jobs:
 
   publish-rust-crates:
     name: Publish crates.io packages
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubicloud-standard-30-ubuntu-2404
     environment: production
     # All reversible build and test work must succeed before the first
     # immutable registry upload. Registry publication is then serialized:
@@ -519,7 +519,7 @@ jobs:
 
   publish-js-sdk:
     name: Publish @lix-js/sdk packages
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2-ubuntu-2404
     environment: production
     needs:
       - release-version
@@ -645,7 +645,7 @@ jobs:
 
   create-github-release:
     name: Create GitHub release
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2-ubuntu-2404
     needs:
       - release-version
       - publish-rust-crates
@@ -715,7 +715,7 @@ jobs:
 
   publish-status:
     name: Publish status
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2-ubuntu-2404
     needs:
       - release-version
       - publish-lix-server

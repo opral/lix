@@ -15,7 +15,7 @@ jobs:
   metadata:
     name: Draft release metadata
     if: github.event.pull_request.draft && startsWith(github.head_ref, 'release/v')
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4

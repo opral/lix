@@ -29,15 +29,16 @@ test("draft reruns cannot cancel ready-candidate CI", () => {
 
 test("Rust test scopes run independently with workspace-specific caches", () => {
 	for (const [name, task, workspace, runner] of [
-		["Clippy", "clippy", ".", "blacksmith-32vcpu-ubuntu-2404"],
-		["Test", "test", ".", "blacksmith-16vcpu-ubuntu-2404"],
-		["Tooling Test", "tooling", "tooling", "blacksmith-16vcpu-ubuntu-2404"],
-		["E2E Test", "e2e", "tooling", "blacksmith-16vcpu-ubuntu-2404"],
+		["Clippy", "clippy", ".", "ubicloud-standard-30-ubuntu-2404"],
+		["Compatibility", "compatibility", ".", "ubicloud-standard-30-ubuntu-2404"],
+		["Test", "test", ".", "ubicloud-standard-30-ubuntu-2404"],
+		["Tooling Test", "tooling", "tooling", "ubicloud-standard-30-ubuntu-2404"],
+		["E2E Test", "e2e", "tooling", "ubicloud-standard-30-ubuntu-2404"],
 	]) {
 		assert.match(
 			workflow,
 			new RegExp(
-				`- name: ${name}\\n\\s+task: ${task}\\n\\s+workspace: ${workspace === "." ? "\\." : workspace}[\\s\\S]*?blacksmith_runner: ${runner}`,
+				`- name: ${name}\\n\\s+task: ${task}\\n\\s+workspace: ${workspace === "." ? "\\." : workspace}[\\s\\S]*?runner: ${runner}`,
 			),
 		);
 	}
@@ -49,11 +50,11 @@ test("Rust test scopes run independently with workspace-specific caches", () => 
 	assert.match(workflow, /name: rust-cargo-timings-\$\{\{ matrix\.task \}\}/);
 	assert.match(
 		workflow,
-		/name: Cargo \$\{\{ matrix\.name \}\}[\s\S]*?runs-on: \$\{\{ inputs\.runner_provider == 'blacksmith' && matrix\.blacksmith_runner \|\| matrix\.default_runner \|\| 'ubuntu-24\.04' \}\}/,
+		/name: Cargo \$\{\{ matrix\.name \}\}[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/,
 	);
 	assert.match(
 		workflow,
-		/- name: Test\n\s+task: test[\s\S]*?default_runner: blacksmith-8vcpu-ubuntu-2404\n\s+blacksmith_runner: blacksmith-16vcpu-ubuntu-2404/,
+		/- name: Test\n\s+task: test[\s\S]*?runner: ubicloud-standard-30-ubuntu-2404/,
 	);
 });
 
@@ -99,10 +100,10 @@ test("Cargo output directories match the workspace caches and timing uploads", (
 	);
 });
 
-test("short support jobs use free standard runners for the public repository", () => {
-	assert.match(workflow, /name: Changelog[\s\S]*?runs-on: ubuntu-24\.04/);
+test("short Linux support jobs use small Ubicloud runners", () => {
+	assert.match(workflow, /name: Changelog[\s\S]*?runs-on: ubicloud-standard-2-ubuntu-2404/);
 	for (const [name, runner] of [
-		["Linux x64", "ubuntu-24.04"],
+		["Linux x64", "ubicloud-standard-2-ubuntu-2404"],
 		["macOS arm64", "macos-15"],
 		["Windows x64", "windows-2025"],
 	]) {
@@ -115,18 +116,18 @@ test("short support jobs use free standard runners for the public repository", (
 	}
 });
 
-test("SDK CI defaults to free GitHub runners with an explicit Blacksmith fallback", () => {
+test("SDK CI uses large Ubicloud runners for native and browser compilation", () => {
 	assert.match(
 		workflow,
-		/- name: Native\n\s+runtime: native\n\s+blacksmith_runner: blacksmith-16vcpu-ubuntu-2404/,
+		/- name: Native\n\s+runtime: native\n\s+runner: ubicloud-standard-30-ubuntu-2404/,
 	);
 	assert.match(
 		workflow,
-		/- name: Browser\n\s+runtime: browser\n\s+blacksmith_runner: blacksmith-32vcpu-ubuntu-2404/,
+		/- name: Browser\n\s+runtime: browser\n\s+runner: ubicloud-standard-30-ubuntu-2404/,
 	);
 	assert.match(
 		workflow,
-		/name: JS SDK \$\{\{ matrix\.name \}\} Test[\s\S]*?runs-on: \$\{\{ inputs\.runner_provider == 'blacksmith' && matrix\.blacksmith_runner \|\| 'ubuntu-24\.04' \}\}/,
+		/name: JS SDK \$\{\{ matrix\.name \}\} Test[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/,
 	);
 });
 
@@ -239,10 +240,10 @@ test("SDK binary reuse never skips TypeScript builds or integration tests", () =
 	}
 });
 
-test("server publishing and SDK package tests use free GitHub runners", () => {
+test("server publishing and SDK package tests use appropriately sized Ubicloud runners", () => {
 	assert.match(
 		publishWorkflow,
-		/name: Publish Lix reference server\n\s+runs-on: ubuntu-24\.04/,
+		/name: Publish Lix reference server\n\s+runs-on: ubicloud-standard-30-ubuntu-2404/,
 	);
 	assert.match(
 		publishWorkflow,
@@ -251,7 +252,7 @@ test("server publishing and SDK package tests use free GitHub runners", () => {
 	assert.match(publishWorkflow, /imagetools create --prefer-index=false/);
 	assert.match(
 		publishWorkflow,
-		/name: Test @lix-js\/sdk\n\s+runs-on: ubuntu-24\.04/,
+		/name: Test @lix-js\/sdk\n\s+runs-on: ubicloud-standard-8-ubuntu-2404/,
 	);
 });
 
@@ -298,4 +299,17 @@ test("tested merges skip validation but retain SDK artifacts for the landed revi
 	assert.match(promotion, /run-id: \$\{\{ needs\.merge-reuse\.outputs\.run_id \}\}/);
 	assert.match(promotion, /name: lix-browser-sdk-\$\{\{ github\.sha \}\}/);
 	assert.doesNotMatch(promotion, /\bcargo\b|\bnpm\b/);
+});
+
+// These checks protect different consumer configurations and must both execute
+// even when the all-feature lint job passes. They do not emit nextest reports.
+test("consumer compatibility runs independently without requiring nextest artifacts", () => {
+	for (const name of ["Check lix test targets with default features", "Verify stable Cargo can embed the local Rust SDK"]) {
+		const step = workflow.split(`- name: ${name}\n`)[1].split("\n      - name:")[0];
+		assert.match(step, /if: matrix\.task == 'compatibility'/);
+	}
+	for (const name of ["Upload Rust test timing reports", "Upload Cargo build timings"]) {
+		const step = workflow.split(`- name: ${name}\n`)[1].split("\n      - name:")[0];
+		assert.match(step, /if: matrix\.junit && !cancelled\(\)/);
+	}
 });
