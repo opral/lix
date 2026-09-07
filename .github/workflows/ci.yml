@@ -2,14 +2,6 @@ name: CI
 
 on:
   workflow_dispatch:
-    inputs:
-      runner_provider:
-        description: Use the smallest qualified runners by default; Blacksmith forces larger compilation runners
-        type: choice
-        default: default
-        options:
-          - default
-          - blacksmith
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
   push:
@@ -38,7 +30,7 @@ jobs:
     name: ${{ github.event.pull_request.draft && 'Draft - full CI deferred' || 'Release ready' }}
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs: [merge-reuse, promote-browser-sdk, changelog, cargo-config, cargo, js-sdk-test, preview-artifact-changes, preview-server-image]
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     permissions:
       contents: read
@@ -63,7 +55,7 @@ jobs:
   merge-reuse:
     name: Reuse tested merge
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     permissions:
       contents: read
@@ -87,7 +79,7 @@ jobs:
     name: Reuse tested browser SDK
     needs: merge-reuse
     if: needs.merge-reuse.outputs.reuse == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     permissions:
       actions: read
@@ -131,7 +123,7 @@ jobs:
     name: Changelog
     needs: merge-reuse
     if: needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2-ubuntu-2404
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
 
@@ -188,7 +180,7 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            runner: ubuntu-24.04
+            runner: ubicloud-standard-2-ubuntu-2404
           - name: macOS arm64
             runner: macos-15
           - name: Windows x64
@@ -204,10 +196,11 @@ jobs:
           node --test scripts/release.test.mjs
 
   cargo:
+    # Large Rust builds need memory and parallel compilation to target <10 min.
     name: Cargo ${{ matrix.name }}
     needs: changelog
     if: needs.changelog.outputs.rust != 'false' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    runs-on: ${{ inputs.runner_provider == 'blacksmith' && matrix.blacksmith_runner || matrix.default_runner || 'ubuntu-24.04' }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
       # The root Cargo config otherwise sends --manifest-path tooling builds
@@ -223,25 +216,22 @@ jobs:
             cache_workspaces: |
               . -> target
               tooling -> target
-            blacksmith_runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ubicloud-standard-30-ubuntu-2404
           - name: Test
             task: test
             workspace: .
             junit: target/nextest/ci/junit.xml
-            # The 16 GiB GitHub VM shut down twice during this compilation.
-            # Use 32 GiB here; the other Rust/SDK jobs passed on free runners.
-            default_runner: blacksmith-8vcpu-ubuntu-2404
-            blacksmith_runner: blacksmith-16vcpu-ubuntu-2404
+            runner: ubicloud-standard-30-ubuntu-2404
           - name: Tooling Test
             task: tooling
             workspace: tooling
             junit: tooling/target/nextest/ci/junit.xml
-            blacksmith_runner: blacksmith-16vcpu-ubuntu-2404
+            runner: ubicloud-standard-30-ubuntu-2404
           - name: E2E Test
             task: e2e
             workspace: tooling
             junit: tooling/target/nextest/ci-e2e/junit.xml
-            blacksmith_runner: blacksmith-16vcpu-ubuntu-2404
+            runner: ubicloud-standard-30-ubuntu-2404
 
     steps:
       - name: Checkout repository
@@ -249,11 +239,6 @@ jobs:
 
       - name: Prepare Linux build runner
         uses: ./.github/actions/prepare-linux-runner
-
-      - name: Limit root test compilation concurrency
-        if: matrix.task == 'test' && inputs.runner_provider != 'blacksmith'
-        # Leave headroom for the large root test crate on the 32 GiB VM.
-        run: echo 'CARGO_BUILD_JOBS=4' >> "$GITHUB_ENV"
 
       - name: set envs
         run: |
@@ -461,7 +446,7 @@ jobs:
     name: JS SDK ${{ matrix.name }} Test
     needs: merge-reuse
     if: needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    runs-on: ${{ inputs.runner_provider == 'blacksmith' && matrix.blacksmith_runner || 'ubuntu-24.04' }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
       # Pull request workflows normally check out GitHub's synthetic merge
@@ -474,10 +459,10 @@ jobs:
         include:
           - name: Native
             runtime: native
-            blacksmith_runner: blacksmith-16vcpu-ubuntu-2404
+            runner: ubicloud-standard-30-ubuntu-2404
           - name: Browser
             runtime: browser
-            blacksmith_runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ubicloud-standard-30-ubuntu-2404
 
     steps:
       - name: Checkout repository
@@ -704,7 +689,7 @@ jobs:
   preview-artifact-changes:
     name: Select preview artifacts
     if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2-ubuntu-2404
     outputs:
       server: ${{ steps.changes.outputs.server }}
 
@@ -722,6 +707,8 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            .github/workflows/ci.yml \
+            .github/workflows/publish-packages.yml \
             .cargo \
             .dockerignore \
             Cargo.lock \
@@ -743,7 +730,7 @@ jobs:
     name: Lix server preview artifact
     if: needs.preview-artifact-changes.outputs.server == 'true'
     needs: preview-artifact-changes
-    runs-on: ${{ inputs.runner_provider == 'blacksmith' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    runs-on: ubicloud-standard-30-ubuntu-2404
     timeout-minutes: 45
     env:
       LIX_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
