@@ -6,28 +6,30 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use js_sys::{Array, Function, Promise, Reflect, Uint8Array};
+use lix::LixError;
 use lix::server_protocol::client::{
-    ClientCore, ProtocolClient, ProtocolExecuteOptions, ProtocolHttp, ProtocolHttpRequest,
-    ProtocolHttpResponse, ProtocolHttpStream, ProtocolObserveEvents, ProtocolTransaction,
-    open_protocol_client,
+    ClientCore, ProtocolClient, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse,
+    ProtocolHttpStream, ProtocolObserveEvents, ProtocolTransaction, open_protocol_client,
 };
-use lix::{CreateBranchOptions as RsCreateBranchOptions, LixError};
-use serde::Deserialize;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use super::{
-    CreateBranchOptionsDto, CreateBranchReceiptDto, OpenAnotherSessionOptionsDto, RedoReceiptDto,
-    SwitchBranchOptionsDto, SwitchBranchReceiptDto, UndoReceiptDto, batch_statements_from_js,
-    execute_result_to_js, from_js, lix_error_to_js, to_js, values_from_js,
+    OpenAnotherSessionOptionsDto, execute_result_to_js, from_js, lix_error_to_js, values_from_js,
 };
 
 #[wasm_bindgen]
 pub struct WasmRemoteLix {
     inner: ProtocolClient<JsHttp>,
-    http: JsHttp,
-    url: String,
+}
+
+super::session::wasm_session_methods!(WasmRemoteLix);
+
+impl WasmRemoteLix {
+    fn instrument_operation<F: Future>(&self, future: F) -> F {
+        future
+    }
 }
 
 #[wasm_bindgen]
@@ -49,6 +51,30 @@ struct JsHttp {
 }
 
 struct JsCancelOnDrop(Option<Arc<dyn Fn()>>);
+
+// AbortController alone does not release a reader returned by a custom fetch.
+// Keep reader ownership in the stream, including when it is never polled.
+struct JsStreamReader(JsValue);
+
+impl Drop for JsStreamReader {
+    fn drop(&mut self) {
+        let reader = self.0.clone();
+        let cancel = Reflect::get(&reader, &JsValue::from_str("cancel"))
+            .ok()
+            .and_then(|value| value.dyn_into::<Function>().ok())
+            .and_then(|cancel| cancel.call0(&reader).ok());
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(cancel) = cancel {
+                let _ = JsFuture::from(Promise::from(cancel)).await;
+            }
+            if let Ok(release) = Reflect::get(&reader, &JsValue::from_str("releaseLock"))
+                && let Ok(release) = release.dyn_into::<Function>()
+            {
+                let _ = release.call0(&reader);
+            }
+        });
+    }
+}
 
 impl Drop for JsCancelOnDrop {
     fn drop(&mut self) {
@@ -79,9 +105,18 @@ impl ProtocolHttp for JsHttp {
         request: ProtocolHttpRequest,
     ) -> Result<ProtocolHttpStream, LixError> {
         let (response, cancel) = send_js_http_cancellable(self, &request).await?;
+        let mut cancel_on_error = JsCancelOnDrop(Some(cancel.clone()));
         let status = js_status(&response)?;
         let headers = js_headers(&response)?;
-        let body = js_body_stream(&response)?;
+        let empty_error_body = !(200..300).contains(&status)
+            && Reflect::get(&response, &JsValue::from_str("body"))
+                .is_ok_and(|body| body.is_null() || body.is_undefined());
+        let body: lix::server_protocol::client::ProtocolByteStream = if empty_error_body {
+            Box::pin(futures_util::stream::empty())
+        } else {
+            js_body_stream(&response)?
+        };
+        cancel_on_error.0 = None;
         Ok(ProtocolHttpStream {
             status,
             headers,
@@ -111,7 +146,7 @@ pub async fn open_remote(
     let inner = open_protocol_client(http.clone(), url.clone(), initial_active_branch_id)
         .await
         .map_err(lix_error_to_js)?;
-    Ok(WasmRemoteLix { inner, http, url })
+    Ok(WasmRemoteLix { inner })
 }
 
 #[wasm_bindgen]
@@ -126,81 +161,49 @@ impl WasmRemoteLix {
     #[wasm_bindgen(js_name = openAnotherSession)]
     pub async fn open_another_session(&self, options: JsValue) -> Result<WasmRemoteLix, JsValue> {
         let options: OpenAnotherSessionOptionsDto = from_js(options)?;
-        let parent_account_id = self
-            .inner
-            .active_account_id()
-            .await
-            .map_err(lix_error_to_js)?;
-        if let Some(account_id) = options.account_id
-            && account_id != parent_account_id
-        {
-            return Err(lix_error_to_js(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "remote sessions cannot override the authenticated account",
-            )));
-        }
-        let branch_id = match options.branch_id {
-            Some(branch_id) => branch_id,
-            None => self
-                .inner
-                .active_branch_id()
-                .await
-                .map_err(lix_error_to_js)?,
-        };
-        let inner = open_protocol_client(self.http.clone(), self.url.clone(), Some(branch_id))
-            .await
-            .map_err(lix_error_to_js)?;
-        let child_account_id = inner.active_account_id().await.map_err(lix_error_to_js)?;
-        if child_account_id != parent_account_id {
-            let _ = inner.close().await;
-            return Err(lix_error_to_js(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "remote session authentication changed while opening another session",
-            )));
-        }
-        Ok(WasmRemoteLix {
-            inner,
-            http: self.http.clone(),
-            url: self.url.clone(),
-        })
+        let inner = crate::session::SessionOperations::open_another_session(
+            &self.inner,
+            options.branch_id,
+            options.account_id,
+        )
+        .await
+        .map_err(lix_error_to_js)?;
+        Ok(WasmRemoteLix { inner })
     }
 
-    #[wasm_bindgen(js_name = execute)]
-    pub async fn execute(
-        &self,
-        sql: String,
-        params: JsValue,
-        options: Option<JsValue>,
-    ) -> Result<JsValue, JsValue> {
-        let params = values_from_js(params)?;
-        let options = remote_execute_options(options)?;
-        let result = self
-            .inner
-            .execute(&sql, &params, options)
-            .await
-            .map_err(lix_error_to_js)?;
-        execute_result_to_js(result)
-    }
-
-    #[wasm_bindgen(js_name = executeBatch)]
-    pub async fn execute_batch(
-        &self,
-        statements: JsValue,
-        options: Option<JsValue>,
-    ) -> Result<JsValue, JsValue> {
-        let statements = batch_statements_from_js(statements)?;
-        let options = remote_execute_options(options)?;
-        let results = self
-            .inner
-            .execute_batch(&statements, options)
-            .await
-            .map_err(lix_error_to_js)?;
-        let results = results
-            .into_iter()
-            .map(super::ExecuteResultDto::try_from)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(lix_error_to_js)?;
-        to_js(&results)
+    #[wasm_bindgen(js_name = exportSnapshot)]
+    pub fn export_snapshot(&self) -> super::WasmSnapshotExport {
+        let (sender, receiver) = async_channel::bounded(1);
+        let (completion_sender, completion) = async_channel::bounded(1);
+        let inner = self.inner.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            // Closing the receiver cancels both pending HTTP setup and reads.
+            // The protocol stream owns transport cancellation on drop.
+            futures_lite::future::race(
+                async {
+                    let result = async {
+                        let mut export =
+                            crate::session::SessionOperations::export_snapshot(&inner).await?;
+                        while let Some(chunk) = export.next().await? {
+                            if sender.send(Ok(Some(chunk.to_vec()))).await.is_err() {
+                                return Ok::<(), LixError>(());
+                            }
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    let _ = sender.send(result.map(|()| None)).await;
+                },
+                async { sender.closed().await },
+            )
+            .await;
+            let _ = completion_sender.send(()).await;
+        });
+        super::WasmSnapshotExport {
+            receiver,
+            completion,
+            canceled: Cell::new(false),
+        }
     }
 
     #[wasm_bindgen(js_name = observe)]
@@ -210,9 +213,7 @@ impl WasmRemoteLix {
         params: JsValue,
     ) -> Result<WasmRemoteObserveEvents, JsValue> {
         let params = values_from_js(params)?;
-        let inner = self
-            .inner
-            .observe(&sql, params)
+        let inner = crate::session::SessionOperations::observe(&self.inner, &sql, &params)
             .await
             .map_err(lix_error_to_js)?;
         Ok(WasmRemoteObserveEvents {
@@ -224,78 +225,10 @@ impl WasmRemoteLix {
 
     #[wasm_bindgen(js_name = beginTransaction)]
     pub async fn begin_transaction(&self) -> Result<WasmRemoteLixTransaction, JsValue> {
-        let inner = self
-            .inner
-            .begin_transaction()
+        let inner = crate::session::SessionOperations::begin_transaction(&self.inner)
             .await
             .map_err(lix_error_to_js)?;
         Ok(WasmRemoteLixTransaction { inner: Some(inner) })
-    }
-
-    #[wasm_bindgen(js_name = activeBranchId)]
-    pub async fn active_branch_id(&self) -> Result<String, JsValue> {
-        self.inner.active_branch_id().await.map_err(lix_error_to_js)
-    }
-
-    #[wasm_bindgen(js_name = activeAccountId)]
-    pub async fn active_account_id(&self) -> Result<String, JsValue> {
-        self.inner
-            .active_account_id()
-            .await
-            .map_err(lix_error_to_js)
-    }
-
-    #[wasm_bindgen(js_name = createBranch)]
-    pub async fn create_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        let options: CreateBranchOptionsDto = from_js(options)?;
-        let receipt = self
-            .inner
-            .create_branch(RsCreateBranchOptions {
-                id: options.id,
-                name: options.name,
-                from_commit_id: options.from_commit_id,
-            })
-            .await
-            .map_err(lix_error_to_js)?;
-        to_js(&CreateBranchReceiptDto {
-            id: receipt.id,
-            name: receipt.name,
-            hidden: receipt.hidden,
-            commit_id: receipt.commit_id,
-        })
-    }
-
-    #[wasm_bindgen(js_name = undo)]
-    pub async fn undo(&self) -> Result<JsValue, JsValue> {
-        let receipt = self.inner.undo().await.map_err(lix_error_to_js)?;
-        to_js(&UndoReceiptDto {
-            branch_id: receipt.branch_id,
-            target_commit_id: receipt.target_commit_id,
-            inverse_commit_id: receipt.inverse_commit_id,
-        })
-    }
-
-    #[wasm_bindgen(js_name = redo)]
-    pub async fn redo(&self) -> Result<JsValue, JsValue> {
-        let receipt = self.inner.redo().await.map_err(lix_error_to_js)?;
-        to_js(&RedoReceiptDto {
-            branch_id: receipt.branch_id,
-            target_commit_id: receipt.target_commit_id,
-            replay_commit_id: receipt.replay_commit_id,
-        })
-    }
-
-    #[wasm_bindgen(js_name = switchBranch)]
-    pub async fn switch_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        let options: SwitchBranchOptionsDto = from_js(options)?;
-        let receipt = self
-            .inner
-            .switch_branch_and_restart(&options.branch_id)
-            .await
-            .map_err(lix_error_to_js)?;
-        to_js(&SwitchBranchReceiptDto {
-            branch_id: receipt.branch_id,
-        })
     }
 
     #[wasm_bindgen(js_name = importFilesystemPaths)]
@@ -305,18 +238,6 @@ impl WasmRemoteLix {
         ))
     }
 
-    #[wasm_bindgen(js_name = mergeBranchPreview)]
-    pub async fn merge_branch_preview(&self, _options: JsValue) -> Result<JsValue, JsValue> {
-        Err(lix_error_to_js(
-            self.inner.unsupported("mergeBranchPreview"),
-        ))
-    }
-
-    #[wasm_bindgen(js_name = mergeBranch)]
-    pub async fn merge_branch(&self, _options: JsValue) -> Result<JsValue, JsValue> {
-        Err(lix_error_to_js(self.inner.unsupported("mergeBranch")))
-    }
-
     #[wasm_bindgen(js_name = syncDiskToLix)]
     pub async fn sync_disk_to_lix(&self) -> Result<(), JsValue> {
         Err(lix_error_to_js(self.inner.unsupported("syncDiskToLix")))
@@ -324,7 +245,9 @@ impl WasmRemoteLix {
 
     #[wasm_bindgen(js_name = close)]
     pub async fn close(&self) -> Result<(), JsValue> {
-        self.inner.close().await.map_err(lix_error_to_js)
+        crate::session::SessionOperations::close(&self.inner)
+            .await
+            .map_err(lix_error_to_js)
     }
 }
 
@@ -337,30 +260,27 @@ impl WasmRemoteLixTransaction {
         params: JsValue,
         options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
-        let transaction = self.inner.as_ref().ok_or_else(transaction_closed_error)?;
         let params = values_from_js(params)?;
-        let options = remote_execute_options(options)?;
-        let result = transaction
-            .execute(&sql, &params, options)
-            .await
-            .map_err(lix_error_to_js)?;
+        let options = super::session_execute_options_from_js(options)?;
+        let result =
+            crate::session::TransactionOperations::execute(&mut self.inner, &sql, &params, options)
+                .await
+                .map_err(lix_error_to_js)?;
         execute_result_to_js(result)
     }
 
     #[wasm_bindgen(js_name = commit)]
     pub async fn commit(&mut self) -> Result<(), JsValue> {
-        let transaction = self.inner.as_ref().ok_or_else(transaction_closed_error)?;
-        transaction.commit().await.map_err(lix_error_to_js)?;
-        self.inner = None;
-        Ok(())
+        crate::session::TransactionOperations::commit(&mut self.inner)
+            .await
+            .map_err(lix_error_to_js)
     }
 
     #[wasm_bindgen(js_name = rollback)]
     pub async fn rollback(&mut self) -> Result<(), JsValue> {
-        let transaction = self.inner.as_ref().ok_or_else(transaction_closed_error)?;
-        transaction.rollback().await.map_err(lix_error_to_js)?;
-        self.inner = None;
-        Ok(())
+        crate::session::TransactionOperations::rollback(&mut self.inner)
+            .await
+            .map_err(lix_error_to_js)
     }
 }
 
@@ -403,28 +323,6 @@ impl WasmRemoteObserveEvents {
         if let Some(events) = self.inner.borrow().as_ref() {
             events.close();
         }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RemoteExecuteOptionsDto {
-    origin_key: Option<String>,
-    idempotency_key: Option<String>,
-}
-
-fn remote_execute_options(
-    options: Option<JsValue>,
-) -> Result<Option<ProtocolExecuteOptions>, JsValue> {
-    match options {
-        Some(value) if !value.is_null() && !value.is_undefined() => {
-            let options: RemoteExecuteOptionsDto = from_js(value)?;
-            Ok(Some(ProtocolExecuteOptions {
-                origin_key: options.origin_key,
-                idempotency_key: options.idempotency_key,
-            }))
-        }
-        _ => Ok(None),
     }
 }
 
@@ -649,7 +547,10 @@ fn js_body_stream(
     let reader = get_reader
         .call0(&body)
         .map_err(|_| protocol_bridge("remote observe response has no body"))?;
+    let reader = JsStreamReader(reader);
     Ok(Box::pin(async_stream::stream! {
+        let reader_guard = reader;
+        let reader = &reader_guard.0;
         loop {
             let read = match Reflect::get(&reader, &JsValue::from_str("read"))
                 .ok()
@@ -731,11 +632,4 @@ fn js_error_message(value: JsValue) -> String {
         .as_string()
         .or_else(|| js_sys::Error::from(value.clone()).message().as_string())
         .unwrap_or_else(|| format!("{value:?}"))
-}
-
-fn transaction_closed_error() -> JsValue {
-    lix_error_to_js(LixError::new(
-        "LIX_INVALID_TRANSACTION_STATE",
-        "Lix transaction is closed",
-    ))
 }

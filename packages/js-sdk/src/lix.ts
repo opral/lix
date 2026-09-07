@@ -241,16 +241,7 @@ export class Lix {
 			});
 			const operation = this.#runOperation(async () => {
 				try {
-					const exportSnapshot = this.binding.exportSnapshot;
-					if (!exportSnapshot) {
-						const error = new Error(
-							"snapshot export is not available for remote Lix handles",
-						) as Error & { code: string };
-						error.name = "LixError";
-						error.code = "LIX_UNSUPPORTED_STORAGE";
-						throw error;
-					}
-					resolveBinding(exportSnapshot.call(this.binding));
+					resolveBinding(this.binding.exportSnapshot());
 					await completed;
 				} catch (error) {
 					rejectBinding(error);

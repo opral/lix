@@ -85,6 +85,20 @@ Remote server sessions are branch-pinned, so switching one client does not
 switch another client. Browser-local application state belongs to the
 application rather than the remote Lix handle.
 
+Remote handles support branch creation, merge preview and merge through the
+server's Rust engine. `openAnotherSession()` inherits the active branch unless
+one is supplied, retains the authenticated account, and returns an independent
+handle with the same operations—including streaming `exportSnapshot()`. Snapshot
+export covers the complete repository, not only the active branch. Cancelling
+the returned stream releases the HTTP request.
+
+Internally, local and connected-sync bindings call `Lix`; remote bindings call
+the Rust protocol client. Both implement the required Rust session operation
+contract, and the WASM bindings share SQL and branch-operation forwarding and
+value conversion. Host-specific storage, telemetry, stream, and actor cleanup
+remain in the bindings. This does not make network availability or authentication
+constraints identical to an offline local engine.
+
 Filesystem sync uses native Node.js dependencies:
 
 ```ts

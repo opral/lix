@@ -13,13 +13,11 @@ use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Array, Function, Reflect};
 use lix::telemetry::{CallbackTelemetrySink, SpanContext, TelemetrySink, instrument_remote_parent};
 use lix::{
-    BROWSER_TRANSPORT_CONFIG_HEADER, CreateBranchOptions as RsCreateBranchOptions,
-    ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
-    Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
-    MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreviewOptions,
-    ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
-    ServerOptions, SwitchBranchOptions as RsSwitchBranchOptions, Value, open_lix,
-    register_browser_sync_transport, unregister_browser_sync_transport,
+    BROWSER_TRANSPORT_CONFIG_HEADER, ExecuteBatchStatement as RsExecuteBatchStatement,
+    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+    Memory, MergeBranchOutcome, ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress,
+    OpenProgressSink, OpenReport, ServerOptions, Value, open_lix, register_browser_sync_transport,
+    unregister_browser_sync_transport,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -33,6 +31,10 @@ use crate::js_storage::{JsStorage, JsStorageProvider};
 
 #[path = "wasm_remote.rs"]
 mod remote;
+#[path = "wasm_session.rs"]
+mod session;
+
+session::wasm_session_methods!(WasmLix);
 
 type BrowserLix = RsLix<BrowserStorage>;
 type BrowserTransaction = RsLixTransaction<BrowserStorage>;
@@ -774,15 +776,12 @@ impl WasmLix {
     #[wasm_bindgen(js_name = openAnotherSession)]
     pub async fn open_another_session(&self, options: JsValue) -> Result<WasmLix, JsValue> {
         let options: OpenAnotherSessionOptionsDto = from_js(options)?;
-        let mut builder = self.inner.open_another_session();
-        if let Some(branch_id) = options.branch_id {
-            builder = builder.with_branch(branch_id);
-        }
-        if let Some(account_id) = options.account_id {
-            builder = builder.with_account(account_id);
-        }
         let inner = self
-            .instrument_operation(builder)
+            .instrument_operation(crate::session::SessionOperations::open_another_session(
+                &self.inner,
+                options.branch_id,
+                options.account_id,
+            ))
             .await
             .map_err(lix_error_to_js)?;
         self.storage_sessions
@@ -801,7 +800,7 @@ impl WasmLix {
     pub fn export_snapshot(&self) -> WasmSnapshotExport {
         let (sender, receiver) = async_channel::bounded(1);
         let (completion_sender, completion) = async_channel::bounded(1);
-        let builder = self.inner.export_snapshot();
+        let inner = self.inner.clone();
         let telemetry_parent = self
             .telemetry_parent
             .as_ref()
@@ -809,8 +808,11 @@ impl WasmLix {
         let task_sender = sender.clone();
         spawn_local(async move {
             let mut writer = WasmSnapshotWriter::new(task_sender.clone());
-            let result =
-                instrument_remote_parent(telemetry_parent, builder.write_to(&mut writer)).await;
+            let result = instrument_remote_parent(telemetry_parent, async {
+                let builder = crate::session::SessionOperations::export_snapshot(&inner).await?;
+                builder.write_to(&mut writer).await
+            })
+            .await;
             let terminal = match result {
                 Ok(_) => Ok(None),
                 Err(error) => Err(error),
@@ -825,52 +827,6 @@ impl WasmLix {
         }
     }
 
-    #[wasm_bindgen(js_name = execute)]
-    pub async fn execute(
-        &self,
-        sql: String,
-        params: JsValue,
-        options: Option<JsValue>,
-    ) -> Result<JsValue, JsValue> {
-        let params = values_from_js(params)?;
-        let options = execute_options_from_js(options)?;
-        let execution = self.inner.execute(&sql, &params);
-        let execution = match options {
-            Some(origin_key) => execution.with_origin_key(origin_key),
-            None => execution,
-        };
-        let result = self
-            .instrument_operation(execution)
-            .await
-            .map_err(lix_error_to_js)?;
-        execute_result_to_js(result)
-    }
-
-    #[wasm_bindgen(js_name = executeBatch)]
-    pub async fn execute_batch(
-        &self,
-        statements: JsValue,
-        options: Option<JsValue>,
-    ) -> Result<JsValue, JsValue> {
-        let statements = batch_statements_from_js(statements)?;
-        let options = execute_options_from_js(options)?;
-        let execution = self.inner.execute_batch(&statements);
-        let execution = match options {
-            Some(origin_key) => execution.with_origin_key(origin_key),
-            None => execution,
-        };
-        let results = self
-            .instrument_operation(execution)
-            .await
-            .map_err(lix_error_to_js)?;
-        let results = results
-            .into_iter()
-            .map(ExecuteResultDto::try_from)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(lix_error_to_js)?;
-        to_js(&results)
-    }
-
     #[wasm_bindgen(js_name = observe)]
     pub async fn observe(
         &self,
@@ -879,7 +835,11 @@ impl WasmLix {
     ) -> Result<WasmObserveEvents, JsValue> {
         let params = values_from_js(params)?;
         let inner = self
-            .instrument_operation(async { self.inner.observe(&sql, &params) })
+            .instrument_operation(crate::session::SessionOperations::observe(
+                &self.inner,
+                &sql,
+                &params,
+            ))
             .await
             .map_err(lix_error_to_js)?;
         Ok(WasmObserveEvents {
@@ -896,83 +856,14 @@ impl WasmLix {
     #[wasm_bindgen(js_name = beginTransaction)]
     pub async fn begin_transaction(&self) -> Result<WasmLixTransaction, JsValue> {
         let inner = self
-            .instrument_operation(self.inner.begin_transaction())
+            .instrument_operation(crate::session::SessionOperations::begin_transaction(
+                &self.inner,
+            ))
             .await
             .map_err(lix_error_to_js)?;
         Ok(WasmLixTransaction {
             inner: Some(inner),
             telemetry_parent: self.telemetry_parent.clone(),
-        })
-    }
-
-    #[wasm_bindgen(js_name = activeBranchId)]
-    pub async fn active_branch_id(&self) -> Result<String, JsValue> {
-        self.instrument_operation(self.inner.active_branch_id())
-            .await
-            .map_err(lix_error_to_js)
-    }
-
-    #[wasm_bindgen(js_name = activeAccountId)]
-    pub async fn active_account_id(&self) -> Result<String, JsValue> {
-        Ok(self.inner.active_account_id().to_string())
-    }
-
-    #[wasm_bindgen(js_name = createBranch)]
-    pub async fn create_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        let options: CreateBranchOptionsDto = from_js(options)?;
-        let receipt = self
-            .instrument_operation(self.inner.create_branch(RsCreateBranchOptions {
-                id: options.id,
-                name: options.name,
-                from_commit_id: options.from_commit_id,
-            }))
-            .await
-            .map_err(lix_error_to_js)?;
-        to_js(&CreateBranchReceiptDto {
-            id: receipt.id,
-            name: receipt.name,
-            hidden: receipt.hidden,
-            commit_id: receipt.commit_id,
-        })
-    }
-
-    #[wasm_bindgen(js_name = undo)]
-    pub async fn undo(&self) -> Result<JsValue, JsValue> {
-        let receipt = self
-            .instrument_operation(self.inner.undo())
-            .await
-            .map_err(lix_error_to_js)?;
-        to_js(&UndoReceiptDto {
-            branch_id: receipt.branch_id,
-            target_commit_id: receipt.target_commit_id,
-            inverse_commit_id: receipt.inverse_commit_id,
-        })
-    }
-
-    #[wasm_bindgen(js_name = redo)]
-    pub async fn redo(&self) -> Result<JsValue, JsValue> {
-        let receipt = self
-            .instrument_operation(self.inner.redo())
-            .await
-            .map_err(lix_error_to_js)?;
-        to_js(&RedoReceiptDto {
-            branch_id: receipt.branch_id,
-            target_commit_id: receipt.target_commit_id,
-            replay_commit_id: receipt.replay_commit_id,
-        })
-    }
-
-    #[wasm_bindgen(js_name = switchBranch)]
-    pub async fn switch_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        let options: SwitchBranchOptionsDto = from_js(options)?;
-        let receipt = self
-            .instrument_operation(self.inner.switch_branch(RsSwitchBranchOptions {
-                branch_id: options.branch_id,
-            }))
-            .await
-            .map_err(lix_error_to_js)?;
-        to_js(&SwitchBranchReceiptDto {
-            branch_id: receipt.branch_id,
         })
     }
 
@@ -982,30 +873,6 @@ impl WasmLix {
             "LIX_UNSUPPORTED_STORAGE",
             "importFilesystemPaths requires a filesystem storage",
         )))
-    }
-
-    #[wasm_bindgen(js_name = mergeBranchPreview)]
-    pub async fn merge_branch_preview(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        let options: MergeBranchOptionsDto = from_js(options)?;
-        let preview = self
-            .instrument_operation(self.inner.merge_branch_preview(MergeBranchPreviewOptions {
-                source_branch_id: options.source_branch_id,
-            }))
-            .await
-            .map_err(lix_error_to_js)?;
-        to_js(&MergeBranchPreviewDto::from(preview))
-    }
-
-    #[wasm_bindgen(js_name = mergeBranch)]
-    pub async fn merge_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        let options: MergeBranchOptionsDto = from_js(options)?;
-        let receipt = self
-            .instrument_operation(self.inner.merge_branch(RsMergeBranchOptions {
-                source_branch_id: options.source_branch_id,
-            }))
-            .await
-            .map_err(lix_error_to_js)?;
-        to_js(&MergeBranchReceiptDto::from(receipt))
     }
 
     #[wasm_bindgen(js_name = syncDiskToLix)]
@@ -1021,7 +888,10 @@ impl WasmLix {
         if self.closed.replace(true) {
             return Ok(());
         }
-        if let Err(error) = self.instrument_operation(self.inner.close()).await {
+        if let Err(error) = self
+            .instrument_operation(crate::session::SessionOperations::close(&self.inner))
+            .await
+        {
             self.closed.set(false);
             return Err(lix_error_to_js(error));
         }
@@ -1040,17 +910,6 @@ impl WasmLix {
     }
 }
 
-impl WasmLixTransaction {
-    fn instrument_operation<F: IntoFuture>(&self, future: F) -> impl Future<Output = F::Output> {
-        instrument_remote_parent(
-            self.telemetry_parent
-                .as_ref()
-                .and_then(|parent| parent.borrow_mut().take()),
-            future.into_future(),
-        )
-    }
-}
-
 #[wasm_bindgen]
 impl WasmLixTransaction {
     #[wasm_bindgen(js_name = execute)]
@@ -1061,18 +920,14 @@ impl WasmLixTransaction {
         options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
         let params = values_from_js(params)?;
-        let options = execute_options_from_js(options)?;
+        let options = session_execute_options_from_js(options)?;
         let telemetry_parent = self
             .telemetry_parent
             .as_ref()
             .and_then(|parent| parent.borrow_mut().take());
-        let inner = self.inner.as_mut().ok_or_else(transaction_closed_error)?;
-        let execution = inner.execute(&sql, &params);
-        let execution = match options {
-            Some(origin_key) => execution.with_origin_key(origin_key),
-            None => execution,
-        };
-        let result = instrument_remote_parent(telemetry_parent, execution.into_future())
+        let execution =
+            crate::session::TransactionOperations::execute(&mut self.inner, &sql, &params, options);
+        let result = instrument_remote_parent(telemetry_parent, execution)
             .await
             .map_err(lix_error_to_js)?;
         execute_result_to_js(result)
@@ -1080,18 +935,30 @@ impl WasmLixTransaction {
 
     #[wasm_bindgen(js_name = commit)]
     pub async fn commit(&mut self) -> Result<(), JsValue> {
-        let inner = self.inner.take().ok_or_else(transaction_closed_error)?;
-        self.instrument_operation(inner.commit())
-            .await
-            .map_err(lix_error_to_js)
+        let telemetry_parent = self
+            .telemetry_parent
+            .as_ref()
+            .and_then(|parent| parent.borrow_mut().take());
+        instrument_remote_parent(
+            telemetry_parent,
+            crate::session::TransactionOperations::commit(&mut self.inner),
+        )
+        .await
+        .map_err(lix_error_to_js)
     }
 
     #[wasm_bindgen(js_name = rollback)]
     pub async fn rollback(&mut self) -> Result<(), JsValue> {
-        let inner = self.inner.take().ok_or_else(transaction_closed_error)?;
-        self.instrument_operation(inner.rollback())
-            .await
-            .map_err(lix_error_to_js)
+        let telemetry_parent = self
+            .telemetry_parent
+            .as_ref()
+            .and_then(|parent| parent.borrow_mut().take());
+        instrument_remote_parent(
+            telemetry_parent,
+            crate::session::TransactionOperations::rollback(&mut self.inner),
+        )
+        .await
+        .map_err(lix_error_to_js)
     }
 }
 
@@ -1172,24 +1039,17 @@ impl WasmObserveEvents {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ExecuteOptionsDto {
-    origin_key: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(super) struct OpenAnotherSessionOptionsDto {
     pub(super) branch_id: Option<String>,
     pub(super) account_id: Option<String>,
 }
 
-pub(super) fn execute_options_from_js(options: Option<JsValue>) -> Result<Option<String>, JsValue> {
+fn session_execute_options_from_js(
+    options: Option<JsValue>,
+) -> Result<crate::session::ExecuteOptions, JsValue> {
     match options {
-        Some(value) if !value.is_null() && !value.is_undefined() => {
-            let options: ExecuteOptionsDto = from_js(value)?;
-            Ok(options.origin_key)
-        }
-        _ => Ok(None),
+        Some(value) if !value.is_null() && !value.is_undefined() => from_js(value),
+        _ => Ok(crate::session::ExecuteOptions::default()),
     }
 }
 
@@ -1620,13 +1480,6 @@ fn js_index(value: usize) -> f64 {
 
 fn invalid_param(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INVALID_PARAM, message.into())
-}
-
-fn transaction_closed_error() -> JsValue {
-    lix_error_to_js(LixError::new(
-        "LIX_INVALID_TRANSACTION_STATE",
-        "Lix transaction is closed",
-    ))
 }
 
 pub(super) fn observe_next_in_flight_error() -> JsValue {

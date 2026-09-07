@@ -92,8 +92,8 @@ impl NativeSnapshotExportBuilder {
 }
 
 enum NativeLixTransactionInner {
-    Memory(RsLixTransaction<Memory>),
-    FilesystemStorage(RsLixTransaction<FilesystemStorage>),
+    Memory(Option<RsLixTransaction<Memory>>),
+    FilesystemStorage(Option<RsLixTransaction<FilesystemStorage>>),
 }
 
 enum NativeObserveEventsInner {
@@ -1004,7 +1004,7 @@ fn handle_lix_command(
             None
         }
         LixCommand::ActiveAccountId(deferred) => {
-            settle_deferred(deferred, Ok(state.lix.active_account_id().to_string()));
+            settle_deferred(deferred, block_on!(state.lix.active_account_id()));
             None
         }
         LixCommand::CreateBranch { options, deferred } => {
@@ -1063,8 +1063,16 @@ fn handle_lix_command(
                 );
                 return None;
             }
+            let builder = match block_on!(state.lix.snapshot_export_builder()) {
+                Ok(builder) => builder,
+                Err(error) => {
+                    state.snapshot_export_active.store(false, Ordering::SeqCst);
+                    finish_native_snapshot_export(sender, completion, Err(error));
+                    return None;
+                }
+            };
             let job = NativeSnapshotExportJob {
-                builder: state.lix.snapshot_export_builder(),
+                builder,
                 sender,
                 completion,
                 telemetry_parent,
@@ -1102,7 +1110,7 @@ fn handle_lix_command(
             deferred,
         } => {
             let result = block_on!(async {
-                state.lix.observe(&sql, &params).and_then(|events| {
+                state.lix.observe(&sql, &params).await.and_then(|events| {
                     NativeObserveEvents::new(events, telemetry_parent).map_err(|error| {
                         LixError::unknown(format!("failed to start observe actor: {error}"))
                     })
@@ -1296,13 +1304,17 @@ impl NativeLixInner {
         }
     }
 
-    fn snapshot_export_builder(&self) -> NativeSnapshotExportBuilder {
-        match self {
-            Self::Memory(lix) => NativeSnapshotExportBuilder::Memory(lix.export_snapshot()),
-            Self::FilesystemStorage(lix, _, _) => {
-                NativeSnapshotExportBuilder::FilesystemStorage(lix.export_snapshot())
-            }
-        }
+    async fn snapshot_export_builder(
+        &self,
+    ) -> std::result::Result<NativeSnapshotExportBuilder, LixError> {
+        Ok(match self {
+            Self::Memory(lix) => NativeSnapshotExportBuilder::Memory(
+                crate::session::SessionOperations::export_snapshot(lix).await?,
+            ),
+            Self::FilesystemStorage(lix, _, _) => NativeSnapshotExportBuilder::FilesystemStorage(
+                crate::session::SessionOperations::export_snapshot(lix).await?,
+            ),
+        })
     }
 
     async fn execute(
@@ -1311,20 +1323,16 @@ impl NativeLixInner {
         params: &[Value],
         options: Option<String>,
     ) -> std::result::Result<RsExecuteResult, LixError> {
+        let options = crate::session::ExecuteOptions {
+            origin_key: options,
+            ..Default::default()
+        };
         match self {
             Self::Memory(lix) => {
-                let execution = lix.execute(sql, params);
-                match options {
-                    Some(origin_key) => execution.with_origin_key(origin_key).await,
-                    None => execution.await,
-                }
+                crate::session::SessionOperations::execute(lix, sql, params, options).await
             }
             Self::FilesystemStorage(lix, _, _) => {
-                let execution = lix.execute(sql, params);
-                match options {
-                    Some(origin_key) => execution.with_origin_key(origin_key).await,
-                    None => execution.await,
-                }
+                crate::session::SessionOperations::execute(lix, sql, params, options).await
             }
         }
     }
@@ -1334,59 +1342,61 @@ impl NativeLixInner {
         statements: &[RsExecuteBatchStatement],
         options: Option<String>,
     ) -> std::result::Result<Vec<RsExecuteResult>, LixError> {
+        let options = crate::session::ExecuteOptions {
+            origin_key: options,
+            ..Default::default()
+        };
         match self {
             Self::Memory(lix) => {
-                let execution = lix.execute_batch(statements);
-                match options {
-                    Some(origin_key) => execution.with_origin_key(origin_key).await,
-                    None => execution.await,
-                }
+                crate::session::SessionOperations::execute_batch(lix, statements, options).await
             }
             Self::FilesystemStorage(lix, _, _) => {
-                let execution = lix.execute_batch(statements);
-                match options {
-                    Some(origin_key) => execution.with_origin_key(origin_key).await,
-                    None => execution.await,
-                }
+                crate::session::SessionOperations::execute_batch(lix, statements, options).await
             }
         }
     }
 
     async fn begin_transaction(&self) -> std::result::Result<NativeLixTransactionInner, LixError> {
         match self {
-            Self::Memory(lix) => Ok(NativeLixTransactionInner::Memory(
-                lix.begin_transaction().await?,
-            )),
+            Self::Memory(lix) => Ok(NativeLixTransactionInner::Memory(Some(
+                crate::session::SessionOperations::begin_transaction(lix).await?,
+            ))),
             Self::FilesystemStorage(lix, _, _) => Ok(NativeLixTransactionInner::FilesystemStorage(
-                lix.begin_transaction().await?,
+                Some(crate::session::SessionOperations::begin_transaction(lix).await?),
             )),
         }
     }
 
-    fn observe(
+    async fn observe(
         &self,
         sql: &str,
         params: &[Value],
     ) -> std::result::Result<NativeObserveEventsInner, LixError> {
         match self {
-            Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(lix.observe(sql, params)?)),
+            Self::Memory(lix) => Ok(NativeObserveEventsInner::Memory(
+                crate::session::SessionOperations::observe(lix, sql, params).await?,
+            )),
             Self::FilesystemStorage(lix, _, _) => Ok(NativeObserveEventsInner::FilesystemStorage(
-                lix.observe(sql, params)?,
+                crate::session::SessionOperations::observe(lix, sql, params).await?,
             )),
         }
     }
 
     async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
         match self {
-            Self::Memory(lix) => lix.active_branch_id().await,
-            Self::FilesystemStorage(lix, _, _) => lix.active_branch_id().await,
+            Self::Memory(lix) => crate::session::SessionOperations::active_branch_id(lix).await,
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::active_branch_id(lix).await
+            }
         }
     }
 
-    fn active_account_id(&self) -> &str {
+    async fn active_account_id(&self) -> std::result::Result<String, LixError> {
         match self {
-            Self::Memory(lix) => lix.active_account_id(),
-            Self::FilesystemStorage(lix, _, _) => lix.active_account_id(),
+            Self::Memory(lix) => crate::session::SessionOperations::active_account_id(lix).await,
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::active_account_id(lix).await
+            }
         }
     }
 
@@ -1395,22 +1405,30 @@ impl NativeLixInner {
         options: RsCreateBranchOptions,
     ) -> std::result::Result<CreateBranchReceipt, LixError> {
         match self {
-            Self::Memory(lix) => lix.create_branch(options).await,
-            Self::FilesystemStorage(lix, _, _) => lix.create_branch(options).await,
+            Self::Memory(lix) => {
+                crate::session::SessionOperations::create_branch(lix, options).await
+            }
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::create_branch(lix, options).await
+            }
         }
     }
 
     async fn undo(&self) -> std::result::Result<UndoReceipt, LixError> {
         match self {
-            Self::Memory(lix) => lix.undo().await,
-            Self::FilesystemStorage(lix, _, _) => lix.undo().await,
+            Self::Memory(lix) => crate::session::SessionOperations::undo(lix).await,
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::undo(lix).await
+            }
         }
     }
 
     async fn redo(&self) -> std::result::Result<RedoReceipt, LixError> {
         match self {
-            Self::Memory(lix) => lix.redo().await,
-            Self::FilesystemStorage(lix, _, _) => lix.redo().await,
+            Self::Memory(lix) => crate::session::SessionOperations::redo(lix).await,
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::redo(lix).await
+            }
         }
     }
 
@@ -1419,8 +1437,12 @@ impl NativeLixInner {
         options: RsSwitchBranchOptions,
     ) -> std::result::Result<SwitchBranchReceipt, LixError> {
         match self {
-            Self::Memory(lix) => lix.switch_branch(options).await,
-            Self::FilesystemStorage(lix, _, _) => lix.switch_branch(options).await,
+            Self::Memory(lix) => {
+                crate::session::SessionOperations::switch_branch(lix, options).await
+            }
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::switch_branch(lix, options).await
+            }
         }
     }
 
@@ -1442,8 +1464,12 @@ impl NativeLixInner {
         options: MergeBranchPreviewOptions,
     ) -> std::result::Result<MergeBranchPreview, LixError> {
         match self {
-            Self::Memory(lix) => lix.merge_branch_preview(options).await,
-            Self::FilesystemStorage(lix, _, _) => lix.merge_branch_preview(options).await,
+            Self::Memory(lix) => {
+                crate::session::SessionOperations::merge_branch_preview(lix, options).await
+            }
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::merge_branch_preview(lix, options).await
+            }
         }
     }
 
@@ -1452,8 +1478,12 @@ impl NativeLixInner {
         options: RsMergeBranchOptions,
     ) -> std::result::Result<MergeBranchReceipt, LixError> {
         match self {
-            Self::Memory(lix) => lix.merge_branch(options).await,
-            Self::FilesystemStorage(lix, _, _) => lix.merge_branch(options).await,
+            Self::Memory(lix) => {
+                crate::session::SessionOperations::merge_branch(lix, options).await
+            }
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::merge_branch(lix, options).await
+            }
         }
     }
 
@@ -1469,12 +1499,12 @@ impl NativeLixInner {
 
     async fn close(&self) -> std::result::Result<(), LixError> {
         match self {
-            Self::Memory(lix) => lix.close().await,
+            Self::Memory(lix) => crate::session::SessionOperations::close(lix).await,
             Self::FilesystemStorage(lix, storage, sessions) => {
                 if sessions.fetch_sub(1, Ordering::SeqCst) == 1 {
                     storage.stop_sync().await?;
                 }
-                lix.close().await
+                crate::session::SessionOperations::close(lix).await
             }
         }
     }
@@ -1484,25 +1514,21 @@ impl NativeLixInner {
         options: NativeOpenAnotherSessionOptions,
     ) -> std::result::Result<Self, LixError> {
         match self {
-            Self::Memory(lix) => {
-                let mut builder = lix.open_another_session();
-                if let Some(branch_id) = options.branch_id {
-                    builder = builder.with_branch(branch_id);
-                }
-                if let Some(account_id) = options.account_id {
-                    builder = builder.with_account(account_id);
-                }
-                Ok(Self::Memory(builder.await?))
-            }
+            Self::Memory(lix) => Ok(Self::Memory(
+                crate::session::SessionOperations::open_another_session(
+                    lix,
+                    options.branch_id,
+                    options.account_id,
+                )
+                .await?,
+            )),
             Self::FilesystemStorage(lix, storage, sessions) => {
-                let mut builder = lix.open_another_session();
-                if let Some(branch_id) = options.branch_id {
-                    builder = builder.with_branch(branch_id);
-                }
-                if let Some(account_id) = options.account_id {
-                    builder = builder.with_account(account_id);
-                }
-                let opened = builder.await?;
+                let opened = crate::session::SessionOperations::open_another_session(
+                    lix,
+                    options.branch_id,
+                    options.account_id,
+                )
+                .await?;
                 sessions.fetch_add(1, Ordering::SeqCst);
                 Ok(Self::FilesystemStorage(
                     opened,
@@ -1521,35 +1547,41 @@ impl NativeLixTransactionInner {
         params: &[Value],
         options: Option<String>,
     ) -> std::result::Result<RsExecuteResult, LixError> {
+        let options = crate::session::ExecuteOptions {
+            origin_key: options,
+            ..Default::default()
+        };
         match self {
             Self::Memory(transaction) => {
-                let execution = transaction.execute(sql, params);
-                match options {
-                    Some(origin_key) => execution.with_origin_key(origin_key).await,
-                    None => execution.await,
-                }
+                crate::session::TransactionOperations::execute(transaction, sql, params, options)
+                    .await
             }
             Self::FilesystemStorage(transaction) => {
-                let execution = transaction.execute(sql, params);
-                match options {
-                    Some(origin_key) => execution.with_origin_key(origin_key).await,
-                    None => execution.await,
-                }
+                crate::session::TransactionOperations::execute(transaction, sql, params, options)
+                    .await
             }
         }
     }
 
     async fn commit(self) -> std::result::Result<(), LixError> {
         match self {
-            Self::Memory(transaction) => transaction.commit().await,
-            Self::FilesystemStorage(transaction) => transaction.commit().await,
+            Self::Memory(mut transaction) => {
+                crate::session::TransactionOperations::commit(&mut transaction).await
+            }
+            Self::FilesystemStorage(mut transaction) => {
+                crate::session::TransactionOperations::commit(&mut transaction).await
+            }
         }
     }
 
     async fn rollback(self) -> std::result::Result<(), LixError> {
         match self {
-            Self::Memory(transaction) => transaction.rollback().await,
-            Self::FilesystemStorage(transaction) => transaction.rollback().await,
+            Self::Memory(mut transaction) => {
+                crate::session::TransactionOperations::rollback(&mut transaction).await
+            }
+            Self::FilesystemStorage(mut transaction) => {
+                crate::session::TransactionOperations::rollback(&mut transaction).await
+            }
         }
     }
 }

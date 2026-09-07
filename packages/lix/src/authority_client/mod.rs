@@ -3,6 +3,7 @@
 mod blobs;
 mod http;
 mod observe;
+mod snapshot;
 mod sse;
 pub(crate) mod wire;
 
@@ -42,6 +43,8 @@ pub use http::{
     ProtocolByteStream, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse, ProtocolHttpStream,
 };
 pub use observe::ProtocolObserveEvents;
+#[cfg(feature = "server-protocol-client")]
+pub use snapshot::ProtocolSnapshotExport;
 #[cfg(feature = "server-protocol-client")]
 pub use wire::{SERVER_CLOSED_CODE, SESSION_GONE_CODE};
 
@@ -143,6 +146,19 @@ pub async fn open_protocol_client<H: ProtocolHttp + Clone + 'static>(
     base_url: impl Into<String>,
     initial_active_branch_id: Option<String>,
 ) -> Result<ProtocolClient<H>, LixError> {
+    open_protocol_client_at_base(
+        http,
+        normalize_protocol_base_url(&base_url.into())?,
+        initial_active_branch_id,
+    )
+    .await
+}
+
+async fn open_protocol_client_at_base<H: ProtocolHttp + Clone + 'static>(
+    http: H,
+    base_url: String,
+    initial_active_branch_id: Option<String>,
+) -> Result<ProtocolClient<H>, LixError> {
     if let Some(branch_id) = &initial_active_branch_id
         && branch_id.is_empty()
     {
@@ -153,7 +169,7 @@ pub async fn open_protocol_client<H: ProtocolHttp + Clone + 'static>(
     }
     let core = ClientCore {
         http: Arc::new(http),
-        base_url: normalize_protocol_base_url(&base_url.into())?,
+        base_url,
             state: Arc::new(std::sync::Mutex::new(ClientState {
                 session_id: None,
                 active_branch_id: None,
@@ -737,7 +753,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
         .await
     }
 
-    pub(crate) async fn merge_branch(
+    pub async fn merge_branch(
         &self,
         options: MergeBranchOptions,
     ) -> Result<MergeBranchReceipt, LixError> {
@@ -760,7 +776,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
         .await
     }
 
-    pub(crate) async fn merge_branch_preview(
+    pub async fn merge_branch_preview(
         &self,
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
@@ -858,6 +874,40 @@ impl<H: ProtocolHttp> ClientCore<H> {
 }
 
 impl<H: ProtocolHttp + Clone + 'static> ProtocolClient<H> {
+    /// Opens an independent session on the same repository and authenticated account.
+    pub async fn open_another_session(
+        &self,
+        branch_id: Option<String>,
+        account_id: Option<String>,
+    ) -> Result<Self, LixError> {
+        self.ensure_usable()?;
+        let parent_account_id = self.active_account_id().await?;
+        if account_id.as_ref().is_some_and(|id| id != &parent_account_id) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "remote sessions cannot override the authenticated account",
+            ));
+        }
+        let branch_id = match branch_id {
+            Some(branch_id) => branch_id,
+            None => self.active_branch_id().await?,
+        };
+        let child = open_protocol_client_at_base(
+            self.http().clone(),
+            self.base_url.clone(),
+            Some(branch_id),
+        )
+        .await?;
+        if child.active_account_id().await? != parent_account_id {
+            let _ = child.close().await;
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "remote session authentication changed while opening another session",
+            ));
+        }
+        Ok(child)
+    }
+
     pub async fn observe(
         &self,
         sql: &str,

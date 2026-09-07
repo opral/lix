@@ -86,6 +86,135 @@ test("remote exportSnapshot streams the canonical authenticated endpoint", async
 	await lix.close();
 });
 
+test("remote snapshots remain available on child and grandchild sessions", async () => {
+	let handshakes = 0;
+	let snapshots = 0;
+	let responseMode: "bytes" | "error" | "empty-error" | "stream" = "bytes";
+	const cancelled = vi.fn();
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				if (request.method === "DELETE")
+					return new Response(null, { status: 204 });
+				if (!new URL(request.url).pathname.endsWith("/snapshot")) {
+					return Response.json({
+						protocolVersion: 6,
+						activeBranchId: "main-id",
+						activeAccountId: "00000000-0000-7000-8000-000000000002",
+						sessionId: `session-${++handshakes}`,
+					});
+				}
+				snapshots += 1;
+				expect(request.headers.has("lix-session-id")).toBe(false);
+				if (responseMode === "empty-error") {
+					return new Response(null, { status: 403 });
+				}
+				if (responseMode === "error") {
+					return Response.json(
+						{
+							error: {
+								code: "LIX_SNAPSHOT_TEST_ERROR",
+								message: "snapshot denied",
+							},
+						},
+						{ status: 403 },
+					);
+				}
+				if (responseMode === "stream") {
+					return new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								controller.enqueue(new Uint8Array([1]));
+							},
+							cancel: cancelled,
+						}),
+					);
+				}
+				return new Response(new Uint8Array([0x4c, 0x49, 0x58]));
+			},
+		},
+	});
+	const child = await lix.openAnotherSession();
+	const grandchild = await child.openAnotherSession();
+	try {
+		for (const session of [lix, child, grandchild]) {
+			expect(
+				new Uint8Array(
+					await new Response(session.exportSnapshot()).arrayBuffer(),
+				),
+			).toEqual(new Uint8Array([0x4c, 0x49, 0x58]));
+		}
+		expect(handshakes).toBe(3);
+		expect(snapshots).toBe(3);
+		responseMode = "error";
+		await expect(
+			new Response(child.exportSnapshot()).arrayBuffer(),
+		).rejects.toMatchObject({ code: "LIX_SNAPSHOT_TEST_ERROR" });
+		responseMode = "empty-error";
+		await expect(
+			new Response(child.exportSnapshot()).arrayBuffer(),
+		).rejects.toMatchObject({
+			code: "LIX_REMOTE_REQUEST_FAILED",
+			details: { httpStatus: 403 },
+		});
+		responseMode = "stream";
+		const reader = grandchild.exportSnapshot().getReader();
+		await expect(reader.read()).resolves.toEqual({
+			done: false,
+			value: new Uint8Array([1]),
+		});
+		await reader.cancel();
+		await vi.waitFor(() => expect(cancelled).toHaveBeenCalledOnce());
+		await lix.close();
+		responseMode = "bytes";
+		expect(
+			new Uint8Array(
+				await new Response(grandchild.exportSnapshot()).arrayBuffer(),
+			),
+		).toEqual(new Uint8Array([0x4c, 0x49, 0x58]));
+	} finally {
+		await Promise.all([lix.close(), child.close(), grandchild.close()]);
+	}
+});
+
+test("remote snapshot cancellation does not wait for pending authentication headers", async () => {
+	const headersStarted = deferred<void>();
+	const releaseHeaders = deferred<Record<string, string>>();
+	let headerCalls = 0;
+	const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+		const request = new Request(input, init);
+		if (request.method === "DELETE") return new Response(null, { status: 204 });
+		return handshakeResponse();
+	});
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+			fetch,
+			headers: () => {
+				if (++headerCalls !== 2) return {};
+				headersStarted.resolve();
+				return releaseHeaders.promise;
+			},
+		},
+	});
+	try {
+		const reader = lix.exportSnapshot().getReader();
+		const reading = reader.read();
+		await headersStarted.promise;
+		await reader.cancel();
+		await expect(reading).resolves.toEqual({ done: true, value: undefined });
+		expect(fetch).toHaveBeenCalledOnce();
+	} finally {
+		releaseHeaders.resolve({});
+		await lix.close();
+	}
+	expect(fetch).toHaveBeenCalledTimes(2); // Handshake and close; no snapshot request.
+});
+
 test("Lix Server Protocol handshake requests a restored initial active branch", async () => {
 	const accountId = "01920000-0000-7000-8000-000000000601";
 	const requests: Request[] = [];
@@ -1319,26 +1448,69 @@ test("remote beginTransaction uses one capability-bound server lifecycle", async
 	]);
 });
 
-test("remote mode rejects unsupported local-only operations honestly", async () => {
+test("remote preview and merge forward source branch and preserve engine receipts", async () => {
+	const requests: Array<{
+		path: string;
+		session: string | null;
+		body: unknown;
+	}> = [];
+	const changeStats = { total: 3, added: 1, modified: 1, removed: 1 };
+	const preview = {
+		outcome: "mergeCommitted",
+		targetBranchId: "main-id",
+		sourceBranchId: "source",
+		baseCommitId: "base",
+		targetHeadCommitId: "target",
+		sourceHeadCommitId: "source-head",
+		changeStats,
+		conflicts: [],
+	};
+	const receipt = {
+		outcome: "mergeCommitted",
+		targetBranchId: "main-id",
+		sourceBranchId: "source",
+		baseCommitId: "base",
+		targetHeadBeforeCommitId: "target",
+		sourceHeadBeforeCommitId: "source-head",
+		targetHeadAfterCommitId: "merged",
+		createdMergeCommitId: "merged",
+		changeStats,
+	};
 	const lix = await openLix({
 		server: {
 			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
-			fetch: (async () =>
-				Response.json({
-					protocolVersion: 6,
-					activeBranchId: "main-id",
-					activeAccountId: "00000000-0000-7000-8000-000000000002",
-					sessionId: "session-1",
-				})) as typeof fetch,
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				if (request.method === "GET") return handshakeResponse();
+				if (request.method === "DELETE")
+					return new Response(null, { status: 204 });
+				const path = new URL(request.url).pathname;
+				requests.push({
+					path,
+					session: request.headers.get("lix-session-id"),
+					body: await requestJson(request),
+				});
+				return Response.json(
+					path.endsWith("/merge-preview") ? preview : receipt,
+				);
+			},
 		},
 	});
 
 	await expect(
-		lix.mergeBranch({ sourceBranchId: "source" }),
-	).rejects.toMatchObject({
-		code: "LIX_UNSUPPORTED_REMOTE_OPERATION",
-	});
+		lix.mergeBranchPreview({ sourceBranchId: "source" }),
+	).resolves.toEqual(preview);
+	await expect(lix.mergeBranch({ sourceBranchId: "source" })).resolves.toEqual(
+		receipt,
+	);
+	expect(requests).toEqual(
+		["merge-preview", "merge"].map((operation) => ({
+			path: `/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/branch/${operation}`,
+			session: "session-1",
+			body: { sourceBranchId: "source" },
+		})),
+	);
 	await lix.close();
 	await expect(lix.execute("SELECT 1")).rejects.toMatchObject({
 		code: "LIX_ERROR_CLOSED",
