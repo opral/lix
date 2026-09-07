@@ -55,3 +55,7 @@ application. `npm run benchmark` reports raw samples plus p50/p95 for warm Lix
 reopen, local execute-through-observer delivery, and the 10k/1M-row storage
 scorecards. `npm run benchmark:multi-tab` reports cross-tab observer delivery
 and owner-failover recovery from packed production artifacts.
+
+Run these benchmarks manually when investigating performance. CI/CD runs the
+functional browser tests and publishes the tested SDK artifact without running
+the OPFS performance budgets.
