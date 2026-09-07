@@ -767,7 +767,7 @@ impl NativeLixActor {
             return;
         };
         if self.closed.load(Ordering::SeqCst) {
-            settle_deferred(deferred, Err(lix_closed_error()));
+            settle_command_after_close(command(deferred));
             return;
         }
         let queued = QueuedLixCommand {
@@ -872,14 +872,15 @@ fn run_lix_actor(
             drain_commands_after_close(&receiver, &send_lock);
             break;
         }
-        if handle_lix_command(
-            &rt,
-            open_state,
-            &closed,
-            queued.command,
-            queued.telemetry_parent,
-        ) {
+        if let Some(deferred) =
+            handle_lix_command(&rt, open_state, queued.command, queued.telemetry_parent)
+        {
+            // Closing the session does not drop its storage ownership. Release
+            // the actor state before publishing completion, including the flag
+            // used by repeated close calls to resolve without queueing.
             drop(state.take());
+            closed.store(true, Ordering::SeqCst);
+            settle_deferred(deferred, Ok(()));
             drain_commands_after_close(&receiver, &send_lock);
             break;
         }
@@ -940,10 +941,9 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
 fn handle_lix_command(
     rt: &Runtime,
     state: &mut NativeLixActorState,
-    closed: &AtomicBool,
     command: LixCommand,
     telemetry_parent: Option<SpanContext>,
-) -> bool {
+) -> Option<NativeUnitDeferred> {
     macro_rules! block_on {
         ($future:expr) => {
             rt.block_on(instrument_remote_parent(telemetry_parent.clone(), $future))
@@ -958,7 +958,7 @@ fn handle_lix_command(
             let result = block_on!(state.lix.open_another_session(options))
                 .and_then(|lix| NativeLix::new(lix, telemetry_parent));
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::Execute {
             sql,
@@ -969,7 +969,7 @@ fn handle_lix_command(
             let result = block_on!(state.lix.execute(&sql, &params, options))
                 .and_then(ExecuteResult::try_from);
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::ExecuteBatch {
             statements,
@@ -984,7 +984,7 @@ fn handle_lix_command(
                         .collect::<std::result::Result<Vec<_>, _>>()
                 });
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::BeginTransaction {
             transaction_id,
@@ -996,60 +996,60 @@ fn handle_lix_command(
                 NativeLixTransaction::new(actor, transaction_id)
             });
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::ActiveBranchId(deferred) => {
             let result = block_on!(state.lix.active_branch_id());
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::ActiveAccountId(deferred) => {
             settle_deferred(deferred, Ok(state.lix.active_account_id().to_string()));
-            false
+            None
         }
         LixCommand::CreateBranch { options, deferred } => {
             let result =
                 block_on!(state.lix.create_branch(options)).map(CreateBranchReceiptDto::from);
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::Undo(deferred) => {
             let result = block_on!(state.lix.undo()).map(UndoReceiptDto::from);
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::Redo(deferred) => {
             let result = block_on!(state.lix.redo()).map(RedoReceiptDto::from);
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::SwitchBranch { options, deferred } => {
             let result =
                 block_on!(state.lix.switch_branch(options)).map(SwitchBranchReceiptDto::from);
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::ImportFilesystemPaths { paths, deferred } => {
             let result = block_on!(state.lix.import_filesystem_paths(paths));
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::MergeBranchPreview { options, deferred } => {
             let result =
                 block_on!(state.lix.merge_branch_preview(options)).map(MergeBranchPreviewDto::from);
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::MergeBranch { options, deferred } => {
             let result =
                 block_on!(state.lix.merge_branch(options)).map(MergeBranchReceiptDto::from);
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::SyncDiskToLix(deferred) => {
             let result = block_on!(state.lix.sync_disk_to_lix());
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::ExportSnapshot { sender, completion } => {
             if state.snapshot_export_active.swap(true, Ordering::SeqCst) {
@@ -1061,7 +1061,7 @@ fn handle_lix_command(
                         "a native snapshot export is already active; finish or cancel it before starting another",
                     )),
                 );
-                return false;
+                return None;
             }
             let job = NativeSnapshotExportJob {
                 builder: state.lix.snapshot_export_builder(),
@@ -1083,16 +1083,17 @@ fn handle_lix_command(
                     );
                 }
             }
-            false
+            None
         }
         LixCommand::Close(deferred) => {
             let result = block_on!(state.lix.close());
-            let should_drop_state = result.is_ok();
-            if result.is_ok() {
-                closed.store(true, Ordering::SeqCst);
+            match result {
+                Ok(()) => Some(deferred),
+                Err(error) => {
+                    settle_deferred(deferred, Err(error));
+                    None
+                }
             }
-            settle_deferred(deferred, result);
-            should_drop_state
         }
         LixCommand::Observe {
             sql,
@@ -1108,7 +1109,7 @@ fn handle_lix_command(
                 })
             });
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::TransactionExecute {
             transaction_id,
@@ -1125,7 +1126,7 @@ fn handle_lix_command(
                 },
             );
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::TransactionCommit {
             transaction_id,
@@ -1136,7 +1137,7 @@ fn handle_lix_command(
                 |transaction| block_on!(transaction.commit()),
             );
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::TransactionRollback {
             transaction_id,
@@ -1147,13 +1148,13 @@ fn handle_lix_command(
                 |transaction| block_on!(transaction.rollback()),
             );
             settle_deferred(deferred, result);
-            false
+            None
         }
         LixCommand::TransactionAbandon { transaction_id } => {
             if let Some(transaction) = state.transactions.remove(&transaction_id) {
                 let _ = block_on!(transaction.rollback());
             }
-            false
+            None
         }
     }
 }
