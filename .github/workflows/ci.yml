@@ -31,9 +31,76 @@ defaults:
     shell: bash --noprofile --norc -o errexit -o nounset -o pipefail -o xtrace -O nullglob -O dotglob {0}
 
 jobs:
+  merge-reuse:
+    name: Reuse tested merge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      reuse: ${{ steps.reuse.outputs.reuse }}
+      run_id: ${{ steps.reuse.outputs.run_id }}
+      revision: ${{ steps.reuse.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find successful PR validation of the exact merged tree
+        id: reuse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { selectMergeReuse } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/ci-merge-reuse.mjs`);
+            await selectMergeReuse({ github, context, core });
+
+  promote-browser-sdk:
+    name: Reuse tested browser SDK
+    needs: merge-reuse
+    if: needs.merge-reuse.outputs.reuse == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lix-browser-sdk-${{ needs.merge-reuse.outputs.revision }}
+          run-id: ${{ needs.merge-reuse.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Record identical-tree artifact provenance
+        env:
+          SOURCE_REVISION: ${{ needs.merge-reuse.outputs.revision }}
+          SOURCE_RUN: ${{ needs.merge-reuse.outputs.run_id }}
+        run: |
+          node --input-type=module - <<'EOF'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const path = 'ci-artifact/browser.json';
+          const manifest = JSON.parse(readFileSync(path, 'utf8'));
+          if (manifest.schemaVersion !== 1 || manifest.kind !== 'lix-browser-sdk' ||
+              manifest.sourceRevision !== process.env.SOURCE_REVISION) {
+            throw new Error('Unexpected source artifact provenance');
+          }
+          manifest.reusedFromRevision = manifest.sourceRevision;
+          manifest.reusedFromRun = process.env.SOURCE_RUN;
+          manifest.sourceRevision = process.env.GITHUB_SHA;
+          writeFileSync(path, JSON.stringify(manifest, null, 2));
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lix-browser-sdk-${{ github.sha }}
+          path: |
+            packages/js-sdk/dist
+            packages/storage-opfs/dist
+            ci-artifact/browser.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
   changelog:
     name: Changelog
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: merge-reuse
+    if: needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-24.04
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
@@ -44,6 +111,29 @@ jobs:
         with:
           # Include both parents of the tested PR merge for scope detection.
           fetch-depth: 2
+
+      # Rust validates the checkout merge tree; SDK jobs validate the PR head.
+      # This evidence is reusable only after the entire workflow succeeds.
+      - name: Record tested source trees
+        env:
+          SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          node --input-type=module - <<'EOF'
+          import { execFileSync } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+          const tree = ref => execFileSync('git', ['rev-parse', `${ref}^{tree}`], { encoding: 'utf8' }).trim();
+          writeFileSync('tested-source.json', JSON.stringify({
+            schemaVersion: 1,
+            sourceRevision: process.env.SOURCE_REVISION,
+            sourceTree: tree(process.env.SOURCE_REVISION),
+            testedTree: tree('HEAD'),
+          }));
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-tested-source
+          path: tested-source.json
+          retention-days: 90
 
       - name: Select Rust CI scope
         id: scope
@@ -56,11 +146,12 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/ci-workflow.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-server-image.test.mjs
+        run: node --test scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-server-image.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: merge-reuse
+    if: needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -338,7 +429,8 @@ jobs:
 
   js-sdk-test:
     name: JS SDK ${{ matrix.name }} Test
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: merge-reuse
+    if: needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ${{ inputs.runner_provider == 'blacksmith' && matrix.blacksmith_runner || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
@@ -553,18 +645,18 @@ jobs:
           }, null, 2));
           EOF
 
-      - name: Share browser SDK with performance checks
+      - name: Upload tested browser SDK for submodule consumers
         if: matrix.runtime == 'browser'
         uses: actions/upload-artifact@v4
         with:
-          name: lix-browser-sdk-build-${{ env.LIX_SOURCE_SHA }}
+          name: lix-browser-sdk-${{ env.LIX_SOURCE_SHA }}
           path: |
             packages/js-sdk/dist
             packages/storage-opfs/dist
             ci-artifact/browser.json
           if-no-files-found: error
           compression-level: 0
-          retention-days: 1
+          retention-days: 90
 
       - name: Cache successfully tested SDK binaries
         if: steps.binary-cache.outputs.reuse != 'true' && steps.binaries.outputs.cache-hit != 'true'
@@ -578,63 +670,6 @@ jobs:
         run: |
           df -h "$GITHUB_WORKSPACE"
           free -h
-
-  opfs-benchmarks:
-    name: OPFS performance budgets
-    needs: js-sdk-test
-    # Preserve hardware-sensitive latency budgets on Blacksmith. This small
-    # job downloads the functional-test output and never recompiles Rust/Wasm.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
-    env:
-      LIX_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.LIX_SOURCE_SHA }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            packages/js-sdk/package-lock.json
-            packages/storage-opfs/package-lock.json
-
-      - name: Install browser test dependencies
-        run: |
-          npm --prefix packages/js-sdk ci
-          npm --prefix packages/storage-opfs ci
-
-      - name: Download functionally tested browser SDK
-        uses: actions/download-artifact@v4
-        with:
-          name: lix-browser-sdk-build-${{ env.LIX_SOURCE_SHA }}
-
-      - name: Install Chromium
-        working-directory: packages/js-sdk
-        run: npx playwright install --with-deps chromium
-
-      - name: Check OPFS performance budgets with the existing SDK
-        working-directory: packages/storage-opfs
-        run: |
-          npm run benchmark
-          npm run benchmark:multi-tab
-
-      - name: Upload tested browser SDK for submodule consumers
-        uses: actions/upload-artifact@v4
-        with:
-          name: lix-browser-sdk-${{ env.LIX_SOURCE_SHA }}
-          path: |
-            packages/js-sdk/dist
-            packages/storage-opfs/dist
-            ci-artifact/browser.json
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 90
 
   preview-artifact-changes:
     name: Select preview artifacts

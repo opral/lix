@@ -64,8 +64,9 @@ test("Rust scope gates only Rust jobs and keeps both SDK integration suites", ()
 	assert.match(cargo, /if: needs\.changelog\.outputs\.rust != 'false'/);
 	const sdk = workflow
 		.split("\n  js-sdk-test:\n")[1]
-		.split("\n  opfs-benchmarks:\n")[0];
-	assert.doesNotMatch(sdk, /needs:|outputs\.rust/);
+		.split("\n  preview-artifact-changes:\n")[0];
+	assert.match(sdk, /needs: merge-reuse/);
+	assert.doesNotMatch(sdk, /outputs\.rust/);
 	assert.match(workflow, /fetch-depth: 2/);
 	assert.match(workflow, /rust: \$\{\{ steps\.scope\.outputs\.rust \}\}/);
 	assert.match(workflow, /run: node scripts\/ci-rust-scope\.mjs/);
@@ -143,30 +144,35 @@ test("green SDK jobs retain exact-revision artifacts for submodule consumers", (
 	assert.doesNotMatch(workflow, /CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"/);
 });
 
-test("OPFS latency budgets reuse the tested SDK without compiling on Blacksmith", () => {
+test("browser artifacts publish after functional tests without OPFS benchmarks", () => {
 	const sdk = workflow
 		.split("\n  js-sdk-test:\n")[1]
-		.split("\n  opfs-benchmarks:\n")[0];
-	const benchmarks = workflow
-		.split("\n  opfs-benchmarks:\n")[1]
 		.split("\n  preview-artifact-changes:\n")[0];
-	assert.match(sdk, /name: lix-browser-sdk-build-\$\{\{ env\.LIX_SOURCE_SHA \}\}/);
-	assert.doesNotMatch(sdk, /npm run benchmark/);
-	assert.match(benchmarks, /needs: js-sdk-test/);
-	assert.match(benchmarks, /runs-on: blacksmith-4vcpu-ubuntu-2404/);
-	assert.match(
-		benchmarks,
-		/uses: actions\/download-artifact@v4[\s\S]*?name: lix-browser-sdk-build-\$\{\{ env\.LIX_SOURCE_SHA \}\}/,
-	);
-	assert.match(benchmarks, /npm run benchmark\n\s+npm run benchmark:multi-tab/);
-	assert.doesNotMatch(
-		benchmarks,
-		/\brustup\b|\bcargo\b|\bbuild:(?:native|wasm|plugins|browser)\b/,
-	);
+	const upload = sdk
+		.split("name: Upload tested browser SDK for submodule consumers\n")[1]
+		.split("\n      - name:")[0];
+	assert.match(upload, /if: matrix\.runtime == 'browser'/);
+	assert.match(upload, /uses: actions\/upload-artifact@v4/);
+	assert.match(upload, /name: lix-browser-sdk-\$\{\{ env\.LIX_SOURCE_SHA \}\}/);
+	for (const path of [
+		"packages/js-sdk/dist",
+		"packages/storage-opfs/dist",
+		"ci-artifact/browser.json",
+	]) {
+		assert.ok(upload.includes(path));
+	}
+	assert.match(upload, /retention-days: 90/);
 	assert.ok(
-		benchmarks.indexOf("name: Upload tested browser SDK for submodule consumers") >
-			benchmarks.indexOf("npm run benchmark:multi-tab"),
+		sdk.indexOf("name: Upload tested browser SDK for submodule consumers") >
+			sdk.indexOf("name: Run OPFS storage browser tests"),
 	);
+	for (const source of [workflow, publishWorkflow]) {
+		assert.doesNotMatch(
+			source,
+			/opfs-benchmarks:|OPFS performance budgets|npm run benchmark/,
+		);
+		assert.doesNotMatch(source, /lix-browser-sdk-build-/);
+	}
 });
 
 test("server-changing pull requests retain one reusable preview image", () => {
@@ -256,4 +262,20 @@ test("tooling Clippy excludes the benchmark-only DuckDB feature", () => {
 	assert.ok(e2eClippy);
 	assert.match(e2eClippy, /--all-targets --features /);
 	assert.doesNotMatch(e2eClippy, /\btpch\b|--all-features/);
+});
+
+test("tested merges skip validation but retain SDK artifacts for the landed revision", () => {
+	for (const job of ["changelog", "cargo-config", "js-sdk-test"]) {
+		const definition = workflow.split(`\n  ${job}:\n`)[1].split("\n    steps:")[0];
+		assert.match(definition, /needs: merge-reuse/);
+		assert.match(definition, /needs\.merge-reuse\.outputs\.reuse != 'true'/);
+	}
+	assert.match(workflow, /name: ci-tested-source/);
+	assert.match(workflow, /sourceTree: tree\(process\.env\.SOURCE_REVISION\)/);
+	assert.match(workflow, /testedTree: tree\('HEAD'\)/);
+	const promotion = workflow.split("\n  promote-browser-sdk:\n")[1].split("\n  changelog:\n")[0];
+	assert.match(promotion, /if: needs\.merge-reuse\.outputs\.reuse == 'true'/);
+	assert.match(promotion, /run-id: \$\{\{ needs\.merge-reuse\.outputs\.run_id \}\}/);
+	assert.match(promotion, /name: lix-browser-sdk-\$\{\{ github\.sha \}\}/);
+	assert.doesNotMatch(promotion, /\bcargo\b|\bnpm\b/);
 });

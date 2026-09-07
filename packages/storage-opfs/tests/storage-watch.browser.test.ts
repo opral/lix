@@ -2,6 +2,7 @@ import { openLix, type LixStorageProvider, type LixStorageProviderRegistration }
 import { OpfsStorage } from "@lix-js/storage-opfs";
 import { expect, test } from "vitest";
 import { OpfsStorageClient } from "../js/client.js";
+import { StorageChangeNotifier } from "../js/change-watch.js";
 import {
 	OPFS_RPC_CHANNEL,
 	type OpfsRpcRequest,
@@ -63,6 +64,11 @@ test("storage watch coalesces multiple unseen commits", async () => {
 			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
 			["coalesced-b", 2],
 		);
+		// Writer completion does not mean the independent watching client has
+		// received both announcements. Observe the committed generation through
+		// that client before consuming its coalesced invalidation.
+		const sessionToken = await provider.acquireSession();
+		await provider.beginRead({ sessionToken, consistency: "latest", durability: "visible" });
 		await expect(withTimeout(watch.changed(), 2_000)).resolves.toBeUndefined();
 
 		const noSecondNotification = watch.changed();
@@ -74,6 +80,83 @@ test("storage watch coalesces multiple unseen commits", async () => {
 	} finally {
 		watch.close();
 		await Promise.all([provider.close(), lix.close()]);
+	}
+});
+
+test("storage notifier coalesces delivered changes without losing a later change", async () => {
+	const notifier = new StorageChangeNotifier();
+	const watch = notifier.watch();
+	try {
+		notifier.notify();
+		notifier.notify();
+		await expect(watch.changed()).resolves.toBeUndefined();
+
+		let resolved = false;
+		const next = watch.changed().then(() => { resolved = true; });
+		// An already-resolved promise would run its callback at this microtask
+		// boundary. No timer or transport delivery is involved in this test.
+		await Promise.resolve();
+		expect(resolved).toBe(false);
+		notifier.notify();
+		await expect(next).resolves.toBeUndefined();
+		expect(resolved).toBe(true);
+	} finally {
+		watch.close();
+	}
+});
+
+test.each([false, true])("watching-client read barrier before consumption: %s", async (readBeforeConsume) => {
+	const channelName = `lix-opfs-watch-order:${crypto.randomUUID()}`;
+	const storageName = `watch-order-storage:${crypto.randomUUID()}`;
+	const ownerEpoch = crypto.randomUUID();
+	let generation = 0;
+	const owner = new BroadcastChannel(channelName);
+	owner.onmessage = (event: MessageEvent<OpfsRpcRequest>) => {
+		const request = event.data;
+		if (!request || request.kind !== "request" || request.storageName !== storageName) return;
+		const response: OpfsRpcResponse = {
+			kind: "response",
+			requestId: request.requestId,
+			clientId: request.clientId,
+			ok: true,
+			result: request.operation === "open" || request.operation === "beginRead" || request.operation === "heartbeat"
+				? { ownerEpoch, generation, snapshotCacheKey: String(generation) }
+				: request.operation === "acquireSession" ? "1" : undefined,
+		};
+		owner.postMessage(response);
+	};
+	const client = await OpfsStorageClient.open(storageName, channelName);
+	const sessionToken = await client.acquireSession();
+	const readOptions = { sessionToken, consistency: "latest", durability: "visible" } as const;
+	const watch = await client.watchForChanges();
+	try {
+		generation = 1;
+		await client.beginRead(readOptions);
+		// Both owner commits are complete, but generation 2 has deliberately
+		// not been announced to this client. Control delivery rather than sleep.
+		generation = 2;
+		if (readBeforeConsume) await client.beginRead(readOptions);
+		await expect(withTimeout(watch.changed(), 2_000)).resolves.toBeUndefined();
+		let resolved = false;
+		const next = watch.changed();
+		void next.then(() => { resolved = true; }, () => undefined);
+		owner.postMessage({ kind: "storageState", storageName, ownerEpoch, generation });
+		// The same-owner read response fences delivery of the delayed announcement.
+		await client.beginRead(readOptions);
+		if (readBeforeConsume) {
+			expect(resolved).toBe(false);
+			watch.close();
+			await expect(next).rejects.toMatchObject({ code: "LIX_STORAGE_CLOSED" });
+		} else {
+			// A genuinely unseen delivery must still wake the watcher. Requiring
+			// silence here, as the old fixture did, rejects correct behavior.
+			await expect(withTimeout(next, 2_000)).resolves.toBeUndefined();
+			expect(resolved).toBe(true);
+		}
+	} finally {
+		watch.close();
+		await client.close();
+		owner.close();
 	}
 });
 
