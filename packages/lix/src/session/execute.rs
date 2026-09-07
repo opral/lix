@@ -11978,6 +11978,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transaction_declared_column_filters_see_staged_rows() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "transaction_filter_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "locale", "type": "text", "nullable": false },
+                { "name": "count", "type": "int8", "nullable": false }
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("register schema");
+        session.execute(
+            "INSERT INTO transaction_filter_probe (id, locale, count) VALUES ('existing', 'de', 1)",
+            &[],
+        ).await.expect("seed committed row");
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("begin transaction");
+        transaction
+            .execute(
+                "INSERT INTO transaction_filter_probe (id, locale, count) VALUES ('new', 'en', 7)",
+                &[],
+            )
+            .await
+            .expect("stage inserted row");
+        for sql in [
+            "SELECT id FROM transaction_filter_probe WHERE locale = 'en'",
+            "SELECT id FROM transaction_filter_probe WHERE locale IN ('en', 'fr')",
+            "SELECT id FROM transaction_filter_probe WHERE count > 6",
+            "WITH matching AS (SELECT id FROM transaction_filter_probe WHERE locale = 'en') SELECT id FROM matching",
+        ] {
+            let result = transaction
+                .execute(sql, &[])
+                .await
+                .expect("read staged row");
+            assert_eq!(result.len(), 1, "{sql}");
+            assert_eq!(
+                result.rows()[0].get::<String>("id").unwrap(),
+                "new",
+                "{sql}"
+            );
+        }
+        transaction.execute(
+            "UPDATE transaction_filter_probe SET locale = 'en', count = 8 WHERE id = 'existing'",
+            &[],
+        ).await.expect("stage updated row");
+        let matching = transaction
+            .execute(
+                "SELECT id FROM transaction_filter_probe WHERE locale = $1 ORDER BY id",
+                &[Value::Text("en".into())],
+            )
+            .await
+            .expect("read inserted and updated rows");
+        assert_eq!(matching.len(), 2);
+        let old_value = transaction
+            .execute(
+                "SELECT id FROM transaction_filter_probe WHERE locale = 'de'",
+                &[],
+            )
+            .await
+            .expect("staged update masks committed value");
+        assert!(old_value.is_empty());
+        transaction
+            .execute("DELETE FROM transaction_filter_probe WHERE count = 7", &[])
+            .await
+            .expect("delete by staged non-primary value");
+        let remaining = transaction
+            .execute(
+                "SELECT id FROM transaction_filter_probe WHERE locale = 'en'",
+                &[],
+            )
+            .await
+            .expect("deleted rows stay hidden");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.rows()[0].get::<String>("id").unwrap(), "existing");
+        transaction.rollback().await.expect("roll back transaction");
+        let committed = session
+            .execute(
+                "SELECT id FROM transaction_filter_probe WHERE locale = 'de'",
+                &[],
+            )
+            .await
+            .expect("rollback preserves original row");
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed.rows()[0].get::<String>("id").unwrap(), "existing");
+    }
+
+    #[tokio::test]
     async fn transaction_referenced_provider_reads_see_staged_writes() {
         let session = open_session().await;
         let mut transaction = session

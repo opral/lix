@@ -3551,8 +3551,8 @@ fn apply_row_batch_filters(
     // a deletion slot so later layers can reconcile it; compact those slots
     // before Arrow projection even when the SQL query has no predicate.
     let rows = rows.filter(|row| !row.deleted(), None);
-    validate_typed_row_schema_bindings(spec, &rows)?;
     if filters.is_empty() {
+        validate_typed_row_schema_bindings(spec, &rows)?;
         return Ok(FilteredRowBatch { rows });
     }
     let mut filter_columns = BTreeSet::new();
@@ -3569,7 +3569,21 @@ fn apply_row_batch_filters(
             if failure.is_some() {
                 return false;
             }
-            if let Some(typed) = row.decoded_snapshot() {
+            // Staged mutation journals retain durable binary payloads, while
+            // committed scans may already have decoded rows. A predicate must
+            // see the same logical values in either representation.
+            let typed = match row.materialize_decoded_snapshot() {
+                Ok(typed) => typed,
+                Err(error) => {
+                    failure = Some(lix_error_to_datafusion_error(error));
+                    return false;
+                }
+            };
+            if let Some(typed) = typed {
+                if let Err(error) = validate_typed_row_schema_binding(spec, row.schema_key(), &typed) {
+                    failure = Some(error);
+                    return false;
+                }
                 for filter in filters {
                     match filter.matches_typed(&typed.row, row.schema_key()) {
                         Ok(true) => {}
@@ -5008,6 +5022,59 @@ mod tests {
             })),
         );
         batch.finish()
+    }
+
+    fn raw_typed_binding_test_batch(schema_fingerprint: [u8; 32]) -> MaterializedHotStateBatch {
+        let rows = typed_binding_test_batch("project_message", schema_fingerprint);
+        let row = rows.iter().next().expect("one typed row");
+        let payload = row
+            .decoded_snapshot()
+            .unwrap()
+            .durable_payload()
+            .expect("encode row");
+        let mut builder = crate::hot_state::MaterializedHotStateBatchBuilder::with_capacity(1);
+        builder.push_ref(row, None);
+        builder.set_decoded_snapshot(0, None);
+        builder.set_raw_snapshot(0, Some(Bytes::copy_from_slice(&payload)));
+        builder.finish()
+    }
+
+    #[test]
+    fn raw_typed_row_filters_match_decoded_rows() {
+        let spec = typed_binding_test_spec();
+        for (value, expected) in [("hello", 1), ("other", 0)] {
+            let filter = super::RowFilter::ColumnEq {
+                column: "body".to_owned(),
+                column_type: SchemaColumnType::String,
+                value: super::RowFilterValue::String(value.to_owned()),
+            };
+            let rows = raw_typed_binding_test_batch(spec.schema_fingerprint);
+            let filtered = super::apply_row_batch_filters(&spec, rows, &[filter])
+                .expect("raw typed row filter should evaluate");
+            assert_eq!(filtered.rows.len(), expected);
+        }
+    }
+
+    #[test]
+    fn raw_typed_row_filters_reject_stale_schema_fingerprint() {
+        let spec = typed_binding_test_spec();
+        let mut stale = spec.schema_fingerprint;
+        stale[0] ^= 0xff;
+        let rows = raw_typed_binding_test_batch(stale);
+        let filter = super::RowFilter::ColumnEq {
+            column: "body".to_owned(),
+            column_type: SchemaColumnType::String,
+            value: super::RowFilterValue::String("other".to_owned()),
+        };
+        let result = super::apply_row_batch_filters(&spec, rows, &[filter]);
+        let error = result
+            .err()
+            .expect("invalid binding must fail even for a nonmatching row");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the resolved schema")
+        );
     }
 
     #[test]
