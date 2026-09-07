@@ -518,16 +518,30 @@ test("observe.next samples its own telemetry parent", async () => {
 
 test("openLix forwards production commit phases through onSpan", async () => {
 	const names = new Set<string>();
+	const pendingNames = new Set([
+		"lix.sql.query",
+		"lix.transaction.materialize",
+		"lix.transaction.storage",
+		"lix.transaction.notify",
+	]);
+	let resolveSpans!: () => void;
+	const received = new Promise<void>((resolve) => {
+		resolveSpans = resolve;
+	});
 	const lix = await openLix({
 		telemetry: {
 			onSpan(span) {
 				names.add(span.name);
+				pendingNames.delete(span.name);
+				if (pendingNames.size === 0) resolveSpans();
 			},
 		},
 	});
 	await lix.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ('telemetry-cut', '1')",
 	);
+	// Native telemetry callbacks are queued independently of execute's promise.
+	await received;
 	expect(names.has("lix.sql.query")).toBe(true);
 	expect(names.has("lix.transaction.materialize")).toBe(true);
 	expect(names.has("lix.transaction.storage")).toBe(true);
