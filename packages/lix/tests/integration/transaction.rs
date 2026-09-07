@@ -14,6 +14,356 @@ use lix::{engine::Engine, session::SessionContext};
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const UNTRACKED_RACE_BRANCH_ID: &str = "01930000-0000-7000-8000-000000000018";
 
+#[tokio::test]
+async fn conditional_publication_rejects_stale_transaction() {
+    assert_conditional_publication_has_one_committed_winner(false, false, false).await;
+}
+
+#[tokio::test]
+async fn conditional_publication_rejects_stale_commit_cohort_member() {
+    assert_conditional_publication_has_one_committed_winner(true, false, false).await;
+}
+
+#[tokio::test]
+async fn conditional_publication_independent_engines_have_one_committed_winner() {
+    assert_conditional_publication_has_one_committed_winner(true, false, true).await;
+}
+
+#[tokio::test]
+async fn conditional_publication_untracked_fence_is_atomic_with_storage_write() {
+    let storage = InterferingStorage::new();
+    let gate = storage.gate();
+    Engine::initialize(storage.clone()).await.unwrap();
+    let first_engine = Engine::new(storage.clone()).await.unwrap();
+    let first_session = first_engine.open_session().await.unwrap();
+    first_session
+        .execute(
+            r#"INSERT INTO lix_registered_schema (value)
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"atomic_publication_cas","columns":[{"name":"id","type":"text","nullable":false},{"name":"revision","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB))"#,
+            &[],
+        )
+        .await
+        .unwrap();
+    first_session
+        .execute(
+            "INSERT INTO atomic_publication_cas (id, revision, lixcol_untracked) VALUES ('canon', 'base', true)",
+            &[],
+        )
+        .await
+        .unwrap();
+    let second_engine = Engine::new(storage).await.unwrap();
+    let winner = second_engine.open_session().await.unwrap();
+    let mut first = first_session.begin_transaction().await.unwrap();
+    let staged = first
+        .execute(
+            "UPDATE atomic_publication_cas SET revision = 'stale' WHERE id = 'canon' AND revision = 'base' RETURNING revision",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.rows().len(), 1);
+
+    gate.arm();
+    let competing_publication = async {
+        // The first commit has finished its snapshot checks and is parked
+        // immediately before opening its physical write. This independent
+        // engine changes only untracked state, leaving the branch head intact.
+        gate.wait_until_a_write_is_parked().await;
+        let result = winner
+            .execute(
+                "UPDATE atomic_publication_cas SET revision = 'winner' WHERE id = 'canon' AND revision = 'base' RETURNING revision",
+                &[],
+            )
+            .await;
+        gate.release_parked_write();
+        result
+    };
+    let (first_result, winner_result) =
+        tokio::time::timeout(TEST_WAIT_TIMEOUT * 15, async {
+            tokio::join!(first.commit(), competing_publication)
+        })
+        .await
+        .expect("independent publishers must not deadlock");
+    assert_eq!(winner_result.unwrap().rows().len(), 1);
+    let conflict = first_result.expect_err("storage must reject the now-stale untracked token");
+    assert_eq!(conflict.code, "LIX_TRANSACTION_CONFLICT");
+    let published = winner
+        .execute(
+            "SELECT revision FROM atomic_publication_cas WHERE id = 'canon'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(published.rows()[0].get::<String>("revision").unwrap(), "winner");
+}
+
+#[tokio::test]
+async fn conditional_publication_delete_conflict_discards_audit_write() {
+    assert_stale_publication_decision_discards_audit(
+        "DELETE FROM publication_cas WHERE id = 'canon' AND revision = 'base' RETURNING revision",
+        1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn conditional_publication_zero_row_update_conflict_discards_audit_write() {
+    assert_stale_publication_decision_discards_audit(
+        "UPDATE publication_cas SET revision = 'stale' WHERE id = 'canon' AND revision = 'missing' RETURNING revision",
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn conditional_publication_untracked_rejects_stale_transaction() {
+    assert_conditional_publication_has_one_committed_winner(false, true, false).await;
+}
+
+#[tokio::test]
+async fn conditional_publication_untracked_rejects_stale_commit_cohort_member() {
+    assert_conditional_publication_has_one_committed_winner(true, true, false).await;
+}
+
+async fn assert_stale_publication_decision_discards_audit(sql: &str, affected: usize) {
+    let engine = publication_test_engine().await;
+    let stale_session = engine.open_session().await.unwrap();
+    let winner_session = engine.open_session().await.unwrap();
+    let mut stale = stale_session.begin_transaction().await.unwrap();
+    let decision = stale.execute(sql, &[]).await.unwrap();
+    assert_eq!(decision.rows().len(), affected);
+    stale
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('publication-audit', 'stale')",
+            &[],
+        )
+        .await
+        .unwrap();
+    winner_session
+        .execute(
+            "UPDATE publication_cas SET revision = 'winner' WHERE id = 'canon'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let conflict = stale
+        .commit()
+        .await
+        .expect_err("stale SQL decisions must abort their entire transaction");
+    assert_eq!(conflict.code, "LIX_TRANSACTION_CONFLICT");
+    let publication = winner_session
+        .execute(
+            "SELECT revision FROM publication_cas WHERE id = 'canon'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        publication.rows()[0].get::<String>("revision").unwrap(),
+        "winner"
+    );
+    let audit = winner_session
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key = 'publication-audit'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        audit.rows().is_empty(),
+        "a rejected publication must not leave an audit receipt"
+    );
+}
+
+#[tokio::test]
+async fn conditional_publication_warm_prepared_batch_rejects_stale_transaction() {
+    use crate::prepared_dml::PreparedDmlParameterBatch;
+    use lix::Value;
+
+    let engine = publication_test_engine().await;
+    let stale_session = engine.open_session().await.unwrap();
+    let winner_session = engine.open_session().await.unwrap();
+    let sql: Arc<str> =
+        "UPDATE publication_cas SET revision = $1 WHERE id = $2 AND revision = $3".into();
+    let parameters = || {
+        PreparedDmlParameterBatch::from_rows([vec![
+            Value::Text("stale".into()),
+            Value::Text("canon".into()),
+            Value::Text("base".into()),
+        ]])
+        .unwrap()
+    };
+    let mut warm = stale_session.begin_transaction().await.unwrap();
+    warm.execute_prepared_dml_batch(Arc::clone(&sql), parameters())
+        .await
+        .unwrap();
+    warm.rollback().await.unwrap();
+    let mut stale = stale_session.begin_transaction().await.unwrap();
+    let updates = stale
+        .execute_prepared_dml_batch(sql, parameters())
+        .await
+        .unwrap();
+    assert_eq!(updates[0].rows_affected(), 1);
+    winner_session
+        .execute(
+            "UPDATE publication_cas SET revision = 'winner' WHERE id = 'canon'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let conflict = stale
+        .commit()
+        .await
+        .expect_err("a cached prepared update needs the same commit guard");
+    assert_eq!(conflict.code, "LIX_TRANSACTION_CONFLICT");
+    let publication = winner_session
+        .execute(
+            "SELECT revision FROM publication_cas WHERE id = 'canon'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        publication.rows()[0].get::<String>("revision").unwrap(),
+        "winner"
+    );
+}
+
+#[tokio::test]
+async fn conditional_publication_file_change_id_rejects_stale_transaction() {
+    use lix::Value;
+
+    let engine = publication_test_engine().await;
+    let stale_session = engine.open_session().await.unwrap();
+    let winner_session = engine.open_session().await.unwrap();
+    winner_session.execute("INSERT INTO lix_file (path, content) VALUES ('/publication.txt', CAST('base' AS BYTEA))", &[]).await.unwrap();
+    let current = winner_session
+        .execute(
+            "SELECT lixcol_change_id FROM lix_file WHERE path = '/publication.txt'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let change_id = current.rows()[0].get::<String>("lixcol_change_id").unwrap();
+    let mut stale = stale_session.begin_transaction().await.unwrap();
+    let update = stale.execute(
+        "UPDATE lix_file SET content = CAST('stale' AS BYTEA) WHERE path = '/publication.txt' AND lixcol_change_id = $1",
+        &[Value::Text(change_id)],
+    ).await.unwrap();
+    assert_eq!(update.rows_affected(), 1);
+    winner_session
+        .upsert_file_content("/publication.txt".into(), b"winner".to_vec().into())
+        .await
+        .unwrap();
+    let conflict = stale
+        .commit()
+        .await
+        .expect_err("file predicates must not be silently reconciled");
+    assert_eq!(conflict.code, "LIX_TRANSACTION_CONFLICT");
+    let file = winner_session
+        .read_file_content("/publication.txt".into(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(file.content().as_ref(), b"winner");
+}
+
+async fn publication_test_engine() -> Engine<Memory> {
+    publication_test_engine_in_mode(false).await
+}
+
+async fn publication_test_engine_in_mode(untracked: bool) -> Engine<Memory> {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone()).await.unwrap();
+    let engine = Engine::new(storage).await.unwrap();
+    let alice_session = engine.open_session().await.unwrap();
+    alice_session
+        .execute(
+            r#"INSERT INTO lix_registered_schema (value)
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"publication_cas","columns":[{"name":"id","type":"text","nullable":false},{"name":"revision","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB))"#,
+            &[],
+        )
+        .await
+        .unwrap();
+    alice_session
+        .execute(
+            &format!("INSERT INTO publication_cas (id, revision, lixcol_untracked) VALUES ('canon', 'base', {untracked})"),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    engine
+}
+
+async fn assert_conditional_publication_has_one_committed_winner(
+    commit_together: bool,
+    untracked: bool,
+    independent_engines: bool,
+) {
+    let engine = publication_test_engine_in_mode(untracked).await;
+    let other_engine = if independent_engines {
+        Some(Engine::new(engine.storage().storage().clone()).await.unwrap())
+    } else {
+        None
+    };
+    let alice_session = engine.open_session().await.unwrap();
+    let bob_session = other_engine
+        .as_ref()
+        .unwrap_or(&engine)
+        .open_session()
+        .await
+        .unwrap();
+
+    // Both publishers have read the same base and stage their conditional
+    // update before either commits. RETURNING alone is provisional; committing
+    // must not acknowledge both incompatible publication decisions.
+    let mut alice = alice_session.begin_transaction().await.unwrap();
+    let mut bob = bob_session.begin_transaction().await.unwrap();
+    let alice_update = alice
+        .execute(
+            "UPDATE publication_cas SET revision = 'alice' WHERE id = 'canon' AND revision = 'base' RETURNING revision",
+            &[],
+        )
+        .await
+        .unwrap();
+    let bob_update = bob
+        .execute(
+            "UPDATE publication_cas SET revision = 'bob' WHERE id = 'canon' AND revision = 'base' RETURNING revision",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(alice_update.rows().len(), 1);
+    assert_eq!(bob_update.rows().len(), 1);
+
+    let (alice_commit, bob_commit) = if commit_together {
+        tokio::join!(alice.commit(), bob.commit())
+    } else {
+        (alice.commit().await, bob.commit().await)
+    };
+    let published = alice_session
+        .execute(
+            "SELECT revision FROM publication_cas WHERE id = 'canon'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let revision = published.rows()[0].get::<String>("revision").unwrap();
+    assert_eq!(
+        usize::from(alice_commit.is_ok()) + usize::from(bob_commit.is_ok()),
+        1,
+        "exactly one conditional publisher may commit; alice={alice_commit:?}, bob={bob_commit:?}, published={revision}"
+    );
+    let (winner, loser) = if alice_commit.is_ok() {
+        ("alice", bob_commit.unwrap_err())
+    } else {
+        ("bob", alice_commit.unwrap_err())
+    };
+    assert_eq!(revision, winner);
+    assert_eq!(loser.code, "LIX_TRANSACTION_CONFLICT");
+}
+
 async fn setup_untracked_race_branch<StorageImpl>(engine: &Engine<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -105,7 +455,7 @@ async fn stale_transaction_composes_disjoint_semantic_writes() {
 }
 
 #[tokio::test]
-async fn stale_transaction_composes_different_columns_of_one_ordinary_row() {
+async fn stale_sql_update_retries_before_preserving_different_column_edits() {
     let storage = Memory::new();
     Engine::initialize(storage.clone())
         .await
@@ -159,10 +509,18 @@ async fn stale_transaction_composes_different_columns_of_one_ordinary_row() {
         )
         .await
         .expect("winner body edit should commit");
-    stale
+    let conflict = stale
         .commit()
         .await
-        .expect("different columns should compose without a conflict API");
+        .expect_err("SQL decisions from an old branch head must be retried");
+    assert_eq!(conflict.code, "LIX_TRANSACTION_CONFLICT");
+    stale_session
+        .execute(
+            "UPDATE row_merge_note SET title = 'alice title' WHERE id = 'note-1'",
+            &[],
+        )
+        .await
+        .expect("a fresh update should preserve the other column edit");
 
     let result = winner_session
         .execute(
@@ -179,7 +537,7 @@ async fn stale_transaction_composes_different_columns_of_one_ordinary_row() {
 }
 
 #[tokio::test]
-async fn commit_cohort_composes_different_columns_of_one_ordinary_row() {
+async fn commit_cohort_sql_updates_retry_before_preserving_different_column_edits() {
     let storage = Memory::new();
     Engine::initialize(storage.clone())
         .await
@@ -238,8 +596,25 @@ async fn commit_cohort_composes_different_columns_of_one_ordinary_row() {
     .expect("bob body edit should stage");
 
     let (alice_result, bob_result) = tokio::join!(alice.commit(), bob.commit());
-    alice_result.expect("alice cohort member should commit");
-    bob_result.expect("bob cohort member should commit");
+    assert_eq!(
+        usize::from(alice_result.is_ok()) + usize::from(bob_result.is_ok()),
+        1
+    );
+    let (retry_session, retry_sql, conflict) = if alice_result.is_ok() {
+        (
+            &bob_session,
+            "UPDATE cohort_row_merge_note SET body = 'bob body' WHERE id = 'note-1'",
+            bob_result.unwrap_err(),
+        )
+    } else {
+        (
+            &alice_session,
+            "UPDATE cohort_row_merge_note SET title = 'alice title' WHERE id = 'note-1'",
+            alice_result.unwrap_err(),
+        )
+    };
+    assert_eq!(conflict.code, "LIX_TRANSACTION_CONFLICT");
+    retry_session.execute(retry_sql, &[]).await.unwrap();
 
     let result = setup
         .execute(

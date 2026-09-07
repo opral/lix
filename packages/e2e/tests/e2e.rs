@@ -4317,7 +4317,7 @@ async fn v2_json_row_write_rollback_keeps_original_bytes_and_actor() {
 }
 
 #[tokio::test]
-async fn same_base_json_transactions_resolve_overlap_and_converge() {
+async fn json_branch_transactions_resolve_overlap_and_converge() {
     let archive = build_json_plugin_archive();
     let first = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -4332,7 +4332,22 @@ async fn same_base_json_transactions_resolve_overlap_and_converge() {
         .await
         .unwrap();
     let file_id = file_id_at_path(&first, path).await;
+    let target_branch = first.active_branch_id().await.unwrap();
+    let source_branch = first
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "Merge source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
     let second = first.open_another_session().await.unwrap();
+    second
+        .switch_branch(SwitchBranchOptions {
+            branch_id: source_branch.id.clone(),
+        })
+        .await
+        .unwrap();
     let mut first_transaction = first.begin_transaction().await.unwrap();
     let mut second_transaction = second.begin_transaction().await.unwrap();
     for (transaction, value) in [
@@ -4353,7 +4368,20 @@ async fn same_base_json_transactions_resolve_overlap_and_converge() {
     second_transaction
         .commit()
         .await
-        .expect("stale plugin overlap should resolve at commit");
+        .expect("source branch edit should commit");
+
+    first
+        .merge_branch(MergeBranchOptions {
+            source_branch_id: source_branch.id,
+        })
+        .await
+        .expect("explicit branch merge should resolve plugin edits");
+    second
+        .switch_branch(SwitchBranchOptions {
+            branch_id: target_branch,
+        })
+        .await
+        .unwrap();
 
     let first_bytes = read_file(&first, path).await.unwrap().unwrap();
     let second_bytes = read_file(&second, path).await.unwrap().unwrap();
@@ -4381,9 +4409,11 @@ async fn same_base_json_file_edits_compose_disjoint_semantics_without_resolution
     let second = first.open_another_session().await.unwrap();
     let mut first_transaction = first.begin_transaction().await.unwrap();
     let mut second_transaction = second.begin_transaction().await.unwrap();
+    // Unconditional file upserts use the native content-edit merge semantics.
     first_transaction
         .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = $2",
+            "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
             &[
                 Value::Blob(b"{\"a\":\"first\",\"b\":\"base\"}\n".to_vec().into()),
                 Value::Text(path.to_owned()),
@@ -4393,7 +4423,8 @@ async fn same_base_json_file_edits_compose_disjoint_semantics_without_resolution
         .unwrap();
     second_transaction
         .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = $2",
+            "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
             &[
                 Value::Blob(b"{\"a\":\"base\",\"b\":\"second\"}\n".to_vec().into()),
                 Value::Text(path.to_owned()),
@@ -4437,7 +4468,8 @@ async fn stale_json_transaction_renders_retained_same_file_edits_with_resolution
     let mut winner = winner_client.begin_transaction().await.unwrap();
     stale
         .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = $2",
+            "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
             &[
                 Value::Blob(
                     b"{\"overlap\":\"stale\",\"retained\":\"stale\"}\n"
@@ -4451,7 +4483,8 @@ async fn stale_json_transaction_renders_retained_same_file_edits_with_resolution
         .unwrap();
     winner
         .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = $2",
+            "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
             &[
                 Value::Blob(
                     b"{\"overlap\":\"winner\",\"retained\":\"base\"}\n"
@@ -4512,7 +4545,8 @@ async fn stale_json_transaction_batches_conflicts_into_one_render_transition() {
         );
         transaction
             .execute(
-                "UPDATE lix_file SET content = $1 WHERE path = $2",
+                "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[
                     Value::Blob(
                         serde_json::to_vec(&changed)
@@ -4593,7 +4627,8 @@ async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
         ] {
             transaction
                 .execute(
-                    "UPDATE lix_file SET content = $1 WHERE path = $2",
+                    "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                     &[Value::Blob(bytes.into()), Value::Text(path.clone())],
                 )
                 .await

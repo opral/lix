@@ -1,11 +1,17 @@
 use crate::LixError;
-use crate::sql2::bind::write::BoundWrite;
+use crate::sql2::bind::write::{BoundWrite, BoundWriteOp};
 use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LogicalWritePlan {
     pub(crate) bound: BoundWrite,
     pub(crate) filters: PlannedWriteFilters,
+}
+
+impl LogicalWritePlan {
+    pub(crate) fn requires_current_write_snapshot(&self) -> bool {
+        matches!(self.bound.op, BoundWriteOp::Update | BoundWriteOp::Delete)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -280,12 +280,14 @@ async fn stage_file_update<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    // Unconditional file upserts retain plugin reconciliation; SQL UPDATE
+    // decisions instead reject stale snapshots and require a caller retry.
     transaction
         .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = $2",
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
             &[
-                Value::Blob(bytes.to_vec().into()),
                 Value::Text(path.to_owned()),
+                Value::Blob(bytes.to_vec().into()),
             ],
         )
         .await

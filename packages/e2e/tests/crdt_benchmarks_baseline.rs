@@ -3,7 +3,8 @@
 //! The heavier workloads here are ignored profiling runs. The upstream suite
 //! measures synchronous in-memory CRDT update exchange; Lix measures durable
 //! commit-to-convergence across same-base clients. These workloads use only the
-//! existing `begin_transaction()` API and never create synthetic branches.
+//! existing `begin_transaction()` API and unconditional file upserts, leaving
+//! plugin reconciliation responsible for composing document edits.
 
 use std::fs;
 use std::io::{Cursor, Write};
@@ -42,7 +43,8 @@ async fn crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts() {
         ] {
             transaction
                 .execute(
-                    "UPDATE lix_file SET content = $1 WHERE path = $2",
+                    "INSERT INTO lix_file (content, path) VALUES ($1, $2) \
+                     ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                     &[
                         Value::Blob(bytes.to_vec().into()),
                         Value::Text(path.to_owned()),
@@ -109,7 +111,6 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
         install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
         let path = format!("/b3-1-{sample}.json");
         write_file(&lix, &path, br#"{"v":-1}"#).await;
-        let file_id = file_id(&lix, &path).await;
         let mut peers = Vec::with_capacity(clients);
         let mut transactions = Vec::with_capacity(clients);
         for client in 0..clients {
@@ -123,11 +124,11 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
                 .expect("same-base transaction should open");
             transaction
                 .execute(
-                    "UPDATE json_object_member SET scalar_json = $1 \
-                     WHERE parent_id = 'root' AND key = 'v' AND lixcol_file_id = $2",
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                     ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                     &[
-                        Value::Jsonb(serde_json::json!(client).into()),
-                        Value::Text(file_id.clone()),
+                        Value::Text(path.clone()),
+                        Value::Blob(format!(r#"{{"v":{client}}}"#).into_bytes().into()),
                     ],
                 )
                 .await
@@ -256,11 +257,11 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                         let mut transaction = peer.begin_transaction().await.unwrap();
                         transaction
                             .execute(
-                                "UPDATE json_object_member SET scalar_json = $1 \
-                 WHERE parent_id = 'root' AND key = 'v' AND lixcol_file_id = $2",
+                                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                                 &[
-                                    Value::Jsonb(serde_json::json!(value).into()),
-                                    Value::Text(file_id.clone()),
+                                    Value::Text(path.to_owned()),
+                                    Value::Blob(format!(r#"{{"v":{value}}}"#).into_bytes().into()),
                                 ],
                             )
                             .await
@@ -345,7 +346,6 @@ fn serialized_leader_forces_stale_followers_to_reconcile_without_losing_writes()
                     install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
                     let path = "/stale-follower-reconcile.json";
                     write_file(&lix, path, br#"{"a":0,"b":0,"c":0}"#).await;
-                    let file_id = file_id(&lix, path).await;
                     let mut peers = Vec::new();
                     let mut transactions = Vec::new();
                     for (key, value) in [("a", 1), ("b", 2), ("c", 3)] {
@@ -353,12 +353,16 @@ fn serialized_leader_forces_stale_followers_to_reconcile_without_losing_writes()
                         let mut transaction = peer.begin_transaction().await.unwrap();
                         transaction
                             .execute(
-                                "UPDATE json_object_member SET scalar_json = $1 \
-                                 WHERE parent_id = 'root' AND key = $2 AND lixcol_file_id = $3",
+                                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                                 &[
-                                    Value::Jsonb(serde_json::json!(value).into()),
-                                    Value::Text(key.to_owned()),
-                                    Value::Text(file_id.clone()),
+                                    Value::Text(path.to_owned()),
+                                    Value::Blob({
+                                        let mut document =
+                                            serde_json::json!({"a": 0, "b": 0, "c": 0});
+                                        document[key] = serde_json::json!(value);
+                                        serde_json::to_vec(&document).unwrap().into()
+                                    }),
                                 ],
                             )
                             .await

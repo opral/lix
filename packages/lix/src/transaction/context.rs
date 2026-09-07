@@ -24,7 +24,8 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchLifecycle,
-    BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
+    BranchOperation, BranchRefReader, BranchReferenceRole, branch_head_control_precondition,
+    branch_ref_stage_row,
 };
 use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogRevision, CatalogSnapshot, ForeignKeyPlan,
@@ -241,6 +242,8 @@ where
         && a.opening_active_branch_head == b.opening_active_branch_head
         && a.opening_global_branch_head == b.opening_global_branch_head
         && a.opening_tracked_mutation_revision == b.opening_tracked_mutation_revision
+        && !a.protect_sql_write_snapshot
+        && !b.protect_sql_write_snapshot
         && a.idempotency_receipt.is_none()
         && b.idempotency_receipt.is_none()
         && a.atomic_metadata_writes.is_none()
@@ -708,6 +711,9 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// overlapping semantic write without creating a temporary branch.
     opening_active_branch_head: Option<CommitId>,
     opening_global_branch_head: Option<CommitId>,
+    /// SQL UPDATE/DELETE predicates and computed values are decisions against
+    /// the opening snapshot, not edits that may be silently reconciled later.
+    protect_sql_write_snapshot: bool,
     commit_boundary: Option<TransactionCommitBoundary>,
     trust_filesystem_planner: bool,
     origin_key: Option<SharedStr>,
@@ -1035,6 +1041,40 @@ where
         self.staged_writes
             .stage_empty_commit(self.active_branch_id.clone())?;
         Ok(true)
+    }
+
+    async fn fence_sql_write_snapshot<S>(&mut self, read: &S) -> Result<(), LixError>
+    where
+        S: StorageAdapterRead,
+    {
+        if !self.protect_sql_write_snapshot {
+            return Ok(());
+        }
+        let mut branches = vec![self.active_branch_id.clone()];
+        if self.active_branch_id != GLOBAL_BRANCH_ID {
+            branches.push(GLOBAL_BRANCH_ID.to_owned());
+        }
+        let controls = BranchHeadControlContext::new();
+        let opening = controls
+            .reader(self.opening_read())
+            .load_observed(&branches)
+            .await?;
+        let current = controls.reader(read).load_observed(&branches).await?;
+        for ((branch_id, opening), current) in branches.iter().zip(opening).zip(current) {
+            if opening.raw_token != current.raw_token {
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    "SQL update or delete snapshot is stale because branch state changed",
+                )
+                .with_hint("Retry the transaction against the latest committed state."));
+            }
+            // The opening token includes history-free untracked mutations.
+            // Compare it again in the atomic storage commit so another engine
+            // cannot invalidate the decision after this coherent read.
+            self.atomic_metadata_preconditions
+                .push(branch_head_control_precondition(branch_id, opening.raw_token)?);
+        }
+        Ok(())
     }
 
     async fn reconcile_stale_disjoint_writes<S>(
@@ -1687,6 +1727,7 @@ where
                     opening_tracked_mutation_revision,
                     opening_active_branch_head,
                     opening_global_branch_head,
+                    protect_sql_write_snapshot: false,
                     commit_boundary: None,
                     trust_filesystem_planner: false,
                     origin_key: None,
@@ -1810,6 +1851,14 @@ where
             // and the transaction drops this read before its storage field.
             let commit_read = unsafe { assume_static_storage_read::<StorageImpl>(commit_read) };
             let mut read = SharedStorageAdapterRead::new(commit_read);
+            // Preserve the original statement snapshot until its SQL decisions
+            // have been fenced; reconciliation below uses the current read.
+            if let Err(error) = transaction.fence_sql_write_snapshot(&read).await {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(error);
+            }
             // Commit-time reconciliation and validation must all observe this
             // current coherent snapshot, while user statements above observed the
             // snapshot retained from transaction open.
@@ -7333,7 +7382,7 @@ where
     }
 
     pub(crate) fn prepare_sql_write_logical_plan(
-        &self,
+        &mut self,
         sql: &str,
         statement: &DataFusionStatement,
     ) -> Result<crate::sql2::SqlLogicalPlan, LixError> {
@@ -7341,25 +7390,27 @@ where
             return Ok(crate::sql2::SqlLogicalPlan::Checkpoint(plan));
         }
         let fingerprint = self.sql_catalog_fingerprint();
-        if let Some(plan) =
+        let plan = if let Some(plan) =
             self.sql_planning_cache
                 .write_plan(sql, fingerprint, &self.active_branch_id)
         {
-            return Ok(crate::sql2::create_write_logical_plan_from_template(plan));
-        }
-
-        let catalog = self.sql_public_catalog()?;
-        let plan = crate::sql2::create_write_plan_template_from_parsed(
-            statement,
-            catalog.as_ref(),
-            &self.active_branch_id,
-        )?;
-        self.sql_planning_cache.remember_write_plan(
-            sql,
-            fingerprint.clone(),
-            &self.active_branch_id,
-            &plan,
-        );
+            plan
+        } else {
+            let catalog = self.sql_public_catalog()?;
+            let plan = crate::sql2::create_write_plan_template_from_parsed(
+                statement,
+                catalog.as_ref(),
+                &self.active_branch_id,
+            )?;
+            self.sql_planning_cache.remember_write_plan(
+                sql,
+                fingerprint.clone(),
+                &self.active_branch_id,
+                &plan,
+            );
+            plan
+        };
+        self.protect_sql_write_snapshot |= plan.requires_current_write_snapshot();
         Ok(crate::sql2::create_write_logical_plan_from_template(plan))
     }
 

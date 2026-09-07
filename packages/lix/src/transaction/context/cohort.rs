@@ -112,6 +112,7 @@ where
             && transaction.opening_global_branch_head == leader.opening_global_branch_head
             && transaction.opening_tracked_mutation_revision
                 == leader.opening_tracked_mutation_revision
+            && !transaction.protect_sql_write_snapshot
             && transaction.idempotency_receipt.is_none()
             && transaction.atomic_metadata_writes.is_none()
             && transaction.atomic_metadata_preconditions.is_empty()

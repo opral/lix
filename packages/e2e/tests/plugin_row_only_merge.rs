@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Cursor, Write};
 use std::path::Path;
 
-use lix::{Value, open_lix};
+use lix::{CreateBranchOptions, MergeBranchOptions, SwitchBranchOptions, Value, open_lix};
 
 #[tokio::test]
 async fn test_only_row_merger_composes_text_without_a_file() {
@@ -28,7 +28,20 @@ async fn test_only_row_merger_composes_text_without_a_file() {
     .await
     .expect("merge test row should insert");
 
+    let source_branch = lix
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "Row merger source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("source branch should open");
     let peer = lix.open_another_session().await.expect("peer should open");
+    peer.switch_branch(SwitchBranchOptions {
+        branch_id: source_branch.id.clone(),
+    })
+    .await
+    .expect("peer should select source branch");
     let mut a = lix.begin_transaction().await.expect("transaction A");
     let mut b = peer.begin_transaction().await.expect("transaction B");
     a.execute(
@@ -52,9 +65,31 @@ async fn test_only_row_merger_composes_text_without_a_file() {
     .await
     .expect("B edit should stage");
     a.commit().await.expect("A should commit");
-    b.commit()
-        .await
-        .expect("B should invoke the row-only merger");
+    b.commit().await.expect("B should commit on its branch");
+    // Host LWW orders durable change IDs, not source/target branch roles.
+    // Canonical UUID strings preserve the byte ordering used by ConflictRank.
+    let mut change_ids = Vec::new();
+    for session in [&lix, &peer] {
+        let row = session
+            .execute(
+                "SELECT lixcol_change_id FROM merge_test_row WHERE id = $1",
+                &[Value::Text("0198b7a1-0000-7000-8000-000000000001".to_owned())],
+            )
+            .await
+            .expect("branch change ID should read");
+        change_ids.push(row.rows()[0].get::<String>("lixcol_change_id").unwrap());
+    }
+    assert_ne!(change_ids[0], change_ids[1]);
+    let expected_label = if change_ids[0] > change_ids[1] {
+        "label-a"
+    } else {
+        "label-b"
+    };
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source_branch.id,
+    })
+    .await
+    .expect("explicit merge should invoke the row-only merger");
 
     let result = lix
         .execute(
@@ -71,7 +106,7 @@ async fn test_only_row_merger_composes_text_without_a_file() {
     );
     assert_eq!(
         result.rows()[0].get::<String>("label").unwrap(),
-        "label-a",
+        expected_label,
         "the non-custom column must retain host LWW behavior"
     );
 
