@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_stream::stream;
@@ -58,6 +59,7 @@ fn connection_locator_rejects_raw_protocol_and_noncanonical_ids() {
 struct ScriptHttp {
     requests: Arc<Mutex<Vec<ProtocolHttpRequest>>>,
     outcomes: Arc<Mutex<VecDeque<ScriptOutcome>>>,
+    stream_cancellations: Arc<AtomicUsize>,
 }
 
 enum ScriptOutcome {
@@ -151,7 +153,10 @@ impl ProtocolHttp for ScriptHttp {
                 headers,
                 chunks,
             }) => {
-                let cancel: StreamCancel = Arc::new(|| {});
+                let cancellations = self.stream_cancellations.clone();
+                let cancel: StreamCancel = Arc::new(move || {
+                    cancellations.fetch_add(1, Ordering::SeqCst);
+                });
                 Ok(ProtocolHttpStream {
                     status,
                     headers,
@@ -164,7 +169,10 @@ impl ProtocolHttp for ScriptHttp {
                 })
             }
             Some(ScriptOutcome::Json { status, body }) => {
-                let cancel: StreamCancel = Arc::new(|| {});
+                let cancellations = self.stream_cancellations.clone();
+                let cancel: StreamCancel = Arc::new(move || {
+                    cancellations.fetch_add(1, Ordering::SeqCst);
+                });
                 Ok(ProtocolHttpStream {
                     status,
                     headers: vec![("content-type".to_owned(), "application/json".to_owned())],
@@ -257,6 +265,153 @@ fn sse_error(code: &str) -> String {
             "error": { "code": code, "message": code },
         })
     )
+}
+
+#[tokio::test]
+async fn child_sessions_inherit_branch_and_retain_snapshot_export() {
+    let http = ScriptHttp::default();
+    http.push_json(200, handshake("parent", "branch-a"));
+    http.push_json(200, handshake("child", "branch-a"));
+    http.push_json(200, handshake("grandchild", "branch-b"));
+    http.push_stream(200, "snapshot bytes");
+    let parent = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("parent");
+    let child = parent
+        .open_another_session(None, None)
+        .await
+        .expect("child");
+    let grandchild = child
+        .open_another_session(Some("branch-b".to_owned()), None)
+        .await
+        .expect("grandchild");
+    assert_eq!(child.active_branch_id().await.expect("branch"), "branch-a");
+    assert_eq!(parent.session_id().as_deref(), Some("parent"));
+    assert_eq!(grandchild.session_id().as_deref(), Some("grandchild"));
+    let mut snapshot = grandchild.export_snapshot().await.expect("export");
+    assert_eq!(
+        snapshot.next().await.expect("chunk"),
+        Some(Bytes::from_static(b"snapshot bytes"))
+    );
+    assert_eq!(snapshot.next().await.expect("end"), None);
+    assert_eq!(http.stream_cancellations.load(Ordering::SeqCst), 1);
+    let requests = http.requests();
+    assert!(requests[1].url.ends_with("/?activeBranchId=branch-a"));
+    assert!(requests[2].url.ends_with("/?activeBranchId=branch-b"));
+    assert!(
+        requests[3]
+            .url
+            .ends_with("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/snapshot")
+    );
+    assert_eq!(
+        requests[3].header("accept"),
+        Some("application/vnd.lix.snapshot")
+    );
+    assert_eq!(requests[3].header("lix-session-id"), None);
+}
+
+#[tokio::test]
+async fn child_session_rejects_account_override_without_opening_a_session() {
+    let http = ScriptHttp::default();
+    http.push_json(200, handshake("parent", "branch-a"));
+    let parent = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("parent");
+    let error = parent
+        .open_another_session(None, Some("another-account".to_owned()))
+        .await
+        .expect_err("account override");
+    assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    assert_eq!(http.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn child_session_closes_new_session_if_authentication_changes() {
+    let http = ScriptHttp::default();
+    http.push_json(200, handshake("parent", "branch-a"));
+    http.push_json(
+        200,
+        handshake_with_account("child", "branch-a", "another-account"),
+    );
+    http.push_empty(204);
+    let parent = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("parent");
+    let error = parent
+        .open_another_session(None, None)
+        .await
+        .expect_err("authentication change");
+    assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    let requests = http.requests();
+    assert_eq!(requests[2].method, "DELETE");
+    assert_eq!(requests[2].header("lix-session-id"), Some("child"));
+    assert_eq!(
+        parent
+            .active_branch_id()
+            .await
+            .expect("parent remains usable"),
+        "branch-a"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_errors_use_protocol_error_envelopes_and_cancel_the_stream() {
+    let http = ScriptHttp::default();
+    http.push_json(200, handshake("parent", "branch-a"));
+    http.push_json(
+        403,
+        serde_json::json!({"error": {
+            "code": "LIX_ACCESS_DENIED", "message": "denied", "hint": "request access",
+            "details": {"scope": "snapshot"}
+        }}),
+    );
+    let parent = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("parent");
+    let error = parent.export_snapshot().await.err().expect("denied");
+    assert_eq!(error.code, "LIX_ACCESS_DENIED");
+    assert_eq!(error.hint.as_deref(), Some("request access"));
+    assert_eq!(error.details.as_ref().expect("details")["httpStatus"], 403);
+    assert_eq!(http.stream_cancellations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn snapshot_cancel_and_drop_release_the_stream_once() {
+    let http = ScriptHttp::default();
+    http.push_json(200, handshake("parent", "branch-a"));
+    http.push_stream(200, "snapshot bytes");
+    http.push_stream(200, "snapshot bytes");
+    let parent = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("parent");
+    let mut snapshot = parent.export_snapshot().await.expect("export");
+    snapshot.cancel();
+    snapshot.cancel();
+    assert_eq!(snapshot.next().await.expect("cancelled"), None);
+    drop(snapshot);
+    assert_eq!(http.stream_cancellations.load(Ordering::SeqCst), 1);
+    drop(parent.export_snapshot().await.expect("export"));
+    assert_eq!(http.stream_cancellations.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

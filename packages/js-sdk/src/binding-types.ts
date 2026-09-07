@@ -91,7 +91,7 @@ export type LixBinding = {
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
 	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt>;
 	syncDiskToLix(): Promise<void>;
-	exportSnapshot?(): SnapshotExportBinding;
+	exportSnapshot(): SnapshotExportBinding;
 	close(): Promise<void>;
 };
 

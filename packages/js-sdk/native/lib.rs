@@ -10,6 +10,7 @@ mod browser_storage;
 mod js_storage;
 #[cfg(not(target_family = "wasm"))]
 mod napi;
+mod session;
 mod telemetry;
 #[cfg(target_family = "wasm")]
 mod wasm;

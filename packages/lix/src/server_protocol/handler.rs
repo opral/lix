@@ -8422,6 +8422,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_merge_preview_and_merge_roundtrip_through_the_engine() {
+        let app = app().await;
+        let (target_session, handshake) = new_session(&app.router).await;
+        let target_branch = handshake["activeBranchId"].clone();
+        let (source_session, _) = new_session(&app.router).await;
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/branch/create",
+            Some(&source_session),
+            Some(json!({ "name": "Remote merge source" })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let source_branch = response_json(response).await["id"].clone();
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/branch/switch",
+            Some(&source_session),
+            Some(json!({ "branchId": source_branch })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for (session, sql) in [
+            (
+                &source_session,
+                "INSERT INTO lix_key_value (key, value) VALUES ('remote-merge-source', 'source')",
+            ),
+            (
+                &target_session,
+                "INSERT INTO lix_key_value (key, value) VALUES ('remote-merge-target', 'target')",
+            ),
+        ] {
+            let response = request(
+                &app.router,
+                "POST",
+                "/lix/v1/execute",
+                Some(session),
+                Some(json!({ "sql": sql })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/branch/merge-preview",
+            Some(&target_session),
+            Some(json!({ "sourceBranchId": source_branch })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let preview = response_json(response).await;
+        assert_eq!(preview["targetBranchId"], target_branch);
+        assert_eq!(preview["sourceBranchId"], source_branch);
+        assert_eq!(preview["conflicts"], json!([]));
+        // Preview must not publish source changes; merge publishes source changes.
+        for (merge, expected_count) in [(false, 0), (true, 1)] {
+            if merge {
+                let response = request(
+                    &app.router,
+                    "POST",
+                    "/lix/v1/branch/merge",
+                    Some(&target_session),
+                    Some(json!({ "sourceBranchId": source_branch })),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let receipt = response_json(response).await;
+                assert_eq!(receipt["targetBranchId"], target_branch);
+                assert_eq!(receipt["sourceBranchId"], source_branch);
+                assert_eq!(receipt["outcome"], preview["outcome"]);
+                assert!(receipt["createdMergeCommitId"].as_str().is_some());
+                assert_eq!(
+                    receipt["targetHeadBeforeCommitId"],
+                    preview["targetHeadCommitId"]
+                );
+            }
+            let sql = "SELECT COUNT(*) FROM lix_key_value WHERE key = 'remote-merge-source'";
+            let response = request(
+                &app.router,
+                "POST",
+                "/lix/v1/execute",
+                Some(&target_session),
+                Some(json!({ "sql": sql })),
+            )
+            .await;
+            let status = response.status();
+            let result = response_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(
+                result["rows"][0][0],
+                json!({ "kind": "int", "value": expected_count })
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn sync_history_and_push_roundtrip_commit_scoped_merge_provenance() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
