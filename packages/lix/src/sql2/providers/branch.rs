@@ -33,7 +33,7 @@ use crate::sql2::write_normalization::{
 };
 use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextHotStateReader};
 use crate::transaction_types::{
-    LogicalPrimaryKey, RawWriteBatch, TransactionWrite, TransactionWriteMode,
+    LogicalPrimaryKey, RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteRow,
 };
 
@@ -43,7 +43,11 @@ use super::spec::{
     register_spec_table, row_source, scan_row_source, take_record_batch_rows,
 };
 use super::upsert::{StagedUpsert, UpsertReturningRow, UpsertSupport, materialize_omitted_column};
-use super::values::{required_bool_value, required_string_value};
+use super::values::{
+    optional_metadata_value, required_bool_value, required_string_value,
+    update_optional_metadata_value,
+};
+use crate::sql2::result_metadata::json_field;
 
 pub(super) async fn register_lix_branch_read_provider(
     session: &datafusion::prelude::SessionContext,
@@ -503,6 +507,7 @@ impl UpsertSupport for BranchSpec {
 
     fn validate_proposed_batch(&self, batch: &RecordBatch) -> Result<()> {
         for row_index in 0..batch.num_rows() {
+            optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_branch")?;
             defaultable_bool_insert_value(batch, row_index, "hidden", "INSERT into lix_branch")?;
             defaultable_text_insert_value(batch, row_index, "commit_id", "INSERT into lix_branch")?;
         }
@@ -656,6 +661,7 @@ impl UpsertSupport for BranchSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BranchRow {
+    metadata: Option<TransactionJson>,
     id: String,
     name: String,
     hidden: bool,
@@ -667,6 +673,10 @@ static LIX_BRANCH_COLS: ColumnTable<BranchRow> = ColumnTable {
         ("id", Col::Utf8(|row| Some(row.id.as_str()))),
         ("name", Col::Utf8(|row| Some(row.name.as_str()))),
         ("hidden", Col::Bool(|row| Some(row.hidden))),
+        (
+            "lixcol_metadata",
+            Col::Utf8(|row| row.metadata.as_ref().map(TransactionJson::normalized)),
+        ),
         (
             "commit_id",
             Col::Utf8Owned(|row| Some(row.commit_id.to_string())),
@@ -892,6 +902,7 @@ async fn load_branch_rows_with_point_lookups(
             id: descriptor.id,
             name: descriptor.name,
             hidden: descriptor.hidden,
+            metadata: descriptor.metadata,
         });
     }
     Ok(out)
@@ -914,6 +925,7 @@ fn join_branch_descriptors_with_heads(
                 id: descriptor.id,
                 name: descriptor.name,
                 hidden: descriptor.hidden,
+                metadata: descriptor.metadata,
             })
         })
         .collect()
@@ -921,6 +933,7 @@ fn join_branch_descriptors_with_heads(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BranchDescriptor {
+    metadata: Option<TransactionJson>,
     id: String,
     name: String,
     hidden: bool,
@@ -942,7 +955,15 @@ fn parse_descriptor(row: MaterializedHotStateRowRef<'_>) -> Result<BranchDescrip
         .get("hidden")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
-    Ok(BranchDescriptor { id, name, hidden })
+    Ok(BranchDescriptor {
+        id,
+        name,
+        hidden,
+        metadata: row
+            .metadata()
+            .cloned()
+            .map(TransactionJson::from_certified_shared_normalized_metadata),
+    })
 }
 
 fn parse_snapshot(
@@ -963,7 +984,7 @@ fn parse_snapshot(
 fn validate_lix_branch_update_assignments(assignments: &[(String, Expr)]) -> Result<()> {
     for (column_name, _) in assignments {
         match column_name.as_str() {
-            "name" | "hidden" | "commit_id" => {}
+            "name" | "hidden" | "commit_id" | "lixcol_metadata" => {}
             "id" => {
                 return Err(DataFusionError::Execution(
                     "UPDATE lix_branch cannot change immutable column 'id'".to_string(),
@@ -1006,6 +1027,12 @@ fn branch_insert_rows_from_batch(
             .transpose()?
             .unwrap_or(*default_commit_id);
             Ok(BranchRow {
+                metadata: optional_metadata_value(
+                    batch,
+                    row_index,
+                    "lixcol_metadata",
+                    "lix_branch",
+                )?,
                 id,
                 name,
                 hidden,
@@ -1020,6 +1047,12 @@ fn branch_rows_from_batch(batch: &RecordBatch) -> Result<Vec<BranchRow>> {
         .map(|row_index| {
             Ok(BranchRow {
                 id: required_string_value(batch, row_index, "id", "DELETE lix_branch")?,
+                metadata: optional_metadata_value(
+                    batch,
+                    row_index,
+                    "lixcol_metadata",
+                    "lix_branch",
+                )?,
                 name: required_string_value(batch, row_index, "name", "DELETE lix_branch")?,
                 hidden: required_bool_value(batch, row_index, "hidden", "DELETE lix_branch")?,
                 commit_id: parse_branch_row_commit_id(
@@ -1117,6 +1150,13 @@ fn branch_update_rows_from_batch(
         .map(|row_index| {
             Ok(BranchRow {
                 id: required_string_value(batch, row_index, "id", "UPDATE lix_branch")?,
+                metadata: update_optional_metadata_value(
+                    batch,
+                    &assignment_values,
+                    row_index,
+                    "lixcol_metadata",
+                    "lix_branch",
+                )?,
                 name: update_string_value(
                     batch,
                     &assignment_values,
@@ -1177,10 +1217,9 @@ fn push_branch_stage_rows(
         ));
         rows.push(with_origin(branch_ref_tombstone_row(&row.id), origin));
     } else {
-        rows.push(with_origin(
-            branch_descriptor_stage_row(&row.id, &row.name, row.hidden),
-            origin.clone(),
-        ));
+        let mut descriptor = branch_descriptor_stage_row(&row.id, &row.name, row.hidden);
+        descriptor.metadata = row.metadata;
+        rows.push(with_origin(descriptor, origin.clone()));
         rows.push(with_origin(
             branch_ref_stage_row(&row.id, &row.commit_id),
             origin,
@@ -1276,6 +1315,7 @@ pub(super) fn lix_branch_schema() -> SchemaRef {
         Field::new("name", DataType::Utf8, false),
         Field::new("hidden", DataType::Boolean, false),
         Field::new("commit_id", DataType::Utf8, false),
+        json_field("lixcol_metadata", true),
     ]))
 }
 
@@ -1443,6 +1483,7 @@ mod tests {
             push_branch_stage_rows(
                 &mut rows,
                 BranchRow {
+                    metadata: None,
                     name: format!("Branch {index}"),
                     commit_id: CommitId::for_test_label(&format!("commit-{index}")),
                     id,
@@ -1509,6 +1550,28 @@ mod tests {
             head_read_strategy: BranchHeadReadStrategy::Point,
         };
         (spec, hot_state, branch_ref)
+    }
+
+    #[test]
+    fn branch_metadata_is_staged_only_on_descriptor() {
+        let metadata = TransactionJson::from_value_for_test(serde_json::json!({"owner": "team"}));
+        let mut rows = RawWriteBatch::default();
+        push_branch_stage_rows(
+            &mut rows,
+            BranchRow {
+                id: "01920000-0000-7000-8000-0000000000a1".into(),
+                name: "branch".into(),
+                hidden: false,
+                commit_id: CommitId::for_test_label("head"),
+                metadata: Some(metadata.clone()),
+            },
+            TransactionWriteOperation::Update,
+            false,
+        );
+        assert_eq!(rows.row(0).schema_key, "lix_branch_descriptor");
+        assert_eq!(rows.row(0).metadata, Some(&metadata));
+        assert_eq!(rows.row(1).schema_key, "lix_branch_ref");
+        assert_eq!(rows.row(1).metadata, None);
     }
 
     #[tokio::test]
@@ -1681,12 +1744,14 @@ mod tests {
             rows,
             vec![
                 BranchRow {
+                    metadata: None,
                     id: "01920000-0000-7000-8000-0000000000a1".to_string(),
                     name: "Branch A".to_string(),
                     hidden: false,
                     commit_id: head("01920000-0000-7000-8000-0000000000a1").commit_id,
                 },
                 BranchRow {
+                    metadata: None,
                     id: "01920000-0000-7000-8000-0000000000b1".to_string(),
                     name: "Branch B".to_string(),
                     hidden: false,
