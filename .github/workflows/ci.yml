@@ -18,7 +18,9 @@ on:
       - master
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # A rerun retains its original event payload. Draft reruns must never cancel
+  # ready-candidate validation, even when they reference the same head commit.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.draft && 'draft' || 'ready' }}
   cancel-in-progress: true
 
 permissions:
@@ -31,8 +33,36 @@ defaults:
     shell: bash --noprofile --norc -o errexit -o nounset -o pipefail -o xtrace -O nullglob -O dotglob {0}
 
 jobs:
+  release-ready:
+    # Draft reruns must not overwrite the required ready-candidate check.
+    name: ${{ github.event.pull_request.draft && 'Draft - full CI deferred' || 'Release ready' }}
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    needs: [merge-reuse, promote-browser-sdk, changelog, cargo-config, cargo, js-sdk-test, preview-artifact-changes, preview-server-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require successful validation of the current candidate
+        uses: actions/github-script@v7
+        env:
+          VALIDATION_NEEDS: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const { assertReleaseReady } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/release-candidate.mjs`);
+            const currentPr = context.eventName === 'pull_request'
+              ? (await github.rest.pulls.get({ ...context.repo, pull_number: context.issue.number })).data
+              : undefined;
+            assertReleaseReady({
+              needs: JSON.parse(process.env.VALIDATION_NEEDS),
+              eventName: context.eventName, event: context.payload, currentPr,
+            });
+
   merge-reuse:
     name: Reuse tested merge
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -146,7 +176,7 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-server-image.test.mjs
+        run: node --test scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-server-image.test.mjs scripts/release-candidate.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
