@@ -26,6 +26,9 @@ use tracing_subscriber::{
 const PERF_SPAN_EVENTS_ENV: &str = "LIX_SERVER_PERF_SPANS";
 const OTEL_TELEMETRY_FILTER: &str = "lix_server=info,lix=info,lix_sql=info";
 
+#[cfg(test)]
+mod runtime_tests;
+
 #[derive(Clone, Debug, Default)]
 /// Tracks SQL spans that have started under a protocol request but have not closed.
 pub struct InFlightSqlRegistry {
@@ -291,7 +294,11 @@ fn perf_span_events_enabled() -> bool {
 }
 
 fn provider_from_env() -> Result<SdkTracerProvider> {
-    let Some(endpoint) = optional_nonempty_env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")? else {
+    provider_from_endpoint(optional_nonempty_env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")?)
+}
+
+fn provider_from_endpoint(endpoint: Option<String>) -> Result<SdkTracerProvider> {
+    let Some(endpoint) = endpoint else {
         return Ok(SdkTracerProvider::builder().build());
     };
     let exporter = opentelemetry_otlp::SpanExporter::builder()

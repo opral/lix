@@ -352,6 +352,14 @@ impl LixRuntimeManager {
 
     #[cfg(test)]
     pub(crate) fn new_in_memory(max_open_lixes: usize) -> Arc<Self> {
+        Self::new_in_memory_with_telemetry(max_open_lixes, test_telemetry_sink())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_in_memory_with_telemetry(
+        max_open_lixes: usize,
+        telemetry: Arc<dyn lix_sdk::telemetry::TelemetrySink>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             backend: StorageBackend::Memory {
                 object_store: Arc::new(InMemory::new()),
@@ -359,7 +367,7 @@ impl LixRuntimeManager {
             max_open_lixes,
             recovery_watchdog: RecoveryWatchdog::test_default(),
             state: Mutex::new(ManagerState::default()),
-            telemetry: test_telemetry_sink(),
+            telemetry,
             open_gate: None,
             _cache_root_lease: None,
         })
