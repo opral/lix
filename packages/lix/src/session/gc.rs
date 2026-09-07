@@ -168,17 +168,33 @@ where
                     checkpoint_gc_retry_delay(attempt).await;
                 }
                 Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => {
-                    reclaim_failures_total().fetch_add(1, Ordering::Relaxed);
-                    if let Err(record_error) = self.record_reclaim_failure().await {
+                    // Contention is not a failed reclamation proof. Persisting
+                    // failure damping here can make already-due debt ineligible
+                    // even after writers quiesce. Cool down only automatic
+                    // scheduling; keep the repository's due state unchanged so
+                    // an explicit collector (or a reopened engine) can retry.
+                    let cooldown = async {
+                        let read = SharedStorageAdapterRead::new(
+                            self.storage
+                                .begin_read(StorageReadOptions::default())
+                                .await?,
+                        );
+                        let state = load_checkpoint_gc_state(&read).await?;
+                        self.commit_coordinator
+                            .defer_checkpoint_gc_until(state.checkpoint_sequence.saturating_add(8));
+                        Ok::<_, LixError>(())
+                    }
+                    .await;
+                    if let Err(record_error) = cooldown {
                         tracing::warn!(
                             error = %record_error,
-                            "could not record checkpoint GC conflict backoff"
+                            "could not defer checkpoint GC scheduling after conflicts"
                         );
                     }
                     tracing::debug!(
                         attempts = CHECKPOINT_GC_MAX_CONFLICT_ATTEMPTS,
                         error = %error,
-                        "post-checkpoint garbage collection yielded and damped retries after sustained conflicts"
+                        "post-checkpoint garbage collection yielded and deferred scheduling after sustained conflicts"
                     );
                     return;
                 }
@@ -257,6 +273,249 @@ mod tests {
         let engine = Engine::new(storage).await.expect("engine opens");
         let session = engine.open_session().await.expect("session opens");
         (engine, session)
+    }
+
+    /// Injects storage write conflicts (or real failures) only after the GC
+    /// planner has built its guarded maintenance write. All state is still
+    /// served and committed by the canonical in-memory backend.
+    #[derive(Clone, Default)]
+    struct FailingMaintenanceStorage {
+        inner: Memory,
+        failures: std::sync::Arc<
+            std::sync::Mutex<std::collections::VecDeque<crate::storage::StorageError>>,
+        >,
+    }
+
+    impl crate::storage::Storage for FailingMaintenanceStorage {
+        type Read<'a> = crate::storage::MemoryRead;
+        type Write<'a> = crate::storage::MemoryWrite;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, crate::storage::StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(
+            &self,
+            opts: crate::storage::ReadOptions,
+        ) -> Result<Self::Read<'_>, crate::storage::StorageError> {
+            self.inner.begin_read(opts).await
+        }
+
+        async fn begin_write(
+            &self,
+            opts: crate::storage::WriteOptions,
+        ) -> Result<Self::Write<'_>, crate::storage::StorageError> {
+            if opts.background_maintenance {
+                if let Some(error) = self
+                    .failures
+                    .lock()
+                    .expect("failure queue locks")
+                    .pop_front()
+                {
+                    return Err(error);
+                }
+            }
+            self.inner.begin_write(opts).await
+        }
+    }
+
+    async fn gc_state<S: crate::storage::Storage + Clone + Send + Sync + 'static>(
+        session: &SessionContext<S>,
+    ) -> CheckpointGcState {
+        let read = SharedStorageAdapterRead::new(
+            session
+                .storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("state read opens"),
+        );
+        load_checkpoint_gc_state(&read)
+            .await
+            .expect("GC state loads")
+    }
+
+    #[tokio::test]
+    async fn checkpoint_gc_conflicts_preserve_due_debt_for_quiescent_collection() {
+        use crate::storage::StorageError;
+        let storage = FailingMaintenanceStorage::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage initializes");
+        let engine = Engine::new(storage.clone()).await.expect("engine opens");
+        let session = engine.open_session().await.expect("session opens");
+        let branch_id = session.branch.get().expect("branch resolves");
+        let mut interior = Vec::new();
+        let mut checkpoints = Vec::new();
+        for round in 0..ROUNDS {
+            for write in 0..WRITES_PER_ROUND {
+                session.execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    &[Value::Text(format!("gc-conflict-k{write}")), Value::Jsonb(json!({"round": round, "write": write}).into())],
+                ).await.expect("write commits");
+                if write == 0 && round > 0 {
+                    interior.push(
+                        engine
+                            .load_branch_head_commit_id(&branch_id)
+                            .await
+                            .expect("head loads")
+                            .expect("head exists"),
+                    );
+                }
+            }
+            checkpoints.push(
+                session
+                    .create_checkpoint()
+                    .await
+                    .expect("checkpoint commits")
+                    .commit_id,
+            );
+        }
+        reclaim_history_delta_like_a_pre_fix_sweep(
+            &session,
+            CommitId::parse_lix(&checkpoints[1], "legacy checkpoint").expect("ID parses"),
+        )
+        .await
+        .expect("legacy damage commits");
+
+        // Hold only maintenance ownership, not the foreground session lease.
+        // Real empty checkpoints must rotate recovery roots as well as advance
+        // sequence. Coalescing their workers makes the three failures below
+        // deterministic without changing the fixture's retention shape.
+        let before_padding = gc_state(&session).await;
+        assert_eq!(before_padding.checkpoint_sequence, ROUNDS as u64);
+        assert!(before_padding.has_collectible_debt());
+        assert_eq!(before_padding.consecutive_reclaim_failures, 0);
+        assert!(!checkpoint_gc_due(before_padding).expect("predicate evaluates"));
+        assert!(
+            session
+                .commit_coordinator
+                .try_begin_checkpoint_gc(before_padding.checkpoint_sequence)
+        );
+        for _ in 0..RECLAIM_MAX_STALENESS {
+            session
+                .create_checkpoint()
+                .await
+                .expect("padding checkpoint commits");
+        }
+        session.commit_coordinator.finish_checkpoint_gc();
+        let due = gc_state(&session).await;
+        assert_eq!(
+            due.checkpoint_sequence,
+            (ROUNDS + RECLAIM_MAX_STALENESS) as u64
+        );
+        // The first empty checkpoint releases the preceding non-empty
+        // recovery interval; subsequent empty intervals add no further debt.
+        assert_eq!(
+            due.collectible_interval_count,
+            before_padding.collectible_interval_count + 1
+        );
+        assert!(checkpoint_gc_due(due).expect("predicate evaluates"));
+        assert_eq!(present(&session, &interior).await, interior);
+
+        storage
+            .failures
+            .lock()
+            .expect("queue locks")
+            .extend(std::iter::repeat_n(
+                StorageError::WriteConflict,
+                super::CHECKPOINT_GC_MAX_CONFLICT_ATTEMPTS as usize,
+            ));
+        session.collect_checkpoint_garbage_best_effort().await;
+        assert!(
+            storage.failures.lock().expect("queue locks").is_empty(),
+            "all three conflicts must be consumed"
+        );
+        let after_conflicts = gc_state(&session).await;
+        assert_eq!(
+            present(&session, &interior).await,
+            interior,
+            "failed writes cannot retire commits"
+        );
+        assert_eq!(
+            after_conflicts, due,
+            "optimistic conflicts must not turn collectible debt into durable failure backoff: {after_conflicts:?}"
+        );
+
+        // Scheduling can cool down, but that must not change the repository's
+        // due predicate or the explicit collector's existing if-due contract.
+        assert!(
+            !session
+                .commit_coordinator
+                .try_begin_checkpoint_gc(due.checkpoint_sequence)
+        );
+        assert!(
+            session
+                .commit_coordinator
+                .try_begin_checkpoint_gc(due.checkpoint_sequence + 8)
+        );
+        session.commit_coordinator.finish_checkpoint_gc();
+        let plan = session
+            .collect_checkpoint_garbage()
+            .await
+            .expect("quiescent collection succeeds")
+            .expect("debt remains due");
+        assert!(!plan.sweep.has_more);
+        assert!(plan.profile.history_manifests_missing > 0);
+        assert!(present(&session, &interior).await.is_empty());
+        assert_eq!(
+            present(&session, &checkpoints).await,
+            checkpoints,
+            "retained history must survive"
+        );
+        let collected = gc_state(&session).await;
+        assert_eq!(collected.last_gc_sequence, due.checkpoint_sequence);
+        assert!(!collected.has_collectible_debt());
+        assert_eq!(collected.consecutive_reclaim_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_gc_real_failure_still_persists_backoff() {
+        let storage = FailingMaintenanceStorage::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage initializes");
+        let engine = Engine::new(storage.clone()).await.expect("engine opens");
+        let session = engine.open_session().await.expect("session opens");
+        let due = CheckpointGcState {
+            checkpoint_sequence: 70,
+            collectible_interval_count: 5,
+            ..CheckpointGcState::default()
+        };
+        let mut writes = session.storage.new_write_set();
+        stage_checkpoint_gc_state(&mut writes, &due).expect("due state stages");
+        session
+            .storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("due state commits");
+        storage
+            .failures
+            .lock()
+            .expect("queue locks")
+            .push_back(crate::storage::StorageError::Io(
+                "injected maintenance failure".into(),
+            ));
+        session.collect_checkpoint_garbage_best_effort().await;
+        assert!(storage.failures.lock().expect("queue locks").is_empty());
+        let failed = gc_state(&session).await;
+        assert_eq!(
+            failed,
+            CheckpointGcState {
+                consecutive_reclaim_failures: 1,
+                ..due
+            }
+        );
+        assert!(!checkpoint_gc_due(failed).expect("predicate evaluates"));
+        assert!(
+            session
+                .collect_checkpoint_garbage()
+                .await
+                .expect("if-due collection succeeds")
+                .is_none()
+        );
+        assert_eq!(gc_state(&session).await, failed);
     }
 
     #[tokio::test]
@@ -340,7 +599,10 @@ mod tests {
     }
 
     /// Which of `commit_ids` the changelog still serves.
-    async fn present(session: &SessionContext<Memory>, commit_ids: &[String]) -> Vec<String> {
+    async fn present<S: crate::storage::Storage + Clone + Send + Sync + 'static>(
+        session: &SessionContext<S>,
+        commit_ids: &[String],
+    ) -> Vec<String> {
         let mut present = Vec::new();
         for commit_id in commit_ids {
             let result = session
@@ -604,8 +866,10 @@ mod tests {
     /// publicly reachable way to delete a manifest is a footgun that would
     /// outlive the fixture it was added for, so this test lives in-crate
     /// rather than in the integration suite.
-    async fn reclaim_history_delta_like_a_pre_fix_sweep(
-        session: &SessionContext<Memory>,
+    async fn reclaim_history_delta_like_a_pre_fix_sweep<
+        S: crate::storage::Storage + Clone + Send + Sync + 'static,
+    >(
+        session: &SessionContext<S>,
         commit_id: CommitId,
     ) -> Result<(), LixError> {
         let read = session
