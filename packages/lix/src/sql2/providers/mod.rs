@@ -871,9 +871,9 @@ mod tests {
              SELECT left_side.id \
              FROM shadowed AS left_side \
              JOIN (\
-                 SELECT row_ref FROM lix_change \
+                 SELECT row_pk FROM lix_change \
                  UNION ALL \
-                 SELECT row_ref FROM lix_change\
+                 SELECT row_pk FROM lix_change\
                ) AS right_side \
                ON false \
              JOIN public.\"lix_directory\" AS directory_a ON true \
