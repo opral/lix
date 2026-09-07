@@ -1,0 +1,72 @@
+name: ARM64 cross-build qualification
+on:
+  push:
+    branches: [ci/arm64-cross-build]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubicloud-standard-30-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross-toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang mold gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-js-sdk-linux-arm64-cross-v1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Cross-compile ARM64 native SDK
+        working-directory: packages/js-sdk
+        env:
+          LIX_NATIVE_TARGET: aarch64-unknown-linux-gnu
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu: --sysroot=/usr/aarch64-linux-gnu
+        run: npm run build:native
+      - name: Verify ARM64 ELF and package
+        working-directory: packages/js-sdk
+        env:
+          LIX_NATIVE_PACKAGE_ALLOW_CROSS: '1'
+        run: |
+          file lix_js_sdk.node
+          readelf -h lix_js_sdk.node | grep -q 'Machine:.*AArch64'
+          readelf --version-info lix_js_sdk.node
+          npm run prepare:native-package -- --suffix=linux-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arm64-native
+          path: packages/js-sdk/native-packages/linux-arm64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arm64-cargo-timings
+          path: target/cargo-timings/*.html
+  test:
+    needs: build
+    runs-on: ubicloud-standard-8-arm-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/js-sdk/package-lock.json
+      - uses: actions/download-artifact@v4
+        with:
+          name: arm64-native
+          path: packages/js-sdk/native-packages/linux-arm64
+      - name: Test cross-compiled binary on ARM64
+        working-directory: packages/js-sdk
+        run: |
+          test "$(uname -m)" = aarch64
+          cp native-packages/linux-arm64/lix_js_sdk.node lix_js_sdk.node
+          npm ci
+          npx vitest run src/binding.node.test.ts
