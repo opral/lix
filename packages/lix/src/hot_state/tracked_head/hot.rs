@@ -5548,6 +5548,91 @@ where
         );
     }
 
+    /// Replaces only the inherited schema cache of a local generation. Local
+    /// rows (including schema overrides/tombstones), untracked rows, and the
+    /// working-diff epoch retain their original ownership and before images.
+    /// A branch-local catalog is needed by domain validation; projecting a
+    /// global schema row through ordinary visibility is not equivalent.
+    pub(crate) async fn stage_inherited_catalog_refresh(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        local_catalog: HotTrackedSnapshot,
+        mut inherited_catalog: HotTrackedSnapshot,
+    ) -> Result<(), LixError> {
+        const CATALOG: &str = "lix_registered_schema";
+        // Early main generations can still reference the initial global root.
+        // Once a local overlay exists, that root is not local ownership: its
+        // values must come from the live global plane, not shadow its updates.
+        if let Some(root) = load_root_current_base_commit(self.store, branch_id, generation).await?
+        {
+            let node = crate::commit_graph::CommitGraphContext::new()
+                .reader(self.store)
+                .load_node(&root)
+                .await?
+                .ok_or_else(|| head_value_error("current-base commit is missing"))?;
+            if node.base_commit_id.is_none() {
+                self.writes.delete(
+                    ROOT_CURRENT_BASE_SPACE,
+                    StorageKey(Bytes::from(hot_scope_prefix(branch_id, generation))),
+                );
+            }
+        }
+        inherited_catalog
+            .rows
+            .retain(|key, _| !local_catalog.rows.contains_key(key));
+        normalize_complete_hot_snapshot_baselines(
+            &mut inherited_catalog.rows,
+            WorkingDiffBaseline::Clean,
+        )?;
+        let filter = TrackedStateFilter {
+            schema_keys: vec![CATALOG.to_owned()],
+            include_tombstones: true,
+            ..TrackedStateFilter::default()
+        };
+        let HotScanEntries::Decoded(previous) =
+            hot_scan_entries(self.store, branch_id, generation, &filter, None, None)
+                .await?
+                .expect("unbounded catalog scan cannot exhaust a byte budget")
+        else {
+            unreachable!("catalog scan has no finite primary-key predicate");
+        };
+        let mut untracked = BTreeMap::new();
+        for (identity, bytes) in previous {
+            let value = decode_head_value(&bytes)?;
+            let key = identity.into_row_identity();
+            if value.untracked {
+                untracked.insert(key, bytes);
+            } else if !local_catalog.rows.contains_key(&key)
+                && !inherited_catalog.rows.contains_key(&key)
+            {
+                self.writes.delete(
+                    ROW_SPACE,
+                    StorageKey(Bytes::from(encode_hot_row_key_parts(
+                        branch_id,
+                        generation,
+                        &key.schema_key,
+                        &key.row_pk,
+                        key.file_id.as_deref(),
+                    ))),
+                );
+            }
+        }
+        let mut complete_catalog = local_catalog.rows;
+        complete_catalog.extend(
+            inherited_catalog
+                .rows
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        // A newly inherited tracked schema must not silently replace a
+        // branch-local history-free schema with the same identity.
+        merge_final_untracked_rows(&mut complete_catalog, untracked)?;
+        stage_complete_collection_controls(self.writes, branch_id, generation, &complete_catalog)?;
+        stage_complete_hot_rows(self.writes, branch_id, generation, inherited_catalog.rows);
+        Ok(())
+    }
+
     /// Publishes a transaction-certified ordered insert batch as an immutable
     /// current-state base without rebuilding row-shaped deltas or absence
     /// guards.
@@ -13543,6 +13628,59 @@ mod tests {
             })
             .expect("closure fixture HOT value should encode"),
         )
+    }
+
+    #[tokio::test]
+    async fn inherited_catalog_refresh_preserves_owned_bytes_and_removes_retired_cache() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("catalog-refresh");
+        let identity = |key: &str| HeadRowIdentity {
+            schema_key: "lix_registered_schema".to_owned(),
+            row_pk: RowPk::single(key),
+            file_id: None,
+        };
+        let tracked = encoded_test_hot_value(generation, false, false);
+        let tombstone = encoded_test_hot_value(generation, false, true);
+        let untracked = encoded_test_hot_value(generation, true, false);
+        let local = HotRowMap::from([
+            (identity("owned"), tracked.clone()),
+            (identity("hidden"), tombstone.clone()),
+        ]);
+        let mut previous = local.clone();
+        previous.extend([
+            (identity("retired"), tracked.clone()),
+            (identity("inherited"), tracked.clone()),
+            (identity("private"), untracked.clone()),
+        ]);
+        let mut writes = StorageWriteSet::new();
+        stage_complete_hot_rows(&mut writes, "branch", generation, previous);
+        storage.commit_write_set(writes, StorageWriteOptions::default()).await.unwrap();
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        HotStateWriter {
+            store: &read,
+            writes: &mut writes,
+            transaction_global_schema_keys: None,
+        }.stage_inherited_catalog_refresh(
+            "branch", generation,
+            HotTrackedSnapshot { rows: local },
+            HotTrackedSnapshot { rows: HotRowMap::from([
+                (identity("owned"), tracked.clone()),
+                (identity("hidden"), tracked.clone()),
+                (identity("inherited"), tracked.clone()),
+                (identity("new"), tracked),
+            ]) },
+        ).await.unwrap();
+        storage.commit_write_set(writes, StorageWriteOptions::default()).await.expect("one mutation per key, including replacements");
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let filter = TrackedStateFilter { schema_keys: vec!["lix_registered_schema".to_owned()], include_tombstones: true, ..TrackedStateFilter::default() };
+        let HotScanEntries::Decoded(rows) = hot_scan_entries(&read, "branch", generation, &filter, None, None).await.unwrap().unwrap() else { panic!("decoded catalog"); };
+        let rows = rows.into_iter().map(|(key, value)| (key.into_row_identity(), value)).collect::<HotRowMap>();
+        assert_eq!(rows.len(), 5);
+        assert!(!rows.contains_key(&identity("retired")));
+        assert_eq!(rows[&identity("hidden")], tombstone, "local tombstone is not overwritten by inheritance");
+        assert_eq!(rows[&identity("private")], untracked, "history-free bytes are untouched");
+        assert!(decode_head_value(&rows[&identity("new")]).unwrap().commit_id.is_some());
     }
 
     #[test]

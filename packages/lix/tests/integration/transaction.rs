@@ -730,8 +730,8 @@ async fn existing_session_ignores_later_default_branch_corruption() {
 
     let delta = storage.stats().delta_since(&before);
     assert_eq!(
-        delta.read_opened, 4,
-        "an externally invalidated session preflights its pinned branch/global base before SQL"
+        delta.read_opened, 5,
+        "an externally invalidated session preflights its pinned branch/global base and warms the atomically revised catalog before SQL"
     );
     assert_eq!(
         delta.write_opened, 1,

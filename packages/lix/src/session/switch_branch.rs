@@ -230,6 +230,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_creation_shares_immutable_rows_and_refresh_keeps_its_generation() {
+        use crate::branch::BranchHeadControlContext;
+        use crate::hot_state::{
+            ROOT_CURRENT_BASE_SPACE, ROW_SPACE, hot_generation_scope_prefix,
+        };
+        use crate::storage_adapter::{
+            StorageAdapterRead as _, StorageBeginScanOptions, StoragePrefix,
+        };
+
+        for rows in [8, 1024] {
+            let storage = CountingStorage::new();
+            let initialized = Engine::initialize(storage.clone())
+                .await
+                .expect("initialize");
+            let engine = Engine::new(storage.clone()).await.expect("engine");
+            let session = engine
+                .open_session_at(&initialized.main_branch_id)
+                .await
+                .expect("session");
+            let values = (0..rows)
+                .map(|i| format!("('row-{i}', 'value-{i}')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            session
+                .execute(
+                    &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
+                    &[],
+                )
+                .await
+                .expect("seed");
+            session
+                .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+                .await
+                .expect("checkpoint");
+            let branch = session
+                .create_branch(CreateBranchOptions {
+                    id: None,
+                    name: "shared-root".to_owned(),
+                    from_commit_id: None,
+                })
+                .await
+                .expect("create");
+            let read = engine
+                .storage()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read");
+            let control = BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&branch.id)
+                .await
+                .expect("control")
+                .expect("branch");
+            let range = StoragePrefix {
+                bytes: hot_generation_scope_prefix(&branch.id, control.tracked_generation).into(),
+            }
+            .to_range()
+            .expect("scope");
+            let roots = read
+                .begin_scan(
+                    ROOT_CURRENT_BASE_SPACE,
+                    range.clone(),
+                    StorageBeginScanOptions::default(),
+                )
+                .await
+                .expect("root scan")
+                .collect_all()
+                .await
+                .expect("roots");
+            assert_eq!(
+                roots.len(),
+                1,
+                "new branch must share its immutable root ({rows} rows)"
+            );
+            let hot = read
+                .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
+                .await
+                .expect("hot scan")
+                .collect_all()
+                .await
+                .expect("hot rows");
+            assert!(
+                hot.len() < 64,
+                "only the serving catalog may be copied, not {rows} owned rows: {}",
+                hot.len()
+            );
+            drop(read);
+            session
+                .switch_branch(SwitchBranchOptions {
+                    branch_id: branch.id.clone(),
+                })
+                .await
+                .expect("stale checkout");
+            let read = engine
+                .storage()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read");
+            let refreshed = BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&branch.id)
+                .await
+                .expect("control")
+                .expect("branch");
+            assert_ne!(
+                control.head_commit_id, refreshed.head_commit_id,
+                "stale checkout publishes a base refresh"
+            );
+            assert_eq!(
+                control.tracked_generation, refreshed.tracked_generation,
+                "base refresh must retain the local serving generation"
+            );
+            assert_eq!(
+                control.working_diff_checkpoint_commit_id,
+                refreshed.working_diff_checkpoint_commit_id
+            );
+            drop(read);
+            let count = session
+                .execute("SELECT COUNT(*) AS n FROM lix_key_value WHERE key LIKE 'row-%'", &[])
+                .await
+                .expect("shared rows");
+            assert_eq!(count.rows()[0].get::<i64>("n").expect("count"), rows);
+        }
+    }
+
+    #[tokio::test]
     async fn switching_a_stale_branch_publishes_one_bounded_base_refresh() {
         let storage = CountingStorage::new();
         let receipt = Engine::initialize(storage.clone())
@@ -263,9 +389,13 @@ mod tests {
         assert_eq!(switched.branch_id, branch.id);
         assert_eq!(delta.begin_writes, 1, "stale checkout needs one commit");
         assert!(
-            delta.begin_reads <= 4
-                && delta.get_many_calls <= 80
-                && delta.get_many_keys <= 96
+            // In-place publication authenticates catalog/root ownership and
+            // the private epoch. Its catalog revision also warms the new
+            // catalog in one fresh read. These are fixed metadata costs,
+            // independent of the number of branch-owned application rows.
+            delta.begin_reads <= 5
+                && delta.get_many_calls <= 144
+                && delta.get_many_keys <= 160
                 && delta.scan_calls <= 20,
             "metadata-only auto-rebase must remain bounded, saw {delta:?}"
         );

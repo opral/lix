@@ -3281,6 +3281,69 @@ async fn load_local_overlay_with_inherited_catalog(
     Ok(rows)
 }
 
+/// Only schema definitions are materialized into a local serving generation
+/// from its pinned global base. The rest of that generation is the immutable
+/// local root plus its own HOT mutations, not a copy of the global plane.
+async fn load_lifecycle_catalog(
+    read: &(impl StorageAdapterRead + ?Sized),
+    commit_id: Option<CommitId>,
+    local: bool,
+) -> Result<HotTrackedSnapshot, LixError> {
+    let Some(commit_id) = commit_id else {
+        return Ok(HotTrackedSnapshot::default());
+    };
+    let mut rows = TrackedStateContext::new()
+        .reader(read)
+        .scan_batch_at_commit(
+            &commit_id.to_string(),
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec!["lix_registered_schema".to_owned()],
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns::default(),
+                limit: None,
+            },
+        )
+        .await?
+        .into_rows();
+    if local {
+        // Only the catalog's own replacement marker is relevant; enumerating
+        // every file/collection marker would turn this into state-sized work.
+        let marker_key = RowPk::single(crate::collection_generation::collection_scope_key(
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: "lix_registered_schema",
+                file_id: None,
+            },
+        ));
+        rows.extend(
+            TrackedStateContext::new()
+                .reader(read)
+                .scan_batch_at_commit(
+                    &commit_id.to_string(),
+                    &TrackedStateScanRequest {
+                        filter: TrackedStateFilter {
+                            schema_keys: vec![
+                                crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                                    .to_owned(),
+                            ],
+                            row_pks: vec![marker_key],
+                            file_ids: vec![NullableKeyFilter::Null],
+                            include_tombstones: true,
+                            ..TrackedStateFilter::default()
+                        },
+                        read_columns: TrackedStateReadColumns::default(),
+                        limit: None,
+                    },
+                )
+                .await?
+                .into_rows(),
+        );
+    }
+    HotTrackedSnapshot::from_materialized_rows(rows)
+}
+
 fn lifecycle_selected_tracked_row(
     change_ref: StagedCommitChangeRef<'_>,
     commit_id: CommitId,
@@ -3687,10 +3750,9 @@ async fn stage_tracked_head(
             .get(&root.commit_id)
             .and_then(|inventory| inventory.columnar_parts.as_ref());
 
-        // A lazy composite-base refresh has no logical row delta, but it must
-        // replace the branch's old complete HOT generation with the durable
-        // local overlay. The mutable global plane then supplies exactly the
-        // newly pinned base without stale inherited rows shadowing it.
+        // A lazy composite-base refresh changes inheritance, not the owned
+        // local rows or their private working interval. Refresh the serving
+        // catalog without rematerializing that unchanged local overlay.
         let parent_base_commit_id = if root.branch_id != crate::GLOBAL_BRANCH_ID
             && state_row_indices.is_empty()
             && staged.selected_change_batches.is_empty()
@@ -3717,105 +3779,77 @@ async fn stage_tracked_head(
                     "base refresh has no previous branch control",
                 )
             })?;
-            let mut local_overlay = match root.state_parent_commit_id {
-                None => BTreeMap::new(),
-                Some(parent_commit_id) => {
-                    load_persisted_lifecycle_tracked_snapshot(
-                        read,
-                        &root.branch_id,
-                        parent_commit_id,
-                    )
-                    .await?
-                }
-            };
-            if let Some(base_commit_id) = staged.record.base_commit_id {
-                let inherited_catalog = load_persisted_lifecycle_tracked_snapshot(
-                    read,
-                    crate::GLOBAL_BRANCH_ID,
-                    base_commit_id,
-                )
-                .await?;
-                for (key, row) in inherited_catalog {
-                    if row.schema_key == "lix_registered_schema" {
-                        local_overlay.entry(key).or_insert(row);
-                    }
-                }
-            }
-            let serving_catalog = local_overlay
-                .iter()
-                .filter(|(_, row)| row.schema_key == "lix_registered_schema")
-                .map(|(key, row)| (key.clone(), row.clone()))
-                .collect::<Vec<_>>();
+            let local_catalog =
+                load_lifecycle_catalog(read, root.state_parent_commit_id, true).await?;
+            let inherited_catalog =
+                load_lifecycle_catalog(read, staged.record.base_commit_id, false).await?;
             let checkpoint_commit_id = parent_control
                 .working_diff_checkpoint_commit_id
                 .unwrap_or(root.parent_commit_id.expect("refresh has a parent"));
-            let checkpoint_node = crate::commit_graph::CommitGraphContext::new()
-                .reader(read)
-                .load_node(&checkpoint_commit_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_COMMIT_NOT_FOUND,
-                        format!("base refresh checkpoint '{checkpoint_commit_id}' is missing"),
-                    )
-                })?;
-            let mut checkpoint_overlay = if checkpoint_node.base_commit_id.is_none() {
-                BTreeMap::new()
-            } else {
-                load_persisted_lifecycle_tracked_snapshot(
+            let generation = if root.state_parent_commit_id.is_some() {
+                // The durable local overlay did not change. Keep its owned
+                // rows, untracked retention and private working-diff epoch in
+                // place; only the inherited serving catalog has a new source.
+                load_working_diff_epoch_for_publication(
                     read,
                     &root.branch_id,
-                    checkpoint_commit_id,
-                )
-                .await?
-            };
-            // Registered-schema rows in a local HOT generation are a serving
-            // cache, not local working changes. Compare both sides against the
-            // newly pinned catalog so a global schema refresh stays clean.
-            for (key, row) in serving_catalog {
-                checkpoint_overlay.insert(key, row);
-            }
-            let generation = lifecycle_generation(
-                &root.branch_id,
-                root.commit_id,
-                root.ref_change_id,
-            );
-            let mut coverage = WorkingDiffIndexCoverage::default();
-            tracked_head
-                .writer(read, writes)
-                .stage_complete_current_state_with_working_diff(
-                    &root.branch_id,
-                    generation,
-                    HotTrackedSnapshot::from_materialized_rows(
-                        local_overlay.into_values().collect(),
-                    )?,
+                    None,
+                    root.parent_commit_id,
+                    Some(parent_control),
                     Some(parent_control.tracked_generation),
-                    &[],
-                    &[],
-                    &BTreeSet::new(),
-                    CompleteWorkingDiffMode::Rebase {
-                        checkpoint_commit_id,
-                        checkpoint: HotTrackedSnapshot::from_materialized_rows(
-                            checkpoint_overlay.into_values().collect(),
-                        )?,
-                    },
-                    &mut coverage,
                 )
                 .await?;
-            stage_tracked_working_diff_epoch(
-                writes,
-                &root.branch_id,
-                TrackedWorkingDiffEpoch {
-                    checkpoint_commit_id,
-                    generation,
-                    coverage,
-                },
-            )?;
+                tracked_head
+                    .writer(read, writes)
+                    .stage_inherited_catalog_refresh(
+                        &root.branch_id,
+                        parent_control.tracked_generation,
+                        local_catalog,
+                        inherited_catalog,
+                    )
+                    .await?;
+                parent_control.tracked_generation
+            } else {
+                // A branch still pointing directly at a global commit has no
+                // local tracked overlay to retain. Begin that local plane,
+                // preserving only its history-free rows and serving catalog.
+                let generation =
+                    lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
+                let mut coverage = WorkingDiffIndexCoverage::default();
+                tracked_head
+                    .writer(read, writes)
+                    .stage_complete_current_state_with_working_diff(
+                        &root.branch_id,
+                        generation,
+                        inherited_catalog,
+                        Some(parent_control.tracked_generation),
+                        &[],
+                        &[],
+                        &BTreeSet::new(),
+                        CompleteWorkingDiffMode::ResetClean,
+                        &mut coverage,
+                    )
+                    .await?;
+                stage_tracked_working_diff_epoch(
+                    writes,
+                    &root.branch_id,
+                    TrackedWorkingDiffEpoch {
+                        checkpoint_commit_id,
+                        generation,
+                        coverage,
+                    },
+                )?;
+                generation
+            };
             let control = normal_branch_head_control(
                 root,
                 Some(parent_control),
                 generation,
-                Some(checkpoint_commit_id),
+                if root.state_parent_commit_id.is_some() {
+                    parent_control.working_diff_checkpoint_commit_id
+                } else {
+                    Some(checkpoint_commit_id)
+                },
             )?;
             insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
             continue;
@@ -5469,27 +5503,18 @@ async fn stage_root_backed_branch_publication(
                         )
                     })?;
                 if branch_id != crate::GLOBAL_BRANCH_ID && node.base_commit_id.is_some() {
-                    let current = load_local_overlay_with_inherited_catalog(
-                        read,
-                        branch_id,
-                        head_commit_id,
-                    )
-                    .await?;
-                    let mut coverage = WorkingDiffIndexCoverage::default();
-                    tracked_head
-                        .writer(read, writes)
-                        .stage_complete_current_state_with_working_diff(
+                    let local_catalog =
+                        load_lifecycle_catalog(read, Some(head_commit_id), true).await?;
+                    let inherited_catalog =
+                        load_lifecycle_catalog(read, node.base_commit_id, false).await?;
+                    let mut writer = tracked_head.writer(read, writes);
+                    writer.stage_root_current_base(branch_id, generation, head_commit_id);
+                    writer
+                        .stage_inherited_catalog_refresh(
                             branch_id,
                             generation,
-                            HotTrackedSnapshot::from_materialized_rows(
-                                current.into_values().collect(),
-                            )?,
-                            None,
-                            &[],
-                            &[],
-                            &BTreeSet::new(),
-                            CompleteWorkingDiffMode::ResetClean,
-                            &mut coverage,
+                            local_catalog,
+                            inherited_catalog,
                         )
                         .await?;
                 } else {
