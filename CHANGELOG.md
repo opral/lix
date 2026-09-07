@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.15.0 - 2026-09-07
+
+### Minor
+
+- Added a deployable reference server for the Lix Server Protocol.
+
+  Hosts can run the provided S3-backed container, embed the Rust protocol handler, or provide an independent compatible implementation.
+- Changed connected sync clients to serve only authority-certified current state.
+
+  Sync protocol v6 is a semantic hard cut from v5 and older clients that still permit replica-local writes; its existing JSON fields, paths, and operations are unchanged. JavaScript sync mutations and history execute on the authority, local HOT reads wait for a finite authority publication fence, and private replica receipts certify complete live values, provenance, and branch coordinates against the existing snapshot roots. Durable authority/replica storage fences prevent uncaptured local writes. The existing one-argument `lix_diff` reads Working Changes from the certified HOT epoch without hydrating arbitrary history; selected point-in-time file content remains server-first through the existing history surface.
+
+  The Rust and JavaScript public type and function surfaces are unchanged. Rust retains `ServerOptions::sync(...)` with `open_lix().with_server(...)` and its existing remote protocol client, while JavaScript retains `openLix({ server: { mode: "sync" | "remote", ... } })`. No SQL surface was added or removed. The semantic hard cut is intentional: raw Rust sync handles serve certified HOT reads and return `LIX_AUTHORITY_EXECUTION_REQUIRED` for mutations, transactions, observations, and history; server-first Rust applications use the existing protocol client. JavaScript `openLix` performs that authority routing internally.
+- Restore `lix_change` record identities as `schema_key`, JSONB `row_pk`, and `file_id`, replacing its public `row_ref`.
+
+  History `lixcol_source_changes` objects use the same record identity. Snapshots and identities describe the same underlying schema record. Public history rows and diff commands continue to use opaque row references.
+- Removed the obsolete hidden JSON primary-key projection from current SQL relations.
+
+  Current relations now derive identity exclusively from their declared primary-key columns. Cross-relation addresses continue to use opaque row references, and derived columnar accelerators use a private physical identity field that is not part of any SQL schema.
+
+### Patch
+
+- Use immutable scope certificates and row-primary-key catalogs for bounded packed-state point reads instead of decoding unrelated rows. Preserve file scopes, selected-source identities, and native columnar lookup behavior.
+- Fixed tracked-state updates that could drop newly inserted rows or produce inconsistent state roots.
+
+  Sparse updates now repair boundaries across neighboring subtrees while skipping unaffected gaps and preserving existing canonical grouping rules. Key-size combinations that cannot form a finite canonical tree now fail explicitly instead of looping indefinitely.
+- Avoid invalidating and warming unchanged schema catalogs when publishing checkpoints, three-way merges, or data-only inherited-base refreshes.
+
+  Invalidate inherited catalogs when their visible definitions actually change, preserving local overrides, tombstones, and collection-generation fences.
+- Prevent concurrent writes from incorrectly delaying eligible garbage collection after checkpoint cleanup encounters write conflicts.
+
+  Write contention now delays automatic cleanup scheduling without marking reclamation as failed. Retention protections and backoff for genuine storage failures are unchanged.
+- Fixed missing values and directory paths in working diffs.
+
+  Default-range `lix_diff` queries now return the requested before and after values and metadata instead of silently returning null or failing to reconstruct directory paths.
+- Prevent concurrent SQL updates and deletes from silently committing stale decisions.
+
+  Transactions that plan an `UPDATE` or `DELETE` now reject an intervening change to their active-branch or shared/global state with `LIX_TRANSACTION_CONFLICT`, instead of merging the stale write. Retry an explicit transaction from the beginning. Local `execute()` and `executeBatch()` retry conflicts automatically within their existing limits. `RETURNING` results inside an explicit transaction remain provisional until commit succeeds. The branch-level check can also reject unrelated concurrent edits; explicit branch merging remains available for collaborative changes.
+- Remote Lix handles now support merge previews and merges, and retain snapshot export on child sessions.
+
+  Remote snapshot streams preserve server errors and release requests when cancelled. Local, sync, and remote bindings now share operation forwarding to reduce differences between modes.
+- Share immutable state when creating branches and refresh inherited schema catalogs without rebuilding unchanged branch-local rows.
+
+  Preserve private checkpoint before-images, untracked rows, and local overrides across stale-base refreshes, and invalidate cached catalogs when newly inherited schemas become visible.
+- Local and remote JavaScript SDK handles now share Wasm initialization, preventing concurrent opens from initializing the same module twice.
+
 ## 0.14.0 - 2026-08-28
 
 ### Minor
