@@ -72,6 +72,7 @@ and will remain red until that one-time setting is complete.
 | `S3_ALLOW_HTTP` | `false` | Allow an insecure object-store endpoint |
 | `SLATEDB_CACHE_DIR` | `/tmp/lix-server-slatedb-cache` | Local cache root |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | Optional OTLP/HTTP trace endpoint |
+| `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | unset | Collector authentication headers, for example `Authorization=Bearer%20token` |
 
 `S3_PREFIX` is part of the persistent object layout. Set it explicitly and do
 not change it for an existing deployment. Cache settings affect only local,
@@ -88,3 +89,24 @@ docker build -f packages/server/Dockerfile -t lix-server .
 LixRay-specific public routing, Supabase policy, demo identities, MCP routes,
 and product analytics remain in LixRay's gateway. They are intentionally not
 part of this reference implementation.
+
+## Telemetry
+
+The server exports one stream of gzip-compressed OTLP/HTTP protobuf traces.
+Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to the complete receiver URL (including
+its trace path) and configure receiver authentication through standard OTLP
+headers. No analytics-vendor credentials or product-event conversion live in
+the server or engine. The deployment-owned receiver maps canonical lifecycle
+spans to its analytics system and forwards diagnostic traces as needed.
+
+`lix.repository.opened` comes from the Lix session-bind boundary, including
+the verified `lix.account_id`. Loading a repository engine or resuming an
+existing session does not create another open. Anonymous sessions remain in
+raw traces; the analytics receiver owns identity filtering. Remote and sync
+clients must not emit a duplicate open event.
+
+Export uses a bounded background batch processor with a five-second timeout.
+Delivery failures do not fail repository operations. Missing endpoint
+configuration disables export; invalid configuration is logged. Deployments
+that depend on telemetry must verify the full receive path, not just server
+health.

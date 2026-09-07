@@ -34,6 +34,8 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 uuid = "1.19.0"
 
 [dev-dependencies]
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
+prost = "0.14"
 async-trait = "0.1.89"
 bytes = "1.10.1"
 flate2 = "1.1.8"
