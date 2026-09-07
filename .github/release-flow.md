@@ -8,7 +8,7 @@
    CI. The bot will neither update it nor close it in favor of another version.
 3. Wait for **Release ready** on the current head commit. This aggregates the
    existing CI suites, rejecting failures, cancellations, and unexpected skips.
-   It also checks that the PR is still open, ready, and at the tested head.
+   It also checks that the PR is still open, ready, and at the tested head and base.
 4. Merge the candidate. The existing publishing workflow handles publication.
 
 To include newer changes, return the candidate to draft and manually dispatch
@@ -16,10 +16,19 @@ To include newer changes, return the candidate to draft and manually dispatch
 Do not rerun an old draft event to validate a ready candidate: reruns retain
 their original event payload. Rerun the ready-for-review run instead.
 
+If main advances during validation, refresh the candidate through the draft flow
+and start new CI. Rerunning the old event retains its old base SHA and is not a
+substitute for validating the refreshed candidate.
+
 ## One-time rollout
 
 After these workflows land, configure main's branch protection to require
 **Release ready** from GitHub Actions, preserving any other required checks.
+Also enable **Require branches to be up to date before merging** (required status
+checks `strict: true`). Both settings are required: the gate detects base changes
+before it finishes, while strict branch protection prevents an already-green
+candidate from merging after main advances. A completed check cannot invalidate
+itself when the base changes later. Do not bypass these protections for releases.
 GitHub requires checks on the target branch, so this lightweight aggregate is
 also emitted for ordinary ready PRs; it adds no test suite or build matrix.
 Draft CI uses a different check name and concurrency group, so it cannot cancel

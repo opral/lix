@@ -3,7 +3,7 @@ import test from "node:test";
 import { assertReleaseReady, checkReleaseFreeze, frozenReleaseCandidates } from "./release-candidate.mjs";
 
 const pr = (overrides = {}) => ({
-	number: 1669, state: "open", draft: false, base: { ref: "main" },
+	number: 1669, state: "open", draft: false, base: { ref: "main", sha: "tested-base" },
 	head: { ref: "release/v0.15.0", sha: "candidate", repo: { full_name: "opral/lix" } },
 	...overrides,
 });
@@ -71,6 +71,29 @@ test("existing explicit SDK-only and unchanged-server scopes remain allowed", ()
 	input.needs["preview-artifact-changes"].outputs.server = "false";
 	input.needs["preview-server-image"].result = "skipped";
 	assert.doesNotThrow(() => assertReleaseReady(input));
+});
+
+test("an unchanged head cannot certify an advanced or retargeted base", () => {
+	for (const base of [
+		{ ref: "main", sha: "new-base" },
+		{ ref: "other", sha: "tested-base" },
+	]) {
+		const input = validation();
+		input.currentPr.base = base;
+		assert.equal(input.currentPr.head.sha, input.event.pull_request.head.sha);
+		assert.throws(() => assertReleaseReady(input), /base branch changed/);
+	}
+});
+
+test("missing base evidence fails closed on either side", () => {
+	for (const side of ["event", "current"]) {
+		for (const base of [undefined, { ref: "main" }]) {
+			const input = validation();
+			if (side === "event") input.event.pull_request.base = base;
+			else input.currentPr.base = base;
+			assert.throws(() => assertReleaseReady(input), /base branch changed or is unknown/);
+		}
+	}
 });
 
 test("verified exact-tree reuse is push-only and requires artifact promotion", () => {
