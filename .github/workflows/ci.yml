@@ -217,6 +217,12 @@ jobs:
               . -> target
               tooling -> target
             runner: ubicloud-standard-30-ubuntu-2404
+          # Consumer checks compile different feature/toolchain combinations.
+          # Run them alongside lint instead of extending its critical path.
+          - name: Compatibility
+            task: compatibility
+            workspace: .
+            runner: ubicloud-standard-30-ubuntu-2404
           - name: Test
             task: test
             workspace: .
@@ -266,7 +272,7 @@ jobs:
           sudo apt-get install -y llvm-dev libclang-dev clang mold
 
       - name: Install cargo-nextest
-        if: matrix.task != 'clippy'
+        if: matrix.junit
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -315,11 +321,11 @@ jobs:
       # `test`: the matrix below already runs the tests, this only has to prove
       # the configuration compiles.
       - name: Check lix test targets with default features
-        if: matrix.task == 'clippy'
+        if: matrix.task == 'compatibility'
         run: cargo check -p lix --tests
 
       - name: Verify stable Cargo can embed the local Rust SDK
-        if: matrix.task == 'clippy'
+        if: matrix.task == 'compatibility'
         run: |
           rustup toolchain install 1.93.0 --profile minimal
           rustup run 1.93.0 cargo metadata --locked --format-version 1 --no-deps --manifest-path packages/lix/Cargo.toml
@@ -381,7 +387,7 @@ jobs:
         run: cargo nextest run --config-file .config/nextest.toml --profile ci-e2e --locked --manifest-path tooling/Cargo.toml --cargo-profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --tests --timings
 
       - name: Upload Rust test timing reports
-        if: matrix.task != 'clippy' && !cancelled()
+        if: matrix.junit && !cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: rust-nextest-junit-${{ matrix.task }}
@@ -389,7 +395,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Cargo build timings
-        if: matrix.task != 'clippy' && !cancelled()
+        if: matrix.junit && !cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: rust-cargo-timings-${{ matrix.task }}

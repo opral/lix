@@ -30,6 +30,7 @@ test("draft reruns cannot cancel ready-candidate CI", () => {
 test("Rust test scopes run independently with workspace-specific caches", () => {
 	for (const [name, task, workspace, runner] of [
 		["Clippy", "clippy", ".", "ubicloud-standard-30-ubuntu-2404"],
+		["Compatibility", "compatibility", ".", "ubicloud-standard-30-ubuntu-2404"],
 		["Test", "test", ".", "ubicloud-standard-30-ubuntu-2404"],
 		["Tooling Test", "tooling", "tooling", "ubicloud-standard-30-ubuntu-2404"],
 		["E2E Test", "e2e", "tooling", "ubicloud-standard-30-ubuntu-2404"],
@@ -298,4 +299,17 @@ test("tested merges skip validation but retain SDK artifacts for the landed revi
 	assert.match(promotion, /run-id: \$\{\{ needs\.merge-reuse\.outputs\.run_id \}\}/);
 	assert.match(promotion, /name: lix-browser-sdk-\$\{\{ github\.sha \}\}/);
 	assert.doesNotMatch(promotion, /\bcargo\b|\bnpm\b/);
+});
+
+// These checks protect different consumer configurations and must both execute
+// even when the all-feature lint job passes. They do not emit nextest reports.
+test("consumer compatibility runs independently without requiring nextest artifacts", () => {
+	for (const name of ["Check lix test targets with default features", "Verify stable Cargo can embed the local Rust SDK"]) {
+		const step = workflow.split(`- name: ${name}\n`)[1].split("\n      - name:")[0];
+		assert.match(step, /if: matrix\.task == 'compatibility'/);
+	}
+	for (const name of ["Upload Rust test timing reports", "Upload Cargo build timings"]) {
+		const step = workflow.split(`- name: ${name}\n`)[1].split("\n      - name:")[0];
+		assert.match(step, /if: matrix\.junit && !cancelled\(\)/);
+	}
 });

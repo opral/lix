@@ -82,6 +82,6 @@ if (
 	console.log(
 		rust
 			? "Run all Rust checks (Rust/unknown inputs, push, dispatch, or uncertain diff)."
-			: "SDK TypeScript-only PR: run both SDK suites; skip the four Rust-only jobs.",
+			: "SDK TypeScript-only PR: run both SDK suites; skip the Rust-only jobs.",
 	);
 }
