@@ -5,13 +5,13 @@
 //! same persistent tree implementation serve row-primary-key prefix lookups.
 
 use crate::row_pk::RowPk;
-use crate::tracked_state::codec::{decode_key, encode_key_ref};
+use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
+use crate::tracked_state::codec::{decode_key, encode_key_ref, encode_value_ref};
 use crate::tracked_state::types::{
     CommitStateManifest, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
     TrackedStateMutation, TrackedStateMutationBatch, TrackedStateRootId,
     TrackedStateTreeScanRequest,
 };
-use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::{LixError, NullableKeyFilter};
 
 const NULL_FILE_ID_TAG: &str = "n";
@@ -118,6 +118,11 @@ pub(crate) fn with_row_pk_index_mutations(
 }
 
 /// Stages the monotonic identity catalog transition for one commit.
+///
+/// Values only keep catalog entries visible to the shared tree scanner; readers
+/// resolve current values through canonical state. Preserve an existing entry's
+/// bytes across updates, deletes, and recreates instead of rewriting its leaf.
+/// An unchanged identity set can therefore share the parent's catalog root.
 pub(crate) async fn stage_row_pk_index_from_members(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -126,17 +131,40 @@ pub(crate) async fn stage_row_pk_index_from_members(
     members: &[super::storage::CommitDeltaMember],
     commit_id: crate::changelog::CommitId,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
-    let mut primary = crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
-        members.len(),
-    );
-    for member in members {
-        primary.push(
-            TrackedStateKeyRef {
+    if members.is_empty() && base_root.is_some() {
+        return Ok(base_root.cloned());
+    }
+    let keys = members
+        .iter()
+        .map(|member| {
+            encode_row_pk_index_key(TrackedStateKeyRef {
                 schema_key: &member.key.schema_key,
                 file_id: member.key.file_id.as_deref(),
                 row_pk: &member.key.row_pk,
-            },
-            TrackedStateIndexValueRef {
+            })
+            .map(bytes::Bytes::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tree = super::tree::TrackedStateTree::new();
+    let existing = if let Some(root) = base_root {
+        // A preceding commit in this publication may only exist in the chunk
+        // overlay. Probe the same coherent staged view used by tree mutation.
+        let staged_read = super::storage::TrackedStateStagedRead::new(store, overlay);
+        tree.get_many_encoded(&staged_read, root, &keys).await?
+    } else {
+        vec![None; keys.len()]
+    };
+    if existing.iter().flatten().any(|value| value.deleted()) {
+        return Err(row_pk_index_error("identity catalog contains a tombstone"));
+    }
+    let mut secondary = Vec::new();
+    for ((member, key), existing) in members.iter().zip(keys).zip(existing) {
+        if existing.is_some() {
+            continue;
+        }
+        secondary.push(TrackedStateMutation::from_shared(
+            key,
+            encode_value_ref(TrackedStateIndexValueRef {
                 change_id: member.value.change_id,
                 commit_id: member.value.commit_id,
                 // This tree is an identity catalog, not current-state
@@ -145,17 +173,20 @@ pub(crate) async fn stage_row_pk_index_from_members(
                 deleted: false,
                 created_at: member.value.created_at,
                 updated_at: member.value.updated_at,
-            },
-        );
+            })
+            .into(),
+        ));
     }
-    let (_, secondary) = with_row_pk_index_mutations(primary.finish())?;
-    let result = super::tree::TrackedStateTree::new()
+    if secondary.is_empty() && base_root.is_some() {
+        return Ok(base_root.cloned());
+    }
+    let result = tree
         .apply_mutations_with_overlay(
             store,
             writes,
             overlay,
             base_root,
-            secondary,
+            TrackedStateMutationBatch::from_shared(secondary),
             Some(&commit_id.to_string()),
         )
         .await?;
@@ -317,7 +348,11 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::codec::{TrackedStateMutationBatchBuilder, encode_value_ref};
+    use crate::tracked_state::storage::{
+        CommitDeltaMember, TrackedStateChunkOverlay, TrackedStateStagedRead,
+    };
     use crate::tracked_state::types::TrackedStateIndexValueRef;
 
     fn identities() -> Vec<TrackedStateKey> {
@@ -335,10 +370,318 @@ mod tests {
             TrackedStateKey {
                 schema_key: "schema\0escaped".to_owned(),
                 file_id: Some("file\0escaped".to_owned()),
-                row_pk: RowPk::uuid_from_canonical("01920000-0000-7000-8000-000000000002")
-                    .unwrap(),
+                row_pk: RowPk::uuid_from_canonical("01920000-0000-7000-8000-000000000002").unwrap(),
             },
         ]
+    }
+
+    // Construct a real decoded member through the canonical delta codec rather
+    // than exposing CommitDeltaMember's private authority fields to tests.
+    async fn catalog_member(store: &impl StorageAdapterRead) -> CommitDeltaMember {
+        let row_pk = RowPk::single("row");
+        let commit_id = CommitId::for_test_label("catalog-original");
+        let snapshot = crate::plugin::runtime::WasmTypedRow {
+            schema_fingerprint: [9; 32],
+            row_pk: vec![lix_schema::Value::Text("row".to_owned())].into(),
+            row: lix_schema::Row::from([("value".to_owned(), lix_schema::Value::Int8(1))]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        };
+        let deltas = [crate::tracked_state::types::TrackedStateCommitDeltaRef {
+            delta: crate::tracked_state::TrackedStateDeltaRef {
+                schema_key: "schema",
+                file_id: None,
+                row_pk: &row_pk,
+                change_id: ChangeId::for_test_label("catalog-original-change"),
+                commit_id,
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+            },
+            metadata: None,
+            snapshot: Some(snapshot.durable_payload_ref().unwrap()),
+            origin_key: None,
+            base_coordinate: None,
+            authored: true,
+        }];
+        let mut writes = StorageWriteSet::default();
+        let staged =
+            super::super::storage::stage_addressable_commit_deltas(&mut writes, &deltas, &[false])
+                .unwrap();
+        let inventory = staged.mutation_inventory();
+        let segments =
+            super::super::storage::staged_commit_delta_segment_bytes(&writes, commit_id, inventory)
+                .unwrap();
+        super::super::storage::staged_commit_delta_members(
+            store,
+            commit_id,
+            "catalog-account",
+            inventory,
+            segments,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+    }
+
+    fn member_key(member: &CommitDeltaMember) -> bytes::Bytes {
+        encode_row_pk_index_key(TrackedStateKeyRef {
+            schema_key: &member.key.schema_key,
+            file_id: member.key.file_id.as_deref(),
+            row_pk: &member.key.row_pk,
+        })
+        .unwrap()
+        .into()
+    }
+
+    #[tokio::test]
+    async fn identity_catalog_retains_durable_root_and_values_through_row_lifecycle() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let original = catalog_member(&read).await;
+        let mut writes = storage.new_write_set();
+        let mut overlay = TrackedStateChunkOverlay::new();
+        // A snapshot/backfill-style base is compatible with incremental catalog maintenance.
+        let root = stage_row_pk_index_from_deltas(
+            &read,
+            &mut writes,
+            &mut overlay,
+            [crate::tracked_state::TrackedStateDeltaRef {
+                schema_key: &original.key.schema_key,
+                file_id: original.key.file_id.as_deref(),
+                row_pk: &original.key.row_pk,
+                change_id: original.value.change_id,
+                commit_id: original.value.commit_id,
+                deleted: false,
+                created_at: original.value.created_at,
+                updated_at: original.value.updated_at,
+            }],
+            original.value.commit_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut overlay = TrackedStateChunkOverlay::new();
+        let mut writes = storage.new_write_set();
+        for (label, deleted) in [("update", false), ("delete", true), ("recreate", false)] {
+            let mut member = original.clone();
+            member.value.change_id = ChangeId::for_test_label(label);
+            member.value.commit_id = CommitId::for_test_label(label);
+            member.value.created_at = LixTimestamp::from_unix_millis_utc_lossy(30);
+            member.value.updated_at = LixTimestamp::from_unix_millis_utc_lossy(40);
+            member.value.deleted = deleted;
+            let before = writes.stats();
+            let next = stage_row_pk_index_from_members(
+                &read,
+                &mut writes,
+                &mut overlay,
+                Some(&root),
+                &[member],
+                CommitId::for_test_label(label),
+            )
+            .await
+            .unwrap();
+            assert_eq!(next.as_ref(), Some(&root), "{label} must retain the root");
+            assert_eq!(writes.stats(), before, "{label} must stage no chunks");
+        }
+        let values = super::super::tree::TrackedStateTree::new()
+            .get_many_encoded(&read, &root, &[member_key(&original)])
+            .await
+            .unwrap();
+        assert_eq!(values, vec![Some(original.value)]);
+        assert_eq!(
+            stage_row_pk_index_from_members(
+                &read,
+                &mut writes,
+                &mut overlay,
+                Some(&root),
+                &[],
+                CommitId::for_test_label("empty-child"),
+            )
+            .await
+            .unwrap(),
+            Some(root)
+        );
+        assert_eq!(writes.stats().staged_puts, 0);
+    }
+
+    #[tokio::test]
+    async fn identity_catalog_scopes_and_staged_parent_child_are_exact() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let original = catalog_member(&read).await;
+        let mut writes = storage.new_write_set();
+        let mut overlay = TrackedStateChunkOverlay::new();
+        let root = stage_row_pk_index_from_members(
+            &read,
+            &mut writes,
+            &mut overlay,
+            None,
+            std::slice::from_ref(&original),
+            original.value.commit_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut members = vec![original.clone(); 4];
+        members[0].value.updated_at = LixTimestamp::from_unix_millis_utc_lossy(100);
+        members[1].key.file_id = Some("first-file".into());
+        members[2].key.file_id = Some("second-file".into());
+        members[2].value.deleted = true; // New deleted identities must still enter the catalog.
+        members[3].key.schema_key = "other-schema".into();
+        let child = stage_row_pk_index_from_members(
+            &read,
+            &mut writes,
+            &mut overlay,
+            Some(&root),
+            &members,
+            CommitId::for_test_label("scoped-child"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(child, root);
+        let staged_read = TrackedStateStagedRead::new(&read, &overlay);
+        let keys = members.iter().map(member_key).collect::<Vec<_>>();
+        let values = super::super::tree::TrackedStateTree::new()
+            .get_many_encoded(&staged_read, &child, &keys)
+            .await
+            .unwrap();
+        assert_eq!(values[0], Some(original.value.clone()));
+        assert!(
+            values
+                .iter()
+                .all(|value| value.as_ref().is_some_and(|value| !value.deleted()))
+        );
+        drop(staged_read);
+        let before = writes.stats();
+        let grandchild = stage_row_pk_index_from_members(
+            &read,
+            &mut writes,
+            &mut overlay,
+            Some(&child),
+            &members,
+            CommitId::for_test_label("scoped-grandchild"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(grandchild, Some(child));
+        assert_eq!(writes.stats(), before);
+    }
+
+    #[tokio::test]
+    async fn identity_catalog_empty_base_still_publishes_a_readable_root() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = storage.new_write_set();
+        let mut overlay = TrackedStateChunkOverlay::new();
+        let root = stage_row_pk_index_from_members(
+            &read,
+            &mut writes,
+            &mut overlay,
+            None,
+            &[],
+            CommitId::for_test_label("empty-catalog"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let staged_read = TrackedStateStagedRead::new(&read, &overlay);
+        let rows = super::super::tree::TrackedStateTree::new()
+            .scan(&staged_read, &root, &TrackedStateTreeScanRequest::default())
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        drop(staged_read);
+        let before = writes.stats();
+        assert_eq!(
+            stage_row_pk_index_from_members(
+                &read,
+                &mut writes,
+                &mut overlay,
+                Some(&root),
+                &[],
+                CommitId::for_test_label("empty-catalog-child"),
+            )
+            .await
+            .unwrap(),
+            Some(root)
+        );
+        assert_eq!(writes.stats(), before);
+    }
+
+    #[tokio::test]
+    async fn identity_catalog_rejects_secondary_tombstones_without_staging() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let original = catalog_member(&read).await;
+        let mutation = TrackedStateMutation::from_shared(
+            member_key(&original),
+            encode_value_ref(TrackedStateIndexValueRef {
+                change_id: original.value.change_id,
+                commit_id: original.value.commit_id,
+                deleted: true,
+                created_at: original.value.created_at,
+                updated_at: original.value.updated_at,
+            })
+            .into(),
+        );
+        let mut writes = storage.new_write_set();
+        let mut overlay = TrackedStateChunkOverlay::new();
+        let root = super::super::tree::TrackedStateTree::new()
+            .apply_mutations_with_overlay(
+                &read,
+                &mut writes,
+                &mut overlay,
+                None,
+                TrackedStateMutationBatch::from_shared(vec![mutation]),
+                None,
+            )
+            .await
+            .unwrap()
+            .root_id;
+        let before = writes.stats();
+        let mut missing = original.clone();
+        missing.key.row_pk = RowPk::single("new-row");
+        let error = stage_row_pk_index_from_members(
+            &read,
+            &mut writes,
+            &mut overlay,
+            Some(&root),
+            &[missing, original],
+            CommitId::for_test_label("invalid-child"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(
+            error
+                .message
+                .contains("identity catalog contains a tombstone")
+        );
+        assert_eq!(writes.stats(), before);
     }
 
     #[test]

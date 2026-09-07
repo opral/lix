@@ -140,6 +140,83 @@ simulation_test!(state_at_primary_key_keeps_duplicate_file_scopes, |sim| async m
     );
 });
 
+simulation_test!(state_at_identity_catalog_retains_root_across_scoped_row_lifecycle, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine.open_session().await.expect("session should open"),
+        &engine,
+    );
+    let first = "01991b1d-6d8b-7000-8000-000000000021";
+    let second = "01991b1d-6d8b-7000-8000-000000000022";
+    session.execute(
+        "INSERT INTO lix_file (id, path, content) VALUES \
+         ($1, '/catalog-first', CAST('a' AS BYTEA)), \
+         ($2, '/catalog-second', CAST('b' AS BYTEA))",
+        &[Value::Text(first.into()), Value::Text(second.into())],
+    ).await.expect("files should insert");
+    for (file, value) in [(first, "original"), (second, "other-scope")] {
+        session.execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_file_id) VALUES ('catalog-row', $1, $2)",
+            &[Value::Jsonb(json!(value).into()), Value::Text(file.into())],
+        ).await.expect("scoped row should insert");
+    }
+
+    let storage = engine.storage();
+    let mut catalog_root = None;
+    let mut previous_primary_root = None;
+    let mut history = Vec::new();
+    for (statement, expected) in [
+        (None, Some("original")),
+        (Some("UPDATE lix_key_value SET value = 'updated' WHERE key = 'catalog-row' AND lixcol_file_id = $1"), Some("updated")),
+        (Some("DELETE FROM lix_key_value WHERE key = 'catalog-row' AND lixcol_file_id = $1"), None),
+        (Some("INSERT INTO lix_key_value (key, value, lixcol_file_id) VALUES ('catalog-row', 'recreated', $1)"), Some("recreated")),
+    ] {
+        if let Some(statement) = statement {
+            session.execute(statement, &[Value::Text(first.into())])
+                .await.expect("lifecycle mutation should succeed");
+        }
+        let result = session.execute("SELECT lix_active_branch_commit_id()", &[])
+            .await.expect("head should load");
+        let [Value::Text(commit_id)] = result.rows()[0].values() else {
+            panic!("expected commit ID");
+        };
+        let read = storage.begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .await.expect("manifest read should open");
+        let manifest = crate::tracked_state::load_commit_state_manifest(
+            &read, crate::changelog::CommitId::parse_lix(commit_id, "test head").unwrap(),
+        ).await.expect("manifest should load").expect("head should have authority");
+        let root = manifest.row_pk_index_root_id.expect("head should have an identity catalog");
+        if let Some(previous) = &catalog_root {
+            assert_eq!(&root, previous, "existing scoped identities must retain their catalog root");
+        }
+        catalog_root = Some(root);
+        let primary = manifest.snapshot_root.expect("head should be rooted").root_id;
+        if let Some(previous) = &previous_primary_root {
+            assert_ne!(&primary, previous, "canonical state must still record each mutation");
+        }
+        previous_primary_root = Some(primary);
+        drop(read);
+        history.push((commit_id.clone(), expected));
+    }
+
+    // Query every historical state after recreation. Stale secondary lifecycle
+    // metadata must neither resurrect the deleted row nor return an old value,
+    // and the same PK in the other file must stay independently visible.
+    for (commit_id, expected) in history {
+        let result = session.execute(
+            "SELECT lixcol_file_id, value FROM lix_state_at('lix_key_value', $1) \
+             WHERE key = 'catalog-row' ORDER BY lixcol_file_id",
+            &[Value::Text(commit_id)],
+        ).await.expect("historical scoped points should resolve");
+        let mut rows = Vec::new();
+        if let Some(value) = expected {
+            rows.push(vec![Value::Text(first.into()), Value::Jsonb(json!(value).into())]);
+        }
+        rows.push(vec![Value::Text(second.into()), Value::Jsonb(json!("other-scope").into())]);
+        assert_rows_eq(result, rows);
+    }
+});
+
 simulation_test!(state_at_materializes_historical_file_content_and_path, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
