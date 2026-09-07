@@ -1,14 +1,21 @@
-name: ARM64 cross-build qualification
+name: Build and test ARM64 SDK
 on:
-  push:
-    branches: [ci/arm64-cross-build]
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact revision to build and test
+        required: true
+        type: string
 permissions:
   contents: read
 jobs:
   build:
     runs-on: ubicloud-standard-30-ubuntu-2404
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - name: Install cross-toolchain
         run: |
           sudo apt-get update
@@ -41,7 +48,7 @@ jobs:
           npm run prepare:native-package -- --suffix=linux-arm64
       - uses: actions/upload-artifact@v4
         with:
-          name: arm64-native
+          name: js-sdk-native-linux-arm64
           path: packages/js-sdk/native-packages/linux-arm64
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
@@ -52,8 +59,11 @@ jobs:
   test:
     needs: build
     runs-on: ubicloud-standard-8-arm-ubuntu-2404
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -61,7 +71,7 @@ jobs:
           cache-dependency-path: packages/js-sdk/package-lock.json
       - uses: actions/download-artifact@v4
         with:
-          name: arm64-native
+          name: js-sdk-native-linux-arm64
           path: packages/js-sdk/native-packages/linux-arm64
       - name: Test cross-compiled binary on ARM64
         working-directory: packages/js-sdk

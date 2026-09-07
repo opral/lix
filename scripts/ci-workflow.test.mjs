@@ -323,3 +323,19 @@ test("tokenless npm publishing retains a GitHub-hosted runner and OIDC permissio
 	assert.match(publish, /npm publish .*--provenance --access public/);
 	assert.doesNotMatch(publish, /secrets\.(?:NPM_TOKEN|NODE_AUTH_TOKEN)/);
 });
+
+test("ARM64 release artifacts are tested on ARM hardware before publishing", () => {
+	const armWorkflow = readFileSync(resolve(repositoryRoot, ".github/workflows/build-js-sdk-arm64.yml"), "utf8");
+	const armRelease = publishWorkflow.split("\n  build-js-sdk-arm64:\n")[1].split("\n  build-js-sdk-native-packages:\n")[0];
+	assert.match(armRelease, /uses: \.\/\.github\/workflows\/build-js-sdk-arm64\.yml/);
+	assert.match(armRelease, /ref: \$\{\{ needs\.release-version\.outputs\.release_sha \}\}/);
+	assert.match(armWorkflow, /LIX_NATIVE_TARGET: aarch64-unknown-linux-gnu/);
+	assert.match(armWorkflow, /readelf -h lix_js_sdk\.node \| grep -q 'Machine:\.\*AArch64'/);
+	const armTest = armWorkflow.split("\n  test:\n")[1];
+	assert.match(armTest, /needs: build/);
+	assert.match(armTest, /runs-on: ubicloud-standard-8-arm-ubuntu-2404/);
+	assert.match(armTest, /name: js-sdk-native-linux-arm64/);
+	assert.match(armTest, /npx vitest run src\/binding\.node\.test\.ts/);
+	const rustPublish = publishWorkflow.split("\n  publish-rust-crates:\n")[1].split("\n  publish-js-sdk:\n")[0];
+	assert.match(rustPublish, /needs:[\s\S]*?- build-js-sdk-arm64/);
+});
