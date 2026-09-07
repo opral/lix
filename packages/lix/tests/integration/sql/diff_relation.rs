@@ -725,3 +725,142 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    working_diff_retains_relation_payloads_on_both_sides,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_metadata) VALUES \
+                 ('modified', 'before', '{\"stage\":\"before\"}'), ('removed', 'deleted', NULL)",
+                &[],
+            )
+            .await
+            .expect("baseline rows should insert");
+        session.create_checkpoint().await.expect("checkpoint should succeed");
+        for sql in [
+            "INSERT INTO lix_key_value (key, value) VALUES ('added', 'new')",
+            "UPDATE lix_key_value SET value = 'after', lixcol_metadata = '{\"stage\":\"after\"}' WHERE key = 'modified'",
+            "DELETE FROM lix_key_value WHERE key = 'removed'",
+        ] {
+            session.execute(sql, &[]).await.expect("working edit should succeed");
+        }
+        assert_eq!(
+            select_rows(&session,
+                "SELECT key, diff_type FROM lix_diff('lix_key_value') ORDER BY key"
+            ).await,
+            vec![
+                vec![Value::Text("added".into()), Value::Text("added".into())],
+                vec![Value::Text("modified".into()), Value::Text("modified".into())],
+                vec![Value::Text("removed".into()), Value::Text("removed".into())],
+            ],
+            "identity-only projections must preserve the same changed rows",
+        );
+        let projection = "key, diff_type, from_value, to_value, from_lixcol_global, to_lixcol_global";
+        let expected = vec![
+            vec![
+                Value::Text("added".into()), Value::Text("added".into()),
+                Value::Null, Value::Jsonb(json!("new").into()),
+                Value::Null, Value::Boolean(false),
+            ],
+            vec![
+                Value::Text("modified".into()), Value::Text("modified".into()),
+                Value::Jsonb(json!("before").into()), Value::Jsonb(json!("after").into()),
+                Value::Boolean(false), Value::Boolean(false),
+            ],
+            vec![
+                Value::Text("removed".into()), Value::Text("removed".into()),
+                Value::Jsonb(json!("deleted").into()), Value::Null,
+                Value::Boolean(false), Value::Null,
+            ],
+        ];
+        for arguments in [
+            "'lix_key_value'",
+            "'lix_key_value', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()",
+        ] {
+            assert_eq!(
+                select_rows(&session, &format!(
+                    "SELECT {projection} FROM lix_diff({arguments}) ORDER BY key"
+                )).await,
+                expected,
+                "working and explicit ranges must preserve payload values and side presence: {arguments}",
+            );
+        }
+        assert_eq!(
+            select_rows(&session,
+                "SELECT from_lixcol_metadata, to_lixcol_metadata \
+                 FROM lix_diff('lix_key_value') WHERE key = 'modified'"
+            ).await,
+            vec![vec![
+                Value::Jsonb(json!({"stage": "before"}).into()),
+                Value::Jsonb(json!({"stage": "after"}).into()),
+            ]],
+            "metadata must be loaded from each side's exact change",
+        );
+        assert_eq!(
+            select_rows(&session,
+                "SELECT key FROM lix_diff('lix_key_value') WHERE from_value IS NOT NULL AND to_value IS NOT NULL"
+            ).await,
+            vec![vec![Value::Text("modified".into())]],
+            "payloads used only by a predicate must also be retained",
+        );
+    }
+);
+
+simulation_test!(
+    working_diff_retains_directory_descriptors_on_both_sides,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_directory (path) VALUES ('/docs/original'), ('/docs/removed')",
+                &[],
+            )
+            .await
+            .expect("nested baseline directories should insert");
+        session.create_checkpoint().await.expect("checkpoint should succeed");
+        for sql in [
+            "INSERT INTO lix_directory (path) VALUES ('/docs/added')",
+            "UPDATE lix_directory SET path = '/docs/renamed' WHERE path = '/docs/original'",
+            "DELETE FROM lix_directory WHERE path = '/docs/removed'",
+        ] {
+            session.execute(sql, &[]).await.expect("working edit should succeed");
+        }
+        let expected = vec![
+            vec![
+                Value::Text("added".into()), Value::Null, Value::Text("added".into()),
+                Value::Null, Value::Text("/docs/added".into()),
+            ],
+            vec![
+                Value::Text("removed".into()), Value::Text("removed".into()), Value::Null,
+                Value::Text("/docs/removed".into()), Value::Null,
+            ],
+            vec![
+                Value::Text("modified".into()), Value::Text("original".into()), Value::Text("renamed".into()),
+                Value::Text("/docs/original".into()), Value::Text("/docs/renamed".into()),
+            ],
+        ];
+        for arguments in [
+            "'lix_directory'",
+            "'lix_directory', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()",
+        ] {
+            assert_eq!(
+                select_rows(&session, &format!(
+                    "SELECT diff_type, from_name, to_name, from_path, to_path \
+                     FROM lix_diff({arguments}) ORDER BY coalesce(to_path, from_path)"
+                )).await,
+                expected,
+                "working and explicit ranges must reconstruct paths through unchanged parents: {arguments}",
+            );
+        }
+    }
+);

@@ -509,6 +509,10 @@ where
                         direct_candidates,
                     )
                     .await?;
+                    if route.request.retain_payloads {
+                        diff.validate_live_payloads()
+                            .map_err(lix_error_to_datafusion_error)?;
+                    }
                     let (from_global_rows, to_global_rows) = if needs_global_provenance {
                         (from_global_rows, to_global_rows)
                     } else {

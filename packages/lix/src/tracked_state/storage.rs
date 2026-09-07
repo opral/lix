@@ -9374,11 +9374,13 @@ pub(crate) async fn load_commit_delta_change_records_for_owners(
         .collect())
 }
 
-/// The complete address of one live change payload.
+/// Identity and endpoint provenance of one live change payload.
 ///
 /// The change id addresses the ordinary local changelog. The source commit and
-/// row identity address the immutable physical fallback used by compact or
-/// deferred history. The timestamp prevents a same-identity record from a
+/// row identity address an immutable fallback used by compact or deferred
+/// history. The endpoint can name a checkpoint rather than the authored owner;
+/// an encoded change address supplies a second exact owner candidate.
+/// The timestamp prevents a same-identity record from a
 /// different row lifetime from being accepted as the requested payload.
 pub(crate) struct AuthoritativeLiveChangeRequest {
     pub(crate) change_id: crate::changelog::ChangeId,
@@ -9388,7 +9390,9 @@ pub(crate) struct AuthoritativeLiveChangeRequest {
 }
 
 /// Resolves live payloads from local changelog authority first, then co-loads
-/// only the exact physical owners that were absent or did not match.
+/// only the exact physical owners that were absent or did not match. Encoded
+/// change owners and endpoint owners are candidates, never trusted payloads:
+/// every result must match the requested identity and lifetime.
 ///
 /// Both paths apply the same identity and lifetime validation. Callers decide
 /// which changes need payloads; this function is the single authority policy
@@ -9433,16 +9437,69 @@ pub(crate) async fn load_authoritative_live_change_records(
             fallback_indices.push(index);
         }
     }
-    let owner_requests = fallback_indices
-        .iter()
-        .map(|&index| {
-            let request = &requests[index];
-            (request.source_commit_id, request.key.clone())
-        })
-        .collect::<Vec<_>>();
+    let mut owner_requests = Vec::new();
+    let mut owner_outputs = Vec::new();
+    for index in fallback_indices {
+        let request = &requests[index];
+        if let Some(locator) = direct_change_locator(request.change_id)
+            && locator.commit_id != request.source_commit_id
+        {
+            // A checkpoint can rebase logical provenance without rewriting
+            // the change ID. Resolve its authored owner directly, not by
+            // replaying the endpoint's ancestry.
+            owner_requests.push((locator.commit_id, request.key.clone()));
+            owner_outputs.push(index);
+        }
+        owner_requests.push((request.source_commit_id, request.key.clone()));
+        owner_outputs.push(index);
+    }
     let fallback = load_commit_delta_change_records_for_owners(store, &owner_requests).await?;
-    for (index, record) in fallback_indices.into_iter().zip(fallback) {
-        records[index] = record;
+    for (index, record) in owner_outputs.into_iter().zip(fallback) {
+        if record
+            .as_ref()
+            .is_some_and(|record| authoritative_live_change_matches(&requests[index], record))
+        {
+            records[index] = record;
+        }
+    }
+    // Non-direct change IDs can outlive their standalone record as well. Their
+    // explicit locator names an exact owner; it does not require walking the
+    // logical checkpoint's history. Keep this lookup off the ordinary path.
+    let unresolved = records
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| record.is_none().then_some(index))
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        let keys = unresolved
+            .iter()
+            .map(|&index| {
+                StorageKey(Bytes::copy_from_slice(
+                    requests[index].change_id.as_uuid().as_bytes(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let locators = PointReadPlan::new(TRACKED_STATE_CHANGE_LOCATOR_SPACE, &keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+        let mut owners = Vec::new();
+        let mut outputs = Vec::new();
+        for (index, value) in unresolved.into_iter().zip(locators.value) {
+            if let Some(bytes) = value.and_then(full_value_bytes) {
+                let locator = decode_change_locator(requests[index].change_id, &bytes)?;
+                owners.push((locator.commit_id, requests[index].key.clone()));
+                outputs.push(index);
+            }
+        }
+        let located = load_commit_delta_change_records_for_owners(store, &owners).await?;
+        for (index, record) in outputs.into_iter().zip(located) {
+            if record
+                .as_ref()
+                .is_some_and(|record| authoritative_live_change_matches(&requests[index], record))
+            {
+                records[index] = record;
+            }
+        }
     }
     requests
         .iter()
@@ -18569,6 +18626,123 @@ mod tests {
                 .await
                 .expect("missing exact locator read should succeed")
                 .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_payload_resolves_authored_owner_after_checkpoint_rebases_provenance() {
+        let storage = StorageAdapter::new(Memory::new());
+        let authored = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1234_0000_0000,
+        ));
+        let checkpoint = CommitId::for_test_label("live-payload-checkpoint");
+        let fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        let mut writes = storage.new_write_set();
+        let deltas = commit_delta_refs(authored, std::slice::from_ref(&fixture));
+        let staged = stage_addressable_commit_deltas(&mut writes, &deltas, &[true]).unwrap();
+        let requested_change = staged.assigned_change_ids[0];
+        assert!(staged.locators.is_empty());
+        // The same endpoint identity can name another change. It must not
+        // replace a matching record already found at the encoded owner.
+        let other_deltas = commit_delta_refs(checkpoint, std::slice::from_ref(&fixture));
+        stage_addressable_commit_deltas(&mut writes, &other_deltas, &[false]).unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let loaded = super::load_authoritative_live_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id: requested_change,
+                source_commit_id: checkpoint,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .expect("logical checkpoint provenance must resolve the authored change");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].change_id, requested_change);
+        assert_eq!(
+            loaded[0].snapshot.as_deref(),
+            Some(b"typed-live-fixture".as_slice())
+        );
+        let wrong_lifetime = super::load_authoritative_live_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id: requested_change,
+                source_commit_id: checkpoint,
+                key: fixture.key(),
+                updated_at: fixture.created_at,
+            }],
+        )
+        .await;
+        assert!(
+            wrong_lifetime.is_err(),
+            "an owner hint must not bypass lifetime validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_payload_uses_explicit_locator_when_owner_candidates_do_not_match() {
+        for address_shaped in [false, true] {
+            let storage = StorageAdapter::new(Memory::new());
+            let hinted_owner = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+                0x0192_0000_0000_7000_8000_4321_0000_0000,
+            ));
+            let explicit_owner = CommitId::for_test_label("live-payload-explicit-owner");
+            let endpoint = CommitId::for_test_label("live-payload-logical-endpoint");
+            let other = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+            let mut requested = other.clone();
+            requested.change_id = if address_shaped {
+                super::addressable_change_id(hinted_owner, 0, 0).unwrap()
+            } else {
+                // A non-direct ID is valid legacy/selected payload identity.
+                ChangeId::new(uuid::Uuid::from_u128(
+                    0x0192_0000_0000_7000_8000_9876_0000_0000,
+                ))
+            };
+            let mut writes = storage.new_write_set();
+            // Both guessed and supplied owners contain the same key but the
+            // wrong change. Neither is sufficient authority for this request.
+            for owner in [hinted_owner, endpoint] {
+                let deltas = commit_delta_refs(owner, std::slice::from_ref(&other));
+                stage_addressable_commit_deltas(&mut writes, &deltas, &[false]).unwrap();
+            }
+            let deltas = commit_delta_refs(explicit_owner, std::slice::from_ref(&requested));
+            let staged = stage_addressable_commit_deltas(&mut writes, &deltas, &[false]).unwrap();
+            assert_eq!(staged.locators.len(), 1);
+            stage_change_locators(&mut writes, &staged.locators);
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .unwrap();
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            let loaded = super::load_authoritative_live_change_records(
+                &read,
+                &[super::AuthoritativeLiveChangeRequest {
+                    change_id: requested.change_id,
+                    source_commit_id: endpoint,
+                    key: requested.key(),
+                    updated_at: requested.updated_at,
+                }],
+            )
+            .await
+            .expect("mismatched owner candidates must not suppress explicit locator resolution");
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].change_id, requested.change_id);
+            assert_eq!(loaded[0].row_pk, requested.row_pk);
+            assert_eq!(
+                loaded[0].snapshot.as_deref(),
+                Some(b"typed-live-fixture".as_slice())
             );
         }
     }

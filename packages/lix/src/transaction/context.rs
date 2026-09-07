@@ -9010,7 +9010,10 @@ where
             // schema registration, parent directory, FK target, or unique
             // value owner outside the explicitly selected relation.
             requests.clear();
-            requests.push(TrackedStateDiffRequest::default());
+            requests.push(TrackedStateDiffRequest {
+                retain_payloads: false,
+                ..TrackedStateDiffRequest::default()
+            });
         }
 
         let source = selections
@@ -9495,7 +9498,10 @@ where
                     .working_diff_for_control(
                         &branch_id,
                         control,
-                        &TrackedStateDiffRequest::default(),
+                        &TrackedStateDiffRequest {
+                            retain_payloads: false,
+                            ..TrackedStateDiffRequest::default()
+                        },
                     )
                     .await?;
                 let hot_working_diff_certified = direct_diff.is_some();
@@ -9507,7 +9513,10 @@ where
                             .diff_commits(
                                 &previous_checkpoint_commit_id.to_string(),
                                 &head_commit_id.to_string(),
-                                &TrackedStateDiffRequest::default(),
+                                &TrackedStateDiffRequest {
+                                    retain_payloads: false,
+                                    ..TrackedStateDiffRequest::default()
+                                },
                             )
                             .await?
                     }
