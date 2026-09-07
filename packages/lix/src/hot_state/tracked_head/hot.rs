@@ -13670,7 +13670,7 @@ mod tests {
 
     #[tokio::test]
     async fn inherited_catalog_visibility_compares_deletions_and_local_tombstones() {
-        let storage = crate::storage_adapter::StorageAdapter::new(crate::storage::Memory::new());
+        let storage = StorageAdapter::new(Memory::new());
         let generation = CommitId::for_test_label("catalog-visibility");
         let identity = |key: &str| HeadRowIdentity {
             schema_key: "lix_registered_schema".to_owned(),
