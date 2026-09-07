@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Cursor, Write};
 use std::path::Path;
 
-use lix::{Value, open_lix};
+use lix::{CreateBranchOptions, MergeBranchOptions, SwitchBranchOptions, Value, open_lix};
 
 #[tokio::test]
 async fn test_only_row_merger_composes_text_without_a_file() {
@@ -28,7 +28,20 @@ async fn test_only_row_merger_composes_text_without_a_file() {
     .await
     .expect("merge test row should insert");
 
+    let source_branch = lix
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "Row merger source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("source branch should open");
     let peer = lix.open_another_session().await.expect("peer should open");
+    peer.switch_branch(SwitchBranchOptions {
+        branch_id: source_branch.id.clone(),
+    })
+    .await
+    .expect("peer should select source branch");
     let mut a = lix.begin_transaction().await.expect("transaction A");
     let mut b = peer.begin_transaction().await.expect("transaction B");
     a.execute(
@@ -52,9 +65,12 @@ async fn test_only_row_merger_composes_text_without_a_file() {
     .await
     .expect("B edit should stage");
     a.commit().await.expect("A should commit");
-    b.commit()
-        .await
-        .expect("B should invoke the row-only merger");
+    b.commit().await.expect("B should commit on its branch");
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source_branch.id,
+    })
+    .await
+    .expect("explicit merge should invoke the row-only merger");
 
     let result = lix
         .execute(

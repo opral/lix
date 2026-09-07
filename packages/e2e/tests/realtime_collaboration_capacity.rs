@@ -254,12 +254,14 @@ impl CollaborationCapacityBackend for LocalCapacityBackend {
                 .begin_transaction()
                 .await
                 .expect("wave transaction should open");
+            // Model native file saves with unconditional upserts so plugin
+            // reconciliation composes edits rather than retrying SQL decisions.
             transaction
                 .execute(
-                    "UPDATE lix_file SET content = $1 WHERE path = $2",
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                     &[
-                        Value::Blob(self.format.edit(base, edit.slot, &edit.token).into()),
                         Value::Text(self.path.clone()),
+                        Value::Blob(self.format.edit(base, edit.slot, &edit.token).into()),
                     ],
                 )
                 .await
@@ -423,10 +425,10 @@ async fn abandoned_transactions_and_sessions_release_resources() {
             let edit = format!("{{\"value\":\"round-{round}-client-{client}\"}}\n");
             transaction
                 .execute(
-                    "UPDATE lix_file SET content = $1 WHERE path = $2",
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                     &[
-                        Value::Blob(edit.into_bytes().into()),
                         Value::Text(path.to_owned()),
+                        Value::Blob(edit.into_bytes().into()),
                     ],
                 )
                 .await

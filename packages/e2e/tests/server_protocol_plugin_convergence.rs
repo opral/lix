@@ -1,5 +1,3 @@
-use std::io::{Cursor, Write as _};
-use std::path::Path;
 use http::{Request, StatusCode, header::CONTENT_TYPE};
 use http_body_util::BodyExt as _;
 use lix::server_protocol::{
@@ -8,34 +6,39 @@ use lix::server_protocol::{
 };
 use lix::{Memory, Value, open_lix};
 use serde_json::{Value as JsonValue, json};
+use std::io::{Cursor, Write as _};
+use std::path::Path;
 
 #[tokio::test]
-async fn same_base_server_protocol_plugin_writes_resolve_and_converge() {
+async fn same_base_server_protocol_plugin_updates_conflict_then_retry() {
     let storage = Memory::new();
     let setup = open_lix()
         .with_storage(storage.clone())
         .await
         .expect("open setup Lix");
-    setup.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
-            Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
-            Value::Blob(json_plugin_archive().into()),
-        ],
-    )
-    .await
-    .expect("install JSON plugin");
-    setup.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/remote-conflict.json', $1)",
-        &[Value::Blob(br#"{"value":"base"}"#.to_vec().into())],
-    )
-    .await
-    .expect("write base JSON file");
+    setup
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+            &[
+                Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
+                Value::Blob(json_plugin_archive().into()),
+            ],
+        )
+        .await
+        .expect("install JSON plugin");
+    setup
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/remote-conflict.json', $1)",
+            &[Value::Blob(br#"{"value":"base"}"#.to_vec().into())],
+        )
+        .await
+        .expect("write base JSON file");
 
     setup.close().await.expect("close setup Lix");
     let protocol = open_lix()
         .with_storage(storage.clone())
-        .serve().with_embedded_lix_id()
+        .serve()
+        .with_embedded_lix_id()
         .await
         .expect("serve Lix");
     let sessions = [
@@ -78,8 +81,48 @@ async fn same_base_server_protocol_plugin_writes_resolve_and_converge() {
         commit(&protocol, &sessions[1], &transactions[1]),
         commit(&protocol, &sessions[2], &transactions[2]),
     );
-    for response in [first, second, third] {
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let responses = [first, second, third];
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::NO_CONTENT)
+            .count(),
+        1,
+        "only one same-base SQL update may publish"
+    );
+    for (index, response) in responses.into_iter().enumerate() {
+        if response.status() == StatusCode::NO_CONTENT {
+            continue;
+        }
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "LIX_TRANSACTION_CONFLICT"
+        );
+        let transaction = begin_transaction(&protocol, &sessions[index]).await;
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!(r#"{{"value":"retry-{index}"}}"#),
+        );
+        let retried = transaction_request(
+            &protocol,
+            "POST",
+            "/lix/v1/transaction/execute",
+            &sessions[index],
+            &transaction,
+            Some(json!({
+                "sql": "UPDATE lix_file SET content = $1 WHERE path = '/remote-conflict.json'",
+                "params": [{ "kind": "blob", "base64": encoded }]
+            })),
+        )
+        .await;
+        assert_eq!(retried.status(), StatusCode::OK);
+        assert_eq!(
+            commit(&protocol, &sessions[index], &transaction)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
     }
 
     let verifier = open_lix()

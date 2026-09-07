@@ -235,6 +235,26 @@ const tx = await lix.beginTransaction();
 
 Starts a transaction. While it is open, execute statements on the transaction handle.
 
+SQL `UPDATE` and `DELETE` decisions are protected until commit. If another
+transaction changes active-branch or shared/global state after this transaction
+opens, committing these statements fails with `LIX_TRANSACTION_CONFLICT`. Start
+a new transaction and rerun its statements against current state. This is a conservative branch
+check, including untracked rows: even changes to unrelated rows can require a
+retry. A successfully planned update or delete retains this check if it matches
+no rows or subsequently fails and the transaction continues with other writes.
+
+Rows returned by `RETURNING` inside a transaction are provisional. Report a
+publication as successful only after `commit()` succeeds. Ordinary local
+`execute()` and `executeBatch()` automatically retry transaction conflicts a
+bounded number of times by rerunning the statements; they can still return a
+conflict if contention persists. This check does not provide general serializable
+isolation for arbitrary reads or cross-branch dependencies.
+
+Unconditional `INSERT ... ON CONFLICT DO UPDATE` file saves and explicit branch
+merges retain their collaboration semantics. Use `UPDATE ... WHERE` with an
+expected revision and require commit success when publication depends on that
+revision remaining current.
+
 ```ts
 const tx = await lix.beginTransaction();
 try {

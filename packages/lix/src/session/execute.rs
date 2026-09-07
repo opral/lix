@@ -12322,7 +12322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_complete_journal_replacement_preserves_disjoint_insert() {
+    async fn stale_complete_journal_replacement_rejects_changed_branch() {
         const ROW_COUNT: usize = 1_024;
         let storage = Memory::default();
         Engine::initialize(storage.clone())
@@ -12409,10 +12409,23 @@ mod tests {
             )
             .await
             .expect("disjoint insert should commit first");
-        replacement
+        let conflict = replacement
             .commit()
             .await
-            .expect("stale disjoint replacement should reconcile");
+            .expect_err("prepared SQL updates must reject a changed opening snapshot");
+        assert_eq!(conflict.code, LixError::CODE_TRANSACTION_CONFLICT);
+
+        let unchanged = session
+            .execute(
+                "SELECT value FROM stale_journal_replacement_probe WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .expect("rejected journal must leave the original row readable");
+        assert_eq!(
+            unchanged.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({"state": "base"})
+        );
 
         let rows = concurrent_session
             .execute(
@@ -12424,7 +12437,7 @@ mod tests {
         assert_eq!(
             rows.rows()[0].get::<i64>("count").unwrap(),
             (ROW_COUNT + 1) as i64,
-            "the stale complete-set proof must not erase the disjoint insert"
+            "rejecting the stale complete-set proof must preserve the disjoint insert"
         );
         let concurrent = concurrent_session
             .execute(
@@ -12439,18 +12452,18 @@ mod tests {
                 .unwrap(),
             serde_json::json!({"state": "concurrent"})
         );
-        let reconciled_created_at = session
+        let unchanged_created_at = session
             .execute(
                 "SELECT lixcol_created_at FROM stale_journal_replacement_probe WHERE path = '0000'",
                 &[],
             )
             .await
-            .expect("reconciled lifecycle should be readable")
+            .expect("unchanged lifecycle should be readable")
             .rows()[0]
             .get::<String>("lixcol_created_at")
             .unwrap()
             .clone();
-        assert_eq!(reconciled_created_at, original_created_at);
+        assert_eq!(unchanged_created_at, original_created_at);
     }
 
     #[tokio::test]
