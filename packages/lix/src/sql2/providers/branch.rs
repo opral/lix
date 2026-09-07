@@ -1048,20 +1048,21 @@ async fn load_default_branch_id(write_ctx: &SqlWriteContext) -> Result<String> {
         })
         .await
         .map_err(lix_error_to_datafusion_error)?;
-    let snapshot = rows
-        .row(0)
-        .and_then(MaterializedHotStateRowRef::snapshot_content)
+    let row = rows.row(0).ok_or_else(|| {
+        DataFusionError::Execution("repository default branch is missing".to_string())
+    })?;
+    // Transaction-local key/value updates can retain only a binary snapshot.
+    // Read the logical value independently of its serving representation.
+    let snapshot = row
+        .snapshot_json_value()
+        .map_err(lix_error_to_datafusion_error)?
         .ok_or_else(|| {
             DataFusionError::Execution("repository default branch is missing".to_string())
         })?;
-    serde_json::from_str::<JsonValue>(snapshot)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("value")
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned)
-        })
+    snapshot
+        .get("value")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             DataFusionError::Execution("repository default branch is invalid".to_string())

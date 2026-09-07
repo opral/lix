@@ -526,10 +526,19 @@ fn decode_visible_materialization_ref(
     row: MaterializedHotStateRowRef<'_>,
     file_id: &str,
 ) -> Result<VisibleMaterialization, LixError> {
+    // Staged materializations retain the durable native payload rather than
+    // the JSON projection supplied by committed reads.
+    let native_snapshot = row
+        .materialize_decoded_snapshot()?
+        .map(|snapshot| snapshot.to_json_shared())
+        .transpose()?;
     decode_visible_materialization_parts(
         row.schema_key(),
         row.change_id(),
-        row.snapshot_content().map(|content| content.as_str()),
+        native_snapshot
+            .as_ref()
+            .or_else(|| row.snapshot_content())
+            .map(|content| content.as_str()),
         file_id,
     )
 }
@@ -15015,6 +15024,50 @@ mod tests {
                 "global={global} untracked={untracked} must force a rebuild"
             );
         }
+    }
+
+    #[test]
+    fn visible_materialization_reads_staged_native_blob_ref() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let blob_hash = BlobId::from_content(b"staged");
+        let row_pk = RowPk::uuid_from_canonical(file_id).expect("canonical file identity");
+        let typed = WasmTypedRow::from_builtin_json(
+            BLOB_REF_SCHEMA_KEY,
+            &row_pk,
+            &json!({"id": file_id, "blob_hash": blob_hash.to_hex(), "size_bytes": 6}),
+        )
+        .expect("valid built-in blob reference");
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+        let mut builder = crate::hot_state::MaterializedHotStateBatchBuilder::with_capacity(1);
+        let ordinal = builder.push_materialized_ref(
+            &row_pk,
+            BLOB_REF_SCHEMA_KEY,
+            Some(file_id),
+            None,
+            None,
+            false,
+            timestamp,
+            timestamp,
+            false,
+            Some(ChangeId::default()),
+            None,
+            false,
+            "main",
+        );
+        builder.set_raw_snapshot(
+            ordinal,
+            Some(Bytes::copy_from_slice(
+                &typed
+                    .durable_payload()
+                    .expect("encode native blob reference"),
+            )),
+        );
+        let batch = builder.finish();
+        let visible = decode_visible_materialization_ref(batch.row(0), file_id)
+            .expect("staged native blob reference must retain its durable proof");
+        assert!(
+            matches!(visible.bytes, VisibleMaterializationBytes::Blob { hash } if hash == blob_hash)
+        );
     }
 
     #[test]
