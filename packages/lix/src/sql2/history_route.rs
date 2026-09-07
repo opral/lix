@@ -14,7 +14,7 @@ use crate::row_pk::RowPk;
 
 use super::SqlHistoryQuerySource;
 use crate::sql2::change_materialization::{
-    MaterializedChange, materialize_located_history_change, public_change_row_ref,
+    MaterializedChange, materialize_located_history_change,
 };
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -202,7 +202,7 @@ pub(crate) fn serialize_history_source_changes(
     let source_changes = ordered_changes
         .into_iter()
         .map(|change| {
-            let row_ref = public_change_row_ref(change)?.map(|value| value.to_string());
+            let row_pk = change.row_pk.as_json_array_value()?;
             let snapshot_content = parse_optional_source_json(
                 change.snapshot_content.as_deref(),
                 surface_name,
@@ -212,7 +212,7 @@ pub(crate) fn serialize_history_source_changes(
                 parse_optional_source_json(change.metadata.as_deref(), surface_name, "metadata")?;
             Ok(serde_json::json!({
                 "id": change.id,
-                "row_ref": row_ref,
+                "row_pk": row_pk,
                 "schema_key": change.schema_key,
                 "file_id": change.file_id,
                 "snapshot_content": snapshot_content,
@@ -837,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn source_change_row_ref_uses_public_filesystem_relation() {
+    fn source_change_identity_matches_underlying_schema() {
         let file_id = "018f6f7e-7cb2-7d45-8e1f-0a2b3c4d5e6f";
         let row_pk = RowPk::uuid_from_canonical(file_id).expect("test UUID should be canonical");
         let change = MaterializedChange {
@@ -857,14 +857,10 @@ mod tests {
             .expect("source changes should serialize");
         let value: serde_json::Value =
             serde_json::from_str(&json).expect("source changes should be JSON");
-        let encoded = value[0]["row_ref"]
-            .as_str()
-            .expect("public change should have a row reference");
-        let decoded = crate::row_ref::decode_str(encoded).expect("row reference should decode");
-
         assert_eq!(value[0]["schema_key"], "lix_file_descriptor");
-        assert_eq!(decoded.relation, "lix_file");
-        assert_eq!(decoded.row_pk, row_pk);
+        assert_eq!(value[0]["row_pk"], row_pk.as_json_array_value().unwrap());
+        assert_eq!(value[0]["file_id"], file_id);
+        assert!(value[0].get("row_ref").is_none());
     }
 
     #[test]

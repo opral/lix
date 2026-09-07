@@ -136,8 +136,9 @@ Filesystem history describes a composed projection. Renaming, moving,
 deleting, or restoring an ancestor directory creates a revision for every
 affected descendant even when the descendant's own descriptor did not change.
 Each row records all same-commit causes in the structured
-`lixcol_source_changes` JSON array. Each source object carries a `row_ref`
-instead of a JSON primary-key tuple. It deliberately does not expose singular
+`lixcol_source_changes` JSON array. Each source object carries the underlying record’s `schema_key`, JSON `row_pk`
+tuple, and `file_id`, matching `lix_change`. These identities describe the source
+snapshots, while `lixcol_row_ref` addresses the composed public history row. It deliberately does not expose singular
 `lixcol_change_id`, `lixcol_schema_key`, or `lixcol_origin_key` columns.
 
 Lix reconstructs rows through the anchor commit's ancestry. It does not treat
@@ -153,7 +154,7 @@ branch reachability. Ordinary untracked writes do not create change rows.
 | Column | What it is |
 | :-- | :-- |
 | `id` | Unique change ID. |
-| `row_ref` | Relation-qualified row reference, or `NULL` for private engine rows. |
+| `row_pk` | JSON primary-key tuple in the changed schema’s primary-key order. |
 | `schema_key` | Changed Schema v1 key. |
 | `file_id` | Owning file, or `NULL`. |
 | `metadata` | JSON change metadata. |
@@ -162,13 +163,16 @@ branch reachability. Ordinary untracked writes do not create change rows.
 | `origin_key` | Optional origin key attached to the change. |
 | `created_at` | Change timestamp. |
 
-Use `lix_row_ref()` to address a public logical row without reconstructing its
-primary-key encoding:
+Filter by the changed schema and its primary-key tuple; include `file_id` when
+the record is file-scoped. A change snapshot represents this underlying record,
+not a composed public view such as `lix_file` or `lix_branch`:
 
 ```sql
 SELECT created_at, id, snapshot_content
 FROM lix_change
-WHERE row_ref = lix_row_ref('acme_issue', 'launch', '7')
+WHERE schema_key = 'acme_issue'
+  AND row_pk = CAST('["launch", "7"]' AS JSONB)
+  AND file_id IS NULL
 ORDER BY created_at, id;
 ```
 

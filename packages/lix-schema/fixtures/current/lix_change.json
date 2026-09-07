@@ -19,10 +19,10 @@
       ]
     },
     {
-      "name": "row_ref",
-      "type": "text",
-      "nullable": true,
-      "description": "Opaque reference to the public relation row this change applies to; NULL for private engine rows."
+      "name": "row_pk",
+      "type": "jsonb",
+      "nullable": false,
+      "description": "Canonical primary-key tuple of the changed schema record, in schema primary-key order and scoped by schema_key and file_id. Matches the record represented by snapshot_content."
     },
     {
       "name": "file_id",

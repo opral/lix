@@ -215,7 +215,7 @@ simulation_test!(
                     "SELECT file_id \
                      FROM lix_change \
                      WHERE schema_key = 'lix_directory_descriptor' \
-                       AND row_ref = lix_row_ref('lix_directory', '{directory_id}') \
+                       AND row_pk = CAST('[\"{directory_id}\"]' AS JSONB) \
                      ORDER BY created_at"
                 ),
             )
@@ -1040,7 +1040,7 @@ simulation_test!(
             .execute(
                 "SELECT schema_key \
              FROM lix_change \
-             WHERE row_ref = lix_row_ref('lix_file', '66696c65-2d72-8561-846d-650000000000') \
+             WHERE file_id = '66696c65-2d72-8561-846d-650000000000' \
                AND schema_key IN ('lix_file_descriptor', 'lix_binary_blob_ref') \
              ORDER BY schema_key",
                 &[],
@@ -1636,7 +1636,7 @@ simulation_test!(
                 "SELECT id \
              FROM lix_change \
              WHERE schema_key = 'lix_binary_blob_ref' \
-               AND row_ref = lix_row_ref('lix_file', '656d7074-792d-8461-8461-2d66696c6500')",
+               AND file_id = '656d7074-792d-8461-8461-2d66696c6500'",
                 &[],
             )
             .await
@@ -2954,7 +2954,7 @@ async fn file_descriptor_event_count(
         .expect("file history source changes should be an array")
         .iter()
         .filter(|source| {
-            source["row_ref"].as_str().is_some()
+            source["row_pk"].as_array().is_some()
                 && source["snapshot_content"]["id"] == json!(file_id)
                 && source["snapshot_content"].get("name").is_some()
         })
@@ -2994,7 +2994,7 @@ simulation_test!(
                 "SELECT id \
                  FROM lix_change \
                  WHERE schema_key = 'lix_binary_blob_ref' \
-                   AND row_ref = lix_row_ref('lix_file', '616c7265-6164-892d-856d-7074792d6600')",
+                   AND file_id = '616c7265-6164-892d-856d-7074792d6600'",
                 &[],
             )
             .await

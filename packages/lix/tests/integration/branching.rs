@@ -1235,7 +1235,7 @@ simulation_test!(
             "SELECT count(*) \
 	     FROM lix_change \
 	     WHERE schema_key = 'lix_key_value' \
-	       AND row_ref = lix_row_ref('lix_key_value', 'merge-select-change') \
+	       AND row_pk = CAST('[\"merge-select-change\"]' AS JSONB) \
 	       AND snapshot_content = CAST('{\"key\":\"merge-select-change\",\"value\":\"source\"}' AS JSONB)",
         )
         .await;

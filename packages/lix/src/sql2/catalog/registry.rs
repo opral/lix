@@ -169,7 +169,7 @@ impl PublicCatalog {
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("account_id", DataType::Utf8, false),
-                row_ref_field("row_ref", true),
+                json_field("row_pk", false),
                 Field::new("schema_key", DataType::Utf8, false),
                 Field::new("file_id", DataType::Utf8, true),
                 json_field("metadata", true),
@@ -262,7 +262,7 @@ impl PublicCatalog {
             public_columns([
                 ("id", false),
                 ("account_id", false),
-                ("row_ref", true),
+                ("row_pk", false),
                 ("schema_key", false),
                 ("file_id", true),
                 ("metadata", true),

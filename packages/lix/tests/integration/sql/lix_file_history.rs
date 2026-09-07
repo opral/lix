@@ -618,7 +618,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
         panic!("ancestor source changes should be JSON");
     };
     let sources = sources.to_value();
-    assert!(sources[0]["row_ref"].as_str().is_some());
+    assert!(sources[0]["row_pk"].as_array().is_some());
 
     let (requested_keys, scan_calls, scanned_rows) = storage.counters();
     assert!(
@@ -712,7 +712,7 @@ simulation_test!(
         };
         let rename_sources = rename_sources.to_value();
         assert_eq!(rename_sources.as_array().map(Vec::len), Some(1));
-        assert!(rename_sources[0]["row_ref"].as_str().is_some());
+        assert!(rename_sources[0]["row_pk"].as_array().is_some());
 
         crate::sql2::reset_file_history_anchor_probe_census();
         let bounded_renamed_file = session
@@ -883,7 +883,7 @@ simulation_test!(
             .as_array()
             .expect("grouped file sources should be an array")
             .iter()
-            .map(|source| source["row_ref"].as_str().unwrap())
+            .map(|source| (source["schema_key"].to_string(), source["row_pk"].to_string()))
             .collect::<BTreeSet<_>>();
         assert_eq!(source_refs.len(), 3);
 
@@ -1087,7 +1087,7 @@ simulation_test!(
             .as_array()
             .expect("delete sources should be an array")
             .iter()
-            .filter_map(|source| source["row_ref"].as_str())
+            .map(|source| (source["schema_key"].to_string(), source["row_pk"].to_string()))
             .collect::<BTreeSet<_>>();
         assert!(deleted_directory_refs.len() >= 2);
 
@@ -1153,7 +1153,7 @@ simulation_test!(
             .as_array()
             .expect("restore sources should be an array")
             .iter()
-            .filter_map(|source| source["row_ref"].as_str())
+            .map(|source| (source["schema_key"].to_string(), source["row_pk"].to_string()))
             .collect::<BTreeSet<_>>();
         assert!(restored_directory_refs.len() >= 2);
     }
@@ -1281,7 +1281,7 @@ simulation_test!(
         };
         let source_changes = source_changes.to_value();
         assert_eq!(source_changes.as_array().map(Vec::len), Some(1));
-        assert!(source_changes[0]["row_ref"].as_str().is_some());
+        assert!(source_changes[0]["row_pk"].as_array().is_some());
         assert_eq!(
             source_changes[0]["snapshot_content"]["name"],
             json!("readme-renamed.md")
@@ -2201,7 +2201,7 @@ simulation_test!(
         };
         let latest_sources = latest_sources.to_value();
         assert_eq!(latest_sources.as_array().map(Vec::len), Some(1));
-        assert!(latest_sources[0]["row_ref"].as_str().is_some());
+        assert!(latest_sources[0]["row_pk"].as_array().is_some());
 
         let Value::Jsonb(initial_sources) = &result.rows()[1].values()[3] else {
             panic!(
@@ -2211,27 +2211,14 @@ simulation_test!(
         };
         let initial_sources = initial_sources.to_value();
         assert_eq!(initial_sources.as_array().map(Vec::len), Some(2));
-        let source_row_refs = initial_sources
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|source| source["row_ref"].as_str().unwrap().to_owned())
+        let source_schema_keys = initial_sources.as_array().unwrap().iter()
+            .map(|source| source["schema_key"].as_str().unwrap())
             .collect::<BTreeSet<_>>();
-        let expected_row_ref = session
-            .execute(
-                "SELECT lix_row_ref('lix_file', '68697374-6f72-892d-8669-6c652d626c00')",
-                &[],
-            )
-            .await
-            .expect("public file row reference should be constructible");
-        let Value::RowRef(expected_row_ref) = &expected_row_ref.rows()[0].values()[0] else {
-            panic!("lix_row_ref should return the opaque row-reference type");
-        };
-        assert_eq!(
-            source_row_refs,
-            BTreeSet::from([expected_row_ref.as_str().to_owned()]),
-            "descriptor and blob provenance must address the same public file row"
-        );
+        assert_eq!(source_schema_keys, BTreeSet::from(["lix_binary_blob_ref", "lix_file_descriptor"]));
+        for source in initial_sources.as_array().unwrap() {
+            assert!(source["row_pk"].as_array().is_some());
+            assert!(source.get("row_ref").is_none());
+        }
         let source_ids = initial_sources
             .as_array()
             .unwrap()
@@ -2256,7 +2243,7 @@ simulation_test!(
                     "id",
                     "metadata",
                     "origin_key",
-                    "row_ref",
+                    "row_pk",
                     "schema_key",
                     "snapshot_content",
                 ],

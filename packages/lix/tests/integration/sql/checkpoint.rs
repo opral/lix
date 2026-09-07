@@ -236,15 +236,15 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT schema_key, row_ref = lix_row_ref('lix_checkpoint', '{}') \
+                    "SELECT schema_key, row_pk \
                      FROM lix_change WHERE id = '{}'",
-                    receipt.commit_id, receipt.change_id
+                    receipt.change_id
                 ),
             )
             .await,
             vec![vec![
                 Value::Text("lix_checkpoint".to_string()),
-                Value::Boolean(true),
+                Value::Jsonb(json!([receipt.commit_id.to_string()]).into()),
             ]],
             "checkpoint publication must be a normal logical change"
         );

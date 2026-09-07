@@ -555,7 +555,7 @@ simulation_test!(
                 .execute(
                     "SELECT metadata \
                      FROM lix_change \
-                     WHERE row_ref = lix_row_ref('lix_key_value', 'metadata-valid-object') \
+                     WHERE row_pk = CAST('[\"metadata-valid-object\"]' AS JSONB) \
                        AND schema_key = 'lix_key_value'",
                     &[],
                 )

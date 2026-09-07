@@ -11739,9 +11739,9 @@ mod tests {
                  FROM files AS file_a \
                  JOIN files AS file_b ON file_a.id = file_b.id \
                  LEFT JOIN (\
-                     SELECT row_ref FROM lix_change \
+                     SELECT row_pk FROM lix_change \
                      UNION ALL \
-                     SELECT row_ref FROM lix_change\
+                     SELECT row_pk FROM lix_change\
                  ) AS changes ON false",
                 &[],
             )

@@ -25,16 +25,19 @@ simulation_test!(lix_change_queries_durable_change_facts, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT row_ref, schema_key, snapshot_content \
+            "SELECT row_pk, schema_key, snapshot_content \
              FROM lix_change \
-             WHERE row_ref = lix_row_ref('lix_key_value', 'change-query')",
+             WHERE schema_key = 'lix_key_value' AND row_pk = CAST('[\"change-query\"]' AS JSONB)",
             &[],
         )
         .await
         .expect("lix_change should read");
     let rows = result;
     assert_eq!(rows.len(), 1);
-    assert!(matches!(rows.rows()[0].values()[0], Value::RowRef(_)));
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        Value::Jsonb(json!(["change-query"]).into())
+    );
     assert_eq!(
         &rows.rows()[0].values()[1..],
         &[
@@ -43,6 +46,80 @@ simulation_test!(lix_change_queries_durable_change_facts, |sim| async move {
         ]
     );
 });
+
+simulation_test!(
+    lix_change_exposes_tracked_schema_identity_and_not_public_row_refs,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        // Bootstrap may retain ref facts; ordinary writes must not append head movements.
+        let initial_ref_changes = session.execute(
+            "SELECT count(*) AS n FROM lix_change WHERE schema_key = 'lix_branch_ref'", &[],
+        ).await.unwrap().rows()[0].get::<i64>("n").unwrap();
+        let file_id = "01950000-0000-7000-8000-000000000041";
+        session.execute(
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, '/record.txt', CAST('hello' AS BYTEA))",
+        &[Value::Text(file_id.into())],
+    ).await.unwrap();
+        let changes = session.execute(
+        "SELECT schema_key, row_pk, file_id, snapshot_content FROM lix_change WHERE file_id = $1",
+        &[Value::Text(file_id.into())],
+    ).await.unwrap();
+        assert_eq!(changes.column_types()[1], lix::ResultColumnType::Jsonb);
+        let descriptor = changes
+            .rows()
+            .iter()
+            .find(|row| row.get::<String>("schema_key").unwrap() == "lix_file_descriptor")
+            .expect("descriptor change should remain visible");
+        assert_eq!(
+            descriptor.values()[1],
+            Value::Jsonb(json!([file_id]).into())
+        );
+        assert_eq!(descriptor.values()[2], Value::Text(file_id.into()));
+        let Value::Jsonb(snapshot) = &descriptor.values()[3] else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(snapshot.to_value()["id"], file_id);
+        assert_eq!(snapshot.to_value()["name"], "record.txt");
+
+        let columns = session.execute(
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = 'lix_change' AND column_name IN ('row_pk', 'row_ref')",
+        &[],
+    ).await.unwrap();
+        assert_eq!(columns.len(), 1);
+        assert_eq!(
+            columns.rows()[0].get::<String>("column_name").unwrap(),
+            "row_pk"
+        );
+        assert!(
+            session
+                .execute("SELECT row_ref FROM lix_change", &[])
+                .await
+                .is_err()
+        );
+        let refs = session
+            .execute(
+                "SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1",
+                &[Value::Text(file_id.into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(refs.column_types()[0], lix::ResultColumnType::RowRef);
+        assert_eq!(
+            session
+                .execute(
+                    "SELECT count(*) AS n FROM lix_change WHERE schema_key = 'lix_branch_ref'",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<i64>("n")
+                .unwrap(),
+            initial_ref_changes
+        );
+    }
+);
 
 simulation_test!(lix_change_includes_commit_changes, |sim| async move {
     let engine = sim.boot_engine().await;
@@ -78,7 +155,7 @@ simulation_test!(lix_change_includes_commit_changes, |sim| async move {
 });
 
 simulation_test!(
-    lix_change_row_ref_is_lossless_for_composite_primary_keys,
+    lix_change_row_pk_is_lossless_for_composite_primary_keys,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -120,18 +197,23 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT row_ref, \
-                        row_ref = lix_row_ref('engine_composite_message', 'welcome.title', 'en') AS expected_ref \
+                "SELECT row_pk, file_id \
                  FROM lix_change \
                  WHERE schema_key = 'engine_composite_message'",
                 &[],
             )
             .await
-            .expect("lix_change should expose the semantic composite row_ref");
+            .expect("lix_change should expose the schema record identity");
 
         assert_eq!(result.len(), 1);
-        assert!(matches!(result.rows()[0].values()[0], Value::RowRef(_)));
-        assert_eq!(result.rows()[0].values()[1], Value::Boolean(true));
+        assert_eq!(
+            result.rows()[0].values()[0],
+            Value::Jsonb(json!(["welcome.title", "en"]).into())
+        );
+        assert_eq!(
+            result.rows()[0].values()[1],
+            Value::Text("01950000-0000-7000-8000-000000000031".into())
+        );
     }
 );
 
@@ -162,9 +244,7 @@ simulation_test!(
 
         assert_eq!(error.code, lix::LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error
-                .message
-                .contains("must use text, uuid, or int8"),
+            error.message.contains("must use text, uuid, or int8"),
             "error should explain unsupported primary-key schema: {error:?}"
         );
     }
