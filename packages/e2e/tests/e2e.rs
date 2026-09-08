@@ -8485,3 +8485,47 @@ async fn json_structural_qa_multi_parent_file_updates_are_deterministic() {
     }
     lix.close().await.unwrap();
 }
+#[tokio::test]
+async fn json_decimal_spelling_survives_structural_rebuild_and_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/decimal-spelling.json";
+    let original = br#"{"one":1.0,"hundred":100.0,"array":[1.0,-0.0],"remove":0}"#;
+    write_file(&lix, path, original.to_vec()).await.unwrap();
+    lix.close().await.unwrap();
+    let reopened = open_rocksdb_lix(root.path()).await;
+    reopened
+        .execute("DELETE FROM json_object_member WHERE key = 'remove'", &[])
+        .await
+        .unwrap();
+    let expected = br#"{"one":1.0,"hundred":100.0,"array":[1.0,-0.0]}"#;
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(expected.to_vec())
+    );
+    reopened.close().await.unwrap();
+    let reopened = open_rocksdb_lix(root.path()).await;
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(expected.to_vec())
+    );
+    reopened
+        .execute(
+            "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'hundred'",
+            &[Value::Jsonb(serde_json::json!(7).into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(br#"{"one":1.0,"hundred":7,"array":[1.0,-0.0]}"#.to_vec())
+    );
+    reopened.close().await.unwrap();
+}

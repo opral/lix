@@ -55,6 +55,9 @@ fn render(file: &Snapshot, rows: &[sdk::TypedRowRecord], warm: bool) -> sdk::tes
 fn native_exact_roundtrip_json_corpus() {
     for bytes in [
         b"null".as_slice(),
+        b"1.0",
+        b"100.0",
+        b"[1.0,100.0,-0.0]",
         b" 1.2300e+04 \r\n",
         b"-0",
         b"{\r\n  \"a\" : 1.00 , \"b\": [ true, null, \"\\u0061\" ] \r\n}\n",

@@ -2661,8 +2661,8 @@ fn set_scalar_text(row: &mut sdk::TypedRow, raw: &[u8]) -> Result<(), String> {
     let Some(sdk::TypedValue::Jsonb(value)) = row.get("scalar_json") else {
         return Err("missing scalar_json".to_owned());
     };
-    let canonical = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    let spelling = if canonical == raw {
+    let canonical = value.to_json_string().map_err(|error| error.to_string())?;
+    let spelling = if canonical.as_bytes() == raw {
         sdk::TypedValue::Null
     } else {
         sdk::TypedValue::Text(
