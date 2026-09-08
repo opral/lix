@@ -4445,6 +4445,119 @@ async fn same_base_json_file_edits_compose_disjoint_semantics_without_resolution
 }
 
 #[tokio::test]
+async fn json_transaction_inherits_parent_acknowledged_file_view() {
+    let parent = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &parent,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/inherited-transaction-view.json";
+    let original = br#"{"mine":"base"}"#.to_vec();
+    write_file(&parent, path, original.clone()).await.unwrap();
+    assert_eq!(read_file(&parent, path).await.unwrap(), Some(original));
+
+    let peer = parent.open_another_session().await.unwrap();
+    write_file(&peer, path, br#"{"mine":"base","peer":"keep"}"#.to_vec())
+        .await
+        .unwrap();
+    // Begin after the peer's commit. The editor still submits bytes derived
+    // from the parent's earlier observation, not the latest repository bytes.
+    let mut transaction = parent.begin_transaction().await.unwrap();
+    transaction
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = $2",
+            &[
+                Value::Blob(br#"{"mine":"transaction"}"#.to_vec().into()),
+                Value::Text(path.to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let bytes = read_file(&peer, path).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        serde_json::json!({ "mine": "transaction", "peer": "keep" }),
+        "starting a transaction must preserve the editor's acknowledged base"
+    );
+    peer.close().await.unwrap();
+    parent.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn json_transaction_rollback_preserves_parent_acknowledged_view() {
+    let parent = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &parent,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/rolled-back-transaction-view.json";
+    let original = br#"{"mine":"base","next":"base"}"#.to_vec();
+    write_file(&parent, path, original.clone()).await.unwrap();
+    assert_eq!(read_file(&parent, path).await.unwrap(), Some(original));
+
+    let mut transaction = parent.begin_transaction().await.unwrap();
+    let submitted = br#"{"mine":"rolled-back","next":"base"}"#.to_vec();
+    transaction
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = $2",
+            &[
+                Value::Blob(submitted.clone().into()),
+                Value::Text(path.to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+    let staged = transaction
+        .execute(
+            "SELECT content FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_owned())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        staged.rows()[0].get::<Vec<u8>>("content").unwrap(),
+        submitted
+    );
+    transaction.rollback().await.unwrap();
+
+    let peer = parent.open_another_session().await.unwrap();
+    let persisted = read_file(&peer, path).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&persisted).unwrap(),
+        serde_json::json!({ "mine": "base", "next": "base" })
+    );
+    write_file(
+        &peer,
+        path,
+        br#"{"mine":"peer","next":"base","peer":"keep"}"#.to_vec(),
+    )
+    .await
+    .unwrap();
+    // Neither staging nor reading rolled-back bytes may replace the parent's
+    // original acknowledged view. Its unchanged scalar must remain unchanged.
+    write_file(&parent, path, br#"{"mine":"base","next":"saved"}"#.to_vec())
+        .await
+        .unwrap();
+
+    let bytes = read_file(&peer, path).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        serde_json::json!({ "mine": "peer", "peer": "keep", "next": "saved" }),
+        "rolled-back file views must not become the parent's acknowledged base"
+    );
+    peer.close().await.unwrap();
+    parent.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn stale_json_transaction_renders_retained_same_file_edits_with_resolutions() {
     let archive = build_json_plugin_archive();
     let stale_client = open_lix().await.unwrap();

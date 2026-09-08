@@ -1686,6 +1686,48 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 	await lix.close();
 });
 
+test("transactions preserve acknowledged plugin files when saving stale bytes", async () => {
+	const lix = await openLix();
+	const csvPlugin = (await bundledPluginArchives()).find(
+		(plugin) => plugin.key === "plugin_csv",
+	);
+	if (!csvPlugin) throw new Error("expected bundled CSV plugin");
+	await upsertPluginArchive(lix, csvPlugin.key, csvPlugin.archiveBytes);
+	const path = "/transaction-views.csv";
+	const write =
+		"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content";
+	const encode = (content: string) => new TextEncoder().encode(content);
+	await lix.execute(write, [path, encode("name,value\nfirst,base\n")]);
+	await lix.execute("SELECT content FROM lix_file WHERE path = $1", [path]);
+	const other = await lix.openAnotherSession();
+	try {
+		await other.execute(write, [
+			path,
+			encode("name,value\nfirst,base\nsecond,peer\n"),
+		]);
+		const tx = await lix.beginTransaction();
+		try {
+			await tx.execute(write, [path, encode("name,value\nfirst,edited\n")]);
+			await tx.commit();
+		} catch (error) {
+			await tx.rollback().catch(() => undefined);
+			throw error;
+		}
+		const result = await lix.execute(
+			"SELECT content FROM lix_file WHERE path = $1",
+			[path],
+		);
+		const content = new TextDecoder().decode(
+			get(result, "content") as Uint8Array,
+		);
+		expect(content).toContain("first,edited");
+		expect(content).toContain("second,peer");
+	} finally {
+		await other.close();
+		await lix.close();
+	}
+});
+
 test("bundled Markdown plugin executes detect-changes and render", async () => {
 	const lix = await openLix();
 	const markdownPlugin = (await bundledPluginArchives()).find(

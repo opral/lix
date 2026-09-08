@@ -2026,7 +2026,8 @@ where
                     active_branch_id.clone(),
                     self.active_account_id().to_owned(),
                 )
-                .await?;
+                .await?
+                .with_file_views_from(&self.session);
             let (_, session_state) = session.begin_connected_transaction_state()?;
             let client = authority.open_dedicated_client(active_branch_id).await?;
             // Install the dedicated client in its drop guard before the
@@ -2060,7 +2061,8 @@ where
         let session = Arc::new(
             self.engine
                 .open_session_at_with_account(branch_id, self.active_account_id().to_owned())
-                .await?,
+                .await?
+                .with_file_views_from(&self.session),
         );
         Ok(LixTransaction {
             _lifecycle: lifecycle,

@@ -239,6 +239,8 @@ these reads see its staged writes. Ordinary `lix.execute()` reads and
 `lix.observe()` remain available on the original handle and see committed data.
 Observers publish relevant updates after commit; rolled-back writes are never
 published. Changing the original handle's branch does not retarget the transaction.
+Local transactions retain the caller's previously acknowledged plugin-file view,
+so plugins can merge stale content against the correct base.
 
 Each handle permits one opening or active explicit transaction at a time. Use
 `openAnotherSession()` for another independent handle when needed.

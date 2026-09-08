@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use futures_util::io::Cursor;
 use http::header::CONTENT_TYPE;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt as _, Full};
+use http_body_util::BodyExt as _;
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -681,43 +681,45 @@ async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() 
         Some("committed"),
     );
 
-    let guarded = replica
+    let mut guarded = replica
         .begin_transaction()
         .await
-        .expect("connected transaction reserves the ordinary session state");
-    for (label, result) in [
-        (
-            "read",
-            replica.execute("SELECT 1 AS value", &[]).await.map(|_| ()),
-        ),
-        (
-            "write",
-            replica
-                .execute(
-                    "INSERT INTO lix_key_value (key, value) VALUES ('outside-transaction', 'forbidden')",
-                    &[],
-                )
-                .await
-                .map(|_| ()),
-        ),
-    ] {
-        let error = result.expect_err("same-handle work must be blocked by connected transaction");
-        assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE", "{label}");
-    }
-    let observe_error = match replica.observe("SELECT 1 AS value", &[]) {
-        Err(error) => error,
-        Ok(mut observation) => {
-            observation.close();
-            panic!("same-handle observe must be blocked by connected transaction");
-        }
-    };
-    assert_eq!(observe_error.code, "LIX_INVALID_TRANSACTION_STATE");
+        .expect("connected transaction captures its own context");
+    guarded
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('pending-isolated', 'discarded')",
+            &[],
+        )
+        .await
+        .expect("stage data in the isolated transaction");
+    assert_eq!(read_value(&replica, "pending-isolated").await, None);
+    replica
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('outside-transaction', 'independent')",
+            &[],
+        )
+        .await
+        .expect("parent writes remain independent of the active transaction");
+    let mut observation = replica
+        .observe("SELECT key FROM lix_key_value WHERE key IN ('pending-isolated', 'outside-transaction') ORDER BY key", &[])
+        .expect("parent can register observations during a transaction");
+    let initial = tokio::time::timeout(WAIT_TIMEOUT, observation.next())
+        .await
+        .expect("parent observation must not stall during a transaction")
+        .expect("parent observation remains usable")
+        .expect("parent observation returns committed state");
+    assert_eq!(initial.rows.rows().len(), 1);
+    assert_eq!(
+        initial.rows.rows()[0].get::<String>("key").unwrap(),
+        "outside-transaction"
+    );
+    observation.close();
     let close_error = replica
         .close()
         .await
         .expect_err("close must reject an active connected transaction");
     assert_eq!(close_error.code, "LIX_INVALID_TRANSACTION_STATE");
-    let switch_error = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(5),
         replica.switch_branch(SwitchBranchOptions {
             branch_id: race_branch.id.clone(),
@@ -725,12 +727,31 @@ async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() 
     )
     .await
     .expect("switch under connected transaction must not deadlock")
-    .expect_err("switch must reject an active connected transaction");
-    assert_eq!(switch_error.code, "LIX_INVALID_TRANSACTION_STATE");
+    .expect("parent branch can change independently of the transaction");
+    let captured = guarded
+        .execute("SELECT lix_active_branch_id() AS branch_id", &[])
+        .await
+        .expect("transaction retains its captured branch");
+    assert_eq!(
+        captured.rows()[0].get::<String>("branch_id").unwrap(),
+        main_branch_id
+    );
     guarded
         .rollback()
         .await
-        .expect("connected transaction rollback releases session state");
+        .expect("connected transaction rollback releases its lifecycle reservation");
+    assert_eq!(replica.active_branch_id().await.unwrap(), race_branch.id);
+    replica
+        .switch_branch(SwitchBranchOptions {
+            branch_id: main_branch_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(read_value(&replica, "pending-isolated").await, None);
+    assert_eq!(
+        read_value(&replica, "outside-transaction").await.as_deref(),
+        Some("independent")
+    );
     replica
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('after-failed-close', 'usable')",
@@ -1767,7 +1788,7 @@ async fn handle_http<S>(
     probe: Arc<HttpProbe>,
     principal: ServerProtocolPrincipal,
     request: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible>
+) -> Result<Response<ServerProtocolBody>, Infallible>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -1776,7 +1797,7 @@ where
         return Ok(Response::builder()
             .status(503)
             .header(CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from_static(
+            .body(ServerProtocolBody::full(Bytes::from_static(
                 br#"{"error":{"code":"LIX_SYNC_TEST_OFFLINE","message":"test server offline"}}"#,
             )))
             .expect("build offline response"));
@@ -1803,7 +1824,7 @@ where
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "application/json")
-                .body(Full::new(Bytes::from(body)))
+                .body(ServerProtocolBody::full(Bytes::from(body)))
                 .expect("build mismatched handshake"));
         }
     }
@@ -1868,13 +1889,10 @@ where
         )
         .await;
     let (parts, body) = response.into_parts();
-    let body = body
-        .collect()
-        .await
-        .expect("collect protocol response")
-        .to_bytes();
+    // Observations are streaming responses. Collecting them here would wait
+    // forever before sending headers and conceal authority-backed observers.
     tokio::time::sleep(one_way_delay).await;
-    Ok(Response::from_parts(parts, Full::new(body)))
+    Ok(Response::from_parts(parts, body))
 }
 
 /// Asserts every file row's `directory_id` resolves among the same tree's
