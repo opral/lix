@@ -402,7 +402,7 @@ impl IntoFuture for RemoteOpenLixBuilder {
                 let http = crate::sync::authority_http(&self.server.headers)?;
                 let client = open_protocol_client(http, self.server.url, None).await?;
                 let account_id = client.active_account_id().await?;
-                Ok(RemoteLix { client, account_id, transaction_lifecycle: Arc::default() })
+                Ok(RemoteLix { client, account_id })
         })
     }
 }
@@ -410,7 +410,6 @@ impl IntoFuture for RemoteOpenLixBuilder {
 /// A repository whose operations execute on its server.
 #[derive(Debug, Clone)]
 pub struct RemoteLix {
-    transaction_lifecycle: Arc<PublicTransactionLifecycle>,
     account_id: String,
     client: ProtocolClient<crate::sync::AuthorityHttp>,
 }
@@ -465,14 +464,27 @@ impl RemoteLix {
         self.client.redo().await
     }
     pub async fn begin_transaction(&self) -> Result<RemoteLixTransaction, LixError> {
-        let lifecycle = PublicTransactionLease::acquire(Arc::clone(&self.transaction_lifecycle))?;
-        let _admission = self.transaction_lifecycle.admission.lock().await;
-        Ok(RemoteLixTransaction {
-            transaction: Some(self.client.begin_transaction().await?),
-            http: self.client.http().clone(),
-            lifecycle: Some(lifecycle),
-        })
+        let client = self
+            .client
+            .open_another_session(None, Some(self.account_id.clone()))
+            .await?;
+        // Own the session before awaiting begin so failure or cancellation
+        // schedules closure of any transaction the server may have started.
+        let mut opened = RemoteLixTransaction {
+            transaction: None,
+            client: Some(client),
+        };
+        opened.transaction = Some(
+            opened
+                .client
+                .as_ref()
+                .ok_or_else(closed_transaction_error)?
+                .begin_transaction()
+                .await?,
+        );
+        Ok(opened)
     }
+
     pub fn observe(&self, sql: &str, params: &[Value]) -> Result<RemoteObserveEvents, LixError> {
         self.client.ensure_usable()?;
         Ok(RemoteObserveEvents {
@@ -507,27 +519,20 @@ impl RemoteLix {
         &self.account_id
     }
     pub async fn close(&self) -> Result<(), LixError> {
-        if self.transaction_lifecycle.active.load(Ordering::Acquire) > 0 {
-            return Err(LixError::new("LIX_INVALID_TRANSACTION_STATE", "cannot close Lix while an explicit transaction is active"));
-        }
-        let _admission = self.transaction_lifecycle.admission.lock().await;
-        if self.transaction_lifecycle.active.load(Ordering::Acquire) > 0 {
-            return Err(LixError::new("LIX_INVALID_TRANSACTION_STATE", "cannot close Lix while an explicit transaction is active"));
-        }
         self.client.close().await
     }
 }
 
 /// A transaction executing on the remote repository.
 ///
-/// Dropping an unfinished transaction schedules a best-effort rollback. Until
-/// cleanup finishes, the parent handle rejects new transactions and closing.
-/// Call [`Self::rollback`] to await rollback explicitly.
+/// Each transaction owns a dedicated server session. Dropping it schedules
+/// best-effort session closure, which rolls back unfinished work without
+/// blocking the parent session. Server session expiry bounds abandoned work.
+/// Call [`Self::rollback`] to await rollback and session closure explicitly.
 #[derive(Debug)]
 pub struct RemoteLixTransaction {
-    lifecycle: Option<PublicTransactionLease>,
     transaction: Option<ProtocolTransaction<crate::sync::AuthorityHttp>>,
-    http: crate::sync::AuthorityHttp,
+    client: Option<ProtocolClient<crate::sync::AuthorityHttp>>,
 }
 impl RemoteLixTransaction {
     pub fn execute<'a>(
@@ -543,26 +548,53 @@ impl RemoteLixTransaction {
         }
     }
     pub async fn commit(mut self) -> Result<(), LixError> {
-        self.transaction.as_ref().ok_or_else(closed_transaction_error)?.commit().await?;
-        self.transaction.take();
-        Ok(())
+        let result = self
+            .transaction
+            .as_ref()
+            .ok_or_else(closed_transaction_error)?
+            .commit()
+            .await;
+        let close_result = self
+            .client
+            .as_ref()
+            .ok_or_else(closed_transaction_error)?
+            .close()
+            .await;
+        self.client.take();
+        result?;
+        close_result
     }
     pub async fn rollback(mut self) -> Result<(), LixError> {
-        self.transaction.as_ref().ok_or_else(closed_transaction_error)?.rollback().await?;
-        self.transaction.take();
-        Ok(())
+        let result = self
+            .transaction
+            .as_ref()
+            .ok_or_else(closed_transaction_error)?
+            .rollback()
+            .await;
+        let close_result = self
+            .client
+            .as_ref()
+            .ok_or_else(closed_transaction_error)?
+            .close()
+            .await;
+        self.client.take();
+        result?;
+        close_result
     }
 }
 
 impl Drop for RemoteLixTransaction {
     fn drop(&mut self) {
-        let Some(transaction) = self.transaction.take() else { return; };
-        let lifecycle = self.lifecycle.take();
-        crate::authority_client::ProtocolHttp::spawn(&self.http, Box::pin(async move {
-            // Keep close and new transactions fenced until cleanup finishes.
-            let _lifecycle = lifecycle;
-            let _ = transaction.rollback().await;
-        }));
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let http = client.http().clone();
+        crate::authority_client::ProtocolHttp::spawn(
+            &http,
+            Box::pin(async move {
+                let _ = client.close().await;
+            }),
+        );
     }
 }
 
@@ -594,7 +626,7 @@ impl<'a> IntoFuture for RemoteOpenAnotherSessionBuilder<'a> {
                     .open_another_session(self.branch_id, self.account_id)
                     .await?;
                 let account_id = client.active_account_id().await?;
-                Ok(RemoteLix { client, account_id, transaction_lifecycle: Arc::default() })
+                Ok(RemoteLix { client, account_id })
         })
     }
 }
@@ -3379,111 +3411,315 @@ mod tests {
     }
 
     #[cfg(not(target_family = "wasm"))]
+    fn remote_request(
+        listener: &std::net::TcpListener,
+        method: &str,
+        path: &str,
+        session: Option<&str>,
+    ) -> std::net::TcpStream {
+        use std::io::Read;
+        let (mut connection, _) = listener.accept().unwrap();
+        connection
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut byte = [0];
+            connection.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.starts_with(&format!("{method} ")), "{request}");
+        assert!(request.lines().next().unwrap().contains(path), "{request}");
+        if let Some(session) = session {
+            assert!(
+                request
+                    .to_lowercase()
+                    .contains(&format!("lix-session-id: {session}\r\n")),
+                "{request}"
+            );
+        }
+        let size = request
+            .lines()
+            .find_map(|line| {
+                line.to_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|n| n.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        connection.read_exact(&mut vec![0; size]).unwrap();
+        connection
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn remote_response(mut connection: std::net::TcpStream, status: u16, body: serde_json::Value) {
+        use std::io::Write;
+        let body = if status == 204 {
+            String::new()
+        } else {
+            body.to_string()
+        };
+        write!(connection, "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn remote_handshake(listener: &std::net::TcpListener, session: &str, child: bool) {
+        let path = if child {
+            "/?activeBranchId=feature"
+        } else {
+            "/ "
+        };
+        remote_response(
+            remote_request(listener, "GET", path, None),
+            200,
+            serde_json::json!({
+                "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                "sessionId": session, "activeBranchId": "feature", "activeAccountId": "account"
+            }),
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     #[tokio::test]
-    async fn remote_close_preserves_opening_and_active_transactions() {
-        use std::io::{Read, Write};
+    async fn remote_transactions_finish_and_close_their_dedicated_sessions() {
+        for commit in [false, true] {
+            for fail_finish in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let thread = std::thread::spawn(move || {
+                    remote_handshake(&listener, "parent", false);
+                    remote_handshake(&listener, "child", true);
+                    remote_response(
+                        remote_request(&listener, "POST", "/transaction/begin ", Some("child")),
+                        200,
+                        serde_json::json!({ "transactionId": "transaction" }),
+                    );
+                    let path = if commit {
+                        "/transaction/commit "
+                    } else {
+                        "/transaction/rollback "
+                    };
+                    remote_response(
+                        remote_request(&listener, "POST", path, Some("child")),
+                        if fail_finish { 500 } else { 204 },
+                        serde_json::json!({"error": {"code": "TEST_FINISH_FAILED", "message": "finish failed"}}),
+                    );
+                    remote_response(
+                        remote_request(&listener, "DELETE", "/session ", Some("child")),
+                        204,
+                        serde_json::Value::Null,
+                    );
+                    remote_response(
+                        remote_request(&listener, "POST", "/execute ", Some("parent")),
+                        200,
+                        serde_json::json!({ "columns": [], "rows": [], "rowsAffected": 0 }),
+                    );
+                    remote_response(
+                        remote_request(&listener, "DELETE", "/session ", Some("parent")),
+                        204,
+                        serde_json::Value::Null,
+                    );
+                });
+                let lix = open_lix()
+                    .with_server(ServerOptions::new(format!(
+                        "http://{address}/lix/00000000-0000-4000-8000-000000000001"
+                    )))
+                    .await
+                    .unwrap();
+                let transaction = lix.begin_transaction().await.unwrap();
+                let child = transaction.client.as_ref().unwrap();
+                assert_eq!(
+                    child.active_branch_id().await.unwrap(),
+                    lix.active_branch_id().await.unwrap()
+                );
+                assert_eq!(
+                    child.active_account_id().await.unwrap(),
+                    lix.active_account_id()
+                );
+                assert_ne!(child.session_id(), lix.client.session_id());
+                let result = if commit {
+                    transaction.commit().await
+                } else {
+                    transaction.rollback().await
+                };
+                if fail_finish {
+                    assert_eq!(result.unwrap_err().code, "TEST_FINISH_FAILED");
+                } else {
+                    result.unwrap();
+                }
+                lix.execute("SELECT 1", &[])
+                    .await
+                    .expect("parent remains usable after transaction finishes");
+                lix.close().await.unwrap();
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn dropping_remote_transaction_does_not_block_parent_during_failed_session_cleanup() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let (opening_tx, opening_rx) = tokio::sync::oneshot::channel();
+        let (closing_tx, closing_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let mut opening_tx = Some(opening_tx);
-            for step in 0..4 {
-                let (mut connection, _) = listener.accept().unwrap();
-                connection.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut byte = [0];
-                    connection.read_exact(&mut byte).unwrap();
-                    request.push(byte[0]);
-                    if request.ends_with(b"\r\n\r\n") { break; }
-                }
-                let request = String::from_utf8(request).unwrap();
-                let size = request.lines().find_map(|line| line.to_lowercase().strip_prefix("content-length:").and_then(|n| n.trim().parse::<usize>().ok())).unwrap_or(0);
-                connection.read_exact(&mut vec![0; size]).unwrap();
-                let (status, body) = match step {
-                    0 => (200, serde_json::json!({ "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
-                        "sessionId": "transaction-session", "activeBranchId": "main", "activeAccountId": "account" }).to_string()),
-                    1 => {
-                        assert!(request.contains("/transaction/begin "));
-                        opening_tx.take().unwrap().send(()).unwrap();
-                        resume_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-                        (200, serde_json::json!({ "transactionId": "transaction" }).to_string())
-                    }
-                    2 => { assert!(request.contains("/transaction/rollback ")); (204, String::new()) }
-                    _ => { assert!(request.starts_with("DELETE ") && request.contains("/session ")); (204, String::new()) }
-                };
-                write!(connection, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-            }
+            remote_handshake(&listener, "parent", false);
+            remote_handshake(&listener, "abandoned", true);
+            remote_response(
+                remote_request(&listener, "POST", "/transaction/begin ", Some("abandoned")),
+                200,
+                serde_json::json!({ "transactionId": "abandoned-transaction" }),
+            );
+            let pending_close = remote_request(&listener, "DELETE", "/session ", Some("abandoned"));
+            closing_tx.send(()).unwrap();
+            // Keep cleanup unanswered while the same parent executes, opens another
+            // transaction, and closes. No rollback request should be sent on drop.
+            remote_response(
+                remote_request(&listener, "POST", "/execute ", Some("parent")),
+                200,
+                serde_json::json!({ "columns": [], "rows": [], "rowsAffected": 0 }),
+            );
+            remote_handshake(&listener, "replacement", true);
+            remote_response(
+                remote_request(
+                    &listener,
+                    "POST",
+                    "/transaction/begin ",
+                    Some("replacement"),
+                ),
+                200,
+                serde_json::json!({ "transactionId": "replacement-transaction" }),
+            );
+            remote_response(
+                remote_request(
+                    &listener,
+                    "POST",
+                    "/transaction/commit ",
+                    Some("replacement"),
+                ),
+                204,
+                serde_json::Value::Null,
+            );
+            remote_response(
+                remote_request(&listener, "DELETE", "/session ", Some("replacement")),
+                204,
+                serde_json::Value::Null,
+            );
+            remote_response(
+                remote_request(&listener, "DELETE", "/session ", Some("parent")),
+                204,
+                serde_json::Value::Null,
+            );
+            resume_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            remote_response(
+                pending_close,
+                500,
+                serde_json::json!({ "error": {"code": "TEST_CLOSE_FAILED", "message": "close failed"} }),
+            );
         });
-        let lix = open_lix().with_server(ServerOptions::new(format!("http://{address}/lix/00000000-0000-4000-8000-000000000001"))).await.unwrap();
-        let opening = tokio::spawn({ let lix = lix.clone(); async move { lix.begin_transaction().await } });
-        opening_rx.await.unwrap();
-        assert_eq!(lix.close().await.unwrap_err().code, "LIX_INVALID_TRANSACTION_STATE");
+        let lix = open_lix()
+            .with_server(ServerOptions::new(format!(
+                "http://{address}/lix/00000000-0000-4000-8000-000000000001"
+            )))
+            .await
+            .unwrap();
+        drop(lix.begin_transaction().await.unwrap());
+        closing_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            lix.execute("SELECT 1", &[])
+                .await
+                .expect("parent SQL during cleanup");
+            lix.begin_transaction()
+                .await
+                .expect("parent transaction during cleanup")
+                .commit()
+                .await
+                .unwrap();
+            lix.close().await.expect("parent close during cleanup");
+        })
+        .await
+        .expect("cleanup must not block parent operations");
         resume_tx.send(()).unwrap();
-        let transaction = opening.await.unwrap().unwrap();
-        assert_eq!(lix.close().await.unwrap_err().code, "LIX_INVALID_TRANSACTION_STATE");
-        transaction.rollback().await.unwrap();
-        lix.close().await.unwrap();
         thread.join().unwrap();
     }
 
     #[cfg(not(target_family = "wasm"))]
     #[tokio::test]
-    async fn dropping_remote_transaction_rolls_back_before_releasing_lease() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (rollback_tx, rollback_rx) = tokio::sync::oneshot::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            let mut rollback_tx = Some(rollback_tx);
-            for step in 0..6 {
-                let (mut connection, _) = listener.accept().unwrap();
-                connection.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut byte = [0];
-                    connection.read_exact(&mut byte).unwrap();
-                    request.push(byte[0]);
-                    if request.ends_with(b"\r\n\r\n") { break; }
-                }
-                let request = String::from_utf8(request).unwrap();
-                let size = request.lines().find_map(|line| line.to_lowercase().strip_prefix("content-length:").and_then(|n| n.trim().parse::<usize>().ok())).unwrap_or(0);
-                connection.read_exact(&mut vec![0; size]).unwrap();
-                let (status, body) = match step {
-                    0 => (200, serde_json::json!({ "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
-                        "sessionId": "drop-session", "activeBranchId": "main", "activeAccountId": "account" }).to_string()),
-                    1 | 3 => {
-                        assert!(request.contains("/transaction/begin "));
-                        (200, serde_json::json!({ "transactionId": format!("transaction-{step}") }).to_string())
-                    }
-                    2 => {
-                        assert!(request.contains("/transaction/rollback "));
-                        rollback_tx.take().unwrap().send(()).unwrap();
-                        resume_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-                        (204, String::new())
-                    }
-                    4 => { assert!(request.contains("/transaction/commit ")); (204, String::new()) }
-                    _ => { assert!(request.starts_with("DELETE ") && request.contains("/session ")); (204, String::new()) }
+    async fn failed_or_cancelled_remote_transaction_begin_closes_only_its_dedicated_session() {
+        for cancel in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let (begin_tx, begin_rx) = tokio::sync::oneshot::channel();
+            let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+            let thread = std::thread::spawn(move || {
+                remote_handshake(&listener, "parent", false);
+                remote_handshake(&listener, "child", true);
+                let begin = remote_request(&listener, "POST", "/transaction/begin ", Some("child"));
+                begin_tx.send(()).unwrap();
+                let pending_begin = if cancel {
+                    Some(begin)
+                } else {
+                    remote_response(
+                        begin,
+                        500,
+                        serde_json::json!({ "error": {"code": "TEST_BEGIN_FAILED", "message": "begin failed"} }),
+                    );
+                    None
                 };
-                write!(connection, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                remote_response(
+                    remote_request(&listener, "DELETE", "/session ", Some("child")),
+                    204,
+                    serde_json::Value::Null,
+                );
+                drop(pending_begin);
+                closed_tx.send(()).unwrap();
+                remote_response(
+                    remote_request(&listener, "POST", "/execute ", Some("parent")),
+                    200,
+                    serde_json::json!({ "columns": [], "rows": [], "rowsAffected": 0 }),
+                );
+                remote_response(
+                    remote_request(&listener, "DELETE", "/session ", Some("parent")),
+                    204,
+                    serde_json::Value::Null,
+                );
+            });
+            let lix = open_lix()
+                .with_server(ServerOptions::new(format!(
+                    "http://{address}/lix/00000000-0000-4000-8000-000000000001"
+                )))
+                .await
+                .unwrap();
+            let opening = tokio::spawn({
+                let lix = lix.clone();
+                async move { lix.begin_transaction().await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), begin_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                opening.abort();
+                assert!(opening.await.unwrap_err().is_cancelled());
+            } else {
+                assert_eq!(opening.await.unwrap().unwrap_err().code, "TEST_BEGIN_FAILED");
             }
-        });
-        let lix = open_lix().with_server(ServerOptions::new(format!("http://{address}/lix/00000000-0000-4000-8000-000000000001"))).await.unwrap();
-        drop(lix.begin_transaction().await.unwrap());
-        rollback_rx.await.unwrap();
-        assert_eq!(lix.close().await.unwrap_err().code, "LIX_INVALID_TRANSACTION_STATE");
-        assert_eq!(lix.begin_transaction().await.unwrap_err().code, "LIX_INVALID_TRANSACTION_STATE");
-        resume_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while lix.transaction_lifecycle.active.load(Ordering::Acquire) != 0 {
-                tokio::task::yield_now().await;
-            }
-        }).await.unwrap();
-        lix.begin_transaction().await.unwrap().commit().await.unwrap();
-        lix.close().await.unwrap();
-        thread.join().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), closed_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            lix.execute("SELECT 1", &[])
+                .await
+                .expect("failed child begin leaves parent usable");
+            lix.close().await.unwrap();
+            thread.join().unwrap();
+        }
     }
 
     #[tokio::test]
