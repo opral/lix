@@ -407,6 +407,7 @@ impl TransitionHost for RecordingHost {
         delete_len: u64,
         insert: &[u8],
     ) -> std::result::Result<(), CommonHostError> {
+        self.check_state_size(0, insert.len())?;
         let mut record = self.record.borrow_mut();
         if record.replacement.is_some() || record.pending_replacement.is_some() {
             return Err(CommonHostError::Rejected(
@@ -555,6 +556,18 @@ mod tests {
         );
         host.delete_state(b"abcd").unwrap();
         host.delete_state_prefix(b"abcd").unwrap();
+    }
+
+    #[test]
+    fn file_edits_enforce_each_insertion_batch_boundary() {
+        let host = RecordingHost::new(&Snapshot::default(), 4);
+        host.emit_file_edit(0, 0, b"1234").unwrap();
+        assert!(host.emit_file_edit(0, 0, b"12345").is_err());
+        assert_eq!(host.record.borrow().edits.len(), 1);
+        // The boundary is per insertion, not the sum of separate calls.
+        host.emit_file_edit(0, 0, b"5678").unwrap();
+        host.emit_file_edit(0, 0, b"").unwrap();
+        assert_eq!(host.record.borrow().edits.len(), 3);
     }
 
     #[test]
