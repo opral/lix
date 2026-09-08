@@ -470,6 +470,8 @@ pub(crate) async fn load_sync_commit<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    #[cfg(test)]
+    super::upload_metrics::record_commit_payload_load();
     let requested = [commit_id];
     let record = ChangelogContext::new()
         .reader(store)
