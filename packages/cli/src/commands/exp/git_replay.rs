@@ -345,6 +345,13 @@ where
     ))
     .map_err(|error| CliError::msg(format!("failed to enable deterministic mode: {error}")))?;
 
+    // Replay owns a newly created output repository. Its initial file tree
+    // must come entirely from Git, including when Git contains its own README.
+    // Remove repository starter files before installing plugins or timing work.
+    db::block_on(lix.execute("DELETE FROM lix_file", &[])).map_err(|error| {
+        CliError::msg(format!("failed to clear replay starter files: {error}"))
+    })?;
+
     let plugin_install_started = Instant::now();
     if args.plugins == GitReplayPlugins::All {
         install_embedded_replay_plugins(&lix)?;
