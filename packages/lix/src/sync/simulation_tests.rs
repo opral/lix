@@ -208,6 +208,7 @@ struct Replica {
     _demand_tx: tokio::sync::mpsc::Sender<super::runtime::SyncDemand>,
     demand_rx: tokio::sync::mpsc::Receiver<super::runtime::SyncDemand>,
     pending_demands: Vec<super::runtime::SyncDemand>,
+    upload_plan: Option<super::repository::CachedSyncUploadPlan>,
     pull_item_limit: usize,
 }
 
@@ -257,6 +258,7 @@ impl Replica {
             _demand_tx: demand_tx,
             demand_rx,
             pending_demands: Vec::new(),
+            upload_plan: None,
             pull_item_limit: super::MAX_SYNC_REQUEST_ITEMS,
         }
     }
@@ -272,6 +274,7 @@ impl Replica {
             &mut self.lix.sync_mode_state().change_watcher(),
             &mut self.demand_rx,
             &mut self.pending_demands,
+            &mut self.upload_plan,
         )
         .await
     }

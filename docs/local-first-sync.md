@@ -65,12 +65,51 @@ Checkpoint sync provenance adds one constant-size metadata write per checkpoint,
 without rewriting the pending checkpoint queue. Background pending walks load
 these source records by commit ID as needed.
 
-One upload plan constructs dependency order in O((P + E) log P), replacing a
-quadratic next-ready scan. Its traversal stops at confirmed boundaries rather
-than walking cold history. Upload requests are bounded and at most four batches
-run before incoming demands and a finite pull receive service. Rebuilding the
-remaining plan per bounded batch can still make a large offline drain quadratic
-in P; this background limitation is separate from foreground latency.
+The worker captures a finite upload wave using commit IDs and dependency
+metadata, orders it once, and decodes payloads only for the selected page. It
+retains the disposable in-memory plan across pages and advances it only after
+the server acknowledgment has been imported durably. Ordinary appends and
+checkpoints join the next wave, so continuous editing cannot indefinitely delay
+publication of the captured refs. Restarting the worker reconstructs a plan from
+the durable replica; there is no additional durable outbox.
+
+Dependency ordering costs O((P + E) log P); the retained plan holds O(P + B)
+IDs and refs, where B is branch count. Payload loading is proportional to the
+commits sent rather than the sum of the remaining queues across pages. Initial
+ancestry checks can still revisit overlapping branch closures, costing up to
+O(B * (P + E)); each page also decodes the receipt and compares authority
+coordinates. Thus this removes repeated queue planning, not every branch-count
+or acknowledgment-frontier cost. Traversal stops at confirmed boundaries rather
+than loading cold history. At most four upload batches run before incoming
+demands and a finite pull receive service.
+
+Explicit branch creation, replacement, deletion, and restores rotate an atomically
+written invalidation token. Creating a branch also invalidates the plan so a
+recreated ID cannot publish a previously captured deletion. A
+fresh read checks that token and server coordinates before loading each page;
+ref preparation additionally guards current reset intent and persists exact
+request proofs with a compare-and-swap. Restores, incompatible server updates,
+and missing garbage-collected bodies discard the cache. No storage snapshot is
+held across the network. Lost responses retry unacknowledged work, and a request
+size rejection selects a smaller prefix without advancing the plan.
+
+Generic request proofs are retired atomically when the authority leaves their
+source coordinate, including a leave-and-return within one received page. Active
+restores retain their own copied tokens; old generic proofs cannot misclassify a
+later foreign write as an acknowledgment after an authority-coordinate cycle.
+
+Prepared-ref proofs retain at most 64 distinct targets per branch and source
+coordinate. Repeated ordinary retries reuse the same target. Exceptionally,
+64 distinct preparations without an authority advance can exhaust that bound;
+a further distinct target returns an error rather than forgetting a possibly
+in-flight acknowledgment. Automatic recovery for this exceptional case is not
+implemented.
+
+Checkpoint source acknowledgments are cleared once every branch has converged
+and no restore is pending. This uses an O(B) control scan guarded against
+concurrent branch creation and mutation. Body-only acknowledgments retain source
+boundaries needed by other pending branches. A wide pending graph can still
+require a wide acknowledgment frontier before convergence.
 
 Ordinary ref deltas load only their affected branch controls and perform no
 branch scans. Incompatible-state resets inspect O(B) branch metadata to guard
@@ -129,3 +168,64 @@ LIX_LOCAL_FIRST_PROFILE_OUTPUT=/tmp/local-first-profile.json \
 The JSON artifact uses `lix.local-first-foreground-profile.v1` and records all
 32/256-row and 0/100 ms RTT cases. Run the same harness on the baseline checkout
 for a comparison; do not compare unrelated older benchmark binaries.
+
+
+### Large offline queues
+
+The ignored `upload_plan_scaling_profile` compares three implementations using
+512, 2,048, and 8,192 pending commits, 1 KiB values written to one key, and a
+512-item upload limit. The baseline is main `37cd4904a`; page-only mode rebuilds
+metadata each page while decoding only selected payloads; retained mode is the
+production worker behavior in this change.
+
+Results use Cargo's unoptimized test profile and in-memory replica/authority
+storage with no injected network latency. Planning excludes fixture writes,
+authority processing, and receipt import; catch-up includes those upload and
+import steps and harness bookkeeping/frontier sampling, but excludes fixture
+construction. These are single-run diagnostics,
+not production percentile guarantees. The [recorded counters](benchmarks/sync-upload-planning.json)
+include all three modes and checkpoint summaries.
+
+| Pending commits | Main planning | Page-only planning | Retained planning | Main catch-up | Retained catch-up |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 512 | 94 ms | 88 ms | 81 ms | 493 ms | 464 ms |
+| 2,048 | 828 ms | 493 ms | 310 ms | 2,436 ms | 1,802 ms |
+| 8,192 | 11,328 ms | 4,594 ms | 1,281 ms | 18,031 ms | 7,380 ms |
+
+At 8,192 commits, payload-load calls fall from 69,632 to 8,192; commit-header
+point reads fall from 278,528 to 24,576; encoded storage bytes returned during
+planning fall from 282.6 MB to 27.7 MB. Payload loads and header-read counts have
+non-timing regression assertions. Returned storage bytes measure backend reads,
+not a census of decoded bytes or wire traffic. The counters show why retaining
+the plan earns its extra complexity beyond loading only the selected page.
+
+A separate 32-wave checkpoint profile uses four edits and one full/scoped
+checkpoint per wave, with two-item pages. On main, full checkpoints leave 32
+source acknowledgment entries after convergence (maximum 34 while uploading).
+The retained implementation finishes each wave with zero entries (maximum 3).
+Scoped checkpoints finish with zero in both versions (maximum 2). The cleanup
+therefore addresses full-checkpoint aliases without removing boundaries that a
+pending sibling branch still needs.
+
+The harness also records whole-process Linux `VmHWM`. That includes fixtures,
+the in-process authority, and earlier cases in the same process; it does not
+isolate planner peak memory. The retained-plan memory bound is established by
+its ID/ref-only representation, not by interpreting process RSS as cache size.
+
+Reproduce the candidate from the repository root:
+
+```sh
+LIX_UPLOAD_PROFILE_SIZES=512,2048,8192 LIX_UPLOAD_PROFILE_CACHED=1 \
+  cargo test -p lix --all-features --lib upload_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Set `LIX_UPLOAD_PROFILE_CACHED=0` for the page-only comparator. To reproduce
+main, port `upload_plan_profile_tests.rs` and `upload_metrics.rs` to that
+checkout, wiring their test-only module/include and the counter at the start of
+`load_sync_commit`. Adapt the harness drain to call only the original
+`build_sync_push`: remove retained-mode/cleanup calls and the candidate-only
+linear-read regression. Keep the baseline production planner unchanged.
+Run builds and profiles sequentially
+when sharing a Cargo target directory. Frontier and timing JSON is printed as
+`UPLOAD_FRONTIER_PROFILE` and `UPLOAD_PLAN_PROFILE`, respectively.
