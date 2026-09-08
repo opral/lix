@@ -7,11 +7,21 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageDir = join(__dirname, "..");
 const manifestPath = join(packageDir, "Cargo.toml");
+const target = process.env.LIX_NATIVE_TARGET;
 const requestedProfile = process.env.LIX_NATIVE_PROFILE ?? "release";
 const cargoProfile = requestedProfile === "debug" ? "dev" : requestedProfile;
 const artifactProfile =
 	cargoProfile === "dev" || cargoProfile === "test" ? "debug" : cargoProfile;
-const artifactName =
+const targetArtifacts = {
+	"aarch64-unknown-linux-gnu": "liblix_js_sdk.so",
+	"x86_64-unknown-linux-gnu": "liblix_js_sdk.so",
+	"aarch64-apple-darwin": "liblix_js_sdk.dylib",
+	"x86_64-pc-windows-msvc": "lix_js_sdk.dll",
+};
+if (target && !Object.hasOwn(targetArtifacts, target)) {
+	throw new Error(`Unsupported native target: ${target}`);
+}
+const artifactName = target ? targetArtifacts[target] :
 	process.platform === "darwin"
 		? "liblix_js_sdk.dylib"
 		: process.platform === "win32"
@@ -74,9 +84,12 @@ const args = [
 	cargoProfile,
 ];
 
+if (target) args.push("--target", target);
+args.push("--timings");
+
 await run("cargo", args);
 await mkdir(packageDir, { recursive: true });
 await cp(
-	join(await cargoTargetDir(), artifactProfile, artifactName),
+	join(await cargoTargetDir(), target ?? "", artifactProfile, artifactName),
 	destination,
 );

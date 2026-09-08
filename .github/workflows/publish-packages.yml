@@ -219,6 +219,13 @@ jobs:
           docker manifest inspect \
             "ghcr.io/opral/lix-server@$SERVER_DIGEST"
 
+  build-js-sdk-arm64:
+    needs: release-version
+    if: needs.release-version.outputs.has_release == 'true'
+    uses: ./.github/workflows/build-js-sdk-arm64.yml
+    with:
+      ref: ${{ needs.release-version.outputs.release_sha }}
+
   build-js-sdk-native-packages:
     name: Build @lix-js/sdk native package (${{ matrix.suffix }})
     runs-on: ${{ matrix.runner }}
@@ -230,8 +237,6 @@ jobs:
         include:
           - suffix: linux-x64
             runner: ubicloud-standard-30-ubuntu-2404
-          - suffix: linux-arm64
-            runner: ubicloud-standard-30-arm-ubuntu-2404
           - suffix: darwin-arm64
             runner: blacksmith-12vcpu-macos-15
           - suffix: win32-x64
@@ -467,6 +472,7 @@ jobs:
     needs:
       - release-version
       - build-js-sdk-native-packages
+      - build-js-sdk-arm64
       - test-js-sdk
     if: needs.release-version.outputs.has_release == 'true'
 
@@ -527,6 +533,7 @@ jobs:
     needs:
       - release-version
       - build-js-sdk-native-packages
+      - build-js-sdk-arm64
       - test-js-sdk
       - publish-rust-crates
     permissions:
@@ -724,6 +731,7 @@ jobs:
       - publish-lix-server
       - create-github-release
       - build-js-sdk-native-packages
+      - build-js-sdk-arm64
       - build-js-sdk
       - test-js-sdk
       - publish-rust-crates
@@ -736,6 +744,7 @@ jobs:
           echo "release-version: ${{ needs.release-version.result }}"
           echo "publish-lix-server: ${{ needs.publish-lix-server.result }}"
           echo "create-github-release: ${{ needs.create-github-release.result }}"
+          echo "build-js-sdk-arm64: ${{ needs.build-js-sdk-arm64.result }}"
           echo "build-js-sdk-native-packages: ${{ needs.build-js-sdk-native-packages.result }}"
           echo "build-js-sdk: ${{ needs.build-js-sdk.result }}"
           echo "test-js-sdk: ${{ needs.test-js-sdk.result }}"
