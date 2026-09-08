@@ -14,6 +14,7 @@ const ROWS_PER_CHUNK: usize = 512;
 const IDENTITIES_PER_CHUNK: usize = 64;
 const QUOTED_FIELD: u32 = 1 << 31;
 const FIELD_LENGTH_MASK: u32 = !QUOTED_FIELD;
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdNamespace(pub [u8; 16]);
@@ -81,6 +82,7 @@ pub struct Dialect {
     pub delimiter: u8,
     pub quote: Option<u8>,
     pub terminator: Terminator,
+    pub bom: bool,
 }
 
 impl Dialect {
@@ -94,6 +96,7 @@ impl Dialect {
             delimiter,
             quote: Some(b'"'),
             terminator: Terminator::Lf,
+            bom: false,
         }
     }
 
@@ -121,6 +124,8 @@ pub struct RowLayout {
     /// Base64url bitset, decoded into one bit per field. A set bit forces
     /// quoting even when the field's decoded value does not require it.
     force_quote: Vec<u8>,
+    /// Preserve accepted literal quotes inside otherwise-unquoted fields.
+    unquoted_quote: Vec<u8>,
     /// `None` inherits the table terminator, `Some(None)` is an unterminated
     /// row, and `Some(Some(_))` selects an exceptional row terminator.
     terminator: Option<Option<Terminator>>,
@@ -128,11 +133,17 @@ pub struct RowLayout {
 
 impl RowLayout {
     fn is_default(&self) -> bool {
-        self.force_quote.is_empty() && self.terminator.is_none()
+        self.force_quote.is_empty() && self.unquoted_quote.is_empty() && self.terminator.is_none()
     }
 
     fn force_quotes(&self, field: usize) -> bool {
         self.force_quote
+            .get(field / 8)
+            .is_some_and(|byte| byte & (1 << (field % 8)) != 0)
+    }
+
+    fn leaves_quotes_unquoted(&self, field: usize) -> bool {
+        self.unquoted_quote
             .get(field / 8)
             .is_some_and(|byte| byte & (1 << (field % 8)) != 0)
     }
@@ -1629,11 +1640,12 @@ impl RowImportBuilder {
                 .cmp(right.order_key.bytes(order_key_bytes))
                 .then_with(|| left.id.bytes(id_bytes).cmp(right.id.bytes(id_bytes)))
         });
-        let layouts = self
+        let mut layouts = self
             .layout_overrides
             .iter()
-            .map(|value| ((value.id.start, value.id.len), &value.layout))
+            .map(|value| ((value.id.start, value.id.len), value.layout.clone()))
             .collect::<HashMap<_, _>>();
+        let mut moved_unterminated_ending = false;
         for (index, row) in self.rows.iter().enumerate() {
             let ending = layouts
                 .get(&(row.id.start, row.id.len))
@@ -1641,12 +1653,24 @@ impl RowImportBuilder {
                     layout.ending(self.dialect)
                 });
             if ending.is_none() && index + 1 != self.rows.len() {
-                return Err("only the final CSV row may be unterminated".to_owned());
+                layouts
+                    .get_mut(&(row.id.start, row.id.len))
+                    .expect("an unterminated row has a layout override")
+                    .terminator = None;
+                moved_unterminated_ending = true;
             }
         }
+        if moved_unterminated_ending {
+            let last = self.rows.last().expect("a moved final ending has rows");
+            layouts
+                .entry((last.id.start, last.id.len))
+                .or_default()
+                .terminator = Some(None);
+        }
 
-        let rendered_len = self.rows.iter().try_fold(0usize, |total, row| {
-            let layout = layouts.get(&(row.id.start, row.id.len)).copied();
+        let prefix_len = if self.dialect.bom { UTF8_BOM.len() } else { 0 };
+        let rendered_len = self.rows.iter().try_fold(prefix_len, |total, row| {
+            let layout = layouts.get(&(row.id.start, row.id.len));
             let ending = layout.map_or(Some(self.dialect.terminator), |layout| {
                 layout.ending(self.dialect)
             });
@@ -1663,7 +1687,9 @@ impl RowImportBuilder {
                     .checked_add(rendered_cell_len(
                         cell,
                         self.dialect,
-                        layout.is_some_and(|layout| layout.force_quotes(index)),
+                        layout.is_some_and(|layout| layout.force_quotes(index))
+                            || (row.cell_count == 1 && ending.is_none() && cell.is_empty()),
+                        layout.is_some_and(|layout| layout.leaves_quotes_unquoted(index)),
                     )?)
                     .ok_or_else(|| "CSV rendered length overflowed".to_owned())?;
             }
@@ -1678,10 +1704,13 @@ impl RowImportBuilder {
         let row_count =
             u32::try_from(self.rows.len()).map_err(|_| "CSV has too many rows".to_owned())?;
         let mut blob = Vec::with_capacity(rendered_len);
+        if self.dialect.bom {
+            blob.extend_from_slice(UTF8_BOM);
+        }
         let mut chunks = Vec::with_capacity(self.rows.len().div_ceil(ROWS_PER_CHUNK));
         let mut chunk_rows = Vec::with_capacity(ROWS_PER_CHUNK);
         let mut chunk_fields = Vec::new();
-        let mut chunk_start = 0u32;
+        let mut chunk_start = prefix_len as u32;
         let mut field_count = 0u32;
         let mut chunk_key_cursor = 0u32;
         let mut noncompact_ranges = Vec::with_capacity(self.rows.len());
@@ -1706,7 +1735,7 @@ impl RowImportBuilder {
             let first_field = u32::try_from(chunk_fields.len())
                 .map_err(|_| "CSV chunk has too many fields".to_owned())?;
             let mut cursor = usize::try_from(row.cell_start).expect("u32 fits usize");
-            let layout = layouts.get(&(row.id.start, row.id.len)).copied();
+            let layout = layouts.get(&(row.id.start, row.id.len));
             for cell_index in 0..usize::from(row.cell_count) {
                 if cell_index > 0 {
                     blob.push(self.dialect.delimiter);
@@ -1718,7 +1747,11 @@ impl RowImportBuilder {
                     &mut blob,
                     cell,
                     self.dialect,
-                    layout.is_some_and(|layout| layout.force_quotes(cell_index)),
+                    layout.is_some_and(|layout| layout.force_quotes(cell_index))
+                        || (row.cell_count == 1
+                            && layout.is_some_and(|layout| layout.ending(self.dialect).is_none())
+                            && cell.is_empty()),
+                    layout.is_some_and(|layout| layout.leaves_quotes_unquoted(cell_index)),
                 )?;
                 let field_len = blob.len()
                     - usize::try_from(row_start).expect("validated rendered offset")
@@ -1856,11 +1889,25 @@ fn imported_cell_needs_quotes(cell: &[u8], dialect: Dialect) -> Result<bool, Str
     Ok(structural || cell.contains(&quote))
 }
 
-fn rendered_cell_len(cell: &[u8], dialect: Dialect, force_quote: bool) -> Result<usize, String> {
-    let canonical_quote = imported_cell_needs_quotes(cell, dialect)?;
-    if force_quote && canonical_quote {
-        return Err("CSV force_quote may select only otherwise-unnecessary quotes".to_owned());
+fn cell_needs_quotes(cell: &[u8], dialect: Dialect, unquoted_quote: bool) -> Result<bool, String> {
+    if unquoted_quote
+        && cell.first().copied() != dialect.quote
+        && !cell
+            .iter()
+            .any(|byte| *byte == dialect.delimiter || matches!(byte, b'\r' | b'\n'))
+    {
+        return Ok(false);
     }
+    imported_cell_needs_quotes(cell, dialect)
+}
+
+fn rendered_cell_len(
+    cell: &[u8],
+    dialect: Dialect,
+    force_quote: bool,
+    unquoted_quote: bool,
+) -> Result<usize, String> {
+    let canonical_quote = cell_needs_quotes(cell, dialect, unquoted_quote)?;
     if !force_quote && !canonical_quote {
         return Ok(cell.len());
     }
@@ -1881,11 +1928,9 @@ fn render_import_cell(
     cell: &[u8],
     dialect: Dialect,
     force_quote: bool,
+    unquoted_quote: bool,
 ) -> Result<bool, String> {
-    let canonical_quote = imported_cell_needs_quotes(cell, dialect)?;
-    if force_quote && canonical_quote {
-        return Err("CSV force_quote may select only otherwise-unnecessary quotes".to_owned());
-    }
+    let canonical_quote = cell_needs_quotes(cell, dialect, unquoted_quote)?;
     let quoted = force_quote || canonical_quote;
     if !quoted {
         output.extend_from_slice(cell);
@@ -1916,17 +1961,42 @@ impl Document {
 
     pub fn open_file_with_dialect(
         bytes: Vec<u8>,
+        dialect: Dialect,
+        namespace: IdNamespace,
+    ) -> Result<(Self, InitialChanges), String> {
+        Self::open_file_internal(bytes, dialect, namespace, true)
+    }
+
+    pub fn open_file_with_stored_dialect(
+        bytes: Vec<u8>,
+        dialect: Dialect,
+        namespace: IdNamespace,
+    ) -> Result<(Self, InitialChanges), String> {
+        Self::open_file_internal(bytes, dialect, namespace, false)
+    }
+
+    fn open_file_internal(
+        bytes: Vec<u8>,
         mut dialect: Dialect,
         namespace: IdNamespace,
+        infer_terminator: bool,
     ) -> Result<(Self, InitialChanges), String> {
         if bytes.len() > u32::MAX as usize {
             return Err("CSV supports files smaller than 4GiB".to_owned());
         }
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         dialect = dialect.validate_row()?;
-        let mut drafts = scan_rows(&bytes, 0, bytes.len(), dialect)?;
-        dialect.terminator =
-            preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
+        if infer_terminator {
+            dialect.bom = bytes.starts_with(UTF8_BOM);
+        } else if dialect.bom != bytes.starts_with(UTF8_BOM) {
+            return Err("CSV stored BOM metadata does not match accepted bytes".to_owned());
+        }
+        let prefix_len = if dialect.bom { UTF8_BOM.len() } else { 0 };
+        let mut drafts = scan_rows(&bytes, prefix_len, bytes.len(), dialect)?;
+        if infer_terminator {
+            dialect.terminator =
+                preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
+        }
         let identities = IdentityStore::initial(namespace, drafts.len())?;
         assign_initial_rows(&mut drafts);
         let document = Self(Arc::new(DocumentInner {
@@ -1951,7 +2021,7 @@ impl Document {
         namespace: IdNamespace,
         identities: &[RowIdentity],
     ) -> Result<Self, String> {
-        let document = Self::open_file_with_dialect(bytes, dialect, namespace)?.0;
+        let document = Self::open_file_with_stored_dialect(bytes, dialect, namespace)?.0;
         let mut records = document.row_records()?;
         if records.len() != identities.len() + 1 {
             return Err("CSV identity checkpoint row count does not match the file".to_owned());
@@ -2040,7 +2110,7 @@ impl Document {
             Terminator::CrLf => 2,
             Terminator::Cr => 3,
         });
-        output.push(0);
+        output.push(u8::from(self.0.dialect.bom));
         output.extend_from_slice(&row_count.to_le_bytes());
         for start in starts {
             output.extend_from_slice(&start.to_le_bytes());
@@ -2099,8 +2169,22 @@ impl Document {
         if descriptor_dialect_changed {
             return self.reparse_after_descriptor_change(after, after_path, namespace);
         }
+        if self.0.dialect.bom || after.range(0, after.len().min(UTF8_BOM.len()))? == UTF8_BOM {
+            return self.reparse_with_dialect(after, self.0.dialect, namespace, false);
+        }
 
-        let (first_old, last_old) = affected_row_window(&self.0.index, splices)?;
+        let (mut first_old, mut last_old) = affected_row_window(&self.0.index, splices)?;
+        if let Some(first) = first_old {
+            let start = self.0.index.row_start(first);
+            if start > 0 && self.0.blob.byte(start as usize - 1) == Some(b'\r') {
+                first_old = self
+                    .0
+                    .index
+                    .ordinal_of(first)
+                    .checked_sub(1)
+                    .and_then(|ordinal| self.0.index.ordinal_location(ordinal));
+            }
+        }
         let old_start = first_old.map_or(0, |location| self.0.index.row_start(location));
         let old_end = last_old.map_or(0, |location| self.0.index.row_end(location));
         let new_start = map_offset(old_start, splices, false)?;
@@ -2110,6 +2194,21 @@ impl Document {
         }
 
         let mut new_drafts = loop {
+            if new_end < after.len()
+                && new_end > 0
+                && after.byte(new_end - 1) == Some(b'\r')
+                && after.byte(new_end) == Some(b'\n')
+            {
+                let next_ordinal = last_old.map_or(0, |last| self.0.index.ordinal_of(last) + 1);
+                let next = self
+                    .0
+                    .index
+                    .ordinal_location(next_ordinal)
+                    .ok_or_else(|| "CSV CRLF extends beyond the indexed rows".to_owned())?;
+                last_old = Some(next);
+                new_end = map_offset(self.0.index.row_end(next), splices, true)?;
+                continue;
+            }
             let window = after.range(new_start, new_end)?;
             match scan_rows(&window, 0, window.len(), self.0.dialect) {
                 Ok(mut rows) => {
@@ -2124,7 +2223,15 @@ impl Document {
                 Err(error)
                     if new_end < after.len() && error.contains("unterminated quoted field") =>
                 {
-                    new_end = extend_to_next_record_boundary(&after, new_end);
+                    // Expanding a quoted field consumes predecessor records as
+                    // well as bytes. Include those records in reconciliation
+                    // and replacement so their old index entries cannot survive.
+                    let next_ordinal = last_old.map_or(0, |last| self.0.index.ordinal_of(last) + 1);
+                    let next = self.0.index.ordinal_location(next_ordinal).ok_or_else(|| {
+                        "CSV quoted field extends beyond the indexed rows".to_owned()
+                    })?;
+                    last_old = Some(next);
+                    new_end = map_offset(self.0.index.row_end(next), splices, true)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -2187,12 +2294,25 @@ impl Document {
         after_path: Option<&str>,
         namespace: IdNamespace,
     ) -> Result<(Self, Vec<RowChange>), String> {
+        self.reparse_with_dialect(after, Dialect::for_path(after_path), namespace, true)
+    }
+
+    fn reparse_with_dialect(
+        &self,
+        after: PersistentBlob,
+        mut dialect: Dialect,
+        namespace: IdNamespace,
+        infer_terminator: bool,
+    ) -> Result<(Self, Vec<RowChange>), String> {
         let bytes = after.materialize();
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
-        let mut dialect = Dialect::for_path(after_path);
-        let mut drafts = scan_rows(&bytes, 0, bytes.len(), dialect)?;
-        dialect.terminator =
-            preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
+        dialect.bom = bytes.starts_with(UTF8_BOM);
+        let prefix_len = if dialect.bom { UTF8_BOM.len() } else { 0 };
+        let mut drafts = scan_rows(&bytes, prefix_len, bytes.len(), dialect)?;
+        if infer_terminator {
+            dialect.terminator =
+                preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
+        }
         let old_locations = self.0.index.locations().collect::<Vec<_>>();
         let mut identities = self.0.identities.clone();
         match_rows(
@@ -2416,6 +2536,7 @@ impl Document {
             self.0.dialect,
             desired_ending,
             &semantic.layout.force_quote,
+            &semantic.layout.unquoted_quote,
         )?;
         let source_start = source_chunk.byte_start + source_row.relative_start;
         let source_len = source_row.byte_len;
@@ -2527,6 +2648,7 @@ impl Document {
             self.0.dialect,
             ending,
             &semantic.layout.force_quote,
+            &semantic.layout.unquoted_quote,
         )?;
         let splice = FileEdit {
             offset: u64::from(start),
@@ -2587,6 +2709,7 @@ impl Document {
             self.0.dialect,
             ending,
             &semantic.layout.force_quote,
+            &semantic.layout.unquoted_quote,
         )?;
         let mut replacement_drafts = Vec::with_capacity(2);
         let offset = if target_ordinal < self.row_count() {
@@ -2815,6 +2938,7 @@ impl ColdInitialImport {
         }
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(path);
+        dialect.bom = bytes.starts_with(UTF8_BOM);
         let (rows, fields) = scan_cold_rows(&bytes, dialect)?;
         dialect.terminator =
             preferred_terminator(rows.iter().map(|row| row.ending), Terminator::Lf);
@@ -2860,7 +2984,7 @@ impl ColdInitialImport {
             Terminator::CrLf => 2,
             Terminator::Cr => 3,
         });
-        output.push(0);
+        output.push(u8::from(self.dialect.bom));
         output.extend_from_slice(
             &u32::try_from(self.rows.len())
                 .expect("CSV row count fits u32")
@@ -2914,6 +3038,9 @@ pub struct ArenaRowIndex {
 
 #[allow(dead_code)]
 impl ArenaRowIndex {
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
+    }
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         const HEADER_BYTES: usize = 36;
         if bytes.len() < HEADER_BYTES || &bytes[..8] != b"LIXCSV3\0" {
@@ -2955,7 +3082,10 @@ impl ArenaRowIndex {
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte CSV row offset")))
             .collect::<Vec<_>>();
-        if starts.first().copied() != Some(0)
+        if bytes[31] > 1
+            || file_len < u64::from(bytes[31]) * 3
+            || (file_len == u64::from(bytes[31]) * 3) != (row_count == 0)
+            || (!starts.is_empty() && starts.first().copied() != Some(u32::from(bytes[31]) * 3))
             || !starts.windows(2).all(|pair| pair[0] < pair[1])
             || starts
                 .last()
@@ -2970,7 +3100,9 @@ impl ArenaRowIndex {
                 delimiter,
                 quote,
                 terminator,
-            },
+                bom: bytes[31] != 0,
+            }
+            .validate_row()?,
             row_count: u32::try_from(row_count).expect("decoded CSV row count came from u32"),
             starts,
         })
@@ -3005,7 +3137,11 @@ impl ArenaRowIndex {
             .expect("header size fits u64")
             .checked_add(u64::from(row_count).saturating_mul(4))
             .ok_or_else(|| "CSV arena state size overflowed".to_owned())?;
-        if state_len != expected || row_count == 0 {
+        if state_len != expected
+            || bytes[31] > 1
+            || file_len < u64::from(bytes[31]) * 3
+            || (file_len == u64::from(bytes[31]) * 3) != (row_count == 0)
+        {
             return Err("CSV arena state row index is truncated".to_owned());
         }
         Ok(Self {
@@ -3015,7 +3151,9 @@ impl ArenaRowIndex {
                 delimiter,
                 quote,
                 terminator,
-            },
+                bom: bytes[31] != 0,
+            }
+            .validate_row()?,
             row_count,
             starts: Vec::new(),
         })
@@ -3195,19 +3333,21 @@ fn scan_cold_rows(
     bytes: &[u8],
     dialect: Dialect,
 ) -> Result<(Vec<ColdRowDraft>, Vec<FieldRange>), String> {
+    validate_csv_text(bytes)?;
     if bytes.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
     let mut rows = Vec::new();
     let mut fields = Vec::new();
-    let mut row_start = 0usize;
-    let mut field_start = 0usize;
+    let prefix_len = if dialect.bom { UTF8_BOM.len() } else { 0 };
+    let mut row_start = prefix_len;
+    let mut field_start = prefix_len;
     let mut row_first_field = 0usize;
     let mut row_has_quoted_fields = false;
     let mut quoted = false;
     let mut field_was_quoted = false;
     let mut just_closed_quote = false;
-    let mut cursor = 0usize;
+    let mut cursor = prefix_len;
 
     let push_row = |rows: &mut Vec<ColdRowDraft>,
                     fields: &Vec<FieldRange>,
@@ -3353,6 +3493,7 @@ fn scan_rows(
     if start > end || end > bytes.len() {
         return Err("invalid CSV scan range".to_owned());
     }
+    validate_csv_text(&bytes[start..end])?;
     if start == end {
         return Ok(Vec::new());
     }
@@ -3768,9 +3909,21 @@ mod cold_scan_tests {
     }
 }
 
+fn validate_csv_text(bytes: &[u8]) -> Result<(), String> {
+    std::str::from_utf8(bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
+    if bytes.contains(&0) {
+        return Err(
+            "CSV cells cannot contain NUL bytes because typed JSONB strings cannot represent them"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_splices(file_len: usize, splices: &[FileEdit<'_>]) -> Result<(), String> {
     let mut previous_end = 0u64;
-    for (index, splice) in splices.iter().enumerate() {
+    let mut previous_start = None;
+    for splice in splices {
         let end = splice
             .offset
             .checked_add(splice.delete_len)
@@ -3778,11 +3931,12 @@ fn validate_splices(file_len: usize, splices: &[FileEdit<'_>]) -> Result<(), Str
         if end > u64::try_from(file_len).expect("usize fits u64") {
             return Err("CSV splice exceeds accepted file".to_owned());
         }
-        if index > 0 && splice.offset <= previous_end {
+        if previous_start == Some(splice.offset) || splice.offset < previous_end {
             return Err(
                 "CSV splices must have strictly increasing, non-overlapping starts".to_owned(),
             );
         }
+        previous_start = Some(splice.offset);
         previous_end = end;
     }
     Ok(())
@@ -4520,6 +4674,7 @@ fn typed_row_from_index(
     let end = first + usize::from(row.field_count);
     let mut cells = Vec::with_capacity(usize::from(row.field_count));
     let mut force_quote = Vec::new();
+    let mut unquoted_quote = Vec::new();
     for (index, field) in chunk.data.fields[first..end].iter().copied().enumerate() {
         if field_has_unnecessary_quotes(&row_bytes, 0, field, dialect)? {
             if force_quote.len() <= index / 8 {
@@ -4527,7 +4682,16 @@ fn typed_row_from_index(
             }
             force_quote[index / 8] |= 1 << (index % 8);
         }
-        cells.push(decoded_field(&row_bytes, 0, field, dialect.quote)?);
+        let cell = decoded_field(&row_bytes, 0, field, dialect.quote)?;
+        if !field.quoted()
+            && dialect
+                .quote
+                .is_some_and(|quote| cell.as_bytes().contains(&quote))
+        {
+            unquoted_quote.resize(index / 8 + 1, 0);
+            unquoted_quote[index / 8] |= 1 << (index % 8);
+        }
+        cells.push(cell);
     }
     let exceptional_ending = (row.ending() != Some(dialect.terminator)).then_some(row.ending());
     csv_typed_row(CsvRow {
@@ -4536,6 +4700,7 @@ fn typed_row_from_index(
         cells,
         layout: RowLayout {
             force_quote,
+            unquoted_quote,
             terminator: exceptional_ending,
         },
     })
@@ -4555,6 +4720,7 @@ fn typed_row_from_cold(
     let end = first + usize::from(row.field_count);
     let mut cells = Vec::with_capacity(usize::from(row.field_count));
     let mut force_quote = Vec::new();
+    let mut unquoted_quote = Vec::new();
     for (index, field) in fields[first..end].iter().copied().enumerate() {
         if row.has_quoted_fields && field_has_unnecessary_quotes(row_bytes, 0, field, dialect)? {
             if force_quote.len() <= index / 8 {
@@ -4562,7 +4728,16 @@ fn typed_row_from_cold(
             }
             force_quote[index / 8] |= 1 << (index % 8);
         }
-        cells.push(decoded_field(row_bytes, 0, field, dialect.quote)?);
+        let cell = decoded_field(row_bytes, 0, field, dialect.quote)?;
+        if !field.quoted()
+            && dialect
+                .quote
+                .is_some_and(|quote| cell.as_bytes().contains(&quote))
+        {
+            unquoted_quote.resize(index / 8 + 1, 0);
+            unquoted_quote[index / 8] |= 1 << (index % 8);
+        }
+        cells.push(cell);
     }
     let exceptional_ending = (row.ending != Some(dialect.terminator)).then_some(row.ending);
     csv_typed_row(CsvRow {
@@ -4571,6 +4746,7 @@ fn typed_row_from_cold(
         cells,
         layout: RowLayout {
             force_quote,
+            unquoted_quote,
             terminator: exceptional_ending,
         },
     })
@@ -4592,6 +4768,9 @@ fn table_row(dialect: Dialect) -> TypedRow {
         "terminator".to_owned(),
         JsonValue::String(dialect.terminator.text().to_owned()),
     );
+    if dialect.bom {
+        dialect_value.insert("bom".to_owned(), JsonValue::Bool(true));
+    }
     TypedRow::from([
         (
             "dialect".to_owned(),
@@ -4620,12 +4799,17 @@ fn parse_table_row(row: &TypedRow) -> Result<Dialect, String> {
     let dialect = dialect
         .as_object()
         .ok_or_else(|| "CSV table dialect must be an object".to_owned())?;
-    if dialect.len() != 3
+    if dialect
+        .keys()
+        .any(|key| !matches!(key.as_str(), "delimiter" | "quote" | "terminator" | "bom"))
         || !dialect.contains_key("delimiter")
         || !dialect.contains_key("quote")
         || !dialect.contains_key("terminator")
     {
-        return Err("CSV dialect must contain only delimiter, quote, and terminator".to_owned());
+        return Err(
+            "CSV dialect must contain delimiter, quote, and terminator, with an optional bom flag"
+                .to_owned(),
+        );
     }
     let delimiter = dialect
         .get("delimiter")
@@ -4650,10 +4834,16 @@ fn parse_table_row(row: &TypedRow) -> Result<Dialect, String> {
         Some("\r") => Terminator::Cr,
         _ => return Err("CSV terminator is invalid".to_owned()),
     };
+    let bom = match dialect.get("bom") {
+        None => false,
+        Some(JsonValue::Bool(bom)) => *bom,
+        _ => return Err("CSV BOM flag must be a boolean".to_owned()),
+    };
     Dialect {
         delimiter,
         quote,
         terminator,
+        bom,
     }
     .validate_row()
 }
@@ -4710,6 +4900,12 @@ fn csv_typed_row(row: CsvRow) -> Result<TypedRow, String> {
             layout.insert(
                 "force_quote".to_owned(),
                 JsonValue::String(URL_SAFE_NO_PAD.encode(row.layout.force_quote)),
+            );
+        }
+        if !row.layout.unquoted_quote.is_empty() {
+            layout.insert(
+                "unquoted_quote".to_owned(),
+                JsonValue::String(URL_SAFE_NO_PAD.encode(row.layout.unquoted_quote)),
             );
         }
         if let Some(ending) = row.layout.terminator {
@@ -4782,49 +4978,69 @@ pub fn parse_csv_row(row: &TypedRow) -> Result<CsvRow, String> {
     })
 }
 
+fn parse_quote_bitset(
+    value: Option<&JsonValue>,
+    field_count: usize,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let JsonValue::String(value) = value else {
+        return Err(format!("CSV {name} must be a base64url string"));
+    };
+    let mut decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| format!("CSV {name} must be unpadded base64url"))?;
+    if URL_SAFE_NO_PAD.encode(&decoded) != *value {
+        return Err(format!("CSV {name} must use canonical unpadded base64url"));
+    }
+    let maximum = field_count.div_ceil(8);
+    if decoded.is_empty() || decoded.last().is_some_and(|byte| *byte == 0) {
+        return Err(format!("CSV {name} must be a minimal nonzero bitset"));
+    }
+    // Cell-array edits may remove columns without editing the prior layout.
+    // Discard those stale style bits while retaining strict wire validation.
+    decoded.truncate(maximum);
+    let remainder = field_count % 8;
+    if remainder != 0 && decoded.len() == maximum {
+        if let Some(last) = decoded.last_mut() {
+            *last &= (1 << remainder) - 1;
+        }
+    }
+    while decoded.last() == Some(&0) {
+        decoded.pop();
+    }
+    Ok(decoded)
+}
+
 fn parse_row_layout(value: &JsonValue, field_count: usize) -> Result<RowLayout, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "CSV row layout must be an object".to_owned())?;
     if object.is_empty()
-        || object
-            .keys()
-            .any(|key| !matches!(key.as_str(), "force_quote" | "terminator"))
+        || object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "force_quote" | "unquoted_quote" | "terminator"
+            )
+        })
     {
-        return Err("CSV row layout must contain force_quote and/or terminator only".to_owned());
+        return Err(
+            "CSV row layout must contain force_quote, unquoted_quote, and/or terminator only"
+                .to_owned(),
+        );
     }
-    let force_quote = match object.get("force_quote") {
-        None => Vec::new(),
-        Some(JsonValue::String(value)) => {
-            let decoded = URL_SAFE_NO_PAD
-                .decode(value)
-                .map_err(|_| "CSV force_quote must be unpadded base64url".to_owned())?;
-            if URL_SAFE_NO_PAD.encode(&decoded) != *value {
-                return Err("CSV force_quote must use canonical unpadded base64url".to_owned());
-            }
-            let maximum = field_count.div_ceil(8);
-            if decoded.is_empty()
-                || decoded.len() > maximum
-                || decoded.last().is_some_and(|byte| *byte == 0)
-            {
-                return Err(
-                    "CSV force_quote must be a minimal nonzero bitset within the field count"
-                        .to_owned(),
-                );
-            }
-            let remainder = field_count % 8;
-            if remainder != 0
-                && decoded.len() == maximum
-                && decoded
-                    .last()
-                    .is_some_and(|byte| byte & !((1 << remainder) - 1) != 0)
-            {
-                return Err("CSV force_quote has bits beyond the final field".to_owned());
-            }
-            decoded
-        }
-        Some(_) => return Err("CSV force_quote must be a base64url string".to_owned()),
-    };
+    let force_quote = parse_quote_bitset(object.get("force_quote"), field_count, "force_quote")?;
+    let unquoted_quote =
+        parse_quote_bitset(object.get("unquoted_quote"), field_count, "unquoted_quote")?;
+    if force_quote
+        .iter()
+        .zip(&unquoted_quote)
+        .any(|(quoted, unquoted)| quoted & unquoted != 0)
+    {
+        return Err("CSV force_quote and unquoted_quote must not overlap".to_owned());
+    }
     let terminator = match object.get("terminator") {
         None => None,
         Some(JsonValue::String(value)) => Some(match value.as_str() {
@@ -4838,6 +5054,7 @@ fn parse_row_layout(value: &JsonValue, field_count: usize) -> Result<RowLayout, 
     };
     Ok(RowLayout {
         force_quote,
+        unquoted_quote,
         terminator,
     })
 }
@@ -4866,7 +5083,7 @@ pub fn render_row(
     dialect: Dialect,
     ending: Option<Terminator>,
 ) -> Result<Vec<u8>, String> {
-    render_row_with_layout(cells, dialect, ending, &[])
+    render_row_with_layout(cells, dialect, ending, &[], &[])
 }
 
 fn render_row_with_layout(
@@ -4874,6 +5091,7 @@ fn render_row_with_layout(
     dialect: Dialect,
     ending: Option<Terminator>,
     force_quote: &[u8],
+    unquoted_quote: &[u8],
 ) -> Result<Vec<u8>, String> {
     if cells.is_empty() {
         return Err("CSV rows require at least one cell".to_owned());
@@ -4885,11 +5103,12 @@ fn render_row_with_layout(
         }
         let force_quote = force_quote
             .get(index / 8)
+            .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
+            || (cells.len() == 1 && ending.is_none() && cell.is_empty());
+        let unquoted_quote = unquoted_quote
+            .get(index / 8)
             .is_some_and(|byte| byte & (1 << (index % 8)) != 0);
-        let canonical_quote = imported_cell_needs_quotes(cell.as_bytes(), dialect)?;
-        if force_quote && canonical_quote {
-            return Err("CSV force_quote may select only otherwise-unnecessary quotes".to_owned());
-        }
+        let canonical_quote = cell_needs_quotes(cell.as_bytes(), dialect, unquoted_quote)?;
         let needs_quote = force_quote || canonical_quote;
         if needs_quote {
             let quote = dialect.quote.ok_or_else(|| {
@@ -4926,3 +5145,7 @@ pub fn describe_memory(document: &Document) -> String {
     );
     description
 }
+
+#[cfg(test)]
+#[path = "core_qa_tests.rs"]
+mod core_qa_tests;
