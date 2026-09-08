@@ -64,7 +64,6 @@ import { FilesystemStorage } from "@lix-js/storage-filesystem";
 const lix = await openLix({
   storage: new FilesystemStorage({ path: "/workspace/project" }),
   server: {
-    mode: "sync",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
@@ -85,7 +84,7 @@ for initial downloads and offline behavior.
 <a id="connect-to-a-server"></a>
 
 A classic client-server setup: your app sends requests through the Lix SDK,
-and the server executes them against its repository. Use `mode: "remote"`.
+and the server executes them against its repository. Pass `server` without `storage`.
 Storage is managed on the server. Use [LixRay](https://lixray.com/docs) or
 [your own host](./hosting.md), and replace the example URL with your Lix
 connection URL.
@@ -97,7 +96,6 @@ import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
   server: {
-    mode: "remote",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
@@ -112,12 +110,12 @@ by the server. For ordinary files on disk, use [filesystem sync](#filesystem-syn
 
 <a id="sync-a-browser-with-a-server"></a>
 
-`OpfsStorage` persists Lix in the browser across reloads. Add `mode: "sync"`
+`OpfsStorage` persists Lix in the browser across reloads. Add `server` alongside `storage`
 to keep that local replica synchronized with a server.
 
-For a Linear-like UI, reads and writes use local data instead of waiting for a
-network round trip on each interaction. Edits commit locally and sync in the
-background. Uncached data can still require a network fetch.
+Certified current-state reads can use local data. Mutations and history execute
+on the server; the replica receives certified updates. Uncached data and reads
+requiring a newer certificate can require a network fetch.
 
 <img src="../website/public/assets/browser-server-storage.webp" alt="A browser runs Replica Lix with a SQLite storage adapter backed by OPFS. It synchronizes with Authoritative Lix on a server, whose SlateDB storage adapter uses S3." width="760" decoding="async" loading="lazy" />
 
@@ -128,7 +126,6 @@ import { OpfsStorage } from "@lix-js/storage-opfs";
 const lix = await openLix({
   storage: new OpfsStorage({ name: "acme" }),
   server: {
-    mode: "sync",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
@@ -142,7 +139,7 @@ same name through the package's storage worker and cross-tab Web Lock.
 
 Both sync setups download current working state on first open. Existing
 replicas reopen locally; older history and binary content load when needed.
-Local writes may finish before reaching the server. See
+Mutations require server acceptance. See
 [opening and reconnecting](./collaboration-and-sync.md#opening-and-reconnecting).
 
 ## How storage adapters fit

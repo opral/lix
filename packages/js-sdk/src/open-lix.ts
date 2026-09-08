@@ -8,7 +8,7 @@ import {
 import type {
 	LixOpenProgress,
 	OpenLixOptions,
-	SyncLixServerOptions,
+	LixServerOptions,
 } from "./types.js";
 
 export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
@@ -53,39 +53,42 @@ async function openLixInternal(
 		throw new TypeError("openLix() onProgress must be a function");
 	}
 	if (options.server !== undefined) {
+		if ("mode" in options.server)
+			throw new TypeError(
+				"server.mode was removed; provide storage for synchronization or omit it for remote execution",
+			);
 		if (snapshot) {
 			throw new TypeError("openLix.fromSnapshot() does not accept server mode");
 		}
-		if (options.server.mode === "remote") {
+		if (options.storage === undefined) {
+			if (options.telemetry !== undefined || options.onProgress !== undefined)
+				throw new TypeError(
+					"remote execution does not accept local telemetry or onProgress",
+				);
 			const { openRemoteLixBinding } = await import("./remote/client.js");
-			if ("storage" in options && options.storage !== undefined) {
-				throw new TypeError("openLix() remote mode does not accept storage");
-			}
 			return new Lix(await openRemoteLixBinding(options.server));
 		}
 	}
 	const syncServer =
-		options.server?.mode === "sync"
+		options.server !== undefined && options.storage !== undefined
 			? {
 					url: new URL(options.server.url).toString(),
 					headers: options.server.headers,
 					fetch: options.server.fetch,
 				}
 			: undefined;
-	if (syncServer?.fetch !== undefined && typeof syncServer.fetch !== "function") {
+	if (
+		syncServer?.fetch !== undefined &&
+		typeof syncServer.fetch !== "function"
+	) {
 		throw new TypeError("openLix() sync server fetch must be a function");
 	}
-	if (syncServer?.headers !== undefined && typeof syncServer.headers !== "function") {
+	if (
+		syncServer?.headers !== undefined &&
+		typeof syncServer.headers !== "function"
+	) {
 		// Validate static headers before opening a worker/native runtime.
 		new Headers(syncServer.headers);
-	}
-	if (options.server !== undefined && syncServer === undefined) {
-		throw new TypeError("openLix() server mode must be 'remote' or 'sync'");
-	}
-	if (syncServer !== undefined && options.storage === undefined) {
-		throw new TypeError(
-			"openLix() sync mode requires a durability-capable storage adapter",
-		);
 	}
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
@@ -190,7 +193,7 @@ async function openJsProviderStorage(
 		};
 	},
 	telemetry: OpenLixOptions["telemetry"],
-	syncServer: Omit<SyncLixServerOptions, "mode"> | undefined,
+	syncServer: LixServerOptions | undefined,
 	onProgress: ((progress: LixOpenProgress) => void) | undefined,
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<Lix> {

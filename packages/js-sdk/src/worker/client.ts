@@ -10,7 +10,7 @@ import type {
 	LixOpenProgress,
 	LixOpenReport,
 	RemoteLixFetch,
-	SyncLixServerOptions,
+	LixServerOptions,
 } from "../types.js";
 import { ownedSnapshotRestoreChunks } from "../snapshot-restore.js";
 import {
@@ -23,7 +23,7 @@ import {
 	type WorkerSyncServerOptions,
 } from "./protocol.js";
 
-type SyncServerRuntimeOptions = Omit<SyncLixServerOptions, "mode">;
+type SyncServerRuntimeOptions = LixServerOptions;
 
 type PendingRequest = {
 	resolve(value: unknown): void;
@@ -394,6 +394,7 @@ export function workerBinding(
 			request({ kind: "mergeBranchPreview", options }),
 		mergeBranch: (options) => request({ kind: "mergeBranch", options }),
 		syncDiskToLix: () => request({ kind: "syncDiskToLix" }),
+		createHosted: (server) => request({ kind: "hosted.createFrom", server }),
 		exportSnapshot: () => {
 			const exportId = request<number>({ kind: "exportSnapshot" });
 			let canceled = false;
@@ -527,7 +528,8 @@ export class LixWorkerClient {
 		this.syncServer = undefined;
 		this.onProgress = undefined;
 		this.openReport = undefined;
-		for (const controller of this.syncFetchControllers.values()) controller.abort();
+		for (const controller of this.syncFetchControllers.values())
+			controller.abort();
 		this.syncFetchControllers.clear();
 		for (const reader of this.syncFetchStreams.values()) {
 			void reader?.cancel().catch(() => undefined);
@@ -548,12 +550,12 @@ export class LixWorkerClient {
 				reject,
 			});
 			try {
-			this.connection.postMessage({
-				id,
-				sessionId,
-				telemetryParent: this.telemetry?.parentContext?.(),
-				operation,
-			});
+				this.connection.postMessage({
+					id,
+					sessionId,
+					telemetryParent: this.telemetry?.parentContext?.(),
+					operation,
+				});
 			} catch (error) {
 				this.pending.delete(id);
 				if (this.pending.size === 0) this.connection.unref();
@@ -595,7 +597,9 @@ export class LixWorkerClient {
 		else pending.reject(deserializeWorkerError(message.error));
 	}
 
-	private handleWorkerEvent(message: Extract<WorkerResponse, { kind: string }>): void {
+	private handleWorkerEvent(
+		message: Extract<WorkerResponse, { kind: string }>,
+	): void {
 		switch (message.kind) {
 			case "telemetry":
 				try {
@@ -655,7 +659,9 @@ export class LixWorkerClient {
 				requestId,
 				result: {
 					ok: false,
-					error: serializeWorkerError(new Error("Sync fetch bridge is unavailable")),
+					error: serializeWorkerError(
+						new Error("Sync fetch bridge is unavailable"),
+					),
 				},
 			});
 			return;
@@ -699,7 +705,11 @@ export class LixWorkerClient {
 				});
 				return;
 			}
-			const body = await readSyncResponseBody(response, request.responseLimit, controller);
+			const body = await readSyncResponseBody(
+				response,
+				request.responseLimit,
+				controller,
+			);
 			this.notify({
 				kind: "sync.fetch.result",
 				requestId,
@@ -843,7 +853,9 @@ async function readSyncResponseBody(
 }
 
 function syncResponseTooLarge(limit: number): Error & { code: string } {
-	const error = new Error(`sync fetch response exceeds ${limit} bytes`) as Error & {
+	const error = new Error(
+		`sync fetch response exceeds ${limit} bytes`,
+	) as Error & {
 		code: string;
 	};
 	error.name = "LixError";
@@ -898,4 +910,19 @@ async function resolveDirectSyncServer(
 		headers: headerEntries(headers),
 		fetch: server.fetch,
 	};
+}
+
+export async function hostedLixWorkerOperation<T>(
+	operation: Extract<
+		WorkerOperation,
+		{ kind: "hosted.create" | "hosted.delete" }
+	>,
+): Promise<T> {
+	const client = new LixWorkerClient();
+	client.beginLease();
+	try {
+		return await client.request<T>(operation, 0);
+	} finally {
+		await client.terminate();
+	}
 }

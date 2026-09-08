@@ -11,9 +11,9 @@ const lix = await openLix({
 });
 ```
 
-Combine OPFS with `server: { mode: "sync" }` to keep a durable local working
-copy of a hosted repository. Reads and writes remain local while Lix
-synchronizes commits in the background. See
+Combine OPFS with `server: { url: repositoryUrl }` to keep a durable local
+replica of an existing hosted repository. Reads use the local replica; writes
+execute on the server and synchronize back to the replica. See
 [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
 
 `OpfsStorage` starts one package-owned dedicated worker in the page. The Lix

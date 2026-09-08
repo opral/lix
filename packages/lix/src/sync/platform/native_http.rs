@@ -5,11 +5,10 @@ use super::super::http::{
     SYNC_TRANSPORT_ERROR_CODE, response_too_large,
 };
 use crate::LixError;
-use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
 use crate::authority_client::{
-    ProtocolByteStream, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse,
-    ProtocolHttpStream,
+    ProtocolByteStream, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse, ProtocolHttpStream,
 };
+use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
 use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
@@ -19,10 +18,65 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub(crate) struct AuthorityHttp(reqwest::Client);
 
-pub(crate) fn authority_http(
-    headers: &[(String, String)],
-) -> Result<AuthorityHttp, LixError> {
+pub(crate) fn authority_http(headers: &[(String, String)]) -> Result<AuthorityHttp, LixError> {
     Ok(AuthorityHttp(build_client(headers)?))
+}
+
+impl AuthorityHttp {
+    pub(crate) async fn upload(
+        &self,
+        request: ProtocolHttpRequest,
+        body: Option<ProtocolByteStream>,
+    ) -> Result<ProtocolHttpResponse, LixError> {
+        let method = request.method.parse::<reqwest::Method>().map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("invalid HTTP method: {error}"),
+            )
+        })?;
+        let mut builder = self.0.request(method, request.url);
+        for (name, value) in request.headers {
+            builder = builder.header(name, value);
+        }
+        if let Some(body) = body {
+            builder = builder.body(reqwest::Body::wrap_stream(body));
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| transport_error("upload repository", error))?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| transport_error("read creation response", error))?
+        {
+            if bytes.len() + chunk.len() > 64 * 1024 {
+                return Err(LixError::new(
+                    "LIX_SERVER_PROTOCOL_ERROR",
+                    "creation response exceeds 64 KiB",
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(ProtocolHttpResponse {
+            status,
+            headers,
+            body: Bytes::from(bytes),
+        })
+    }
 }
 
 impl HttpSyncTransport<reqwest::Client> {
@@ -37,31 +91,31 @@ impl HttpSyncTransport<reqwest::Client> {
 }
 
 fn build_client(headers: &[(String, String)]) -> Result<reqwest::Client, LixError> {
-        let mut default_headers = reqwest::header::HeaderMap::new();
-        for (name, value) in headers {
-            if HttpSyncTransport::<reqwest::Client>::is_reserved_header(name) {
-                continue;
-            }
-            let name =
-                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!("invalid sync HTTP header name: {error}"),
-                    )
-                })?;
-            let value = reqwest::header::HeaderValue::from_str(value).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!("invalid sync HTTP header value: {error}"),
-                )
-            })?;
-            default_headers.append(name, value);
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        if HttpSyncTransport::<reqwest::Client>::is_reserved_header(name) {
+            continue;
         }
-        reqwest::Client::builder()
-            .default_headers(default_headers)
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .map_err(|error| transport_error("configure sync transport", error))
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("invalid sync HTTP header name: {error}"),
+            )
+        })?;
+        let value = reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("invalid sync HTTP header value: {error}"),
+            )
+        })?;
+        default_headers.append(name, value);
+    }
+    reqwest::Client::builder()
+        .default_headers(default_headers)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| transport_error("configure sync transport", error))
 }
 
 impl ProtocolHttp for AuthorityHttp {
@@ -71,7 +125,10 @@ impl ProtocolHttp for AuthorityHttp {
     ) -> Result<ProtocolHttpResponse, LixError> {
         let mut builder = self.0.request(
             request.method.parse::<reqwest::Method>().map_err(|error| {
-                LixError::new(LixError::CODE_INVALID_PARAM, format!("invalid HTTP method: {error}"))
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("invalid HTTP method: {error}"),
+                )
             })?,
             request.url,
         );
@@ -81,13 +138,30 @@ impl ProtocolHttp for AuthorityHttp {
         if let Some(body) = request.body {
             builder = builder.body(body);
         }
-        let response = builder.send().await.map_err(|error| transport_error("authority request", error))?;
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| transport_error("authority request", error))?;
         let status = response.status().as_u16();
-        let headers = response.headers().iter().map(|(name, value)| {
-            (name.as_str().to_owned(), value.to_str().unwrap_or_default().to_owned())
-        }).collect();
-        let body = response.bytes().await.map_err(|error| transport_error("read authority response", error))?;
-        Ok(ProtocolHttpResponse { status, headers, body })
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| transport_error("read authority response", error))?;
+        Ok(ProtocolHttpResponse {
+            status,
+            headers,
+            body,
+        })
     }
 
     async fn request_stream(
@@ -96,7 +170,10 @@ impl ProtocolHttp for AuthorityHttp {
     ) -> Result<ProtocolHttpStream, LixError> {
         let mut builder = self.0.request(
             request.method.parse::<reqwest::Method>().map_err(|error| {
-                LixError::new(LixError::CODE_INVALID_PARAM, format!("invalid HTTP method: {error}"))
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("invalid HTTP method: {error}"),
+                )
             })?,
             request.url,
         );
@@ -106,11 +183,21 @@ impl ProtocolHttp for AuthorityHttp {
         if let Some(body) = request.body {
             builder = builder.body(body);
         }
-        let response = builder.send().await.map_err(|error| transport_error("authority stream", error))?;
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| transport_error("authority stream", error))?;
         let status = response.status().as_u16();
-        let headers = response.headers().iter().map(|(name, value)| {
-            (name.as_str().to_owned(), value.to_str().unwrap_or_default().to_owned())
-        }).collect();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
         let body: ProtocolByteStream = Box::pin(async_stream::try_stream! {
             let mut response = response;
             while let Some(chunk) = response.chunk().await.map_err(|error| transport_error("read authority stream", error))? {
@@ -118,7 +205,12 @@ impl ProtocolHttp for AuthorityHttp {
             }
         });
         let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-        Ok(ProtocolHttpStream { status, headers, body, cancel })
+        Ok(ProtocolHttpStream {
+            status,
+            headers,
+            body,
+            cancel,
+        })
     }
 
     async fn sleep(&self, duration: Duration) {

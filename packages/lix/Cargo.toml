@@ -123,6 +123,10 @@ path = "tests/migration_v72_filesystem.rs"
 name = "migration_v75"
 path = "tests/migration_v75.rs"
 
+[[test]]
+name = "snapshot_untracked"
+path = "tests/snapshot_untracked.rs"
+
 [dependencies]
 lix_schema.workspace = true
 serde = { version = "1", features = ["derive"] }
@@ -211,7 +215,7 @@ wit-bindgen-rust = "0.57"
 zstd = "0.13"
 notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 [target.'cfg(all(target_family = "wasm", not(all(target_os = "wasi", target_env = "p2"))))'.dependencies]
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }

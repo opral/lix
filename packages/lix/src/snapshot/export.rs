@@ -26,10 +26,11 @@ pub struct SnapshotExportBuilder<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    storage: StorageAdapter<StorageSession<StorageImpl>>,
+    storage: Option<StorageAdapter<StorageSession<StorageImpl>>>,
     durability: ReadDurability,
     preflight_error: Option<LixError>,
     remote: Option<(crate::ServerOptions, String)>,
+    connected_remote: Option<RemoteSnapshotExport>,
 }
 
 #[derive(Clone)]
@@ -45,10 +46,11 @@ where
 {
     pub(crate) fn new(storage: StorageAdapter<StorageSession<StorageImpl>>) -> Self {
         Self {
-            storage,
+            storage: Some(storage),
             durability: ReadDurability::Visible,
             preflight_error: None,
             remote: None,
+            connected_remote: None,
         }
     }
 
@@ -86,6 +88,9 @@ where
         if let Some(error) = self.preflight_error {
             return Err(error);
         }
+        if let Some(remote) = self.connected_remote {
+            return remote.write_to(writer, self.durability).await;
+        }
         if let Some((server, expected_account_id)) = self.remote {
             // Canonical export explicitly needs the authority's complete
             // history. Open its session lazily: normal opens, reads and writes
@@ -121,8 +126,8 @@ where
             close?;
             return Ok(report);
         }
-        let read = self
-            .storage
+        let storage = self.storage.ok_or_else(|| LixError::new(LixError::CODE_INTERNAL_ERROR, "snapshot export has no source"))?;
+        let read = storage
             .begin_read(StorageReadOptions {
                 durability: self.durability,
                 ..StorageReadOptions::default()
@@ -205,6 +210,26 @@ impl Drop for SnapshotAuthorityLease {
                 let _ = client.close().await;
             }),
         );
+    }
+}
+
+impl SnapshotExportBuilder<crate::Memory> {
+    pub(crate) fn remote(
+        http: crate::sync::AuthorityHttp,
+        url: Result<String, LixError>,
+        session_id: Option<String>,
+    ) -> Self {
+        let (connected_remote, preflight_error) = match url {
+            Ok(url) => (Some(RemoteSnapshotExport { http, url, session_id }), None),
+            Err(error) => (None, Some(error)),
+        };
+        Self {
+            storage: None,
+            durability: ReadDurability::Visible,
+            preflight_error,
+            remote: None,
+            connected_remote,
+        }
     }
 }
 

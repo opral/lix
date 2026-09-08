@@ -6,7 +6,6 @@ test("adding an observation reconnects an established browser multiplex stream",
 	let executeRequests = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);

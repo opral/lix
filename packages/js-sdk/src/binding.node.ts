@@ -14,6 +14,12 @@ import type {
 import { restoreSnapshot } from "./snapshot-restore.js";
 
 type NativeAddon = {
+	createHosted(
+		url: string,
+		headers: [string, string][],
+		idempotencyKey?: string,
+	): Promise<import("./types.js").HostedLix>;
+	deleteHosted(url: string, headers: [string, string][]): Promise<void>;
 	Lix: {
 		openMemory(
 			telemetry?: (spanJson: string) => void,
@@ -140,7 +146,7 @@ class NativeAddonUnavailableError extends Error {
 	}
 }
 
-function loadNativeAddon(): NativeAddon {
+function loadAddon(): NativeAddon {
 	if (addon) return addon;
 	if (addonLoadError) throw addonLoadError;
 	try {
@@ -184,9 +190,7 @@ export async function openLixBinding(
 			throw nativeError;
 		}
 		try {
-			const { openMemoryWasmBinding } = await import(
-				"./binding.node-wasm.js"
-			);
+			const { openMemoryWasmBinding } = await import("./binding.node-wasm.js");
 			return await openMemoryWasmBinding(
 				telemetry,
 				telemetryParent,
@@ -211,7 +215,9 @@ export async function openNativeLixBinding(
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
 	if (server?.fetch) {
-		throw new TypeError("Custom sync fetch is only supported by the browser worker");
+		throw new TypeError(
+			"Custom sync fetch is only supported by the browser worker",
+		);
 	}
 	const nativeOpenProgress = openProgress
 		? (progressJson: string) => {
@@ -224,7 +230,7 @@ export async function openNativeLixBinding(
 		: undefined;
 	switch (storage.kind) {
 		case "memory": {
-			const nativeAddon = loadNativeAddon();
+			const nativeAddon = loadAddon();
 			const nativeTelemetry = telemetry
 				? (spanJson: string) => telemetry(JSON.parse(spanJson))
 				: undefined;
@@ -234,31 +240,35 @@ export async function openNativeLixBinding(
 					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
 					nativeOpenProgress,
 				);
-				return normalizeNativeBinding(
-					await restoreSnapshot(snapshot, restore),
-				);
+				return normalizeNativeBinding(await restoreSnapshot(snapshot, restore));
 			}
 			if (nativeTelemetry) {
-				return normalizeNativeBinding(await nativeAddon.Lix.openMemory(
-					nativeTelemetry,
-					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
+				return normalizeNativeBinding(
+					await nativeAddon.Lix.openMemory(
+						nativeTelemetry,
+						telemetryParent ? JSON.stringify(telemetryParent) : undefined,
+						server?.url,
+						server?.headers,
+						nativeOpenProgress,
+					),
+				);
+			}
+			return normalizeNativeBinding(
+				await nativeAddon.Lix.openMemory(
+					undefined,
+					undefined,
 					server?.url,
 					server?.headers,
 					nativeOpenProgress,
-				));
-			}
-			return normalizeNativeBinding(await nativeAddon.Lix.openMemory(
-				undefined,
-				undefined,
-				server?.url,
-				server?.headers,
-				nativeOpenProgress,
-			));
+				),
+			);
 		}
 		case "jsStorage":
-			throw new Error("JavaScript storage providers are only available in browsers");
+			throw new Error(
+				"JavaScript storage providers are only available in browsers",
+			);
 		case "filesystem": {
-			const nativeAddon = loadNativeAddon();
+			const nativeAddon = loadAddon();
 			const nativeTelemetry = telemetry
 				? (spanJson: string) => telemetry(JSON.parse(spanJson))
 				: undefined;
@@ -270,30 +280,47 @@ export async function openNativeLixBinding(
 					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
 					nativeOpenProgress,
 				);
-				return normalizeNativeBinding(
-					await restoreSnapshot(snapshot, restore),
-				);
+				return normalizeNativeBinding(await restoreSnapshot(snapshot, restore));
 			}
 			if (nativeTelemetry) {
-				return normalizeNativeBinding(await nativeAddon.Lix.openFilesystemStorage(
+				return normalizeNativeBinding(
+					await nativeAddon.Lix.openFilesystemStorage(
+						storage.path,
+						storage.syncAllFiles,
+						nativeTelemetry,
+						telemetryParent ? JSON.stringify(telemetryParent) : undefined,
+						server?.url,
+						server?.headers,
+						nativeOpenProgress,
+					),
+				);
+			}
+			return normalizeNativeBinding(
+				await nativeAddon.Lix.openFilesystemStorage(
 					storage.path,
 					storage.syncAllFiles,
-					nativeTelemetry,
-					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
+					undefined,
+					undefined,
 					server?.url,
 					server?.headers,
 					nativeOpenProgress,
-				));
-			}
-			return normalizeNativeBinding(await nativeAddon.Lix.openFilesystemStorage(
-				storage.path,
-				storage.syncAllFiles,
-				undefined,
-				undefined,
-				server?.url,
-				server?.headers,
-				nativeOpenProgress,
-			));
+				),
+			);
 		}
 	}
+}
+
+export async function createHostedBinding(
+	server: import("./binding-types.js").HostedServerBindingOptions,
+) {
+	return loadAddon().createHosted(
+		server.url,
+		server.headers,
+		server.idempotencyKey,
+	);
+}
+export async function deleteHostedBinding(
+	server: import("./binding-types.js").HostedServerBindingOptions,
+) {
+	await loadAddon().deleteHosted(server.url, server.headers);
 }

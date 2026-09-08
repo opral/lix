@@ -13,7 +13,6 @@ test.each([
 ])("remote mode rejects unsafe or non-root locator %s", async (url) => {
 	await expect(
 		openRemoteLixBinding({
-			mode: "remote",
 			url,
 			fetch: vi.fn(),
 		}),
@@ -33,7 +32,7 @@ test.each([
 			sessionId: "session-1",
 		}),
 	);
-	const binding = await openRemoteLixBinding({ mode: "remote", url, fetch });
+	const binding = await openRemoteLixBinding({ url, fetch });
 	expect(fetch).toHaveBeenCalledOnce();
 	await binding.close();
 });
@@ -43,7 +42,6 @@ test("remote exportSnapshot streams the canonical authenticated endpoint", async
 	let headerCalls = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			headers: () => ({
 				Authorization: `Bearer token-${++headerCalls}`,
@@ -93,7 +91,6 @@ test("remote snapshots remain available on child and grandchild sessions", async
 	const cancelled = vi.fn();
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -191,7 +188,6 @@ test("remote snapshot cancellation does not wait for pending authentication head
 	});
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch,
 			headers: () => {
@@ -220,7 +216,6 @@ test("Lix Server Protocol handshake requests a restored initial active branch", 
 	const requests: Request[] = [];
 	const binding = await openRemoteLixBinding(
 		{
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -259,7 +254,6 @@ test("openAnotherSession creates an independent remote protocol session", async 
 	let nextSession = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -301,7 +295,6 @@ test("openAnotherSession rejects and closes a remote identity mismatch", async (
 	let handshake = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -378,7 +371,6 @@ test("remote mode uses the repository protocol without loading a local engine", 
 	);
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: remoteFetch as typeof fetch,
 			headers: () => {
@@ -448,7 +440,6 @@ test("remote mode compresses only large compressible JSON requests", async () =>
 	const executeRequests: Request[] = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -515,7 +506,6 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 	const requests: Request[] = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -591,7 +581,6 @@ test("remote execute sends successful large blob updates as exact splices", asyn
 	const bodies: Array<Record<string, unknown>> = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -639,7 +628,6 @@ test("remote execute splices the exact 10.68 MB CSV-size blob", async () => {
 	const bodies: Array<Record<string, unknown>> = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -687,7 +675,6 @@ test("remote execute retries a missing blob base once with full bytes", async ()
 	let rejectedDelta = false;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -740,7 +727,6 @@ test("remote execute uses a caller idempotency key only as a header", async () =
 	const requests: Request[] = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -775,7 +761,6 @@ test("remote execute keeps small and low-saving blob updates full", async () => 
 	const bodies: Array<Record<string, unknown>> = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -811,7 +796,6 @@ test("Lix Server Protocol v3 uses blob splices without capability negotiation", 
 	const bodies: Array<Record<string, unknown>> = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -855,7 +839,6 @@ test("remote executeBatch uses blob splices for stable statement slots", async (
 	const bodies: Array<Record<string, unknown>> = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -897,7 +880,6 @@ test("remote branches preserve local Lix branch semantics", async () => {
 	let activeBranchId = "main-id";
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: new URL("https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"),
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
@@ -953,7 +935,6 @@ test("remote lix_restore uses the existing execute endpoint", async () => {
 	const requests: Request[] = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
@@ -1005,7 +986,6 @@ test("remote lix_restore uses the existing execute endpoint", async () => {
 test("remote undo and redo decode branch-history receipts", async () => {
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
@@ -1057,7 +1037,6 @@ test("a failed remote branch switch leaves the active branch unchanged", async (
 	let handshakeCalls = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
@@ -1110,7 +1089,6 @@ test("an ambiguous remote branch switch is reconciled by the next branch read", 
 	let handshakeCalls = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
@@ -1152,7 +1130,6 @@ test("branch reconciliation rejects and never caches a replacement session", asy
 	let handshakeCalls = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const request = new Request(input, init);
@@ -1229,7 +1206,6 @@ test("remote clients retain independent active branches", async () => {
 	};
 	const options = {
 		server: {
-			mode: "remote" as const,
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: remoteFetch,
 		},
@@ -1253,7 +1229,6 @@ test("remote operations preserve normal Lix call ordering", async () => {
 	let executeBody: unknown;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -1312,7 +1287,6 @@ test("remote responses reject malformed rows and non-JSON HTTP errors", async ()
 	let executeCalls = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -1365,7 +1339,6 @@ test("remote beginTransaction uses one capability-bound server lifecycle", async
 	}> = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -1478,7 +1451,6 @@ test("remote preview and merge forward source branch and preserve engine receipt
 	};
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -1522,7 +1494,6 @@ test("remote mode rejects incompatible protocol versions", async () => {
 		openLix({
 			storage: undefined,
 			server: {
-				mode: "remote",
 				url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 				fetch: (async () =>
 					Response.json({
@@ -1542,7 +1513,6 @@ test.each([undefined, "", " contains-space", "contains\nnewline", 42])(
 		await expect(
 			openLix({
 				server: {
-					mode: "remote",
 					url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 					fetch: (async () =>
 						Response.json({
@@ -1561,7 +1531,6 @@ test("active branch reads reuse the initial handshake without another GET", asyn
 	let handshakeCalls = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -1591,7 +1560,6 @@ test("execute recovers a gone protocol session once by opening a new handshake",
 	let goneOnce = false;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -1665,7 +1633,6 @@ test("execute recovers a closed protocol server once then retries with the new s
 	let executeCalls = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -1707,7 +1674,6 @@ test("a second gone protocol session after recovery is not retried", async () =>
 	let executeCalls = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -1747,7 +1713,6 @@ test("an active branch read adopts a new session after protocol session gone", a
 	}> = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -1799,7 +1764,6 @@ test("an expired session mutation is propagated without a new handshake or retry
 	let executeCalls = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -1847,7 +1811,6 @@ test("close waits for queued operations before deleting the remote session", asy
 	const order: string[] = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);

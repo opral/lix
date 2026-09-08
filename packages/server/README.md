@@ -14,8 +14,8 @@ as a ready-made internal data plane or as source code for a custom host.
 
 The binary deliberately does not implement product authentication,
 authorization, tenancy, billing, or repository discovery. Put it behind a
-trusted gateway that owns those policies. A valid Lix UUID is opened on demand,
-so the gateway must reject targets the caller is not allowed to access.
+trusted gateway that owns those policies. Repositories must be created explicitly; opening an unknown UUID returns 404.
+The gateway must authorize creation, access, and deletion separately.
 
 `LIX_SERVER_INTERNAL_TOKEN` is required at startup. Protocol requests must carry
 `Authorization: Bearer <token>`. After authenticating the end user, the trusted
@@ -32,7 +32,14 @@ Clients must never be allowed to set or forward them directly.
 
 `GET /healthz` and the internal bearer token are operational features of this
 binary, not Lix Server Protocol endpoints. All protocol operations live below
-`/lix/v1/{lix_id}`.
+`/lix/v1`, with repository operations below `/lix/v1/{lix_id}`.
+
+`POST /lix/v1` creates an empty repository, or restores a streamed
+`application/vnd.lix.snapshot` body. Supply an `Idempotency-Key`; retries with
+the same verified principal and body return the same `{id, url}`. Snapshot
+creation preserves both tracked and untracked rows and history.
+`DELETE /lix/v1/{lix_id}` fences sessions and permanently deletes the repository.
+Neither a stale syncing client nor a repeated create request resurrects it.
 
 ## Run
 
@@ -44,6 +51,7 @@ S3_BUCKET=lix \
 S3_ACCESS_KEY_ID=... \
 S3_SECRET_ACCESS_KEY=... \
 LIX_SERVER_INTERNAL_TOKEN=... \
+LIX_SERVER_PUBLIC_URL=https://lix.example.com \
 cargo run --release --package lix-server
 ```
 
@@ -60,6 +68,7 @@ and will remain red until that one-time setting is complete.
 | `BIND_ADDR` | `0.0.0.0:$PORT` | Listen address |
 | `PORT` | `8080` | Port used when `BIND_ADDR` is absent |
 | `LIX_SERVER_INTERNAL_TOKEN` | required | Protect protocol routes and enable trusted identity headers |
+| `LIX_SERVER_PUBLIC_URL` | required | External host origin used for canonical `https://host/lix/{id}` locators; no path |
 | `LIX_SERVER_MAX_OPEN_LIXS` | `32` | Maximum retained Lix runtimes |
 | `LIX_SERVER_PROTOCOL_TIMEOUT_SECS` | `60` | Admission and request deadline |
 | `LIX_SERVER_RECOVERY_CLOSE_TIMEOUT_SECS` | `30` | Runtime recovery close deadline |
@@ -110,3 +119,13 @@ Delivery failures do not fail repository operations. Missing endpoint
 configuration disables export; invalid configuration is logged. Deployments
 that depend on telemetry must verify the full receive path, not just server
 health.
+
+## Interrupted creation
+
+Each upload attempt uses isolated storage and publishes through a conditional
+catalog update. Retrying an interrupted upload starts a fresh attempt. Superseded
+storage remains reachable from the catalog and is fenced and swept on retry,
+successful publication, replay, and deletion. Retired IDs remain recorded so a
+late or crashed writer cannot leave unreachable data. An operation is limited to
+1024 retired attempts; exceeding this limit requires operator reconciliation of
+its staging catalog. Uploads are streamed with a 16 GiB limit.

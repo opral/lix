@@ -1832,10 +1832,6 @@ where
                 || !prepared_writes.extra_commit_parents_by_branch.is_empty();
             let has_untracked_state_writes =
                 prepared_writes.state_rows.iter().any(|row| row.untracked);
-            let has_unsynchronized_untracked_state_writes = prepared_writes
-                .state_rows
-                .iter()
-                .any(|row| row.untracked && row.schema_key != BRANCH_REF_SCHEMA_KEY);
             // Untracked rows are mutable current state, but their validation can read
             // tracked schemas, parents, uniqueness owners, or filesystem state.
             // Fence that snapshot without rotating the tracked revision: normal
@@ -1883,17 +1879,6 @@ where
                 return Err(LixError::new(
                     "LIX_REPLICA_CACHE_READ_ONLY",
                     "replica storage can only be changed by an admitted sync engine",
-                ));
-            }
-            if transaction.sync_role == crate::sync::SyncRole::Authority
-                && has_unsynchronized_untracked_state_writes
-            {
-                transaction
-                    .discard_pending_plugin_actor_publications()
-                    .await;
-                return Err(LixError::new(
-                    "LIX_AUTHORITY_UNTRACKED_UNSUPPORTED",
-                    "repository authorities require synchronized tracked rows; untracked state is unsupported",
                 ));
             }
             if let Err(error) = transaction

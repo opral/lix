@@ -82,6 +82,8 @@ const MODULE_LAYERS: &[&[&str]] = &[
     &["hot_state"],
     // Row-level overlays over the state planes.
     &["checkpoint", "undo_redo"],
+    // Public hosted lifecycle composes snapshots and protocol transport.
+    &["lifecycle"],
 ];
 
 /// Top-level modules deliberately left out of [`MODULE_LAYERS`], with the

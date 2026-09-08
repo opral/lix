@@ -18,25 +18,26 @@ See [storage adapters](./persistence.md#how-storage-adapters-fit) for persistenc
 
 <a id="choose-a-client-mode"></a>
 
-`openLix()` selects where SDK operations execute with `server.mode`.
-Both client modes connect to the same server.
+`openLix()` selects execution from the supplied connections: `server` alone
+executes remotely; `storage` plus `server` maintains a synchronized local replica.
+Both connect to the same hosted repository.
 
 | | `remote` | `sync` |
 | --- | --- | --- |
 | Reads and writes execute | On the server | On a local replica |
-| Client storage | None; do not pass `storage` | An explicit durable adapter in JavaScript |
+| Client storage | None; do not pass `storage` | An explicit durable adapter |
 | Network round trip | Every operation | Background synchronization; uncached data may need a fetch |
 | Successful write | Accepted by the server | Committed locally; may not yet be on the server |
 | Offline work | No | Cached reads and local writes |
 
 ### Remote mode
 
-Use `server: { mode: "remote", url: lixConnectionUrl }` for SDK access with
+Use `server: { url: lixConnectionUrl }` for SDK access with
 server-acknowledged writes. It creates no local repository or synchronized files.
 
 ### Sync mode
 
-Use `server: { mode: "sync", url: lixConnectionUrl }` with `FilesystemStorage`
+Use `server: { url: lixConnectionUrl }` with `FilesystemStorage`
 for files on disk or `OpfsStorage` for a browser replica. Current data and new
 commits sync automatically; older history and binary content download on demand.
 
@@ -51,7 +52,6 @@ and async credential refresh:
 
 ```ts
 server: {
-  mode: "sync",
   url: lixConnectionUrl,
   headers: async () => ({
     Authorization: `Bearer ${await getAccessToken()}`,
@@ -118,3 +118,6 @@ Durable pending commits resume uploading on the next open.
 
 Sync has no public API to await server confirmation. Use remote mode when each
 successful write requires server acknowledgment.
+
+Closing does not delete either repository. Use `deleteLix()` for explicit
+hosted deletion.

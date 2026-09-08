@@ -1834,7 +1834,7 @@ async fn open_replica(path: &Path, url: &str) -> Lix<FilesystemStorage> {
                 .open()
                 .expect("open filesystem storage"),
         )
-        .with_server(ServerOptions::sync(url))
+        .with_server(ServerOptions::new(url))
         .await
         .expect("open sync replica")
 }

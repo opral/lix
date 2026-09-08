@@ -4,7 +4,7 @@ description: "Reference for opening local, remote, and synchronized Lix instance
 
 # JavaScript API Reference
 
-`@lix-js/sdk` exports `openLix()`, the generic JavaScript storage protocol,
+`@lix-js/sdk` exports `openLix()`, `createLix()`, `deleteLix()`, the generic JavaScript storage protocol,
 `Value` and `bundledPluginArchives`. `@lix-js/storage-opfs` and
 `@lix-js/storage-filesystem` provide concrete storage implementations.
 `openLix()` returns a local repository, a thin remote client, or a synchronized
@@ -16,6 +16,45 @@ import { openLix } from "@lix-js/sdk";
 const lix = await openLix();
 ```
 
+## Hosted repository lifecycle
+
+`createLix()` provisions a hosted repository and returns `{ id, url }`. Its
+`server.url` is the host origin; opening and deleting use the repository URL.
+
+```ts
+import { createLix, openLix, deleteLix } from "@lix-js/sdk";
+
+const headers = () => ({ Authorization: `Bearer ${token}` });
+const repository = await createLix({
+  server: { url: "https://example.com", headers },
+});
+const remote = await openLix({ server: { url: repository.url, headers } });
+await remote.close();
+await deleteLix({ server: { url: repository.url, headers } });
+```
+
+Supply `from: localLix` to copy an existing repository instead of creating an
+empty one. Creation takes one consistent snapshot, including files, branches,
+history, and untracked rows. It does not attach or change the source handle.
+Subsequent source edits are not part of that copy. To attach the original
+durable storage afterward, pause writes during creation, close the local handle,
+and reopen the same storage with the returned server URL. Lix refuses to replace
+unrelated or locally diverged history.
+
+Supply `idempotencyKey` to recover a creation after a lost response. Retry with
+the same key and unchanged source snapshot; reusing a key for different content
+fails. When omitted, the SDK generates a key for that call. Lifecycle requests
+accept `url` and `headers`; custom `fetch` overrides are not supported.
+
+Browser creation from a local repository requires Fetch request streaming;
+browsers without it return `LIX_UNSUPPORTED_OPERATION`. Browser Fetch may also
+require HTTP/2 or HTTP/3 for these uploads. Lix does not buffer a complete
+repository as a fallback. Empty creation does not require request streaming.
+
+Opening a missing hosted repository fails; it never provisions one. Deletion
+removes the hosted resource without deleting local copies. Closing only releases
+a session. A disconnected replica never recreates a deleted server repository.
+
 ## openLix()
 
 ```ts
@@ -26,8 +65,8 @@ Options:
 
 | Option      | Type                                             | Description                                                                                |
 | ----------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------ |
-| `storage`   | `LixStorage`                                     | Local storage selected by a provider package. Omit it for memory.                          |
-| `server`    | `RemoteLixServerOptions \| SyncLixServerOptions` | Connect directly to a server or synchronize a local replica.                               |
+| `storage`   | `LixStorage`                                     | Local storage selected by a provider package. Omit both `storage` and `server` for memory.                          |
+| `server`    | `LixServerOptions` | Connect directly to a server or synchronize a local replica.                               |
 | `telemetry` | `LixTelemetryOptions`                            | Optional `onSpan(span)` callback that receives telemetry spans. Local and sync modes only. |
 
 Connect to a remote server:
@@ -35,7 +74,6 @@ Connect to a remote server:
 ```ts
 const lix = await openLix({
   server: {
-    mode: "remote",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
     headers: () => ({ Authorization: `Bearer ${token}` }),
   },
@@ -44,7 +82,7 @@ const lix = await openLix({
 
 Remote file content, SQL rows, and branches live on the server. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
 
-Open a synchronized local replica by combining storage with sync mode:
+Open a synchronized local replica by combining `storage` with `server`:
 
 ```ts
 import { OpfsStorage } from "@lix-js/storage-opfs";
@@ -52,15 +90,14 @@ import { OpfsStorage } from "@lix-js/storage-opfs";
 const lix = await openLix({
   storage: new OpfsStorage({ name: "atelier" }),
   server: {
-    mode: "sync",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
     headers: () => ({ Authorization: `Bearer ${token}` }),
   },
 });
 ```
 
-In sync mode, `execute()` resolves when the local transaction commits. Server
-synchronization continues in the background. See
+With storage and a server, mutations execute on the server while certified
+current-state reads can use the local replica. See
 [Collaboration](./collaboration-and-sync.md) for the complete behavior.
 
 Use `OpfsStorage` to persist a local browser Lix across reloads:

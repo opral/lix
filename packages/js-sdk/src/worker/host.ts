@@ -1,11 +1,19 @@
-import { openLixBinding } from "#binding";
+import {
+	openLixBinding,
+	createHostedBinding,
+	deleteHostedBinding,
+} from "#binding";
 import type {
 	LixBinding,
 	LixTransactionBinding,
 	ObserveEventsBinding,
 	SnapshotExportBinding,
 } from "../binding-types.js";
-import type { LixOpenProgress, LixOpenReport, LixTelemetrySpan } from "../types.js";
+import type {
+	LixOpenProgress,
+	LixOpenReport,
+	LixTelemetrySpan,
+} from "../types.js";
 import {
 	deserializeWorkerError,
 	serializeWorkerError,
@@ -44,7 +52,10 @@ export function startWorkerHost(
 	>();
 	const pendingSyncFetch = new Map<
 		number,
-		{ resolve(response: WorkerSyncFetchResponse): void; reject(error: unknown): void }
+		{
+			resolve(response: WorkerSyncFetchResponse): void;
+			reject(error: unknown): void;
+		}
 	>();
 	const pendingSyncStreamPulls = new Map<
 		number,
@@ -113,7 +124,11 @@ export function startWorkerHost(
 		finiteQueue = finiteQueue.then(async () => {
 			try {
 				await respond(message, async () => {
-					if (message.operation.kind !== "open") {
+					if (
+						message.operation.kind !== "open" &&
+						message.operation.kind !== "hosted.create" &&
+						message.operation.kind !== "hosted.delete"
+					) {
 						requiredLix(message.sessionId).setTelemetryParent(
 							message.telemetryParent,
 						);
@@ -128,7 +143,9 @@ export function startWorkerHost(
 				// The mutable FFI carrier is safe only within this serialized
 				// operation. Clear it before another request or background task
 				// can accidentally inherit a stale remote parent.
-				(sessions.get(message.sessionId) ?? sessions.get(0))?.setTelemetryParent();
+				(
+					sessions.get(message.sessionId) ?? sessions.get(0)
+				)?.setTelemetryParent();
 			}
 		});
 	});
@@ -136,7 +153,7 @@ export function startWorkerHost(
 	function handleNotification(
 		message: Exclude<WorkerInput, WorkerRequest>,
 	): void {
-			switch (message.kind) {
+		switch (message.kind) {
 			case "observe.close": {
 				const events = observations.get(message.observeId);
 				observations.delete(message.observeId);
@@ -222,6 +239,16 @@ export function startWorkerHost(
 		telemetryParent: WorkerRequest["telemetryParent"],
 	): Promise<unknown> {
 		switch (operation.kind) {
+			case "hosted.create":
+				return createHostedBinding(operation.server);
+			case "hosted.delete":
+				return deleteHostedBinding(operation.server);
+			case "hosted.createFrom": {
+				const binding = requiredLix(sessionId);
+				if (!binding.createHosted)
+					throw new TypeError("createLix() from requires a local Lix");
+				return binding.createHosted(operation.server);
+			}
 			case "open":
 				if (sessions.size > 0)
 					throw workerStateError("Lix worker is already open");
@@ -231,22 +258,22 @@ export function startWorkerHost(
 							? undefined
 							: requiredSnapshotInput(operation.snapshotId).readable;
 					try {
-					const opened = await openBinding(
-						operation.storage,
-						operation.telemetryEnabled
-							? (span: LixTelemetrySpan) =>
-									endpoint.postMessage({ kind: "telemetry", span })
-							: undefined,
-						telemetryParent,
-						createSyncServerBridge(operation.server),
-						operation.progressEnabled
-							? (progress: LixOpenProgress) =>
-									endpoint.postMessage({ kind: "open.progress", progress })
-							: undefined,
-						snapshot,
-					);
-					sessions.set(0, opened);
-					return opened.openReport?.() satisfies LixOpenReport | undefined;
+						const opened = await openBinding(
+							operation.storage,
+							operation.telemetryEnabled
+								? (span: LixTelemetrySpan) =>
+										endpoint.postMessage({ kind: "telemetry", span })
+								: undefined,
+							telemetryParent,
+							createSyncServerBridge(operation.server),
+							operation.progressEnabled
+								? (progress: LixOpenProgress) =>
+										endpoint.postMessage({ kind: "open.progress", progress })
+								: undefined,
+							snapshot,
+						);
+						sessions.set(0, opened);
+						return opened.openReport?.() satisfies LixOpenReport | undefined;
 					} finally {
 						if (operation.snapshotId !== undefined) {
 							snapshotInputs.delete(operation.snapshotId);
@@ -319,22 +346,25 @@ export function startWorkerHost(
 				return requiredLix(sessionId).importFilesystemPaths(operation.paths);
 			case "syncDiskToLix":
 				return requiredLix(sessionId).syncDiskToLix();
-			case "exportSnapshot":
-				{
-					const binding = requiredLix(sessionId);
-					const exportSnapshot = binding.exportSnapshot;
-					if (!exportSnapshot) {
-						throw workerStateError("this Lix binding cannot export snapshots");
-					}
-					const snapshot = exportSnapshot.call(binding);
-					const exportId = nextSnapshotExportId++;
-					snapshotExports.set(exportId, snapshot);
-					return exportId;
+			case "exportSnapshot": {
+				const binding = requiredLix(sessionId);
+				const exportSnapshot = binding.exportSnapshot;
+				if (!exportSnapshot) {
+					throw workerStateError("this Lix binding cannot export snapshots");
 				}
+				const snapshot = exportSnapshot.call(binding);
+				const exportId = nextSnapshotExportId++;
+				snapshotExports.set(exportId, snapshot);
+				return exportId;
+			}
 			case "exportSnapshot.next":
-				throw workerStateError("snapshot pulls bypass the finite operation queue");
+				throw workerStateError(
+					"snapshot pulls bypass the finite operation queue",
+				);
 			case "exportSnapshot.cancel":
-				throw workerStateError("snapshot cancellation bypasses the finite operation queue");
+				throw workerStateError(
+					"snapshot cancellation bypasses the finite operation queue",
+				);
 			case "observe":
 				throw workerStateError("observe must use the observation lane");
 			case "close": {
@@ -403,9 +433,7 @@ export function startWorkerHost(
 		await input.writer.close();
 	}
 
-	function createSyncServerBridge(
-		server: WorkerSyncServerOptions | undefined,
-	):
+	function createSyncServerBridge(server: WorkerSyncServerOptions | undefined):
 		| {
 				url: string;
 				headers: [string, string][];
@@ -469,7 +497,7 @@ export function startWorkerHost(
 					...requestBase,
 					responseMode: "buffered",
 					responseLimit: responseLimit as number,
-			  };
+				};
 		const response = new Promise<WorkerSyncFetchResponse>((resolve, reject) => {
 			pendingSyncFetch.set(requestId, { resolve, reject });
 			endpoint.postMessage({ kind: "sync.fetch", requestId, request });
@@ -478,12 +506,17 @@ export function startWorkerHost(
 			const pending = pendingSyncFetch.get(requestId);
 			pendingSyncFetch.delete(requestId);
 			if (pending) {
-				pending.reject(new DOMException("The operation was aborted", "AbortError"));
+				pending.reject(
+					new DOMException("The operation was aborted", "AbortError"),
+				);
 			}
 			const pull = pendingSyncStreamPulls.get(requestId);
 			pendingSyncStreamPulls.delete(requestId);
 			if (pull) {
-				const error = new DOMException("The operation was aborted", "AbortError");
+				const error = new DOMException(
+					"The operation was aborted",
+					"AbortError",
+				);
 				pull.controller.error(error);
 				pull.reject(error);
 			}
@@ -599,7 +632,9 @@ export function responseFromSyncFetch(
 	resolved: WorkerSyncFetchResponse,
 ): Response {
 	if (resolved.streaming) {
-		throw new TypeError("Streaming sync responses require the worker stream bridge");
+		throw new TypeError(
+			"Streaming sync responses require the worker stream bridge",
+		);
 	}
 	const body =
 		resolved.status === 204 ||
@@ -627,7 +662,9 @@ function headerEntries(headers: HeadersInit | undefined): [string, string][] {
 	return entries;
 }
 
-function serializableBody(body: BodyInit | null | undefined): string | Uint8Array | undefined {
+function serializableBody(
+	body: BodyInit | null | undefined,
+): string | Uint8Array | undefined {
 	if (body === undefined || body === null) return undefined;
 	if (typeof body === "string") return body;
 	if (body instanceof Uint8Array) return body;

@@ -22,10 +22,51 @@ console.log(result.rows[0]?.message);
 await lix.close();
 ```
 
+## Hosted lifecycle
+
+`openLix()` selects execution from the supplied locations:
+
+| Options | Behavior |
+| --- | --- |
+| Neither | Fresh in-memory repository |
+| `storage` | Local repository, initialized if empty |
+| `server` | Execute against an existing hosted repository |
+| `storage` and `server` | Synchronized local reads; mutations execute on the server |
+
+Creation and deletion are explicit server operations:
+
+```ts
+import { createLix, deleteLix, openLix } from "@lix-js/sdk";
+
+const repository = await createLix({
+  server: { url: "https://example.com", headers: getAuthHeaders },
+  from: localLix, // Omit to create an empty repository.
+});
+
+const remote = await openLix({
+  server: { url: repository.url, headers: getAuthHeaders },
+});
+await remote.close();
+await deleteLix({ server: { url: repository.url, headers: getAuthHeaders } });
+```
+
+`from` captures a consistent repository snapshot, including history and untracked
+rows. The source remains open. Creation returns `{ id, url }`, not a session.
+Use the same optional `idempotencyKey` when retrying creation after an uncertain
+response. Deletion removes the hosted repository and leaves local copies intact. Opening
+or synchronizing never implicitly creates a missing hosted repository.
+
+Browser creation from a local repository requires Fetch request streaming.
+Browsers without that support return `LIX_UNSUPPORTED_OPERATION`; Lix does not
+buffer the complete repository as a fallback. Browser Fetch may also require an
+HTTP/2 or HTTP/3 connection for streaming uploads. Empty creation and remote
+execution do not require streaming uploads.
+
 ## Synchronized local repositories
 
-Use sync mode when reads and writes should execute locally while Lix exchanges
-commits with a hosted repository in the background:
+Combine storage with a server to keep a synchronized local read replica.
+Certified current-state reads can execute locally; mutations execute on the
+server:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -34,7 +75,6 @@ import { OpfsStorage } from "@lix-js/storage-opfs";
 const lix = await openLix({
   storage: new OpfsStorage({ name: "acme" }),
   server: {
-    mode: "sync",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
     headers: async () => ({
       Authorization: `Bearer ${await accessToken()}`,
@@ -43,9 +83,10 @@ const lix = await openLix({
 });
 ```
 
-`await lix.execute(...)` means that the local transaction committed. It does
-not mean that the server has received the commit. Current data and new commits
-synchronize automatically; older history and binary content load when needed.
+A successful mutation confirms server acceptance. The local replica receives
+the resulting certified state automatically; older history and binary content
+load when needed. Connected mutations require the server, and cached reads may
+also need fresh server certification.
 See [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
 
 ## Remote repositories
@@ -55,7 +96,6 @@ Use the same Lix client as a thin client against a hosted repository:
 ```ts
 const lix = await openLix({
   server: {
-    mode: "remote",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
     headers: async () => ({
       Authorization: `Bearer ${await accessToken()}`,

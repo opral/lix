@@ -104,7 +104,7 @@ impl ServerProtocolBody {
         }
     }
 
-    async fn into_bytes(mut self, limit: usize) -> Result<Bytes, ApiError> {
+    pub(super) async fn into_bytes(mut self, limit: usize) -> Result<Bytes, ApiError> {
         let mut collected = Vec::new();
         while let Some(frame) =
             std::future::poll_fn(|context| Pin::new(&mut self).poll_frame(context)).await
@@ -424,6 +424,11 @@ pub struct ServerProtocolOptions {
     /// after validation succeeds, and the retained sessions plus their
     /// per-session caches never exceed this limit.
     pub max_sessions: usize,
+    /// Maximum inactivity before a session can expire, including unfinished
+    /// transactions. In-flight requests delay expiry. Expired sessions are
+    /// closed on stale session access, a new handshake, or host-driven server
+    /// closure after [`LixServerProtocol::is_idle`] reports idle. Closure rolls back
+    /// unfinished transactions and releases session resources.
     pub session_idle_timeout: Duration,
     pub max_request_body_bytes: usize,
     /// Maximum request-base bytes retained across all sessions.
@@ -516,7 +521,7 @@ where
                 }
                 let engine = self.open.open_protocol_engine().await?;
                 let expected_mutation_revision = engine
-                    .ensure_sync_authority_has_only_synchronized_rows()
+                    .sync_authority_admission_revision()
                     .await?;
                 engine
                     .admit_sync_authority_storage(expected_mutation_revision)
@@ -838,7 +843,6 @@ impl SessionActivity {
         );
     }
 
-    #[cfg(test)]
     fn lease_count(&self) -> usize {
         self.state.load(Ordering::Acquire) & SESSION_ACTIVITY_LEASE_COUNT_MASK
     }
@@ -1062,7 +1066,10 @@ where
     }
 
     fn is_idle_expired(&self, now: Instant, timeout: Duration) -> bool {
-        self.is_idle() && now.saturating_duration_since(self.last_used()) >= timeout
+        // Unfinished transactions prevent capacity eviction, but must not keep
+        // abandoned sessions alive forever. Only an in-flight request delays expiry.
+        self.activity.lease_count() == 0
+            && now.saturating_duration_since(self.last_used()) >= timeout
     }
 
     fn is_idle(&self) -> bool {
@@ -4100,7 +4107,7 @@ fn required_non_empty(value: Option<String>, field: &'static str) -> Result<Stri
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(super) struct ApiError {
     status: StatusCode,
     body: ErrorEnvelope,
 }
@@ -6418,51 +6425,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_rejects_preexisting_unsynchronized_untracked_rows() {
+    async fn serve_preserves_preexisting_untracked_rows() {
         let storage = Memory::new();
-        let lix = open_lix()
-            .with_storage(storage.clone())
+        let source = open_lix().with_storage(storage.clone()).await.unwrap();
+        source.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('local-state','preserved',true)", &[]).await.unwrap();
+        let query = "SELECT key, value, lixcol_untracked FROM lix_key_value WHERE key = 'local-state'";
+        let before = source.execute(query, &[]).await.unwrap();
+        assert_eq!(before.rows().len(), 1);
+        source.close().await.unwrap();
+        let server = open_lix().with_storage(storage).serve().with_embedded_lix_id().await.unwrap();
+        let mut after = Vec::new();
+        server.export_snapshot().write_to(&mut after).await.unwrap();
+        let restored = open_lix()
+            .from_snapshot(futures_util::io::Cursor::new(after))
             .await
-            .expect("initialize Lix before serving");
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-             VALUES ('local-only-before-serve', 'forbidden', true)",
-            &[],
-        )
-        .await
-        .expect("non-authority setup may contain untracked state");
-        lix.close().await.expect("close setup Lix");
-
-        let result = open_lix()
-            .with_storage(storage.clone())
-            .serve()
-            .with_embedded_lix_id()
-            .await;
-        let Err(error) = result else {
-            panic!("server admission must reject state omitted from sync");
-        };
-        assert_eq!(error.code, "LIX_AUTHORITY_UNTRACKED_UNSUPPORTED");
-
-        let cleanup = open_lix()
-            .with_storage(storage.clone())
-            .await
-            .expect("failed admission must leave ordinary repository writes available");
-        cleanup
-            .execute(
-                "DELETE FROM lix_key_value WHERE key = 'local-only-before-serve'",
-                &[],
-            )
-            .await
-            .expect("the unsupported row should remain recoverable after failed admission");
-        cleanup.close().await.expect("close cleanup engine");
-
-        let recovered = open_lix()
-            .with_storage(storage)
-            .serve()
-            .with_embedded_lix_id()
-            .await
-            .expect("serving should succeed after the unsupported row is removed");
-        recovered.close().await.expect("close recovered server");
+            .unwrap();
+        let after = restored.execute(query, &[]).await.unwrap();
+        assert_eq!(before.rows(), after.rows(), "serving must preserve untracked rows in exported snapshots");
+        restored.close().await.unwrap();
+        server.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -13119,21 +13100,6 @@ mod tests {
         .await;
         let (session_id, _) = new_session(&app.router).await;
         let transaction_id = begin_remote_transaction(&app.router, &session_id).await;
-        let record = app
-            .server
-            .inner
-            .registry
-            .lock()
-            .await
-            .get(&session_id)
-            .cloned()
-            .expect("transaction session should remain registered");
-        *record
-            .last_used
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Instant::now() - Duration::from_mins(2);
-
         let at_capacity = request(&app.router, "GET", "/lix/v1", None, None).await;
         assert_eq!(at_capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
         let rolled_back = remote_transaction_request(
@@ -13149,6 +13115,97 @@ mod tests {
 
         let replacement = request(&app.router, "GET", "/lix/v1", None, None).await;
         assert_eq!(replacement.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_rolls_back_abandoned_transactions_and_releases_sessions() {
+        // Exercise both expiry entry points: a request using the stale capability
+        // and a new session reclaiming the abandoned session's capacity.
+        for expire_on_open in [false, true] {
+            let app = app_with_options(ServerProtocolOptions {
+                max_sessions: 1,
+                session_idle_timeout: Duration::from_mins(1),
+                ..ServerProtocolOptions::default()
+            })
+            .await;
+            let (session_id, _) = new_session(&app.router).await;
+            let transaction_id = begin_remote_transaction(&app.router, &session_id).await;
+            let staged = remote_transaction_request(
+                &app.router,
+                "POST",
+                "/lix/v1/transaction/execute",
+                &session_id,
+                &transaction_id,
+                Some(json!({
+                    "sql": "INSERT INTO lix_key_value (key, value) VALUES ('abandoned', 'staged')"
+                })),
+            )
+            .await;
+            assert_eq!(staged.status(), StatusCode::OK);
+            let record = app.server.inner.registry.lock().await[&session_id].clone();
+            let weak_record = Arc::downgrade(&record);
+            assert!(record.activity.transaction_is_active());
+            assert_eq!(record.lease_count(), 0);
+            *record
+                .last_used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Instant::now() - Duration::from_mins(2);
+            let lease = SessionLease::new(session_id.clone(), Arc::clone(&record), None);
+            assert!(!record.is_idle_expired(Instant::now(), Duration::from_mins(1)));
+            assert!(!app.server.is_idle(), "in-flight requests must prevent expiry");
+            drop(lease);
+            // Re-age after releasing the request, which refreshes last_used.
+            *record
+                .last_used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Instant::now() - Duration::from_mins(2);
+            assert!(
+                app.server.is_idle(),
+                "abandoned transactions must permit host expiry"
+            );
+
+            if !expire_on_open {
+                let expired = request(&app.router, "GET", "/lix/v1", Some(&session_id), None).await;
+                assert_eq!(expired.status(), StatusCode::GONE);
+                assert_eq!(error_code(expired).await, "LIX_ERROR_PROTOCOL_SESSION_GONE");
+            }
+            let (replacement_id, _) = new_session(&app.router).await;
+            assert!(!record.activity.transaction_is_active());
+            assert!(record.transactions.lock().await.active.is_none());
+            assert_eq!(
+                record.lix.execute("SELECT 1", &[]).await.unwrap_err().code,
+                LixError::CODE_CLOSED
+            );
+            drop(record);
+            assert!(
+                weak_record.upgrade().is_none(),
+                "expired session resources must be released"
+            );
+
+            let replacement = app.server.inner.registry.lock().await[&replacement_id].clone();
+            let rows = replacement
+                .lix
+                .execute(
+                    "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'abandoned'",
+                    &[],
+                )
+                .await
+                .expect("replacement reads committed state");
+            assert_eq!(rows.rows()[0].get::<i64>("count").unwrap(), 0);
+            let transaction_id = begin_remote_transaction(&app.router, &replacement_id).await;
+            let rolled_back = remote_transaction_request(
+                &app.router,
+                "POST",
+                "/lix/v1/transaction/rollback",
+                &replacement_id,
+                &transaction_id,
+                None,
+            )
+            .await;
+            assert_eq!(rolled_back.status(), StatusCode::NO_CONTENT);
+        }
     }
 
     #[test]
@@ -13762,7 +13819,8 @@ mod tests {
     #[tokio::test]
     async fn sync_replica_configuration_cannot_be_served_as_an_authority() {
         let result = open_lix()
-            .with_server(lix::ServerOptions::sync(
+            .with_storage(Memory::new())
+            .with_server(lix::ServerOptions::new(
                 "https://example.invalid/repository",
             ))
             .serve()

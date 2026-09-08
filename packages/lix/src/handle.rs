@@ -16,6 +16,10 @@ use std::{
     },
 };
 
+use crate::authority_client::{
+    ClientCore, ProtocolClient, ProtocolExecuteOptions, ProtocolObserveEvents,
+    ProtocolTransaction, open_protocol_client,
+};
 use crate::common::ExpiredReadRetryState;
 use crate::engine::{Engine, EngineOptions};
 use crate::open_types::{
@@ -97,44 +101,35 @@ impl OpenProgressSink for RetainingOpenProgressSink {
     }
 }
 
-/// Server behavior for an opened local Lix repository.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ServerMode {
-    /// Execute against local storage and continuously synchronize the active
-    /// branch with the server.
-    Sync,
-}
-
-/// Configures the server associated with a local Lix repository.
+/// Connection information for a hosted Lix repository.
+///
+/// A server alone selects remote execution. Adding explicit local storage selects synchronization.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerOptions {
-    pub mode: ServerMode,
     pub url: String,
-    /// HTTP headers included on browser sync protocol requests.
+    /// HTTP headers included on server protocol requests.
     pub headers: Vec<(String, String)>,
 }
 
 impl ServerOptions {
-    pub fn sync(url: impl Into<String>) -> Self {
+    pub fn new(url: impl Into<String>) -> Self {
         Self {
-            mode: ServerMode::Sync,
             url: url.into(),
             headers: Vec::new(),
         }
     }
 
-    /// Adds HTTP headers used by the sync transport, such as Authorization.
+    /// Adds HTTP headers used by the server transport, such as Authorization.
     pub fn with_headers(mut self, headers: impl IntoIterator<Item = (String, String)>) -> Self {
         self.headers = headers.into_iter().collect();
         self
     }
 }
 
-/// Configures the primary session for a Lix repository.
+/// Configures a session after local storage has been explicitly selected.
 ///
-/// The default builder opens an in-memory Lix. Configure a persistent adapter
-/// with [`OpenLixBuilder::with_storage`] and then await the builder.
+/// Start with [`open_lix`] and select storage with `with_storage`. Adding a
+/// server to this builder selects synchronization.
 #[expect(missing_debug_implementations)]
 pub struct OpenLixBuilder<StorageImpl = Memory> {
     storage: StorageImpl,
@@ -144,8 +139,8 @@ pub struct OpenLixBuilder<StorageImpl = Memory> {
     open_progress: Option<Arc<dyn OpenProgressSink>>,
 }
 
-impl Default for OpenLixBuilder<Memory> {
-    fn default() -> Self {
+impl OpenLixBuilder<Memory> {
+    fn memory() -> Self {
         Self {
             storage: Memory::new(),
             wasm_runtime: None,
@@ -322,8 +317,422 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub fn open_lix() -> OpenLixBuilder<Memory> {
-    OpenLixBuilder::default()
+pub fn open_lix() -> UnconfiguredOpenLixBuilder {
+    UnconfiguredOpenLixBuilder(OpenLixBuilder::memory())
+}
+
+/// An open request without explicitly selected storage.
+/// Supplying only a server opens remote execution; supplying storage opens locally.
+#[expect(missing_debug_implementations)]
+pub struct UnconfiguredOpenLixBuilder(OpenLixBuilder<Memory>);
+
+impl UnconfiguredOpenLixBuilder {
+    pub fn with_storage<S>(self, storage: S) -> OpenLixBuilder<S> {
+        self.0.with_storage(storage)
+    }
+    pub fn with_server(self, server: ServerOptions) -> RemoteOpenLixBuilder {
+        RemoteOpenLixBuilder {
+            open: self.0,
+            server,
+        }
+    }
+    pub fn with_wasm_runtime(mut self, runtime: Arc<dyn WasmRuntime>) -> Self {
+        self.0 = self.0.with_wasm_runtime(runtime);
+        self
+    }
+    pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
+        self.0 = self.0.with_telemetry(telemetry);
+        self
+    }
+    pub fn with_open_progress_sink(mut self, sink: Arc<dyn OpenProgressSink>) -> Self {
+        self.0 = self.0.with_open_progress_sink(sink);
+        self
+    }
+    pub fn from_snapshot<S>(self, source: S) -> OpenLixFromSnapshotBuilder<Memory, S> {
+        self.0.from_snapshot(source)
+    }
+    #[cfg(feature = "server-protocol")]
+    pub fn serve(self) -> crate::server_protocol::ServeLixBuilder<Memory> {
+        self.0.serve()
+    }
+}
+
+impl IntoFuture for UnconfiguredOpenLixBuilder {
+    type Output = Result<Lix<Memory>, LixError>;
+    type IntoFuture = <OpenLixBuilder<Memory> as IntoFuture>::IntoFuture;
+    fn into_future(self) -> Self::IntoFuture {
+        self.0.into_future()
+    }
+}
+
+/// An open request with a server but no explicitly selected local storage.
+#[expect(missing_debug_implementations)]
+pub struct RemoteOpenLixBuilder {
+    open: OpenLixBuilder<Memory>,
+    server: ServerOptions,
+}
+impl RemoteOpenLixBuilder {
+    /// Selects a local replica with durable local writes and background sync.
+    pub fn with_storage<S>(self, storage: S) -> OpenLixBuilder<S> {
+        self.open.with_storage(storage).with_server(self.server)
+    }
+}
+impl IntoFuture for RemoteOpenLixBuilder {
+    type Output = Result<RemoteLix, LixError>;
+    type IntoFuture = crate::sync::SyncTransportFuture<'static, RemoteLix>;
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+                if self.open.wasm_runtime.is_some()
+                    || self.open.telemetry.is_some()
+                    || self.open.open_progress.is_some()
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "remote execution cannot configure a local runtime, telemetry sink, or storage progress sink",
+                    ));
+                }
+                let http = crate::sync::authority_http(&self.server.headers)?;
+                let client = open_protocol_client(http, self.server.url, None).await?;
+                let account_id = client.active_account_id().await?;
+                Ok(RemoteLix { client, account_id })
+        })
+    }
+}
+
+/// A repository whose operations execute on its server.
+#[derive(Debug, Clone)]
+pub struct RemoteLix {
+    account_id: String,
+    client: ProtocolClient<crate::sync::AuthorityHttp>,
+}
+impl RemoteLix {
+    /// Streams a complete snapshot from the server without allocating local storage.
+    pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<Memory> {
+        crate::snapshot::SnapshotExportBuilder::remote(
+            self.client.http().clone(),
+            self.client.ensure_usable().and_then(|_| self.client.join_path("snapshot")),
+            self.client.session_id(),
+        )
+    }
+
+    pub fn execute<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> RemoteExecuteBuilder<'a> {
+        RemoteExecuteBuilder {
+            lix: self,
+            sql,
+            params,
+            options: ProtocolExecuteOptions::default(),
+        }
+    }
+    pub async fn create_branch(
+        &self,
+        options: CreateBranchOptions,
+    ) -> Result<CreateBranchReceipt, LixError> {
+        self.client.create_branch(options).await
+    }
+    pub async fn merge_branch(
+        &self,
+        options: MergeBranchOptions,
+    ) -> Result<MergeBranchReceipt, LixError> {
+        self.client.merge_branch(options).await
+    }
+    pub async fn merge_branch_preview(
+        &self,
+        options: MergeBranchPreviewOptions,
+    ) -> Result<MergeBranchPreview, LixError> {
+        self.client.merge_branch_preview(options).await
+    }
+    pub async fn switch_branch(
+        &self,
+        options: SwitchBranchOptions,
+    ) -> Result<SwitchBranchReceipt, LixError> {
+        self.client
+            .switch_branch_and_restart(&options.branch_id)
+            .await
+    }
+    pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
+        self.client.undo().await
+    }
+    pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
+        self.client.redo().await
+    }
+    pub async fn begin_transaction(&self) -> Result<RemoteLixTransaction, LixError> {
+        let client = self
+            .client
+            .open_another_session(None, Some(self.account_id.clone()))
+            .await?;
+        // Own the session before awaiting begin so failure or cancellation
+        // schedules closure of any transaction the server may have started.
+        let mut opened = RemoteLixTransaction {
+            transaction: None,
+            client: Some(client),
+        };
+        opened.transaction = Some(
+            opened
+                .client
+                .as_ref()
+                .ok_or_else(closed_transaction_error)?
+                .begin_transaction()
+                .await?,
+        );
+        Ok(opened)
+    }
+
+    pub fn observe(&self, sql: &str, params: &[Value]) -> Result<RemoteObserveEvents, LixError> {
+        self.client.ensure_usable()?;
+        Ok(RemoteObserveEvents {
+            client: self.client.clone(),
+            sql: sql.to_owned(),
+            params: params.to_vec(),
+            events: None,
+            closed: false,
+        })
+    }
+    pub fn open_another_session(&self) -> RemoteOpenAnotherSessionBuilder<'_> {
+        RemoteOpenAnotherSessionBuilder {
+            lix: self,
+            account_id: None,
+            branch_id: None,
+        }
+    }
+    pub fn execute_batch<'a>(
+        &'a self,
+        statements: &'a [ExecuteBatchStatement],
+    ) -> RemoteExecuteBatchBuilder<'a> {
+        RemoteExecuteBatchBuilder {
+            lix: self,
+            statements,
+            options: ProtocolExecuteOptions::default(),
+        }
+    }
+    pub async fn active_branch_id(&self) -> Result<String, LixError> {
+        self.client.active_branch_id().await
+    }
+    pub fn active_account_id(&self) -> &str {
+        &self.account_id
+    }
+    pub async fn close(&self) -> Result<(), LixError> {
+        self.client.close().await
+    }
+}
+
+/// A transaction executing on the remote repository.
+///
+/// Each transaction owns a dedicated server session. Dropping it schedules
+/// best-effort session closure, which rolls back unfinished work without
+/// blocking the parent session. Server session expiry bounds abandoned work.
+/// Call [`Self::rollback`] to await rollback and session closure explicitly.
+#[derive(Debug)]
+pub struct RemoteLixTransaction {
+    transaction: Option<ProtocolTransaction<crate::sync::AuthorityHttp>>,
+    client: Option<ProtocolClient<crate::sync::AuthorityHttp>>,
+}
+impl RemoteLixTransaction {
+    pub fn execute<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [Value],
+    ) -> RemoteTransactionExecuteBuilder<'a> {
+        RemoteTransactionExecuteBuilder {
+            transaction: self,
+            sql,
+            params,
+            options: ProtocolExecuteOptions::default(),
+        }
+    }
+    pub async fn commit(mut self) -> Result<(), LixError> {
+        let result = self
+            .transaction
+            .as_ref()
+            .ok_or_else(closed_transaction_error)?
+            .commit()
+            .await;
+        let close_result = self
+            .client
+            .as_ref()
+            .ok_or_else(closed_transaction_error)?
+            .close()
+            .await;
+        self.client.take();
+        result?;
+        close_result
+    }
+    pub async fn rollback(mut self) -> Result<(), LixError> {
+        let result = self
+            .transaction
+            .as_ref()
+            .ok_or_else(closed_transaction_error)?
+            .rollback()
+            .await;
+        let close_result = self
+            .client
+            .as_ref()
+            .ok_or_else(closed_transaction_error)?
+            .close()
+            .await;
+        self.client.take();
+        result?;
+        close_result
+    }
+}
+
+impl Drop for RemoteLixTransaction {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let http = client.http().clone();
+        crate::authority_client::ProtocolHttp::spawn(
+            &http,
+            Box::pin(async move {
+                let _ = client.close().await;
+            }),
+        );
+    }
+}
+
+/// Configures an independent remote session.
+#[derive(Debug)]
+pub struct RemoteOpenAnotherSessionBuilder<'a> {
+    lix: &'a RemoteLix,
+    account_id: Option<String>,
+    branch_id: Option<String>,
+}
+impl RemoteOpenAnotherSessionBuilder<'_> {
+    pub fn with_account(mut self, account_id: impl Into<String>) -> Self {
+        self.account_id = Some(account_id.into());
+        self
+    }
+    pub fn with_branch(mut self, branch_id: impl Into<String>) -> Self {
+        self.branch_id = Some(branch_id.into());
+        self
+    }
+}
+impl<'a> IntoFuture for RemoteOpenAnotherSessionBuilder<'a> {
+    type Output = Result<RemoteLix, LixError>;
+    type IntoFuture = crate::sync::SyncTransportFuture<'a, RemoteLix>;
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+                let client = self
+                    .lix
+                    .client
+                    .open_another_session(self.branch_id, self.account_id)
+                    .await?;
+                let account_id = client.active_account_id().await?;
+                Ok(RemoteLix { client, account_id })
+        })
+    }
+}
+
+/// Configures SQL executed inside a remote transaction.
+#[derive(Debug)]
+pub struct RemoteTransactionExecuteBuilder<'a> {
+    transaction: &'a RemoteLixTransaction,
+    sql: &'a str,
+    params: &'a [Value],
+    options: ProtocolExecuteOptions,
+}
+impl RemoteTransactionExecuteBuilder<'_> {
+    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
+        self.options.origin_key = Some(origin_key.into());
+        self
+    }
+}
+impl<'a> IntoFuture for RemoteTransactionExecuteBuilder<'a> {
+    type Output = Result<ExecuteResult, LixError>;
+    type IntoFuture = crate::sync::SyncTransportFuture<'a, ExecuteResult>;
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+                self.transaction
+                    .transaction
+                    .as_ref().ok_or_else(closed_transaction_error)?
+                    .execute(self.sql, self.params, Some(self.options))
+                    .await
+        })
+    }
+}
+
+/// Observation events streamed from the remote repository.
+#[expect(missing_debug_implementations)]
+pub struct RemoteObserveEvents {
+    client: ProtocolClient<crate::sync::AuthorityHttp>,
+    sql: String,
+    params: Vec<Value>,
+    events: Option<ProtocolObserveEvents<ClientCore<crate::sync::AuthorityHttp>>>,
+    closed: bool,
+}
+impl RemoteObserveEvents {
+    pub async fn next(&mut self) -> Result<Option<ObserveEvent>, LixError> {
+        if self.closed {
+            return Ok(None);
+        }
+        if self.events.is_none() {
+            self.events = Some(self.client.observe(&self.sql, self.params.clone()).await?);
+        }
+        self.events
+            .as_ref()
+            .expect("observation registered")
+            .next()
+            .await
+    }
+    pub fn close(&mut self) {
+        self.closed = true;
+        if let Some(events) = self.events.take() {
+            events.close();
+        }
+    }
+}
+
+/// Configures an atomic SQL batch on the server.
+#[derive(Debug)]
+pub struct RemoteExecuteBatchBuilder<'a> {
+    lix: &'a RemoteLix,
+    statements: &'a [ExecuteBatchStatement],
+    options: ProtocolExecuteOptions,
+}
+impl RemoteExecuteBatchBuilder<'_> {
+    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
+        self.options.origin_key = Some(origin_key.into());
+        self
+    }
+}
+impl<'a> IntoFuture for RemoteExecuteBatchBuilder<'a> {
+    type Output = Result<Vec<ExecuteResult>, LixError>;
+    type IntoFuture = crate::sync::SyncTransportFuture<'a, Vec<ExecuteResult>>;
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+                self.lix
+                    .client
+                    .execute_batch(self.statements, Some(self.options))
+                    .await
+        })
+    }
+}
+
+/// Configures execution on a remote repository.
+#[derive(Debug)]
+pub struct RemoteExecuteBuilder<'a> {
+    lix: &'a RemoteLix,
+    sql: &'a str,
+    params: &'a [Value],
+    options: ProtocolExecuteOptions,
+}
+impl RemoteExecuteBuilder<'_> {
+    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
+        self.options.origin_key = Some(origin_key.into());
+        self
+    }
+}
+impl<'a> IntoFuture for RemoteExecuteBuilder<'a> {
+    type Output = Result<ExecuteResult, LixError>;
+    type IntoFuture = crate::sync::SyncTransportFuture<'a, ExecuteResult>;
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+                self.lix
+                    .client
+                    .execute(self.sql, self.params, Some(self.options))
+                    .await
+        })
+    }
 }
 
 /// Restores a snapshot into fresh storage and then opens the resulting Lix.
@@ -623,12 +1032,13 @@ where
 }
 
 /// Reserves only the handle's close lifecycle, not its SQL session.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct PublicTransactionLifecycle {
     admission: tokio::sync::Mutex<()>,
     active: AtomicUsize,
 }
 
+#[derive(Debug)]
 struct PublicTransactionLease(Arc<PublicTransactionLifecycle>);
 
 impl PublicTransactionLease {
@@ -791,21 +1201,17 @@ where
         open_report: Arc::new(open_report),
     };
     if let Some(server) = server {
-        match server.mode {
-            ServerMode::Sync => {
-                let initial_transport = if let Some(prepared) = prepared_sync.take() {
-                    Some(crate::sync::install_sync_bootstrap(&mut lix, &server, prepared).await?)
-                } else {
-                    None
-                };
-                let runtime =
-                    crate::sync::activate_sync_mode(&mut lix, &server, initial_transport).await?;
-                lix.sync_demand_tx = Some(runtime.demand_tx.clone());
-                lix.sync_lease = Some(SyncSessionLease::root(runtime));
-                // Foreground execution belongs to the durable local replica.
-                // The sync worker owns all server traffic, including lazy history.
-            }
-        }
+        let initial_transport = if let Some(prepared) = prepared_sync.take() {
+            Some(crate::sync::install_sync_bootstrap(&mut lix, &server, prepared).await?)
+        } else {
+            None
+        };
+        let runtime =
+            crate::sync::activate_sync_mode(&mut lix, &server, initial_transport).await?;
+        lix.sync_demand_tx = Some(runtime.demand_tx.clone());
+        lix.sync_lease = Some(SyncSessionLease::root(runtime));
+        // Foreground execution belongs to the durable local replica.
+        // The sync worker owns all server traffic, including lazy history.
     }
     lix.bind_session();
     emit_open_progress(
@@ -1894,12 +2300,415 @@ mod tests {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn server_without_storage_opens_remote_protocol_session() {
+        use std::io::{Read, Write};
+        let source = open_lix().await.unwrap();
+        source.execute("INSERT INTO lix_key_value (key, value) VALUES ('remote-snapshot', 'true'::jsonb)", &[]).await.unwrap();
+        let mut snapshot = Vec::new();
+        source.export_snapshot().write_to(&mut snapshot).await.unwrap();
+        let expected_snapshot = snapshot.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0];
+                connection.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /lix/v1/00000000-0000-4000-8000-000000000001/ "));
+            assert!(
+                request
+                    .to_lowercase()
+                    .contains("authorization: bearer test")
+            );
+            let body = serde_json::json!({
+                "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                "sessionId": "remote-session", "activeBranchId": "main", "activeAccountId": "account"
+            }).to_string();
+            write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            drop(connection);
+            let (mut connection, _) = listener.accept().unwrap();
+            connection.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0];
+                connection.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") { break; }
+            }
+            assert!(String::from_utf8(request).unwrap().starts_with("GET /lix/v1/00000000-0000-4000-8000-000000000001/snapshot"));
+            write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.lix.snapshot\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", snapshot.len()).unwrap();
+            connection.write_all(&snapshot).unwrap();
+        });
+        let lix: RemoteLix = open_lix()
+            .with_server(
+                ServerOptions::new(format!(
+                    "http://{address}/lix/00000000-0000-4000-8000-000000000001"
+                ))
+                .with_headers([("Authorization".to_owned(), "Bearer test".to_owned())]),
+            )
+            .await
+            .expect("remote open");
+        assert_eq!(lix.client.session_id().as_deref(), Some("remote-session"));
+        let mut exported = Vec::new();
+        lix.export_snapshot().write_to(&mut exported).await.expect("remote snapshot export");
+        assert_eq!(exported, expected_snapshot);
+        assert_eq!(lix.active_account_id(), "account");
+        thread.join().unwrap();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn remote_request(
+        listener: &std::net::TcpListener,
+        method: &str,
+        path: &str,
+        session: Option<&str>,
+    ) -> std::net::TcpStream {
+        use std::io::Read;
+        let (mut connection, _) = listener.accept().unwrap();
+        connection
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut byte = [0];
+            connection.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.starts_with(&format!("{method} ")), "{request}");
+        assert!(request.lines().next().unwrap().contains(path), "{request}");
+        if let Some(session) = session {
+            assert!(
+                request
+                    .to_lowercase()
+                    .contains(&format!("lix-session-id: {session}\r\n")),
+                "{request}"
+            );
+        }
+        let size = request
+            .lines()
+            .find_map(|line| {
+                line.to_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|n| n.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        connection.read_exact(&mut vec![0; size]).unwrap();
+        connection
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn remote_response(mut connection: std::net::TcpStream, status: u16, body: serde_json::Value) {
+        use std::io::Write;
+        let body = if status == 204 {
+            String::new()
+        } else {
+            body.to_string()
+        };
+        write!(connection, "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn remote_handshake(listener: &std::net::TcpListener, session: &str, child: bool) {
+        let path = if child {
+            "/?activeBranchId=feature"
+        } else {
+            "/ "
+        };
+        remote_response(
+            remote_request(listener, "GET", path, None),
+            200,
+            serde_json::json!({
+                "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                "sessionId": session, "activeBranchId": "feature", "activeAccountId": "account"
+            }),
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn remote_transactions_finish_and_close_their_dedicated_sessions() {
+        for commit in [false, true] {
+            for fail_finish in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let thread = std::thread::spawn(move || {
+                    remote_handshake(&listener, "parent", false);
+                    remote_handshake(&listener, "child", true);
+                    remote_response(
+                        remote_request(&listener, "POST", "/transaction/begin ", Some("child")),
+                        200,
+                        serde_json::json!({ "transactionId": "transaction" }),
+                    );
+                    let path = if commit {
+                        "/transaction/commit "
+                    } else {
+                        "/transaction/rollback "
+                    };
+                    remote_response(
+                        remote_request(&listener, "POST", path, Some("child")),
+                        if fail_finish { 500 } else { 204 },
+                        serde_json::json!({"error": {"code": "TEST_FINISH_FAILED", "message": "finish failed"}}),
+                    );
+                    remote_response(
+                        remote_request(&listener, "DELETE", "/session ", Some("child")),
+                        204,
+                        serde_json::Value::Null,
+                    );
+                    remote_response(
+                        remote_request(&listener, "POST", "/execute ", Some("parent")),
+                        200,
+                        serde_json::json!({ "columns": [], "rows": [], "rowsAffected": 0 }),
+                    );
+                    remote_response(
+                        remote_request(&listener, "DELETE", "/session ", Some("parent")),
+                        204,
+                        serde_json::Value::Null,
+                    );
+                });
+                let lix = open_lix()
+                    .with_server(ServerOptions::new(format!(
+                        "http://{address}/lix/00000000-0000-4000-8000-000000000001"
+                    )))
+                    .await
+                    .unwrap();
+                let transaction = lix.begin_transaction().await.unwrap();
+                let child = transaction.client.as_ref().unwrap();
+                assert_eq!(
+                    child.active_branch_id().await.unwrap(),
+                    lix.active_branch_id().await.unwrap()
+                );
+                assert_eq!(
+                    child.active_account_id().await.unwrap(),
+                    lix.active_account_id()
+                );
+                assert_ne!(child.session_id(), lix.client.session_id());
+                let result = if commit {
+                    transaction.commit().await
+                } else {
+                    transaction.rollback().await
+                };
+                if fail_finish {
+                    assert_eq!(result.unwrap_err().code, "TEST_FINISH_FAILED");
+                } else {
+                    result.unwrap();
+                }
+                lix.execute("SELECT 1", &[])
+                    .await
+                    .expect("parent remains usable after transaction finishes");
+                lix.close().await.unwrap();
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn dropping_remote_transaction_does_not_block_parent_during_failed_session_cleanup() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closing_tx, closing_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            remote_handshake(&listener, "parent", false);
+            remote_handshake(&listener, "abandoned", true);
+            remote_response(
+                remote_request(&listener, "POST", "/transaction/begin ", Some("abandoned")),
+                200,
+                serde_json::json!({ "transactionId": "abandoned-transaction" }),
+            );
+            let pending_close = remote_request(&listener, "DELETE", "/session ", Some("abandoned"));
+            closing_tx.send(()).unwrap();
+            // Keep cleanup unanswered while the same parent executes, opens another
+            // transaction, and closes. No rollback request should be sent on drop.
+            remote_response(
+                remote_request(&listener, "POST", "/execute ", Some("parent")),
+                200,
+                serde_json::json!({ "columns": [], "rows": [], "rowsAffected": 0 }),
+            );
+            remote_handshake(&listener, "replacement", true);
+            remote_response(
+                remote_request(
+                    &listener,
+                    "POST",
+                    "/transaction/begin ",
+                    Some("replacement"),
+                ),
+                200,
+                serde_json::json!({ "transactionId": "replacement-transaction" }),
+            );
+            remote_response(
+                remote_request(
+                    &listener,
+                    "POST",
+                    "/transaction/commit ",
+                    Some("replacement"),
+                ),
+                204,
+                serde_json::Value::Null,
+            );
+            remote_response(
+                remote_request(&listener, "DELETE", "/session ", Some("replacement")),
+                204,
+                serde_json::Value::Null,
+            );
+            remote_response(
+                remote_request(&listener, "DELETE", "/session ", Some("parent")),
+                204,
+                serde_json::Value::Null,
+            );
+            resume_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            remote_response(
+                pending_close,
+                500,
+                serde_json::json!({ "error": {"code": "TEST_CLOSE_FAILED", "message": "close failed"} }),
+            );
+        });
+        let lix = open_lix()
+            .with_server(ServerOptions::new(format!(
+                "http://{address}/lix/00000000-0000-4000-8000-000000000001"
+            )))
+            .await
+            .unwrap();
+        drop(lix.begin_transaction().await.unwrap());
+        closing_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            lix.execute("SELECT 1", &[])
+                .await
+                .expect("parent SQL during cleanup");
+            lix.begin_transaction()
+                .await
+                .expect("parent transaction during cleanup")
+                .commit()
+                .await
+                .unwrap();
+            lix.close().await.expect("parent close during cleanup");
+        })
+        .await
+        .expect("cleanup must not block parent operations");
+        resume_tx.send(()).unwrap();
+        thread.join().unwrap();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn failed_or_cancelled_remote_transaction_begin_closes_only_its_dedicated_session() {
+        for cancel in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let (begin_tx, begin_rx) = tokio::sync::oneshot::channel();
+            let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+            let thread = std::thread::spawn(move || {
+                remote_handshake(&listener, "parent", false);
+                remote_handshake(&listener, "child", true);
+                let begin = remote_request(&listener, "POST", "/transaction/begin ", Some("child"));
+                begin_tx.send(()).unwrap();
+                let pending_begin = if cancel {
+                    Some(begin)
+                } else {
+                    remote_response(
+                        begin,
+                        500,
+                        serde_json::json!({ "error": {"code": "TEST_BEGIN_FAILED", "message": "begin failed"} }),
+                    );
+                    None
+                };
+                remote_response(
+                    remote_request(&listener, "DELETE", "/session ", Some("child")),
+                    204,
+                    serde_json::Value::Null,
+                );
+                drop(pending_begin);
+                closed_tx.send(()).unwrap();
+                remote_response(
+                    remote_request(&listener, "POST", "/execute ", Some("parent")),
+                    200,
+                    serde_json::json!({ "columns": [], "rows": [], "rowsAffected": 0 }),
+                );
+                remote_response(
+                    remote_request(&listener, "DELETE", "/session ", Some("parent")),
+                    204,
+                    serde_json::Value::Null,
+                );
+            });
+            let lix = open_lix()
+                .with_server(ServerOptions::new(format!(
+                    "http://{address}/lix/00000000-0000-4000-8000-000000000001"
+                )))
+                .await
+                .unwrap();
+            let opening = tokio::spawn({
+                let lix = lix.clone();
+                async move { lix.begin_transaction().await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), begin_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                opening.abort();
+                assert!(opening.await.unwrap_err().is_cancelled());
+            } else {
+                assert_eq!(opening.await.unwrap().unwrap_err().code, "TEST_BEGIN_FAILED");
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), closed_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            lix.execute("SELECT 1", &[])
+                .await
+                .expect("failed child begin leaves parent usable");
+            lix.close().await.unwrap();
+            thread.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_open_rejects_local_configuration_before_network_access() {
+        let result = open_lix()
+            .with_open_progress_sink(Arc::new(CallbackOpenProgressSink::new(|_| {})))
+            .with_server(ServerOptions::new("https://example.invalid/lix/00000000-0000-4000-8000-000000000001"))
+            .await;
+        let error = result.expect_err("remote open must reject local progress configuration");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("local runtime"));
+    }
+
+    #[tokio::test]
+    async fn server_then_storage_selects_sync_without_initializing_invalid_destination() {
+        let storage = Memory::new();
+        let result = open_lix()
+            .with_server(ServerOptions::new("https://example.test/not-a-lix"))
+            .with_storage(storage.clone())
+            .await;
+        assert!(result.is_err());
+        let local = open_lix().with_storage(storage).await.unwrap();
+        assert!(local.open_report().initialized);
+    }
+
     #[tokio::test]
     async fn invalid_sync_locator_is_rejected_before_storage_initialization() {
         let storage = Memory::new();
         let result = open_lix()
             .with_storage(storage.clone())
-            .with_server(ServerOptions::sync("https://example.test/not-a-lix"))
+            .with_server(ServerOptions::new("https://example.test/not-a-lix"))
             .await;
         let Err(error) = result else {
             panic!("invalid sync locator must fail");

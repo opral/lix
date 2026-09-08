@@ -420,16 +420,8 @@ test("filesystem storage is owned by its adapter package", async () => {
 	expect("LocalFilesystem" in sdk).toBe(false);
 });
 
-test("sync mode requires an explicit durability-capable storage adapter", async () => {
-	await expect(
-		// @ts-expect-error Sync deliberately has no implicit volatile Memory fallback.
-		openLix({
-			server: {
-				mode: "sync",
-				url: "https://sync.example/repository",
-			},
-		}),
-	).rejects.toThrow(/requires a durability-capable storage adapter/u);
+test("server.mode is removed from the public API", async () => {
+ await expect(openLix({ server: { url: "https://sync.example/lix/id", mode: "sync" } } as never)).rejects.toThrow("server.mode was removed");
 });
 
 test("openLix forwards opt-in SQL telemetry from the engine", async () => {

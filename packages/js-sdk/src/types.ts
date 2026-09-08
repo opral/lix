@@ -3,27 +3,22 @@ export type RemoteLixFetch = (
 	init?: RequestInit,
 ) => Promise<Response>;
 
-export type RemoteLixServerOptions = {
-	mode: "remote";
-	/** Stable HTTPS locator whose path is exactly `/lix/{uuid}`. HTTP is loopback-only. */
+/** A Lix protocol endpoint. Host URL for creation; repository URL for opening/deletion. */
+export type LixServerOptions = {
 	url: string | URL;
 	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
 	fetch?: RemoteLixFetch;
 };
 
-/**
- * Opens a local native replica that synchronizes with the server in the
- * background. Sync mode keeps the normal local storage/read path and works
- * with browser storage such as OPFS as well as native storage.
- */
-export type SyncLixServerOptions = {
-	mode: "sync";
-	/** Stable HTTPS locator whose path is exactly `/lix/{uuid}`. HTTP is loopback-only. */
-	url: string | URL;
-	/** Resolved for every browser sync request, including reconnect handshakes. */
-	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
-	/** Browser fetch override. Functions cross the worker boundary through RPC. */
-	fetch?: RemoteLixFetch;
+export type HostedLix = { id: string; url: string };
+export type CreateLixOptions = {
+	/** Reuse this key when retrying a creation whose outcome was uncertain. */
+	idempotencyKey?: string;
+	server: Pick<LixServerOptions, "url" | "headers">;
+	from?: import("./lix.js").Lix;
+};
+export type DeleteLixOptions = {
+	server: Pick<LixServerOptions, "url" | "headers">;
 };
 
 export type LixTelemetrySpanLink = {
@@ -101,23 +96,24 @@ export type LixOpenProgressOptions = {
 	onProgress?(progress: LixOpenProgress): void;
 };
 
+/** No options: memory. Storage: local. Server: remote. Storage + server: sync. */
 export type OpenLixOptions =
-	| {
+	| ({
 			storage?: import("./storage-adapter.js").LixStorage;
 			server?: never;
 			telemetry?: LixTelemetryOptions;
-	  } & LixOpenProgressOptions
+	  } & LixOpenProgressOptions)
 	| {
 			storage?: never;
-			server: RemoteLixServerOptions;
+			server: LixServerOptions;
 			telemetry?: never;
 			onProgress?: never;
 	  }
-	| {
+	| ({
 			storage: import("./storage-adapter.js").LixStorage;
-			server: SyncLixServerOptions;
+			server: LixServerOptions;
 			telemetry?: LixTelemetryOptions;
-	  } & LixOpenProgressOptions;
+	  } & LixOpenProgressOptions);
 
 /** Selects the initial context for an additional independent session. */
 export type OpenAnotherSessionOptions = {
@@ -200,8 +196,8 @@ export type ExecuteResult<TRow extends object = ResultObjectRow> = {
 
 export type ExecuteBatchResult<TRow extends object = ResultObjectRow> =
 	ExecuteResult<TRow> & {
-	statementIndex: number;
-};
+		statementIndex: number;
+	};
 
 export type ObserveEvent = {
 	sequence: number;

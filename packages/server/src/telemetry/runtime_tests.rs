@@ -108,6 +108,7 @@ async fn authenticated_protocol_bind_reaches_otlp() {
     let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await });
     let provider = provider_from_endpoint(Some(endpoint)).unwrap();
     let manager = crate::LixRuntimeManager::new_in_memory_with_telemetry(1, sink(&provider));
+    manager.provision_test_repositories().await;
     let app = crate::router(
         Arc::clone(&manager),
         Some("test-internal-token".into()),

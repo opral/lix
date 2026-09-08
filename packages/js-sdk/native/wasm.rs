@@ -583,7 +583,7 @@ async fn open_browser_storage(
                     .push((BROWSER_TRANSPORT_CONFIG_HEADER.to_owned(), id.clone()));
                 browser_sync_transport_id = Some(id);
             }
-            Some(ServerOptions::sync(parsed.url).with_headers(parsed.headers))
+            Some(ServerOptions::new(parsed.url).with_headers(parsed.headers))
         }
         None => None,
     };
@@ -794,6 +794,15 @@ impl WasmLix {
             browser_sync_transport_id: self.browser_sync_transport_id.clone(),
             telemetry_parent: self.telemetry_parent.clone(),
         })
+    }
+
+    #[wasm_bindgen(js_name = createHosted)]
+    pub async fn create_hosted(&self, server: JsValue) -> Result<JsValue, JsValue> {
+        let hosted = hosted_create_builder(server)?
+            .from_lix(&self.inner)
+            .await
+            .map_err(lix_error_to_js)?;
+        to_js(&hosted)
     }
 
     #[wasm_bindgen(js_name = exportSnapshot)]
@@ -1556,4 +1565,44 @@ mod value_kind_tests {
             assert!(error.message.contains("unsupported LixValue kind"));
         }
     }
+}
+
+fn hosted_server(value: JsValue) -> Result<ServerOptions, JsValue> {
+    #[derive(Deserialize)]
+    struct Options {
+        url: String,
+        headers: Vec<(String, String)>,
+    }
+    let options: Options = from_js(value)?;
+    Ok(ServerOptions::new(options.url).with_headers(options.headers))
+}
+
+#[wasm_bindgen(js_name = createHosted)]
+pub async fn create_hosted(server: JsValue) -> Result<JsValue, JsValue> {
+    let hosted = hosted_create_builder(server)?
+        .await
+        .map_err(lix_error_to_js)?;
+    to_js(&hosted)
+}
+
+#[wasm_bindgen(js_name = deleteHosted)]
+pub async fn delete_hosted(server: JsValue) -> Result<(), JsValue> {
+    lix::delete_lix()
+        .with_server(hosted_server(server)?)
+        .await
+        .map_err(lix_error_to_js)
+}
+
+fn hosted_create_builder(value: JsValue) -> Result<lix::CreateLixBuilder, JsValue> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Options {
+        idempotency_key: Option<String>,
+    }
+    let options: Options = from_js(value.clone())?;
+    let mut builder = lix::create_lix().with_server(hosted_server(value)?);
+    if let Some(key) = options.idempotency_key {
+        builder = builder.with_idempotency_key(key);
+    }
+    Ok(builder)
 }

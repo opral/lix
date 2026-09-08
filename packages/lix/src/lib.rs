@@ -148,10 +148,14 @@ pub mod wasm;
 #[cfg(feature = "default_wasm_runtime")]
 #[doc(hidden)]
 pub use plugin::runtime::default::runtime as default_wasm_runtime;
+mod lifecycle;
+pub use lifecycle::{create_lix, delete_lix, CreateLixBuilder, DeleteLixBuilder, HostedLix};
 pub use handle::{
     CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
     ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder,
-    ServerMode, ServerOptions, TransactionExecuteBuilder, open_lix,
+    ServerOptions, TransactionExecuteBuilder, UnconfiguredOpenLixBuilder, RemoteOpenLixBuilder,
+    RemoteLix, RemoteExecuteBuilder, RemoteLixTransaction, RemoteObserveEvents,
+    RemoteOpenAnotherSessionBuilder, RemoteTransactionExecuteBuilder, RemoteExecuteBatchBuilder, open_lix,
 };
 pub use open_types::{
     OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,

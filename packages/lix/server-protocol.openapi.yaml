@@ -10,7 +10,42 @@ security:
   - cookieAuth: []
   - {}
 paths:
+  /lix/v1:
+    post:
+      operationId: createLix
+      description: Atomically create an empty hosted repository or import a complete snapshot, preserving tracked and untracked rows and history. Creation is explicit; opening an unknown ID never creates it. The host authenticates and authorizes creation before protocol dispatch.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 255 }
+          description: A stable operation key scoped to the verified principal. Retries with the same body return the same repository; a different body conflicts.
+      requestBody:
+        required: false
+        content:
+          application/vnd.lix.snapshot:
+            schema: { type: string, format: binary }
+      responses:
+        "201":
+          description: Repository is durably initialized and available. An idempotent replay returns the same descriptor.
+          headers:
+            Location: { schema: { type: string, format: uri } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, url]
+                properties:
+                  id: { type: string, format: uuid }
+                  url: { type: string, format: uri }
+        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}:
+    delete:
+      operationId: deleteLix
+      description: Permanently delete the hosted repository and fence its sessions. Missing repositories succeed. Old creation retries and syncing clients cannot recreate deleted resources.
+      responses:
+        "204": { description: Repository is deleted or already absent. }
+        default: { $ref: "#/components/responses/Error" }
     parameters:
       - $ref: "#/components/parameters/LixId"
     get:
@@ -23,7 +58,7 @@ paths:
           description: Allowed only while creating a session.
       responses:
         "200":
-          description: Session created or resumed.
+          description: Session created or resumed in an existing repository. Unknown repository IDs return 404.
           headers:
             Cache-Control: { schema: { type: string, const: no-store } }
           content:

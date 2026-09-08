@@ -22,6 +22,19 @@ There are two ways to get a server:
 
 Both speak the same protocol. Only the URL changes in client code.
 
+## Create and delete repositories
+
+Use `createLix({ server: { url: hostOrigin, headers } })` to create a hosted
+repository programmatically. It returns `{ id, url }`; pass `url` to
+`openLix({ server: { url, headers } })`. Add `storage` to that open request to
+keep a synchronized local replica.
+
+`createLix({ server, from: localLix })` creates a point-in-time copy including
+history and untracked rows. It does not connect the source handle. Use
+`deleteLix({ server: { url, headers } })` to delete the hosted repository;
+closing a session does not delete it. See the
+[API reference](./js-api-reference.md#hosted-repository-lifecycle).
+
 ## Official host: lixray.com
 
 [LixRay](https://lixray.com) is the official Lix host. Copy the immutable Lix
@@ -32,7 +45,6 @@ import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
   server: {
-    mode: "remote",
     url: "https://lixray.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
     headers: async () => ({
       Authorization: `Bearer ${await getAccessToken()}`,
