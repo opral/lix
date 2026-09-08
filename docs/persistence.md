@@ -7,7 +7,7 @@ description: Start with in-memory Lix, persist local files, connect to a server,
 Lix runs in memory by default. Choose a storage adapter when you need to keep
 data across restarts. Files, SQL, and version control use the same API.
 
-<img src="../website/public/assets/local-only-storage.png" alt="Lix runs on one device with a choice of memory, filesystem, or browser OPFS storage adapter. No server is required." width="760" />
+<img src="../website/public/assets/local-only-storage.webp" alt="Lix runs on one device with a choice of memory, filesystem, or browser OPFS storage adapter. No server is required." width="760" decoding="async" />
 
 ## In-memory (default)
 
@@ -55,7 +55,7 @@ Use `FilesystemStorage` for project directories or mounted sandbox volumes.
 It keeps ordinary files synchronized with the replica, which exchanges commits
 with the server in the background.
 
-<img src="../website/public/assets/filesystem-server-storage.png" alt="A machine or sandbox runs Replica Lix with FilesystemStorage. Agents and tools read and write ordinary project files. The replica synchronizes with Authoritative Lix on a server backed by SlateDB and S3." width="760" />
+<img src="../website/public/assets/filesystem-server-storage.webp" alt="A machine or sandbox runs Replica Lix with FilesystemStorage. Agents and tools read and write ordinary project files. The replica synchronizes with Authoritative Lix on a server backed by SlateDB and S3." width="760" decoding="async" loading="lazy" />
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -90,7 +90,7 @@ Storage is managed on the server. Use [LixRay](https://lixray.com/docs) or
 [your own host](./hosting.md), and replace the example URL with your Lix
 connection URL.
 
-<img src="../website/public/assets/remote-server-storage.png" alt="The client uses the Lix SDK to make API calls to Authoritative Lix on the server, with no local storage. The server uses a SlateDB storage adapter backed by S3." width="760" />
+<img src="../website/public/assets/remote-server-storage.webp" alt="The client uses the Lix SDK to make API calls to Authoritative Lix on the server, with no local storage. The server uses a SlateDB storage adapter backed by S3." width="760" decoding="async" loading="lazy" />
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -119,7 +119,7 @@ For a Linear-like UI, reads and writes use local data instead of waiting for a
 network round trip on each interaction. Edits commit locally and sync in the
 background. Uncached data can still require a network fetch.
 
-<img src="../website/public/assets/browser-server-storage.png" alt="A browser runs Replica Lix with a SQLite storage adapter backed by OPFS. It synchronizes with Authoritative Lix on a server, whose SlateDB storage adapter uses S3." width="760" />
+<img src="../website/public/assets/browser-server-storage.webp" alt="A browser runs Replica Lix with a SQLite storage adapter backed by OPFS. It synchronizes with Authoritative Lix on a server, whose SlateDB storage adapter uses S3." width="760" decoding="async" loading="lazy" />
 
 ```ts
 import { openLix } from "@lix-js/sdk";
