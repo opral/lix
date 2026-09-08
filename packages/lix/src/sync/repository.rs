@@ -671,14 +671,33 @@ struct PendingSyncReset {
     /// can differ from the restore target when local commits follow restore.
     #[serde(default)]
     prepared_reset_head_commit_id: Option<String>,
-    /// Reset request heads prepared before a newer restore replaced them. An
-    /// acknowledgement for one of these rebases, rather than erases, the
-    /// newest local restore intent.
+    #[serde(default)]
+    prepared_reset_checkpoint_commit_id: Option<String>,
+    /// Legacy head-only tokens retained for receipt decoding. They cannot
+    /// establish the exact target coordinate of an acknowledgment.
     #[serde(default)]
     superseded_prepared_reset_head_commit_ids: BTreeSet<String>,
+    /// Exact superseded targets prepared against this intent's expected
+    /// authority coordinate. Legacy head-only tokens never prove acceptance.
+    #[serde(default)]
+    superseded_prepared_reset_coordinates: BTreeSet<(String, String)>,
 }
 
-const MAX_SUPERSEDED_RESET_HEADS: usize = 16;
+const MAX_SUPERSEDED_RESET_COORDINATES: usize = 64;
+
+fn retain_prepared_reset_coordinate(
+    coordinates: &mut BTreeSet<(String, String)>,
+    head: Option<&String>,
+    checkpoint: Option<&String>,
+) -> bool {
+    let (Some(head), Some(checkpoint)) = (head, checkpoint) else {
+        return false;
+    };
+    if coordinates.len() >= MAX_SUPERSEDED_RESET_COORDINATES {
+        return false;
+    }
+    coordinates.insert((head.clone(), checkpoint.clone()))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SyncReplicaBinding {
@@ -1317,17 +1336,20 @@ pub(crate) async fn stage_sync_restore_intents(
         )
         .await?
         .map(|commit_id| commit_id.to_string());
-        let mut superseded_prepared_reset_head_commit_ids = previous_intent
+        let superseded_prepared_reset_head_commit_ids = previous_intent
             .as_ref()
             .map(|pending| pending.superseded_prepared_reset_head_commit_ids.clone())
             .unwrap_or_default();
-        if let Some(prepared_head) = previous_intent
+        let mut superseded_prepared_reset_coordinates = previous_intent
             .as_ref()
-            .and_then(|pending| pending.prepared_reset_head_commit_id.as_ref())
-            .filter(|prepared_head| *prepared_head != &restore_target)
-            && superseded_prepared_reset_head_commit_ids.len() < MAX_SUPERSEDED_RESET_HEADS
-        {
-            superseded_prepared_reset_head_commit_ids.insert(prepared_head.clone());
+            .map(|pending| pending.superseded_prepared_reset_coordinates.clone())
+            .unwrap_or_default();
+        if let Some(previous) = previous_intent.as_ref() {
+            retain_prepared_reset_coordinate(
+                &mut superseded_prepared_reset_coordinates,
+                previous.prepared_reset_head_commit_id.as_ref(),
+                previous.prepared_reset_checkpoint_commit_id.as_ref(),
+            );
         }
         let intent = PendingSyncReset {
             expected_authority_head_commit_id: head_commit_id,
@@ -1335,7 +1357,9 @@ pub(crate) async fn stage_sync_restore_intents(
             restore_target_commit_id: restore_target,
             authority_known_ancestor_commit_id,
             prepared_reset_head_commit_id: None,
+            prepared_reset_checkpoint_commit_id: None,
             superseded_prepared_reset_head_commit_ids,
+            superseded_prepared_reset_coordinates,
         };
         if state.pending_resets.get(branch_id) != Some(&intent) {
             state.pending_resets.insert(branch_id.clone(), intent);
@@ -3258,7 +3282,11 @@ where
                 .filter_map(|update| {
                     let intent = state.pending_resets.get(&update.branch_id)?;
                     let head = update.head_commit_id.as_ref()?;
-                    Some((update.branch_id.clone(), (intent.clone(), head.clone())))
+                    let checkpoint = update.checkpoint_commit_id.as_ref()?;
+                    Some((
+                        update.branch_id.clone(),
+                        (intent.clone(), head.clone(), checkpoint.clone()),
+                    ))
                 })
                 .collect::<BTreeMap<_, _>>();
             let blob_ids = sync_commit_blob_ids(&request.commits)?;
@@ -3298,7 +3326,7 @@ where
     async fn mark_pending_reset_heads(
         &self,
         _remote_id: &str,
-        prepared: &BTreeMap<String, (PendingSyncReset, String)>,
+        prepared: &BTreeMap<String, (PendingSyncReset, String, String)>,
     ) -> Result<bool, LixError> {
         let _collaboration_guard = self.lock_collaboration_writes().await;
         let adapter = self.storage_adapter();
@@ -3307,23 +3335,31 @@ where
             return Ok(false);
         };
         let mut changed = false;
-        for (branch_id, (expected, prepared_head)) in prepared {
+        for (branch_id, (expected, prepared_head, prepared_checkpoint)) in prepared {
             let Some(current) = state.pending_resets.get_mut(branch_id) else {
                 return Ok(false);
             };
             if current != expected {
                 return Ok(false);
             }
-            if current.prepared_reset_head_commit_id.as_deref() != Some(prepared_head) {
-                current.prepared_reset_head_commit_id = Some(prepared_head.clone());
-                changed = true;
-            }
-            if current
-                .superseded_prepared_reset_head_commit_ids
-                .remove(prepared_head)
+            if current.prepared_reset_head_commit_id.as_deref() != Some(prepared_head)
+                || current.prepared_reset_checkpoint_commit_id.as_deref()
+                    != Some(prepared_checkpoint)
             {
+                // Another worker may still have the previous request in
+                // flight, even when only an ordinary local child changed H.
+                retain_prepared_reset_coordinate(
+                    &mut current.superseded_prepared_reset_coordinates,
+                    current.prepared_reset_head_commit_id.as_ref(),
+                    current.prepared_reset_checkpoint_commit_id.as_ref(),
+                );
+                current.prepared_reset_head_commit_id = Some(prepared_head.clone());
+                current.prepared_reset_checkpoint_commit_id = Some(prepared_checkpoint.clone());
                 changed = true;
             }
+            changed |= current
+                .superseded_prepared_reset_coordinates
+                .remove(&(prepared_head.clone(), prepared_checkpoint.clone()));
         }
         if !changed {
             return Ok(true);
@@ -3626,6 +3662,7 @@ where
                 let mut commits = BTreeMap::new();
                 let mut inline_blobs = BTreeMap::new();
                 let mut branch_chains = BTreeMap::<String, (Option<String>, Option<String>)>::new();
+                let mut preserved_reset_branches = BTreeSet::new();
                 for event in events {
                     let next_cursor = state
                         .cursor
@@ -3690,6 +3727,53 @@ where
                             update.checkpoint_commit_id.clone(),
                             "sync delta ref",
                         )?;
+                        // A newer restore is not necessarily a descendant of
+                        // an older in-flight restore. Its durable prepared-head
+                        // token proves this is our acknowledgment, not another
+                        // writer's incompatible ref. Rebase the newer intent's
+                        // CAS coordinate without changing its target or baseline.
+                        let superseded_reset_ack = state
+                            .pending_resets
+                            .get_mut(&update.branch_id)
+                            .is_some_and(|intent| {
+                                let Some(head) = update.head_commit_id.as_ref() else {
+                                    return false;
+                                };
+                                let Some(checkpoint) = update.checkpoint_commit_id.as_ref() else {
+                                    return false;
+                                };
+                                if Some(intent.expected_authority_head_commit_id.as_str())
+                                    != update.expected_head_commit_id.as_deref()
+                                    || Some(intent.expected_authority_checkpoint_commit_id.as_str())
+                                        != update.expected_checkpoint_commit_id.as_deref()
+                                    || !intent
+                                        .superseded_prepared_reset_coordinates
+                                        .contains(&(head.clone(), checkpoint.clone()))
+                                {
+                                    return false;
+                                }
+                                // All recorded requests used the old expected
+                                // source. Once it advances none can CAS again;
+                                // retaining them would misidentify a foreign
+                                // write from the new source as our acknowledgment.
+                                intent.superseded_prepared_reset_coordinates.clear();
+                                intent.superseded_prepared_reset_head_commit_ids.clear();
+                                intent.expected_authority_head_commit_id = head.clone();
+                                intent.expected_authority_checkpoint_commit_id = update
+                                    .checkpoint_commit_id
+                                    .clone()
+                                    .expect("headed ref has a checkpoint");
+                                intent.prepared_reset_head_commit_id = None;
+                                intent.prepared_reset_checkpoint_commit_id = None;
+                                true
+                            });
+                        if superseded_reset_ack {
+                            preserved_reset_branches.insert(update.branch_id.clone());
+                        } else {
+                            // A later unrelated ref in the same delta page
+                            // still wins over the pending restore.
+                            preserved_reset_branches.remove(&update.branch_id);
+                        }
                         let chain = branch_chains
                             .entry(update.branch_id.clone())
                             .or_insert_with(|| {
@@ -3727,21 +3811,22 @@ where
                     // Own acknowledged prefixes must never roll back a newer
                     // local transaction. A competing server branch wins. Walk
                     // only the local chain; no historical network demand.
-                    let preserve_local = match (local.0.as_deref(), head.as_deref()) {
-                        (Some(local_head), Some(server_head)) if local_head != server_head => {
-                            let server_head =
-                                CommitId::parse_lix(server_head, "acknowledged head")?;
-                            !confirmed_boundaries.contains(&server_head)
-                                && pending_commit_reaches(
-                                    &read,
-                                    CommitId::parse_lix(local_head, "local pending head")?,
-                                    server_head,
-                                    &confirmed_boundaries,
-                                )
-                                .await?
-                        }
-                        _ => false,
-                    };
+                    let preserve_local = preserved_reset_branches.contains(branch_id)
+                        || match (local.0.as_deref(), head.as_deref()) {
+                            (Some(local_head), Some(server_head)) if local_head != server_head => {
+                                let server_head =
+                                    CommitId::parse_lix(server_head, "acknowledged head")?;
+                                !confirmed_boundaries.contains(&server_head)
+                                    && pending_commit_reaches(
+                                        &read,
+                                        CommitId::parse_lix(local_head, "local pending head")?,
+                                        server_head,
+                                        &confirmed_boundaries,
+                                    )
+                                    .await?
+                            }
+                            _ => false,
+                        };
                     if !preserve_local
                         && (local.0.as_deref(), local.1.as_deref())
                             != (head.as_deref(), checkpoint.as_deref())
@@ -11968,90 +12053,380 @@ mod tests {
         );
     }
 
+    #[test]
+    fn superseded_restore_coordinates_are_bounded_by_pairs() {
+        let mut coordinates = BTreeSet::new();
+        let head = "same-head".to_owned();
+        for index in 0..=MAX_SUPERSEDED_RESET_COORDINATES {
+            retain_prepared_reset_coordinate(
+                &mut coordinates,
+                Some(&head),
+                Some(&format!("checkpoint-{index}")),
+            );
+        }
+        assert_eq!(coordinates.len(), MAX_SUPERSEDED_RESET_COORDINATES);
+        assert!(coordinates.contains(&(head, "checkpoint-0".to_owned())));
+    }
+
     #[tokio::test]
-    #[ignore = "v3 replicas cannot author restore intents"]
+    async fn multiple_prepared_restore_coordinates_preserve_the_oldest_in_flight_ack() {
+        for (same_head, foreign_reuses_old_pair) in [(true, false), (false, false), (true, true)] {
+            let authority = open_lix().await.expect("authority opens");
+            write_key_value(&authority, "restore-chain", "oldest").await;
+            let oldest = current_branch_head(&authority).await;
+            write_key_value(&authority, "restore-chain", "middle").await;
+            let middle = current_branch_head(&authority).await;
+            write_key_value(&authority, "restore-chain", "tip").await;
+            let snapshot = authority
+                .pull_sync_repository(None, 1)
+                .await
+                .expect("snapshot");
+            let replica = replica_from_snapshot(&authority, &snapshot).await;
+            hydrate_history_commit(&authority, &replica, &middle).await;
+            hydrate_history_commit(&authority, &replica, &oldest).await;
+            replica
+                .execute(
+                    "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                    &[Value::Text(middle)],
+                )
+                .await
+                .expect("restore A");
+            write_key_value(&replica, "after-A", "child").await;
+            let first = replica
+                .build_sync_push(TEST_REMOTE, 128)
+                .await
+                .expect("prepare A")
+                .expect("pending A");
+            authority
+                .push_sync_repository(&first)
+                .await
+                .expect("accept A before its delta arrives");
+            if same_head {
+                // Restoring CURRENT HEAD is a no-op. Make H an ancestor
+                // before restoring it to establish the distinct (H,H) pair.
+                write_key_value(&replica, "temporary-before-B", "discarded").await;
+                replica
+                    .execute(
+                        "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                        &[Value::Text(
+                            first.ref_updates[0].head_commit_id.clone().unwrap(),
+                        )],
+                    )
+                    .await
+                    .expect("restore B to same H with a new C");
+            } else {
+                write_key_value(&replica, "after-B", "ordinary child").await;
+            }
+            // A sibling sync worker can prepare another request while A's
+            // acknowledgment is in flight. Preserve both exact coordinates.
+            let second = replica
+                .build_sync_push(TEST_REMOTE, 128)
+                .await
+                .expect("prepare B")
+                .expect("pending B");
+            replica
+                .execute(
+                    "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                    &[Value::Text(oldest)],
+                )
+                .await
+                .expect("restore C");
+            write_key_value(&replica, "after-C", "preserved").await;
+            let local_head = current_branch_head(&replica).await;
+            let read = replica
+                .storage_adapter()
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("intent read");
+            let state = load_replica_state(&read).await.expect("receipt").0.unwrap();
+            let intent = state
+                .pending_resets
+                .get(&first.ref_updates[0].branch_id)
+                .unwrap();
+            for request in [&first, &second] {
+                assert!(intent.superseded_prepared_reset_coordinates.contains(&(
+                    request.ref_updates[0].head_commit_id.clone().unwrap(),
+                    request.ref_updates[0].checkpoint_commit_id.clone().unwrap()
+                )));
+            }
+            drop(read);
+            if foreign_reuses_old_pair {
+                let mut foreign = second.clone();
+                foreign.ref_updates[0].expected_head_commit_id =
+                    first.ref_updates[0].head_commit_id.clone();
+                foreign.ref_updates[0].expected_checkpoint_commit_id =
+                    first.ref_updates[0].checkpoint_commit_id.clone();
+                authority
+                    .push_sync_repository(&foreign)
+                    .await
+                    .expect("foreign write uses new source and B's old target pair");
+            }
+            let cursor = replica
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .expect("cursor")
+                .unwrap();
+            let delta = authority
+                .pull_sync_repository(Some(cursor), 128)
+                .await
+                .expect("acknowledgment page");
+            replica
+                .apply_sync_repository_pull(TEST_REMOTE, &delta)
+                .await
+                .expect("apply acknowledgment");
+            if foreign_reuses_old_pair {
+                assert_eq!(
+                    current_branch_head(&replica).await,
+                    second.ref_updates[0].head_commit_id.clone().unwrap()
+                );
+                assert!(
+                    replica
+                        .build_sync_push(TEST_REMOTE, 128)
+                        .await
+                        .expect("foreign source must not be mistaken for own ack")
+                        .is_none()
+                );
+            } else {
+                assert_eq!(current_branch_head(&replica).await, local_head);
+                assert_eq!(read_key_value(&replica, "after-C").await, "preserved");
+                let third = replica
+                    .build_sync_push(TEST_REMOTE, 128)
+                    .await
+                    .expect("rebased C")
+                    .expect("C remains pending");
+                assert_eq!(
+                    third.ref_updates[0].expected_head_commit_id,
+                    first.ref_updates[0].head_commit_id
+                );
+                assert_eq!(
+                    third.ref_updates[0].expected_checkpoint_commit_id,
+                    first.ref_updates[0].checkpoint_commit_id
+                );
+                authority
+                    .push_sync_repository(&third)
+                    .await
+                    .expect("accept C against A's coordinate");
+                assert_eq!(read_key_value(&authority, "after-C").await, "preserved");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_restore_tokens_decode_without_claiming_an_exact_checkpoint() {
+        let pending: PendingSyncReset = serde_json::from_value(serde_json::json!({
+            "expectedAuthorityHeadCommitId": "head",
+            "expectedAuthorityCheckpointCommitId": "checkpoint",
+            "restoreTargetCommitId": "target",
+            "authorityKnownAncestorCommitId": null,
+            "preparedResetHeadCommitId": "prepared",
+            "supersededPreparedResetHeadCommitIds": ["older"]
+        }))
+        .expect("previous receipt format remains readable");
+        assert!(pending.prepared_reset_checkpoint_commit_id.is_none());
+        assert!(pending.superseded_prepared_reset_coordinates.is_empty());
+    }
+
+    #[tokio::test]
     async fn newer_restore_survives_an_older_reset_acknowledgement() {
-        let authority = open_lix().await.expect("authority should open");
-        write_key_value(&authority, "restore-chain", "oldest").await;
-        write_key_value(&authority, "restore-chain", "middle").await;
-        write_key_value(&authority, "restore-chain", "tip").await;
-        let snapshot = authority
-            .pull_sync_repository(None, 1)
-            .await
-            .expect("snapshot should load");
-        let (_, authority_head) = default_head(&snapshot);
-        let middle = authority
-            .sync_history(&authority_head, 1)
-            .await
-            .expect("tip history should load")
-            .commits[0]
-            .parent_commit_ids[0]
-            .clone();
-        let oldest = authority
-            .sync_history(&middle, 1)
-            .await
-            .expect("middle history should load")
-            .commits[0]
-            .parent_commit_ids[0]
-            .clone();
-        let replica = replica_from_snapshot(&authority, &snapshot).await;
-        hydrate_history_commit(&authority, &replica, &middle).await;
-        hydrate_history_commit(&authority, &replica, &oldest).await;
+        for (local_child, competing_server_write, different_checkpoint, same_head_restore) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (false, false, false, true),
+        ] {
+            let authority = open_lix().await.expect("authority should open");
+            write_key_value(&authority, "restore-chain", "oldest").await;
+            write_key_value(&authority, "restore-chain", "middle").await;
+            write_key_value(&authority, "restore-chain", "tip").await;
+            let snapshot = authority
+                .pull_sync_repository(None, 1)
+                .await
+                .expect("snapshot should load");
+            let (_, authority_head) = default_head(&snapshot);
+            let middle = authority
+                .sync_history(&authority_head, 1)
+                .await
+                .expect("tip history should load")
+                .commits[0]
+                .parent_commit_ids[0]
+                .clone();
+            let oldest = authority
+                .sync_history(&middle, 1)
+                .await
+                .expect("middle history should load")
+                .commits[0]
+                .parent_commit_ids[0]
+                .clone();
+            let replica = replica_from_snapshot(&authority, &snapshot).await;
+            hydrate_history_commit(&authority, &replica, &middle).await;
+            hydrate_history_commit(&authority, &replica, &oldest).await;
 
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(middle.clone())],
-            )
-            .await
-            .expect("first restore should succeed");
-        write_key_value(&replica, "after-first-restore", "local-child").await;
-        let first_prepared_head = current_branch_head(&replica).await;
-        let first = replica
-            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
-            .await
-            .expect("first reset should build")
-            .expect("first reset should be pending");
-        authority
-            .push_sync_repository(&first)
-            .await
-            .expect("authority should accept the first reset");
+            replica
+                .execute(
+                    "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                    &[Value::Text(middle.clone())],
+                )
+                .await
+                .expect("first restore should succeed");
+            write_key_value(&replica, "after-first-restore", "local-child").await;
+            let first_prepared_head = current_branch_head(&replica).await;
+            let first = replica
+                .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                .await
+                .expect("first reset should build")
+                .expect("first reset should be pending");
+            let mut accepted = first.clone();
+            if different_checkpoint {
+                accepted.ref_updates[0].checkpoint_commit_id = accepted.ref_updates[0]
+                    .expected_checkpoint_commit_id
+                    .clone();
+                assert_ne!(
+                    accepted.ref_updates[0].checkpoint_commit_id,
+                    first.ref_updates[0].checkpoint_commit_id
+                );
+            }
+            authority
+                .push_sync_repository(&accepted)
+                .await
+                .expect("authority should accept the first reset");
 
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(oldest.clone())],
-            )
-            .await
-            .expect("newer restore should replace the in-flight intent");
-        let acknowledgement = authority
-            .pull_sync_repository(Some(0), 128)
-            .await
-            .expect("first reset acknowledgement should load");
-        replica
-            .apply_sync_repository_pull(TEST_REMOTE, &acknowledgement)
-            .await
-            .expect("older acknowledgement should preserve the newer restore");
+            if same_head_restore {
+                write_key_value(&replica, "temporary-before-newer-restore", "discarded").await;
+            }
+            replica
+                .execute(
+                    "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                    &[Value::Text(if same_head_restore {
+                        first_prepared_head.clone()
+                    } else {
+                        oldest.clone()
+                    })],
+                )
+                .await
+                .expect("newer restore should replace the in-flight intent");
+            if local_child {
+                write_key_value(&replica, "after-second-restore", "preserved").await;
+            }
+            let newer_local_head = current_branch_head(&replica).await;
+            if competing_server_write {
+                authority
+                    .set_sync_role(super::super::SyncRole::Authority)
+                    .expect("publish competing server event");
+                write_key_value(&authority, "restore-chain", "server-wins").await;
+            }
+            let acknowledgement = authority
+                .pull_sync_repository(Some(0), 128)
+                .await
+                .expect("first reset acknowledgement should load");
+            replica
+                .apply_sync_repository_pull(TEST_REMOTE, &acknowledgement)
+                .await
+                .expect("older acknowledgement should preserve the newer restore");
 
-        let second = replica
-            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
-            .await
-            .expect("rebased reset should build")
-            .expect("newer restore must remain pending");
-        assert_eq!(second.ref_updates.len(), 1);
-        assert_eq!(
-            second.ref_updates[0].expected_head_commit_id.as_deref(),
-            Some(first_prepared_head.as_str())
-        );
-        assert_eq!(
-            second.ref_updates[0].head_commit_id.as_deref(),
-            Some(oldest.as_str())
-        );
-        authority
-            .push_sync_repository(&second)
-            .await
-            .expect("authority should accept the rebased newer reset");
-        assert_eq!(current_branch_head(&authority).await, oldest);
+            if different_checkpoint {
+                assert_eq!(current_branch_head(&replica).await, first_prepared_head);
+                let read = replica
+                    .storage_adapter()
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("corrected control read");
+                let control = BranchHeadControlContext::new()
+                    .reader(&read)
+                    .load(&accepted.ref_updates[0].branch_id)
+                    .await
+                    .expect("corrected control")
+                    .expect("branch exists");
+                assert_eq!(
+                    control
+                        .working_diff_checkpoint_commit_id
+                        .map(|id| id.to_string()),
+                    accepted.ref_updates[0].checkpoint_commit_id
+                );
+                drop(read);
+                assert!(
+                    replica
+                        .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                        .await
+                        .expect("same head with a different checkpoint is a server correction")
+                        .is_none()
+                );
+                continue;
+            }
+            if competing_server_write {
+                assert_eq!(
+                    read_key_value(&replica, "restore-chain").await,
+                    "server-wins"
+                );
+                assert!(
+                    replica
+                        .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                        .await
+                        .expect("competing server ref clears pending restore")
+                        .is_none()
+                );
+                continue;
+            }
+            assert_eq!(current_branch_head(&replica).await, newer_local_head);
+            assert_eq!(
+                read_key_value(&replica, "restore-chain").await,
+                if same_head_restore {
+                    "middle"
+                } else {
+                    "oldest"
+                }
+            );
+            if local_child {
+                assert_eq!(
+                    read_key_value(&replica, "after-second-restore").await,
+                    "preserved"
+                );
+            }
+            let second = replica
+                .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                .await
+                .expect("rebased reset should build")
+                .unwrap_or_else(|| panic!("newer restore must remain pending: child={local_child}, competing={competing_server_write}, different_checkpoint={different_checkpoint}, same_head_restore={same_head_restore}"));
+            assert_eq!(second.ref_updates.len(), 1);
+            assert_eq!(
+                second.ref_updates[0].expected_head_commit_id.as_deref(),
+                Some(first_prepared_head.as_str())
+            );
+            assert_eq!(
+                second.ref_updates[0].expected_checkpoint_commit_id,
+                first.ref_updates[0].checkpoint_commit_id,
+                "newer restore must rebase both authority CAS coordinates"
+            );
+            assert_eq!(
+                second.ref_updates[0].head_commit_id.as_deref(),
+                Some(newer_local_head.as_str())
+            );
+            authority
+                .push_sync_repository(&second)
+                .await
+                .expect("authority should accept the rebased newer reset");
+            assert_eq!(current_branch_head(&authority).await, newer_local_head);
+            let cursor = replica
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .expect("replica cursor")
+                .expect("receipt");
+            let final_ack = authority
+                .pull_sync_repository(Some(cursor), 128)
+                .await
+                .expect("newer reset acknowledgment");
+            replica
+                .apply_sync_repository_pull(TEST_REMOTE, &final_ack)
+                .await
+                .expect("acknowledge newer restore");
+            assert!(
+                replica
+                    .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                    .await
+                    .expect("both restores acknowledged")
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]
