@@ -45,6 +45,10 @@ Coherent mixed current/history batches retry the whole captured read after
 hydration. Explicit transactions require historical inputs to be prefetched
 before opening their fixed snapshot.
 
+Current working-diff reads preserve storage snapshot-expiration errors through
+the HOT index provider, so concurrent publication retries the complete read
+batch instead of reporting a falsely unavailable index.
+
 Warm reopen uses local state and reconnects in the background. Close cancels
 network work; it does not await delivery. Canonical snapshot export opens a
 short-lived authority session on demand and exports accepted server state,

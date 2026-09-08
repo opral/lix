@@ -5292,7 +5292,9 @@ where
         control: BranchHeadControl,
         request: &TrackedStateDiffRequest,
     ) -> Result<Option<TrackedWorkingDiff>, LixError> {
-        let Ok(Some(epoch)) = self.working_diff_epoch(branch_id).await else {
+        // Expiration is a coherent-read retry signal, not missing coverage.
+        // Turning it into None strands callers behind a false HOT failure.
+        let Some(epoch) = self.working_diff_epoch(branch_id).await? else {
             return Ok(None);
         };
         let generation = epoch.generation;

@@ -15,6 +15,7 @@ struct ExpiringReadStorage {
     remaining_expired_scan_calls: Arc<AtomicUsize>,
     read_calls_before_expiry: Arc<AtomicUsize>,
     expired_calls: Arc<AtomicUsize>,
+    remaining_expired_hot_epoch_calls: Arc<AtomicUsize>,
 }
 
 impl ExpiringReadStorage {
@@ -25,6 +26,7 @@ impl ExpiringReadStorage {
             remaining_expired_scan_calls: Arc::new(AtomicUsize::new(0)),
             read_calls_before_expiry: Arc::new(AtomicUsize::new(usize::MAX)),
             expired_calls: Arc::new(AtomicUsize::new(0)),
+            remaining_expired_hot_epoch_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -63,17 +65,22 @@ struct ExpiringRead {
     remaining_expired_scan_calls: Arc<AtomicUsize>,
     read_calls_before_expiry: Arc<AtomicUsize>,
     expired_calls: Arc<AtomicUsize>,
+    remaining_expired_hot_epoch_calls: Arc<AtomicUsize>,
 }
 
 impl ExpiringRead {
     fn expire_if_armed(&self) -> Result<(), StorageError> {
         let countdown_expired = self
             .read_calls_before_expiry
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| match remaining {
-                usize::MAX => None,
-                0 => Some(usize::MAX),
-                remaining => Some(remaining - 1),
-            })
+            .fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |remaining| match remaining {
+                    usize::MAX => None,
+                    0 => Some(usize::MAX),
+                    remaining => Some(remaining - 1),
+                },
+            )
             .is_ok_and(|remaining| remaining == 0);
         let repeated_expiry = self
             .remaining_expired_read_calls
@@ -113,9 +120,7 @@ impl Storage for ExpiringReadStorage {
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
 
@@ -126,6 +131,7 @@ impl Storage for ExpiringReadStorage {
             remaining_expired_scan_calls: Arc::clone(&self.remaining_expired_scan_calls),
             read_calls_before_expiry: Arc::clone(&self.read_calls_before_expiry),
             expired_calls: Arc::clone(&self.expired_calls),
+            remaining_expired_hot_epoch_calls: Arc::clone(&self.remaining_expired_hot_epoch_calls),
         })
     }
 
@@ -144,6 +150,21 @@ impl StorageRead for ExpiringRead {
         requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
         self.expire_if_armed()?;
+        if requests.iter().any(|request| {
+            request.space.id.0 & 0x3fff_ffff
+                == crate::registered_spaces::TRACKED_WORKING_DIFF_MARKER_SPACE
+                    .id
+                    .0
+        }) && self
+            .remaining_expired_hot_epoch_calls
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.expired_calls.fetch_add(1, Ordering::AcqRel);
+            return Err(StorageError::ReadExpired);
+        }
         self.inner.get_many(requests).await
     }
 
@@ -299,6 +320,47 @@ async fn filesystem_provider_scan_preserves_expired_read_for_session_retry() {
             .expect("filesystem provider must preserve the typed retry signal");
         assert_eq!(storage.expired_calls(), expired_before + 1);
     }
+}
+
+#[tokio::test]
+async fn working_review_batch_retries_expired_hot_epoch_read() {
+    let storage = ExpiringReadStorage::new();
+    let lix = crate::open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open Lix");
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ('/review.md', $1)",
+        &[Value::Blob(b"pending review".to_vec().into())],
+    )
+    .await
+    .expect("seed working file");
+    let statements = [
+        ExecuteBatchStatement {
+            label: None,
+            sql: "SELECT lix_latest_checkpoint_commit_id() AS before_commit_id, lix_active_branch_commit_id() AS after_commit_id".to_string(),
+            params: vec![],
+        },
+        ExecuteBatchStatement {
+            label: None,
+            sql: "SELECT id, row_count, from_path, to_path FROM lix_diff('lix_file')".to_string(),
+            params: vec![],
+        },
+    ];
+    storage
+        .remaining_expired_hot_epoch_calls
+        .store(1, Ordering::Release);
+    let result = lix
+        .execute_batch(&statements)
+        .await
+        .expect("review must retry the whole coherent batch after HOT epoch expiration");
+    assert_eq!(
+        storage.expired_calls(),
+        1,
+        "fault must reach the HOT epoch lookup"
+    );
+    assert_eq!(result[1].rows().len(), 1);
+    assert_eq!(result[1].rows()[0].get::<String>("to_path").unwrap(), "/review.md");
 }
 
 #[tokio::test]
