@@ -169,3 +169,22 @@ pub(super) async fn load_copy_targets(
         .map(|proof| proof.targets)
         .unwrap_or_default())
 }
+
+/// A source coordinate may recur after an authority restore (ABA). Retire
+/// requests when the authority leaves that source, in the same receipt commit.
+/// Active local restores already copied their needed tokens into the receipt.
+pub(super) async fn stage_retire_proof(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+    branch_id: &str,
+) -> Result<(), LixError> {
+    let (_, raw) = load_proof(read, branch_id).await?;
+    let key = proof_key(branch_id)?;
+    let exists = raw.is_some();
+    preconditions.push(proof_precondition(key.clone(), raw));
+    if exists {
+        writes.delete(SYNC_UPLOAD_PROOF_SPACE, key);
+    }
+    Ok(())
+}

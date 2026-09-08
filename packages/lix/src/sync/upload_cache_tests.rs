@@ -504,3 +504,110 @@ async fn cached_upload_multiple_branch_deletes_share_one_atomic_generation() {
     );
     assert_eq!(read_key_value(&authority, "pending").await, "value-3");
 }
+
+#[tokio::test]
+async fn cached_upload_recreated_branch_invalidates_an_already_captured_deletion() {
+    let authority = open_lix().await.expect("authority");
+    let branch = authority
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-000000007913".to_owned()),
+            name: "captured-deletion".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+    let snapshot = authority.pull_sync_repository(None, 1).await.unwrap();
+    let replica = replica_from_snapshot(&authority, &snapshot).await;
+    for i in 0..8 {
+        write_key_value(&replica, "recreated-during-upload", &format!("value-{i}")).await;
+    }
+    let replacement_head = upload_cache_head(&replica).await;
+    replica
+        .execute(
+            "DELETE FROM lix_branch WHERE id = $1",
+            &[Value::Text(branch.id.clone())],
+        )
+        .await
+        .expect("delete an authority-known branch before capturing the wave");
+    let mut cache = None;
+    let first = replica
+        .build_sync_push_with_plan(TEST_REMOTE, 1, &mut cache)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.commits.len(), 1);
+    assert!(first.ref_updates.is_empty());
+    let plan = &cache.as_ref().unwrap().plan;
+    let generation = plan.generation();
+    assert!(
+        plan.page(128)
+            .unwrap()
+            .unwrap()
+            .ref_updates
+            .iter()
+            .any(|update| update.branch_id == branch.id && update.head_commit_id.is_none()),
+        "the retained wave must already contain the now-obsolete deletion"
+    );
+    frontier_apply_upload(&authority, &replica, &first).await;
+    cache.as_mut().unwrap().acknowledge().unwrap();
+
+    // This is absent-to-headed locally: checking only existing.is_some()
+    // misses the destructive change to the previously captured deletion.
+    replica
+        .create_branch(CreateBranchOptions {
+            id: Some(branch.id.clone()),
+            name: "recreated-during-upload".to_owned(),
+            from_commit_id: Some(replacement_head.clone()),
+        })
+        .await
+        .expect("recreate the same branch while the deletion wave drains");
+    let mut rebuilt = false;
+    let mut published_replacement = false;
+    for _ in 0..32 {
+        let Some(request) = replica
+            .build_sync_push_with_plan(TEST_REMOTE, 2, &mut cache)
+            .await
+            .expect("recreated branch rebuilds the retained wave")
+        else {
+            break;
+        };
+        if !rebuilt {
+            assert_ne!(cache.as_ref().unwrap().plan.generation(), generation);
+            rebuilt = true;
+        }
+        for update in &request.ref_updates {
+            if update.branch_id == branch.id {
+                assert_eq!(
+                    update.head_commit_id.as_deref(),
+                    Some(replacement_head.as_str()),
+                    "an obsolete deletion must never reach the authority"
+                );
+                published_replacement = true;
+            }
+        }
+        frontier_apply_upload(&authority, &replica, &request).await;
+        cache.as_mut().unwrap().acknowledge().unwrap();
+    }
+    assert!(rebuilt && published_replacement);
+    for lix in [&authority, &replica] {
+        assert_eq!(
+            lix.execute(
+                "SELECT name FROM lix_branch WHERE id = $1",
+                &[Value::Text(branch.id.clone())]
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+                .get::<String>("name")
+                .unwrap(),
+            "recreated-during-upload"
+        );
+        lix.switch_branch(SwitchBranchOptions {
+            branch_id: branch.id.clone(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(upload_cache_head(lix).await, replacement_head);
+        assert_eq!(read_key_value(lix, "recreated-during-upload").await, "value-7");
+    }
+}

@@ -250,3 +250,101 @@ async fn ordinary_upload_ack_preserves_a_later_restore_without_prior_reset() {
         }
     }
 }
+
+#[tokio::test]
+async fn authority_coordinate_aba_cannot_revive_an_old_upload_proof() {
+    for separate_acknowledgment_page in [false, true] {
+        let authority = open_lix().await.unwrap();
+        write_key_value(&authority, "proof-aba", "restore-target").await;
+        let restore_target = current_branch_head(&authority).await;
+        write_key_value(&authority, "proof-aba", "source-a").await;
+        let snapshot = authority.pull_sync_repository(None, 1).await.unwrap();
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        hydrate_history_commit(&authority, &replica, &restore_target).await;
+        write_key_value(&replica, "proof-aba", "target-t").await;
+        let target = current_branch_head(&replica).await;
+        let request = replica
+            .build_sync_push(TEST_REMOTE, 128)
+            .await
+            .unwrap()
+            .unwrap();
+        let prepared = request
+            .ref_updates
+            .iter()
+            .find(|update| update.head_commit_id.as_deref() == Some(target.as_str()))
+            .unwrap()
+            .clone();
+        if separate_acknowledgment_page {
+            frontier_apply_upload(&authority, &replica, &request).await;
+        } else {
+            authority.push_sync_repository(&request).await.unwrap();
+        }
+        // Another writer returns the authority to the exact old H/C pair.
+        // Also exercise both transitions folded into one delta publication.
+        authority
+            .push_sync_repository(&SyncPushRequest {
+                commits: Vec::new(),
+                inline_blobs: Vec::new(),
+                ref_updates: vec![SyncRefUpdate {
+                    branch_id: prepared.branch_id.clone(),
+                    expected_head_commit_id: prepared.head_commit_id.clone(),
+                    expected_checkpoint_commit_id: prepared.checkpoint_commit_id.clone(),
+                    head_commit_id: prepared.expected_head_commit_id.clone(),
+                    checkpoint_commit_id: prepared.expected_checkpoint_commit_id.clone(),
+                }],
+            })
+            .await
+            .unwrap();
+        let cursor = replica
+            .load_sync_repository_cursor(TEST_REMOTE)
+            .await
+            .unwrap();
+        let delta = authority.pull_sync_repository(cursor, 128).await.unwrap();
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .unwrap();
+        let adapter = replica.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            super::super::upload_proof::load_proof(&read, &prepared.branch_id)
+                .await
+                .unwrap()
+                .0
+                .is_none(),
+            "an authority source transition retires its prepared requests"
+        );
+        drop(read);
+        replica
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                &[Value::Text(restore_target)],
+            )
+            .await
+            .unwrap();
+        // This is a new foreign A -> T, not the old request's acknowledgment.
+        // Equal commit coordinates must not revive its retired proof.
+        frontier_apply_upload(
+            &authority,
+            &replica,
+            &SyncPushRequest {
+                commits: Vec::new(),
+                inline_blobs: Vec::new(),
+                ref_updates: vec![prepared],
+            },
+        )
+        .await;
+        assert_eq!(read_key_value(&replica, "proof-aba").await, "target-t");
+        assert!(
+            replica
+                .build_sync_push(TEST_REMOTE, 128)
+                .await
+                .unwrap()
+                .is_none(),
+            "foreign authority publication discards the pending restore after ABA"
+        );
+    }
+}

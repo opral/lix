@@ -815,6 +815,7 @@ impl AuthoritativeBranchCoordinate {
 }
 
 struct ReplicaStatePublication<'a> {
+    retired_upload_proof_branches: &'a [String],
     reset_pending: bool,
     expected_cursor: u64,
     expected_state_raw: &'a Bytes,
@@ -3780,6 +3781,7 @@ where
                 SyncImportPurpose::ReplicaDelta,
                 None,
                 Some(ReplicaStatePublication {
+                    retired_upload_proof_branches: &[],
                     expected_cursor: cursor,
                     expected_state_raw: &raw,
                     state: &state,
@@ -3904,6 +3906,7 @@ where
                 let mut inline_blobs = BTreeMap::new();
                 let mut branch_chains = BTreeMap::<String, (Option<String>, Option<String>)>::new();
                 let mut preserved_reset_branches = BTreeSet::new();
+                let mut retired_upload_proof_branches = BTreeSet::new();
                 for event in events {
                     let next_cursor = state
                         .cursor
@@ -3968,6 +3971,11 @@ where
                             update.checkpoint_commit_id.clone(),
                             "sync delta ref",
                         )?;
+                        if update.head_commit_id != update.expected_head_commit_id
+                            || update.checkpoint_commit_id != update.expected_checkpoint_commit_id
+                        {
+                            retired_upload_proof_branches.insert(update.branch_id.clone());
+                        }
                         // A newer restore is not necessarily a descendant of
                         // an older in-flight restore. Its durable prepared-head
                         // token proves this is our acknowledgment, not another
@@ -4201,6 +4209,9 @@ where
                     }
                 }
                 drop(read);
+                let retired_upload_proof_branches = retired_upload_proof_branches
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 let publication = Box::pin(self.import_sync_repository(
                     &SyncPushRequest {
                         commits,
@@ -4210,6 +4221,7 @@ where
                     SyncImportPurpose::ReplicaDelta,
                     None,
                     Some(ReplicaStatePublication {
+                        retired_upload_proof_branches: &retired_upload_proof_branches,
                         reset_pending: reset_pending_dependents,
                         expected_cursor,
                         expected_state_raw: &expected_state_raw,
@@ -6798,6 +6810,15 @@ where
                     LixError::CODE_TRANSACTION_CONFLICT,
                     "sync replica state changed while its repository event was admitted",
                 ));
+            }
+            for branch_id in publication.retired_upload_proof_branches {
+                super::upload_proof::stage_retire_proof(
+                    &read,
+                    &mut writes,
+                    &mut preconditions,
+                    branch_id,
+                )
+                .await?;
             }
             stage_replica_state(&mut writes, &mut preconditions, publication.state, previous)?;
         }
@@ -13198,6 +13219,7 @@ mod tests {
                 SyncImportPurpose::ReplicaDelta,
                 None,
                 Some(ReplicaStatePublication {
+                    retired_upload_proof_branches: &[],
                     reset_pending: false,
                     expected_cursor: 7,
                     expected_state_raw: &expected_state_raw,

@@ -5702,14 +5702,15 @@ async fn stage_branch_head_control_publications(
                 )
             })?
             .control;
-        // Explicit replacement/deletion can abandon an upload wave. Normal
-        // commits and checkpoint publications retain the captured wave.
+        // Explicit creation/replacement/deletion can supersede a captured
+        // upload ref, including a deletion followed by recreation of its ID.
+        // Normal commits and checkpoint publications retain the captured wave.
         // A transaction containing any restore stages its one generation in
         // automatic_sync_writes with the durable restore intents. That set is
         // merged with these materialized writes only after this function, so
         // even a different branch's deletion must defer to the restore marker.
         if restore_targets.is_empty()
-            && existing.is_some()
+            && (existing.is_some() || target.head_commit_id.is_some())
             && !checkpoint_epochs.contains_key(branch_id)
             && !branch_checkpoint_bridges.contains_key(branch_id)
         {

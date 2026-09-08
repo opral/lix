@@ -83,13 +83,20 @@ or acknowledgment-frontier cost. Traversal stops at confirmed boundaries rather
 than loading cold history. At most four upload batches run before incoming
 demands and a finite pull receive service.
 
-Destructive ref changes rotate an atomically written invalidation token. A
+Explicit branch creation, replacement, deletion, and restores rotate an atomically
+written invalidation token. Creating a branch also invalidates the plan so a
+recreated ID cannot publish a previously captured deletion. A
 fresh read checks that token and server coordinates before loading each page;
 ref preparation additionally guards current reset intent and persists exact
 request proofs with a compare-and-swap. Restores, incompatible server updates,
 and missing garbage-collected bodies discard the cache. No storage snapshot is
 held across the network. Lost responses retry unacknowledged work, and a request
 size rejection selects a smaller prefix without advancing the plan.
+
+Generic request proofs are retired atomically when the authority leaves their
+source coordinate, including a leave-and-return within one received page. Active
+restores retain their own copied tokens; old generic proofs cannot misclassify a
+later foreign write as an acknowledgment after an authority-coordinate cycle.
 
 Prepared-ref proofs retain at most 64 distinct targets per branch and source
 coordinate. Repeated ordinary retries reuse the same target. Exceptionally,
