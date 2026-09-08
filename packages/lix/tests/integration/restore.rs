@@ -3,8 +3,7 @@ use serde_json::json;
 
 use crate::support::simulation_test::engine::SimSession;
 
-const RESTORE_SQL: &str =
-    "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id";
+const RESTORE_SQL: &str = "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id";
 
 simulation_test!(
     restore_moves_only_the_active_branch_to_an_ancestor,
@@ -15,6 +14,7 @@ simulation_test!(
             &engine,
         );
         let initial_commit_id = sim.initial_commit_id().to_string();
+        let initial_file_count = count(&session, "lix_file").await;
         session
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ('/a.txt', CAST('a' AS BYTEA))",
@@ -48,9 +48,9 @@ simulation_test!(
             .expect("ancestor restore should succeed");
         assert_eq!(head(&session).await, target_commit_id);
         assert_eq!(count(&session, "lix_commit").await, commit_count_before);
-        assert_eq!(count(&session, "lix_file").await, 1);
+        assert_eq!(count(&session, "lix_file").await, initial_file_count + 1);
         let files = session
-            .execute("SELECT path FROM lix_file ORDER BY path", &[])
+            .execute("SELECT path FROM lix_file WHERE path = '/a.txt'", &[])
             .await
             .expect("files should read");
         assert_eq!(files.rows()[0].get::<String>("path").unwrap(), "/a.txt");
@@ -78,13 +78,13 @@ simulation_test!(
             other_branch.commit_id,
             "checking out the control branch refreshes its stale global base"
         );
-        assert_eq!(count(&session, "lix_file").await, 1);
+        assert_eq!(count(&session, "lix_file").await, initial_file_count + 1);
 
         restore(&session, &initial_commit_id)
             .await
             .expect("parentless commit should be restorable");
         assert_eq!(head(&session).await, initial_commit_id);
-        assert_eq!(count(&session, "lix_file").await, 0);
+        assert_eq!(count(&session, "lix_file").await, initial_file_count);
     }
 );
 

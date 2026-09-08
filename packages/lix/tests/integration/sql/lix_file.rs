@@ -7,6 +7,113 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
+    bootstrap_lix_files_belong_to_initial_main_commit,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let initial_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial_head, sim.initial_commit_id());
+        let readme = include_bytes!("../../../src/init_readme.md");
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT path, content FROM lix_file WHERE path = '/.lix/README.md'",
+                    &[],
+                )
+                .await
+                .unwrap(),
+            vec![vec![
+                Value::Text("/.lix/README.md".into()),
+                Value::Blob(readme.to_vec().into()),
+            ]],
+        );
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT path FROM lix_directory WHERE path LIKE '/.lix%' ORDER BY path",
+                    &[],
+                )
+                .await
+                .unwrap(),
+            vec![
+                vec![Value::Text("/.lix".into())],
+                vec![Value::Text("/.lix/app_data".into())],
+                vec![Value::Text("/.lix/plugins".into())],
+            ],
+        );
+        assert_rows_eq(
+        session.execute(
+            "SELECT content, lixcol_depth FROM lix_history('lix_file', $1) WHERE path = '/.lix/README.md'",
+            &[Value::Text(initial_head.clone())],
+        ).await.unwrap(),
+        vec![vec![Value::Blob(readme.to_vec().into()), Value::Integer(0)]],
+    );
+        assert!(
+            session
+                .execute("SELECT id FROM lix_diff('lix_file')", &[])
+                .await
+                .unwrap()
+                .rows()
+                .is_empty()
+        );
+        let global = engine
+            .open_session_at(crate::GLOBAL_BRANCH_ID)
+            .await
+            .unwrap();
+        assert!(
+            global
+                .execute("SELECT * FROM lix_file", &[])
+                .await
+                .unwrap()
+                .rows()
+                .is_empty()
+        );
+        assert!(
+            global
+                .execute("SELECT * FROM lix_directory", &[])
+                .await
+                .unwrap()
+                .rows()
+                .is_empty()
+        );
+        assert_eq!(
+            engine
+                .load_branch_head_commit_id(sim.main_branch_id())
+                .await
+                .unwrap()
+                .unwrap(),
+            initial_head
+        );
+
+        session.execute("UPDATE lix_file SET content = CAST('custom guide' AS BYTEA) WHERE path = '/.lix/README.md'", &[])
+        .await.unwrap();
+        let reopened_engine = sim.reboot_engine_from_current_snapshot().await.unwrap();
+        let reopened = reopened_engine.open_session().await.unwrap();
+        assert_rows_eq(
+            reopened
+                .execute(
+                    "SELECT content FROM lix_file WHERE path = '/.lix/README.md'",
+                    &[],
+                )
+                .await
+                .unwrap(),
+            vec![vec![Value::Blob(b"custom guide".to_vec().into())]],
+        );
+        assert_rows_eq(
+        reopened.execute(
+            "SELECT content FROM lix_history('lix_file', $1) WHERE path = '/.lix/README.md'",
+            &[Value::Text(initial_head)],
+        ).await.unwrap(),
+        vec![vec![Value::Blob(readme.to_vec().into())]],
+    );
+    }
+);
+
+simulation_test!(
     lix_file_public_timestamps_cover_descriptor_and_content_revisions,
     |sim| async move {
         let engine = sim.boot_engine().await;

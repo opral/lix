@@ -408,7 +408,6 @@ simulation_test!(
     }
 );
 
-
 simulation_test!(
     lix_directory_path_insert_rejects_existing_file_entry,
     |sim| async move {
@@ -900,7 +899,6 @@ simulation_test!(
         );
     }
 );
-
 
 simulation_test!(
     lix_directory_global_path_insert_reuses_existing_global_directory,
@@ -1396,8 +1394,6 @@ simulation_test!(
     }
 );
 
-
-
 simulation_test!(
     lix_directory_insert_on_conflict_path_rejects_missing_path,
     |sim| async move {
@@ -1662,7 +1658,10 @@ simulation_test!(
         );
 
         let files = session
-            .execute("SELECT id, path FROM lix_file", &[])
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/docs' OR path LIKE '/docs/%'",
+                &[],
+            )
             .await
             .expect("file read after recursive delete must not be poisoned by an orphan");
         assert_eq!(
@@ -1672,7 +1671,10 @@ simulation_test!(
         );
 
         let directories = session
-            .execute("SELECT id, path FROM lix_directory", &[])
+            .execute(
+                "SELECT id, path FROM lix_directory WHERE path = '/docs' OR path LIKE '/docs/%'",
+                &[],
+            )
             .await
             .expect("directory read after recursive delete must not be poisoned by an orphan");
         assert_eq!(directories.len(), 0, "the directory must be deleted");
@@ -1722,13 +1724,19 @@ simulation_test!(
         );
 
         let files = session
-            .execute("SELECT id, path FROM lix_file", &[])
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/docs' OR path LIKE '/docs/%'",
+                &[],
+            )
             .await
             .expect("file read after recursive delete must not be poisoned by an orphan");
         assert_eq!(files.len(), 0, "no nested file may survive its parent tree");
 
         let directories = session
-            .execute("SELECT id, path FROM lix_directory", &[])
+            .execute(
+                "SELECT id, path FROM lix_directory WHERE path = '/docs' OR path LIKE '/docs/%'",
+                &[],
+            )
             .await
             .expect("directory read after recursive delete must not be poisoned by an orphan");
         assert_eq!(directories.len(), 0, "the whole tree must be deleted");
@@ -1774,7 +1782,10 @@ simulation_test!(
         assert_eq!(delete_result, ExecuteResult::from_rows_affected(2));
 
         let directories = session
-            .execute("SELECT id, path FROM lix_directory", &[])
+            .execute(
+                "SELECT id, path FROM lix_directory WHERE path = '/docs' OR path LIKE '/docs/%'",
+                &[],
+            )
             .await
             .expect("directory read after recursive delete should succeed");
         assert_eq!(directories.len(), 0);
@@ -1830,13 +1841,19 @@ simulation_test!(
         );
 
         let files = session
-            .execute("SELECT id, path FROM lix_file", &[])
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/docs' OR path LIKE '/docs/%'",
+                &[],
+            )
             .await
             .expect("file read after reboot must not be poisoned by an orphan");
         assert_eq!(files.len(), 0);
 
         let directories = session
-            .execute("SELECT id, path FROM lix_directory", &[])
+            .execute(
+                "SELECT id, path FROM lix_directory WHERE path = '/docs' OR path LIKE '/docs/%'",
+                &[],
+            )
             .await
             .expect("directory read after reboot must not be poisoned by an orphan");
         assert_eq!(directories.len(), 0);

@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -95,7 +96,9 @@ impl FilesystemStorageOptions {
 
     pub fn open(self) -> Result<FilesystemStorage, LixError> {
         let layout = prepare_filesystem_layout(&self.path)?;
+        let initial_import = !layout.lix_dir.join(".internal").exists();
         Ok(FilesystemStorage {
+            initial_import: Arc::new(AtomicBool::new(initial_import)),
             inner: open_filesystem_rocksdb(&layout)?,
             layout,
             sync_all_files: self.sync_all_files,
@@ -130,6 +133,7 @@ struct FilesystemPathFilter {
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct FilesystemStorage {
+    initial_import: Arc<AtomicBool>,
     inner: RocksDBFilesystem,
     layout: FilesystemLayout,
     sync_all_files: bool,
@@ -344,6 +348,7 @@ impl FilesystemStorage {
         Box::pin(async move {
             let startup = FilesystemSyncStartup::begin(Arc::clone(&self.sync_lifecycle))?;
             let supervisor = self.open_supervisor(lix).await?;
+            self.initial_import.store(false, Ordering::Release);
             startup.complete(supervisor);
             Ok(())
         })
@@ -416,6 +421,7 @@ impl FilesystemStorage {
             sync_lix,
             self.layout.clone(),
             FilesystemPathFilter::from_sync_all_files(self.sync_all_files),
+            self.initial_import.load(Ordering::Acquire),
         )
         .await
     }
@@ -601,6 +607,7 @@ impl FilesystemSupervisor {
         lix: Lix<RocksDBFilesystem>,
         layout: FilesystemLayout,
         path_filter: FilesystemPathFilter,
+        initial_import: bool,
     ) -> Result<Self, LixError> {
         validate_filesystem_root_directory(&layout.root)?;
         validate_filesystem_lix_directory(&layout.lix_dir)?;
@@ -612,7 +619,9 @@ impl FilesystemSupervisor {
             last_materialized: Mutex::new(None),
         });
 
-        state.sync_disk_to_lix(false).await?;
+        state
+            .sync_disk_to_lix_with_initial_import(false, initial_import)
+            .await?;
         state.sync_from_lix().await?;
 
         let (event_tx, event_rx) = mpsc::channel();
@@ -813,6 +822,15 @@ impl FilesystemState {
     }
 
     async fn sync_disk_to_lix(&self, skip_if_last_materialized: bool) -> Result<(), LixError> {
+        self.sync_disk_to_lix_with_initial_import(skip_if_last_materialized, false)
+            .await
+    }
+
+    async fn sync_disk_to_lix_with_initial_import(
+        &self,
+        skip_if_last_materialized: bool,
+        initial_import: bool,
+    ) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
         let path_filter = self.path_filter();
         let local = collect_local_snapshot(&self.layout, &path_filter)?;
@@ -824,7 +842,14 @@ impl FilesystemState {
                 return Ok(());
             }
         }
-        let previous = self.last_materialized_disk();
+        // A new repository has never materialized its bootstrap content. Treat
+        // absent disk paths as not yet exported, not as user deletions. Existing
+        // disk files are still imported and take precedence at matching paths.
+        let previous = if initial_import {
+            Some(Snapshot::default())
+        } else {
+            self.last_materialized_disk()
+        };
         let lix = self
             .apply_local_snapshot_to_lix_with_filter(&local, previous.as_ref(), &path_filter)
             .await?;
@@ -2527,6 +2552,7 @@ mod tests {
         path_filter: FilesystemPathFilter,
     ) -> FilesystemState {
         let storage = FilesystemStorage {
+            initial_import: Arc::new(AtomicBool::new(false)),
             inner: open_filesystem_rocksdb(&layout).unwrap(),
             layout: layout.clone(),
             sync_all_files: path_filter.is_unfiltered(),

@@ -28,9 +28,8 @@ use crate::storage_adapter::{
     StorageSpaceId, StorageWriteSet, ValueSemantics,
 };
 use crate::tracked_state::{
-    CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
-    TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef,
-    stage_commit_deltas_for_commit_state,
+    CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
+    TrackedStateDeltaRef, stage_commit_deltas_for_commit_state,
 };
 use bytes::Bytes;
 use serde_json::json;
@@ -238,6 +237,7 @@ pub(crate) struct InitSeedPlan {
     global_commit: InitSeedCommit,
     main_commit: InitSeedCommit,
     changes: Vec<InitSeedChange>,
+    main_changes: Vec<InitSeedChange>,
     branch_controls: Vec<InitBranchHeadControl>,
     pub(crate) receipt: InitReceipt,
 }
@@ -255,6 +255,7 @@ struct InitSeedCommit {
 struct InitSeedChange {
     id: ChangeId,
     row_pk: RowPk,
+    file_id: Option<String>,
     schema_key: String,
     #[cfg(test)]
     snapshot_content: serde_json::Value,
@@ -331,6 +332,7 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
         .map(|seed| InitSeedChange {
             id: ChangeId::from(functions.call_uuid_v7()),
             row_pk: seed.row_pk.clone(),
+            file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_owned(),
             #[cfg(test)]
             snapshot_content: seed.snapshot_content.clone(),
@@ -467,6 +469,7 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
                 anonymous_account_change,
             ])
             .collect(),
+        main_changes: plan_main_files(&functions, timestamp)?,
         branch_controls: vec![global_branch_control, main_branch_control],
         receipt: InitReceipt {
             lix_id,
@@ -476,6 +479,60 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
             initial_commit_id: initial_commit_id.to_string(),
         },
     })
+}
+
+const LIX_README: &[u8] = include_bytes!("init_readme.md");
+
+/// Repository content belongs to main, so edits and deletions follow ordinary
+/// branch history rather than changing repository-wide global metadata.
+fn plan_main_files(
+    functions: &FunctionProviderHandle,
+    timestamp: LixTimestamp,
+) -> Result<Vec<InitSeedChange>, LixError> {
+    let directory_id = functions.call_uuid_v7();
+    let mut changes = Vec::new();
+    for (id, name, parent_id) in [
+        (directory_id, ".lix", None),
+        (functions.call_uuid_v7(), "app_data", Some(directory_id)),
+        (functions.call_uuid_v7(), "plugins", Some(directory_id)),
+    ] {
+        changes.push(canonical_change(
+            functions.call_uuid_v7(),
+            RowPk::uuid_from_canonical(&id.to_string())
+                .expect("generated directory ID is a canonical UUID"),
+            "lix_directory_descriptor",
+            json!({ "id": id.to_string(), "name": name, "parent_id": parent_id.map(|id| id.to_string()) }),
+            timestamp,
+        )?);
+    }
+    let file_id = functions.call_uuid_v7().to_string();
+    for (schema_key, snapshot) in [
+        (
+            "lix_file_descriptor",
+            json!({
+                "id": file_id, "directory_id": directory_id.to_string(), "name": "README.md",
+            }),
+        ),
+        (
+            "lix_binary_blob_ref",
+            json!({
+                "id": file_id,
+                "blob_hash": crate::binary_cas::BlobId::from_content(LIX_README).to_hex(),
+                "size_bytes": LIX_README.len(),
+            }),
+        ),
+    ] {
+        let mut change = canonical_change(
+            functions.call_uuid_v7(),
+            RowPk::uuid_from_canonical(&file_id).expect("generated file ID is a canonical UUID"),
+            schema_key,
+            snapshot,
+            timestamp,
+        )?;
+        change.file_id = Some(file_id.clone());
+        changes.push(change);
+    }
+    Ok(changes)
 }
 
 /// Initializes an empty engine repository in one storage transaction.
@@ -518,6 +575,15 @@ where
         .iter()
         .map(seed_change_to_change_record)
         .collect::<Result<Vec<_>, _>>()?;
+    let main_changes = plan
+        .main_changes
+        .iter()
+        .map(seed_change_to_change_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::binary_cas::BinaryCasContext::new()
+        .writer_skipping_existing_chunks(&read, &mut writes)
+        .stage_payload(&crate::binary_cas::BlobPayload::from_bytes(LIX_README))
+        .await?;
     let branch_ref_ledger_changes = plan
         .branch_controls
         .iter()
@@ -542,6 +608,13 @@ where
         &plan,
         branch_ref_ledger_changes.clone(),
         &init_touched_scopes,
+        &main_changes
+            .iter()
+            .map(|change| crate::changelog::CommitScopeKey {
+                schema_key: change.schema_key.clone(),
+                file_id: change.file_id.clone(),
+            })
+            .collect::<Vec<_>>(),
     )
     .await?;
 
@@ -606,9 +679,9 @@ where
             &read,
             &mut writes,
             &mut row_pk_index_overlay,
-                None,
-                &initial_members,
-                plan.global_commit.id,
+            None,
+            &initial_members,
+            plan.global_commit.id,
         )
         .await?;
         let physical_publication =
@@ -638,14 +711,37 @@ where
                 &physical_publication,
             )?;
 
-        // Main starts as an empty immutable overlay pinned to the global
-        // genesis snapshot. Its causal parent is global, but its physical
-        // state root deliberately has no parent: the base edge supplies the
-        // global half of the effective state.
-        let empty_deltas = Vec::<TrackedStateDeltaRef<'_>>::new();
+        // Main's bootstrap content is a local overlay pinned to global genesis.
+        let main_deltas = main_changes
+            .iter()
+            .map(|change| TrackedStateDeltaRef {
+                schema_key: &change.schema_key,
+                file_id: change.file_id.as_deref(),
+                row_pk: &change.row_pk,
+                change_id: change.change_id,
+                commit_id: plan.main_commit.id,
+                deleted: false,
+                created_at: change.created_at,
+                updated_at: change.created_at,
+            })
+            .collect::<Vec<_>>();
+        let main_commit_deltas = main_changes
+            .iter()
+            .zip(main_deltas.iter().copied())
+            .map(|(change, delta)| TrackedStateCommitDeltaRef {
+                delta,
+                metadata: change.metadata.as_ref(),
+                snapshot: change.snapshot.as_deref(),
+                origin_key: change.origin_key.as_deref(),
+                base_coordinate: None,
+                authored: true,
+            })
+            .collect::<Vec<_>>();
+        let staged_main = stage_commit_deltas_for_commit_state(&mut writes, &main_commit_deltas)?;
+        crate::tracked_state::stage_change_locators(&mut writes, &staged_main.locators);
         let mut tracked_writer = tracked_state.writer(&read, &mut writes);
         tracked_writer
-            .stage_commit_root(&receipt.initial_commit_id, None, empty_deltas)
+            .stage_commit_root(&receipt.initial_commit_id, None, main_deltas)
             .await?;
         let main_snapshot_root = tracked_writer
             .staged_commit_roots()
@@ -657,8 +753,20 @@ where
                     "repository initialization did not stage the main overlay root",
                 )
             })?;
-        let main_mutations = CommitStateMutationInventory::default();
-        let main_members = Vec::new();
+        let main_mutations = staged_main.mutation_inventory().clone();
+        let main_segments = crate::tracked_state::staged_commit_delta_segment_bytes(
+            &writes,
+            plan.main_commit.id,
+            &main_mutations,
+        )?;
+        let main_members = crate::tracked_state::staged_commit_delta_members(
+            &read,
+            plan.main_commit.id,
+            &plan.main_commit.account_id,
+            &main_mutations,
+            main_segments,
+        )
+        .await?;
         let mut main_row_pk_overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
         let main_row_pk_index_root_id = crate::tracked_state::stage_row_pk_index_from_members(
             &read,
@@ -696,18 +804,25 @@ where
         )?;
 
         // Seed global with its complete state. Main's physical generation is
-        // only the local overlay plus the registered-schema serving cache;
+        // the bootstrap files plus the registered-schema serving cache;
         // ordinary values are resolved through its pinned global base.
         let tracked_head_deltas = authored_changes
             .iter()
             .zip(&plan.changes)
-            .map(|(change, seed)| {
+            .map(|pair| (pair, plan.global_commit.id))
+            .chain(
+                main_changes
+                    .iter()
+                    .zip(&plan.main_changes)
+                    .map(|pair| (pair, plan.main_commit.id)),
+            )
+            .map(|((change, seed), commit_id)| {
                 Ok(CurrentStateDeltaRef {
                     schema_key: &change.schema_key,
                     file_id: change.file_id.as_deref(),
                     row_pk: &change.row_pk,
                     change_id: Some(change.change_id),
-                    commit_id: Some(plan.global_commit.id),
+                    commit_id: Some(commit_id),
                     untracked: false,
                     deleted: false,
                     created_at: change.created_at,
@@ -729,11 +844,14 @@ where
         let absence_guards = std::collections::BTreeSet::default();
         for branch in &plan.branch_controls {
             let mut head_deltas = tracked_head_deltas.clone();
-            // Checkpoints and built-in accounts are global facts. Staging them
-            // onto main would turn the global snapshot into a local overlay.
-            if branch.branch_id != GLOBAL_BRANCH_ID {
-                head_deltas.retain(|delta| delta.schema_key == REGISTERED_SCHEMA_KEY);
-            }
+            head_deltas.retain(|delta| {
+                if branch.branch_id == GLOBAL_BRANCH_ID {
+                    delta.commit_id == Some(plan.global_commit.id)
+                } else {
+                    delta.commit_id == Some(plan.main_commit.id)
+                        || delta.schema_key == REGISTERED_SCHEMA_KEY
+                }
+            });
             let generation = if branch.branch_id == GLOBAL_BRANCH_ID {
                 plan.global_commit.id
             } else {
@@ -818,7 +936,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> Result<ChangeRecord,
         account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
         row_pk: change.row_pk.clone(),
         schema_key: change.schema_key.clone(),
-        file_id: None,
+        file_id: change.file_id.clone(),
         metadata: None,
         snapshot: Some(seed_snapshot(&change.decoded_snapshot)?),
         created_at: change.created_at,
@@ -858,6 +976,7 @@ async fn stage_init_changelog_commit(
     plan: &InitSeedPlan,
     changes: Vec<ChangeRecord>,
     touched_scopes: &[crate::changelog::CommitScopeKey],
+    main_touched_scopes: &[crate::changelog::CommitScopeKey],
 ) -> Result<(), LixError> {
     let global_commit = CommitRecord {
         touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(touched_scopes),
@@ -872,7 +991,9 @@ async fn stage_init_changelog_commit(
         created_at: plan.global_commit.created_at,
     };
     let main_commit = CommitRecord {
-        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(&[]),
+        touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(
+            main_touched_scopes,
+        ),
         format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
         commit_id: plan.main_commit.id,
         generation: 1,
@@ -931,6 +1052,7 @@ fn canonical_change(
     Ok(InitSeedChange {
         id: ChangeId::from(id),
         row_pk,
+        file_id: None,
         schema_key: schema_key.to_string(),
         #[cfg(test)]
         snapshot_content,
