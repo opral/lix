@@ -156,7 +156,7 @@ Lix runs in-process with pluggable storage: in memory, on the local filesystem, 
 
 <img src="./website/public/assets/pluggable-storage.svg" alt="Lix runs in-process inside your product, with an arrow to pluggable storage: memory, filesystem, or S3" width="760" />
 
-Existing VCS like Git assume a local POSIX filesystem, which makes them hard to embed and scale. See the [Persistence and Storage](https://lix.dev/docs/persistence) docs.
+Existing VCS like Git assume a local POSIX filesystem, which makes them hard to embed and scale. See the [Storage](https://lix.dev/docs/persistence) docs.
 
 ## Comparison
 

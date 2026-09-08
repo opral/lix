@@ -14,9 +14,9 @@
     { "path": "./history.md", "label": "History" },
     {
       "path": "./collaboration-and-sync.md",
-      "label": "Collaboration and Sync"
+      "label": "Collaboration"
     },
-    { "path": "./persistence.md", "label": "Persistence and Storage" },
+    { "path": "./persistence.md", "label": "Storage" },
     { "path": "./snapshots.md", "label": "Snapshots" }
   ],
   "Guides": [

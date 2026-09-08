@@ -65,12 +65,12 @@ script string.
 
 The repository is in memory and disappears when the process ends. For native
 persistence, use `lix-storage-rocksdb` or `lix-storage-filesystem`. See
-[Persistence and Storage](./persistence.md).
+[Storage](./persistence.md).
 
 ## Next
 
 - [Store application data](./schemas.md)
 - [Work with files and media](./files-and-media.md)
 - [Branch, review, and merge](./branching.md)
-- [Persistence and Storage](./persistence.md)
+- [Storage](./persistence.md)
 - [Rust API reference](https://docs.rs/lix)

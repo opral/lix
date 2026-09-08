@@ -65,7 +65,7 @@ await lix.close();
 ```
 
 The repository is in memory and disappears when the process ends. Continue
-with [Persistence and Storage](./persistence.md) to save it locally or connect
+with [Storage](./persistence.md) to save it locally or connect
 to a server.
 
 ## Next
@@ -74,4 +74,4 @@ to a server.
 - [Work with files and media](./files-and-media.md)
 - [Branch, review, and merge](./branching.md)
 - [Add collaboration and local sync](./collaboration-and-sync.md)
-- [Persistence and Storage](./persistence.md)
+- [Storage](./persistence.md)

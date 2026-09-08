@@ -4,17 +4,15 @@ description: Give each agent an isolated branch, preview its changes, then merge
 
 # Lix for AI Agents
 
-Agents make fast, useful, and sometimes wrong changes. Lix gives each agent task its own branch so a human or policy can review the work before it reaches main.
-
-Agents can work through normal files with `FilesystemStorage`, through SQL, or through a hosted Lix server. All writes stay isolated on the task branch.
+Give each agent task a branch for review before merging into main.
+Agents can edit normal files or SQL rows, locally or through a hosted server.
 
 ## The pattern
 
-1. Create a branch for the agent task.
-2. Switch the agent to that branch.
-3. Let the agent edit files or SQL rows.
-4. Switch back to main and preview the merge.
-5. Merge, iterate on the branch, or discard it.
+1. Create and switch to a task branch.
+2. Run the agent.
+3. Return to main and preview the merge.
+4. Merge, iterate, or discard.
 
 ```ts
 const main = await lix.activeBranchId();
@@ -41,25 +39,23 @@ if (preview.conflicts.length === 0) {
 
 ## Local file repository
 
-Use `FilesystemStorage` when the agent works with files on disk. See
-[Persistence and Storage](./persistence.md#local-filesystem) for setup.
+Use [`FilesystemStorage`](./persistence.md#local-filesystem) for files on disk.
 
 ## Hosted repository
 
-Use remote mode when the repository runs on a server. See
-[Persistence and Storage](./persistence.md#remote-server) for setup.
+For SDK-only access, [query the server directly](./persistence.md#remote-mode).
+For files in a sandbox or mounted volume, [sync a filesystem replica](./persistence.md#filesystem-sync).
+A browser can share the repository through an [OPFS replica](./persistence.md#browser-opfs).
 
 ## Why branches matter
 
-- Run agents in parallel without changing main.
-- Compare proposed results side by side.
-- Review the [diff](./diffs.md) instead of rereading every file.
-- Discard a bad attempt without manual cleanup.
+- Run agents in parallel, isolated from main.
+- Compare results and review [diffs](./diffs.md).
+- Discard failed attempts.
 
 ## Inspect the work
 
-To review the agent's work before the merge, open another session on the task
-branch and query the ordinary current-state relation:
+Review current rows in a session on the task branch:
 
 ```ts
 const reviewLix = await lix.openAnotherSession({ branchId: task.id });
@@ -69,18 +65,16 @@ const rows = await reviewLix.execute(
 await reviewLix.close();
 ```
 
-`lix_history('<schema>')` is revision history anchored to a commit; it is not a
-current-state snapshot replacement. Use the branch-scoped session for current
-rows and `lix_diff('acme_task', from_commit_id, to_commit_id)` for a
-relation-specific commit-to-commit change set.
+Use `lix_history('<schema>')` for commit-anchored history, not current rows;
+use `lix_diff('acme_task', from_commit_id, to_commit_id)` for changes between commits.
 
-Use `lix_registered_schema` to discover available schemas. Use `lix_change` for activity across the whole repository. It is not limited to the active branch.
+`lix_registered_schema` lists schemas. `lix_change` shows repository-wide
+activity across branches.
 
 ## Conflicts
 
-Merge is per row today. Two branches that edit different rows can merge cleanly. Two branches that edit the same row produce a `sameRowChanged` conflict.
-
-See [Branching](./branching.md) for preview results and conflict handling.
+Merges operate per row: different-row edits can merge cleanly; same-row edits
+produce `sameRowChanged`. See [Branching](./branching.md) for conflict handling.
 
 ## Next
 

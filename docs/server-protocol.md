@@ -9,7 +9,7 @@ It does not define HTTP frameworks, authentication schemes, or deployment
 policy.
 
 Application developers should start with
-[Collaboration and Sync](./collaboration-and-sync.md). This page documents the
+[Collaboration](./collaboration-and-sync.md). This page documents the
 server wire contract.
 
 ## Why it exists
@@ -22,7 +22,7 @@ nothing in the client changes but the connection URL. The OpenAPI document plus
 the normative behavior below is the complete per-Lix contract.
 
 The `lix` crate contains a reusable Rust handler and this repository ships a
-[reference server](../packages/server/README.md). A host can run or customize
+[reference server](https://github.com/opral/lix/tree/main/packages/server). A host can run or customize
 that server, embed the Rust handler, or independently implement the same wire
 contract in another language. See [Hosting](./hosting.md).
 
@@ -133,7 +133,7 @@ provenance shadow state or extra source body fetch.
 ## Contract
 
 The machine-readable surface is
-[`packages/lix/server-protocol.openapi.yaml`](../packages/lix/server-protocol.openapi.yaml).
+[`packages/lix/server-protocol.openapi.yaml`](https://github.com/opral/lix/blob/main/packages/lix/server-protocol.openapi.yaml).
 
 Behavior that OpenAPI cannot express — session pinning, transaction ownership,
 idempotency replay, observation ordering, and terminal storage semantics — is
