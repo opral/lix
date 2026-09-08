@@ -192,6 +192,8 @@ pub fn router(
     let request_id_key = protocol_request_id_key(internal_token.as_deref());
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/lix/v1", any(lix_create))
+        .route("/lix/v1/", any(lix_create))
         .route("/lix/v1/{lix_id}", any(lix_protocol_root))
         .route("/lix/v1/{lix_id}/", any(lix_protocol_root))
         .route("/lix/v1/{lix_id}/{*protocol_path}", any(lix_protocol))
@@ -242,6 +244,74 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+async fn lix_create(State(state): State<AppState>, request: Request<Body>) -> Response {
+    lix_lifecycle(state, None, request).await
+}
+
+async fn lix_lifecycle(
+    state: AppState,
+    id: Option<String>,
+    mut request: Request<Body>,
+) -> Response {
+    use futures_util::TryStreamExt as _;
+    if !authorized(request.headers(), state.internal_token.as_deref()) {
+        return protocol_error(
+            StatusCode::UNAUTHORIZED,
+            "LIX_ERROR_UNAUTHENTICATED",
+            "Invalid internal service token.",
+            None,
+            None,
+        );
+    }
+    let principal = match take_trusted_principal(&mut request, state.internal_token.is_some()) {
+        Ok(Some(principal)) => ServerProtocolPrincipal::Authenticated {
+            account_id: principal.account_id,
+            idempotency_scope: principal.idempotency_scope,
+        },
+        Ok(None) => ServerProtocolPrincipal::Anonymous,
+        Err(message) => {
+            return protocol_error(
+                StatusCode::BAD_REQUEST,
+                "LIX_INVALID_ARGUMENT",
+                message,
+                None,
+                None,
+            );
+        }
+    };
+    let handler = match server_protocol::LixServerLifecycle::new(
+        crate::store::LifecycleHost(Arc::clone(&state.manager)),
+        &state.manager.public_url,
+    ) {
+        Ok(handler) => handler,
+        Err(error) => {
+            return protocol_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.code,
+                error.message,
+                None,
+                None,
+            );
+        }
+    };
+    let (parts, body) = request.into_parts();
+    let body = server_protocol::ServerProtocolBody::stream(
+        body.into_data_stream().map_err(std::io::Error::other),
+    );
+    let response = handler
+        .handle(
+            Request::from_parts(parts, body),
+            id.as_deref(),
+            ServerProtocolContext {
+                principal,
+                durable_terminal_storage_notifier: None,
+            },
+        )
+        .await;
+    let (parts, body) = response.into_parts();
+    Response::from_parts(parts, Body::new(body))
+}
+
 async fn lix_protocol(
     State(state): State<AppState>,
     Path((lix_id, protocol_path)): Path<(String, String)>,
@@ -255,6 +325,9 @@ async fn lix_protocol_root(
     Path(lix_id): Path<String>,
     request: Request<Body>,
 ) -> Response {
+    if request.method() == http::Method::DELETE {
+        return lix_lifecycle(state, Some(lix_id), request).await;
+    }
     lix_protocol_route(state, lix_id, String::new(), request).await
 }
 
@@ -658,6 +731,13 @@ fn authorized(headers: &HeaderMap, internal_token: Option<&str>) -> bool {
 
 fn lix_error(error: LixRuntimeError) -> Response {
     match error {
+        LixRuntimeError::NotFound => protocol_error(
+            StatusCode::NOT_FOUND,
+            "LIX_NOT_FOUND",
+            "Lix not found.",
+            None,
+            None,
+        ),
         LixRuntimeError::InvalidId => protocol_error(
             StatusCode::BAD_REQUEST,
             "LIX_INVALID_ARGUMENT",
@@ -882,8 +962,9 @@ mod tests {
     const LIX_MARKDOWN: &str = "33333333-3333-4333-8333-333333333333";
     static TEST_IDEMPOTENCY_KEY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
-    fn test_router() -> Router {
+    async fn test_router() -> Router {
         let manager = LixRuntimeManager::new_in_memory(4);
+        manager.provision_test_repositories().await;
         router(
             manager,
             None,
@@ -892,8 +973,9 @@ mod tests {
         )
     }
 
-    fn trusted_test_router() -> Router {
+    async fn trusted_test_router() -> Router {
         let manager = LixRuntimeManager::new_in_memory(4);
+        manager.provision_test_repositories().await;
         router(
             manager,
             Some(TEST_INTERNAL_TOKEN.to_string()),
@@ -916,7 +998,7 @@ mod tests {
 
     #[tokio::test]
     async fn exposes_only_the_lix_addressed_protocol() {
-        let app = test_router();
+        let app = test_router().await;
         let unscoped = app
             .clone()
             .oneshot(
@@ -927,7 +1009,7 @@ mod tests {
             )
             .await
             .expect("unscoped response");
-        assert_eq!(unscoped.status(), StatusCode::NOT_FOUND);
+        assert_eq!(unscoped.status(), StatusCode::METHOD_NOT_ALLOWED);
 
         let legacy = app
             .clone()
@@ -975,6 +1057,7 @@ mod tests {
     async fn snapshot_is_an_authenticated_canonical_protocol_stream() {
         const ACCOUNT_ID: &str = "01920000-0000-7000-8000-000000000601";
         let response = trusted_test_router()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/snapshot")
@@ -1013,6 +1096,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_protocol_ids_do_not_open_storage() {
         let manager = LixRuntimeManager::new_in_memory(1);
+        manager.provision_test_repositories().await;
         let app = router(
             Arc::clone(&manager),
             None,
@@ -1036,7 +1120,7 @@ mod tests {
     async fn trusted_account_is_provisioned_bound_and_attributed_end_to_end() {
         const ACCOUNT_ID: &str = "01920000-0000-7000-8000-000000000601";
         const OTHER_ACCOUNT_ID: &str = "01920000-0000-7000-8000-000000000602";
-        let app = trusted_test_router();
+        let app = trusted_test_router().await;
         let handshake = app
             .clone()
             .oneshot(
@@ -1129,7 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn decompresses_gzip_before_canonical_protocol_dispatch() {
-        let app = test_router();
+        let app = test_router().await;
         let handshake = app
             .clone()
             .oneshot(
@@ -1171,6 +1255,7 @@ mod tests {
     #[tokio::test]
     async fn health_does_not_open_a_lix_or_require_authentication() {
         let response = test_router()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
@@ -1195,6 +1280,7 @@ mod tests {
     #[tokio::test]
     async fn internal_token_protects_lix_routes() {
         let manager = LixRuntimeManager::new_in_memory(4);
+        manager.provision_test_repositories().await;
         let app = router(
             manager,
             Some("secret".to_string()),
@@ -1236,7 +1322,7 @@ mod tests {
 
     #[tokio::test]
     async fn isolates_lix_data() {
-        let app = test_router();
+        let app = test_router().await;
         let lix_a_session = open_protocol_session(app.clone(), LIX_A).await;
         let insert = app
             .clone()
@@ -1308,7 +1394,7 @@ mod tests {
             return;
         };
 
-        let app = test_router();
+        let app = test_router().await;
         let lix_id = LIX_MARKDOWN;
         let installer = open_protocol_session(app.clone(), lix_id).await;
         expect_protocol_ok(
@@ -1410,6 +1496,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_lix_ids_are_not_found_before_storage_open() {
         let response = test_router()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/lix/v1/contains%20space/")
@@ -1615,6 +1702,7 @@ mod tests {
     #[tokio::test]
     async fn client_cannot_select_an_active_account_in_the_handshake() {
         let response = test_router()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111?activeAccountId=spoofed")
@@ -1629,6 +1717,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_nonterminal_request_does_not_recover_its_runtime() {
         let manager = LixRuntimeManager::new_in_memory(1);
+        manager.provision_test_repositories().await;
         let service = manager.get(LIX_A).await.expect("open lix runtime");
         let (notifier, signal) = server_protocol::durable_terminal_storage_signal();
         let cancellation_recovery = CancellationRecovery::new(
@@ -1649,6 +1738,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_during_terminal_response_recovery_still_starts_runtime_recovery() {
         let manager = LixRuntimeManager::new_in_memory(1);
+        manager.provision_test_repositories().await;
         let service = manager.get(LIX_A).await.expect("open lix runtime");
         let (notifier, signal) = server_protocol::durable_terminal_storage_signal();
         let mut cancellation_recovery = CancellationRecovery::new(

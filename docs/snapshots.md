@@ -33,11 +33,16 @@ not merge new history into an existing Lix.
 
 Lix opens one coherent read and exports every registered logical storage
 space. This includes files, application rows, schemas, branches, history,
-blobs, and engine-owned state.
+blobs, untracked rows, and engine-owned state.
+
+Creating a hosted repository from an existing Lix uses this same snapshot
+contract. Untracked rows are preserved in `.lixsnap` files and hosted copies.
+The host-local authority fence is excluded; active sessions are not transferred.
 
 It does not contain inactive migration data, backend WALs or caches, active
-sessions or transactions, server configuration, credentials, or encryption
-keys. The container adds no export timestamp, hostname, Lix name, random
+sessions or transactions, server configuration, or transport credentials.
+Application data stored in rows is included, even when marked untracked.
+The container adds no export timestamp, hostname, Lix name, random
 identifier, or exporter metadata, so equal logical states produce equal bytes.
 
 The artifact describes logical Lix data, not the physical layout of RocksDB,
@@ -172,7 +177,7 @@ const restored = await openLix.fromSnapshot(snapshotStream, {
 ```
 
 `openLix.fromSnapshot()` also accepts a `Uint8Array` for bounded fixtures. It
-rejects remote or sync server mode and any destination that already contains
+rejects `server` and any destination that already contains
 a Lix. There is no separate byte-array export method; bounded callers can use
 standard APIs such as `new Response(lix.exportSnapshot()).arrayBuffer()`.
 
@@ -189,11 +194,17 @@ Accept: application/vnd.lix.snapshot
 The response is a backpressured `application/vnd.lix.snapshot` stream with
 `Cache-Control: no-store, no-transform`. Snapshot export requires an
 authenticated host principal even when selected files from the Lix are public.
-`lix.exportSnapshot()` remains a local-handle API; non-SDK backup clients call
-this authenticated REST endpoint and stream the body to their destination.
-The remote protocol deliberately has no snapshot upload or import route. Restore
-the artifact into a fresh local or host-provisioned destination through the
-storage APIs described above.
+`lix.exportSnapshot()` on a remote or connected replica handle streams this
+authoritative snapshot. It includes the server's untracked rows, not any
+replica-local untracked rows. An offline sparse replica cannot export a complete
+snapshot; reconnect it to the authority first.
+
+Create a new hosted repository from a snapshot with `POST /lix/v1`, using
+`Content-Type: application/vnd.lix.snapshot` and an `Idempotency-Key` header.
+The SDK's `createLix({ server, from: localLix })` streams the same payload;
+Rust also accepts a snapshot reader with `create_lix().from_snapshot(reader)`.
+Creation never overwrites an existing hosted repository. See the
+[server protocol](./server-protocol.md) for the lifecycle contract.
 
 ## Consistency, integrity, and format
 

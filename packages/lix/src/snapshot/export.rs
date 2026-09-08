@@ -26,7 +26,7 @@ pub struct SnapshotExportBuilder<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    storage: StorageAdapter<StorageSession<StorageImpl>>,
+    storage: Option<StorageAdapter<StorageSession<StorageImpl>>>,
     durability: ReadDurability,
     preflight_error: Option<LixError>,
     remote: Option<RemoteSnapshotExport>,
@@ -45,7 +45,7 @@ where
 {
     pub(crate) fn new(storage: StorageAdapter<StorageSession<StorageImpl>>) -> Self {
         Self {
-            storage,
+            storage: Some(storage),
             durability: ReadDurability::Visible,
             preflight_error: None,
             remote: None,
@@ -93,8 +93,8 @@ where
         if let Some(remote) = self.remote {
             return remote.write_to(writer, self.durability).await;
         }
-        let read = self
-            .storage
+        let storage = self.storage.ok_or_else(|| LixError::new(LixError::CODE_INTERNAL_ERROR, "snapshot export has no source"))?;
+        let read = storage
             .begin_read(StorageReadOptions {
                 durability: self.durability,
                 ..StorageReadOptions::default()
@@ -161,6 +161,17 @@ where
             payload_bytes: trailer.payload_bytes,
             digest: trailer.digest,
         })
+    }
+}
+
+impl SnapshotExportBuilder<crate::Memory> {
+    pub(crate) fn remote(
+        http: crate::sync::AuthorityHttp,
+        url: Result<String, LixError>,
+        session_id: Option<String>,
+    ) -> Self {
+        Self { storage: None, durability: ReadDurability::Visible, preflight_error: None, remote: None }
+            .from_connected_authority(http, url, session_id)
     }
 }
 

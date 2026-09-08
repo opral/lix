@@ -52,6 +52,18 @@ export type WorkerRequest = {
 
 export type WorkerOperation =
 	| {
+			kind: "hosted.create";
+			server: import("../binding-types.js").HostedServerBindingOptions;
+	  }
+	| {
+			kind: "hosted.delete";
+			server: import("../binding-types.js").HostedServerBindingOptions;
+	  }
+	| {
+			kind: "hosted.createFrom";
+			server: import("../binding-types.js").HostedServerBindingOptions;
+	  }
+	| {
 			kind: "open";
 			storage: LixStorageConfig;
 			telemetryEnabled: boolean;

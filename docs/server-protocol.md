@@ -1,8 +1,8 @@
 # Lix Server Protocol
 
 The Lix Server Protocol is the HTTP contract for talking to a remote Lix. Its
-stable HTTP API major is `v1` and every operation lives under
-`/lix/v1/{lix_id}`.
+stable HTTP API major is `v1`. Collection creation uses `/lix/v1`; repository
+operations live under `/lix/v1/{lix_id}`.
 
 It defines the methods, wire formats, session behavior, and error envelopes.
 It does not define HTTP frameworks, authentication schemes, or deployment
@@ -44,6 +44,24 @@ SDK users pass the complete stable locator `https://host/lix/{lix_id}`.
 session, carries the server-issued `Lix-Session-Id` on later requests, and
 reconnects observation streams. Raw HTTP clients use the versioned paths
 directly.
+
+## Repository lifecycle
+
+- `POST /lix/v1` creates an empty repository when no body is supplied. A body
+  with `Content-Type: application/vnd.lix.snapshot` creates it from a complete
+  snapshot, including untracked rows. The response contains `{ id, url }`.
+- `DELETE /lix/v1/{lix_id}` deletes the hosted repository and invalidates its
+  sessions. Local replicas are not deleted.
+- Reads, handshakes, and sync requests for missing repositories return `404`;
+  they never create a repository implicitly.
+
+Creation validates and durably installs the repository before exposing it.
+An `Idempotency-Key` lets a client recover the original result after losing a
+creation response. Creation does not overwrite another repository. Hosts apply
+their authentication and provisioning policy before executing these operations.
+
+These lifecycle operations are part of Lix interoperability, alongside SQL and
+sync. SDK `create_lix`/`createLix` and `delete_lix`/`deleteLix` use this contract.
 
 ## Identity and sessions
 

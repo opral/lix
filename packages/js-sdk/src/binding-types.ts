@@ -67,6 +67,9 @@ export type BindingBatchStatement = {
 };
 
 export type LixBinding = {
+	createHosted?(
+		server: HostedServerBindingOptions,
+	): Promise<import("./types.js").HostedLix>;
 	openReport?(): LixOpenReport | undefined;
 	setTelemetryParent(parent?: TelemetryParentContext): void;
 	openAnotherSession(options: OpenAnotherSessionOptions): Promise<LixBinding>;
@@ -131,3 +134,9 @@ export type LixStorageConfig =
 			path: string;
 			syncAllFiles: boolean;
 	  };
+
+export type HostedServerBindingOptions = {
+	idempotencyKey?: string;
+	url: string;
+	headers: [string, string][];
+};

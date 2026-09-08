@@ -104,7 +104,7 @@ impl ServerProtocolBody {
         }
     }
 
-    async fn into_bytes(mut self, limit: usize) -> Result<Bytes, ApiError> {
+    pub(super) async fn into_bytes(mut self, limit: usize) -> Result<Bytes, ApiError> {
         let mut collected = Vec::new();
         while let Some(frame) =
             std::future::poll_fn(|context| Pin::new(&mut self).poll_frame(context)).await
@@ -516,7 +516,7 @@ where
                 }
                 let engine = self.open.open_protocol_engine().await?;
                 let expected_mutation_revision = engine
-                    .ensure_sync_authority_has_only_synchronized_rows()
+                    .sync_authority_admission_revision()
                     .await?;
                 engine
                     .admit_sync_authority_storage(expected_mutation_revision)
@@ -4096,7 +4096,7 @@ fn required_non_empty(value: Option<String>, field: &'static str) -> Result<Stri
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(super) struct ApiError {
     status: StatusCode,
     body: ErrorEnvelope,
 }
@@ -6414,51 +6414,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_rejects_preexisting_unsynchronized_untracked_rows() {
+    async fn serve_preserves_preexisting_untracked_rows() {
         let storage = Memory::new();
-        let lix = open_lix()
-            .with_storage(storage.clone())
-            .await
-            .expect("initialize Lix before serving");
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-             VALUES ('local-only-before-serve', 'forbidden', true)",
-            &[],
-        )
-        .await
-        .expect("non-authority setup may contain untracked state");
-        lix.close().await.expect("close setup Lix");
-
-        let result = open_lix()
-            .with_storage(storage.clone())
-            .serve()
-            .with_embedded_lix_id()
-            .await;
-        let Err(error) = result else {
-            panic!("server admission must reject state omitted from sync");
-        };
-        assert_eq!(error.code, "LIX_AUTHORITY_UNTRACKED_UNSUPPORTED");
-
-        let cleanup = open_lix()
-            .with_storage(storage.clone())
-            .await
-            .expect("failed admission must leave ordinary repository writes available");
-        cleanup
-            .execute(
-                "DELETE FROM lix_key_value WHERE key = 'local-only-before-serve'",
-                &[],
-            )
-            .await
-            .expect("the unsupported row should remain recoverable after failed admission");
-        cleanup.close().await.expect("close cleanup engine");
-
-        let recovered = open_lix()
-            .with_storage(storage)
-            .serve()
-            .with_embedded_lix_id()
-            .await
-            .expect("serving should succeed after the unsupported row is removed");
-        recovered.close().await.expect("close recovered server");
+        let source = open_lix().with_storage(storage.clone()).await.unwrap();
+        source.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('local-state','preserved',true)", &[]).await.unwrap();
+        let mut before = Vec::new();
+        source.export_snapshot().write_to(&mut before).await.unwrap();
+        source.close().await.unwrap();
+        let server = open_lix().with_storage(storage).serve().with_embedded_lix_id().await.unwrap();
+        let mut after = Vec::new();
+        server.export_snapshot().write_to(&mut after).await.unwrap();
+        assert_eq!(before, after, "serving must preserve the complete snapshot including untracked rows");
+        server.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -13631,7 +13598,7 @@ mod tests {
     #[tokio::test]
     async fn sync_replica_configuration_cannot_be_served_as_an_authority() {
         let result = open_lix()
-            .with_server(lix::ServerOptions::sync(
+            .with_server(lix::ServerOptions::new(
                 "https://example.invalid/repository",
             ))
             .serve()

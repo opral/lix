@@ -5,7 +5,6 @@ test("remote observe streams native Lix results", async () => {
 	const requests: Request[] = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -92,7 +91,6 @@ test("remote observe applies every blob delta before coalescing delivery", async
 	].join("");
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -167,7 +165,6 @@ test("remote observe applies sequential row deltas before coalescing delivery", 
 	].join("");
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -203,7 +200,6 @@ test("adding an observation reconnects an established multiplex stream with the 
 	const observeRequests: Request[] = [];
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -264,7 +260,6 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 	let rebalanced = false;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			headers: () => {
 				headerResolutions += 1;
@@ -416,7 +411,6 @@ test("hub-wide protocol failures abort a held multiplex stream without reconnect
 		let liveObserveRequests = 0;
 		const lix = await openLix({
 			server: {
-				mode: "remote",
 				url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
@@ -464,7 +458,6 @@ test("remote observe can continue after a semantic SSE error", async () => {
 		let observeRequests = 0;
 		const lix = await openLix({
 			server: {
-				mode: "remote",
 				url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
@@ -526,7 +519,6 @@ test("remote observe treats unmarked semantic errors as terminal", async () => {
 		let observeRequests = 0;
 		const lix = await openLix({
 			server: {
-				mode: "remote",
 				url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
@@ -570,7 +562,6 @@ test("a successful branch switch restarts observations on the pinned session", a
 	let observeRequests = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -650,7 +641,6 @@ test("a local branch switch setup failure preserves a healthy observation", asyn
 	let observeSignal: AbortSignal | undefined;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			headers: () => {
 				if (failHeaders) throw new Error("headers unavailable");
@@ -701,7 +691,6 @@ test("remote observe reconnects after a gone protocol session instead of failing
 	let observeCalls = 0;
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -770,7 +759,6 @@ test("remote observe recovers multiple expired shards with one handshake", async
 	let valuePrefix = "value";
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -862,7 +850,6 @@ test("remote observe fails if the recovered protocol session is also gone", asyn
 		let observeCalls = 0;
 		const lix = await openLix({
 			server: {
-				mode: "remote",
 				url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 				fetch: async (input, init) => {
 					const request = new Request(input, init);
@@ -910,7 +897,6 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 		const observedSessionIds: Array<string | null> = [];
 		const lix = await openLix({
 			server: {
-				mode: "remote",
 				url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 				headers: () => ({ Authorization: `Bearer token-${++headerCalls}` }),
 				fetch: async (input, init) => {
@@ -969,7 +955,6 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 test("closing Lix resolves pending remote observation reads", async () => {
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);
@@ -993,7 +978,6 @@ test("closing Lix stops observations before an earlier finite request settles", 
 	const releaseExecute = deferred<void>();
 	const lix = await openLix({
 		server: {
-			mode: "remote",
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 			fetch: async (input, init) => {
 				const request = new Request(input, init);

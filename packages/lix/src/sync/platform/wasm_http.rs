@@ -15,11 +15,10 @@ use super::super::http::{
     SYNC_TRANSPORT_ERROR_CODE, response_too_large,
 };
 use crate::LixError;
-use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
 use crate::authority_client::{
-    ProtocolByteStream, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse,
-    ProtocolHttpStream,
+    ProtocolByteStream, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse, ProtocolHttpStream,
 };
+use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
 use bytes::Bytes;
 
 #[doc(hidden)]
@@ -72,6 +71,237 @@ pub(crate) struct AuthorityHttp(BrowserHttpClient);
 
 pub(crate) fn authority_http(headers: &[(String, String)]) -> Result<AuthorityHttp, LixError> {
     Ok(AuthorityHttp(BrowserHttpClient::from_headers(headers)?))
+}
+
+const HOSTED_RESPONSE_LIMIT: usize = 64 * 1024;
+
+struct UploadBodyState {
+    stream: RefCell<Option<ProtocolByteStream>>,
+    canceled: std::cell::Cell<bool>,
+    pending: RefCell<Option<futures_util::future::AbortHandle>>,
+}
+
+impl UploadBodyState {
+    fn cancel(&self) {
+        self.canceled.set(true);
+        self.stream.borrow_mut().take();
+        if let Some(pending) = self.pending.borrow_mut().take() {
+            pending.abort();
+        }
+    }
+}
+
+struct UploadBodyGuard(std::rc::Rc<UploadBodyState>);
+impl Drop for UploadBodyGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+impl AuthorityHttp {
+    pub(crate) async fn upload(
+        &self,
+        request: ProtocolHttpRequest,
+        body: ProtocolByteStream,
+    ) -> Result<ProtocolHttpResponse, LixError> {
+        use futures_util::{
+            StreamExt,
+            future::{AbortHandle, Abortable},
+        };
+        let state = std::rc::Rc::new(UploadBodyState {
+            stream: RefCell::new(Some(body)),
+            canceled: std::cell::Cell::new(false),
+            pending: RefCell::new(None),
+        });
+        // Fetch may reject without canceling its request body. Cancellation must
+        // also reach a Rust producer that is currently waiting for its next chunk.
+        let _body_guard = UploadBodyGuard(state.clone());
+        let pull_state = state.clone();
+        let pull: Closure<dyn FnMut(JsValue) -> Promise> =
+            Closure::wrap(Box::new(move |controller: JsValue| -> Promise {
+                let state = pull_state.clone();
+                wasm_bindgen_futures::future_to_promise(async move {
+                    if state.canceled.get() {
+                        return Ok(JsValue::UNDEFINED);
+                    }
+                    let mut stream = state.stream.borrow_mut().take();
+                    let (abort, registration) = AbortHandle::new_pair();
+                    *state.pending.borrow_mut() = Some(abort);
+                    let item = Abortable::new(
+                        async {
+                            match stream.as_mut() {
+                                Some(stream) => stream.next().await,
+                                None => None,
+                            }
+                        },
+                        registration,
+                    )
+                    .await;
+                    state.pending.borrow_mut().take();
+                    // A cancel that arrived during next() wins. Never put the source
+                    // back into the shared state after cancellation.
+                    if state.canceled.get() || item.is_err() {
+                        return Ok(JsValue::UNDEFINED);
+                    }
+                    let (method, value) = match item.unwrap() {
+                        Some(Ok(bytes)) => {
+                            *state.stream.borrow_mut() = stream;
+                            ("enqueue", Uint8Array::from(bytes.as_ref()).into())
+                        }
+                        Some(Err(error)) => ("error", JsValue::from_str(&error.to_string())),
+                        None => ("close", JsValue::UNDEFINED),
+                    };
+                    let function =
+                        Reflect::get(&controller, &method.into())?.dyn_into::<Function>()?;
+                    function.call1(&controller, &value)?;
+                    Ok(JsValue::UNDEFINED)
+                })
+            }));
+        let cancel_state = state.clone();
+        let cancel: Closure<dyn FnMut()> = Closure::wrap(Box::new(move || cancel_state.cancel()));
+        let source = Object::new();
+        Reflect::set(&source, &"pull".into(), &pull.into_js_value()).map_err(js_transport_error)?;
+        Reflect::set(&source, &"cancel".into(), &cancel.into_js_value())
+            .map_err(js_transport_error)?;
+        let global = js_sys::global();
+        let constructor = Reflect::get(&global, &"ReadableStream".into())
+            .map_err(js_transport_error)?
+            .dyn_into::<Function>()
+            .map_err(js_transport_error)?;
+        let args = Array::new();
+        args.push(&source);
+        let stream = Reflect::construct(&constructor, &args).map_err(js_transport_error)?;
+        let init = Object::new();
+        Reflect::set(&init, &"method".into(), &request.method.into())
+            .map_err(js_transport_error)?;
+        Reflect::set(&init, &"body".into(), &stream).map_err(js_transport_error)?;
+        Reflect::set(&init, &"duplex".into(), &"half".into()).map_err(js_transport_error)?;
+        Reflect::set(&init, &"credentials".into(), &"include".into())
+            .map_err(js_transport_error)?;
+        Reflect::set(&init, &"redirect".into(), &"error".into()).map_err(js_transport_error)?;
+        Reflect::set(&init, &"cache".into(), &"no-store".into()).map_err(js_transport_error)?;
+        Reflect::set(
+            &init,
+            &"lixResponseLimit".into(),
+            &JsValue::from_f64(HOSTED_RESPONSE_LIMIT as f64),
+        )
+        .map_err(js_transport_error)?;
+        let controller_constructor = Reflect::get(&global, &"AbortController".into())
+            .map_err(js_transport_error)?
+            .dyn_into::<Function>()
+            .map_err(js_transport_error)?;
+        let controller: Object = Reflect::construct(&controller_constructor, &Array::new())
+            .map_err(js_transport_error)?
+            .into();
+        let signal = Reflect::get(&controller, &"signal".into()).map_err(js_transport_error)?;
+        Reflect::set(&init, &"signal".into(), &signal).map_err(js_transport_error)?;
+        let timeout_controller = controller.clone();
+        let timeout_state = state.clone();
+        let timeout_callback: Closure<dyn FnMut()> = Closure::wrap(Box::new(move || {
+            timeout_state.cancel();
+            abort_controller(&timeout_controller);
+        }));
+        let set_timeout = Reflect::get(&global, &"setTimeout".into())
+            .map_err(js_transport_error)?
+            .dyn_into::<Function>()
+            .map_err(js_transport_error)?;
+        let timeout_handle = set_timeout
+            .call2(
+                &global,
+                timeout_callback.as_ref(),
+                &JsValue::from_f64(HTTP_TIMEOUT.as_millis() as f64),
+            )
+            .map_err(js_transport_error)?;
+        let mut abort_on_drop = AbortOnDrop {
+            controller: controller.clone(),
+            timeout: Some(BrowserTimeout {
+                global: global.clone().into(),
+                handle: timeout_handle,
+                _callback: timeout_callback,
+            }),
+            armed: true,
+        };
+        let mut headers =
+            resolve_request_headers(&self.0.headers, self.0.header_provider.as_ref()).await?;
+        headers
+            .retain(|(name, _)| !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name));
+        headers.extend(request.headers);
+        let pairs = Array::new();
+        for (name, value) in headers {
+            let pair = Array::new();
+            pair.push(&name.into());
+            pair.push(&value.into());
+            pairs.push(&pair);
+        }
+        Reflect::set(&init, &"headers".into(), &pairs).map_err(js_transport_error)?;
+        // Native browser Fetch must support streamed request bodies. Never turn
+        // a repository into a giant ArrayBuffer as a compatibility fallback.
+        if self.0.fetch.is_none() {
+            let constructor = Reflect::get(&global, &"Request".into())
+                .map_err(js_transport_error)?
+                .dyn_into::<Function>()
+                .map_err(js_transport_error)?;
+            let args = Array::new();
+            args.push(&request.url.clone().into());
+            args.push(&init);
+            let probe =
+                Reflect::construct(&constructor, &args).map_err(|_| unsupported_upload())?;
+            if Reflect::get(&probe, &"duplex".into())
+                .ok()
+                .and_then(|value| value.as_string())
+                .as_deref()
+                != Some("half")
+            {
+                return Err(unsupported_upload());
+            }
+        }
+        let fetch = match &self.0.fetch {
+            Some(fetch) => fetch.clone(),
+            None => Reflect::get(&global, &"fetch".into())
+                .map_err(js_transport_error)?
+                .dyn_into::<Function>()
+                .map_err(js_transport_error)?,
+        };
+        let this = if self.0.fetch.is_some() {
+            JsValue::UNDEFINED
+        } else {
+            global.into()
+        };
+        let response = JsFuture::from(
+            fetch
+                .call2(&this, &request.url.into(), &init)
+                .map_err(js_transport_error)?
+                .dyn_into::<Promise>()
+                .map_err(js_transport_error)?,
+        )
+        .await
+        .map_err(js_transport_error)?;
+        let status = Reflect::get(&response, &"status".into())
+            .map_err(js_transport_error)?
+            .as_f64()
+            .unwrap_or_default() as u16;
+        let headers = browser_response_headers(&response)?;
+        let bytes = read_response_body_limited(
+            &response,
+            "repository creation",
+            &controller,
+            HOSTED_RESPONSE_LIMIT,
+        )
+        .await?;
+        abort_on_drop.disarm();
+        Ok(ProtocolHttpResponse {
+            status,
+            headers,
+            body: Bytes::from(bytes),
+        })
+    }
+}
+
+fn unsupported_upload() -> LixError {
+    LixError::new(
+        "LIX_UNSUPPORTED_OPERATION",
+        "creating a repository from a local Lix requires Fetch request streaming support in this browser",
+    )
 }
 
 impl std::fmt::Debug for BrowserHttpClient {
@@ -133,16 +363,22 @@ impl ProtocolHttp for AuthorityHttp {
         request: ProtocolHttpRequest,
     ) -> Result<ProtocolHttpResponse, LixError> {
         let method = request.method.parse().map_err(|error| {
-            LixError::new(LixError::CODE_INVALID_PARAM, format!("invalid HTTP method: {error}"))
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("invalid HTTP method: {error}"),
+            )
         })?;
-        let response = self.0.send(RawHttpRequest {
-            method,
-            url: request.url,
-            headers: request.headers,
-            body: request.body.map(|body| body.to_vec()),
-            cache_immutable: false,
-            operation: "authority request",
-        }).await?;
+        let response = self
+            .0
+            .send(RawHttpRequest {
+                method,
+                url: request.url,
+                headers: request.headers,
+                body: request.body.map(|body| body.to_vec()),
+                cache_immutable: false,
+                operation: "authority request",
+            })
+            .await?;
         Ok(ProtocolHttpResponse {
             status: response.status,
             headers: Vec::new(),
@@ -170,7 +406,8 @@ async fn authority_stream(
     client: &BrowserHttpClient,
     request: ProtocolHttpRequest,
 ) -> Result<ProtocolHttpStream, LixError> {
-    let mut headers = resolve_request_headers(&client.headers, client.header_provider.as_ref()).await?;
+    let mut headers =
+        resolve_request_headers(&client.headers, client.header_provider.as_ref()).await?;
     headers.retain(|(name, _)| !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name));
     headers.extend(request.headers);
 
@@ -178,8 +415,7 @@ async fn authority_stream(
     Reflect::set(&init, &"method".into(), &request.method.into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"credentials".into(), &"include".into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"cache".into(), &"no-store".into()).map_err(js_transport_error)?;
-    Reflect::set(&init, &"lixResponseStream".into(), &JsValue::TRUE)
-        .map_err(js_transport_error)?;
+    Reflect::set(&init, &"lixResponseStream".into(), &JsValue::TRUE).map_err(js_transport_error)?;
     let header_pairs = Array::new();
     for (name, value) in &headers {
         let pair = Array::new();
@@ -189,12 +425,8 @@ async fn authority_stream(
     }
     Reflect::set(&init, &"headers".into(), &header_pairs).map_err(js_transport_error)?;
     if let Some(body) = request.body {
-        Reflect::set(
-            &init,
-            &"body".into(),
-            &Uint8Array::from(body.as_ref()),
-        )
-        .map_err(js_transport_error)?;
+        Reflect::set(&init, &"body".into(), &Uint8Array::from(body.as_ref()))
+            .map_err(js_transport_error)?;
     }
 
     let global = js_sys::global();
@@ -503,6 +735,21 @@ async fn read_response_body(
     operation: &str,
     controller: &Object,
 ) -> Result<Vec<u8>, LixError> {
+    read_response_body_limited(
+        response,
+        operation,
+        controller,
+        MAX_SYNC_PULL_RESPONSE_BYTES,
+    )
+    .await
+}
+
+async fn read_response_body_limited(
+    response: &JsValue,
+    operation: &str,
+    controller: &Object,
+    limit: usize,
+) -> Result<Vec<u8>, LixError> {
     let stream = Reflect::get(response, &"body".into()).map_err(js_transport_error)?;
     if stream.is_null() || stream.is_undefined() {
         return Ok(Vec::new());
@@ -513,6 +760,10 @@ async fn read_response_body(
         .map_err(js_transport_error)?
         .call0(&stream)
         .map_err(js_transport_error)?;
+    let mut reader_guard = ResponseReaderGuard {
+        reader: reader.clone(),
+        complete: false,
+    };
     let read = Reflect::get(&reader, &"read".into())
         .map_err(js_transport_error)?
         .dyn_into::<Function>()
@@ -530,6 +781,7 @@ async fn read_response_body(
             .as_bool()
             .unwrap_or(false);
         if done {
+            reader_guard.complete = true;
             release_reader(&reader);
             return Ok(body);
         }
@@ -543,10 +795,16 @@ async fn read_response_body(
                 "browser sync response chunk length exceeds usize",
             )
         })?;
-        if body.len().saturating_add(chunk_len) > MAX_SYNC_PULL_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk_len) > limit {
             abort_controller(controller);
-            cancel_reader(&reader);
-            return Err(response_too_large(operation));
+            return Err(if limit == MAX_SYNC_PULL_RESPONSE_BYTES {
+                response_too_large(operation)
+            } else {
+                LixError::new(
+                    "LIX_SERVER_PROTOCOL_ERROR",
+                    format!("{operation} response exceeds {limit} bytes"),
+                )
+            });
         }
         let offset = body.len();
         body.resize(offset + chunk_len, 0);
@@ -554,18 +812,32 @@ async fn read_response_body(
     }
 }
 
+struct ResponseReaderGuard {
+    reader: JsValue,
+    complete: bool,
+}
+impl Drop for ResponseReaderGuard {
+    fn drop(&mut self) {
+        if !self.complete {
+            cancel_reader(&self.reader);
+        }
+    }
+}
+
 fn cancel_reader(reader: &JsValue) {
-    let Ok(cancel) = Reflect::get(reader, &"cancel".into()) else {
-        return;
-    };
-    let Ok(cancel) = cancel.dyn_into::<Function>() else {
-        return;
-    };
-    let Ok(result) = cancel.call0(reader) else {
-        return;
-    };
-    let _ = result;
-    release_reader(reader);
+    let reader = reader.clone();
+    let canceled = Reflect::get(&reader, &"cancel".into())
+        .ok()
+        .and_then(|value| value.dyn_into::<Function>().ok())
+        .and_then(|cancel| cancel.call0(&reader).ok());
+    // A pending read can keep the lock until cancellation settles. Release only
+    // afterward, including when the stream's cancel hook rejects.
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Some(result) = canceled {
+            let _ = JsFuture::from(Promise::resolve(&result)).await;
+        }
+        release_reader(&reader);
+    });
 }
 
 fn release_reader(reader: &JsValue) {

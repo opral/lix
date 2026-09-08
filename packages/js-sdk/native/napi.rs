@@ -267,6 +267,11 @@ type NativeUnitDeferred = NativeDeferred<()>;
 type PendingTelemetryParent = Arc<Mutex<Option<SpanContext>>>;
 
 enum LixCommand {
+    CreateHosted {
+        server: ServerOptions,
+        idempotency_key: Option<String>,
+        deferred: NativeDeferred<HostedLixDto>,
+    },
     OpenAnotherSession {
         options: NativeOpenAnotherSessionOptions,
         telemetry_parent: Option<PendingTelemetryParent>,
@@ -900,6 +905,7 @@ fn drain_commands_after_close(receiver: &mpsc::Receiver<QueuedLixCommand>, send_
 fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error: io::Error) {
     while let Ok(queued) = receiver.recv() {
         match queued.command {
+            LixCommand::CreateHosted { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::Execute { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::OpenAnotherSession { deferred, .. } => {
                 deferred.reject(to_napi_error(&error))
@@ -995,6 +1001,15 @@ fn handle_lix_command(
                 state.transactions.insert(transaction_id, transaction);
                 NativeLixTransaction::new(actor, transaction_id)
             });
+            settle_deferred(deferred, result);
+            None
+        }
+        LixCommand::CreateHosted {
+            server,
+            idempotency_key,
+            deferred,
+        } => {
+            let result = block_on!(state.lix.create_hosted(server, idempotency_key));
             settle_deferred(deferred, result);
             None
         }
@@ -1237,6 +1252,9 @@ fn finish_native_snapshot_export(
 
 fn settle_command_after_close(command: LixCommand) {
     match command {
+        LixCommand::CreateHosted { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()))
+        }
         LixCommand::Close(deferred) => settle_deferred(deferred, Ok(())),
         LixCommand::OpenAnotherSession { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
@@ -1297,6 +1315,25 @@ fn transaction_closed_error() -> LixError {
 }
 
 impl NativeLixInner {
+    async fn create_hosted(
+        &self,
+        server: ServerOptions,
+        idempotency_key: Option<String>,
+    ) -> NativeResult<HostedLixDto> {
+        let mut builder = lix::create_lix().with_server(server);
+        if let Some(key) = idempotency_key {
+            builder = builder.with_idempotency_key(key);
+        }
+        let hosted = match self {
+            Self::Memory(lix) => builder.from_lix(lix).await?,
+            Self::FilesystemStorage(lix, _, _) => builder.from_lix(lix).await?,
+        };
+        Ok(HostedLixDto {
+            id: hosted.id,
+            url: hosted.url,
+        })
+    }
+
     fn open_report(&self) -> &OpenReport {
         match self {
             Self::Memory(lix) => lix.open_report(),
@@ -1731,7 +1768,7 @@ fn open_memory_native(
     let (telemetry, telemetry_parent_source) = telemetry_dispatch
         .map(telemetry_sink)
         .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
-    let mut builder = open_lix();
+    let mut builder = open_lix().with_storage(Memory::new());
     if let Some(telemetry) = telemetry {
         builder = builder.with_telemetry(telemetry);
     }
@@ -1739,7 +1776,7 @@ fn open_memory_native(
         builder = builder.with_open_progress_sink(open_progress_sink(dispatch));
     }
     if let Some(url) = server_url {
-        builder = builder.with_server(ServerOptions::sync(url).with_headers(server_headers));
+        builder = builder.with_server(ServerOptions::new(url).with_headers(server_headers));
     }
     let lix = rt.block_on(instrument_remote_parent(telemetry_parent, async move {
         match snapshot {
@@ -1779,7 +1816,7 @@ fn open_filesystem_storage_native(
         builder = builder.with_open_progress_sink(open_progress_sink(dispatch));
     }
     if let Some(url) = server_url {
-        builder = builder.with_server(ServerOptions::sync(url).with_headers(server_headers));
+        builder = builder.with_server(ServerOptions::new(url).with_headers(server_headers));
     }
     let lix = rt.block_on(instrument_remote_parent(telemetry_parent, async move {
         match snapshot {
@@ -2158,6 +2195,25 @@ impl NativeLix {
         self.actor
             .send_with_deferred(deferred, |deferred| LixCommand::MergeBranch {
                 options: options.into(),
+                deferred,
+            });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "createHosted")]
+    pub fn create_hosted<'env>(
+        &self,
+        env: &'env Env,
+        server: HostedServerDto,
+    ) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeDeferred<HostedLixDto>, Object<'env>) =
+            env.create_deferred()?;
+        let idempotency_key = server.idempotency_key;
+        let server = ServerOptions::new(server.url).with_headers(server.headers);
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::CreateHosted {
+                server,
+                idempotency_key,
                 deferred,
             });
         Ok(promise)
@@ -3142,4 +3198,84 @@ fn throw_lix_error(env: &Env, error: LixError) -> Error {
         Ok(()) => Error::new(Status::PendingException, ""),
         Err(error) => error,
     }
+}
+
+#[napi(object)]
+#[derive(Debug)]
+pub struct HostedLixDto {
+    pub id: String,
+    pub url: String,
+}
+
+#[napi(object)]
+#[derive(Debug)]
+pub struct HostedServerDto {
+    pub idempotency_key: Option<String>,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+}
+
+#[derive(Debug)]
+pub struct HostedLifecycleTask {
+    idempotency_key: Option<String>,
+    server: Option<ServerOptions>,
+    delete: bool,
+}
+
+impl Task for HostedLifecycleTask {
+    type Output = NativeResult<Option<HostedLixDto>>;
+    type JsValue = Option<HostedLixDto>;
+    fn compute(&mut self) -> Result<Self::Output> {
+        let server = self
+            .server
+            .take()
+            .ok_or_else(|| Error::from_reason("lifecycle task already consumed"))?;
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(to_napi_error)?;
+        Ok(runtime.block_on(async {
+            if self.delete {
+                lix::delete_lix().with_server(server).await?;
+                Ok(None)
+            } else {
+                let mut builder = lix::create_lix().with_server(server);
+                if let Some(key) = self.idempotency_key.take() {
+                    builder = builder.with_idempotency_key(key);
+                }
+                let hosted = builder.await?;
+                Ok(Some(HostedLixDto {
+                    id: hosted.id,
+                    url: hosted.url,
+                }))
+            }
+        }))
+    }
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        output.map_err(|error| lix_error_to_napi_error(&env, error))
+    }
+}
+
+#[napi(js_name = "createHosted")]
+pub fn create_hosted(
+    url: String,
+    headers: Vec<(String, String)>,
+    idempotency_key: Option<String>,
+) -> AsyncTask<HostedLifecycleTask> {
+    AsyncTask::new(HostedLifecycleTask {
+        idempotency_key,
+        server: Some(ServerOptions::new(url).with_headers(headers)),
+        delete: false,
+    })
+}
+#[napi(js_name = "deleteHosted")]
+pub fn delete_hosted(
+    url: String,
+    headers: Vec<(String, String)>,
+) -> AsyncTask<HostedLifecycleTask> {
+    AsyncTask::new(HostedLifecycleTask {
+        idempotency_key: None,
+        server: Some(ServerOptions::new(url).with_headers(headers)),
+        delete: true,
+    })
 }
