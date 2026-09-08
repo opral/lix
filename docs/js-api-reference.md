@@ -233,7 +233,19 @@ events.close();
 const tx = await lix.beginTransaction();
 ```
 
-Starts a transaction. While it is open, execute statements on the transaction handle.
+Starts an independent transaction context on this handle's current branch and
+account. Execute statements that belong to the transaction through `tx.execute()`;
+these reads see its staged writes. Ordinary `lix.execute()` reads and
+`lix.observe()` remain available on the original handle and see committed data.
+Observers publish relevant updates after commit; rolled-back writes are never
+published. Changing the original handle's branch does not retarget the transaction.
+
+Each handle permits one opening or active explicit transaction at a time. Use
+`openAnotherSession()` for another independent handle when needed.
+
+Commit or roll back the transaction before closing the original handle. Closing
+with an opening or active transaction still fails with
+`LIX_INVALID_TRANSACTION_STATE`.
 
 SQL `UPDATE` and `DELETE` decisions are protected until commit. If another
 transaction changes active-branch or shared/global state after this transaction

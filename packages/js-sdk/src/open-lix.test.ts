@@ -950,7 +950,7 @@ test("observe close reliably resolves pending next calls", async () => {
 	await lix.close();
 });
 
-test("observe remains usable after next rejects", async () => {
+test("observe remains usable during a transaction and after rollback", async () => {
 	const lix = await openLix();
 	const events = lix.observe(
 		"SELECT key, value FROM lix_key_value WHERE key = $1",
@@ -961,14 +961,14 @@ test("observe remains usable after next rejects", async () => {
 	await tx.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ('js-observe-error', 'rolled-back')",
 	);
-	await expect(events.next()).rejects.toMatchObject({ name: "LixError" });
+	expect((await withTimeout(events.next()))?.result.rows).toEqual([]);
 	await tx.rollback();
 
 	await lix.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ('js-observe-error', 'after-error')",
 	);
 	const update = await events.next();
-	expect(update?.sequence).toBe(0);
+	expect(update?.sequence).toBe(1);
 	expect(update?.result.rows[0]?.value).toBe("after-error");
 
 	events.close();
@@ -1907,7 +1907,7 @@ test("beginTransaction preserves handle after invalid JS parameter", async () =>
 	await lix.close();
 });
 
-test("beginTransaction blocks session reads and writes on the same handle", async () => {
+test("beginTransaction leaves committed session reads available", async () => {
 	const lix = await openLix();
 	await registerCrmTaskSchema(lix);
 
@@ -1917,23 +1917,18 @@ test("beginTransaction blocks session reads and writes on the same handle", asyn
 		["tx-only-task", "Inside tx", false, JSON.stringify({ batch: 1 })],
 	);
 
-	await expect(lix.execute("SELECT 1 AS ok")).rejects.toMatchObject({
-		code: "LIX_INVALID_TRANSACTION_STATE",
-	});
-	await expect(
-		lix.execute(
-			"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
-			["outside-task", "Outside tx", false, JSON.stringify({ batch: 1 })],
-		),
-	).rejects.toMatchObject({ code: "LIX_INVALID_TRANSACTION_STATE" });
+	const committed = await lix.execute("SELECT id FROM crm_task WHERE id = $1", ["tx-only-task"]);
+	expect(committed.rows).toEqual([]);
+	const staged = await tx.execute("SELECT id FROM crm_task WHERE id = $1", ["tx-only-task"]);
+	expect(staged.rows).toEqual([{ id: "tx-only-task" }]);
 
 	await tx.commit();
 
-	const committed = await lix.execute(
+	const afterCommit = await lix.execute(
 		"SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
 		["outside-task", "tx-only-task"],
 	);
-	expect(committed.rows.map((row) => row.id)).toEqual(["tx-only-task"]);
+	expect(afterCommit.rows.map((row) => row.id)).toEqual(["tx-only-task"]);
 
 	await lix.close();
 });
