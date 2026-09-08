@@ -1403,16 +1403,14 @@ async fn filesystem_ignores_special_and_invalid_utf8_entries() {
     let lix = open_filesystem_lix(tempdir.path()).await;
 
     assert_eq!(read_file(&lix, "/socket").await.unwrap(), None);
+    let files = lix
+        .execute("SELECT path FROM lix_file ORDER BY path", &[])
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "only the bootstrap README is tracked");
     assert_eq!(
-        lix.execute("SELECT path FROM lix_file ORDER BY path", &[])
-            .await
-            .unwrap()
-            .rows()
-            .iter()
-            .map(|row| row.get::<String>("path").unwrap())
-            .collect::<Vec<_>>(),
-        vec!["/.lix/README.md"],
-        "only the repository bootstrap file is tracked",
+        files.rows()[0].get::<String>("path").unwrap(),
+        "/.lix/README.md"
     );
     assert!(
         std::fs::symlink_metadata(socket_path)

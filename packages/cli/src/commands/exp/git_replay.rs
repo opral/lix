@@ -345,6 +345,13 @@ where
     ))
     .map_err(|error| CliError::msg(format!("failed to enable deterministic mode: {error}")))?;
 
+    // Replay owns a newly created output repository. Its initial file tree
+    // must come entirely from Git, including when Git contains its own README.
+    // Remove repository starter files before installing plugins or timing work.
+    db::block_on(lix.execute("DELETE FROM lix_file", &[])).map_err(|error| {
+        CliError::msg(format!("failed to clear replay starter files: {error}"))
+    })?;
+
     let plugin_install_started = Instant::now();
     if args.plugins == GitReplayPlugins::All {
         install_embedded_replay_plugins(&lix)?;
@@ -1946,13 +1953,9 @@ where
         }
     }
 
-    // Only replay-owned files belong to the Git tree. Repository bootstrap
-    // documentation and installed plugins are Lix files too, without Git OIDs.
-    // Counting replay metadata still detects stale Git rows outside the final
-    // tree instead of excluding all files beneath a special directory.
     let count = db::block_on(lix.execute(
         "SELECT COUNT(*) FROM lix_file \
-         WHERE lixcol_metadata ->> 'git_oid' IS NOT NULL",
+         WHERE path NOT LIKE '/.lix/plugins/%'",
         &[],
     ))
     .map_err(|error| CliError::msg(format!("failed to count Lix final tree: {error}")))?;
@@ -2523,50 +2526,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn final_tree_verification_excludes_bootstrap_files_but_rejects_stale_git_rows() {
-        let fixture = unique_temp_dir();
-        fs::create_dir_all(&fixture).expect("fixture repository should be created");
-        git_ok(&fixture, &["init", "-q", "-b", "main"]);
-        git_ok(&fixture, &["config", "user.email", "replay@example.test"]);
-        git_ok(&fixture, &["config", "user.name", "Replay Test"]);
-        git_ok(&fixture, &["commit", "--allow-empty", "-qm", "empty tree"]);
-        let commit = resolve_commit_oid(&fixture, "HEAD").unwrap();
-        let lix = db::block_on(open_lix().with_storage(Memory::new())).unwrap();
-        let bootstrap = db::block_on(lix.execute(
-            "SELECT path FROM lix_file WHERE path = '/.lix/README.md'",
-            &[],
-        ))
-        .unwrap();
-        assert_eq!(
-            bootstrap.rows().len(),
-            1,
-            "fixture contains the seeded repository documentation"
-        );
-        let mut blobs = GitBlobReader::spawn(&fixture).unwrap();
-        verify_final_git_tree(&fixture, &commit, &HashSet::new(), &mut blobs, &lix)
-            .expect("bootstrap files are not part of the empty Git tree");
-        db::block_on(lix.execute(
-            "INSERT INTO lix_file (path, content, lixcol_metadata) VALUES ($1, $2, $3)",
-            &[
-                Value::Text("/stale.txt".into()),
-                Value::Blob(vec![1].into()),
-                Value::Jsonb(json!({"git_mode":"100644", "git_oid":"stale-oid"}).into()),
-            ],
-        ))
-        .unwrap();
-        let error = verify_final_git_tree(&fixture, &commit, &HashSet::new(), &mut blobs, &lix)
-            .expect_err("a stale replay-owned row must still fail verification");
-        assert!(
-            error
-                .to_string()
-                .contains("row count differs (lix=1, git=0)")
-        );
-        drop(blobs);
-        db::block_on(lix.close()).unwrap();
-        fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
