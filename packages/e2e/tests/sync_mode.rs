@@ -1619,18 +1619,26 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
     .await
     .expect("a scoped checkpoint must upload without a false divergence reset");
     assert_eq!(
-        remote.execute("SELECT path FROM lix_file", &[]).await,
-        vec![vec![Value::Text("/b/a/note.txt".to_owned())]],
+        remote
+            .execute("SELECT path FROM lix_file ORDER BY path", &[])
+            .await,
+        vec![
+            vec![Value::Text("/.lix/README.md".to_owned())],
+            vec![Value::Text("/b/a/note.txt".to_owned())],
+        ],
     );
     let checkpoint_params = [Value::Text(checkpoint.clone())];
     assert_eq!(
         remote
             .execute(
-                "SELECT path FROM lix_state_at('lix_file', $1)",
+                "SELECT path FROM lix_state_at('lix_file', $1) ORDER BY path",
                 &checkpoint_params
             )
             .await,
-        vec![vec![Value::Text("/b/a/note.txt".to_owned())]],
+        vec![
+            vec![Value::Text("/.lix/README.md".to_owned())],
+            vec![Value::Text("/b/a/note.txt".to_owned())],
+        ],
     );
     if leave_unselected_work {
         remote.wait_for_value("unselected", "keep working").await;
@@ -2408,7 +2416,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
     let commit_id = first_checkpoint.clone();
     let files = replica
         .execute(
-            "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
+            "SELECT name, directory_id FROM lix_state_at('lix_file', $1) ORDER BY name",
             &[Value::Text(commit_id.clone())],
         )
         .await
@@ -2419,14 +2427,14 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .map(|row| row.get::<String>("name").expect("file name"))
         .collect::<Vec<_>>();
     assert_eq!(
-        file_names.len(),
-        2,
-        "first checkpoint holds both seeded files, got {file_names:?}"
+        file_names,
+        vec!["README.md", "inside.md", "playbook.md"],
+        "first checkpoint holds the bootstrap README and both authored files"
     );
 
     let directories = replica
         .execute(
-            "SELECT id, name FROM lix_state_at('lix_directory', $1)",
+            "SELECT id, name FROM lix_state_at('lix_directory', $1) ORDER BY name",
             &[Value::Text(commit_id.clone())],
         )
         .await
@@ -2437,9 +2445,9 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .map(|row| row.get::<String>("name").expect("directory name"))
         .collect::<Vec<_>>();
     assert_eq!(
-        directory_names.len(),
-        3,
-        "first checkpoint holds sales, docs, handbook — got {directory_names:?}"
+        directory_names,
+        vec![".lix", "app_data", "docs", "handbook", "plugins", "sales"],
+        "first checkpoint holds bootstrap and authored directories"
     );
     assert_files_resolve_directories(&files, &directories);
 
@@ -2459,6 +2467,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
     assert_eq!(
         paths,
         vec![
+            "/.lix/README.md".to_string(),
             "/docs/handbook/inside.md".to_string(),
             "/sales/playbook.md".to_string(),
         ],
@@ -2512,9 +2521,12 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
     assert_eq!(
         latest_names,
         vec![
+            ".lix".to_string(),
+            "app_data".to_string(),
             "brand".to_string(),
             "docs".to_string(),
             "handbook".to_string(),
+            "plugins".to_string(),
             "sales".to_string(),
         ],
         "latest checkpoint holds every directory"
