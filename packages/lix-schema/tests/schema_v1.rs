@@ -233,17 +233,17 @@ fn bundled_native_jsonb_schemas_match_canonical_fixtures_and_fingerprints() {
         (
             "json",
             "json_root",
-            "041872f6589bbdf8187bccc3894451407073ba21a2a3d396503ac071f8402704",
+            "f9983019fd1050c5234ae1957ecf300757d0a43eb89a24e91ed184c85599f3ad",
         ),
         (
             "json",
             "json_object_member",
-            "be012f960e381e167cc6da518891a6a68b47233eb67153bbba96bb4ba02f5734",
+            "83dd43c644fd996fdec5b907ab08396270adfbe7fdc2f4792e00827f51304bb3",
         ),
         (
             "json",
             "json_array_item",
-            "a980f74baf5f9156853cd73cb3222f79ec5dbfaffa5da4d9d7f705c35357d662",
+            "e5eba027bc7ceb323bfa045dfcf39134565bfc23f84844be628283db1bc62422",
         ),
         (
             "excalidraw",
@@ -253,12 +253,12 @@ fn bundled_native_jsonb_schemas_match_canonical_fixtures_and_fingerprints() {
         (
             "excalidraw",
             "excalidraw_element",
-            "9d4e6f076618c02e1b15e86c0d77bb36545b78330f967f9049985ac79968fd0f",
+            "6f2a49b904fe1f46d484e1488f43c7454e4f0c07c27c299a0bf740ce7e36843b",
         ),
         (
             "excalidraw",
             "excalidraw_file",
-            "f0cc6e729ea8d42f69558972e783e66087addfe13ed34435f10da51fa3694847",
+            "20b7f07a50252241780f2f772f9bcd537d3b42a82d44876f7de6fad2bb241bbd",
         ),
     ];
 

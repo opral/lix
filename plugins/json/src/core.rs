@@ -13,7 +13,7 @@ pub const ARRAY_ITEM_SCHEMA_KEY: &str = "json_array_item";
 const ROOT_ID: &str = "root";
 const OBJECT_CONTAINER_DOMAIN: &[u8] = b"lix-json-object-container\0";
 const NODES_PER_SPAN_CHUNK: usize = 512;
-const SCALAR_ONLY_SEMANTIC_WRITE: &str = "JSON semantic writes support existing scalar values only; use a file byte write for additions, deletions, containers, moves, ordering, or layout changes";
+const REQUIRES_TREE_REBUILD: &str = "JSON row change requires a full tree rebuild";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdNamespace(pub [u8; 16]);
@@ -583,7 +583,7 @@ impl Node {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum RowIdentity {
     Snapshot,
     Object { parent_id: Arc<str>, key: Arc<str> },
@@ -1141,6 +1141,54 @@ struct DocumentInner {
 }
 
 impl Document {
+    pub fn identity_checkpoint(&self) -> Vec<(Option<String>, String)> {
+        self.0
+            .nodes
+            .iter()
+            .map(|node| {
+                let id = match &node.relation {
+                    NodeRelation::Array { id, .. } => Some(id.to_string()),
+                    _ => None,
+                };
+                (id, relation_order(&node.relation).to_owned())
+            })
+            .collect()
+    }
+
+    pub fn open_file_with_checkpoint(
+        bytes: Vec<u8>,
+        namespace: IdNamespace,
+        checkpoint: &[(Option<String>, String)],
+    ) -> Result<Self, String> {
+        let mut nodes = JsonParser::parse(&bytes, namespace)?;
+        if nodes.len() != checkpoint.len() {
+            return Err("JSON identity checkpoint does not match accepted nodes".to_owned());
+        }
+        for (ordinal, (id, order)) in checkpoint.iter().enumerate() {
+            match (&mut nodes[ordinal].relation, id) {
+                (NodeRelation::Array { id: current, .. }, Some(id)) => {
+                    parse_uuid(id, "checkpoint id")?;
+                    *current = Arc::from(id.as_str());
+                }
+                (NodeRelation::Snapshot | NodeRelation::Object { .. }, None) => {}
+                _ => return Err("JSON identity checkpoint relation mismatch".to_owned()),
+            }
+            if nodes[ordinal].parent.is_some() {
+                parse_order_key(order)?;
+                set_relation_order(&mut nodes[ordinal].relation, order);
+            } else if !order.is_empty() {
+                return Err("JSON root checkpoint cannot have an order key".to_owned());
+            }
+            if let Some(parent) = nodes[ordinal].parent {
+                let parent_id = nodes[parent as usize]
+                    .container_id()
+                    .ok_or_else(|| "JSON checkpoint parent is not a container".to_owned())?;
+                refresh_parent(&mut nodes, ordinal as u32, parent_id);
+            }
+        }
+        Self::from_parts(PersistentBlob::from_shared(Arc::new(bytes))?, nodes, 0)
+    }
+
     pub fn open_file(
         bytes: Vec<u8>,
         _path: Option<&str>,
@@ -1430,6 +1478,7 @@ impl Document {
         if let Some(value) = empty_json {
             row.insert("empty_json".to_owned(), sdk::TypedValue::Text(value));
         }
+        set_scalar_text(&mut row, scalar.as_bytes())?;
         complete_nullable_fields(&mut row, schema_key);
         Ok(Some(RowChange {
             schema_key: schema_key.into(),
@@ -1445,16 +1494,16 @@ impl Document {
         change: &RowChange,
     ) -> Result<Option<ByteEdit>, String> {
         let current = Self::scalar_change_from_arena(metadata.clone(), current_scalar)?
-            .ok_or_else(|| SCALAR_ONLY_SEMANTIC_WRITE.to_owned())?;
+            .ok_or_else(|| REQUIRES_TREE_REBUILD.to_owned())?;
         if current.schema_key != change.schema_key || current.row_pk != change.row_pk {
-            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
+            return Err(REQUIRES_TREE_REBUILD.to_owned());
         }
         let Some(changed_row) = &change.row else {
-            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
+            return Err(REQUIRES_TREE_REBUILD.to_owned());
         };
         let current_row = current
             .row
-            .ok_or_else(|| SCALAR_ONLY_SEMANTIC_WRITE.to_owned())?;
+            .ok_or_else(|| REQUIRES_TREE_REBUILD.to_owned())?;
         let mut strings = HashSet::new();
         let changed = SemanticRow::parse(
             RowRecord {
@@ -1481,12 +1530,7 @@ impl Document {
         if !changed.same_location(&current) {
             return Err("indexed semantic row location changed".to_owned());
         }
-        let scalar = serde_json::to_vec(
-            changed
-                .scalar_json()
-                .ok_or_else(|| "scalar JSON row is missing scalar_json".to_owned())?,
-        )
-        .map_err(|error| format!("failed to serialize scalar_json: {error}"))?;
+        let scalar = changed.scalar_bytes()?;
         if parse_complete_scalar(&scalar)? != changed.kind() {
             return Err("scalar_json does not match the row kind".to_owned());
         }
@@ -1609,7 +1653,12 @@ impl Document {
         let changes = if before_row == after_row {
             Vec::new()
         } else {
-            vec![RowChange::upsert(&identity, after_row)]
+            let effect = if rows_equal_without_layout(&before_row, &after_row) {
+                ChangeEffect::FormatOnly
+            } else {
+                ChangeEffect::Content
+            };
+            vec![RowChange::upsert_with_effect(&identity, after_row, effect)]
         };
         Ok(Some((after, changes)))
     }
@@ -1642,6 +1691,15 @@ impl Document {
                 changes.push(RowChange::upsert(&identity, row));
             }
         }
+        // Historical file observations can replay this delta as renderer input.
+        // The host requires schema/key order; HashMap iteration is not stable.
+        changes.sort_by_cached_key(|change| {
+            (
+                change.schema_key.clone(),
+                RowIdentity::from_parts(&change.schema_key, &change.row_pk)
+                    .expect("document diff contains valid JSON identities"),
+            )
+        });
         Ok((after, changes))
     }
 
@@ -1684,9 +1742,17 @@ impl Document {
             return Ok((self.clone(), Vec::new()));
         }
         let mut edits = Vec::with_capacity(changes.len());
+        let mut seen = HashSet::with_capacity(changes.len());
         for change in changes {
-            if let Some(edit) = self.scalar_row_edit(change)? {
-                edits.push(edit);
+            if !seen.insert(RowIdentity::from_parts(&change.schema_key, &change.row_pk)?) {
+                return self.rebuild_rows(changes);
+            }
+            match self.scalar_row_edit(change) {
+                Ok(Some(edit)) => edits.push(edit),
+                Ok(None) => {}
+                // The full-tree path validates the entire batch, including
+                // malformed rows; a rejected scalar shortcut is not acceptance.
+                Err(_) => return self.rebuild_rows(changes),
             }
         }
         edits.sort_unstable_by_key(|edit| edit.offset);
@@ -1696,7 +1762,7 @@ impl Document {
                 .checked_add(pair[0].delete_len)
                 .is_none_or(|end| end > pair[1].offset)
         }) {
-            return Err("JSON semantic write batch contains overlapping scalar edits".to_owned());
+            return self.rebuild_rows(changes);
         }
         if edits.is_empty() {
             return Ok((self.clone(), edits));
@@ -1713,10 +1779,39 @@ impl Document {
         Ok((after, edits))
     }
 
+    fn rebuild_rows(&self, changes: &[RowChange]) -> Result<(Self, Vec<ByteEdit>), String> {
+        let mut rows = self.rows_by_identity()?;
+        for change in changes {
+            let identity = RowIdentity::from_parts(&change.schema_key, &change.row_pk)?;
+            match &change.row {
+                Some(row) => {
+                    rows.insert(identity, row.clone());
+                }
+                None => {
+                    rows.remove(&identity);
+                }
+            }
+        }
+        let mut builder = RowImportBuilder::new();
+        for (identity, row) in rows {
+            builder.push(RowRecord {
+                schema_key: identity.schema_key().into(),
+                row_pk: identity.row_pk(),
+                row,
+            })?;
+        }
+        let (successor, mut edit) = builder.finish()?;
+        if self.bytes_equal(&edit.insert) {
+            return Ok((successor, Vec::new()));
+        }
+        edit.delete_len = self.byte_len() as u64;
+        Ok((successor, vec![edit]))
+    }
+
     fn scalar_row_edit(&self, change: &RowChange) -> Result<Option<ByteEdit>, String> {
         let identity = RowIdentity::from_parts(&change.schema_key, &change.row_pk)?;
         let Some(&node_index) = self.0.lookup.get(&identity_fingerprint(&identity)) else {
-            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
+            return Err(REQUIRES_TREE_REBUILD.to_owned());
         };
         let node_index = usize::try_from(node_index).expect("u32 fits usize");
         let node = &self.0.nodes[node_index];
@@ -1724,10 +1819,10 @@ impl Document {
             return Err("JSON row identity fingerprint collision".to_owned());
         }
         if node.kind.is_container() {
-            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
+            return Err(REQUIRES_TREE_REBUILD.to_owned());
         }
         let Some(changed_row) = &change.row else {
-            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
+            return Err(REQUIRES_TREE_REBUILD.to_owned());
         };
         let mut strings = HashSet::new();
         let row = SemanticRow::parse(
@@ -1739,7 +1834,7 @@ impl Document {
             &mut strings,
         )?;
         if row.identity() != identity || row.kind().is_container() {
-            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
+            return Err(REQUIRES_TREE_REBUILD.to_owned());
         }
         let current = SemanticRow::parse(
             RowRecord {
@@ -1750,13 +1845,9 @@ impl Document {
             &mut strings,
         )?;
         if !row.same_location(&current) {
-            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
+            return Err(REQUIRES_TREE_REBUILD.to_owned());
         }
-        let scalar = serde_json::to_vec(
-            row.scalar_json()
-                .ok_or_else(|| "scalar JSON row is missing scalar_json".to_owned())?,
-        )
-        .map_err(|error| format!("failed to serialize scalar_json: {error}"))?;
+        let scalar = row.scalar_bytes()?;
         let scalar_kind = parse_complete_scalar(&scalar)?;
         if scalar_kind != row.kind() {
             return Err("scalar_json does not match the row kind".to_owned());
@@ -1885,6 +1976,7 @@ enum SemanticRow {
     Snapshot {
         kind: NodeKind,
         scalar_json: Option<Value>,
+        scalar_text: Option<String>,
         layout: Option<Arc<NodeLayout>>,
     },
     Object {
@@ -1893,6 +1985,7 @@ enum SemanticRow {
         order_key: Arc<str>,
         kind: NodeKind,
         scalar_json: Option<Value>,
+        scalar_text: Option<String>,
         container_id: Option<Arc<str>>,
         layout: Option<Arc<NodeLayout>>,
     },
@@ -1902,6 +1995,7 @@ enum SemanticRow {
         order_key: Arc<str>,
         kind: NodeKind,
         scalar_json: Option<Value>,
+        scalar_text: Option<String>,
         layout: Option<Arc<NodeLayout>>,
     },
 }
@@ -1915,6 +2009,10 @@ impl SemanticRow {
         let row = &record.row;
         let kind = required_text(row, "kind").and_then(NodeKind::parse)?;
         let scalar_json = optional_jsonb(row, "scalar_json")?;
+        let scalar_text = optional_text(row, "scalar_text")?;
+        if let Some(text) = &scalar_text {
+            parse_complete_scalar(text.as_bytes())?;
+        }
         validate_scalar_fields(kind, scalar_json.as_ref())?;
         let layout = parse_row_layout(row, &identity, kind, strings)?;
         match identity {
@@ -1922,7 +2020,13 @@ impl SemanticRow {
                 require_fields(
                     row,
                     &["id", "kind"],
-                    &["scalar_json", "prefix_json", "suffix_json", "empty_json"],
+                    &[
+                        "scalar_json",
+                        "scalar_text",
+                        "prefix_json",
+                        "suffix_json",
+                        "empty_json",
+                    ],
                 )?;
                 if required_text(row, "id")? != ROOT_ID {
                     return Err("json_root row id must be \"root\"".to_owned());
@@ -1930,6 +2034,7 @@ impl SemanticRow {
                 Ok(Self::Snapshot {
                     kind,
                     scalar_json,
+                    scalar_text,
                     layout,
                 })
             }
@@ -1939,6 +2044,7 @@ impl SemanticRow {
                     &["parent_id", "key", "order_key", "kind"],
                     &[
                         "scalar_json",
+                        "scalar_text",
                         "container_id",
                         "prefix_json",
                         "suffix_json",
@@ -1969,6 +2075,7 @@ impl SemanticRow {
                     order_key: intern_string(strings, &order_key),
                     kind,
                     scalar_json,
+                    scalar_text,
                     container_id: container_id
                         .as_deref()
                         .map(|value| intern_string(strings, value)),
@@ -1979,7 +2086,13 @@ impl SemanticRow {
                 require_fields(
                     row,
                     &["id", "parent_id", "order_key", "kind"],
-                    &["scalar_json", "prefix_json", "suffix_json", "empty_json"],
+                    &[
+                        "scalar_json",
+                        "scalar_text",
+                        "prefix_json",
+                        "suffix_json",
+                        "empty_json",
+                    ],
                 )?;
                 if required_uuid(row, "id")?.to_string() != id.as_ref() {
                     return Err("json_array_item row ID does not match its key".to_owned());
@@ -1992,6 +2105,7 @@ impl SemanticRow {
                     order_key: intern_string(strings, &order_key),
                     kind,
                     scalar_json,
+                    scalar_text,
                     layout,
                 })
             }
@@ -2046,10 +2160,10 @@ impl SemanticRow {
         else {
             return Ok(());
         };
-        if has_children {
-            return Err("JSON non-empty container cannot carry empty_json".to_owned());
+        // Inserting the first child invalidates this empty-container hint.
+        if !has_children {
+            output.extend_from_slice(empty.as_bytes());
         }
-        output.extend_from_slice(empty.as_bytes());
         Ok(())
     }
 
@@ -2060,6 +2174,28 @@ impl SemanticRow {
         {
             output.extend_from_slice(suffix.as_bytes());
         }
+    }
+
+    fn scalar_bytes(&self) -> Result<Vec<u8>, String> {
+        let value = self
+            .scalar_json()
+            .ok_or_else(|| "JSON scalar has no scalar_json".to_owned())?;
+        let text = match self {
+            Self::Snapshot { scalar_text, .. }
+            | Self::Object { scalar_text, .. }
+            | Self::Array { scalar_text, .. } => scalar_text.as_deref(),
+        };
+        if let Some(text) = text {
+            let lexical: Value = serde_json::from_str(text)
+                .map_err(|error| format!("invalid scalar_text: {error}"))?;
+            if sdk::TypedValue::Jsonb(lexical.into())
+                == sdk::TypedValue::Jsonb(value.clone().into())
+            {
+                return Ok(text.as_bytes().to_vec());
+            }
+        }
+        serde_json::to_vec(value)
+            .map_err(|error| format!("failed to serialize scalar_json: {error}"))
     }
 
     fn scalar_json(&self) -> Option<&Value> {
@@ -2321,12 +2457,7 @@ impl SemanticModel {
                 }
                 output.push(b']');
             }
-            _ => serde_json::to_writer(
-                &mut *output,
-                row.scalar_json()
-                    .ok_or_else(|| "JSON scalar has no scalar_json".to_owned())?,
-            )
-            .map_err(|error| format!("failed to serialize scalar_json: {error}"))?,
+            _ => output.extend_from_slice(&row.scalar_bytes()?),
         }
         if let Some(first) = rendered_children.first().copied() {
             nodes[usize::try_from(node_index).expect("u32 fits usize")].first_child = Some(first);
@@ -2373,7 +2504,14 @@ fn typed_node_row(
             )
         }
     };
-    typed_row_for_node(node, scalar)
+    let mut row = typed_row_for_node(node, scalar)?;
+    if !node.kind.is_container() {
+        let raw = blob.range(value_start, value_start + value_len)?;
+        set_scalar_text(&mut row, &raw)?;
+    } else {
+        row.insert("scalar_text", sdk::TypedValue::Null);
+    }
+    Ok(row)
 }
 fn typed_row_for_node(node: &Node, scalar: Option<Value>) -> Result<sdk::TypedRow, String> {
     static ROOT_COLUMNS: OnceLock<Vec<Arc<str>>> = OnceLock::new();
@@ -2519,8 +2657,32 @@ fn typed_row_for_node(node: &Node, scalar: Option<Value>) -> Result<sdk::TypedRo
     sdk::TypedRow::from_sorted_entries(entries).map_err(str::to_owned)
 }
 
+fn set_scalar_text(row: &mut sdk::TypedRow, raw: &[u8]) -> Result<(), String> {
+    let Some(sdk::TypedValue::Jsonb(value)) = row.get("scalar_json") else {
+        return Err("missing scalar_json".to_owned());
+    };
+    let canonical = value.to_json_string().map_err(|error| error.to_string())?;
+    let spelling = if canonical.as_bytes() == raw {
+        sdk::TypedValue::Null
+    } else {
+        sdk::TypedValue::Text(
+            std::str::from_utf8(raw)
+                .map_err(|error| error.to_string())?
+                .to_owned(),
+        )
+    };
+    row.insert("scalar_text", spelling);
+    Ok(())
+}
+
 fn complete_nullable_fields(row: &mut sdk::TypedRow, schema_key: &str) {
-    for name in ["empty_json", "prefix_json", "scalar_json", "suffix_json"] {
+    for name in [
+        "empty_json",
+        "prefix_json",
+        "scalar_json",
+        "scalar_text",
+        "suffix_json",
+    ] {
         if !row.contains_key(name) {
             row.insert(name, sdk::TypedValue::Null);
         }
@@ -2534,10 +2696,10 @@ fn insert_text(row: &mut sdk::TypedRow, name: &str, value: &str) {
     row.insert(name.to_owned(), sdk::TypedValue::Text(value.to_owned()));
 }
 
-fn rows_equal_without_layout(before: &sdk::TypedRow, after: &sdk::TypedRow) -> bool {
+pub(crate) fn rows_equal_without_layout(before: &sdk::TypedRow, after: &sdk::TypedRow) -> bool {
     let mut before = before.clone();
     let mut after = after.clone();
-    for name in ["prefix_json", "suffix_json", "empty_json"] {
+    for name in ["prefix_json", "suffix_json", "empty_json", "scalar_text"] {
         before.remove(name);
         after.remove(name);
     }
@@ -3309,13 +3471,15 @@ fn parse_row_layout(
     kind: NodeKind,
     strings: &mut HashSet<Arc<str>>,
 ) -> Result<Option<Arc<NodeLayout>>, String> {
-    let prefix_json = optional_text(row, "prefix_json")?;
+    let mut prefix_json = optional_text(row, "prefix_json")?;
     let suffix_json = optional_text(row, "suffix_json")?;
     let empty_json = optional_text(row, "empty_json")?;
 
     if let Some(prefix) = prefix_json.as_deref() {
         match identity {
-            RowIdentity::Object { key, .. } => validate_object_prefix(prefix, key)?,
+            RowIdentity::Object { key, .. } => {
+                prefix_json = Some(normalize_object_prefix(prefix, key)?);
+            }
             RowIdentity::Snapshot | RowIdentity::Array(_) => {
                 if !is_json_whitespace(prefix) {
                     return Err(
@@ -3332,9 +3496,6 @@ fn parse_row_layout(
         return Err("JSON suffix_json must contain only JSON whitespace".to_owned());
     }
     if let Some(empty) = empty_json.as_deref() {
-        if !kind.is_container() {
-            return Err("JSON scalar row cannot carry empty_json".to_owned());
-        }
         if !is_json_whitespace(empty) {
             return Err("JSON empty_json must contain only JSON whitespace".to_owned());
         }
@@ -3347,14 +3508,16 @@ fn parse_row_layout(
         suffix_json: suffix_json
             .as_deref()
             .map(|value| intern_string(strings, value)),
+        // Empty-container whitespace becomes obsolete on scalar conversion.
         empty_json: empty_json
             .as_deref()
+            .filter(|_| kind.is_container())
             .map(|value| intern_string(strings, value)),
     };
     Ok((!layout.is_empty()).then(|| Arc::new(layout)))
 }
 
-fn validate_object_prefix(prefix: &str, expected_key: &str) -> Result<(), String> {
+fn normalize_object_prefix(prefix: &str, expected_key: &str) -> Result<String, String> {
     let bytes = prefix.as_bytes();
     let mut cursor = 0usize;
     skip_json_whitespace(bytes, &mut cursor);
@@ -3363,9 +3526,6 @@ fn validate_object_prefix(prefix: &str, expected_key: &str) -> Result<(), String
         .map_err(|error| format!("invalid JSON object prefix_json: {error}"))?;
     let key: String = serde_json::from_slice(&bytes[key_start..key_end])
         .map_err(|error| format!("invalid JSON object prefix_json key: {error}"))?;
-    if key != expected_key {
-        return Err("JSON object prefix_json key does not match the row key".to_owned());
-    }
     cursor = key_end;
     skip_json_whitespace(bytes, &mut cursor);
     if bytes.get(cursor) != Some(&b':') {
@@ -3376,7 +3536,19 @@ fn validate_object_prefix(prefix: &str, expected_key: &str) -> Result<(), String
     if cursor != bytes.len() {
         return Err("JSON object prefix_json must end immediately before its value".to_owned());
     }
-    Ok(())
+    if key == expected_key {
+        return Ok(prefix.to_owned());
+    }
+    // A rename changes the semantic key, but the row may retain its old
+    // formatting hint. Keep whitespace and replace only the encoded key.
+    let encoded = serde_json::to_string(expected_key)
+        .map_err(|error| format!("failed to encode JSON object key: {error}"))?;
+    Ok(format!(
+        "{}{}{}",
+        &prefix[..key_start],
+        encoded,
+        &prefix[key_end..]
+    ))
 }
 
 fn skip_json_whitespace(bytes: &[u8], cursor: &mut usize) {

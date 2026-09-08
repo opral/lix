@@ -3208,6 +3208,241 @@ async fn v2_csv_rename_and_same_row_edit_fail_without_a_cross_row_conflict_api()
 }
 
 #[tokio::test]
+async fn json_structural_sql_edits_and_root_conversion_survive_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/structural.json";
+    write_file(&lix, path, br#"{"keep":1.2300e+04,"remove":2}"#.to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    lix.execute("INSERT INTO json_object_member (parent_id, key, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', 'new', 'ff', 'number', $1, $2)", &[Value::Jsonb(serde_json::json!(9).into()), Value::Text(file_id.clone())]).await.unwrap();
+    lix.execute(
+        "DELETE FROM json_object_member WHERE key = 'remove' AND lixcol_file_id = $1",
+        &[Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    lix.execute_batch(&[
+        ExecuteBatchStatement { label: None, sql: "DELETE FROM json_object_member WHERE key = 'new' AND lixcol_file_id = $1".into(), params: vec![Value::Text(file_id.clone())] },
+        ExecuteBatchStatement { label: None, sql: "INSERT INTO json_object_member (parent_id, key, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', 'renamed', 'ff', 'number', $1, $2)".into(), params: vec![Value::Jsonb(serde_json::json!(9).into()), Value::Text(file_id.clone())] },
+    ]).await.unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(br#"{"keep":1.2300e+04,"renamed":9}"#.to_vec())
+    );
+    lix.execute_batch(&[
+        ExecuteBatchStatement {
+            label: None,
+            sql: "DELETE FROM json_object_member WHERE lixcol_file_id = $1".into(),
+            params: vec![Value::Text(file_id.clone())],
+        },
+        ExecuteBatchStatement {
+            label: None,
+            sql: "UPDATE json_root SET kind = 'array' WHERE lixcol_file_id = $1".into(),
+            params: vec![Value::Text(file_id.clone())],
+        },
+    ])
+    .await
+    .expect("SQL projects each statement, so remove children before converting the root");
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(b"[]".to_vec()));
+    let inserted = lix.execute("INSERT INTO json_array_item (parent_id, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', '80', 'number', $1, $2) RETURNING id", &[Value::Jsonb(serde_json::json!(1).into()), Value::Text(file_id.clone())]).await.unwrap();
+    let inserted_id = inserted.rows()[0].get::<Value>("id").unwrap();
+    lix.execute("INSERT INTO json_array_item (parent_id, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', '40', 'number', $1, $2)", &[Value::Jsonb(serde_json::json!(2).into()), Value::Text(file_id.clone())]).await.unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"[2,1]".to_vec())
+    );
+    lix.execute(
+        "UPDATE json_array_item SET order_key = '20' WHERE id = $1 AND lixcol_file_id = $2",
+        &[inserted_id.clone(), Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"[1,2]".to_vec())
+    );
+    lix.close().await.unwrap();
+    let reopened = open_rocksdb_lix(root.path()).await;
+    reopened
+        .execute(
+            "UPDATE json_array_item SET scalar_json = $1 WHERE id = $2 AND lixcol_file_id = $3",
+            &[
+                Value::Jsonb(serde_json::json!(100).into()),
+                inserted_id,
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(b"[100,2]".to_vec())
+    );
+    let before = read_file(&reopened, path).await.unwrap();
+    assert!(
+        reopened
+            .execute(
+                "DELETE FROM json_root WHERE lixcol_file_id = $1",
+                &[Value::Text(file_id.clone())]
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(read_file(&reopened, path).await.unwrap(), before);
+    reopened.execute_batch(&[
+        ExecuteBatchStatement { label: None, sql: "DELETE FROM json_array_item WHERE lixcol_file_id = $1".into(), params: vec![Value::Text(file_id.clone())] },
+        ExecuteBatchStatement { label: None, sql: "UPDATE json_root SET kind = 'boolean', scalar_json = $1 WHERE lixcol_file_id = $2".into(), params: vec![Value::Jsonb(serde_json::json!(true).into()), Value::Text(file_id)] },
+    ]).await.unwrap();
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(b"true".to_vec())
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn json_structural_sql_rejects_orphans_and_accepts_subtree_deletion() {
+    let lix = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/subtree.json";
+    let original = br#"{"box":{"x":1},"keep":2}"#;
+    write_file(&lix, path, original.to_vec()).await.unwrap();
+    assert!(
+        lix.execute("DELETE FROM json_object_member WHERE key = 'box'", &[])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(original.to_vec())
+    );
+    assert_eq!(
+        lix.execute("SELECT key FROM json_object_member", &[])
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    lix.execute(
+        "DELETE FROM json_object_member WHERE key IN ('box', 'x')",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(br#"{"keep":2}"#.to_vec())
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn json_scalar_spelling_survives_row_edits_and_cold_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/scalar-spelling.json";
+    let original =
+        " { \"number\" : 1.2300e+04, \"escaped\" : \"\\u0041\", \"edit\" : \"old\" } \r\n";
+    write_file(&lix, path, original.as_bytes().to_vec())
+        .await
+        .unwrap();
+    lix.close().await.unwrap();
+
+    let reopened = open_rocksdb_lix(root.path()).await;
+    reopened
+        .execute(
+            "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'edit'",
+            &[Value::Jsonb(serde_json::json!("longer").into())],
+        )
+        .await
+        .unwrap();
+    let edited = original.replace("old", "longer");
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(edited.as_bytes().to_vec())
+    );
+
+    let file_edited = edited.replace("longer", "new");
+    write_file(&reopened, path, file_edited.as_bytes().to_vec())
+        .await
+        .unwrap();
+    reopened
+        .execute(
+            "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'number'",
+            &[Value::Jsonb(serde_json::json!(7).into())],
+        )
+        .await
+        .unwrap();
+    let expected = file_edited.replace("1.2300e+04", "7");
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(expected.as_bytes().to_vec())
+    );
+    reopened.close().await.unwrap();
+
+    let reopened = open_rocksdb_lix(root.path()).await;
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(expected.into_bytes())
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn json_repeated_array_insertions_keep_inserted_rows_writable() {
+    let lix = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/inserted-identities.json";
+    write_file(&lix, path, b"[1,2]".to_vec()).await.unwrap();
+    write_file(&lix, path, b"[0,1,2]".to_vec()).await.unwrap();
+    let rows = lix
+        .execute("SELECT id FROM json_array_item ORDER BY order_key", &[])
+        .await
+        .unwrap();
+    let inserted_id = rows.rows()[0].get::<Value>("id").unwrap();
+    write_file(&lix, path, b"[0,1,2,3]".to_vec()).await.unwrap();
+    lix.execute(
+        "UPDATE json_array_item SET scalar_json = $1 WHERE id = $2",
+        &[Value::Jsonb(serde_json::json!(100).into()), inserted_id],
+    )
+    .await
+    .expect("an inserted row must remain writable after another insertion");
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"[100,1,2,3]".to_vec())
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn json_first_structural_fallback_preserves_accepted_array_identities() {
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -3415,7 +3650,7 @@ async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
 }
 
 #[tokio::test]
-async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_nodes() {
+async fn v2_json_scalar_lww_and_structural_upserts_compose() {
     let archive = build_json_plugin_archive();
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -3497,38 +3732,31 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
     let lww = b"{\"left\":\"LWW-B\",\"right\":\"TWO-B\",\"gone\":\"three\"}".to_vec();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(lww.clone()));
 
-    // Structure is not a direct semantic SQL operation. Its rejection must
-    // roll back the staged row and leave the actor usable for a later scalar.
-    let direct_structure_error = lix
-        .execute(
-            "DELETE FROM json_object_member \
-             WHERE parent_id = 'root' AND key = 'gone' AND lixcol_file_id = $1",
-            &[Value::Text(file_id.clone())],
-        )
-        .await
-        .expect_err("direct JSON semantic deletion must use an authoritative byte write");
-    assert_eq!(direct_structure_error.code, LixError::CODE_INVALID_PLUGIN);
-    assert!(
-        direct_structure_error
-            .message
-            .contains("existing scalar values only")
+    // Structural deletion updates both the file and durable rows.
+    lix.execute(
+        "DELETE FROM json_object_member WHERE parent_id = 'root' AND key = 'gone' AND lixcol_file_id = $1",
+        &[Value::Text(file_id.clone())],
+    ).await.unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(br#"{"left":"LWW-B","right":"TWO-B"}"#.to_vec())
     );
-    assert_eq!(read_file(&lix, path).await.unwrap(), Some(lww));
+    write_file(&lix, path, lww).await.unwrap();
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $2",
         &[
-            Value::Jsonb(serde_json::json!("AFTER-DIRECT-REJECT").into()),
+            Value::Jsonb(serde_json::json!("AFTER-DELETE").into()),
             Value::Text(file_id.clone()),
         ],
     )
     .await
     .unwrap();
-    let scalar_after_direct_reject =
-        b"{\"left\":\"LWW-B\",\"right\":\"AFTER-DIRECT-REJECT\",\"gone\":\"three\"}".to_vec();
+    let scalar_after_delete =
+        b"{\"left\":\"LWW-B\",\"right\":\"AFTER-DELETE\",\"gone\":\"three\"}".to_vec();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
-        Some(scalar_after_direct_reject.clone())
+        Some(scalar_after_delete.clone())
     );
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
@@ -3544,39 +3772,35 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
         read_file(&lix, path).await.unwrap(),
         Some(b"{\"left\":\"BULK\",\"right\":\"BULK\",\"gone\":\"BULK\"}".to_vec())
     );
-    write_file(&lix, path, scalar_after_direct_reject.clone())
+    write_file(&lix, path, scalar_after_delete.clone())
         .await
         .unwrap();
 
-    // Structure is byte-owned. A stale scalar delta is not allowed to
-    // recreate a row after another writer removes its containing slot.
+    // A later upsert can recreate a deleted key under normal row LWW semantics.
+    // The rendered file and durable rows must agree after that replay.
     let stale_writer = lix.open_another_session().await.unwrap();
     let structure_writer = lix.open_another_session().await.unwrap();
     assert_eq!(
         read_file(&stale_writer, path).await.unwrap(),
-        Some(scalar_after_direct_reject.clone())
+        Some(scalar_after_delete.clone())
     );
     assert_eq!(
         read_file(&structure_writer, path).await.unwrap(),
-        Some(scalar_after_direct_reject)
+        Some(scalar_after_delete)
     );
-    let without_gone = b"{\"left\":\"LWW-B\",\"right\":\"AFTER-DIRECT-REJECT\"}".to_vec();
+    let without_gone = b"{\"left\":\"LWW-B\",\"right\":\"AFTER-DELETE\"}".to_vec();
     write_file(&structure_writer, path, without_gone.clone())
         .await
         .unwrap();
-    let error = write_file(
+    let restored = br#"{"left":"LWW-B","right":"AFTER-DELETE","gone":"STALE"}"#.to_vec();
+    write_file(
         &stale_writer,
         path,
-        b"{\"left\":\"LWW-B\",\"right\":\"AFTER-DIRECT-REJECT\",\"gone\":\"STALE\"}".to_vec(),
+        b"{\"left\":\"LWW-B\",\"right\":\"AFTER-DELETE\",\"gone\":\"STALE\"}".to_vec(),
     )
     .await
-    .expect_err("a stale scalar must not resurrect a byte-deleted JSON node");
-    assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-    assert!(error.message.contains("existing scalar values only"));
-    assert_eq!(
-        read_file(&lix, path).await.unwrap(),
-        Some(without_gone.clone())
-    );
+    .expect("a later row upsert can recreate a deleted key");
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(restored));
     let gone = lix
         .execute(
             "SELECT key FROM json_object_member \
@@ -3585,10 +3809,13 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
         )
         .await
         .unwrap();
-    assert!(gone.is_empty(), "the deleted node must not be resurrected");
+    assert_eq!(
+        gone.len(),
+        1,
+        "the recreated node must exist in durable rows"
+    );
 
-    // A clean semantic scalar write still works after the rejected replay;
-    // returned invalid-input errors discard only the prospective transition.
+    // The rebuilt indexes support the next scalar edit.
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
@@ -3601,7 +3828,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
     .unwrap();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
-        Some(b"{\"left\":\"AFTER-FENCE\",\"right\":\"AFTER-DIRECT-REJECT\"}".to_vec())
+        Some(b"{\"left\":\"AFTER-FENCE\",\"right\":\"AFTER-DELETE\",\"gone\":\"STALE\"}".to_vec())
     );
 
     for session in [
@@ -5068,6 +5295,98 @@ async fn v2_json_rejects_mixed_byte_and_row_transitions_in_one_transaction() {
     transaction.commit().await.unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(bytes_only));
     lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn excalidraw_row_edits_preserve_unrelated_source_and_embedded_files() {
+    let root = tempfile::tempdir().unwrap();
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_excalidraw",
+        &build_excalidraw_plugin_archive(),
+        &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
+    )
+    .await;
+    let path = "/source-preservation.excalidraw";
+    let untouched =
+        r#"{ "id" : "a", "type" : "rectangle", "x" : 1.2300e+04, "custom" : "\u0041" }"#;
+    let file = r#"{ "id" : "img", "dataURL" : "data:image/png;base64,AA==", "extra" : 1.20e2 }"#;
+    let app_state = r#""appState" : { "future" : [null,true,{"name":"\u0041"}] }"#;
+    let source = format!(
+        "{{\n\"type\":\"excalidraw\",\"version\":2,\"elements\":[{untouched},{{\"id\":\"b\",\"type\":\"ellipse\",\"x\":2}}],{app_state},\"files\":{{\"img\":{file}}}\n}}\n"
+    );
+    write_file(&lix, path, source.into_bytes()).await.unwrap();
+    let result = lix
+        .execute(
+            "SELECT element_json FROM excalidraw_element WHERE id = 'b'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let mut element = result.rows()[0]
+        .get::<serde_json::Value>("element_json")
+        .unwrap();
+    element["x"] = serde_json::json!(1234);
+    lix.execute(
+        "UPDATE excalidraw_element SET element_json = $1 WHERE id = 'b'",
+        &[Value::Jsonb(element.into())],
+    )
+    .await
+    .unwrap();
+    let rendered = String::from_utf8(read_file(&lix, path).await.unwrap().unwrap()).unwrap();
+    assert!(
+        rendered.contains(untouched),
+        "untouched element spelling must survive"
+    );
+    assert!(
+        rendered.contains(file),
+        "untouched embedded file spelling must survive"
+    );
+    assert!(
+        rendered.contains(app_state),
+        "unknown scene data must survive"
+    );
+    let edited = rendered.replace("1234", "12345");
+    write_file(&lix, path, edited.as_bytes().to_vec())
+        .await
+        .unwrap();
+    lix.close().await.unwrap();
+
+    let reopened = open_rocksdb_lix(root.path()).await;
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(edited.into_bytes())
+    );
+    let result = reopened
+        .execute(
+            "SELECT file_json FROM excalidraw_file WHERE id = 'img'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let mut file_json = result.rows()[0]
+        .get::<serde_json::Value>("file_json")
+        .unwrap();
+    file_json["future"] = serde_json::json!({"preserved": true});
+    reopened
+        .execute(
+            "UPDATE excalidraw_file SET file_json = $1 WHERE id = 'img'",
+            &[Value::Jsonb(file_json.into())],
+        )
+        .await
+        .unwrap();
+    let rendered = String::from_utf8(read_file(&reopened, path).await.unwrap().unwrap()).unwrap();
+    assert!(rendered.contains(untouched));
+    assert!(rendered.contains(app_state));
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(parsed["elements"][1]["x"], serde_json::json!(12345));
+    assert_eq!(
+        parsed["files"]["img"]["dataURL"],
+        "data:image/png;base64,AA=="
+    );
+    assert_eq!(parsed["files"]["img"]["future"]["preserved"], true);
+    reopened.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -7952,4 +8271,261 @@ fn build_csv_plugin_archive_variant(
         writer.write_all(marker).unwrap();
     }
     writer.finish().unwrap().into_inner()
+}
+#[tokio::test]
+async fn json_structural_qa_stale_subtree_upsert_rejects_atomically_and_reopens() {
+    let root = tempfile::tempdir().unwrap();
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/stale-subtree.json";
+    let initial = br#"{"box":{"nested":{"leaf":1}},"keep":2}"#.to_vec();
+    write_file(&lix, path, initial.clone()).await.unwrap();
+    let stale = lix.open_another_session().await.unwrap();
+    assert_eq!(read_file(&stale, path).await.unwrap(), Some(initial));
+    lix.execute(
+        "DELETE FROM json_object_member WHERE key IN ('box', 'nested', 'leaf')",
+        &[],
+    )
+    .await
+    .unwrap();
+    let accepted = br#"{"keep":2}"#.to_vec();
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(accepted.clone()));
+    // Only the leaf and keep differ from the stale observation. The leaf cannot
+    // be reinstated without its deleted ancestors, and keep must roll back too.
+    let error = write_file(
+        &stale,
+        path,
+        br#"{"box":{"nested":{"leaf":9}},"keep":8}"#.to_vec(),
+    )
+    .await
+    .expect_err("a stale child upsert must not create an orphan");
+    assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN, "{error:?}");
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(accepted.clone()));
+    let rows = lix
+        .execute("SELECT key, scalar_json FROM json_object_member", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.rows()[0].get::<String>("key").unwrap(), "keep");
+    assert_eq!(
+        rows.rows()[0].get::<Value>("scalar_json").unwrap(),
+        Value::Jsonb(serde_json::json!(2).into())
+    );
+    stale.close().await.unwrap();
+    lix.close().await.unwrap();
+    let reopened = open_rocksdb_lix(root.path()).await;
+    assert_eq!(read_file(&reopened, path).await.unwrap(), Some(accepted));
+    assert_eq!(
+        reopened
+            .execute("SELECT key FROM json_object_member", &[])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    reopened
+        .execute(
+            "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'keep'",
+            &[Value::Jsonb(serde_json::json!(3).into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(br#"{"keep":3}"#.to_vec())
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn json_structural_qa_stale_disjoint_insertions_and_deletions_compose() {
+    let lix = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/stale-disjoint.json";
+    let initial = br#"{"keep":1.2300e+04,"gone":2}"#.to_vec();
+    write_file(&lix, path, initial.clone()).await.unwrap();
+    let first = lix.open_another_session().await.unwrap();
+    let second = lix.open_another_session().await.unwrap();
+    assert_eq!(
+        read_file(&first, path).await.unwrap(),
+        Some(initial.clone())
+    );
+    assert_eq!(read_file(&second, path).await.unwrap(), Some(initial));
+    lix.execute("DELETE FROM json_object_member WHERE key = 'gone'", &[])
+        .await
+        .unwrap();
+    write_file(
+        &first,
+        path,
+        br#"{"keep":1.2300e+04,"gone":2,"alpha":3}"#.to_vec(),
+    )
+    .await
+    .unwrap();
+    let before_stale = read_file(&lix, path).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(before_stale.as_ref().unwrap()).unwrap(),
+        serde_json::json!({"keep":12300.0,"alpha":3})
+    );
+    let error = write_file(
+        &second,
+        path,
+        br#"{"keep":1.2300e+04,"gone":2,"beta":4}"#.to_vec(),
+    )
+    .await
+    .expect_err("full replacement invalidates the older observation history");
+    assert_eq!(error.code, LixError::CODE_PLUGIN_OBSERVATION_STALE);
+    assert_eq!(read_file(&lix, path).await.unwrap(), before_stale);
+    // Explicitly re-observe before retrying, retaining the accepted sibling.
+    let current = read_file(&second, path).await.unwrap().unwrap();
+    let mut retry = String::from_utf8(current).unwrap();
+    retry.pop();
+    retry.push_str(",\"beta\":4}");
+    write_file(&second, path, retry.into_bytes()).await.unwrap();
+    let rendered = read_file(&lix, path).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rendered).unwrap(),
+        serde_json::json!({"keep":12300.0,"alpha":3,"beta":4})
+    );
+    assert!(String::from_utf8(rendered).unwrap().contains("1.2300e+04"));
+    let rows = lix
+        .execute("SELECT key FROM json_object_member ORDER BY key", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.rows()
+            .iter()
+            .map(|row| row.get::<String>("key").unwrap())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta", "keep"]
+    );
+    // Both inserted keys remain directly writable after the merged rebuilds.
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = $1 WHERE key IN ('alpha', 'beta')",
+        &[Value::Jsonb(serde_json::json!(5).into())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&read_file(&lix, path).await.unwrap().unwrap())
+            .unwrap(),
+        serde_json::json!({"keep":12300.0,"alpha":5,"beta":5})
+    );
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    lix.close().await.unwrap();
+}
+#[tokio::test]
+async fn json_structural_qa_multi_parent_file_updates_are_deterministic() {
+    let lix = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/multi-parent.json";
+    write_file(
+        &lix,
+        path,
+        br#"{"box":{"leaf":1},"keep":2,"gone":0}"#.to_vec(),
+    )
+    .await
+    .unwrap();
+    let stale = lix.open_another_session().await.unwrap();
+    read_file(&stale, path).await.unwrap();
+    lix.execute("DELETE FROM json_object_member WHERE key = 'gone'", &[])
+        .await
+        .unwrap();
+    write_file(
+        &stale,
+        path,
+        br#"{"box":{"leaf":2},"keep":3,"gone":0}"#.to_vec(),
+    )
+    .await
+    .expect("valid stale multi-parent changes must compose with independent deletion");
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(br#"{"box":{"leaf":2},"keep":3}"#.to_vec())
+    );
+    stale.close().await.unwrap();
+    for value in 3..15 {
+        let source = format!("{{\"box\":{{\"leaf\":{value}}},\"keep\":{value}}}").into_bytes();
+        write_file(&lix, path, source.clone())
+            .await
+            .expect("valid changes under different parents must be accepted");
+        assert_eq!(read_file(&lix, path).await.unwrap(), Some(source));
+        let rows = lix
+            .execute(
+                "SELECT scalar_json FROM json_object_member WHERE key IN ('leaf', 'keep')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows.rows() {
+            assert_eq!(
+                row.get::<Value>("scalar_json").unwrap(),
+                Value::Jsonb(serde_json::json!(value).into())
+            );
+        }
+    }
+    lix.close().await.unwrap();
+}
+#[tokio::test]
+async fn json_decimal_spelling_survives_structural_rebuild_and_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/decimal-spelling.json";
+    let original = br#"{"one":1.0,"hundred":100.0,"array":[1.0,-0.0],"remove":0}"#;
+    write_file(&lix, path, original.to_vec()).await.unwrap();
+    lix.close().await.unwrap();
+    let reopened = open_rocksdb_lix(root.path()).await;
+    reopened
+        .execute("DELETE FROM json_object_member WHERE key = 'remove'", &[])
+        .await
+        .unwrap();
+    let expected = br#"{"one":1.0,"hundred":100.0,"array":[1.0,-0.0]}"#;
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(expected.to_vec())
+    );
+    reopened.close().await.unwrap();
+    let reopened = open_rocksdb_lix(root.path()).await;
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(expected.to_vec())
+    );
+    reopened
+        .execute(
+            "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'hundred'",
+            &[Value::Jsonb(serde_json::json!(7).into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(br#"{"one":1.0,"hundred":7,"array":[1.0,-0.0]}"#.to_vec())
+    );
+    reopened.close().await.unwrap();
 }

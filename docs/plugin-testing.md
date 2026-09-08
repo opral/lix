@@ -110,6 +110,24 @@ into complete durable rows. Use a new deterministic create namespace for each
 transition. See the Markdown plugin's `src/adapter_qa_tests.rs` for a complete
 parse, sparse-edit, row-edit, and cold-reopen lifecycle.
 
+Additional examples live in `plugins/json/src/adapter_qa_tests.rs` and
+`plugins/excalidraw/src/qa_tests.rs`. They exercise composite and native primary
+keys, repeated edits, exact scalar/object spelling, and embedded files. JSON's
+row-edit contract supports scalar updates, insertion, deletion, reordering, moves,
+and scalar/container conversion. Scalar updates use small byte splices; structural
+batches rebuild the tree and stream a complete replacement, preserving unchanged
+scalar spelling and row identities. Invalid final trees reject the entire plugin
+call. Deleting a container requires deleting or moving its descendants in the same
+row batch; there is no implicit cascade.
+
+SQL projects each statement separately, including within `execute_batch`. Delete
+a subtree in one `DELETE` statement, and remove children before changing their
+parent's kind. Object keys are primary keys: rename them with a delete and insert.
+Valid existing key-layout hints adapt to the new key while preserving whitespace;
+empty-container whitespace hints are ignored after conversion to a scalar. Structural writes use normal
+row upsert semantics, so a later stale writer can recreate a deleted key. The
+plugin does not provide a separate deletion-wins concurrency policy.
+
 The harness uses a conservative 1 MiB batch limit by default. Set
 `driver.max_batch_bytes = 2 * 1024 * 1024` to match the standard runtime page
 budget when testing large state pages or embedded files. Cold-file admission can
