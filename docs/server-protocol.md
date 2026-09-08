@@ -30,6 +30,7 @@ contract in another language. See [Hosting](./hosting.md).
 
 | Group       | Paths                                                                                         |
 | :---------- | :-------------------------------------------------------------------------------------------- |
+| Lifecycle   | `/lix/v1`, `/lix/v1/{lix_id}`                                                   |
 | Handshake   | `/lix/v1/{lix_id}`, `/lix/v1/{lix_id}/session`                                  |
 | SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                    |
 | Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                  |
@@ -80,9 +81,9 @@ idempotent by immutable commit identity and compare-and-swap branch updates.
 
 ## Sync
 
-Sync is Lix-scoped: the immutable ID in the path selects the Lix. A local write
-commits to the local Lix first and reaches these endpoints only from the
-background sync worker.
+Sync is Lix-scoped: the immutable ID in the path selects the Lix. Connected
+replica mutations execute on the authority; the background sync worker brings
+the resulting committed state into the local replica.
 
 - `POST /lix/v1/{lix_id}/sync/push` atomically uploads immutable commits and applies
   compare-and-swap branch-ref updates.
