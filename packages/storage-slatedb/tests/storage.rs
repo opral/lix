@@ -142,8 +142,14 @@ async fn assert_cached_explicit_directory_transaction() {
         .with_storage(storage.clone())
         .await
         .expect("cold reopen cached transaction repository");
+    // Inspect both sides of the move so stale source entries still fail, while
+    // repository bootstrap files and directories are outside this fixture.
     let file = reopened
-        .execute("SELECT path, content FROM lix_file", &[])
+        .execute(
+            "SELECT path, content FROM lix_file \
+             WHERE path LIKE '/source/%' OR path LIKE '/target/%'",
+            &[],
+        )
         .await
         .expect("read moved file after cold reopen");
     assert_eq!(file.len(), 1);
@@ -153,7 +159,13 @@ async fn assert_cached_explicit_directory_transaction() {
     );
     assert_eq!(file.rows()[0].get::<Vec<u8>>("content").unwrap(), content);
     let directories = reopened
-        .execute("SELECT path FROM lix_directory ORDER BY path", &[])
+        .execute(
+            "SELECT path FROM lix_directory \
+             WHERE path IN ('/source', '/target') \
+                OR path LIKE '/source/%' OR path LIKE '/target/%' \
+             ORDER BY path",
+            &[],
+        )
         .await
         .expect("read empty descendant after cold reopen");
     assert_eq!(directories.len(), 2);

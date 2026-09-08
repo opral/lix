@@ -267,7 +267,7 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 		`);
 		const rows = result.rows
 			.map((row) => row as { path: string; kind: string })
-			.filter((row) => !row.path.startsWith("/.lix/"));
+			.filter((row) => row.path !== "/.lix" && !row.path.startsWith("/.lix/"));
 
 		expect(rows).toEqual([
 			{ path: "/README.md", kind: "file" },

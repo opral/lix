@@ -1407,8 +1407,12 @@ async fn filesystem_ignores_special_and_invalid_utf8_entries() {
         lix.execute("SELECT path FROM lix_file ORDER BY path", &[])
             .await
             .unwrap()
-            .len(),
-        0
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("path").unwrap())
+            .collect::<Vec<_>>(),
+        vec!["/.lix/README.md"],
+        "only the repository bootstrap file is tracked",
     );
     assert!(
         std::fs::symlink_metadata(socket_path)
