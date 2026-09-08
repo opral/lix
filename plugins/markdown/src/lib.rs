@@ -1,6 +1,8 @@
 //! Markdown support for the row-first Component API v2.
 #![allow(dead_code)]
 
+use lix::plugin::StateOutput;
+
 extern crate alloc;
 
 mod core;
@@ -111,7 +113,7 @@ impl sdk::FileProjection for MarkdownPlugin {
         for edit in edits {
             sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
         }
-        store_rendered_markdown_state(&update.before, sink, &successor)?;
+        store_markdown_state(sink, &successor)?;
         Ok(())
     }
 
@@ -189,29 +191,7 @@ impl sdk::FileProjection for MarkdownPlugin {
             .file_changed(&splices, namespace)
             .map_err(core_error)?;
         strip_duplicated_lexical_fallback(&mut changes)?;
-        let (root, blocks) = document.arena_state().map_err(core_error)?;
-        sink.put_state(ROOT_STATE, &root)?;
-        let (old_index_pages, old_block_pages) = block_page_counts(&update.before)?;
-        let encoded = encode_blocks(&blocks)?;
-        sink.put_state(BLOCKS_STATE, &encoded.manifest)?;
-        for (ordinal, page) in encoded.index_pages.iter().enumerate() {
-            sink.put_state(&block_index_page_key(ordinal as u32), page)?;
-        }
-        for ordinal in encoded.index_pages.len() as u32..old_index_pages {
-            sink.delete_state(&block_index_page_key(ordinal))?;
-        }
-        for (ordinal, page) in encoded.block_pages.iter().enumerate() {
-            sink.put_state(&block_page_key(ordinal as u32), page)?;
-        }
-        for ordinal in encoded.block_pages.len() as u32..old_block_pages {
-            sink.delete_state(&block_page_key(ordinal))?;
-        }
-        if let Some(shifts) = update.before.get_state(BLOCK_SHIFTS_STATE)? {
-            for (ordinal, _) in decode_block_shifts(&shifts)? {
-                sink.delete_state(&block_overlay_key(ordinal))?;
-            }
-        }
-        sink.delete_state(BLOCK_SHIFTS_STATE)?;
+        store_markdown_state(sink, &document)?;
         emit_changes(changes, update.creates, Some(0), sink)?;
         Ok(())
     }
@@ -247,67 +227,21 @@ impl sdk::ColumnMerger for MarkdownPlugin {
     }
 }
 
-fn store_rendered_markdown_state(
-    before: &sdk::Snapshot<'_>,
-    sink: &mut impl StateOutput,
-    document: &Document,
-) -> sdk::Result<()> {
+fn store_markdown_state(sink: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
     let (root, blocks) = document.arena_state().map_err(core_error)?;
     sink.put_state(ROOT_STATE, &root)?;
-    let (old_index_pages, old_block_pages) = block_page_counts(before)?;
+    sink.delete_state_prefix(b"markdown/block-index-page/")?;
+    sink.delete_state_prefix(b"markdown/block-page/")?;
     let encoded = encode_blocks(&blocks)?;
     sink.put_state(BLOCKS_STATE, &encoded.manifest)?;
     for (ordinal, page) in encoded.index_pages.iter().enumerate() {
         sink.put_state(&block_index_page_key(ordinal as u32), page)?;
     }
-    for ordinal in encoded.index_pages.len() as u32..old_index_pages {
-        sink.delete_state(&block_index_page_key(ordinal))?;
-    }
     for (ordinal, page) in encoded.block_pages.iter().enumerate() {
         sink.put_state(&block_page_key(ordinal as u32), page)?;
     }
-    for ordinal in encoded.block_pages.len() as u32..old_block_pages {
-        sink.delete_state(&block_page_key(ordinal))?;
-    }
-    if let Some(shifts) = before.get_state(BLOCK_SHIFTS_STATE)? {
-        for (ordinal, _) in decode_block_shifts(&shifts)? {
-            sink.delete_state(&block_overlay_key(ordinal))?;
-        }
-    }
+    sink.delete_state_prefix(b"markdown/block-overlay/")?;
     sink.delete_state(BLOCK_SHIFTS_STATE)?;
-    Ok(())
-}
-
-fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<u8>> {
-    for edit in edits.iter().rev() {
-        let start = usize::try_from(edit.offset)
-            .map_err(|_| sdk::Error::invalid_input("Markdown edit offset exceeds guest memory"))?;
-        let end = start
-            .checked_add(usize::try_from(edit.delete_len).map_err(|_| {
-                sdk::Error::invalid_input("Markdown edit deletion exceeds guest memory")
-            })?)
-            .ok_or_else(|| sdk::Error::invalid_input("Markdown edit range overflowed"))?;
-        if end > bytes.len() {
-            return Err(sdk::Error::invalid_input(
-                "Markdown edit exceeds accepted bytes",
-            ));
-        }
-        bytes.splice(start..end, edit.insert.iter().copied());
-    }
-    Ok(bytes)
-}
-
-fn store_markdown_state(successor: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
-    let (root, blocks) = document.arena_state().map_err(core_error)?;
-    successor.put_state(ROOT_STATE, &root)?;
-    let encoded = encode_blocks(&blocks)?;
-    successor.put_state(BLOCKS_STATE, &encoded.manifest)?;
-    for (ordinal, page) in encoded.index_pages.iter().enumerate() {
-        successor.put_state(&block_index_page_key(ordinal as u32), page)?;
-    }
-    for (ordinal, page) in encoded.block_pages.iter().enumerate() {
-        successor.put_state(&block_page_key(ordinal as u32), page)?;
-    }
     Ok(())
 }
 
@@ -621,21 +555,6 @@ fn block_index_page_key(ordinal: u32) -> Vec<u8> {
     key
 }
 
-fn block_page_counts(root: &sdk::Snapshot<'_>) -> sdk::Result<(u32, u32)> {
-    let Some(header) = root.read_state_range(BLOCKS_STATE, 0, BLOCK_INDEX_HEADER_BYTES)? else {
-        return Ok((0, 0));
-    };
-    if header.get(..4) != Some(BLOCK_INDEX_MAGIC) {
-        return Err(sdk::Error::invalid_input(
-            "unsupported Markdown block index",
-        ));
-    }
-    Ok((
-        u32::from_le_bytes(header[12..16].try_into().expect("fixed Markdown header")),
-        u32::from_le_bytes(header[8..12].try_into().expect("fixed Markdown header")),
-    ))
-}
-
 fn effective_block_position(base: u64, ordinal: u32, shifts: &[(u32, i64)]) -> sdk::Result<u64> {
     let delta = shifts
         .iter()
@@ -783,27 +702,6 @@ fn emit_changes(
     }
     Ok(())
 }
-
-trait StateOutput {
-    fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()>;
-    fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()>;
-}
-macro_rules! impl_state_output {
-    ($type:ty) => {
-        impl StateOutput for $type {
-            fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
-                <$type>::put_state(self, key, value)
-            }
-            fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
-                <$type>::delete_state(self, key)
-            }
-        }
-    };
-}
-impl_state_output!(sdk::RowOutput<'_, '_>);
-impl_state_output!(sdk::RowChangeOutput<'_, '_>);
-impl_state_output!(sdk::FileOutput<'_, '_>);
-impl_state_output!(sdk::FileEditOutput<'_, '_>);
 
 trait MutationOutput {
     fn create(&mut self, schema_key: &str, local_ref: u32, row: &sdk::TypedRow) -> sdk::Result<()>;
@@ -1070,3 +968,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod adapter_qa_tests;

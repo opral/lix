@@ -1072,6 +1072,19 @@ impl Transaction {
         self.state_changes.insert(key, None);
     }
 
+    /// Clears accepted and already staged keys with this literal prefix.
+    /// Subsequent puts recreate entries in the same transaction.
+    pub fn delete_state_prefix(&mut self, prefix: &[u8]) {
+        for key in self.base.state.keys().filter(|key| key.starts_with(prefix)) {
+            self.state_changes.insert(key.to_vec(), None);
+        }
+        for (key, value) in &mut self.state_changes {
+            if key.starts_with(prefix) {
+                *value = None;
+            }
+        }
+    }
+
     pub fn upgrade_to(&mut self, generation: impl Into<Arc<str>>) {
         self.generation = Some(generation.into());
     }
@@ -1168,6 +1181,35 @@ mod tests {
             [(b"index/0".to_vec(), b"row/1".to_vec())],
         );
         (store, root)
+    }
+
+    #[test]
+    fn prefix_deletion_obeys_write_order_and_preserves_the_base() {
+        let (_, root) = fixture();
+        let mut transaction = root.transaction();
+        transaction.put_state(b"index/new".to_vec(), b"pending".to_vec());
+        transaction.put_state(b"index-other/0".to_vec(), b"untouched".to_vec());
+        transaction.delete_state_prefix(b"index/");
+        transaction.put_state(b"index/replacement".to_vec(), b"new".to_vec());
+        let successor = transaction.commit().unwrap();
+        assert!(successor.state.get(b"index/0").unwrap().is_none());
+        assert!(successor.state.get(b"index/new").unwrap().is_none());
+        assert_eq!(
+            successor.state.get(b"index/replacement").unwrap(),
+            Some(b"new".to_vec())
+        );
+        assert_eq!(
+            successor.state.get(b"index-other/0").unwrap(),
+            Some(b"untouched".to_vec())
+        );
+        assert_eq!(root.state.get(b"index/0").unwrap(), Some(b"row/1".to_vec()));
+        let mut discarded = successor.transaction();
+        discarded.delete_state_prefix(b"index/");
+        drop(discarded);
+        assert_eq!(
+            successor.state.get(b"index/replacement").unwrap(),
+            Some(b"new".to_vec())
+        );
     }
 
     #[test]

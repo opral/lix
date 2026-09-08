@@ -49,6 +49,9 @@ interface host {
     max-batch-bytes: func() -> u32;
     put-state: func(key: bytes, value: bytes) -> result<_, host-error>;
     delete-state: func(key: bytes) -> result<_, host-error>;
+    /// Delete matching accepted and pending private state. Later writes survive.
+    /// Empty prefixes and prefixes overlapping host-reserved state are rejected.
+    delete-state-prefix: func(prefix: bytes) -> result<_, host-error>;
     emit-rows: func(page: row-page) -> result<_, host-error>;
     replace-all-rows: func() -> result<_, host-error>;
     emit-file-edit: func(edit: file-edit) -> result<_, host-error>;

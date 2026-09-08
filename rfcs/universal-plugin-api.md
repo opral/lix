@@ -30,6 +30,11 @@ pub trait ColumnMerger: 'static {
 Files are only a projection of rows. A file format additionally implements all
 four directions so incremental behavior is explicit at compile time:
 
+The SDK also provides a native projection test harness, validated `EditSet`
+range reads, and a shared `StateOutput` with transactional prefix deletion.
+See [Testing and maintaining file plugins](../docs/plugin-testing.md) for their
+contracts and lossless-editing checks.
+
 ```rust
 pub trait FileProjection: 'static {
     fn parse(input: ParseInput<'_>, output: &mut RowOutput<'_, '_>) -> Result<()>;

@@ -1024,6 +1024,31 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         Ok(())
     }
 
+    fn delete_state_prefix(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        prefix: Vec<u8>,
+    ) -> Result<(), bindings::lix::plugin::host::HostError> {
+        const RESERVED: &[u8] = b"\0lix/";
+        if prefix.is_empty() || prefix.starts_with(RESERVED) || RESERVED.starts_with(&prefix) {
+            return Err(bindings::lix::plugin::host::HostError::Rejected(
+                "state prefix must be nonempty and outside host-reserved state".to_owned(),
+            ));
+        }
+        let resource = self.table.get_mut(&resource).map_err(host_table_error)?;
+        {
+            let mut state = resource
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.charge_page(prefix.len())?;
+            state.counters.component_import_calls =
+                state.counters.component_import_calls.saturating_add(1);
+        }
+        resource.transaction.delete_state_prefix(&prefix);
+        Ok(())
+    }
+
     fn emit_rows(
         &mut self,
         resource: Resource<TransitionResource>,
