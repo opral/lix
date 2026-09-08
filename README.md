@@ -56,7 +56,6 @@ Or against a server:
 ```ts
 const lix = await openLix({
   server: {
-    mode: "remote",
     url: "https://example.com/repositories/acme",
   },
 });
@@ -82,7 +81,6 @@ Lix handles any file format, collaborates in real time, and embeds in your produ
 // One hosted repository per customer.
 const lix = await openLix({
   server: {
-    mode: "remote",
     url: `https://example.com/repositories/${customer.id}`,
   },
 });
@@ -110,7 +108,6 @@ import { FilesystemStorage } from "@lix-js/storage-filesystem";
 const lix = await openLix({
   storage: new FilesystemStorage({ path: "./project" }),
   server: {
-    mode: "remote",
     url: "https://lixray.com/@acme/project",
   },
 });

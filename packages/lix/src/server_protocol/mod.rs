@@ -14,3 +14,8 @@ pub use handler::*;
 pub mod client {
     pub use crate::authority_client::*;
 }
+
+#[cfg(feature = "server-protocol")]
+mod lifecycle;
+#[cfg(feature = "server-protocol")]
+pub use lifecycle::*;

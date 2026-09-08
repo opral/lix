@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- Unify repository opening around storage and server connections. Server-only opening executes remotely; explicit storage plus server selects synchronization. Remove the mode option and its types without compatibility aliases.
+- Add Rust `create_lix` and `delete_lix`, exposed as JavaScript `createLix` and `deleteLix`, for interoperable hosted repository lifecycle operations. Creation optionally copies a complete snapshot including history and untracked rows. Opening missing server resources no longer creates them.
+
 ## 0.15.1 - 2026-09-07
 
 ### Patch

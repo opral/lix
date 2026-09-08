@@ -64,10 +64,14 @@ export type {
 	LixOpenProgressOptions,
 	LixOpenReport,
 	RemoteLixFetch,
-	RemoteLixServerOptions,
-	SyncLixServerOptions,
+	LixServerOptions,
+	HostedLix,
+	CreateLixOptions,
+	DeleteLixOptions,
 	UndoReceipt,
 	SqlParam,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 } from "./types.js";
+
+export { createLix, deleteLix } from "./hosted-lix.js";

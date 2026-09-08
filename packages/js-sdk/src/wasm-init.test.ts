@@ -21,7 +21,6 @@ vi.mock("node:fs/promises", () => ({
 }));
 
 const options = {
-	mode: "remote" as const,
 	url: "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 	fetch: vi.fn(),
 };

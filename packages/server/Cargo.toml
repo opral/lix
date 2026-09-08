@@ -15,7 +15,7 @@ anyhow = "1.0.100"
 axum = "0.8.9"
 blake3 = "1.8.2"
 fs2 = "0.4.3"
-futures-util = "0.3.31"
+futures-util = { version = "0.3.31", features = ["io"] }
 http = "1.4.0"
 http-body = "1.0.1"
 lix_sdk = { package = "lix", path = "../lix", default-features = false, features = ["default_wasm_runtime", "server-protocol"] }
@@ -31,7 +31,7 @@ tower-http = { version = "0.6.8", features = ["compression-gzip", "compression-z
 tracing = "0.1.44"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-uuid = "1.19.0"
+uuid = { version = "1.19.0", features = ["v4"] }
 
 [dev-dependencies]
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }

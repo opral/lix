@@ -18,30 +18,32 @@ See [storage adapters](./persistence.md#how-storage-adapters-fit) for persistenc
 
 <a id="choose-a-client-mode"></a>
 
-`openLix()` selects where SDK operations execute with `server.mode`.
-Both client modes connect to the same server.
+`openLix()` selects execution from the supplied connections: `server` alone
+executes remotely; `storage` plus `server` maintains a synchronized local read replica.
+Both connect to the same hosted repository.
 
 | | `remote` | `sync` |
 | --- | --- | --- |
-| Reads and writes execute | On the server | On a local replica |
-| Client storage | None; do not pass `storage` | An explicit durable adapter in JavaScript |
+| Reads and writes execute | On the server | Certified current-state reads locally; mutations and history on the server |
+| Client storage | None; do not pass `storage` | An explicit durable adapter |
 | Network round trip | Every operation | Background synchronization; uncached data may need a fetch |
-| Successful write | Accepted by the server | Committed locally; may not yet be on the server |
-| Offline work | No | Cached reads and local writes |
+| Successful write | Accepted by the server | Accepted by the server |
+| Offline work | No | No offline mutation guarantee; reads may require server certification |
 
 ### Remote mode
 
-Use `server: { mode: "remote", url: lixConnectionUrl }` for SDK access with
+Use `server: { url: lixConnectionUrl }` for SDK access with
 server-acknowledged writes. It creates no local repository or synchronized files.
 
 ### Sync mode
 
-Use `server: { mode: "sync", url: lixConnectionUrl }` with `FilesystemStorage`
+Use `server: { url: lixConnectionUrl }` with `FilesystemStorage`
 for files on disk or `OpfsStorage` for a browser replica. Current data and new
 commits sync automatically; older history and binary content download on demand.
 
-`await lix.execute(...)` confirms a local commit, not server receipt.
-Uploads run in the background; no `sync()` call is needed.
+Mutations execute on the authority. Successful mutation calls confirm server
+acceptance; the local replica receives the resulting certified state. No
+manual `sync()` call is needed.
 
 ### Connection URL and authentication
 
@@ -51,7 +53,6 @@ and async credential refresh:
 
 ```ts
 server: {
-  mode: "sync",
   url: lixConnectionUrl,
   headers: async () => ({
     Authorization: `Bearer ${await getAccessToken()}`,
@@ -62,11 +63,9 @@ server: {
 ## Opening and reconnecting
 
 A fresh replica downloads current working state before `openLix()` resolves.
-Existing replicas can open locally and reconnect in the background, potentially
-starting behind the server.
-
-Offline, cached reads and local writes work; undownloaded history and binary
-content are unavailable. Pending commits upload after reconnect.
+Existing replicas retain local cached state, but connected opening and
+operations may require the server. Mutations, history, and uncached content
+require connectivity; cached reads can also require fresh authority certification.
 
 ## Receive collaborative updates
 
@@ -98,8 +97,6 @@ and avatars. Lix synchronizes repository data.
 ## Closing
 
 Call `await lix.close()` for cleanup. Remote mode closes the server session.
-Sync mode waits for active local work and allows pending uploads, but does not
-guarantee server receipt. Durable commits resume uploading on the next open.
-
-Sync has no public API to await server confirmation. Use remote mode when each
-successful write requires server acknowledgment.
+A synchronized handle releases its local storage session and server session.
+Closing does not delete either repository. Use `deleteLix()` for explicit
+hosted deletion.

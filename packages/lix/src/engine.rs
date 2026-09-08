@@ -7,8 +7,6 @@ use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
 use crate::hot_state::HotStateContext;
-#[cfg(feature = "server-protocol")]
-use crate::hot_state::{HotStateFilter, HotStateScanRequest};
 use crate::hot_state::HotStateRowRequest;
 use crate::init::InitReceipt;
 use crate::observe_coordinator::ObserveCoordinator;
@@ -287,37 +285,14 @@ where
     }
 
     #[cfg(feature = "server-protocol")]
-    pub(crate) async fn ensure_sync_authority_has_only_synchronized_rows(
+    pub(crate) async fn sync_authority_admission_revision(
         &self,
     ) -> Result<Option<bytes::Bytes>, LixError> {
         let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
+            self.storage.begin_read(StorageReadOptions::default()).await?,
         );
-        let rows = self
-            .hot_state
-            .reader(read.clone())
-            .scan_batch(&HotStateScanRequest {
-                filter: HotStateFilter {
-                    untracked: Some(true),
-                    ..HotStateFilter::default()
-                },
-                ..HotStateScanRequest::default()
-            })
-            .await?;
-        if let Some(row) = rows
-            .iter()
-            .find(|row| row.schema_key() != crate::branch::BRANCH_REF_SCHEMA_KEY)
-        {
-            return Err(LixError::new(
-                "LIX_AUTHORITY_UNTRACKED_UNSUPPORTED",
-                format!(
-                    "repository authority contains unsynchronized untracked row '{}'; track or remove it before serving",
-                    row.schema_key()
-                ),
-            ));
-        }
+        // Untracked rows belong to this repository and survive snapshot transfer.
+        // They remain authority-local current state, outside replicated history.
         Ok(crate::storage_adapter::load_repository_mutation_revision(&read).await?)
     }
 

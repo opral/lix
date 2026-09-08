@@ -1,5 +1,10 @@
 # RFC 004: Repository sync for `mode: sync`
 
+> Historical proposal. The public API now selects sync with `{ storage, server }`
+> and remote execution with `{ server }`; `server.mode` has been removed.
+> Current sync writes execute on the authority. See
+> [Collaboration and Sync](../../docs/collaboration-and-sync.md) for the supported contract.
+
 ## Goal
 
 `openLix({ storage, server: { mode: "sync" } })` is a durable local replica.

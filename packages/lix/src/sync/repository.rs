@@ -1845,6 +1845,15 @@ impl ParsedSyncHeader {
         })
     }
 
+    fn matches_record(&self, existing: &CommitRecord) -> bool {
+        // Headers do not transmit the locally derived touched-scope digest.
+        // Preserve that stronger local metadata while checking every field
+        // actually carried by the immutable wire header.
+        let mut expected = self.record();
+        expected.touched_scope_digest = existing.touched_scope_digest.clone();
+        *existing == expected
+    }
+
     fn record(&self) -> CommitRecord {
         CommitRecord {
             format_version: COMMIT_RECORD_FORMAT_VERSION,
@@ -2339,6 +2348,28 @@ async fn commit_reaches_ancestor(
             continue;
         };
         pending.extend(record.parent_commit_ids);
+    }
+    Ok(false)
+}
+
+/// Proves ancestry through incoming immutable headers and existing local history.
+/// Missing cold history is not proof; traversal must actually reach the local head.
+async fn snapshot_head_contains_local_head(
+    read: &(impl StorageAdapterRead + ?Sized),
+    incoming_head: CommitId,
+    local_head: CommitId,
+    incoming_headers: &BTreeMap<CommitId, ParsedSyncHeader>,
+) -> Result<bool, LixError> {
+    let mut pending = vec![incoming_head];
+    let mut seen = BTreeSet::new();
+    while let Some(commit_id) = pending.pop() {
+        if commit_id == local_head { return Ok(true); }
+        if !seen.insert(commit_id) { continue; }
+        if let Some(header) = incoming_headers.get(&commit_id) {
+            pending.extend(header.parent_commit_ids.iter().copied());
+        } else if let Some(record) = load_commit_record(read, commit_id).await? {
+            pending.extend(record.parent_commit_ids);
+        }
     }
     Ok(false)
 }
@@ -4040,6 +4071,17 @@ where
                 "sync snapshot must contain exactly one headed default branch",
             ));
         }
+        let mut header_by_id = BTreeMap::new();
+        for header in commit_headers {
+            let parsed = ParsedSyncHeader::parse(header)?;
+            if header_by_id.insert(parsed.commit_id, parsed).is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync snapshot contains duplicate commit headers",
+                ));
+            }
+        }
+        validate_sync_header_set(&header_by_id, "sync snapshot")?;
         let observed = BranchHeadControlContext::new()
             .reader(&read)
             .load_observed(&branch_ids)
@@ -4063,7 +4105,10 @@ where
             let Some(local) = observation.control else {
                 continue;
             };
-            if local.head_commit_id == incoming_head {
+            if snapshot_head_contains_local_head(&read, incoming_head, local.head_commit_id, &header_by_id).await? {
+                // A newly hosted copy may already include server-side account
+                // initialization or other commits. Accept its proven extension
+                // of our local history, but never discard a diverged local head.
                 continue;
             }
             let record = load_commit_record(&read, local.head_commit_id)
@@ -4102,21 +4147,11 @@ where
             }
         }
         let mut records = BTreeMap::<CommitId, CommitRecord>::new();
-        let mut header_by_id = BTreeMap::new();
-        for header in commit_headers {
-            let parsed = ParsedSyncHeader::parse(header)?;
-            if header_by_id.insert(parsed.commit_id, parsed).is_some() {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync snapshot contains duplicate commit headers",
-                ));
-            }
-        }
-        validate_sync_header_set(&header_by_id, "sync snapshot")?;
+        let mut existing_complete = BTreeSet::new();
         let mut appended_records = Vec::with_capacity(header_by_id.len());
         for header in header_by_id.values() {
             if let Some(existing) = load_commit_record(&read, header.commit_id).await? {
-                if existing != header.record() {
+                if !header.matches_record(&existing) {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
                 let existing_scope =
@@ -4126,6 +4161,9 @@ where
                     };
                 if existing_scope.is_some_and(|scope| scope != header.global_scope) {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
+                }
+                if existing_scope.is_some() && !commit_history_is_deferred(&read, header.commit_id).await? {
+                    existing_complete.insert(header.commit_id);
                 }
                 records.insert(header.commit_id, existing);
             } else {
@@ -4151,6 +4189,15 @@ where
                     LixError::CODE_INVALID_PARAM,
                     format!("sync snapshot head '{commit_id}' body disagrees with its header"),
                 ));
+            }
+        }
+        for (commit_id, commit) in &parsed_heads {
+            if existing_complete.contains(commit_id) {
+                let stored = load_sync_commit(&read, *commit_id).await?.ok_or_else(||
+                    LixError::unknown("complete local commit body is missing"))?;
+                if stored != commit.wire {
+                    return Err(immutable_object_mismatch("commit", commit_id));
+                }
             }
         }
         let mut head_ids = BTreeSet::new();
@@ -4293,7 +4340,7 @@ where
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
         for commit_id in header_by_id.keys().copied() {
-            if parsed_heads.contains_key(&commit_id) {
+            if parsed_heads.contains_key(&commit_id) || existing_complete.contains(&commit_id) {
                 stage_commit_history_available(&mut writes, commit_id);
             } else {
                 stage_commit_history_deferred_with_scope(
@@ -4304,7 +4351,7 @@ where
             }
         }
         for (commit_id, commit) in &parsed_heads {
-            if let Some(alias) = &commit.wire.state_alias {
+            if !existing_complete.contains(commit_id) && let Some(alias) = &commit.wire.state_alias {
                 stage_materialized_sync_state_alias(&mut writes, *commit_id, alias)?;
             }
         }
@@ -4352,7 +4399,7 @@ where
         let mut imported_authored_change_ids = BTreeSet::new();
         for commit in parsed_heads
             .iter()
-            .filter(|(commit_id, _)| snapshot_body_ids.contains(commit_id))
+            .filter(|(commit_id, _)| snapshot_body_ids.contains(commit_id) && !existing_complete.contains(commit_id))
             .map(|(_, commit)| commit)
         {
             let mutations = stage_imported_commit_body(
@@ -4375,10 +4422,7 @@ where
         }
         selected_fallback_locators
             .retain(|change_id, _| !imported_authored_change_ids.contains(change_id));
-        stage_change_locators(
-            &mut writes,
-            &selected_fallback_locators.into_values().collect::<Vec<_>>(),
-        );
+        stage_missing_selected_change_locators(&read, &mut writes, &mut preconditions, selected_fallback_locators).await?;
         stage_change_locators(
             &mut writes,
             &authored_locators.into_values().collect::<Vec<_>>(),
@@ -4393,6 +4437,12 @@ where
 
         let mut row_pk_index_overlay = TrackedStateChunkOverlay::new();
         for head in snapshot_body_ids.iter().copied() {
+            if existing_complete.contains(&head) {
+                // The source already owns the complete immutable body and
+                // state representation. Sparse bootstrap must not rewrite it
+                // under the same identities with a different physical encoding.
+                continue;
+            }
             // A sparse snapshot may advertise a checkpoint coordinate whose
             // header/body is intentionally deferred. Its rows still seed the
             // hot checkpoint baseline; immutable state authority is installed
@@ -4667,7 +4717,7 @@ where
         let mut writes = adapter.new_write_set();
         for header in parsed.values() {
             if let Some(existing) = load_commit_record(&read, header.commit_id).await? {
-                if existing != header.record() {
+                if !header.matches_record(&existing) {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
                 let existing_scope =
@@ -7444,31 +7494,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authority_rejects_unsynchronized_untracked_mutations() {
-        let authority = open_lix().await.expect("authority should open");
-        authority
-            .set_sync_role(super::super::SyncRole::Authority)
-            .expect("authority role should install");
-        let error = authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
-                 VALUES ('authority-local-only', 'forbidden', true)",
-                &[],
-            )
-            .await
-            .expect_err("authority must not accept state omitted from sync");
-        assert_eq!(error.code, "LIX_AUTHORITY_UNTRACKED_UNSUPPORTED");
-        assert!(
-            authority
-                .execute(
-                    "SELECT * FROM lix_key_value WHERE key = 'authority-local-only'",
-                    &[],
-                )
-                .await
-                .expect("rejected untracked row absence should query")
-                .rows()
-                .is_empty()
-        );
+    async fn authority_preserves_untracked_current_state_without_history() {
+        let authority = open_lix().await.unwrap();
+        authority.set_sync_role(super::super::SyncRole::Authority).unwrap();
+        let head = authority.execute("SELECT id FROM lix_commit ORDER BY id", &[]).await.unwrap();
+        authority.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('authority-local-only','preserved',true)", &[]).await.unwrap();
+        assert_eq!(authority.execute("SELECT value FROM lix_key_value WHERE key = 'authority-local-only'", &[]).await.unwrap().rows().len(),1);
+        let after = authority.execute("SELECT id FROM lix_commit ORDER BY id", &[]).await.unwrap();
+        assert_eq!(head.rows(),after.rows(),"untracked mutations must not create history");
     }
 
     #[tokio::test]
@@ -10767,6 +10800,84 @@ mod tests {
             .expect_err("metadata cannot redefine the tracked repository default");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error.message.contains("canonical tracked row"));
+    }
+
+    #[tokio::test]
+    async fn incoming_header_preserves_local_scope_digest_but_checks_identity() {
+        let local = open_lix().await.unwrap();
+        write_key_value(&local, "digest-proof", "local").await;
+        let head = CommitId::parse_lix(&current_branch_head(&local).await, "test head").unwrap();
+        let storage = local.storage_adapter();
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let record = load_commit_record(&read, head).await.unwrap().unwrap();
+        let mut wire = sync_header_from_record(&record, false);
+        let header = ParsedSyncHeader::parse(&wire).unwrap();
+        assert!(header.matches_record(&record));
+        wire.account_id = "0197bf96-8733-7000-8000-000000000099".to_owned();
+        assert!(!ParsedSyncHeader::parse(&wire).unwrap().matches_record(&record));
+    }
+
+    #[tokio::test]
+    async fn snapshot_accepts_hosted_copy_with_new_authority_commits() {
+        for advance_main in [false, true] {
+        let local = open_lix().await.unwrap();
+        write_key_value(&local, "before-publication", "preserved").await;
+        let mut bytes = Vec::new();
+        local.export_snapshot().write_to(&mut bytes).await.unwrap();
+        let authority = open_lix().from_snapshot(futures_lite::io::Cursor::new(bytes)).await.unwrap();
+        authority.ensure_account("0197bf96-8733-7000-8000-000000000001", "Hosted user", "human").await.unwrap();
+        if advance_main { write_key_value(&authority, "after-publication", "server").await; }
+        let snapshot = authority.pull_sync_repository(None, 1).await.unwrap();
+        let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
+        local.set_sync_role(super::super::SyncRole::Replica).unwrap();
+        let result = local.try_install_initial_sync_snapshot(
+            TEST_REMOTE, crate::ANONYMOUS_ACCOUNT_ID, &snapshot,
+            &history.commits, &history.commit_headers, &rows, &checkpoint_roots,
+        ).await.expect("hosted copy extends the source without losing local commits");
+        assert!(matches!(result, InitialSyncSnapshotInstall::Installed));
+        // This fixture constructs no connected authority. Read the installed cache
+        // directly instead of entering the public execution/session machinery.
+        let storage = local.storage_adapter();
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let reader = HotStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
+            .reader(SharedStorageAdapterRead::new(read));
+        let (branch_id, _) = default_head(&snapshot);
+        for (key, expected) in [("before-publication", "preserved"), ("after-publication", "server")] {
+            if key == "after-publication" && !advance_main { continue; }
+            let row = reader.load_row(&HotStateRowRequest {
+                schema_key: "lix_key_value".to_owned(),
+                branch_id: branch_id.clone(),
+                row_pk: RowPk::single(key),
+                file_id: NullableKeyFilter::Null,
+            }).await.unwrap().expect("published row remains available");
+            let content: serde_json::Value = serde_json::from_str(
+                row.snapshot_content.as_deref().expect("live row content")
+            ).unwrap();
+            assert_eq!(content["value"], expected);
+        }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_local_edits_after_hosted_copy_without_losing_them() {
+        let local = open_lix().await.unwrap();
+        write_key_value(&local, "before-publication", "shared").await;
+        let mut bytes = Vec::new();
+        local.export_snapshot().write_to(&mut bytes).await.unwrap();
+        let authority = open_lix().from_snapshot(futures_lite::io::Cursor::new(bytes)).await.unwrap();
+        write_key_value(&local, "after-copy", "local").await;
+        write_key_value(&authority, "after-copy", "server").await;
+        let snapshot = authority.pull_sync_repository(None, 1).await.unwrap();
+        let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
+        local.set_sync_role(super::super::SyncRole::Replica).unwrap();
+        let error = local.try_install_initial_sync_snapshot(
+            TEST_REMOTE, crate::ANONYMOUS_ACCOUNT_ID, &snapshot,
+            &history.commits, &history.commit_headers, &rows, &checkpoint_roots,
+        ).await.expect_err("diverged local commits must not be replaced");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+        local.set_sync_role(super::super::SyncRole::Disabled).unwrap();
+        assert_eq!(read_key_value(&local, "after-copy").await, "local");
+        assert_eq!(local.load_sync_repository_cursor(TEST_REMOTE).await.unwrap(), None);
     }
 
     #[tokio::test]

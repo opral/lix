@@ -19,6 +19,8 @@ const DEFAULT_RECOVERY_CLOSE_TIMEOUT_SECS: u64 = 30;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_addr: String,
+    /// External canonical server URL, e.g. https://host.example.
+    pub public_url: String,
     pub internal_token: Option<String>,
     pub max_open_lixes: usize,
     pub protocol_timeout: Duration,
@@ -80,6 +82,7 @@ impl Config {
 
         Ok(Self {
             bind_addr,
+            public_url: required_env("LIX_SERVER_PUBLIC_URL")?,
             internal_token,
             max_open_lixes,
             protocol_timeout,
@@ -370,6 +373,7 @@ mod tests {
 
     fn set_s3_env() {
         set_env("LIX_SERVER_INTERNAL_TOKEN", "test-token");
+        set_env("LIX_SERVER_PUBLIC_URL", "https://lix.example.com");
         set_env("S3_ENDPOINT", "https://s3.example");
         set_env("S3_BUCKET", "lix");
         set_env("S3_ACCESS_KEY_ID", "access-key");
@@ -381,6 +385,7 @@ mod tests {
             "BIND_ADDR",
             "PORT",
             "LIX_SERVER_INTERNAL_TOKEN",
+            "LIX_SERVER_PUBLIC_URL",
             "LIX_SERVER_MAX_OPEN_LIXS",
             "LIX_SERVER_PROTOCOL_TIMEOUT_SECS",
             "LIX_SERVER_RECOVERY_CLOSE_TIMEOUT_SECS",

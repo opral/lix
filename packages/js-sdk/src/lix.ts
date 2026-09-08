@@ -54,6 +54,28 @@ const observeFinalizer = new FinalizationRegistry<{
 	});
 });
 
+const hostedCreators = new WeakMap<
+	Lix,
+	(
+		server: () => Promise<
+			import("./binding-types.js").HostedServerBindingOptions
+		>,
+	) => Promise<import("./types.js").HostedLix>
+>();
+
+/** @internal Used by createLix without adding another method to Lix. */
+export function createHostedFromLix(
+	lix: Lix,
+	server: () => Promise<
+		import("./binding-types.js").HostedServerBindingOptions
+	>,
+) {
+	const create = hostedCreators.get(lix);
+	if (!create)
+		throw new TypeError("createLix() from must be an open local Lix");
+	return create(server);
+}
+
 export class Lix {
 	readonly openReport: LixOpenReport | undefined;
 	private closePromise: Promise<void> | undefined;
@@ -67,6 +89,13 @@ export class Lix {
 	#acceptingOperations = true;
 
 	constructor(private readonly binding: LixBinding) {
+		hostedCreators.set(this, (server) =>
+			this.#runOperation(async () => {
+				if (!binding.createHosted)
+					throw new TypeError("createLix() from requires a local Lix");
+				return binding.createHosted(await server());
+			}),
+		);
 		const report = binding.openReport?.();
 		this.openReport = report
 			? Object.freeze({
@@ -277,21 +306,21 @@ export class Lix {
 		return new ReadableStream<Uint8Array>(
 			{
 				pull: async (controller) => {
-				const active = start();
-				const binding = await active.binding;
-				try {
-					const chunk = await binding.next();
-					if (chunk == null) {
-						active.finish();
-						controller.close();
-						return;
+					const active = start();
+					const binding = await active.binding;
+					try {
+						const chunk = await binding.next();
+						if (chunk == null) {
+							active.finish();
+							controller.close();
+							return;
+						}
+						controller.enqueue(chunk);
+					} catch (error) {
+						await active.cancel().catch(() => undefined);
+						throw error;
 					}
-					controller.enqueue(chunk);
-				} catch (error) {
-					await active.cancel().catch(() => undefined);
-					throw error;
-				}
-			},
+				},
 				cancel: async () => {
 					if (!snapshot) return;
 					await snapshot.cancel();
