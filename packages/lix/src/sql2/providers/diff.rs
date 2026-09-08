@@ -704,8 +704,14 @@ fn hot_only_diff_error(error: DataFusionError) -> DataFusionError {
     let error = datafusion_error_to_lix_error(error);
     // Pinned HOT file values may be represented by deferred binary-CAS chunks.
     // Fetching those exact content-addressed bytes is not history fallback, so
-    // preserve the demand code for the replica retry loop.
-    if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {
+    // preserve the demand code for the replica retry loop. Coherent-read
+    // expiration must also reach the bounded session retry unchanged.
+    if matches!(
+        error.code.as_str(),
+        "LIX_SYNC_CHUNKS_REQUIRED"
+            | crate::LixError::CODE_STORAGE_READ_EXPIRED
+            | crate::LixError::CODE_TRANSACTION_CONFLICT
+    ) {
         return lix_error_to_datafusion_error(error);
     }
     let message = if error.code == "LIX_SYNC_HISTORY_REQUIRED" {
@@ -714,10 +720,7 @@ fn hot_only_diff_error(error: DataFusionError) -> DataFusionError {
     } else {
         error.message
     };
-    lix_error_to_datafusion_error(crate::LixError::new(
-        "LIX_DIFF_HOT_UNAVAILABLE",
-        message,
-    ))
+    lix_error_to_datafusion_error(crate::LixError::new("LIX_DIFF_HOT_UNAVAILABLE", message))
 }
 
 #[derive(Clone)]
@@ -1900,6 +1903,22 @@ mod tests {
             error.details,
             Some(serde_json::json!({ "chunkIds": ["a".repeat(64)] }))
         );
+    }
+
+    #[test]
+    fn default_range_diff_preserves_coherent_read_retry_errors() {
+        for code in [
+            crate::LixError::CODE_STORAGE_READ_EXPIRED,
+            crate::LixError::CODE_TRANSACTION_CONFLICT,
+        ] {
+            let error = hot_only_diff_error(lix_error_to_datafusion_error(
+                crate::LixError::new(code, "concurrent publication")
+                    .with_details(serde_json::json!({ "retry": true })),
+            ));
+            let error = datafusion_error_to_lix_error(error);
+            assert_eq!(error.code, code);
+            assert_eq!(error.details, Some(serde_json::json!({ "retry": true })));
+        }
     }
 
     #[test]

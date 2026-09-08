@@ -5,20 +5,21 @@ use datafusion::sql::sqlparser::ast::{TableFactor, Visit, Visitor};
 
 use super::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
 
-/// Execution ownership for a parsed public SQL statement.
+/// Classifies a parsed statement's state requirements and mutation behavior.
 ///
-/// Replica hot reads are the only statements that may execute against the
-/// local serving plane. Mutations and historical reads belong to the
-/// authority; keeping this classification beside the SQL parser avoids a
-/// second, text-based dialect in clients.
+/// Sync replicas execute every class locally. Historical reads may demand
+/// deferred immutable data; writes enter the durable upload queue. Keeping
+/// the distinction beside the parser makes whole-read retries safe without
+/// accidentally replaying a mutation. The authority route names also remain
+/// useful to protocol callers that own their execution lifecycle.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StatementAuthorityRoute {
-    /// A certified current-state read which may execute on the hot replica.
+    /// A read over the locally available current-state serving plane.
     HotRead,
-    /// A historical read which must execute on the authority.
+    /// A historical read which may need lazy authority hydration.
     AuthorityRead,
-    /// A mutation which must execute on the authority.
+    /// A local mutation whose accepted result is decided by the authority.
     AuthorityWrite,
 }
 
@@ -79,9 +80,7 @@ fn is_certified_hot_surface(
     argument_count: Option<usize>,
 ) -> bool {
     match &surface.kind {
-        PublicSurfaceKind::File
-        | PublicSurfaceKind::Directory
-        | PublicSurfaceKind::Branch => true,
+        PublicSurfaceKind::File | PublicSurfaceKind::Directory | PublicSurfaceKind::Branch => true,
         PublicSurfaceKind::SchemaBase { .. } => {
             !matches!(surface.name.as_str(), "lix_checkpoint" | "lix_commit")
         }
@@ -154,14 +153,15 @@ mod tests {
                 _ => None,
             };
             let hot = is_certified_hot_surface(surface, argument_count);
-            let expected_hot = matches!(
-                surface.kind,
-                PublicSurfaceKind::File
-                    | PublicSurfaceKind::Directory
-                    | PublicSurfaceKind::Branch
-                    | PublicSurfaceKind::DiffFunction
-                    | PublicSurfaceKind::SchemaBase { .. }
-            ) && !matches!(surface.name.as_str(), "lix_checkpoint" | "lix_commit");
+            let expected_hot =
+                matches!(
+                    surface.kind,
+                    PublicSurfaceKind::File
+                        | PublicSurfaceKind::Directory
+                        | PublicSurfaceKind::Branch
+                        | PublicSurfaceKind::DiffFunction
+                        | PublicSurfaceKind::SchemaBase { .. }
+                ) && !matches!(surface.name.as_str(), "lix_checkpoint" | "lix_commit");
             assert_eq!(hot, expected_hot, "surface {}", surface.name);
         }
     }

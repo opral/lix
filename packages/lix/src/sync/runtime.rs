@@ -11,7 +11,6 @@ use futures_util::{FutureExt, select_biased};
 use crate::storage_adapter::Storage;
 use crate::{Lix, LixError};
 
-#[cfg(test)]
 use super::SyncPushRequest;
 use super::platform::{HttpSyncTransport, SyncTask, sleep, spawn_sync_task};
 use super::{SyncRepositoryPullResponse, SyncTransport};
@@ -64,6 +63,7 @@ impl SyncDemand {
 enum SyncDemandRequest {
     History(Vec<String>),
     Chunks(Vec<String>),
+    #[cfg(test)]
     PublicationBarrier,
 }
 
@@ -259,12 +259,6 @@ async fn send_sync_demand(
     Ok(())
 }
 
-pub(crate) async fn fence_hot_state(
-    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
-) -> Result<(), LixError> {
-    send_sync_demand(demand_tx, SyncDemandRequest::PublicationBarrier).await
-}
-
 fn is_sparse_commit_graph_miss(error: &LixError) -> bool {
     error.code == LixError::CODE_COMMIT_NOT_FOUND
         && error.details.as_ref().is_some_and(|details| {
@@ -331,6 +325,7 @@ where
         validate_connected_authority(lix, &remote_id, transport).await?;
     }
     lix.set_sync_replica_remote_id(&remote_id)?;
+    lix.storage_adapter().admit_sync_replica_writer();
     lix.set_sync_role(crate::sync::SyncRole::Replica)?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(SyncShutdown::Running);
@@ -360,7 +355,7 @@ where
     }))
 }
 
-/// Shared bootstrap, certified pull, long-poll, demand, and retry policy.
+/// Shared bootstrap, durable upload, certified pull, demand, and retry policy.
 ///
 /// Platform adapters supply only task spawning, timers, HTTP, and cancellation.
 async fn run_sync_worker<StorageImpl>(
@@ -376,6 +371,8 @@ where
 {
     let mut retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
     let mut delta_pull_limit = super::MAX_SYNC_REQUEST_ITEMS;
+    let mut push_item_limit = super::MAX_SYNC_REQUEST_ITEMS;
+    let mut change_watcher = lix.sync_mode_state().change_watcher();
     let mut internal_demand_retry = SyncDemandRetry::default();
     let mut pending_demands = Vec::new();
 
@@ -430,7 +427,9 @@ where
                 &lix,
                 &remote_id,
                 current,
+                &mut push_item_limit,
                 &mut delta_pull_limit,
+                &mut change_watcher,
                 &mut demand_rx,
                 &mut pending_demands,
             )
@@ -465,6 +464,7 @@ where
                                         hydrate_chunk_ids(&lix, current, ids.into_iter().collect())
                                             .await
                                     }
+                                    #[cfg(test)]
                                     SyncDemandRequest::PublicationBarrier => Ok(()),
                                 }
                             }
@@ -514,9 +514,8 @@ where
             }
         }
     }
-    // Replica writes are authority-routed and their public promises wait for a
-    // certified pull. Closing a replica therefore has no local outbox to
-    // publish; shutdown only waits for the current pull iteration to stop.
+    // Local commits and their refs are a durable outbox. Close cancels network
+    // work promptly; a warm reopen resumes any unacknowledged suffix.
     let result = terminal_error.map_or(Ok(()), Err);
     drop(pending_demands);
     drop(demand_rx);
@@ -549,7 +548,9 @@ pub(super) async fn sync_iteration<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     remote_id: &str,
     transport: &Transport,
+    push_item_limit: &mut usize,
     delta_pull_limit: &mut usize,
+    change_watcher: &mut tokio::sync::watch::Receiver<u64>,
     demand_rx: &mut tokio::sync::mpsc::Receiver<SyncDemand>,
     pending_demands: &mut Vec<SyncDemand>,
 ) -> Result<(), LixError>
@@ -557,10 +558,10 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
+    while let Ok(demand) = demand_rx.try_recv() {
+        pending_demands.push(demand);
+    }
     if !pending_demands.is_empty() {
-        while let Ok(demand) = demand_rx.try_recv() {
-            pending_demands.push(demand);
-        }
         pending_demands.retain(|demand| !demand.response.is_closed());
         if !pending_demands.is_empty() {
             let demands = std::mem::take(pending_demands);
@@ -573,6 +574,16 @@ where
         }
     }
 
+    // Establish the generation before inspecting the outbox. A commit racing
+    // with outbox construction then wakes the select below and cannot remain
+    // hidden behind an already-held long poll.
+    let _ = change_watcher.borrow_and_update();
+
+    // Publish completed local commits before waiting for remote work. Commit
+    // identity and ref compare-and-swap make retry after a lost response safe.
+    let ref_conflicted =
+        push_pending_outbox(lix, remote_id, transport, push_item_limit, delta_pull_limit).await?;
+
     let cursor = lix
         .load_sync_repository_cursor(remote_id)
         .await?
@@ -582,9 +593,17 @@ where
                 "sync repository cursor disappeared after bootstrap",
             )
         })?;
+    if ref_conflicted {
+        let response = pull_delta_now_adaptive(transport, cursor, delta_pull_limit).await?;
+        validate_delta_after(cursor, &response)?;
+        prepare_pull(lix, transport, &response).await?;
+        lix.apply_sync_repository_pull(remote_id, &response).await?;
+        return Ok(());
+    }
+    let local_changed = change_watcher.changed().fuse();
     let pull = pull_delta_adaptive(transport, cursor, delta_pull_limit).fuse();
     let demand = demand_rx.recv().fuse();
-    futures_util::pin_mut!(pull, demand);
+    futures_util::pin_mut!(local_changed, pull, demand);
     select_biased! {
         demand = demand => {
             pending_demands.push(demand.ok_or_else(|| {
@@ -592,6 +611,7 @@ where
             })?);
             Ok(())
         },
+        _ = local_changed => Ok(()),
         response = pull => {
             let response = response?;
             validate_delta_after(cursor, &response)?;
@@ -599,6 +619,89 @@ where
             lix.apply_sync_repository_pull(remote_id, &response).await?;
             Ok(())
         }
+    }
+}
+
+/// Publishes a bounded number of outbox batches. `true` requests a finite
+/// pull before the next iteration, on conflict or after exhausting the budget.
+/// This prevents sustained local writes from starving history demands.
+async fn push_pending_outbox<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    remote_id: &str,
+    transport: &Transport,
+    push_item_limit: &mut usize,
+    delta_pull_limit: &mut usize,
+) -> Result<bool, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    for _ in 0..4 {
+        let Some(mut request) = lix.build_sync_push(remote_id, *push_item_limit).await? else {
+            return Ok(false);
+        };
+        let result = push_with_inline_fallback(lix, transport, &mut request).await;
+        match result {
+            Ok(receipt) => {
+                catch_up_to(lix, remote_id, transport, receipt.cursor, delta_pull_limit).await?;
+            }
+            // A ref moved concurrently. Pulling the authority's intervening
+            // events lets the importer reconcile local refs/outbox state; an
+            // immediate reconnect/re-push would repeat the same conflict.
+            Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => return Ok(true),
+            Err(error) if error.code == SYNC_REQUEST_TOO_LARGE_CODE => {
+                reduce_push_limit_after_too_large(push_item_limit, error)?;
+            }
+            Err(error) if is_permanent_push_rejection(&error) => {
+                // A rejected transaction has no acknowledgment event. Remove
+                // its dependent pending suffix instead of retrying a doomed
+                // outbox forever. Keep transport/auth-refresh failures durable.
+                tracing::warn!(error = ?error, "server rejected pending local changes");
+                lix.discard_sync_pending_changes().await?;
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+async fn catch_up_to<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    remote_id: &str,
+    transport: &Transport,
+    target_cursor: u64,
+    delta_pull_limit: &mut usize,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    loop {
+        let cursor = lix
+            .load_sync_repository_cursor(remote_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync repository cursor disappeared after push",
+                )
+            })?;
+        if cursor >= target_cursor {
+            return Ok(());
+        }
+        let response = pull_delta_adaptive(transport, cursor, delta_pull_limit).await?;
+        let next = validate_delta_after(cursor, &response)?;
+        if next <= cursor {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "sync push acknowledged cursor {target_cursor}, but pull remained at {cursor}"
+                ),
+            ));
+        }
+        prepare_pull(lix, transport, &response).await?;
+        lix.apply_sync_repository_pull(remote_id, &response).await?;
     }
 }
 
@@ -738,6 +841,15 @@ fn is_response_too_large(error: &LixError) -> bool {
             && error.message.contains("response exceeds"))
 }
 
+fn reduce_push_limit_after_too_large(limit: &mut usize, error: LixError) -> Result<(), LixError> {
+    if *limit > 1 {
+        *limit = smaller_page_limit(*limit);
+        Ok(())
+    } else {
+        Err(sync_item_too_large_error("push item", error))
+    }
+}
+
 fn sync_item_too_large_error(kind: &str, source: LixError) -> LixError {
     LixError::new(
         SYNC_ITEM_TOO_LARGE_CODE,
@@ -777,6 +889,20 @@ fn is_terminal_sync_error(error: &LixError) -> bool {
     )
 }
 
+fn is_permanent_push_rejection(error: &LixError) -> bool {
+    if is_terminal_sync_error(error) {
+        return false;
+    }
+    matches!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("httpStatus"))
+            .and_then(serde_json::Value::as_u64),
+        Some(400 | 403 | 422)
+    )
+}
+
 fn is_retryable_sync_transport_error(error: &LixError) -> bool {
     if error.code == super::http::SYNC_TRANSPORT_ERROR_CODE {
         return true;
@@ -796,8 +922,7 @@ fn is_retryable_sync_demand_error(error: &LixError) -> bool {
     // a publication barrier is idempotent, so retain the waiter and re-pin from
     // the durable receipt instead of leaking a storage race through the public
     // connected handle.
-    error.code == LixError::CODE_STORAGE_READ_EXPIRED
-        || is_retryable_sync_transport_error(error)
+    error.code == LixError::CODE_STORAGE_READ_EXPIRED || is_retryable_sync_transport_error(error)
 }
 
 fn retry_sync_iteration_without_reconnect(error: &LixError) -> bool {
@@ -815,6 +940,7 @@ where
 {
     let mut history_ids = BTreeSet::new();
     let mut chunk_ids = BTreeSet::new();
+    #[cfg(test)]
     let publication_barrier_requested = demands
         .iter()
         .any(|demand| matches!(&demand.request, SyncDemandRequest::PublicationBarrier));
@@ -822,6 +948,7 @@ where
         match &demand.request {
             SyncDemandRequest::History(ids) => history_ids.extend(ids),
             SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
+            #[cfg(test)]
             SyncDemandRequest::PublicationBarrier => {}
         }
     }
@@ -837,24 +964,22 @@ where
     } else {
         hydrate_chunk_ids(lix, transport, chunk_ids).await
     };
+    #[cfg(not(test))]
+    let barrier_result = Ok(());
+    #[cfg(test)]
     let barrier_result = if publication_barrier_requested {
         fence_replica_to_authority_head(lix, transport).await
     } else {
         Ok(())
     };
-    resolve_sync_demand_results(
-        demands,
-        history_result,
-        chunk_result,
-        barrier_result,
-    )
+    resolve_sync_demand_results(demands, history_result, chunk_result, barrier_result)
 }
 
 fn resolve_sync_demand_results(
     demands: Vec<SyncDemand>,
     history_result: Result<(), LixError>,
     chunk_result: Result<(), LixError>,
-    barrier_result: Result<(), LixError>,
+    _barrier_result: Result<(), LixError>,
 ) -> (Vec<SyncDemand>, Option<LixError>) {
     let mut retry = Vec::new();
     let mut retry_error = None;
@@ -865,7 +990,8 @@ fn resolve_sync_demand_results(
         let result = match &demand.request {
             SyncDemandRequest::History(_) => history_result.clone(),
             SyncDemandRequest::Chunks(_) => chunk_result.clone(),
-            SyncDemandRequest::PublicationBarrier => barrier_result.clone(),
+            #[cfg(test)]
+            SyncDemandRequest::PublicationBarrier => _barrier_result.clone(),
         };
         match result {
             Err(error) if is_retryable_sync_demand_error(&error) => {
@@ -880,6 +1006,7 @@ fn resolve_sync_demand_results(
     (retry, retry_error)
 }
 
+#[cfg(test)]
 async fn fence_replica_to_authority_head<StorageImpl, Transport>(
     lix: &Lix<StorageImpl>,
     transport: &Transport,
@@ -1440,9 +1567,86 @@ where
         Some(SyncDemandRequest::Chunks(ids)) => {
             hydrate_chunk_ids(lix, transport, ids.into_iter().collect()).await
         }
+        #[cfg(test)]
         Some(SyncDemandRequest::PublicationBarrier) => Ok(()),
         None => Err(error),
     }
+}
+
+async fn push_request_blobs<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    request: &SyncPushRequest,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let inline_blob_ids = request
+        .inline_blobs
+        .iter()
+        .map(|manifest| manifest.blob_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for blob_id in super::repository::sync_commit_blob_ids(&request.commits)? {
+        if inline_blob_ids.contains(blob_id.as_str()) {
+            continue;
+        }
+        let manifest = lix.get_sync_blob_manifest(&blob_id).await?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("local push references missing sync blob '{blob_id}'"),
+            )
+        })?;
+        let mut registration = transport.register_blob(&manifest).await?;
+        for chunk_id in registration
+            .missing_chunk_ids
+            .iter()
+            .collect::<BTreeSet<_>>()
+        {
+            let bytes = lix
+                .get_sync_chunk(chunk_id)
+                .await?
+                .ok_or_else(|| missing_chunk_error(chunk_id, &blob_id, "local push"))?;
+            transport.put_chunk(chunk_id, &bytes).await?;
+        }
+        if !registration.missing_chunk_ids.is_empty() {
+            registration = transport.register_blob(&manifest).await?;
+        }
+        if !registration.missing_chunk_ids.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "sync blob '{blob_id}' remained incomplete after uploading requested chunks"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn push_with_inline_fallback<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    request: &mut SyncPushRequest,
+) -> Result<super::SyncPushResponse, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    push_request_blobs(lix, transport, request).await?;
+    let first = transport.push(request).await;
+    let request_too_large = first
+        .as_ref()
+        .is_err_and(|error| error.code == SYNC_REQUEST_TOO_LARGE_CODE);
+    if request_too_large && !request.inline_blobs.is_empty() {
+        // A server may configure a lower request-body cap than the protocol
+        // default. Inline blobs are optional acceleration: retry the exact
+        // commit/ref request once through the ordinary manifest lane.
+        request.inline_blobs.clear();
+        push_request_blobs(lix, transport, request).await?;
+        return transport.push(request).await;
+    }
+    first
 }
 
 async fn prepare_pull<StorageImpl, Transport>(
@@ -3312,7 +3516,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "public historical SQL is server-first in v3"]
     async fn one_history_demand_hydrates_and_retries_sql_while_deduping_callers() {
         let (replica, parent, head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture().await;
@@ -3500,7 +3703,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "public historical SQL is server-first in v3"]
     async fn history_hydration_waits_for_collaboration_read_quiescence() {
         let (replica, parent, head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture().await;
@@ -3590,18 +3792,25 @@ mod tests {
             chunk_calls: Arc::new(Mutex::new(Vec::new())),
         };
         let (response, mut done) = tokio::sync::oneshot::channel();
-        let mut demands = vec![SyncDemand {
-            request: SyncDemandRequest::History(vec![parent]),
-            response,
-        }];
-        let (_demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        let mut demands = Vec::new();
+        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        demand_tx
+            .send(SyncDemand {
+                request: SyncDemandRequest::History(vec![parent]),
+                response,
+            })
+            .await
+            .expect("new demand queues before the upload iteration");
         let mut delta_pull_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
+        let mut push_item_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
 
         let error = sync_iteration(
             &replica,
             "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005",
             &transport,
+            &mut push_item_limit,
             &mut delta_pull_limit,
+            &mut replica.sync_mode_state().change_watcher(),
             &mut demand_rx,
             &mut demands,
         )
@@ -3621,7 +3830,9 @@ mod tests {
             &replica,
             "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005",
             &transport,
+            &mut push_item_limit,
             &mut delta_pull_limit,
+            &mut replica.sync_mode_state().change_watcher(),
             &mut demand_rx,
             &mut demands,
         )
@@ -3662,12 +3873,15 @@ mod tests {
         }];
         let (_demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
         let mut delta_pull_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
+        let mut push_item_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
 
         let error = sync_iteration(
             &replica,
             "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005",
             &transport,
+            &mut push_item_limit,
             &mut delta_pull_limit,
+            &mut replica.sync_mode_state().change_watcher(),
             &mut demand_rx,
             &mut demands,
         )
@@ -3676,6 +3890,27 @@ mod tests {
         assert!(error.message.contains("unused history test pull"));
         assert!(demands.is_empty());
         assert!(calls.lock().expect("history calls lock").is_empty());
+    }
+
+    #[test]
+    fn only_permanent_push_rejections_discard_pending_work() {
+        for status in [400, 403, 422] {
+            let error = LixError::new("REJECTED", "invalid write")
+                .with_details(serde_json::json!({ "httpStatus": status }));
+            assert!(is_permanent_push_rejection(&error));
+        }
+        for status in [401, 408, 409, 413, 429, 500, 503] {
+            let error = LixError::new("RETRY", "temporary failure")
+                .with_details(serde_json::json!({ "httpStatus": status }));
+            assert!(!is_permanent_push_rejection(&error));
+        }
+        assert!(!is_permanent_push_rejection(
+            &LixError::new(
+                super::super::SYNC_PROTOCOL_MISMATCH_CODE,
+                "upgrade required"
+            )
+            .with_details(serde_json::json!({ "httpStatus": 400 }))
+        ));
     }
 
     #[test]
@@ -3744,7 +3979,9 @@ mod tests {
             resolve_sync_demand_results(demands, Ok(()), Ok(()), expired());
         assert_eq!(demands.len(), 1);
         assert_eq!(
-            second_error.expect("repeated expiry remains retryable").code,
+            second_error
+                .expect("repeated expiry remains retryable")
+                .code,
             LixError::CODE_STORAGE_READ_EXPIRED,
         );
         assert!(matches!(
@@ -3752,8 +3989,7 @@ mod tests {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
 
-        let (demands, retry_error) =
-            resolve_sync_demand_results(demands, Ok(()), Ok(()), Ok(()));
+        let (demands, retry_error) = resolve_sync_demand_results(demands, Ok(()), Ok(()), Ok(()));
         assert!(demands.is_empty());
         assert!(retry_error.is_none());
         done.await
@@ -3762,7 +3998,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "public historical SQL is server-first in v3"]
     async fn missing_sparse_boundary_hydrates_through_shared_retry_path() {
         let (replica, _parent, _head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture_with_depth(32).await;
@@ -3904,7 +4139,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "replica transactions are authority-routed in v3"]
     async fn explicit_transaction_surfaces_structured_history_demand() {
         let (replica, parent, head, _commits, _commit_headers, _history_boundaries, _boundary_rows) =
             history_fixture().await;

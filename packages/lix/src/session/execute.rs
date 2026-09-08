@@ -1893,11 +1893,6 @@ where
                 .store(invalidation_generation, Ordering::SeqCst);
             return Ok(());
         }
-        if self.sync_mode.role() == crate::sync::SyncRole::Replica {
-            return Err(crate::sync::authority_execution_required(
-                sql2::StatementAuthorityRoute::AuthorityWrite,
-            ));
-        }
         drop(read);
 
         let write_access = self.begin_session_write_access().await?;

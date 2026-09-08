@@ -19,16 +19,16 @@ See [storage adapters](./persistence.md#how-storage-adapters-fit) for persistenc
 <a id="choose-a-client-mode"></a>
 
 `openLix()` selects execution from the supplied connections: `server` alone
-executes remotely; `storage` plus `server` maintains a synchronized local read replica.
+executes remotely; `storage` plus `server` maintains a synchronized local replica.
 Both connect to the same hosted repository.
 
 | | `remote` | `sync` |
 | --- | --- | --- |
-| Reads and writes execute | On the server | Certified current-state reads locally; mutations and history on the server |
+| Reads and writes execute | On the server | On a local replica |
 | Client storage | None; do not pass `storage` | An explicit durable adapter |
 | Network round trip | Every operation | Background synchronization; uncached data may need a fetch |
-| Successful write | Accepted by the server | Accepted by the server |
-| Offline work | No | No offline mutation guarantee; reads may require server certification |
+| Successful write | Accepted by the server | Committed locally; may not yet be on the server |
+| Offline work | No | Cached reads and local writes |
 
 ### Remote mode
 
@@ -41,9 +41,8 @@ Use `server: { url: lixConnectionUrl }` with `FilesystemStorage`
 for files on disk or `OpfsStorage` for a browser replica. Current data and new
 commits sync automatically; older history and binary content download on demand.
 
-Mutations execute on the authority. Successful mutation calls confirm server
-acceptance; the local replica receives the resulting certified state. No
-manual `sync()` call is needed.
+`await lix.execute(...)` confirms a local commit, not server receipt.
+Uploads run in the background; no `sync()` call is needed.
 
 ### Connection URL and authentication
 
@@ -63,9 +62,11 @@ server: {
 ## Opening and reconnecting
 
 A fresh replica downloads current working state before `openLix()` resolves.
-Existing replicas retain local cached state, but connected opening and
-operations may require the server. Mutations, history, and uncached content
-require connectivity; cached reads can also require fresh authority certification.
+Existing replicas can open locally and reconnect in the background, potentially
+starting behind the server.
+
+Offline, cached reads and local writes work; undownloaded history and binary
+content are unavailable. Pending commits upload after reconnect.
 
 ## Receive collaborative updates
 
@@ -86,8 +87,23 @@ for work requiring review.
 
 ## Concurrent changes
 
-Concurrent commits are retained and reconciled through normal branch merging.
-Sync has no separate conflict API.
+The server decides which branch updates are accepted. Pending local commits
+upload with the last confirmed server head and checkpoint as preconditions.
+If another writer advances a pending branch incompatibly, the replica restores
+confirmed server state and discards all of its pending work, including work on
+other branches. This conservative client reset also removes global checkpoint
+catalog entries and cross-branch schema dependencies created by discarded work.
+Sync does not merge divergent heads or expose a conflict-resolution API. Own
+accepted prefixes are acknowledged without rolling back newer descendants.
+
+This is server-wins reconciliation, not timestamp-based last-write-wins.
+Separate branches do not protect unacknowledged work from a client reset.
+
+Historical reads hydrate immutable commit data on demand and cache it in the
+replica's storage. Repeating a cached read does not fetch that history again.
+For explicit transactions, prefetch uncached historical inputs before beginning
+the transaction; a transaction cannot change its captured snapshot to hydrate
+missing history.
 
 ## Presence
 
@@ -97,6 +113,11 @@ and avatars. Lix synchronizes repository data.
 ## Closing
 
 Call `await lix.close()` for cleanup. Remote mode closes the server session.
-A synchronized handle releases its local storage session and server session.
+Sync mode stops its background worker without waiting for network delivery.
+Durable pending commits resume uploading on the next open.
+
+Sync has no public API to await server confirmation. Use remote mode when each
+successful write requires server acknowledgment.
+
 Closing does not delete either repository. Use `deleteLix()` for explicit
 hosted deletion.

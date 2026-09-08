@@ -1,9 +1,14 @@
 # Certified HOT state performance contract
 
-Connected replicas have one serving plane: the authority-certified current
-state and the latest-checkpoint baseline needed for Working Changes. Arbitrary
-commit history is a server read and is not allowed to enter the working-diff
-critical path.
+Sync clients serve current state locally, including durable pending writes.
+The authority-certified receipt remains separate from visible local heads.
+Certification and synchronization run in the background; local write completion
+does not wait for either. The bounds below describe certified bootstrap and
+background publication. See [local-first sync](./local-first-sync.md) for the
+foreground contract and the matched performance profile.
+
+Historical reads hydrate immutable data on demand and retain it in local
+storage. They are separate from the current-state interaction path.
 
 ## Cost model
 
@@ -32,7 +37,7 @@ The intended bounds are:
 | Working-diff identity scan | `O(D log D)` after the certified index is installed | `O(D)` |
 | Selected working-file payload | `O(S + A_f log A_f + P_f)` via exact HOT file-ID pushdown | `O(A_f + P_f)` transient rows and payload copies |
 | Working file rendering | `O(D log F + F * h)` for `F` changed files and directory depth `h` | `O(D + F + directories)` |
-| Historical point/diff read | `O(R)` result transfer for `R` returned bytes/rows today | `O(R)` client result materialization; no persistent replica-history growth |
+| Historical point/diff read | Cold: transfer the missing dependency closure; warm: local query cost | Fetched immutable history persists locally |
 | Connected freshness barrier | One finite authority round trip and `O(1)` metadata when its private cursor is certified. When behind: `O(B + Δ)` transfer, authority `O((B + Q)M log M)` snapshot-root recertification, and client `O(N log N)` per distinct changed root | Authority `O(max branch live set)` plus client `O(B + page + N)` during changed-root certification |
 
 Payload bytes are part of these bounds. A result containing `K` one-megabyte
@@ -106,9 +111,10 @@ all three cases. It allocated 18,491,287 / 18,240,350 / 28,992,135 bytes with
 3,726,576 / 3,508,440 / 4,885,244 peak-live bytes for shallow / deep / wide,
 respectively. Certified current reads and one-argument working diffs use
 payloads installed before publication, so they issue no foreground chunk or
-history requests. Explicit historical reads use the server-first `lix_state_at`
-and multi-argument `lix_diff` surfaces and do not add historical memory to the
-replica.
+history requests. Explicit historical reads use local `lix_state_at` and multi-argument
+`lix_diff` surfaces, hydrating missing history and retaining it for reuse.
+The reference measurements below predate local-first sync and describe the
+former authority-routing implementation.
 
 For 128 retained net-zero tombstones, checkpoint retirement kept the working
 diff at zero rows and reduced the probe from 1,268,863 to 1,058,794 allocated
