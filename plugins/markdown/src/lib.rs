@@ -672,30 +672,21 @@ fn decode_block_shifts(bytes: &[u8]) -> sdk::Result<Vec<(u32, i64)>> {
             .unwrap_or_default()
             .checked_add(delta)
             .ok_or_else(|| sdk::Error::invalid_input("Markdown block shift overflowed"))?;
-        if total == 0 {
-            compact.remove(&ordinal);
-        } else {
-            compact.insert(ordinal, total);
-        }
+        // Zero shifts still identify persisted block overlays for rebuild cleanup.
+        compact.insert(ordinal, total);
     }
     Ok(compact.into_iter().collect())
 }
 
 fn add_block_shift(shifts: &mut Vec<(u32, i64)>, ordinal: u32, delta: i64) -> sdk::Result<bool> {
-    if delta == 0 {
-        return Ok(true);
-    }
+    // Every sparse edit writes an overlay, including equal-length edits.
     match shifts.binary_search_by_key(&ordinal, |(ordinal, _)| *ordinal) {
         Ok(index) => {
             let total = shifts[index]
                 .1
                 .checked_add(delta)
                 .ok_or_else(|| sdk::Error::invalid_input("Markdown block shift overflowed"))?;
-            if total == 0 {
-                shifts.remove(index);
-            } else {
-                shifts[index].1 = total;
-            }
+            shifts[index].1 = total;
             Ok(true)
         }
         Err(index) if shifts.len() < MAX_BLOCK_SHIFT_RECORDS => {
@@ -999,7 +990,8 @@ mod tests {
         }
         assert_eq!(shifts, [(7, 100_000)]);
         assert!(add_block_shift(&mut shifts, 7, -100_000).expect("cancel shift"));
-        assert!(shifts.is_empty());
+        assert_eq!(shifts, [(7, 0)]);
+        shifts.clear();
 
         for ordinal in 0..MAX_BLOCK_SHIFT_RECORDS as u32 {
             assert!(add_block_shift(&mut shifts, ordinal, 1).expect("insert bounded shift"));
@@ -1009,6 +1001,58 @@ mod tests {
             encode_block_shifts(&shifts).len(),
             MAX_BLOCK_SHIFT_RECORDS * 12
         );
+    }
+
+    #[test]
+    fn qa_sparse_overlays_remain_discoverable_without_net_length_changes() {
+        // A successful sparse edit always persists a block overlay. Rebuilds use
+        // this persisted index to delete those overlays before loading new blocks.
+        for deltas in [&[0_i64][..], &[3, -3][..]] {
+            let mut shifts = Vec::new();
+            for delta in deltas {
+                assert!(add_block_shift(&mut shifts, 7, *delta).expect("track edit"));
+            }
+            let persisted =
+                decode_block_shifts(&encode_block_shifts(&shifts)).expect("reopen overlay index");
+            assert!(
+                persisted.iter().any(|(ordinal, _)| *ordinal == 7),
+                "rebuild cleanup must discover overlay 7 after {deltas:?}"
+            );
+            assert_eq!(effective_block_position(100, 8, &persisted).unwrap(), 100);
+        }
+    }
+
+    #[test]
+    fn qa_sparse_positions_match_edited_blocks_across_repeated_reopens() {
+        let mut shifts = Vec::new();
+        let mut lengths = [100_i64; 64];
+        let mut seed = 0x1234_5678_u64;
+        for iteration in 0..4096 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let ordinal = (seed % lengths.len() as u64) as usize;
+            let delta = ((seed >> 8) % 7) as i64 - 3;
+            lengths[ordinal] += delta;
+            assert!(add_block_shift(&mut shifts, ordinal as u32, delta).unwrap());
+            if iteration % 17 == 0 {
+                shifts = decode_block_shifts(&encode_block_shifts(&shifts)).unwrap();
+                let mut expected = 0_u64;
+                for (ordinal, length) in lengths.iter().enumerate() {
+                    let base = ordinal as u64 * 102;
+                    assert_eq!(
+                        effective_block_position(base, ordinal as u32, &shifts).unwrap(),
+                        expected
+                    );
+                    expected += *length as u64;
+                    assert_eq!(
+                        effective_block_position(base + 100, ordinal as u32 + 1, &shifts).unwrap(),
+                        expected
+                    );
+                    expected += 2;
+                }
+            }
+        }
     }
 
     #[test]

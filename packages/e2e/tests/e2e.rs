@@ -1318,6 +1318,86 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_row_edit() {
 }
 
 #[tokio::test]
+async fn markdown_equal_length_overlay_is_cleared_after_rebuild() {
+    let lix = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node"],
+    )
+    .await;
+    let path = "/overlay-qa.md";
+    for source in [
+        "Alpha\n\nBravo\n",
+        "Omega\n\nBravo\n",
+        "Delta\n\nBravo\n\nCharlie\n",
+    ] {
+        write_file(&lix, path, source.as_bytes().to_vec())
+            .await
+            .unwrap();
+    }
+    let rows = lix
+        .execute(
+            "SELECT id, payload_json FROM markdown_node WHERE kind = 'paragraph'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let target = rows
+        .rows()
+        .iter()
+        .find(|row| jsonb_column_contains(row, "payload_json", "Bravo"))
+        .unwrap();
+    lix.execute(
+        "UPDATE markdown_node SET payload_json = $1 WHERE id = $2",
+        &[
+            Value::Text(
+                serde_json::json!({"inline": [{"type": "text", "value": "BRAVO"}]}).to_string(),
+            ),
+            Value::Text(target.get::<String>("id").unwrap()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"Delta\n\nBRAVO\n\nCharlie\n".to_vec())
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn markdown_semantic_edit_retains_unrelated_literal_source() {
+    let lix = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node"],
+    )
+    .await;
+    let path = "/format-qa.md";
+    let source = "#   Heading ###\r\n\r\n```text\r\n|---\\---|\r\n```\r\n\r\nTarget\r\n";
+    write_file(&lix, path, source.as_bytes().to_vec())
+        .await
+        .unwrap();
+    lix.execute(
+        "UPDATE markdown_node SET payload_json = $1 WHERE kind = 'paragraph'",
+        &[Value::Text(
+            serde_json::json!({"inline": [{"type": "text", "value": "Edited"}]}).to_string(),
+        )],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(source.replace("Target", "Edited").into_bytes())
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     let root = tempfile::tempdir().expect("create v3 Markdown directory");
     let lix = open_rocksdb_lix(root.path()).await;
