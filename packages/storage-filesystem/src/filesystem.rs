@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[cfg(test)]
+use lix::open_lix;
 use lix::storage::{
     CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSessionToken,
     StorageSpace, StorageWrite, WriteOptions,
@@ -21,7 +23,7 @@ use lix::storage::{
     CoreProjection, GetManyRequest, GetOptions, PutEntry, ReadDurability, SpaceId, StorageRead,
     StoredValue,
 };
-use lix::{Lix, LixError, LixPath, SYSTEM_ACCOUNT_ID, Value, open_lix};
+use lix::{Lix, LixError, LixPath, Value};
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 use tokio::sync::oneshot;
@@ -404,14 +406,7 @@ impl FilesystemStorage {
         // not FilesystemStorage. This breaks the ownership cycle
         // storage -> supervisor -> Lix session -> storage and prevents its own
         // writes from recursively requesting another filesystem sync.
-        let primary = open_lix().with_storage(self.inner.clone()).await?;
-        let active_branch_id = lix.active_branch_id().await?;
-        let sync_lix = primary
-            .open_another_session()
-            .with_branch(active_branch_id)
-            .with_account(SYSTEM_ACCOUNT_ID)
-            .await?;
-        primary.close().await?;
+        let sync_lix = lix.open_storage_session(self.inner.clone()).await?;
         FilesystemSupervisor::open(
             sync_lix,
             self.layout.clone(),

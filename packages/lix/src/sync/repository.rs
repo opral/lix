@@ -8078,6 +8078,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn storage_session_writes_through_replica_fence_with_owner_account_and_branch() {
+        const ACCOUNT: &str = "01920000-0000-7000-8000-000000000611";
+        let authority = open_lix().await.unwrap();
+        authority
+            .ensure_account(ACCOUNT, "Filesystem author", "human")
+            .await
+            .unwrap();
+        let draft = authority
+            .create_branch(CreateBranchOptions {
+                id: None,
+                name: "Filesystem draft".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let snapshot = authority.pull_sync_repository(None, 128).await.unwrap();
+        let (branch_id, _) = default_head(&snapshot);
+        let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
+        let storage = Memory::new();
+        Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
+            .await
+            .unwrap();
+        let mut replica = open_lix().with_storage(storage.clone()).await.unwrap();
+        replica
+            .set_sync_role(super::super::SyncRole::Replica)
+            .unwrap();
+        replica
+            .try_install_initial_sync_snapshot(
+                TEST_REMOTE,
+                ACCOUNT,
+                &snapshot,
+                &history.commits,
+                &history.commit_headers,
+                &rows,
+                &checkpoint_roots,
+            )
+            .await
+            .unwrap();
+        // Match bootstrap's cached identity alignment after installing authority state.
+        replica
+            .align_repository_identity_for_sync(authority.lix_id().to_owned())
+            .unwrap();
+        replica
+            .align_primary_account_for_sync(ACCOUNT)
+            .await
+            .unwrap();
+        install_publication_fence_responder_for_test(&mut replica);
+        replica
+            .switch_branch(SwitchBranchOptions {
+                branch_id: draft.id.clone(),
+            })
+            .await
+            .unwrap();
+
+        let plain = open_lix().with_storage(storage.clone()).await.unwrap();
+        let error = plain
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/forbidden.txt', $1)",
+                &[Value::Blob(b"forbidden".to_vec().into())],
+            )
+            .await
+            .expect_err("a plain engine must remain fenced by the durable replica receipt");
+        assert_eq!(error.code, "LIX_REPLICA_CACHE_READ_ONLY");
+
+        let backing = replica.open_storage_session(storage).await.unwrap();
+        assert_eq!(backing.active_account_id(), ACCOUNT);
+        assert_eq!(backing.active_branch_id().await.unwrap(), draft.id);
+        let changed = replica.sync_mode_state().change_watcher();
+        backing
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/watched.txt', $1)",
+                &[Value::Blob(b"filesystem edit".to_vec().into())],
+            )
+            .await
+            .expect("the inherited adapter must admit a real replica write");
+        assert!(
+            changed.has_changed().unwrap(),
+            "filesystem commits must wake the owning sync runtime"
+        );
+        assert_eq!(
+            read_file_content(&replica, "/watched.txt").await,
+            Value::Blob(b"filesystem edit".to_vec().into())
+        );
+        let push = replica
+            .build_sync_push(TEST_REMOTE, 128)
+            .await
+            .unwrap()
+            .expect("filesystem edit must enter the owner's outbox");
+        assert!(push.commits.iter().any(|commit| {
+            commit
+                .members
+                .iter()
+                .any(|member| member.change_account_id == ACCOUNT)
+        }));
+
+        backing.close().await.unwrap();
+        plain.close().await.unwrap();
+        replica.close().await.unwrap();
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn admitted_replica_writes_locally_while_plain_engines_remain_fenced() {
         let authority = open_lix().await.expect("authority should open");
         write_key_value(&authority, "authority-only", "before").await;
@@ -14104,6 +14206,9 @@ mod tests {
         let (_, snapshot_head) = default_head(&snapshot);
         assert_eq!(checkpoint, snapshot_head);
         let replica = replica_from_snapshot(&authority, &snapshot).await;
+
+        // This fixture hydrates demands manually below instead of running a worker.
+        replica.set_sync_role(super::super::SyncRole::Disabled).unwrap();
 
         crate::sql2::reset_file_history_anchor_probe_census();
 

@@ -252,6 +252,13 @@ where
         self.storage.clone()
     }
 
+    pub(crate) fn inherit_sync_mode(&mut self, mode: SyncModeState) {
+        self.sync_mode = mode;
+        if self.sync_mode.role() == crate::sync::SyncRole::Replica {
+            self.storage().admit_sync_replica_writer();
+        }
+    }
+
     pub(crate) fn sync_mode(&self) -> SyncModeState {
         self.sync_mode.clone()
     }

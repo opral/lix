@@ -1425,6 +1425,57 @@ where
         Ok(opened)
     }
 
+    /// Storage-adapter integration: open a backing-storage session sharing this
+    /// repository's replica sync admission and wakeups without retaining its storage wrapper.
+    /// This integration hook supports standalone and connected-replica repositories;
+    /// it does not grant authority-server write admission.
+    /// The adapter must stop this session before stopping the owning sync runtime.
+    #[doc(hidden)]
+    pub async fn open_storage_session<Backing>(
+        &self,
+        storage: Backing,
+    ) -> Result<Lix<Backing>, LixError>
+    where
+        Backing: Storage + Clone + Send + Sync + 'static,
+    {
+        if self.session.is_closed() {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "cannot open a storage session from a closed handle",
+            ));
+        }
+        let mut opened = open_lix().with_storage(storage).await?;
+        if opened.lix_id() != self.lix_id() {
+            opened.close().await?;
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "storage session must use the same repository",
+            ));
+        }
+        Arc::get_mut(&mut opened.engine)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "new storage session engine is shared",
+                )
+            })?
+            .inherit_sync_mode(self.engine.sync_mode());
+        let account = if self.engine.sync_mode().role() == crate::sync::SyncRole::Replica {
+            self.active_account_id()
+        } else {
+            crate::SYSTEM_ACCOUNT_ID
+        };
+        let session = opened
+            .engine
+            .open_session_at_with_account(self.active_branch_id().await?, account.to_owned())
+            .await?;
+        let previous = std::mem::replace(&mut opened.session, Arc::new(session));
+        previous.close().await?;
+        opened.sync_demand_tx = self.sync_demand_tx.clone();
+        opened.server = self.server.clone();
+        Ok(opened)
+    }
+
     pub(crate) async fn open_internal_session(
         &self,
         active_branch_id: impl Into<String>,
@@ -2232,6 +2283,35 @@ mod tests {
         Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[tokio::test]
+    async fn storage_session_inherits_replica_admission_account_and_wakeups() {
+        let storage = Memory::new();
+        let source = open_lix().with_storage(storage.clone()).await.unwrap();
+        source
+            .set_sync_role(crate::sync::SyncRole::Replica)
+            .unwrap();
+        source
+            .set_sync_replica_remote_id("http://localhost:8088/lix/test")
+            .unwrap();
+        let backing = source.open_storage_session(storage).await.unwrap();
+        assert_eq!(
+            backing.engine.sync_mode().role(),
+            crate::sync::SyncRole::Replica
+        );
+        assert_eq!(backing.active_account_id(), source.active_account_id());
+        assert_eq!(
+            backing.active_branch_id().await.unwrap(),
+            source.active_branch_id().await.unwrap()
+        );
+        let mut changed = source.engine.sync_mode().change_watcher();
+        backing.engine.sync_mode().notify_sync_change();
+        assert!(changed.has_changed().unwrap());
+        changed.borrow_and_update();
+        assert!(source.open_storage_session(Memory::new()).await.is_err());
+        backing.close().await.unwrap();
+        source.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn opening_transaction_rejects_close_and_cancellation_releases_reservation() {
