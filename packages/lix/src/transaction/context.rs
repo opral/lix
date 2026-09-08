@@ -1994,6 +1994,17 @@ where
                 // row-pack queue is maintained.
                 transaction.await_durable_commit = true;
             }
+            if transaction.sync_role == crate::sync::SyncRole::Replica {
+                for publication in &prepared_writes.checkpoint_publications {
+                    let recovery = &publication.recovery_ref;
+                    crate::sync::stage_sync_checkpoint_source(
+                        &mut automatic_sync_writes,
+                        &recovery.branch_id,
+                        recovery.checkpoint_commit_id,
+                        recovery.recovered_head_commit_id,
+                    )?;
+                }
+            }
             let materialized = match commit::commit_prepared_writes_with_parent_heads(
                 &transaction.binary_cas,
                 &transaction.tracked_state,

@@ -810,13 +810,16 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{sql}");
     }
     assert_eq!(protocol_authority.read_value("coherent-write").await, None);
-    let fences_before_history = probe.publication_fences.load(Ordering::Acquire);
+    // The history query above hydrated its immutable inputs. Background upload
+    // acknowledgments may independently issue finite pulls, so verify local
+    // completion with the authority unavailable instead of counting those pulls.
+    probe.set_offline(true);
     let coherent_history_statements: [(&str, &[Value]); 1] =
         [("SELECT * FROM lix_history('lix_key_value')", &[])];
     let coherent_history = replica
         .execute_coherent_read_batch(&coherent_history_statements)
         .await
-        .expect("connected coherent history retains one authority snapshot");
+        .expect("cached coherent history completes without the authority");
     assert!(!coherent_history.results[0].rows().is_empty());
     assert_eq!(
         coherent_history.active_branch_id,
@@ -826,11 +829,7 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         coherent_history.storage_mutation_revision.is_some(),
         "hydrated history shares a local adapter snapshot",
     );
-    assert_eq!(
-        probe.publication_fences.load(Ordering::Acquire),
-        fences_before_history,
-        "an authority read does not need to republish the local cache",
-    );
+    probe.set_offline(false);
     let mut snapshot = Vec::new();
     replica
         .export_snapshot()
@@ -1502,6 +1501,150 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
             .unwrap(),
         full
     );
+    replica.close().await.unwrap();
+    stop_server(server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selected_all_checkpoint_from_uncheckpointed_authority_survives_reconnect() {
+    scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selected_subset_checkpoint_from_uncheckpointed_authority_survives_reconnect() {
+    scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(true).await;
+}
+
+async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
+    leave_unselected_work: bool,
+) {
+    let (storage, authority) = open_authority().await;
+    authority
+        .execute(
+            "INSERT INTO lix_directory (path) VALUES ('/a'), ('/b')",
+            &[],
+        )
+        .await
+        .unwrap();
+    authority
+        .execute("INSERT INTO lix_file (path) VALUES ('/a/note.txt')", &[])
+        .await
+        .unwrap();
+    // Unlike a checkpointed seed, this reproduces a client checkpoint that
+    // compacts already accepted working commits out of its canonical ancestry.
+    let coordinates = authority
+        .execute(
+            "SELECT lix_active_branch_commit_id() AS head, lix_latest_checkpoint_commit_id() AS checkpoint",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        coordinates.rows()[0].get::<String>("head").unwrap(),
+        coordinates.rows()[0].get::<String>("checkpoint").unwrap(),
+    );
+    authority.close().await.unwrap();
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task, remote) =
+        serve_with_authority_session(storage, Arc::clone(&probe)).await;
+    let directory = TempDir::new().unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    probe.set_offline(true);
+    replica
+        .execute(
+            "UPDATE lix_directory SET path = '/b/a' WHERE path = '/a'",
+            &[],
+        )
+        .await
+        .unwrap();
+    if leave_unselected_work {
+        put_value(&replica, "unselected", "keep working").await;
+    }
+    let checkpoint = replica
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE to_path = '/b/a/note.txt'))",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    let local_head = replica
+        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .unwrap();
+    assert_eq!(
+        local_head != checkpoint,
+        leave_unselected_work,
+        "unselected rows require a working head beyond the partial checkpoint",
+    );
+    replica.close().await.unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(
+        replica
+            .execute("SELECT lix_latest_checkpoint_commit_id() AS id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap(),
+        checkpoint,
+    );
+    assert_eq!(
+        replica
+            .execute("SELECT count(*) AS count FROM lix_diff('lix_file')", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        0,
+    );
+    probe.set_offline(false);
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        loop {
+            let rows = remote
+                .execute("SELECT lix_latest_checkpoint_commit_id()", &[])
+                .await;
+            if rows[0][0] == Value::Text(checkpoint.clone()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a scoped checkpoint must upload without a false divergence reset");
+    assert_eq!(
+        remote.execute("SELECT path FROM lix_file", &[]).await,
+        vec![vec![Value::Text("/b/a/note.txt".to_owned())]],
+    );
+    let checkpoint_params = [Value::Text(checkpoint.clone())];
+    assert_eq!(
+        remote
+            .execute(
+                "SELECT path FROM lix_state_at('lix_file', $1)",
+                &checkpoint_params
+            )
+            .await,
+        vec![vec![Value::Text("/b/a/note.txt".to_owned())]],
+    );
+    if leave_unselected_work {
+        remote.wait_for_value("unselected", "keep working").await;
+        assert!(
+            remote
+                .execute(
+                    "SELECT key FROM lix_state_at('lix_key_value', $1) WHERE key = 'unselected'",
+                    &checkpoint_params,
+                )
+                .await
+                .is_empty(),
+            "upload must not promote unselected working rows into the checkpoint",
+        );
+    }
     replica.close().await.unwrap();
     stop_server(server_task).await;
 }

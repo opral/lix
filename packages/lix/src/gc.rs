@@ -1459,6 +1459,7 @@ where
                 &mut candidate_writes,
                 commit_id,
             );
+            crate::sync::stage_delete_sync_checkpoint_source(&mut candidate_writes, commit_id);
         }
         let reclaims_physical = !blocked_physical_dependency_ids.contains(&commit_id);
         let current = writes.stats();
@@ -4173,6 +4174,146 @@ mod tests {
             .await
             .expect_err("a recovery ref no live control still serves is not a branchable root");
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn repository_gc_retires_checkpoint_source_with_its_commit() {
+        let backend = Memory::new();
+        let storage = StorageAdapter::new(backend.clone());
+        Engine::initialize(backend).await.unwrap();
+        let timestamp = LixTimestamp::expect_parse("checkpoint source GC", "2026-01-01T00:00:00Z");
+        let record = replay_commit_record("retired-checkpoint-source", 0, None, timestamp);
+        let manifest = test_commit_state_manifest(&record, CommitStateMutationInventory::default());
+        let mut writes = storage.new_write_set();
+        crate::sync::stage_sync_checkpoint_source(
+            &mut writes,
+            GLOBAL_BRANCH_ID,
+            record.commit_id,
+            CommitId::for_test_label("abandoned-checkpoint-source"),
+        )
+        .unwrap();
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            std::slice::from_ref(&record),
+            &[manifest],
+        )
+        .await;
+        let key = StorageKey(Bytes::copy_from_slice(
+            record.commit_id.as_uuid().as_bytes(),
+        ));
+        for before_gc in [true, false] {
+            let read = SharedStorageAdapterRead::new(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .unwrap(),
+            );
+            let found = crate::storage_adapter::exact_get_many(
+                &read,
+                &[crate::storage_adapter::StorageGetManyRequest {
+                    space: crate::sync::SYNC_CHECKPOINT_SOURCE_SPACE,
+                    keys: std::slice::from_ref(&key),
+                    opts: StorageGetOptions::default(),
+                }],
+            )
+            .await
+            .unwrap();
+            assert_eq!(found.values[0].is_some(), before_gc);
+            if before_gc {
+                let mut writes = storage.new_write_set();
+                let mut preconditions = Vec::new();
+                super::stage_repository_gc_with_preconditions(
+                    read,
+                    &mut writes,
+                    &mut preconditions,
+                )
+                .await
+                .unwrap();
+                storage
+                    .commit_write_set(
+                        writes,
+                        StorageWriteOptions {
+                            preconditions,
+                            ..StorageWriteOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_checkpoint_retention_tolerates_retired_provenance_but_not_missing_commits() {
+        let backend = Memory::new();
+        let storage = StorageAdapter::new(backend.clone());
+        Engine::initialize(backend).await.unwrap();
+        let timestamp = LixTimestamp::expect_parse("old checkpoint source", "2026-01-01T00:00:00Z");
+        let record = replay_commit_record("restored-old-checkpoint", 0, None, timestamp);
+        let missing = CommitId::for_test_label("retired-old-checkpoint-source");
+        let manifest = test_commit_state_manifest(&record, CommitStateMutationInventory::default());
+        let mut writes = storage.new_write_set();
+        crate::sync::stage_sync_checkpoint_source(
+            &mut writes,
+            GLOBAL_BRANCH_ID,
+            record.commit_id,
+            missing,
+        )
+        .unwrap();
+        writes.put(
+            crate::sync::SYNC_REPLICA_STATE_SPACE,
+            crate::sync::replica_state_key(),
+            serde_json::to_vec(&serde_json::json!({
+                "activeAccountId": crate::ANONYMOUS_ACCOUNT_ID,
+                "cursor": 0,
+                "authoritativeBranches": {},
+                "authorityKnownCommitIds": []
+            }))
+            .unwrap(),
+        );
+        persist_replay_closure_fixture(
+            &storage,
+            writes,
+            std::slice::from_ref(&record),
+            &[manifest],
+        )
+        .await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut control = BranchHeadControlContext::new()
+            .reader(&read)
+            .scan()
+            .await
+            .unwrap()[0]
+            .1;
+        control.head_commit_id = record.commit_id;
+        control.working_diff_checkpoint_commit_id = Some(record.commit_id);
+        let retained = crate::sync::load_pending_sync_export_commit_ids(
+            &read,
+            &[(GLOBAL_BRANCH_ID.to_owned(), control)],
+        )
+        .await
+        .expect("restored historical checkpoint may have a retired provenance source");
+        assert!(retained.contains(&record.commit_id));
+        assert!(!retained.contains(&missing));
+        let mut missing_control = control;
+        missing_control.head_commit_id = missing;
+        missing_control.working_diff_checkpoint_commit_id = Some(missing);
+        // The stack visits the checkpoint's optional edge before the same
+        // missing object as a required root; optional visitation cannot hide it.
+        let error = crate::sync::load_pending_sync_export_commit_ids(
+            &read,
+            &[
+                ("required-missing".to_owned(), missing_control),
+                (GLOBAL_BRANCH_ID.to_owned(), control),
+            ],
+        )
+        .await
+        .expect_err("required upload dependencies must still exist");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
     }
 
     #[tokio::test]

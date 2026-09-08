@@ -33,7 +33,9 @@ pub(crate) use bootstrap::{
     prepare_sync_bootstrap,
 };
 pub(crate) use commit::{
-    SYNC_MATERIALIZED_STATE_ALIAS_SPACE, stage_delete_materialized_sync_state_alias,
+    SYNC_MATERIALIZED_STATE_ALIAS_SPACE, SYNC_CHECKPOINT_SOURCE_SPACE,
+    stage_delete_materialized_sync_state_alias, stage_delete_sync_checkpoint_source,
+    stage_sync_checkpoint_source,
 };
 pub(crate) use commit::{
     SyncCommit, SyncCommitMemberRef, SyncCommitStateAlias, encode_sync_commit_member,

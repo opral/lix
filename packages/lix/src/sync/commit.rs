@@ -33,6 +33,87 @@ pub(crate) const SYNC_MATERIALIZED_STATE_ALIAS_SPACE: StorageSpace = StorageSpac
     ValueSemantics::Immutable,
 );
 
+/// Local publication provenance, never a canonical parent or wire state alias.
+/// A scoped checkpoint replaces its working interval with selected members;
+/// this fixed-size record preserves the captured local head for sync admission.
+pub(crate) const SYNC_CHECKPOINT_SOURCE_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0007_0016),
+    "sync.checkpoint_source.v1",
+    ValueSemantics::Immutable,
+);
+
+pub(crate) fn stage_sync_checkpoint_source(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    checkpoint: CommitId,
+    source: CommitId,
+) -> Result<(), LixError> {
+    let branch = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("invalid checkpoint source branch: {error}"),
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(branch.as_bytes());
+    bytes.extend_from_slice(source.as_uuid().as_bytes());
+    writes.put(
+        SYNC_CHECKPOINT_SOURCE_SPACE,
+        materialized_state_alias_key(checkpoint),
+        StorageValue {
+            bytes: Bytes::from(bytes),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) async fn load_sync_checkpoint_source(
+    store: &(impl StorageAdapterRead + ?Sized),
+    checkpoint: CommitId,
+) -> Result<Option<(String, CommitId)>, LixError> {
+    let key = materialized_state_alias_key(checkpoint);
+    let values = exact_get_many(
+        store,
+        &[StorageGetManyRequest {
+            space: SYNC_CHECKPOINT_SOURCE_SPACE,
+            keys: std::slice::from_ref(&key),
+            opts: StorageGetOptions::default(),
+        }],
+    )
+    .await?;
+    let Some(value) = values.values.into_iter().next().flatten() else {
+        return Ok(None);
+    };
+    let StorageProjectedValue::FullValue(bytes) = value else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "checkpoint source read omitted its value",
+        ));
+    };
+    if bytes.len() != 32 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "checkpoint source record must contain two UUIDs",
+        ));
+    }
+    let branch = uuid::Uuid::from_slice(&bytes[..16]).expect("validated UUID length");
+    let source = uuid::Uuid::from_slice(&bytes[16..]).expect("validated UUID length");
+    Ok(Some((
+        branch.to_string(),
+        CommitId::parse_lix(&source.to_string(), "checkpoint source")?,
+    )))
+}
+
+pub(crate) fn stage_delete_sync_checkpoint_source(
+    writes: &mut StorageWriteSet,
+    checkpoint: CommitId,
+) {
+    writes.delete(
+        SYNC_CHECKPOINT_SOURCE_SPACE,
+        materialized_state_alias_key(checkpoint),
+    );
+}
+
 /// A complete immutable commit, independent of the local storage layout.
 ///
 /// Generation and first-parent jump pointers are intentionally omitted: they
@@ -475,7 +556,11 @@ where
         created_at: record.created_at.to_string(),
         global_scope: crate::tracked_state::load_published_commit_state_topology(store, commit_id)
             .await?
-            .ok_or_else(|| LixError::unknown(format!("sync commit '{commit_id}' has no tracked-state authority")))?
+            .ok_or_else(|| {
+                LixError::unknown(format!(
+                    "sync commit '{commit_id}' has no tracked-state authority"
+                ))
+            })?
             .global_scope(),
         selected_source_commit_id: selected_source_commit_id.map(|source| source.to_string()),
         state_alias,
@@ -780,8 +865,7 @@ mod tests {
         };
         let adapter = lix.storage_adapter();
         let mut writes = adapter.new_write_set();
-        stage_materialized_sync_state_alias(&mut writes, commit_id, &alias)
-            .expect("stage sidecar");
+        stage_materialized_sync_state_alias(&mut writes, commit_id, &alias).expect("stage sidecar");
         adapter
             .commit_certified_replica_write_set(
                 crate::sync::certified_replica_write_capability(),

@@ -1150,8 +1150,8 @@ pub(crate) async fn load_replayable_repository_event_commit_ids(
 /// Commits that must remain exportable until every configured authority has
 /// acknowledged them. Compact checkpoints add a physical-state source edge
 /// outside canonical parent ancestry, so the pending outbox closure follows
-/// both edge kinds. Once an authority reports an id as known, traversal stops
-/// there and ordinary checkpoint GC can reclaim older interval history.
+/// both edge kinds. Only confirmed ref coordinates stop provenance traversal;
+/// body-only acknowledgments must not permit collection of pending source proofs.
 pub(crate) async fn load_pending_sync_export_commit_ids(
     read: &(impl StorageAdapterRead + ?Sized),
     controls: &[(String, BranchHeadControl)],
@@ -1215,12 +1215,8 @@ pub(crate) async fn load_pending_sync_export_commit_ids(
         // Rejection resets need the confirmed baseline even after an offline
         // compact checkpoint removes it from the visible branch ancestry.
         retained.extend(known.iter().copied());
-        for commit_id in state.authority_known_commit_ids {
-            known.insert(CommitId::parse_lix(
-                &commit_id,
-                "sync GC authority-known commit",
-            )?);
-        }
+        // Body acknowledgments do not retire local provenance: only a ref
+        // acknowledgment makes its captured source interval unnecessary.
 
         let mut pending = controls
             .iter()
@@ -1231,26 +1227,48 @@ pub(crate) async fn load_pending_sync_export_commit_ids(
                 ]
             })
             .flatten()
+            .map(|id| (id, true))
             .collect::<Vec<_>>();
-        let mut seen = BTreeSet::new();
-        while let Some(commit_id) = pending.pop() {
-            if known.contains(&commit_id) || !seen.insert(commit_id) {
+        let mut seen_required = BTreeSet::new();
+        let mut seen_provenance = BTreeSet::new();
+        while let Some((commit_id, required)) = pending.pop() {
+            if known.contains(&commit_id)
+                || seen_required.contains(&commit_id)
+                || (!required && !seen_provenance.insert(commit_id))
+            {
                 continue;
             }
-            let record = load_commit_record(read, commit_id).await?.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("pending sync export commit '{commit_id}' has no commit record"),
-                )
-            })?;
+            if required {
+                seen_required.insert(commit_id);
+            }
+            let Some(record) = load_commit_record(read, commit_id).await? else {
+                if required {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("pending sync export commit '{commit_id}' has no commit record"),
+                    ));
+                }
+                // A historical checkpoint may outlive its captured interval.
+                // Restoring it does not turn its old local provenance into a
+                // mandatory wire dependency or require re-fetching cold history.
+                continue;
+            };
             retained.insert(commit_id);
-            pending.extend(record.parent_commit_ids.iter().copied());
-            pending.extend(record.base_commit_id);
+            if let Some((_, source)) =
+                super::commit::load_sync_checkpoint_source(read, commit_id).await?
+            {
+                pending.push((source, false));
+            }
+            pending.extend(record.parent_commit_ids.iter().map(|id| (*id, required)));
+            pending.extend(record.base_commit_id.map(|id| (id, required)));
             if let Some(alias) = load_sync_commit_state_alias(read, commit_id).await? {
-                pending.push(CommitId::parse_lix(
-                    &alias.source_commit_id,
-                    "pending sync export complete-state source",
-                )?);
+                pending.push((
+                    CommitId::parse_lix(
+                        &alias.source_commit_id,
+                        "pending sync export complete-state source",
+                    )?,
+                    required,
+                ));
             }
         }
     }
@@ -2379,6 +2397,7 @@ async fn pending_commit_reaches(
     descendant: CommitId,
     target: CommitId,
     confirmed: &BTreeSet<CommitId>,
+    branch_id: &str,
 ) -> Result<bool, LixError> {
     let mut pending = vec![descendant];
     let mut seen = BTreeSet::new();
@@ -2393,6 +2412,12 @@ async fn pending_commit_reaches(
             continue;
         };
         pending.extend(record.parent_commit_ids);
+        if let Some((source_branch, source)) =
+            super::commit::load_sync_checkpoint_source(read, id).await?
+            && source_branch == branch_id
+        {
+            pending.push(source);
+        }
         if let Some(alias) = load_sync_commit_state_alias(read, id).await? {
             pending.push(CommitId::parse_lix(
                 &alias.source_commit_id,
@@ -3054,6 +3079,7 @@ where
                             local_head,
                             authority_head,
                             &confirmed_boundaries,
+                            &branch_id,
                         )
                         .await?)
                 {
@@ -3822,6 +3848,7 @@ where
                                         CommitId::parse_lix(local_head, "local pending head")?,
                                         server_head,
                                         &confirmed_boundaries,
+                                        branch_id,
                                     )
                                     .await?
                             }
@@ -9301,6 +9328,136 @@ mod tests {
         assert_eq!(
             actual.working_diff_checkpoint_commit_id,
             expected.working_diff_checkpoint_commit_id
+        );
+        drop(read);
+        assert!(
+            replica
+                .build_sync_push(TEST_REMOTE, 128)
+                .await
+                .expect("remaining outbox")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_checkpoint_chain_preserves_older_ack_after_reopen() {
+        let authority = open_lix().await.expect("authority opens");
+        write_key_value(&authority, "authority-working", "uncheckpointed").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot");
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        write_key_value(&replica, "pending", "first").await;
+        let request = replica
+            .build_sync_push(TEST_REMOTE, 128)
+            .await
+            .expect("outbox")
+            .expect("pending write");
+        authority
+            .push_sync_repository(&request)
+            .await
+            .expect("accept first write");
+        // Simulate user work racing the upload acknowledgment, including a
+        // compact checkpoint whose source edge differs from parent ancestry.
+        write_key_value(&replica, "pending", "second").await;
+        for value in ["intermediate", "second"] {
+            write_key_value(&replica, "pending", value).await;
+            replica.execute(
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+                &[],
+            ).await.expect("scoped checkpoint");
+        }
+        let (branch_id, _) = default_head(&snapshot);
+        let read = replica
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read");
+        let expected = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("control")
+            .expect("branch");
+        drop(read);
+        let mut bodies = replica
+            .build_sync_push(TEST_REMOTE, 128)
+            .await
+            .expect("scoped bodies")
+            .expect("scoped pending outbox");
+        bodies.ref_updates.clear();
+        authority
+            .push_sync_repository(&bodies)
+            .await
+            .expect("body-only acceptance");
+        let storage = replica.storage_adapter().storage().clone();
+        replica.close().await.expect("close without upload");
+        let mut replica = open_lix()
+            .with_storage(storage)
+            .await
+            .expect("reopen offline");
+        replica
+            .set_sync_role(super::super::SyncRole::Replica)
+            .expect("replica role");
+        replica
+            .set_sync_replica_remote_id(TEST_REMOTE)
+            .expect("remote");
+        install_publication_fence_responder_for_test(&mut replica);
+        replica
+            .validate_sync_hot_state_authoritative()
+            .await
+            .expect("pending work is valid after reopen");
+        let cursor = replica
+            .load_sync_repository_cursor(TEST_REMOTE)
+            .await
+            .expect("cursor")
+            .expect("receipt");
+        let delta = authority
+            .pull_sync_repository(Some(cursor), 128)
+            .await
+            .expect("acknowledgment");
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .expect("apply acknowledgment");
+        assert_eq!(read_key_value(&replica, "pending").await, "second");
+        let read = replica
+            .storage_adapter()
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read");
+        let actual = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .expect("control")
+            .expect("branch");
+        assert_eq!(actual.head_commit_id, expected.head_commit_id);
+        assert_eq!(
+            actual.working_diff_checkpoint_commit_id,
+            expected.working_diff_checkpoint_commit_id
+        );
+        let state = load_replica_state(&read)
+            .await
+            .expect("receipt")
+            .0
+            .expect("state");
+        assert!(
+            !state.authority_known_commit_ids.is_empty(),
+            "body-only ack retained"
+        );
+        let retained = load_pending_sync_export_commit_ids(&read, &[(branch_id.clone(), actual)])
+            .await
+            .expect("GC pending retention");
+        let (_, source) =
+            super::super::commit::load_sync_checkpoint_source(&read, actual.head_commit_id)
+                .await
+                .expect("source proof")
+                .expect("scoped provenance");
+        assert!(
+            retained.contains(&source),
+            "body-only acknowledgment must retain provenance source"
         );
         drop(read);
         assert!(

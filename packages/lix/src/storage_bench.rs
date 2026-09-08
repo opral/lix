@@ -4118,6 +4118,7 @@ mod tests {
                     crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE.id.0,
                     10,
                 ), // unconditional canonical sync-state alias cleanup descriptors
+                (crate::sync::SYNC_CHECKPOINT_SOURCE_SPACE.id.0, 10), // private checkpoint provenance cleanup
             ]
         );
         assert_eq!(
