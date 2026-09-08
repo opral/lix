@@ -8,7 +8,6 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -96,9 +95,7 @@ impl FilesystemStorageOptions {
 
     pub fn open(self) -> Result<FilesystemStorage, LixError> {
         let layout = prepare_filesystem_layout(&self.path)?;
-        let initial_import = !layout.lix_dir.join(".internal").exists();
         Ok(FilesystemStorage {
-            initial_import: Arc::new(AtomicBool::new(initial_import)),
             inner: open_filesystem_rocksdb(&layout)?,
             layout,
             sync_all_files: self.sync_all_files,
@@ -133,7 +130,6 @@ struct FilesystemPathFilter {
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct FilesystemStorage {
-    initial_import: Arc<AtomicBool>,
     inner: RocksDBFilesystem,
     layout: FilesystemLayout,
     sync_all_files: bool,
@@ -348,7 +344,6 @@ impl FilesystemStorage {
         Box::pin(async move {
             let startup = FilesystemSyncStartup::begin(Arc::clone(&self.sync_lifecycle))?;
             let supervisor = self.open_supervisor(lix).await?;
-            self.initial_import.store(false, Ordering::Release);
             startup.complete(supervisor);
             Ok(())
         })
@@ -421,7 +416,6 @@ impl FilesystemStorage {
             sync_lix,
             self.layout.clone(),
             FilesystemPathFilter::from_sync_all_files(self.sync_all_files),
-            self.initial_import.load(Ordering::Acquire),
         )
         .await
     }
@@ -607,7 +601,6 @@ impl FilesystemSupervisor {
         lix: Lix<RocksDBFilesystem>,
         layout: FilesystemLayout,
         path_filter: FilesystemPathFilter,
-        initial_import: bool,
     ) -> Result<Self, LixError> {
         validate_filesystem_root_directory(&layout.root)?;
         validate_filesystem_lix_directory(&layout.lix_dir)?;
@@ -619,10 +612,60 @@ impl FilesystemSupervisor {
             last_materialized: Mutex::new(None),
         });
 
+        // Storage creation is not evidence that repository content reached disk.
+        // Read completion at sync startup so separately opened handles and process
+        // restarts agree on whether missing paths can represent deletions.
+        let completion = state
+            .layout
+            .lix_dir
+            .join(".internal/filesystem-materialized");
+        let initial_import = !completion.try_exists().map_err(|error| {
+            io_error("read filesystem materialization marker", &completion, error)
+        })?;
         state
             .sync_disk_to_lix_with_initial_import(false, initial_import)
             .await?;
         state.sync_from_lix().await?;
+        if initial_import && state.path_filter().is_unfiltered() {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&completion)
+            {
+                Ok(marker) => {
+                    marker.sync_all().map_err(|error| {
+                        io_error(
+                            "persist filesystem materialization marker",
+                            &completion,
+                            error,
+                        )
+                    })?;
+                    #[cfg(unix)]
+                    {
+                        let parent = completion
+                            .parent()
+                            .expect("marker has an internal directory");
+                        std::fs::File::open(parent)
+                            .and_then(|directory| directory.sync_all())
+                            .map_err(|error| {
+                                io_error(
+                                    "persist filesystem materialization directory",
+                                    parent,
+                                    error,
+                                )
+                            })?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(io_error(
+                        "write filesystem materialization marker",
+                        &completion,
+                        error,
+                    ));
+                }
+            }
+        }
 
         let (event_tx, event_rx) = mpsc::channel();
         let callback_tx = event_tx.clone();
@@ -2552,7 +2595,6 @@ mod tests {
         path_filter: FilesystemPathFilter,
     ) -> FilesystemState {
         let storage = FilesystemStorage {
-            initial_import: Arc::new(AtomicBool::new(false)),
             inner: open_filesystem_rocksdb(&layout).unwrap(),
             layout: layout.clone(),
             sync_all_files: path_filter.is_unfiltered(),
