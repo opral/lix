@@ -14,9 +14,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-mod checkpoint;
 #[cfg(test)]
 mod catalog_visibility_tests;
+mod checkpoint;
 mod context;
 mod create_branch;
 mod execute;
@@ -62,9 +62,6 @@ pub use observe::ObserveEvent;
 pub(crate) use observe::ObserveEvents as SessionObserveEvents;
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;
-pub(crate) use transaction::{
-    ConnectedTransactionStateLease, SessionOperationGuard,
-};
 pub use undo_redo::{RedoReceipt, UndoReceipt};
 
 /// Zero-cost adapter for futures that rustc cannot prove `Send` because an

@@ -87,8 +87,23 @@ for work requiring review.
 
 ## Concurrent changes
 
-Concurrent commits are retained and reconciled through normal branch merging.
-Sync has no separate conflict API.
+The server decides which branch updates are accepted. Pending local commits
+upload with the last confirmed server head and checkpoint as preconditions.
+If another writer advances a pending branch incompatibly, the replica restores
+confirmed server state and discards all of its pending work, including work on
+other branches. This conservative client reset also removes global checkpoint
+catalog entries and cross-branch schema dependencies created by discarded work.
+Sync does not merge divergent heads or expose a conflict-resolution API. Own
+accepted prefixes are acknowledged without rolling back newer descendants.
+
+This is server-wins reconciliation, not timestamp-based last-write-wins.
+Separate branches do not protect unacknowledged work from a client reset.
+
+Historical reads hydrate immutable commit data on demand and cache it in the
+replica's storage. Repeating a cached read does not fetch that history again.
+For explicit transactions, prefetch uncached historical inputs before beginning
+the transaction; a transaction cannot change its captured snapshot to hydrate
+missing history.
 
 ## Presence
 
@@ -98,8 +113,8 @@ and avatars. Lix synchronizes repository data.
 ## Closing
 
 Call `await lix.close()` for cleanup. Remote mode closes the server session.
-Sync mode waits for active local work and allows pending uploads, but does not
-guarantee server receipt. Durable commits resume uploading on the next open.
+Sync mode stops its background worker without waiting for network delivery.
+Durable pending commits resume uploading on the next open.
 
 Sync has no public API to await server confirmation. Use remote mode when each
 successful write requires server acknowledgment.

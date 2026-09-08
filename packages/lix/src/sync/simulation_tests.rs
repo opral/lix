@@ -262,11 +262,14 @@ impl Replica {
     }
 
     async fn pump(&mut self) -> Result<(), LixError> {
+        let mut push_item_limit = super::MAX_SYNC_REQUEST_ITEMS;
         sync_iteration(
             &self.lix,
             REMOTE_ID,
             &self.transport,
+            &mut push_item_limit,
             &mut self.pull_item_limit,
+            &mut self.lix.sync_mode_state().change_watcher(),
             &mut self.demand_rx,
             &mut self.pending_demands,
         )

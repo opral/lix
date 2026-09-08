@@ -98,8 +98,8 @@ export function startWorkerHost(
 		if (message.operation.kind === "observe") {
 			const operation = message.operation;
 			// Observation setup is metadata-only. Keeping it behind the global
-			// finite-operation queue lets an authority mutation that is waiting for
-			// local publication block a newly mounted server-first History query.
+			// finite-operation queue lets a long-running operation block a newly
+			// mounted query, including one that needs lazy history hydration.
 			// The live `next()` lane is already independent for the same reason.
 			void respond(message, () =>
 				handleObserveRegistration(

@@ -476,7 +476,7 @@ async fn seed_hot_profile_rows(authority: &Lix<Memory>, live_rows: usize) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() {
+async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "authority-fence", "before").await;
     authority
@@ -536,11 +536,11 @@ async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() 
             &[],
         )
         .await
-        .expect("connected mutation executes on the authority");
+        .expect("connected mutation commits locally");
     assert_eq!(
         read_value(&replica, "replica-write").await.as_deref(),
         Some("authoritative"),
-        "a successful authority mutation returns only after certified publication",
+        "a successful local mutation is immediately readable",
     );
     protocol_authority
         .wait_for_value("replica-write", "authoritative")
@@ -656,14 +656,14 @@ async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() 
     let mut transaction = replica
         .begin_transaction()
         .await
-        .expect("connected transaction begins on the authority");
+        .expect("connected transaction begins locally");
     transaction
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('transaction-write', 'committed')",
             &[],
         )
         .await
-        .expect("connected transaction stages on the authority");
+        .expect("connected transaction stages locally");
     let staged = transaction
         .execute(
             "SELECT value FROM lix_key_value WHERE key = 'transaction-write'",
@@ -767,7 +767,7 @@ async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() 
     let mut abandoned = replica
         .begin_transaction()
         .await
-        .expect("connected transaction uses an isolated authority session");
+        .expect("connected transaction uses an isolated local session");
     abandoned
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('abandoned-write', 'never-committed')",
@@ -822,9 +822,9 @@ async fn connected_api_routes_authority_work_and_hot_reads_need_no_round_trip() 
         coherent_history.active_branch_id,
         replica.active_branch_id().await.expect("active branch"),
     );
-    assert_eq!(
-        coherent_history.storage_mutation_revision, None,
-        "authority snapshots must not claim a local adapter revision",
+    assert!(
+        coherent_history.storage_mutation_revision.is_some(),
+        "hydrated history shares a local adapter snapshot",
     );
     assert_eq!(
         probe.publication_fences.load(Ordering::Acquire),
@@ -1022,18 +1022,14 @@ async fn two_clients_receive_remote_writes_through_a_held_long_poll() {
     wait_for_value(&alice, "server-originated", "from-authority").await;
     wait_for_value(&bob, "server-originated", "from-authority").await;
 
-    let ((), ()) = tokio::join!(
-        put_value(&alice, "concurrent-alice", "alice"),
-        put_value(&bob, "concurrent-bob", "bob"),
-    );
-    protocol_authority
-        .wait_for_value("concurrent-alice", "alice")
-        .await;
-    protocol_authority
-        .wait_for_value("concurrent-bob", "bob")
-        .await;
-    wait_for_value(&alice, "concurrent-bob", "bob").await;
-    wait_for_value(&bob, "concurrent-alice", "alice").await;
+    // Serial acceptance is the happy path; explicit stale-write reset is
+    // exercised separately. Independent writes from the same stale branch
+    // head are not promised automatic merge by server-wins reconciliation.
+    put_value(&alice, "next-alice", "alice").await;
+    wait_for_value(&bob, "next-alice", "alice").await;
+    put_value(&bob, "next-bob", "bob").await;
+    wait_for_value(&alice, "next-bob", "bob").await;
+    protocol_authority.wait_for_value("next-bob", "bob").await;
 
     alice.close().await.expect("close alice");
     bob.close().await.expect("close bob");
@@ -1316,6 +1312,9 @@ async fn delta_hydrates_external_blob_survivors_in_an_in_page_child() {
 
     // Allow the held poll to publish one boundary, then keep the replacement
     // poll offline so branch creation and its child arrive in one catch-up page.
+    // Local bootstrap completion does not imply that the worker has opened
+    // its first long poll yet; wait for admission before rejecting new calls.
+    wait_for_counter(&probe.delta_pulls, 1).await;
     probe.set_offline(true);
     protocol_authority
         .put_value("external-survivor-boundary", "installed")
@@ -1390,6 +1389,299 @@ async fn delta_hydrates_external_blob_survivors_in_an_in_page_child() {
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
+}
+
+/// A disconnected warm replica is a stronger zero-RTT check than a timing
+/// threshold: no successful authority call can be hidden in these operations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
+    let (storage, authority) = open_authority().await;
+    authority
+        .execute(
+            "INSERT INTO lix_directory (path) VALUES ('/a'), ('/b')",
+            &[],
+        )
+        .await
+        .expect("seed folders");
+    authority
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/a/note.txt', $1)",
+            &[Value::Blob(b"original".to_vec().into())],
+        )
+        .await
+        .expect("seed nested file");
+    authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .expect("seed checkpoint");
+    authority.close().await.unwrap();
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task, remote) =
+        serve_with_authority_session(storage, Arc::clone(&probe)).await;
+    let directory = TempDir::new().unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    probe.set_offline(true);
+
+    let mut transaction = replica
+        .begin_transaction()
+        .await
+        .expect("begin offline transaction");
+    transaction
+        .execute(
+            "UPDATE lix_directory SET path = '/b/a' WHERE path = '/a'",
+            &[],
+        )
+        .await
+        .expect("move folder offline");
+    transaction
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('offline-marker', 'durable')",
+            &[],
+        )
+        .await
+        .expect("stage offline marker");
+    transaction
+        .commit()
+        .await
+        .expect("commit offline transaction");
+    assert_eq!(
+        read_file_content(&replica, "/b/a/note.txt").await,
+        Some(b"original".to_vec())
+    );
+    let partial = replica.execute(
+        "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', 'offline-marker')])", &[])
+        .await.expect("create partial checkpoint offline").rows()[0]
+        .get::<String>("commit_id").unwrap();
+    let full = replica
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .expect("create full checkpoint offline")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    assert_ne!(partial, full);
+    replica
+        .close()
+        .await
+        .expect("close with durable pending transactions");
+
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(
+        read_value(&replica, "offline-marker").await.as_deref(),
+        Some("durable")
+    );
+    assert_eq!(
+        read_file_content(&replica, "/b/a/note.txt").await,
+        Some(b"original".to_vec())
+    );
+    probe.set_offline(false);
+    remote.wait_for_value("offline-marker", "durable").await;
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        loop {
+            let rows = remote
+                .execute("SELECT lix_latest_checkpoint_commit_id()", &[])
+                .await;
+            if rows[0][0] == Value::Text(full.clone()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("upload preserves local checkpoint identity");
+    // A second reconnect must not duplicate accepted checkpoints.
+    replica.close().await.unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(
+        replica
+            .execute("SELECT lix_latest_checkpoint_commit_id() AS id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap(),
+        full
+    );
+    replica.close().await.unwrap();
+    stop_server(server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_pending_branch_resets_to_server_without_conflicts() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let (storage, authority) = open_authority().await;
+    put_value(&authority, "shared", "base").await;
+    authority.close().await.unwrap();
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task, remote) =
+        serve_with_authority_session(storage, Arc::clone(&probe)).await;
+    let directory = TempDir::new().unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    probe.set_offline(true);
+    put_value(&replica, "shared", "pending").await;
+    put_value(&replica, "dependent", "pending").await;
+    assert_eq!(
+        read_value(&replica, "shared").await.as_deref(),
+        Some("pending")
+    );
+    // Close first so an already held long poll cannot publish the server
+    // update before the intended durable-pending reconnect scenario.
+    replica.close().await.unwrap();
+    remote.put_value("shared", "server").await;
+    probe.set_offline(false);
+    let replica = open_replica(directory.path(), &url).await;
+    wait_for_value(&replica, "shared", "server").await;
+    assert_eq!(read_value(&replica, "dependent").await, None);
+    assert_eq!(remote.read_value("dependent").await, None);
+    replica.close().await.unwrap();
+    stop_server(server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetched_immutable_history_is_cached_across_offline_reopen() {
+    let (storage, authority) = open_authority().await;
+    put_value(&authority, "history-marker", "historical").await;
+    let checkpoint = authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    put_value(&authority, "history-marker", "current").await;
+    authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap();
+    authority.close().await.unwrap();
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(storage, Arc::clone(&probe)).await;
+    let directory = TempDir::new().unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    let sql = "SELECT value FROM lix_state_at('lix_key_value', $1) WHERE key = 'history-marker'";
+    let params = [Value::Text(checkpoint)];
+    let historical = replica
+        .execute(sql, &params)
+        .await
+        .expect("fetch historical state");
+    assert_eq!(historical.rows().len(), 1);
+    let value = historical.rows()[0].get::<Value>("value").unwrap();
+    let historical_text = match &value {
+        Value::Text(value) => Some(value.clone()),
+        Value::Jsonb(value) => value.as_json_string(),
+        _ => None,
+    };
+    assert_eq!(historical_text.as_deref(), Some("historical"));
+    let history_gets = probe.history_gets.load(Ordering::Acquire);
+    probe.set_offline(true);
+    assert_eq!(
+        replica
+            .execute(sql, &params)
+            .await
+            .expect("cached history while offline")
+            .rows()[0]
+            .get::<Value>("value")
+            .unwrap(),
+        value
+    );
+    replica.close().await.unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(
+        replica
+            .execute(sql, &params)
+            .await
+            .expect("persisted history while offline")
+            .rows()[0]
+            .get::<Value>("value")
+            .unwrap(),
+        value
+    );
+    assert_eq!(
+        read_value(&replica, "history-marker").await.as_deref(),
+        Some("current")
+    );
+    assert_eq!(probe.history_gets.load(Ordering::Acquire), history_gets);
+    replica.close().await.unwrap();
+    stop_server(server_task).await;
+}
+
+/// Run alone: allocations include the in-process authority and sync worker.
+/// Latency is diagnostic; the offline regression above gates zero network
+/// dependency without fragile wall-clock limits on shared CI hosts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual local-first foreground RTT and width scorecard"]
+async fn local_first_foreground_profile_scorecard() {
+    let mut records = Vec::new();
+    for width in [32usize, 256] {
+        for rtt_ms in [0u64, 100] {
+            let (storage, authority) = open_authority().await;
+            seed_hot_profile_rows(&authority, width).await;
+            authority
+                .execute(
+                    "INSERT INTO lix_directory (path) VALUES ('/a'), ('/b')",
+                    &[],
+                )
+                .await
+                .unwrap();
+            put_value(&authority, "profile-marker", "before").await;
+            authority
+                .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+                .await
+                .unwrap();
+            authority.close().await.unwrap();
+            let probe = Arc::new(HttpProbe::default());
+            let (url, task) = serve(storage, Arc::clone(&probe)).await;
+            let directory = TempDir::new().unwrap();
+            let replica = open_replica(directory.path(), &url).await;
+            probe.set_round_trip_delay(Duration::from_millis(rtt_ms));
+            for (operation, sql) in [
+                (
+                    "current_read",
+                    "SELECT value FROM lix_key_value WHERE key = 'profile-marker'",
+                ),
+                (
+                    "current_write",
+                    "UPDATE lix_key_value SET value = 'after' WHERE key = 'profile-marker'",
+                ),
+                (
+                    "partial_checkpoint",
+                    "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', 'profile-marker')])",
+                ),
+                (
+                    "folder_move",
+                    "UPDATE lix_directory SET path = '/b/a' WHERE path = '/a'",
+                ),
+                (
+                    "full_checkpoint",
+                    "SELECT commit_id FROM lix_create_checkpoint()",
+                ),
+            ] {
+                let scope = AllocationScope::start();
+                let start = Instant::now();
+                replica
+                    .execute(sql, &[])
+                    .await
+                    .expect("profile foreground operation");
+                let elapsed = start.elapsed();
+                let allocation = scope.finish();
+                records.push(json!({"live_rows": width, "rtt_ms": rtt_ms,
+                    "operation": operation, "elapsed_ns": duration_nanos(elapsed),
+                    "allocated_bytes": allocation.allocated_bytes,
+                    "peak_live_bytes": allocation.peak_live_bytes_delta}));
+            }
+            probe.set_round_trip_delay(Duration::ZERO);
+            replica.close().await.unwrap();
+            stop_server(task).await;
+        }
+    }
+    let artifact = json!({"schema": "lix.local-first-foreground-profile.v1", "records": records});
+    println!("LIX_LOCAL_FIRST_PROFILE_JSON={artifact}");
+    if let Ok(path) = std::env::var("LIX_LOCAL_FIRST_PROFILE_OUTPUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
+    }
 }
 
 async fn open_replica(path: &Path, url: &str) -> Lix<FilesystemStorage> {

@@ -23,15 +23,15 @@ use http::{
     },
 };
 use http_body::{Body, Frame, SizeHint};
+use lix::authority_client::wire::{
+    MergeBranchPreviewRequestBody, MergeBranchPreviewResponseBody, MergeBranchRequestBody,
+    MergeBranchResponseBody,
+};
 use lix::storage::{Storage, StorageSession};
 use lix::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction, ObserveEvent,
     ObserveEvents, OpenLixBuilder, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
-};
-use lix::authority_client::wire::{
-    MergeBranchPreviewRequestBody, MergeBranchPreviewResponseBody, MergeBranchRequestBody,
-    MergeBranchResponseBody,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -2705,22 +2705,24 @@ where
             "sync push accepts at most {MAX_SYNC_REQUEST_ITEMS} total commits and ref updates",
         )));
     }
-    let active_account_id = lease.record.principal.account_id();
-    if request
-        .commits
-        .iter()
-        .any(|commit| commit.account_id != active_account_id)
-    {
-        return Err(ApiError::account_mismatch());
-    }
+    let active_account_id = lease.record.principal.account_id().to_owned();
     ensure_sync_push_event_fits(&request, MAX_SYNC_PULL_RESPONSE_BYTES)?;
     let response = lease
-        // The engine-scoped collaboration gate inside
-        // `push_sync_repository` keeps immutable objects, refs, and the event
-        // cursor ordered. It is acquired inside this detached durable task,
-        // so request cancellation cannot release it early.
-        .run_durable(move |lix| async move { lix.push_sync_repository(&request).await })
-        .await?;
+        // Validate authorship inside the import's collaboration gate. Existing
+        // immutable dependencies may have another author; newly introduced
+        // commits must belong to the authenticated principal.
+        .run_durable(move |lix| async move {
+            lix.push_sync_repository_for_account(&request, &active_account_id)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            if error.code == "LIX_SYNC_ACCOUNT_MISMATCH" {
+                ApiError::account_mismatch()
+            } else {
+                ApiError::from(error)
+            }
+        })?;
     Ok(Json(response))
 }
 
@@ -3604,7 +3606,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let preview = lease
-        .run_cancellable_read(move |lix| async move { lix.merge_branch_preview(options.into()).await })
+        .run_cancellable_read(
+            move |lix| async move { lix.merge_branch_preview(options.into()).await },
+        )
         .await?;
     Ok(Json(preview.into()))
 }
@@ -6500,7 +6504,10 @@ mod tests {
             .with_embedded_lix_id()
             .await
             .expect("the exact durable authority claim should reopen");
-        reopened.close().await.expect("reopened authority should close");
+        reopened
+            .close()
+            .await
+            .expect("reopened authority should close");
     }
 
     #[tokio::test]
@@ -7288,7 +7295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replica_batch_mixing_history_and_write_requires_the_authority() {
+    async fn replica_batch_mixing_history_and_write_hydrates_then_commits_locally() {
         let authority = open_lix().await.expect("open history authority");
         authority
             .execute(
@@ -7508,29 +7515,36 @@ mod tests {
                 label: None,
             },
         ];
-        let error = replica
+        let results = replica
             .execute_batch(&statements)
             .await
-            .expect_err("a replica cannot hydrate history and publish a local write");
-        assert_eq!(error.code, crate::sync::AUTHORITY_EXECUTION_REQUIRED_CODE);
-        hydration.abort();
-        let _ = hydration.await;
+            .expect("history hydration retries the atomic batch before its local commit");
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[1].rows()[0].get::<serde_json::Value>("value"),
+            Ok(json!("once"))
+        );
+        hydration.await.expect("history hydration completes");
+        replica
+            .close()
+            .await
+            .expect("close the durable local replica");
 
         let offline_reader = open_lix()
             .with_storage(storage)
             .await
-            .expect("open an offline reader over the rejected replica state");
+            .expect("open an offline reader over the committed replica state");
         let count = offline_reader
             .execute(
                 "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'history-hydrated'",
                 &[],
             )
             .await
-            .expect("read rejected batch state");
+            .expect("read committed batch state");
         assert_eq!(
             count.rows()[0].get::<i64>("count"),
-            Ok(0),
-            "the authority-only batch must not publish a replica write"
+            Ok(1),
+            "hydration must publish the atomic local write exactly once"
         );
     }
 
@@ -9250,6 +9264,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_push_accepts_existing_history_by_another_author_but_rejects_tampering() {
+        let app = app().await;
+        let (anonymous_session, _) = new_session(&app.router).await;
+        let seeded = request(
+            &app.router, "POST", "/lix/v1/execute", Some(&anonymous_session),
+            Some(json!({"sql": "INSERT INTO lix_key_value (key, value) VALUES ('foreign-history', 'original')"})),
+        ).await;
+        assert_eq!(seeded.status(), StatusCode::OK);
+        let head = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&anonymous_session),
+            Some(json!({"sql": "SELECT lix_active_branch_commit_id() AS commit_id"})),
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::OK);
+        let historical_id = response_json(head).await["rows"][0][0]["value"]
+            .as_str()
+            .expect("historical commit id")
+            .to_owned();
+        let advanced = request(
+            &app.router, "POST", "/lix/v1/execute", Some(&anonymous_session),
+            Some(json!({"sql": "UPDATE lix_key_value SET value = 'newer' WHERE key = 'foreign-history'"})),
+        ).await;
+        assert_eq!(advanced.status(), StatusCode::OK);
+        let history = request(
+            &app.router,
+            "GET",
+            &format!("/lix/v1/sync/history?head={historical_id}&limit=1"),
+            Some(&anonymous_session),
+            None,
+        )
+        .await;
+        assert_eq!(history.status(), StatusCode::OK);
+        let history = response_json(history).await;
+        let historical = history["commits"]
+            .as_array()
+            .expect("history commits")
+            .iter()
+            .find(|commit| commit["commitId"] == historical_id)
+            .expect("requested historical dependency")
+            .clone();
+        assert_eq!(historical["accountId"], lix::ANONYMOUS_ACCOUNT_ID);
+
+        let principal = ServerProtocolPrincipal::Authenticated {
+            account_id: lix::SYSTEM_ACCOUNT_ID.to_owned(),
+            idempotency_scope: "historical-dependency-reader".to_owned(),
+        };
+        let response = app
+            .server
+            .handle(
+                Request::builder()
+                    .uri(format!("/lix/v1/{}", app.server.lix_id()))
+                    .body(Body::empty())
+                    .expect("second principal handshake"),
+                ServerProtocolContext {
+                    principal: principal.clone(),
+                    durable_terminal_storage_notifier: None,
+                },
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response_json(response).await["sessionId"]
+            .as_str()
+            .expect("second principal session")
+            .to_owned();
+        for tamper in [false, true] {
+            let mut dependency = historical.clone();
+            if tamper {
+                dependency["createdAt"] = json!("2026-08-19T00:00:00Z");
+            }
+            let push = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/lix/v1/{}/sync/push", app.server.lix_id()))
+                .header(SESSION_ID_HEADER, &session_id)
+                .header(
+                    SYNC_PROTOCOL_VERSION_HEADER,
+                    crate::sync::SYNC_PROTOCOL_VERSION,
+                )
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "commits": [dependency], "refUpdates": [], "inlineBlobs": [],
+                    }))
+                    .expect("encode historical dependency"),
+                ))
+                .expect("dependency push");
+            let response = app
+                .server
+                .handle(
+                    push,
+                    ServerProtocolContext {
+                        principal: principal.clone(),
+                        durable_terminal_storage_notifier: None,
+                    },
+                )
+                .await;
+            if tamper {
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(
+                    error_code(response).await,
+                    crate::sync::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
+                );
+            } else {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "another author's existing immutable dependency must be accepted"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sync_push_rejects_a_commit_authored_by_another_account() {
         let app = app().await;
         let principal = ServerProtocolPrincipal::Authenticated {
@@ -9279,6 +9408,8 @@ mod tests {
         let foreign_commit = json!({
             "commitId": crate::changelog::CommitId::for_test_label("foreign-sync-author").to_string(),
             "parentCommitIds": [],
+            "globalScope": true,
+            "baseCommitId": null,
             "accountId": lix::ANONYMOUS_ACCOUNT_ID,
             "createdAt": "2026-08-19T00:00:00Z",
             "selectedSourceCommitId": null,

@@ -7,7 +7,7 @@ use tracing::Instrument as _;
 
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
-use crate::changelog::{ChangeRecordProjection, CommitId};
+use crate::changelog::ChangeRecordProjection;
 use crate::plugin::runtime::{
     ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
     ReconciledRow, ReconciledTypedRow, RowVersionRef,
@@ -436,102 +436,6 @@ where
             target: "lix_perf",
             "lix.perf.merge_branch_total"
         ))
-        .await
-    }
-
-    /// Reconciles one imported authority commit into the active branch with
-    /// the authority as the row-conflict winner.
-    ///
-    /// Sync deliberately uses the row-level merge primitive directly: remote
-    /// changes to disjoint rows and the remote side of same-row conflicts are
-    /// selected onto the complete local first-parent state. The authority head
-    /// remains the merge parent, preserving both histories without changing
-    /// the engine's first-parent state contract.
-    pub(crate) async fn merge_sync_commit_into_active_branch(
-        &self,
-        source_head: CommitId,
-    ) -> Result<String, LixError> {
-        self.with_write_transaction_lending(async move |transaction| {
-            let active_branch_id = transaction.active_branch_id().to_string();
-            let target_head = {
-                let reader = transaction.branch_ref_reader().await?;
-                BranchLifecycle::new(&reader)
-                    .require_existing_commit_id(
-                        &active_branch_id,
-                        BranchOperation::MergeBranch,
-                        BranchReferenceRole::Target,
-                    )
-                    .await?
-            };
-            if target_head == source_head {
-                return Ok(target_head.to_string());
-            }
-
-            let base_commit_id = {
-                let mut reader = transaction.commit_graph_reader().await?;
-                reader.merge_base(&target_head, &source_head).await?
-            };
-            let analysis = {
-                let mut reader = transaction.tracked_state_reader().await?;
-                analyze(
-                    &mut reader,
-                    MergeCommits {
-                        base_commit_id,
-                        target_commit_id: target_head,
-                        source_commit_id: source_head,
-                    },
-                )
-                .await?
-            };
-            match analysis.outcome {
-                MergeOutcome::AlreadyUpToDate => Ok(target_head.to_string()),
-                MergeOutcome::FastForward => {
-                    transaction
-                        .advance_branch_ref(&active_branch_id, source_head)
-                        .await?;
-                    Ok(source_head.to_string())
-                }
-                MergeOutcome::MergeCommitted => {
-                    let merge_plan = analysis
-                        .merge_plan()
-                        .expect("merge analysis includes a divergent merge plan");
-                    let mut selected_changes = StagedCommitChangeBatchBuilder::with_capacity(
-                        merge_plan.picks.len() + merge_plan.conflicts.len(),
-                    );
-                    for pick in merge_plan.picks.iter() {
-                        selected_changes.push(
-                            pick.identity.clone(),
-                            pick.selected_row.commit_id,
-                            pick.change_id,
-                            pick.selected_row.deleted,
-                            pick.selected_row.created_at,
-                            pick.selected_row.updated_at,
-                        );
-                    }
-                    for conflict in merge_plan.conflicts.iter() {
-                        let selected_row = conflict.source.after.as_ref().ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                "sync merge conflict authority side omitted its resulting row",
-                            )
-                        })?;
-                        selected_changes.push(
-                            conflict.identity.clone(),
-                            selected_row.commit_id,
-                            selected_row.change_id,
-                            selected_row.deleted,
-                            selected_row.created_at,
-                            selected_row.updated_at,
-                        );
-                    }
-                    transaction.stage_merge_commit(
-                        active_branch_id,
-                        source_head,
-                        selected_changes.finish(),
-                    )
-                }
-            }
-        })
         .await
     }
 }

@@ -1872,19 +1872,17 @@ where
             // current coherent snapshot, while user statements above observed the
             // snapshot retained from transaction open.
             transaction.opening_read = read.clone();
-            // A durable authority receipt turns this storage into a certified
-            // replica cache. The fence is deliberately storage-derived rather
-            // than process-local: a second engine or process which opens the
-            // same adapter without selecting replica mode must still be unable
-            // to publish ordinary local state. Certified sync installation is
-            // the only crate-internal path allowed to suppress this guard.
-            if crate::sync::has_any_sync_replica_state(&read).await? {
+            // Plain engines sharing replica storage remain fenced. An admitted
+            // sync engine may commit its durable pending suffix locally.
+            if transaction.sync_role != crate::sync::SyncRole::Replica
+                && crate::sync::has_any_sync_replica_state(&read).await?
+            {
                 transaction
                     .discard_pending_plugin_actor_publications()
                     .await;
                 return Err(LixError::new(
                     "LIX_REPLICA_CACHE_READ_ONLY",
-                    "a certified sync replica cache can only be changed by the authoritative server",
+                    "replica storage can only be changed by an admitted sync engine",
                 ));
             }
             if transaction.sync_role == crate::sync::SyncRole::Authority

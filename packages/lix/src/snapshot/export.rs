@@ -5,12 +5,12 @@ use futures_lite::io::AsyncWriteExt as _;
 use futures_util::StreamExt as _;
 
 use super::format::{SnapshotEncoder, SnapshotEntry};
-use crate::storage_adapter::{
-    MAX_SCAN_PAGE_ROWS, StorageAdapter, StorageAdapterRead as _, StorageBeginScanOptions,
-    StorageCoreProjection, StorageKeyRange, StorageProjectedValue, StorageReadOptions,
-    StorageReadDurability as ReadDurability, StorageSession, Storage,
-};
 use crate::LixError;
+use crate::storage_adapter::{
+    MAX_SCAN_PAGE_ROWS, Storage, StorageAdapter, StorageAdapterRead as _, StorageBeginScanOptions,
+    StorageCoreProjection, StorageKeyRange, StorageProjectedValue,
+    StorageReadDurability as ReadDurability, StorageReadOptions, StorageSession,
+};
 
 /// Summary of a completed snapshot export.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +29,7 @@ where
     storage: StorageAdapter<StorageSession<StorageImpl>>,
     durability: ReadDurability,
     preflight_error: Option<LixError>,
-    remote: Option<RemoteSnapshotExport>,
+    remote: Option<(crate::ServerOptions, String)>,
 }
 
 #[derive(Clone)]
@@ -52,16 +52,12 @@ where
         }
     }
 
-    pub(crate) fn from_connected_authority(
+    pub(crate) fn from_sync_server(
         mut self,
-        http: crate::sync::AuthorityHttp,
-        url: Result<String, LixError>,
-        session_id: Option<String>,
+        server: crate::ServerOptions,
+        expected_account_id: String,
     ) -> Self {
-        match url {
-            Ok(url) => self.remote = Some(RemoteSnapshotExport { http, url, session_id }),
-            Err(error) => self.preflight_error = Some(error),
-        }
+        self.remote = Some((server, expected_account_id));
         self
     }
 
@@ -90,8 +86,40 @@ where
         if let Some(error) = self.preflight_error {
             return Err(error);
         }
-        if let Some(remote) = self.remote {
-            return remote.write_to(writer, self.durability).await;
+        if let Some((server, expected_account_id)) = self.remote {
+            // Canonical export explicitly needs the authority's complete
+            // history. Open its session lazily: normal opens, reads and writes
+            // never depend on this protocol connection.
+            let http = crate::sync::authority_http(&server.headers)?;
+            let client =
+                crate::authority_client::open_protocol_client(http, server.url, None).await?;
+            let mut lease = SnapshotAuthorityLease(Some(client));
+            let client = lease.0.as_ref().expect("new export lease owns its client");
+            let result = async {
+                if client.active_account_id().await? != expected_account_id {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "snapshot authority changed the authenticated account",
+                    ));
+                }
+                RemoteSnapshotExport {
+                    http: client.http().clone(),
+                    url: client.join_path("snapshot")?,
+                    session_id: client.session_id(),
+                }
+                .write_to(writer, self.durability)
+                .await
+            }
+            .await;
+            let close = lease
+                .0
+                .take()
+                .expect("export owns its client")
+                .close()
+                .await;
+            let report = result?;
+            close?;
+            return Ok(report);
         }
         let read = self
             .storage
@@ -106,8 +134,7 @@ where
                 "a persisted replica is a sparse cache and cannot export a canonical repository snapshot; export from the authority",
             ));
         }
-        let mut encoder =
-            SnapshotEncoder::new(writer, crate::init::CURRENT_FORMAT_VERSION).await?;
+        let mut encoder = SnapshotEncoder::new(writer, crate::init::CURRENT_FORMAT_VERSION).await?;
         for space in super::snapshot_spaces() {
             let mut cursor = read
                 .begin_scan(
@@ -123,10 +150,7 @@ where
                 )
                 .await?;
             loop {
-                let (entries, has_more) = cursor
-                    .next_page(MAX_SCAN_PAGE_ROWS)
-                    .await?
-                    .into_parts();
+                let (entries, has_more) = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.into_parts();
                 for entry in entries {
                     // Authority admission is a host-local write fence, not
                     // repository data. Exporting it would make a restored
@@ -164,6 +188,26 @@ where
     }
 }
 
+/// Cancellation and early failures must also release the temporary authority session.
+struct SnapshotAuthorityLease(
+    Option<crate::authority_client::ProtocolClient<crate::sync::AuthorityHttp>>,
+);
+
+impl Drop for SnapshotAuthorityLease {
+    fn drop(&mut self) {
+        let Some(client) = self.0.take() else {
+            return;
+        };
+        let http = client.http().clone();
+        crate::authority_client::ProtocolHttp::spawn(
+            &http,
+            Box::pin(async move {
+                let _ = client.close().await;
+            }),
+        );
+    }
+}
+
 impl RemoteSnapshotExport {
     async fn write_to<W>(
         self,
@@ -175,7 +219,10 @@ impl RemoteSnapshotExport {
     {
         use crate::authority_client::{ProtocolHttp as _, ProtocolHttpRequest};
         let mut headers = vec![
-            ("accept".to_owned(), "application/vnd.lix.snapshot".to_owned()),
+            (
+                "accept".to_owned(),
+                "application/vnd.lix.snapshot".to_owned(),
+            ),
             (
                 "lix-snapshot-durability".to_owned(),
                 authority_snapshot_durability(durability).to_owned(),
@@ -196,7 +243,10 @@ impl RemoteSnapshotExport {
         if !(200..300).contains(&response.status) {
             return Err(LixError::new(
                 "LIX_REMOTE_REQUEST_FAILED",
-                format!("authority snapshot request failed with HTTP {}", response.status),
+                format!(
+                    "authority snapshot request failed with HTTP {}",
+                    response.status
+                ),
             ));
         }
 
@@ -228,10 +278,16 @@ where
         let chunk = chunk?;
         total_bytes = total_bytes
             .checked_add(u64::try_from(chunk.len()).map_err(|_| {
-                LixError::new(LixError::CODE_INVALID_PARAM, "authority snapshot is too large")
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "authority snapshot is too large",
+                )
             })?)
             .ok_or_else(|| {
-                LixError::new(LixError::CODE_INVALID_PARAM, "authority snapshot is too large")
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "authority snapshot is too large",
+                )
             })?;
 
         let mut remaining = chunk.as_ref();
@@ -274,11 +330,7 @@ where
     })
 }
 
-fn retain_trailer_and_hash_payload(
-    hasher: &mut blake3::Hasher,
-    tail: &mut Vec<u8>,
-    bytes: &[u8],
-) {
+fn retain_trailer_and_hash_payload(hasher: &mut blake3::Hasher, tail: &mut Vec<u8>, bytes: &[u8]) {
     let finalized = tail
         .len()
         .saturating_add(bytes.len())
@@ -349,11 +401,7 @@ mod tests {
                 crate::snapshot::format::MAGIC.len() + 1,
                 2,
             ),
-            (
-                "checksum",
-                crate::snapshot::format::MAGIC.len() + 2,
-                0xff,
-            ),
+            ("checksum", crate::snapshot::format::MAGIC.len() + 2, 0xff),
             (
                 "reserved flags",
                 crate::snapshot::format::MAGIC.len() + 3,

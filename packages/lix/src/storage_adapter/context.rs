@@ -26,6 +26,7 @@ pub struct StorageAdapter<StorageImpl = Memory> {
     storage: StorageImpl,
     routing: EpochRouting,
     authority_writer: Arc<AtomicBool>,
+    replica_writer: Arc<AtomicBool>,
 }
 
 #[expect(missing_debug_implementations)]
@@ -46,6 +47,7 @@ where
             storage,
             routing: EpochRouting::legacy(),
             authority_writer: Arc::new(AtomicBool::new(false)),
+            replica_writer: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -61,6 +63,7 @@ where
             storage,
             routing: EpochRouting::unfenced(bank),
             authority_writer: Arc::new(AtomicBool::new(false)),
+            replica_writer: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -75,6 +78,7 @@ where
             storage,
             routing: EpochRouting::fenced(bank, expected_pointer),
             authority_writer: Arc::new(AtomicBool::new(false)),
+            replica_writer: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -90,6 +94,7 @@ where
             storage,
             routing: EpochRouting::migration(bank, expected_pointer),
             authority_writer: Arc::new(AtomicBool::new(false)),
+            replica_writer: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -103,6 +108,11 @@ where
     /// distinct flag and remains fenced by the marker.
     pub(crate) fn admit_sync_authority_writer(&self) {
         self.authority_writer.store(true, Ordering::Release);
+    }
+
+    /// Admits only an engine opened through the authenticated sync lifecycle.
+    pub(crate) fn admit_sync_replica_writer(&self) {
+        self.replica_writer.store(true, Ordering::Release);
     }
 
     pub async fn begin_read(
@@ -203,12 +213,11 @@ where
         mut opts: WriteOptions,
         certified_replica_write: bool,
     ) -> Result<PreparedStorageCommit<'_, StorageImpl>, StorageWriteSetError> {
-        if !certified_replica_write {
+        if !certified_replica_write && !self.replica_writer.load(Ordering::Acquire) {
             // This atomic absence precondition closes the race between an
             // ordinary writer's coherent read and initial receipt install.
-            // Once receipt-bound, every engine sharing this storage is
-            // read-only unless it holds the crate-private certified installer
-            // capability above.
+            // Plain engines sharing receipt-bound storage remain fenced. Only
+            // the admitted sync engine may author a durable local outbox.
             opts.preconditions.push(Precondition::KeyAbsent {
                 space: crate::sync::SYNC_REPLICA_STATE_SPACE,
                 key: crate::sync::replica_state_key(),
