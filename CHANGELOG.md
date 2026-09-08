@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.15.2 - 2026-09-08
+
+### Patch
+
+- Fixed CSV edits and reopen operations losing cells, formatting, or the stored dialect.
+
+  CSV now preserves UTF-8 BOMs, literal quote spelling, empty final cells, and missing final line endings when rows move. Multiline and adjacent file edits reconcile the correct rows, and unsupported NUL bytes are rejected before unreadable state is stored.
+- Fixed explicit transactions failing on SlateDB-backed servers when reading cached file and directory state.
+
+  SlateDB reads, writes, and flushes now also work when called from an executor without a Tokio runtime.
+- Keep ordinary reads and live queries available while an explicit transaction is open.
+
+  Transactions now use an independent context on the originating handle's branch and account. Transaction reads see staged writes, while ordinary reads and observers see committed data. Commit publishes the changes; rollback leaves observers unaffected. Each originating handle still allows one explicit transaction at a time and must finish it before closing.
+- Fixed Markdown edits losing literal content, unrelated formatting, or the original file encoding.
+
+  No-op row updates now preserve file bytes, reference-definition edits refresh affected links, and cached block content no longer reappears after subsequent edits.
+
 ## 0.15.1 - 2026-09-07
 
 ### Patch
