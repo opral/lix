@@ -189,7 +189,8 @@ impl sdk::FileProjection for CsvPlugin {
         {
             return cold_parse_changes(&mut update, sink);
         }
-        if update.before.state_len(CSV_IDENTITIES_KEY)?.is_some()
+        if update.before.is_empty()
+            || update.before.state_len(CSV_IDENTITIES_KEY)?.is_some()
             || update.before_path != update.after_path
             || update.file_edits.iter().len() != 1
         {
@@ -210,14 +211,12 @@ impl sdk::FileProjection for CsvPlugin {
                 .before
                 .read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)?
                 .ok_or_else(|| sdk::Error::invalid_input("CSV arena root has no row index"))?;
-            let row_count = u32::from_le_bytes(header[32..36].try_into().expect("CSV row count"));
-            let logical_state_len = u64::from(CSV_INDEX_HEADER_BYTES)
-                .checked_add(u64::from(row_count) * 4)
-                .ok_or_else(|| sdk::Error::invalid_input("CSV row index size overflowed"))?;
-            let index = ArenaRowIndex::decode_header(&header, logical_state_len)
-                .map_err(sdk::Error::invalid_input)?;
+            let index = decode_csv_index_header(&header)?;
+            if index.dialect().bom && edit.offset < 3 {
+                return fallback_file_changed(update, sink);
+            }
             let range = index
-                .row_range_for_edit_reader(edit.offset, edit.delete_len, |ordinal| {
+                .row_range_for_edit_reader(edit.offset, 0, |ordinal| {
                     let offsets_per_page = (CSV_INDEX_PAGE_BYTES / 4) as u32;
                     let page = ordinal / offsets_per_page;
                     let offset = u64::from(ordinal % offsets_per_page) * 4;
@@ -239,12 +238,25 @@ impl sdk::FileProjection for CsvPlugin {
                     .map_err(sdk::Error::invalid_input)?;
             let state = import.arena_state(update.creates.namespace_bytes());
             let index = ArenaRowIndex::decode(&state).map_err(sdk::Error::invalid_input)?;
+            if index.dialect().bom && edit.offset < 3 {
+                return fallback_file_changed(update, sink);
+            }
             let range = index
-                .row_range_for_edit(edit.offset, edit.delete_len)
+                .row_range_for_edit(edit.offset, 0)
                 .map_err(sdk::Error::invalid_input)?;
             (index, range, Some(state))
         };
         let (ordinal, row_start, row_end) = range;
+        let delete_end = edit
+            .offset
+            .checked_add(edit.delete_len)
+            .ok_or_else(|| sdk::Error::invalid_input("CSV edit range overflowed"))?;
+        if delete_end > update.before.len() {
+            return Err(sdk::Error::invalid_input("CSV edit exceeds accepted bytes"));
+        }
+        if delete_end > row_end {
+            return fallback_file_changed(update, sink);
+        }
         let mut row = update.before.read_range(row_start, row_end - row_start)?;
         let local_start = usize::try_from(edit.offset - row_start)
             .map_err(|_| sdk::Error::invalid_input("CSV edit offset exceeds guest memory"))?;
@@ -373,6 +385,17 @@ fn split_csv_index(state: &[u8]) -> sdk::Result<(&[u8], Vec<&[u8]>)> {
     Ok((header, pages))
 }
 
+fn decode_csv_index_header(header: &[u8]) -> sdk::Result<ArenaRowIndex> {
+    if header.len() != CSV_INDEX_HEADER_BYTES as usize {
+        return Err(sdk::Error::invalid_input(
+            "CSV row index header is truncated",
+        ));
+    }
+    let row_count = u32::from_le_bytes(header[32..36].try_into().expect("CSV row count"));
+    let logical_state_len = u64::from(CSV_INDEX_HEADER_BYTES) + u64::from(row_count) * 4;
+    ArenaRowIndex::decode_header(header, logical_state_len).map_err(sdk::Error::invalid_input)
+}
+
 fn csv_index_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
     let Some(header) = root.read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)? else {
         return Ok(0);
@@ -472,7 +495,7 @@ fn store_identity_checkpoint(
             Terminator::CrLf => 2,
             Terminator::Cr => 3,
         },
-        0,
+        u8::from(dialect.bom),
     ]);
     sink.put_state(CSV_IDENTITIES_KEY, &manifest)?;
     for (ordinal, page) in pages.iter().enumerate() {
@@ -489,6 +512,9 @@ fn decode_identity_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32, Dialect)> {
         return Err(sdk::Error::invalid_input(
             "unsupported CSV identity checkpoint",
         ));
+    }
+    if bytes[15] > 1 {
+        return Err(sdk::Error::invalid_input("invalid CSV checkpoint flags"));
     }
     let terminator = match bytes[14] {
         1 => Terminator::Lf,
@@ -507,6 +533,7 @@ fn decode_identity_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32, Dialect)> {
             delimiter: bytes[12],
             quote: (bytes[13] != 0).then_some(bytes[13]),
             terminator,
+            bom: bytes[15] == 1,
         },
     ))
 }
@@ -571,7 +598,15 @@ fn open_document(
     snapshot: &sdk::Snapshot<'_>,
 ) -> sdk::Result<Document> {
     let Some((dialect, identities)) = read_identity_checkpoint(snapshot)? else {
-        return Document::open_file(bytes, Some(path), namespace)
+        let document = match snapshot.read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)? {
+            Some(header) => Document::open_file_with_stored_dialect(
+                bytes,
+                decode_csv_index_header(&header)?.dialect(),
+                namespace,
+            ),
+            None => Document::open_file(bytes, Some(path), namespace),
+        };
+        return document
             .map(|(document, _)| document)
             .map_err(sdk::Error::invalid_input);
     };
@@ -903,5 +938,400 @@ mod tests {
             successor.canonical_arena_state().is_none(),
             "a mixed-namespace structural successor cannot be represented by one dense namespace"
         );
+    }
+}
+
+#[cfg(test)]
+mod adapter_qa_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct MemoryState(std::collections::BTreeMap<Vec<u8>, Vec<u8>>);
+    impl StateOutput for MemoryState {
+        fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
+            self.0.insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+        fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
+            self.0.remove(key);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sparse_arena_changes_match_full_parse_for_every_nonstructural_byte() {
+        let namespace = IdNamespace::from_halves(31, 47);
+        for (path, source) in [
+            ("a.csv", "name,value\nalpha,one\nbeta,two\n"),
+            (
+                "a.csv",
+                "\"name\",\"value\"\r\n\"a\nline\",\"quoted\"\r\nlast,end",
+            ),
+            ("a.tsv", "name\tvalue\ralpha\tone\rbeta\ttwo\r"),
+            ("a.csv", "\n,\n\"\"\n\"a\"\"b\",x\n"),
+            ("a.csv", "\u{feff}first,value\nlast,tail\n"),
+        ] {
+            let bytes = source.as_bytes();
+            let import = ColdInitialImport::open(bytes.to_vec(), Some(path)).unwrap();
+            let index =
+                ArenaRowIndex::decode(&import.arena_state(namespace.0[..12].try_into().unwrap()))
+                    .unwrap();
+            for offset in 0..bytes.len() {
+                if !bytes[offset].is_ascii_alphabetic()
+                    || index.edit_touches_structure(&bytes[offset..offset + 1], b"Z")
+                {
+                    continue;
+                }
+                let (ordinal, start, end) = index.row_range_for_edit(offset as u64, 1).unwrap();
+                let mut row = bytes[start as usize..end as usize].to_vec();
+                row[offset - start as usize] = b'Z';
+                let sparse = index.row_change(ordinal, row).unwrap();
+                let mut changed = bytes.to_vec();
+                changed[offset] = b'Z';
+                let (full, _) = Document::open_file(changed, Some(path), namespace).unwrap();
+                let records = full.row_records().unwrap();
+                assert_eq!(
+                    sparse.row.as_ref(),
+                    Some(&records[ordinal as usize + 1].row),
+                    "{path} offset {offset}"
+                );
+                assert_eq!(sparse.row_pk, records[ordinal as usize + 1].row_pk);
+            }
+        }
+    }
+
+    #[test]
+    fn identity_checkpoint_preserves_authoritative_table_terminator() {
+        let namespace = IdNamespace::from_halves(31, 47);
+        let (document, _) = Document::open_file(b"a,b\nc,d\n".to_vec(), None, namespace).unwrap();
+        let mut records = document.row_records().unwrap();
+        records[0].row.insert(
+            "dialect",
+            sdk::TypedValue::Jsonb(
+                serde_json::json!({
+                    "delimiter": ",", "quote": "\"", "terminator": "\r\n"
+                })
+                .into(),
+            ),
+        );
+        for record in records.iter_mut().skip(1) {
+            record.row.insert(
+                "layout",
+                sdk::TypedValue::Jsonb(serde_json::json!({"terminator": "\n"}).into()),
+            );
+        }
+        let (document, _) = Document::open_rows(records).unwrap();
+        let (dialect, identities) = document.identity_checkpoint();
+        assert_eq!(dialect.terminator, Terminator::CrLf);
+        assert_eq!(document.bytes(), b"a,b\nc,d\n");
+        let reopened =
+            Document::open_file_with_identities(document.bytes(), dialect, namespace, &identities)
+                .unwrap();
+        assert_eq!(
+            reopened.row_records().unwrap(),
+            document.row_records().unwrap()
+        );
+    }
+
+    #[test]
+    fn empty_import_arena_restores_its_dialect() {
+        let import = ColdInitialImport::open(Vec::new(), Some("a.tsv")).unwrap();
+        let state = import.arena_state([3; 12]);
+        assert_eq!(
+            decode_csv_index_header(&state).unwrap().dialect().delimiter,
+            b'\t'
+        );
+    }
+
+    #[test]
+    fn truncated_index_headers_return_errors_without_panicking() {
+        for length in 0..CSV_INDEX_HEADER_BYTES as usize {
+            assert!(decode_csv_index_header(&vec![0; length]).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_arena_can_store_a_dialect_different_from_the_path() {
+        let namespace = IdNamespace::from_halves(31, 47);
+        let dialect = Dialect {
+            delimiter: b';',
+            quote: Some(b'\''),
+            terminator: Terminator::CrLf,
+            bom: false,
+        };
+        let (document, _) = Document::open_file_with_dialect(
+            b"'a;b';value\r\nlast;tail\r\n".to_vec(),
+            dialect,
+            namespace,
+        )
+        .unwrap();
+        let (serialized, _) = Document::open_rows(document.row_records().unwrap()).unwrap();
+        let (_, state) = serialized
+            .canonical_arena_state()
+            .expect("custom dialect has compact arena");
+        let restored_dialect = decode_csv_index_header(&state[..CSV_INDEX_HEADER_BYTES as usize])
+            .unwrap()
+            .dialect();
+        let (reopened, _) = Document::open_file_with_stored_dialect(
+            serialized.bytes(),
+            restored_dialect,
+            namespace,
+        )
+        .unwrap();
+        assert_eq!(reopened.bytes(), serialized.bytes());
+        assert_eq!(
+            reopened.row_records().unwrap(),
+            serialized.row_records().unwrap()
+        );
+    }
+
+    #[test]
+    fn identity_checkpoint_reopen_preserves_exact_bytes_and_rows() {
+        let namespace = IdNamespace::from_halves(31, 47);
+        for (path, source) in [
+            (
+                "a.csv",
+                "\"name\",value\r\n\"a\nline\",\"quoted\"\r\nlast,end",
+            ),
+            ("a.tsv", "name\tvalue\ralpha\tone\rbeta\ttwo\r"),
+            ("a.csv", "\u{feff}first,value\n\nlast,tail\n"),
+        ] {
+            let (document, _) =
+                Document::open_file(source.as_bytes().to_vec(), Some(path), namespace).unwrap();
+            let (dialect, identities) = document.identity_checkpoint();
+            let reopened = Document::open_file_with_identities(
+                document.bytes(),
+                dialect,
+                IdNamespace::from_halves(99, 101),
+                &identities,
+            )
+            .unwrap();
+            assert_eq!(reopened.bytes(), source.as_bytes());
+            assert_eq!(
+                reopened.row_records().unwrap(),
+                document.row_records().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn paged_index_reads_across_page_and_tree_boundaries() {
+        let namespace = IdNamespace::from_halves(31, 47);
+        let rows_per_page = CSV_INDEX_PAGE_BYTES / 4;
+        let import = ColdInitialImport::open(b"x\n".repeat(rows_per_page + 2), None).unwrap();
+        let state = import.arena_state(namespace.0[..12].try_into().unwrap());
+        let (header, pages) = split_csv_index(&state).unwrap();
+        let index = decode_csv_index_header(header).unwrap();
+        assert_eq!(pages.len(), 2);
+        for ordinal in [
+            0,
+            63,
+            64,
+            511,
+            512,
+            rows_per_page - 1,
+            rows_per_page,
+            rows_per_page + 1,
+        ] {
+            let range = index
+                .row_range_for_edit_reader((ordinal * 2) as u64, 1, |row| {
+                    let row = row as usize;
+                    let offset = row % rows_per_page * 4;
+                    Ok(u32::from_le_bytes(
+                        pages[row / rows_per_page][offset..offset + 4]
+                            .try_into()
+                            .unwrap(),
+                    ))
+                })
+                .unwrap();
+            assert_eq!(
+                range,
+                (
+                    ordinal as u32,
+                    (ordinal * 2) as u64,
+                    (ordinal * 2 + 2) as u64
+                )
+            );
+            let change = index.row_change(ordinal as u32, b"y\n".to_vec()).unwrap();
+            assert_eq!(
+                change.row_pk,
+                vec![sdk::TypedValue::Uuid(namespace.encode(ordinal as u64))]
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_checkpoint_roundtrips_across_identity_and_tree_boundaries() {
+        let namespace = IdNamespace::from_halves(31, 47);
+        let mut seed = 0x19af_3921_efe1_8893_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..12 {
+            let mut bytes = Vec::new();
+            for row in 0..769 {
+                let field = match next() % 5 {
+                    0 => "\"a,b\"",
+                    1 => "\"a\nline\"",
+                    2 => "unquoted\"quote",
+                    3 => "\"\"",
+                    _ => "é漢🙂",
+                };
+                bytes.extend_from_slice(format!("{row},{field}").as_bytes());
+                bytes.extend_from_slice(match next() % 3 {
+                    0 => b"\r\n",
+                    1 => b"\r",
+                    _ => b"\n",
+                });
+            }
+            let (document, _) = Document::open_file(bytes.clone(), None, namespace).unwrap();
+            let (dialect, mut identities) = document.identity_checkpoint();
+            for identity in &mut identities {
+                identity.id =
+                    uuid::Uuid::from_u128((u128::from(next()) << 64) | u128::from(next()));
+            }
+            let reopened =
+                Document::open_file_with_identities(bytes.clone(), dialect, namespace, &identities)
+                    .unwrap();
+            assert_eq!(reopened.bytes(), bytes);
+            assert_eq!(reopened.identity_checkpoint(), (dialect, identities));
+            let (roundtrip, _) = Document::open_rows(reopened.row_records().unwrap()).unwrap();
+            assert_eq!(roundtrip.bytes(), bytes);
+            assert_eq!(
+                roundtrip.row_records().unwrap(),
+                reopened.row_records().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn cell_merger_composes_disjoint_edits_and_declines_conflicts() {
+        let namespace = IdNamespace::from_halves(31, 47);
+        let (document, _) =
+            Document::open_file(b"a,b,c,d,e,f,g,h\n".to_vec(), None, namespace).unwrap();
+        let base = document.row_records().unwrap()[1].row.clone();
+        let base_cells = serde_json::json!(["a", "b", "c", "d", "e", "f", "g", "h"]);
+        for left in 0..8 {
+            for right in 0..8 {
+                let mut a = base.clone();
+                let mut b = base.clone();
+                let mut a_cells = base_cells.clone();
+                let mut b_cells = base_cells.clone();
+                a_cells[left] = serde_json::json!("LEFT");
+                b_cells[right] = serde_json::json!("RIGHT");
+                a.insert("cells", sdk::TypedValue::Jsonb(a_cells.into()));
+                b.insert("cells", sdk::TypedValue::Jsonb(b_cells.clone().into()));
+                let merged = merge_typed_csv_cells(&base, &a, &b).unwrap();
+                if left == right {
+                    assert!(merged.is_none());
+                } else {
+                    b_cells[left] = serde_json::json!("LEFT");
+                    assert_eq!(serde_json::Value::Array(merged.unwrap()), b_cells);
+                    assert_eq!(
+                        merge_typed_csv_cells(&base, &a, &b).unwrap(),
+                        merge_typed_csv_cells(&base, &b, &a).unwrap()
+                    );
+                }
+                assert!(merge_typed_csv_cells(&base, &base, &b).unwrap().is_none());
+                assert!(merge_typed_csv_cells(&base, &a, &a).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn identity_checkpoint_pages_preserve_records_split_across_page_edges() {
+        let namespace = IdNamespace::from_halves(31, 47);
+        let row_count = CSV_IDENTITY_PAGE_BYTES / 36 + 3;
+        let (document, _) = Document::open_file(b"x\n".repeat(row_count), None, namespace).unwrap();
+        let mut stored = MemoryState::default();
+        store_identity_checkpoint(None, &mut stored, &document).unwrap();
+        let (stored_count, page_count, dialect) =
+            decode_identity_manifest(stored.0.get(CSV_IDENTITIES_KEY).unwrap()).unwrap();
+        assert_eq!(stored_count as usize, row_count);
+        assert_eq!(page_count, 2);
+        assert_eq!(dialect, document.dialect());
+        let payload = (0..page_count)
+            .flat_map(|page| {
+                let bytes = &stored.0[&identity_page_key(page)];
+                assert!(bytes.len() <= CSV_IDENTITY_PAGE_BYTES);
+                bytes.iter().copied()
+            })
+            .collect::<Vec<_>>();
+        let expected = document.identity_checkpoint().1;
+        let mut cursor = payload.as_slice();
+        for identity in expected {
+            assert_eq!(uuid::Uuid::from_slice(&cursor[..16]).unwrap(), identity.id);
+            let length = u32::from_le_bytes(cursor[16..20].try_into().unwrap()) as usize;
+            assert_eq!(&cursor[20..20 + length], identity.order_key.as_bytes());
+            cursor = &cursor[20 + length..];
+        }
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn bom_checkpoint_and_arena_preserve_first_quoted_cell() {
+        let namespace = IdNamespace::from_halves(31, 47);
+        for source in [
+            "\u{feff}\"first,quoted\",value\r\nlast,tail\r\n",
+            "\u{feff}first,value\n",
+            "\u{feff}",
+        ] {
+            let bytes = source.as_bytes().to_vec();
+            let (document, _) = Document::open_file(bytes.clone(), None, namespace).unwrap();
+            assert!(document.dialect().bom);
+            let mut stored = MemoryState::default();
+            store_identity_checkpoint(None, &mut stored, &document).unwrap();
+            let (_, _, dialect) =
+                decode_identity_manifest(stored.0.get(CSV_IDENTITIES_KEY).unwrap()).unwrap();
+            assert!(dialect.bom);
+            let identities = document.identity_checkpoint().1;
+            let checkpoint =
+                Document::open_file_with_identities(bytes.clone(), dialect, namespace, &identities)
+                    .unwrap();
+            assert_eq!(checkpoint.bytes(), bytes);
+            assert_eq!(
+                checkpoint.row_records().unwrap(),
+                document.row_records().unwrap()
+            );
+            let import = ColdInitialImport::open(bytes.clone(), None).unwrap();
+            let state = import.arena_state(namespace.0[..12].try_into().unwrap());
+            let index = decode_csv_index_header(&state[..CSV_INDEX_HEADER_BYTES as usize]).unwrap();
+            assert!(index.dialect().bom);
+            let (arena, _) =
+                Document::open_file_with_stored_dialect(bytes.clone(), index.dialect(), namespace)
+                    .unwrap();
+            assert_eq!(arena.bytes(), bytes);
+            assert_eq!(
+                arena.row_records().unwrap(),
+                document.row_records().unwrap()
+            );
+            if document.row_count() > 0 {
+                assert_eq!(
+                    ArenaRowIndex::decode(&state)
+                        .unwrap()
+                        .row_range_for_edit(3, 0)
+                        .unwrap()
+                        .1,
+                    3
+                );
+                let cells = document.row_records().unwrap()[1]
+                    .row
+                    .get("cells")
+                    .unwrap()
+                    .clone();
+                let expected = if source.contains("quoted") {
+                    "first,quoted"
+                } else {
+                    "first"
+                };
+                let sdk::TypedValue::Jsonb(cells) = cells else {
+                    panic!("expected cells");
+                };
+                assert_eq!(cells.as_value()[0], expected);
+            }
+        }
     }
 }

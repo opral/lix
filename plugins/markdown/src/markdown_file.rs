@@ -41,7 +41,7 @@ pub(crate) fn parse_file_with_literal_fast_path(
     parse_markdown_source_with_literal_fast_path(&decoded, allow_literal_fast_path)
 }
 
-fn buffer_with_encoding(buf: &[u8]) -> (&[u8], &'static Encoding) {
+pub(crate) fn buffer_with_encoding(buf: &[u8]) -> (&[u8], &'static Encoding) {
     if let Some((encoding, skip)) = Encoding::for_bom(buf) {
         (&buf[skip..], encoding)
     } else {
@@ -88,41 +88,104 @@ fn parse_markdown_source_with_literal_fast_path(
 }
 
 fn fully_escape_orphan_table_delimiters(rendered: Vec<u8>) -> Vec<u8> {
-    let mut output = Vec::with_capacity(rendered.len());
+    let mut candidates = Vec::new();
+    let mut offset = 0;
     for line in rendered.split_inclusive(|byte| *byte == b'\n') {
-        let content = line
-            .strip_suffix(b"\n")
-            .unwrap_or(line)
-            .strip_suffix(b"\r")
-            .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(line));
+        let content = line.strip_suffix(b"\n").unwrap_or(line);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
         let leading_whitespace = content
             .iter()
             .position(|byte| !byte.is_ascii_whitespace())
             .unwrap_or(content.len());
         let trimmed = &content[leading_whitespace..];
-        let candidate = trimmed.starts_with(b"|")
+        if trimmed.starts_with(b"|")
             && trimmed.ends_with(b"|")
             && trimmed.contains(&b'\\')
             && trimmed
                 .iter()
-                .all(|byte| matches!(byte, b'|' | b'-' | b':' | b'\\' | b' ' | b'\t'));
-        if !candidate {
-            output.extend_from_slice(line);
-            continue;
+                .all(|byte| matches!(byte, b'|' | b'-' | b':' | b'\\' | b' ' | b'\t'))
+        {
+            candidates.push(offset + leading_whitespace..offset + content.len());
         }
+        offset += line.len();
+    }
+    if candidates.is_empty() {
+        return rendered;
+    }
+
+    // Delimiter repair only applies to Markdown prose. In code, HTML, and
+    // frontmatter these same bytes are literal data, so escaping corrupts them.
+    let Ok(source) = std::str::from_utf8(&rendered) else {
+        return rendered;
+    };
+    let mut options = SyntaxOptions::gfm();
+    options.constructs.frontmatter = true;
+    let parsed = options.parse(source);
+    let mut paragraphs = Vec::new();
+    let mut literals = Vec::new();
+    collect_paragraph_spans(&parsed.document.children, &mut paragraphs, &mut literals);
+    paragraphs.sort_unstable_by_key(|span| span.start);
+    literals.sort_unstable_by_key(|span| span.start);
+    candidates.retain(|candidate| {
+        let paragraph = paragraphs.partition_point(|span| span.start <= candidate.start);
+        let literal = literals.partition_point(|span| span.end <= candidate.start);
+        paragraph > 0
+            && candidate.end <= paragraphs[paragraph - 1].end
+            && literals
+                .get(literal)
+                .is_none_or(|span| span.start >= candidate.end)
+    });
+    let mut output = Vec::with_capacity(rendered.len());
+    let mut cursor = 0;
+    for candidate in candidates {
+        output.extend_from_slice(&rendered[cursor..candidate.start]);
         let mut previous = None;
-        for byte in line {
-            if *byte == b'-' && previous != Some(b'\\') {
+        for &byte in &rendered[candidate.clone()] {
+            if byte == b'-' && previous != Some(b'\\') {
                 output.push(b'\\');
             }
-            output.push(*byte);
-            previous = Some(*byte);
+            output.push(byte);
+            previous = Some(byte);
         }
+        cursor = candidate.end;
     }
+    output.extend_from_slice(&rendered[cursor..]);
     output
 }
 
-fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginError> {
+fn collect_paragraph_spans(blocks: &[md::Block], spans: &mut Vec<Span>, literals: &mut Vec<Span>) {
+    for block in blocks {
+        match block {
+            md::Block::Paragraph(node) => {
+                spans.extend(node.meta.span);
+                collect_inline_literal_spans(&node.children, literals);
+            }
+            md::Block::BlockQuote(node) => collect_paragraph_spans(&node.children, spans, literals),
+            md::Block::Alert(node) => collect_paragraph_spans(&node.children, spans, literals),
+            md::Block::List(node) => {
+                for item in &node.children {
+                    collect_paragraph_spans(&item.children, spans, literals);
+                }
+            }
+            md::Block::FootnoteDefinition(node) => {
+                collect_paragraph_spans(&node.children, spans, literals)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_inline_literal_spans(inlines: &[md::Inline], spans: &mut Vec<Span>) {
+    for inline in inlines {
+        match inline {
+            md::Inline::Code(node) => spans.extend(node.meta.span),
+            md::Inline::Html(node) => spans.extend(node.meta.span),
+            _ => collect_inline_literal_spans(inline.children(), spans),
+        }
+    }
+}
+
+pub(crate) fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginError> {
     let mut options = SyntaxOptions::gfm();
     options.constructs.frontmatter = true;
     options.parse.preserve_character_escapes = true;
@@ -965,6 +1028,99 @@ mod tests {
             serde_json::to_vec(&third.root).expect("serialize third AST"),
             "{label} AST serialization must be deterministic"
         );
+    }
+
+    #[test]
+    fn qa_code_block_table_like_content_is_not_rewritten() {
+        for source in [
+            "```text\n|---\\---|\n```\n",
+            "    |---\\---|\n",
+            "`start\n|---\\---|\nend`\n",
+            "<pre>\n|---\\---|\n</pre>\n",
+            "---\n|---\\---|\n---\n",
+            "~~~text\r\n|---\\---|\r\n~~~\r\n",
+        ] {
+            let initial = parse_markdown_source_once(source).expect("initial parse");
+            let stable = parse_markdown_source(source).expect("stable parse");
+            assert_eq!(
+                stable.root.children[0].node.payload, initial.root.children[0].node.payload,
+                "verbatim content must survive canonicalization: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qa_generated_verbatim_contexts_preserve_payloads_and_are_deterministic() {
+        fn literals(tree: &NodeTree, output: &mut Vec<Value>) {
+            if matches!(
+                tree.node.kind,
+                NodeKind::CodeBlock | NodeKind::HtmlBlock | NodeKind::Frontmatter
+            ) {
+                output.push(tree.node.payload.clone());
+            }
+            fn inline_codes(value: &Value, output: &mut Vec<Value>) {
+                match value {
+                    Value::Object(object)
+                        if object.get("type").and_then(Value::as_str) == Some("code") =>
+                    {
+                        output.push(object.get("value").unwrap().clone());
+                    }
+                    Value::Object(object) => {
+                        for value in object.values() {
+                            inline_codes(value, output);
+                        }
+                    }
+                    Value::Array(values) => {
+                        for value in values {
+                            inline_codes(value, output);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            inline_codes(&tree.node.payload, output);
+            for child in &tree.children {
+                literals(child, output);
+            }
+        }
+        for body in [
+            "|---\\---|",
+            "|:--\\--:|",
+            "|\\--|--|",
+            "|--\\\\--|",
+            "|---|",
+            "é 😀 |---\\---|",
+        ] {
+            // A bare table delimiter would end the paragraph before its code
+            // span closes. Keep that control case inside a real inline span.
+            let inline_body = if body == "|---|" { "x |---|" } else { body };
+            let sources = [
+                format!("```text\n{body}\n```\n"),
+                format!("~~~\n{body}\n~~~\n"),
+                format!("    {body}\n"),
+                format!("- item\n\n  ```\n  {body}\n  ```\n"),
+                format!("> ```\n> {body}\n> ```\n"),
+                format!("<pre>\n{body}\n</pre>\n"),
+                format!("---\n{body}\n---\n"),
+                format!("`start\n{inline_body}\nend`\n"),
+                format!("**`start\n{inline_body}\nend`**\n"),
+                format!("[`start\n{inline_body}\nend`](url)\n"),
+            ];
+            for source in sources {
+                let initial = parse_markdown_source_once(&source).unwrap();
+                let stable = parse_markdown_source(&source).unwrap();
+                let mut before = Vec::new();
+                let mut after = Vec::new();
+                literals(&initial.root, &mut before);
+                literals(&stable.root, &mut after);
+                assert!(
+                    !before.is_empty(),
+                    "fixture must exercise literal data: {source:?}"
+                );
+                assert_eq!(before, after, "verbatim payload changed: {source:?}");
+                assert_parse_serialize_fixpoint("generated verbatim context", &source);
+            }
+        }
     }
 
     #[test]
