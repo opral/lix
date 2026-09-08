@@ -8,12 +8,14 @@ use core::{
     IdNamespace, OBJECT_MEMBER_SCHEMA_KEY, ROOT_SCHEMA_KEY, RowChange, RowImportBuilder, RowRecord,
 };
 use lix::plugin as sdk;
+use sdk::StateOutput;
 use std::sync::OnceLock;
 
 struct JsonPlugin;
 
 const SCALAR_INDEX_STATE: &[u8] = b"json/scalar-index";
 const SCALAR_SHIFTS_STATE: &[u8] = b"json/scalar-shifts";
+const NODE_IDENTITIES_STATE: &[u8] = b"json/node-identities";
 const ID_NAMESPACE_STATE: &[u8] = b"json/id-namespace";
 const SCALAR_INDEX_MAGIC: &[u8; 4] = b"JSS3";
 const SCALAR_INDEX_HEADER_BYTES: u32 = 16;
@@ -77,10 +79,11 @@ fn cold_parse_changes(
             insert,
         })
         .collect::<Vec<_>>();
-    let (_, changes) = document
+    let (successor, changes) = document
         .file_changed(&splices, create_namespace)
         .map_err(sdk::Error::invalid_input)?;
     sink.put_state(ID_NAMESPACE_STATE, &accepted_namespace.0[..12])?;
+    store_scalar_state(sink, &successor)?;
     emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
     Ok(())
 }
@@ -119,15 +122,14 @@ impl sdk::FileProjection for JsonPlugin {
         let namespace = read_namespace(&update.before, ID_NAMESPACE_STATE)?
             .or_else(|| namespace_from_changes(&changes))
             .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        let document = Document::open_file(before, Some(update.path), namespace)
-            .map(|(document, _)| document)
-            .map_err(sdk::Error::invalid_input)?;
-        let (_, edits) = document
+        let document = open_cached_document(&update.before, before, namespace)?;
+        let (successor, edits) = document
             .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
-        for edit in edits {
-            sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
+        if !edits.is_empty() {
+            sink.replace_all(&successor.bytes())?;
         }
+        store_scalar_state(sink, &successor)?;
         Ok(())
     }
 
@@ -203,23 +205,10 @@ impl sdk::FileProjection for JsonPlugin {
         }
 
         let before_bytes = update.before.read_all()?;
-        let document =
-            Document::open_file(before_bytes, Some(update.before_path), accepted_namespace)
-                .map(|(document, _)| document)
-                .map_err(sdk::Error::invalid_input)?;
+        let document = open_cached_document(&update.before, before_bytes, accepted_namespace)?;
         let (successor, changes) = document
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
-        let (old_index_page_count, old_scalar_page_count) =
-            scalar_page_counts_root(&update.before)?;
-        sink.delete_state(SCALAR_INDEX_STATE)?;
-        for ordinal in 0..old_index_page_count {
-            sink.delete_state(&scalar_index_page_key(ordinal))?;
-        }
-        for ordinal in 0..old_scalar_page_count {
-            sink.delete_state(&scalar_page_key(ordinal))?;
-        }
-        sink.delete_state(SCALAR_SHIFTS_STATE)?;
         store_scalar_state(sink, &successor)?;
         emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
         Ok(())
@@ -303,12 +292,73 @@ fn apply_file_splices(mut bytes: Vec<u8>, splices: &[FileEdit<'_>]) -> sdk::Resu
     Ok(bytes)
 }
 
+fn identity_page_key(ordinal: usize) -> Vec<u8> {
+    let mut key = b"json/node-identity-page/".to_vec();
+    key.extend_from_slice(&(ordinal as u64).to_le_bytes());
+    key
+}
+
+fn store_identity_checkpoint(sink: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
+    let bytes = serde_json::to_vec(&document.identity_checkpoint())
+        .map_err(|error| sdk::Error::invalid_input(error.to_string()))?;
+    sink.delete_state_prefix(b"json/node-identity-page/")?;
+    sink.put_state(NODE_IDENTITIES_STATE, &(bytes.len() as u64).to_le_bytes())?;
+    for (ordinal, page) in bytes.chunks(STATE_PAGE_BYTES).enumerate() {
+        sink.put_state(&identity_page_key(ordinal), page)?;
+    }
+    Ok(())
+}
+
+fn open_cached_document(
+    before: &sdk::Snapshot<'_>,
+    bytes: Vec<u8>,
+    namespace: IdNamespace,
+) -> sdk::Result<Document> {
+    let Some(header) = before.get_state(NODE_IDENTITIES_STATE)? else {
+        return Document::open_file(bytes, None, namespace)
+            .map(|(document, _)| document)
+            .map_err(sdk::Error::invalid_input);
+    };
+    let length = u64::from_le_bytes(
+        header
+            .as_slice()
+            .try_into()
+            .map_err(|_| sdk::Error::invalid_input("invalid JSON identity checkpoint length"))?,
+    );
+    let length = usize::try_from(length)
+        .map_err(|_| sdk::Error::limit_exceeded("JSON identities exceed guest address space"))?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(length)
+        .map_err(|_| sdk::Error::limit_exceeded("JSON identity allocation failed"))?;
+    for ordinal in 0..length.div_ceil(STATE_PAGE_BYTES) {
+        let expected = (length - payload.len()).min(STATE_PAGE_BYTES);
+        let page = before
+            .read_state_range(&identity_page_key(ordinal), 0, expected as u32)?
+            .ok_or_else(|| sdk::Error::invalid_input("JSON identity checkpoint page is missing"))?;
+        if page.len() != expected {
+            return Err(sdk::Error::invalid_input(
+                "JSON identity checkpoint page is truncated",
+            ));
+        }
+        payload.extend_from_slice(&page);
+    }
+    let checkpoint: Vec<(Option<String>, String)> = serde_json::from_slice(&payload)
+        .map_err(|error| sdk::Error::invalid_input(format!("invalid JSON identities: {error}")))?;
+    Document::open_file_with_checkpoint(bytes, namespace, &checkpoint)
+        .map_err(sdk::Error::invalid_input)
+}
+
 fn store_scalar_state(successor: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
     let state = encode_scalar_state(
         &document
             .arena_scalars()
             .map_err(sdk::Error::invalid_input)?,
     )?;
+    successor.delete_state_prefix(b"json/scalar-index-page/")?;
+    successor.delete_state_prefix(b"json/scalar-page/")?;
+    successor.delete_state(SCALAR_SHIFTS_STATE)?;
+    store_identity_checkpoint(successor, document)?;
     successor.put_state(SCALAR_INDEX_STATE, &state.manifest)?;
     for (ordinal, page) in state.index_pages.iter().enumerate() {
         successor.put_state(&scalar_index_page_key(ordinal as u32), page)?;
@@ -337,7 +387,9 @@ fn sparse_scalar_change(
         .before
         .read_state_range(SCALAR_INDEX_STATE, 0, SCALAR_INDEX_HEADER_BYTES)?
         .ok_or_else(|| sdk::Error::invalid_input("JSON scalar index disappeared"))?;
-    if header.get(..4) != Some(SCALAR_INDEX_MAGIC) {
+    if header.len() != SCALAR_INDEX_HEADER_BYTES as usize
+        || header.get(..4) != Some(SCALAR_INDEX_MAGIC)
+    {
         return Err(sdk::Error::invalid_input("unsupported JSON scalar index"));
     }
     let count = u32::from_le_bytes(header[4..8].try_into().expect("fixed JSON index header"));
@@ -386,6 +438,8 @@ fn sparse_scalar_change(
         .ok_or_else(|| sdk::Error::invalid_input("JSON scalar page disappeared"))?;
     let metadata = decode_scalar_metadata(&metadata)?;
     let mut scalar = update.before.read_range(start, length)?;
+    let prior = Document::scalar_change_from_arena(metadata.clone(), &scalar)
+        .map_err(sdk::Error::invalid_input)?;
     let local_start = usize::try_from(edit.offset - start)
         .map_err(|_| sdk::Error::invalid_input("JSON edit offset exceeds guest memory"))?;
     let local_end = local_start
@@ -395,11 +449,16 @@ fn sparse_scalar_change(
         )
         .ok_or_else(|| sdk::Error::invalid_input("JSON edit range overflowed"))?;
     scalar.splice(local_start..local_end, insert.iter().copied());
-    let Some(change) =
+    let Some(mut change) =
         Document::scalar_change_from_arena(metadata, &scalar).map_err(sdk::Error::invalid_input)?
     else {
         return Ok(None);
     };
+    if let (Some(before), Some(after)) = (prior.and_then(|change| change.row), &change.row) {
+        if core::rows_equal_without_layout(&before, after) {
+            change.effect = ChangeEffect::FormatOnly;
+        }
+    }
     let insert_len = u64::try_from(insert.len())
         .map_err(|_| sdk::Error::limit_exceeded("JSON insert exceeds u64"))?;
     let delta = if insert_len >= edit.delete_len {
@@ -434,7 +493,9 @@ fn sparse_semantic_changes(
     else {
         return Ok(None);
     };
-    if header.get(..4) != Some(SCALAR_INDEX_MAGIC) {
+    if header.len() != SCALAR_INDEX_HEADER_BYTES as usize
+        || header.get(..4) != Some(SCALAR_INDEX_MAGIC)
+    {
         return Err(sdk::Error::invalid_input("unsupported JSON scalar index"));
     }
     let count = u32::from_le_bytes(header[4..8].try_into().expect("scalar count"));
@@ -445,6 +506,7 @@ fn sparse_semantic_changes(
             .unwrap_or_default(),
     )?;
     let base_shifts = shifts.clone();
+    let mut seen = std::collections::HashSet::with_capacity(changes.len());
     let mut edits = Vec::with_capacity(changes.len());
     for change in changes {
         let mut matched = None;
@@ -469,11 +531,12 @@ fn sparse_semantic_changes(
             }
         }
         let Some((ordinal, entry, mut metadata)) = matched else {
-            return Err(sdk::Error::invalid_input(format!(
-                "JSON scalar index has no semantic row {}.{:?}; JSON semantic writes support existing scalar values only",
-                change.schema_key, change.row_pk,
-            )));
+            return Ok(None);
         };
+        // Even a later no-op supersedes an earlier change to the same row.
+        if !seen.insert(ordinal) {
+            return Ok(None);
+        }
         let start = effective_scalar_start(entry.start, ordinal, &base_shifts)?;
         let length = effective_scalar_length(entry.length, ordinal, &base_shifts)?;
         metadata.start = u32::try_from(start)
@@ -481,15 +544,12 @@ fn sparse_semantic_changes(
         metadata.length = u32::try_from(length)
             .map_err(|_| sdk::Error::invalid_input("JSON scalar length exceeds u32"))?;
         let current = before.read_range(start, length)?;
-        let Some(edit) =
-            Document::scalar_edit_from_arena(metadata, &current, change).map_err(|error| {
-                sdk::Error::invalid_input(format!(
-                    "JSON indexed semantic row {}.{:?}: {error}",
-                    change.schema_key, change.row_pk
-                ))
-            })?
-        else {
-            continue;
+        let edit = match Document::scalar_edit_from_arena(metadata, &current, change) {
+            Ok(Some(edit)) => edit,
+            Ok(None) => continue,
+            // Reconstruct and validate the whole row batch for changes that
+            // cannot be expressed as independent scalar replacements.
+            Err(_) => return Ok(None),
         };
         let insert_len = i64::try_from(edit.insert.len())
             .map_err(|_| sdk::Error::limit_exceeded("JSON scalar insert exceeds i64"))?;
@@ -512,6 +572,14 @@ fn sparse_semantic_changes(
         edits.push(edit);
     }
     edits.sort_unstable_by_key(|edit| edit.offset);
+    if edits.windows(2).any(|pair| {
+        pair[0]
+            .offset
+            .checked_add(pair[0].delete_len)
+            .is_none_or(|end| end > pair[1].offset)
+    }) {
+        return Ok(None);
+    }
     Ok(Some((edits, shifts)))
 }
 
@@ -814,20 +882,6 @@ fn scalar_index_page_key(ordinal: u32) -> Vec<u8> {
     key
 }
 
-fn scalar_page_counts_root(root: &sdk::Snapshot<'_>) -> sdk::Result<(u32, u32)> {
-    let Some(header) = root.read_state_range(SCALAR_INDEX_STATE, 0, SCALAR_INDEX_HEADER_BYTES)?
-    else {
-        return Ok((0, 0));
-    };
-    if header.get(..4) != Some(SCALAR_INDEX_MAGIC) {
-        return Err(sdk::Error::invalid_input("unsupported JSON scalar index"));
-    }
-    Ok((
-        u32::from_le_bytes(header[12..16].try_into().expect("index page count")),
-        u32::from_le_bytes(header[8..12].try_into().expect("scalar page count")),
-    ))
-}
-
 fn decode_scalar_shifts(bytes: &[u8]) -> sdk::Result<Vec<(u32, i64)>> {
     if bytes.len() % 12 != 0 {
         return Err(sdk::Error::invalid_input(
@@ -964,27 +1018,6 @@ fn emit_change(
         None => sink.delete(&change.schema_key, change.row_pk),
     }
 }
-
-trait StateOutput {
-    fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()>;
-    fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()>;
-}
-macro_rules! impl_state_output {
-    ($type:ty) => {
-        impl StateOutput for $type {
-            fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
-                <$type>::put_state(self, key, value)
-            }
-            fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
-                <$type>::delete_state(self, key)
-            }
-        }
-    };
-}
-impl_state_output!(sdk::RowOutput<'_, '_>);
-impl_state_output!(sdk::RowChangeOutput<'_, '_>);
-impl_state_output!(sdk::FileOutput<'_, '_>);
-impl_state_output!(sdk::FileEditOutput<'_, '_>);
 
 trait MutationOutput {
     fn create(&mut self, schema_key: &str, local_ref: u32, row: &sdk::TypedRow) -> sdk::Result<()>;
@@ -1332,3 +1365,12 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod adapter_qa_tests;
+
+#[cfg(test)]
+mod structural_format_qa_tests;
+
+#[cfg(test)]
+mod structural_moves_qa_tests;

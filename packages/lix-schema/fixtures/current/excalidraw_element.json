@@ -38,6 +38,12 @@
       "type": "text",
       "nullable": false,
       "description": "A stable fractional key representing array order independently from identity."
+    },
+    {
+      "name": "source_json",
+      "type": "text",
+      "nullable": true,
+      "description": "Exact original JSON spelling. A formatting hint only; edited JSONB values remain authoritative."
     }
   ],
   "primary_key": [

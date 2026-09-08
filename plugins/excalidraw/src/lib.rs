@@ -9,6 +9,7 @@ use core::{
     RowRecord,
 };
 use lix::plugin as sdk;
+use sdk::StateOutput;
 use std::sync::OnceLock;
 
 struct ExcalidrawPlugin;
@@ -221,8 +222,7 @@ impl sdk::FileProjection for ExcalidrawPlugin {
         let (document, changes) = document
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
-        replace_element_index(
-            &update.before,
+        store_element_index(
             sink,
             &encode_element_index(&document.arena_element_spans())?,
         )?;
@@ -385,6 +385,7 @@ fn sparse_element_change(
     let leading_json = state_text(&metadata[order_key_end..leading_json_end])?;
 
     let mut element = update.before.read_range(span_offset, span_length)?;
+    let previous = element.clone();
     let local_start = usize::try_from(edit.offset - span_offset)
         .map_err(|_| sdk::Error::invalid_input("Excalidraw edit offset exceeds guest memory"))?;
     let local_end = local_start
@@ -395,12 +396,24 @@ fn sparse_element_change(
     element.splice(local_start..local_end, insert.iter().copied());
     let element_json = String::from_utf8(element)
         .map_err(|error| sdk::Error::invalid_input(format!("invalid Excalidraw UTF-8: {error}")))?;
-    let Some(change) =
+    if element_json.as_bytes() == previous {
+        return Ok(None);
+    }
+    let Some(mut change) =
         Document::element_change_from_source(&id, order_key, leading_json, element_json)
             .map_err(sdk::Error::invalid_input)?
     else {
         return Ok(None);
     };
+
+    if let (Ok(before), Some(row)) = (
+        serde_json::from_slice::<serde_json::Value>(&previous),
+        &change.row,
+    ) && let Some(sdk::TypedValue::Jsonb(after)) = row.get("element_json")
+        && after == &before
+    {
+        change.effect = ChangeEffect::FormatOnly;
+    }
 
     let insert_len = u64::try_from(insert.len())
         .map_err(|_| sdk::Error::limit_exceeded("Excalidraw insert exceeds u64"))?;
@@ -466,6 +479,8 @@ fn store_element_index(
     successor: &mut impl StateOutput,
     encoded: &EncodedElementIndex,
 ) -> sdk::Result<()> {
+    successor.delete_state(ELEMENT_SHIFTS_KEY)?;
+    successor.delete_state_prefix(b"excalidraw/element-index-page/")?;
     let page_count = u32::try_from(encoded.payload.len().div_ceil(ELEMENT_INDEX_PAGE_BYTES))
         .map_err(|_| sdk::Error::limit_exceeded("too many Excalidraw index pages"))?;
     let mut manifest = Vec::with_capacity(ELEMENT_INDEX_HEADER_BYTES as usize);
@@ -482,38 +497,6 @@ fn store_element_index(
         successor.put_state(&element_index_page_key(ordinal as u32), page)?;
     }
     Ok(())
-}
-
-fn replace_element_index(
-    before: &sdk::Snapshot<'_>,
-    successor: &mut impl StateOutput,
-    encoded: &EncodedElementIndex,
-) -> sdk::Result<()> {
-    let old_page_count = element_index_page_count(before)?;
-    store_element_index(successor, encoded)?;
-    let new_page_count = u32::try_from(encoded.payload.len().div_ceil(ELEMENT_INDEX_PAGE_BYTES))
-        .map_err(|_| sdk::Error::limit_exceeded("too many Excalidraw index pages"))?;
-    for ordinal in new_page_count..old_page_count {
-        successor.delete_state(&element_index_page_key(ordinal))?;
-    }
-    Ok(())
-}
-
-fn element_index_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
-    let Some(header) = root.read_state_range(ELEMENT_INDEX_KEY, 0, ELEMENT_INDEX_HEADER_BYTES)?
-    else {
-        return Ok(0);
-    };
-    if header.get(..4) != Some(ELEMENT_INDEX_MAGIC) {
-        return Err(sdk::Error::invalid_input(
-            "unsupported Excalidraw element index",
-        ));
-    }
-    Ok(u32::from_le_bytes(
-        header[12..16]
-            .try_into()
-            .expect("fixed Excalidraw manifest"),
-    ))
 }
 
 fn element_index_page_key(ordinal: u32) -> Vec<u8> {
@@ -690,27 +673,6 @@ where
     }
     Ok(())
 }
-
-trait StateOutput {
-    fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()>;
-    fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()>;
-}
-macro_rules! impl_state_output {
-    ($type:ty) => {
-        impl StateOutput for $type {
-            fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
-                <$type>::put_state(self, key, value)
-            }
-            fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
-                <$type>::delete_state(self, key)
-            }
-        }
-    };
-}
-impl_state_output!(sdk::RowOutput<'_, '_>);
-impl_state_output!(sdk::RowChangeOutput<'_, '_>);
-impl_state_output!(sdk::FileOutput<'_, '_>);
-impl_state_output!(sdk::FileEditOutput<'_, '_>);
 
 trait MutationOutput {
     fn upsert(
@@ -901,3 +863,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod qa_tests;
