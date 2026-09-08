@@ -3373,6 +3373,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "futures-lite",
  "futures-util",
  "lix",
  "object_store 0.14.0",

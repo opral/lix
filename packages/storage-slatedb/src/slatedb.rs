@@ -2943,8 +2943,13 @@ impl StorageRead for SlateDBRead {
                 }
                 let mut results =
                     vec![value.map(|value| project_value(value, request.opts.projection))];
-                hydrate_immutable_value_gets(&self.immutable_value_store, requests, &mut results)
-                    .await?;
+                hydrate_immutable_value_gets(
+                    &self.worker,
+                    &self.immutable_value_store,
+                    requests,
+                    &mut results,
+                )
+                .await?;
                 return Ok(GetManyResult::new(results));
             }
 
@@ -3027,8 +3032,13 @@ impl StorageRead for SlateDBRead {
             }
             let unexpected_value = values.next();
             debug_assert!(unexpected_value.is_none());
-            hydrate_immutable_value_gets(&self.immutable_value_store, requests, &mut results)
-                .await?;
+            hydrate_immutable_value_gets(
+                &self.worker,
+                &self.immutable_value_store,
+                requests,
+                &mut results,
+            )
+            .await?;
             Ok(GetManyResult::new(results))
         }
     }
@@ -3132,6 +3142,7 @@ impl StorageScanSource for SlateDBScanSource {
             }
             let (mut entries, has_more) = chunk.into_parts();
             hydrate_immutable_value_scan(
+                &self.worker,
                 &self.immutable_value_store,
                 self.space,
                 self.projection,
@@ -3373,6 +3384,7 @@ enum StreamingMergeDecision {
 }
 
 async fn hydrate_immutable_value_gets(
+    worker: &SlateDBWorker,
     immutable_value_store: &ImmutableValueStore,
     requests: &[GetManyRequest<'_>],
     results: &mut [Option<ProjectedValue>],
@@ -3393,8 +3405,12 @@ async fn hydrate_immutable_value_gets(
     if targets.is_empty() {
         return Ok(());
     }
-    let values = immutable_value_store
-        .get_many(targets.iter().map(|(_, marker)| marker.clone()).collect())
+    let store = immutable_value_store.clone();
+    let markers = targets.iter().map(|(_, marker)| marker.clone()).collect();
+    // Commit coordination may run without a caller Tokio runtime. Dispatch
+    // both cache I/O and object-store misses through the adapter's worker.
+    let values = worker
+        .call_read(move |_db| async move { store.get_many(markers).await })
         .await?;
     for ((result_index, _), value) in targets.into_iter().zip(values) {
         results[result_index] = Some(ProjectedValue::FullValue(value));
@@ -3403,6 +3419,7 @@ async fn hydrate_immutable_value_gets(
 }
 
 async fn hydrate_immutable_value_scan(
+    worker: &SlateDBWorker,
     immutable_value_store: &ImmutableValueStore,
     space: StorageSpace,
     projection: CoreProjection,
@@ -3412,18 +3429,18 @@ async fn hydrate_immutable_value_scan(
     {
         return Ok(());
     }
-    let values = immutable_value_store
-        .get_many(
-            entries
-                .iter()
-                .map(|entry| match &entry.value {
-                    ProjectedValue::FullValue(marker) => Ok(marker.clone()),
-                    ProjectedValue::KeyOnly => Err(StorageError::Corruption(
-                        "immutable full-value scan returned a key-only marker".to_string(),
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )
+    let markers = entries
+        .iter()
+        .map(|entry| match &entry.value {
+            ProjectedValue::FullValue(marker) => Ok(marker.clone()),
+            ProjectedValue::KeyOnly => Err(StorageError::Corruption(
+                "immutable full-value scan returned a key-only marker".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let store = immutable_value_store.clone();
+    let values = worker
+        .call_read(move |_db| async move { store.get_many(markers).await })
         .await?;
     for (entry, value) in entries.iter_mut().zip(values) {
         entry.value = ProjectedValue::FullValue(value);
@@ -3617,8 +3634,9 @@ impl StorageWrite for SlateDBWrite {
                         .immutable_locator_rows
                         .fetch_add(immutable_locators.len() as u64, Ordering::Relaxed);
                 }
-                self.immutable_value_store
-                    .put_segments(immutable_segments)
+                let store = self.immutable_value_store.clone();
+                self.worker
+                    .call(move |_db| async move { store.put_segments(immutable_segments).await })
                     .await?;
                 for (physical_key, locator) in immutable_locators {
                     self.overlay.insert(physical_key, Some(locator));
@@ -3704,8 +3722,9 @@ impl StorageWrite for SlateDBWrite {
                     .immutable_locator_rows
                     .fetch_add(immutable_locators.len() as u64, Ordering::Relaxed);
             }
-            self.immutable_value_store
-                .put_segments(immutable_segments)
+            let store = self.immutable_value_store.clone();
+            self.worker
+                .call(move |_db| async move { store.put_segments(immutable_segments).await })
                 .await?;
             for (physical_key, locator) in immutable_locators {
                 self.overlay.insert(physical_key, Some(locator));
@@ -4259,7 +4278,9 @@ impl SlateDBWorker {
 
     async fn wait_for_reclamation(&self) -> Result<(), StorageError> {
         let reclamation = self.inner.reclamation.clone();
-        tokio::task::spawn_blocking(move || reclamation.wait_until_idle())
+        self.inner
+            .runtime
+            .spawn_blocking(move || reclamation.wait_until_idle())
             .await
             .map_err(|error| StorageError::Io(format!("join SlateDB reclamation task: {error}")))
     }

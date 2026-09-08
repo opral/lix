@@ -54,6 +54,210 @@ async fn cached_slatedb_passes_storage_conformance() {
 }
 
 #[tokio::test]
+async fn cached_explicit_directory_transaction_commits_and_reopens() {
+    Box::pin(assert_cached_explicit_directory_transaction()).await;
+}
+
+#[test]
+fn cached_explicit_directory_transaction_works_without_caller_tokio_runtime() {
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    futures_lite::future::block_on(Box::pin(assert_cached_explicit_directory_transaction()));
+}
+
+async fn assert_cached_explicit_directory_transaction() {
+    let directory = tempfile::tempdir().expect("create cached transaction fixture");
+    let cache_path = directory.path().join("cache");
+    let mut backend = FaultStore::new(Arc::new(InMemory::new()));
+    // S3 and other async stores need a Tokio context even when the engine's
+    // executor does not. Require it on cache misses as well as cache hits.
+    backend.require_runtime = true;
+    let backend = Arc::new(backend);
+    let open_storage = || {
+        SlateDB::open_object_store_with_options(
+            "cached-explicit-transaction",
+            backend.clone(),
+            SlateDBObjectStoreOptions {
+                cache: Some(cache_options(cache_path.clone())),
+            },
+        )
+        .expect("open cached transaction storage")
+    };
+    let storage = open_storage();
+    let lix = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("open cached transaction repository");
+    lix.execute(
+        "INSERT INTO lix_directory (path) VALUES ('/source/empty')",
+        &[],
+    )
+    .await
+    .expect("create directory and empty descendant");
+    let content = vec![0x61_u8; 128 * 1024];
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ('/source/note.bin', $1)",
+        &[Value::Blob(content.clone().into())],
+    )
+    .await
+    .expect("create file before explicit transaction");
+
+    let mut transaction = lix
+        .begin_transaction()
+        .await
+        .expect("begin explicit transaction");
+    transaction
+        .execute(
+            "UPDATE lix_directory SET path = '/target' WHERE path = '/source'",
+            &[],
+        )
+        .await
+        .expect("stage directory move");
+    transaction
+        .commit()
+        .await
+        .expect("commit cached directory move");
+
+    let mut rollback = lix
+        .begin_transaction()
+        .await
+        .expect("begin rollback transaction");
+    rollback
+        .execute("DELETE FROM lix_directory WHERE path = '/target'", &[])
+        .await
+        .expect("stage directory deletion");
+    rollback
+        .rollback()
+        .await
+        .expect("rollback directory deletion");
+    drop(lix);
+    storage
+        .flush()
+        .await
+        .expect("flush without borrowing caller runtime");
+    drop(storage);
+    // Force immutable content to hydrate from the object store on reopen.
+    std::fs::remove_dir_all(&cache_path).expect("clear disk cache before cold reopen");
+    let storage = open_storage();
+    let reopened = open_lix()
+        .with_storage(storage.clone())
+        .await
+        .expect("cold reopen cached transaction repository");
+    let file = reopened
+        .execute("SELECT path, content FROM lix_file", &[])
+        .await
+        .expect("read moved file after cold reopen");
+    assert_eq!(file.len(), 1);
+    assert_eq!(
+        file.rows()[0].get::<String>("path").unwrap(),
+        "/target/note.bin"
+    );
+    assert_eq!(file.rows()[0].get::<Vec<u8>>("content").unwrap(), content);
+    let directories = reopened
+        .execute("SELECT path FROM lix_directory ORDER BY path", &[])
+        .await
+        .expect("read empty descendant after cold reopen");
+    assert_eq!(directories.len(), 2);
+    assert_eq!(
+        directories.rows()[0].get::<String>("path").unwrap(),
+        "/target"
+    );
+    assert_eq!(
+        directories.rows()[1].get::<String>("path").unwrap(),
+        "/target/empty"
+    );
+    drop(reopened);
+    storage
+        .flush()
+        .await
+        .expect("flush reopened cached repository");
+}
+
+#[test]
+fn cached_immutable_replacement_works_without_caller_tokio_runtime() {
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    futures_lite::future::block_on(async {
+        let directory = tempfile::tempdir().expect("create cached replacement fixture");
+        let mut backend = FaultStore::new(Arc::new(InMemory::new()));
+        backend.require_runtime = true;
+        let storage = SlateDB::open_object_store_with_options(
+            "cached-immutable-replacement",
+            Arc::new(backend),
+            SlateDBObjectStoreOptions {
+                cache: Some(cache_options(directory.path().join("cache"))),
+            },
+        )
+        .expect("open cached replacement storage");
+        let space = StorageSpace::immutable(SpaceId(0x00ff_0001), "test.immutable");
+        let key = Key(Bytes::from_static(b"replacement-key"));
+        let batch = |value: &'static [u8]| PutBatch {
+            entries: vec![PutEntry {
+                key: key.clone(),
+                value: StoredValue {
+                    bytes: Bytes::from_static(value),
+                },
+            }],
+        };
+        let mut initial = storage.begin_write(WriteOptions::default()).await.unwrap();
+        initial.put_many(space, batch(b"before")).await.unwrap();
+        initial.commit().await.unwrap();
+        let mut replacement = storage.begin_write(WriteOptions::default()).await.unwrap();
+        replacement
+            .replace_many(space, batch(b"after"))
+            .await
+            .unwrap();
+        replacement.commit().await.unwrap();
+        let read = storage.begin_read(ReadOptions::default()).await.unwrap();
+        let actual = read
+            .get_many(&[GetManyRequest {
+                space,
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions {
+                    projection: CoreProjection::FullValue,
+                },
+            }])
+            .await
+            .expect("hydrate replacement point read outside Tokio");
+        assert_eq!(
+            actual.values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from_static(
+                b"after"
+            )))]
+        );
+        let mut scan = read
+            .begin_scan(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions {
+                    projection: CoreProjection::FullValue,
+                    ..BeginScanOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (entries, has_more) = scan
+            .next_page(10)
+            .await
+            .expect("hydrate replacement scan outside Tokio")
+            .into_parts();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].value,
+            ProjectedValue::FullValue(Bytes::from_static(b"after"))
+        );
+        assert!(!has_more);
+        drop(scan);
+        drop(read);
+        storage
+            .flush()
+            .await
+            .expect("flush replacement outside Tokio");
+    });
+}
+
+#[tokio::test]
 async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
     let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
     let path = temp_dir.path().join("file-sql.slatedb");
@@ -623,6 +827,7 @@ struct FaultStore {
     inner: Arc<InMemory>,
     fail_writes: Arc<AtomicBool>,
     write_ops: Arc<AtomicU64>,
+    require_runtime: bool,
 }
 
 impl FaultStore {
@@ -631,6 +836,7 @@ impl FaultStore {
             inner,
             fail_writes: Arc::new(AtomicBool::new(false)),
             write_ops: Arc::new(AtomicU64::new(0)),
+            require_runtime: false,
         }
     }
 
@@ -661,6 +867,12 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
+        if self.require_runtime {
+            assert!(
+                tokio::runtime::Handle::try_current().is_ok(),
+                "object-store put requires its adapter runtime"
+            );
+        }
         self.write_ops.fetch_add(1, Ordering::Relaxed);
         if self.should_fail_writes() {
             return Err(fault_error());
@@ -685,6 +897,12 @@ impl ObjectStore for FaultStore {
         location: &Path,
         options: ObjectStoreGetOptions,
     ) -> ObjectStoreResult<GetResult> {
+        if self.require_runtime {
+            assert!(
+                tokio::runtime::Handle::try_current().is_ok(),
+                "object-store get requires its adapter runtime"
+            );
+        }
         self.inner.get_opts(location, options).await
     }
 
@@ -693,6 +911,12 @@ impl ObjectStore for FaultStore {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> ObjectStoreResult<Vec<Bytes>> {
+        if self.require_runtime {
+            assert!(
+                tokio::runtime::Handle::try_current().is_ok(),
+                "object-store range read requires its adapter runtime"
+            );
+        }
         self.inner.get_ranges(location, ranges).await
     }
 
