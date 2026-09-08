@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use lix::{CreateBranchOptions, ObserveEvent, ObserveEvents, SwitchBranchOptions, Value, open_lix};
 
-const FILES_SQL: &str = "SELECT path, content FROM lix_file ORDER BY path";
+const FILES_SQL: &str =
+    "SELECT path, content FROM lix_file WHERE path NOT LIKE '/.lix/%' ORDER BY path";
 
 async fn next_event(events: &mut ObserveEvents) -> ObserveEvent {
     tokio::time::timeout(Duration::from_secs(2), events.next())

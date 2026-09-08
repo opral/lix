@@ -2592,10 +2592,19 @@ mod tests {
             .expect("default head");
         let mut snapshot_commits = BTreeMap::new();
         let mut snapshot_headers = BTreeMap::new();
-        for branch_head in branches
+        // Match production snapshot fetching: checkpoints have authored content
+        // too, including the files in main's bootstrap commit.
+        let snapshot_heads = branches
             .iter()
-            .filter_map(|branch| branch.head_commit_id.as_deref())
-        {
+            .flat_map(|branch| {
+                [
+                    branch.head_commit_id.as_deref(),
+                    branch.checkpoint_commit_id.as_deref(),
+                ]
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        for branch_head in snapshot_heads {
             let page = authority
                 .sync_history(branch_head, 1)
                 .await

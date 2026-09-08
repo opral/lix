@@ -1673,7 +1673,11 @@ mod tests {
             .expect("scan CAS chunks")
             .into_parts();
         assert!(!chunks_has_more);
-        assert_eq!(chunks.len(), 2, "identical media must reuse payloads");
+        assert_eq!(
+            chunks.len(),
+            3,
+            "two media chunks plus the bootstrap README; identical media must reuse payloads"
+        );
     }
 
     #[tokio::test]

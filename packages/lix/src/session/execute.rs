@@ -6852,13 +6852,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(exact_directories, relational_directories);
-        assert_eq!(exact_directories.rows().len(), 2);
+        assert_eq!(exact_directories.rows().len(), 3);
         assert_eq!(
-            exact_directories.rows()[0].get::<String>("id").unwrap(),
-            "01920000-0000-7000-8000-0000000000d2"
+            exact_directories.rows()[0].get::<String>("path").unwrap(),
+            "/.lix"
         );
         assert_eq!(
             exact_directories.rows()[1].get::<String>("id").unwrap(),
+            "01920000-0000-7000-8000-0000000000d2"
+        );
+        assert_eq!(
+            exact_directories.rows()[2].get::<String>("id").unwrap(),
             "01920000-0000-7000-8000-0000000000d1"
         );
     }
@@ -11720,7 +11724,7 @@ mod tests {
 
         assert_eq!(batch.results.len(), 3);
         assert_eq!(batch.results[0].rows()[0].get::<i64>("one").unwrap(), 1);
-        assert_eq!(batch.results[1].rows()[0].get::<i64>("files").unwrap(), 0);
+        assert_eq!(batch.results[1].rows()[0].get::<i64>("files").unwrap(), 1);
         assert!(batch.results[2].rows()[0].get::<i64>("changes").unwrap() > 0);
     }
 
@@ -11742,7 +11746,7 @@ mod tests {
             )
             .await
             .expect("nested CTE, self-join, and UNION should resolve providers");
-        assert_eq!(complex.rows()[0].get::<i64>("row_count").unwrap(), 0);
+        assert_eq!(complex.rows()[0].get::<i64>("row_count").unwrap(), 1);
 
         let catalog = session
             .execute(

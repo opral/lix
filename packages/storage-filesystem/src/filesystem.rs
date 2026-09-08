@@ -612,8 +612,60 @@ impl FilesystemSupervisor {
             last_materialized: Mutex::new(None),
         });
 
-        state.sync_disk_to_lix(false).await?;
+        // Storage creation is not evidence that repository content reached disk.
+        // Read completion at sync startup so separately opened handles and process
+        // restarts agree on whether missing paths can represent deletions.
+        let completion = state
+            .layout
+            .lix_dir
+            .join(".internal/filesystem-materialized");
+        let initial_import = !completion.try_exists().map_err(|error| {
+            io_error("read filesystem materialization marker", &completion, error)
+        })?;
+        state
+            .sync_disk_to_lix_with_initial_import(false, initial_import)
+            .await?;
         state.sync_from_lix().await?;
+        if initial_import && state.path_filter().is_unfiltered() {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&completion)
+            {
+                Ok(marker) => {
+                    marker.sync_all().map_err(|error| {
+                        io_error(
+                            "persist filesystem materialization marker",
+                            &completion,
+                            error,
+                        )
+                    })?;
+                    #[cfg(unix)]
+                    {
+                        let parent = completion
+                            .parent()
+                            .expect("marker has an internal directory");
+                        std::fs::File::open(parent)
+                            .and_then(|directory| directory.sync_all())
+                            .map_err(|error| {
+                                io_error(
+                                    "persist filesystem materialization directory",
+                                    parent,
+                                    error,
+                                )
+                            })?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(io_error(
+                        "write filesystem materialization marker",
+                        &completion,
+                        error,
+                    ));
+                }
+            }
+        }
 
         let (event_tx, event_rx) = mpsc::channel();
         let callback_tx = event_tx.clone();
@@ -813,6 +865,15 @@ impl FilesystemState {
     }
 
     async fn sync_disk_to_lix(&self, skip_if_last_materialized: bool) -> Result<(), LixError> {
+        self.sync_disk_to_lix_with_initial_import(skip_if_last_materialized, false)
+            .await
+    }
+
+    async fn sync_disk_to_lix_with_initial_import(
+        &self,
+        skip_if_last_materialized: bool,
+        initial_import: bool,
+    ) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
         let path_filter = self.path_filter();
         let local = collect_local_snapshot(&self.layout, &path_filter)?;
@@ -824,7 +885,14 @@ impl FilesystemState {
                 return Ok(());
             }
         }
-        let previous = self.last_materialized_disk();
+        // A new repository has never materialized its bootstrap content. Treat
+        // absent disk paths as not yet exported, not as user deletions. Existing
+        // disk files are still imported and take precedence at matching paths.
+        let previous = if initial_import {
+            Some(Snapshot::default())
+        } else {
+            self.last_materialized_disk()
+        };
         let lix = self
             .apply_local_snapshot_to_lix_with_filter(&local, previous.as_ref(), &path_filter)
             .await?;
