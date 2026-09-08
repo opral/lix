@@ -75,9 +75,9 @@ pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-// v7 restores durable local writes. Older serving-cache clients cannot safely
-// reopen a store containing unacknowledged local commits.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 7;
+// v8 carries canonical typed row payloads for custom schemas. Older peers
+// cannot preserve their typed identity from JSON alone.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 8;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

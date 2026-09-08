@@ -151,6 +151,7 @@ pub struct SyncSnapshotRow {
     pub file_id: Option<String>,
     pub row_pk: serde_json::Value,
     pub snapshot: Option<serde_json::Value>,
+    pub snapshot_payload: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub change_id: String,
     pub commit_id: String,

@@ -369,7 +369,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     assign_local_overlay_parents(&*read, &commit_rows, &mut tracked_roots).await?;
     // v69 certified batches are already native packet pages and do not need
     // expansion through an intermediate JSON-root representation.
-    let certified_packet_root_rows = BTreeMap::<CommitId, Vec<MaterializedHotStateRow>>::new();
     let checkpoint_epochs = checkpoint_epoch_bindings(&prepared_writes.checkpoint_publications)?;
     let checkpoint_state_sources =
         checkpoint_state_source_bindings(&prepared_writes.checkpoint_publications)?;
@@ -719,7 +718,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             &staged_commits,
             &selected_change_records,
             &selected_change_payloads,
-            &certified_packet_root_rows,
             &ordered_replacements,
             &staged_delta_index,
             &checkpoint_state_sources,
@@ -2244,7 +2242,6 @@ fn materialize_staged_sync_commits(
         SelectedChangeKey,
         crate::changelog::MaterializedChangePayload,
     >,
-    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedHotStateRow>>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     staged_delta_index: &StagedCommitDeltaIndex,
     checkpoint_state_sources: &BTreeMap<CommitId, CommitId>,
@@ -2266,8 +2263,9 @@ fn materialize_staged_sync_commits(
         {
             let row = state_rows.row(row_index);
             let delta = tracked_delta_from_state_row(row)?;
-            let snapshot_json = row
-                .materialize_decoded_snapshot()?
+            let decoded_snapshot = row.materialize_decoded_snapshot()?;
+            let snapshot_json = decoded_snapshot
+                .as_ref()
                 .map(|snapshot| snapshot.to_json_shared())
                 .transpose()?;
             let metadata_json = row
@@ -2288,6 +2286,7 @@ fn materialize_staged_sync_commits(
                 row_pk: delta.row_pk,
                 deleted: delta.deleted,
                 snapshot_json: snapshot_json.as_deref(),
+                decoded_snapshot: decoded_snapshot.as_deref(),
                 metadata_json: metadata_json.as_deref(),
                 row_created_at: delta.created_at,
                 row_updated_at: delta.updated_at,
@@ -2330,12 +2329,13 @@ fn materialize_staged_sync_commits(
                 })?;
             for (row, &change_id) in journal.iter().zip(change_ids) {
                 let row_pk = RowPk::single(row.identity());
-                let snapshot_json = std::str::from_utf8(row.snapshot()).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("ordered sync snapshot is not UTF-8 JSON: {error}"),
-                    )
-                })?;
+                let decoded_snapshot =
+                    crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+                        Arc::from(row.snapshot()),
+                        journal.schema_key(),
+                        &row_pk,
+                    )?;
+                let snapshot_json = decoded_snapshot.to_json_shared()?;
                 members.push(encode_sync_commit_member(SyncCommitMemberRef {
                     change_id,
                     authored: true,
@@ -2343,7 +2343,8 @@ fn materialize_staged_sync_commits(
                     file_id: None,
                     row_pk: &row_pk,
                     deleted: false,
-                    snapshot_json: Some(snapshot_json),
+                    snapshot_json: Some(snapshot_json.as_str()),
+                    decoded_snapshot: Some(&decoded_snapshot),
                     metadata_json: None,
                     row_created_at: lifecycle_created_at,
                     row_updated_at: journal.timestamp(),
@@ -2352,34 +2353,6 @@ fn materialize_staged_sync_commits(
                     origin_key: None,
                 })?);
             }
-        }
-
-        for row in certified_packet_root_rows
-            .get(commit_id)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            let change_id = row.change_id.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "sync preflight certified row lacks a change id",
-                )
-            })?;
-            members.push(encode_sync_commit_member(SyncCommitMemberRef {
-                change_id,
-                authored: true,
-                schema_key: &row.schema_key,
-                file_id: row.file_id.as_deref(),
-                row_pk: &row.row_pk,
-                deleted: row.deleted,
-                snapshot_json: row.snapshot_content.as_deref(),
-                metadata_json: row.metadata.as_deref(),
-                row_created_at: row.created_at,
-                row_updated_at: row.updated_at,
-                change_account_id: active_account_id,
-                change_created_at: row.updated_at,
-                origin_key: None,
-            })?);
         }
 
         for change_ref in selected_changes(&staged.selected_change_batches) {
@@ -2394,6 +2367,7 @@ fn materialize_staged_sync_commits(
                 row_pk: change_ref.row_pk(),
                 deleted: change_ref.deleted,
                 snapshot_json: payload.and_then(|payload| payload.snapshot_content.as_deref()),
+                decoded_snapshot: payload.and_then(|payload| payload.decoded_snapshot.as_deref()),
                 metadata_json: payload.and_then(|payload| payload.metadata.as_deref()),
                 row_created_at: change_ref.created_at,
                 row_updated_at: change_ref.updated_at,

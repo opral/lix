@@ -527,7 +527,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 7 }
+      schema: { type: integer, const: 8 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -585,7 +585,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 6 }
-        syncProtocolVersion: { type: integer, const: 7 }
+        syncProtocolVersion: { type: integer, const: 8 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -660,7 +660,7 @@ components:
       description: Sync-only physical row identity components in declared primary-key order; this is not the public SQL/SDK lix_row_ref.
     SyncCommitMember:
       type: object
-      required: [changeId, authored, schemaKey, rowPk, deleted, rowCreatedAt, rowUpdatedAt, changeAccountId, changeCreatedAt]
+      required: [changeId, authored, schemaKey, rowPk, deleted, snapshot, snapshotPayload, rowCreatedAt, rowUpdatedAt, changeAccountId, changeCreatedAt]
       properties:
         changeId: { type: string, minLength: 1 }
         authored: { type: boolean }
@@ -669,6 +669,7 @@ components:
         rowPk: { $ref: "#/components/schemas/SyncRowPk" }
         deleted: { type: boolean }
         snapshot: {}
+        snapshotPayload: { type: [string, "null"], contentEncoding: base64, description: Canonical Schema v1 typed row payload; required for live rows and null for tombstones. }
         metadata: {}
         rowCreatedAt: { type: string, minLength: 1 }
         rowUpdatedAt: { type: string, minLength: 1 }
@@ -738,13 +739,14 @@ components:
         firstParentJumpSpan: { type: [integer, "null"], minimum: 1 }
     SyncSnapshotRow:
       type: object
-      required: [branchId, schemaKey, rowPk, changeId, commitId, createdAt, updatedAt, changeAccountId, changeCreatedAt]
+      required: [branchId, schemaKey, rowPk, snapshot, snapshotPayload, changeId, commitId, createdAt, updatedAt, changeAccountId, changeCreatedAt]
       properties:
         branchId: { type: string }
         schemaKey: { type: string }
         fileId: { type: [string, "null"] }
         rowPk: { $ref: "#/components/schemas/SyncRowPk" }
         snapshot: {}
+        snapshotPayload: { type: [string, "null"], contentEncoding: base64, description: Canonical Schema v1 typed row payload; required for live rows and null for tombstones. }
         metadata: {}
         changeId: { type: string }
         commitId: { type: string }
