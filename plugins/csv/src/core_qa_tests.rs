@@ -462,6 +462,55 @@ fn qa_utf8_bom_is_preserved_outside_first_quoted_cell() {
 }
 
 #[test]
+fn qa_bom_body_edits_keep_the_affected_row_window_local() {
+    let mut source = String::from("\u{feff}");
+    for ordinal in 0..4_096 {
+        use std::fmt::Write as _;
+        writeln!(source, "row{ordinal},value").unwrap();
+    }
+    let before = open(source.as_bytes());
+    let offset = source.find("row2048,value").unwrap() + "row2048,".len();
+    for insert in [b"longer-value".as_slice(), b"\"multiline\nvalue\""] {
+        let (after, changes) = before
+            .file_changed(
+                &[FileEdit {
+                    offset: offset as u64,
+                    delete_len: 5,
+                    insert,
+                }],
+                IdNamespace::from_halves(0xb0, 1),
+            )
+            .unwrap();
+        assert!(
+            after.0.sparse_rows_touched <= 2 * ROWS_PER_CHUNK,
+            "BOM body edit reparsed {} rows",
+            after.0.sparse_rows_touched
+        );
+        assert_reconstructs(&after);
+        let replayed = Document::open_rows(
+            apply_row_changes(before.row_records().unwrap(), &changes).unwrap(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(replayed.bytes(), after.bytes());
+    }
+    let empty = open(UTF8_BOM);
+    let after = empty
+        .file_changed(
+            &[FileEdit {
+                offset: 3,
+                delete_len: 0,
+                insert: b"first,row\n",
+            }],
+            IdNamespace::from_halves(0xb0, 2),
+        )
+        .unwrap()
+        .0;
+    assert_eq!(after.bytes(), b"\xef\xbb\xbffirst,row\n");
+    assert_reconstructs(&after);
+}
+
+#[test]
 fn qa_repeated_edits_replay_after_identity_checkpoint_reopen() {
     let mut document = open(b"a,b\r\n\"c\",d\nlast");
     for revision in 0..80 {

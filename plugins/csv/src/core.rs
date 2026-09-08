@@ -2169,7 +2169,13 @@ impl Document {
         if descriptor_dialect_changed {
             return self.reparse_after_descriptor_change(after, after_path, namespace);
         }
-        if self.0.dialect.bom || after.range(0, after.len().min(UTF8_BOM.len()))? == UTF8_BOM {
+        let successor_bom = after.range(0, after.len().min(UTF8_BOM.len()))? == UTF8_BOM;
+        if self.0.dialect.bom != successor_bom
+            || (self.0.dialect.bom
+                && splices
+                    .iter()
+                    .any(|edit| edit.offset < UTF8_BOM.len() as u64))
+        {
             return self.reparse_with_dialect(after, self.0.dialect, namespace, false);
         }
 
@@ -2185,8 +2191,13 @@ impl Document {
                     .and_then(|ordinal| self.0.index.ordinal_location(ordinal));
             }
         }
-        let old_start = first_old.map_or(0, |location| self.0.index.row_start(location));
-        let old_end = last_old.map_or(0, |location| self.0.index.row_end(location));
+        let prefix_len = if self.0.dialect.bom {
+            UTF8_BOM.len() as u32
+        } else {
+            0
+        };
+        let old_start = first_old.map_or(prefix_len, |location| self.0.index.row_start(location));
+        let old_end = last_old.map_or(prefix_len, |location| self.0.index.row_end(location));
         let new_start = map_offset(old_start, splices, false)?;
         let mut new_end = map_offset(old_end, splices, true)?;
         if new_end < new_start || new_end > after.len() {
