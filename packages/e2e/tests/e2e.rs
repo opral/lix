@@ -1161,6 +1161,181 @@ async fn csv_byte_edit_after_semantic_render_uses_successor_row_boundaries() {
 }
 
 #[tokio::test]
+async fn csv_equal_length_multirow_edit_preserves_cells_and_identities() {
+    let lix = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv",
+        &build_csv_plugin_archive(),
+        &["csv_table", "csv_row"],
+    )
+    .await;
+    let path = "/multirow-qa.csv";
+    write_file(&lix, path, b"alpha,one\nbeta,two\n".to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let initial = active_csv_rows(&lix, &file_id).await;
+    write_file(&lix, path, b"alpha,ONE\nbeta,TWO\n".to_vec())
+        .await
+        .expect("valid same-length edit spanning two records");
+    let rows = active_csv_rows(&lix, &file_id).await;
+    assert_eq!(
+        csv_row_id(&rows, &["alpha", "ONE"]),
+        csv_row_id(&initial, &["alpha", "one"])
+    );
+    assert_eq!(
+        csv_row_id(&rows, &["beta", "TWO"]),
+        csv_row_id(&initial, &["beta", "two"])
+    );
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"alpha,ONE\nbeta,TWO\n".to_vec())
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn csv_quoted_and_empty_cell_edits_survive_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv",
+        &build_csv_plugin_archive(),
+        &["csv_table", "csv_row"],
+    )
+    .await;
+    let path = "/quoted-empty-qa.csv";
+    write_file(&lix, path, b"\"alpha\",one\r\nlast".to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let rows = active_csv_rows(&lix, &file_id).await;
+    for (id, cells) in [
+        (
+            csv_row_id(&rows, &["alpha", "one"]),
+            serde_json::json!(["alpha,changed", "one"]),
+        ),
+        (csv_row_id(&rows, &["last"]), serde_json::json!([""])),
+    ] {
+        lix.execute(
+            "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+            &[
+                Value::Jsonb(cells.into()),
+                Value::Text(id),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    let expected = b"\"alpha,changed\",one\r\n\"\"".to_vec();
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(expected.clone()));
+    lix.close().await.unwrap();
+    let reopened = open_rocksdb_lix(root.path()).await;
+    assert_eq!(read_file(&reopened, path).await.unwrap(), Some(expected));
+    let rows = active_csv_rows(&reopened, &file_id).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| row.cells == [""]));
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn csv_cross_record_quotes_and_crlf_keep_semantic_rows_consistent() {
+    let lix = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv",
+        &build_csv_plugin_archive(),
+        &["csv_table", "csv_row"],
+    )
+    .await;
+    let path = "/quoted-window-qa.csv";
+    write_file(&lix, path, b"a\nb\nc\"\nd\n".to_vec())
+        .await
+        .unwrap();
+    write_file(&lix, path, b"\"a\nb\nc\"\nd\n".to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let rows = active_csv_rows(&lix, &file_id).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].cells, ["a\nb\nc"]);
+    assert_eq!(rows[1].cells, ["d"]);
+    write_file(&lix, path, b"a\nb\rc\r\nd".to_vec())
+        .await
+        .unwrap();
+    let expected = b"a\nb\r\nc\r\nd".to_vec();
+    write_file(&lix, path, expected.clone()).await.unwrap();
+    assert_eq!(active_csv_rows(&lix, &file_id).await.len(), 4);
+    assert!(write_file(&lix, path, b"a\0b\n".to_vec()).await.is_err());
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(expected));
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn csv_bom_stays_a_file_prefix_through_row_edits_and_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let lix = open_rocksdb_lix(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv",
+        &build_csv_plugin_archive(),
+        &["csv_table", "csv_row"],
+    )
+    .await;
+    let path = "/bom-qa.csv";
+    write_file(
+        &lix,
+        path,
+        b"\xef\xbb\xbf\"alpha,one\",x\r\nbeta,y".to_vec(),
+    )
+    .await
+    .unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let rows = active_csv_rows(&lix, &file_id).await;
+    let first_id = csv_row_id(&rows, &["alpha,one", "x"]);
+    lix.execute(
+        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        &[
+            Value::Jsonb(serde_json::json!(["alpha,changed", "x"]).into()),
+            Value::Text(first_id.clone()),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"\xef\xbb\xbf\"alpha,changed\",x\r\nbeta,y".to_vec())
+    );
+    lix.execute(
+        "DELETE FROM csv_row WHERE id = $1 AND lixcol_file_id = $2",
+        &[Value::Text(first_id), Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"\xef\xbb\xbfbeta,y".to_vec())
+    );
+    lix.close().await.unwrap();
+    let reopened = open_rocksdb_lix(root.path()).await;
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(b"\xef\xbb\xbfbeta,y".to_vec())
+    );
+    write_file(&reopened, path, b"beta,UPDATED\n".to_vec())
+        .await
+        .unwrap();
+    let rows = active_csv_rows(&reopened, &file_id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].cells, ["beta", "UPDATED"]);
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn csv_row_structure_edits_use_full_reconciliation() {
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
