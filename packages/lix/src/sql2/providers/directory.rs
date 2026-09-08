@@ -6,6 +6,7 @@
     clippy::unnecessary_wraps
 )]
 
+use super::values::{optional_metadata_value, update_optional_metadata_value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -46,10 +47,10 @@ use crate::sql2::write_normalization::{
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
 use crate::transaction_types::{
-    LogicalPrimaryKey, RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWriteOperation,
+    LogicalPrimaryKey, RawWriteBatch, RawWriteRowRef, TransactionWriteOperation,
     TransactionWriteOrigin,
 };
-use crate::{LixError, SqlQueryResult, Value, parse_row_metadata_value, serialize_row_metadata};
+use crate::{LixError, SqlQueryResult, Value, serialize_row_metadata};
 
 use crate::filesystem::{
     DirectoryDescriptorWriteIntent, DirectoryPathRecord, DirectoryPathResolver,
@@ -2135,23 +2136,6 @@ fn update_optional_string_value(
     }
 }
 
-fn update_optional_metadata_value(
-    batch: &RecordBatch,
-    assignment_values: &UpdateAssignmentValues,
-    row_index: usize,
-    column_name: &str,
-    context: &str,
-) -> Result<Option<TransactionJson>> {
-    update_optional_string_value(batch, assignment_values, row_index, column_name)?
-        .map(|value| {
-            let metadata = parse_row_metadata_value(&value, context)
-                .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
-            TransactionJson::from_value(metadata, &format!("{context} metadata"))
-                .map_err(crate::sql2::error::lix_error_to_datafusion_error)
-        })
-        .transpose()
-}
-
 fn optional_string_value(
     batch: &RecordBatch,
     row_index: usize,
@@ -2174,22 +2158,6 @@ fn optional_string_value(
             "INSERT into lix_directory expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
-}
-
-fn optional_metadata_value(
-    batch: &RecordBatch,
-    row_index: usize,
-    column_name: &str,
-    context: &str,
-) -> Result<Option<TransactionJson>> {
-    optional_string_value(batch, row_index, column_name)?
-        .map(|value| {
-            let metadata = parse_row_metadata_value(&value, context)
-                .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
-            TransactionJson::from_value(metadata, &format!("{context} metadata"))
-                .map_err(crate::sql2::error::lix_error_to_datafusion_error)
-        })
-        .transpose()
 }
 
 fn optional_bool_value(

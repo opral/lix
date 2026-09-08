@@ -150,6 +150,7 @@ impl PublicCatalog {
                 Field::new("name", DataType::Utf8, false),
                 Field::new("hidden", DataType::Boolean, false),
                 Field::new("commit_id", DataType::Utf8, false),
+                json_field("lixcol_metadata", true),
             ])),
             PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
@@ -252,6 +253,7 @@ impl PublicCatalog {
                 PublicColumn::public("hidden", false).with_default("FALSE"),
                 PublicColumn::public("commit_id", false)
                     .with_default("lix_active_branch_commit_id()"),
+                PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
             ],
             SurfaceCapabilities::read_write(),
         ))?;
@@ -714,6 +716,11 @@ mod tests {
                     lixcol_names, tracked,
                     "tracked relation '{}' must expose exactly the canonical bookkeeping set",
                     surface.name
+                ),
+                PublicSurfaceKind::Branch => assert_eq!(
+                    lixcol_names,
+                    BTreeSet::from(["lixcol_metadata"]),
+                    "branches expose descriptor metadata without other tracked-row columns"
                 ),
                 _ => assert!(
                     lixcol_names.is_empty(),

@@ -108,3 +108,19 @@ Lix creates a built-in branch named `global` when it opens a repository. You
 cannot delete that branch, and you cannot delete the active branch.
 
 `hidden` only marks a branch for UIs. It does not change what SQL queries can see.
+
+## Branch metadata
+
+Use `lix_branch.lixcol_metadata` to attach a JSON object to a branch:
+
+```ts
+await lix.execute(
+  "UPDATE lix_branch SET lixcol_metadata = $1 WHERE id = $2",
+  [JSON.stringify({ owner: "design" }), draft.id],
+);
+```
+
+Metadata belongs to the tracked `lix_branch_descriptor` row, just as file and
+directory metadata belongs to their descriptors. Branch descriptors are global,
+so the metadata is visible from every branch. Renaming, hiding, or moving the
+branch head preserves it. Set `lixcol_metadata = NULL` to clear it.

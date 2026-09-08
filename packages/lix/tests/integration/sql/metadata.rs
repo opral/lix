@@ -583,6 +583,130 @@ simulation_test!(
     }
 );
 
+simulation_test!(metadata_on_lix_branch_uses_descriptor, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let id = "6d657461-6461-8461-8d62-72616e636800";
+    let initial = json!({"owner": "team", "nested": {"enabled": true}});
+    assert_metadata_value(
+        session.execute(
+            "INSERT INTO lix_branch (id, name, lixcol_metadata) VALUES ($1, 'metadata-branch', $2) RETURNING lixcol_metadata",
+            &[Value::Text(id.into()), Value::Text(initial.to_string())],
+        ).await.unwrap(),
+        "lixcol_metadata", &initial,
+    );
+    // Unrelated descriptor and ref updates must retain metadata.
+    assert_metadata_value(
+        session.execute(
+            "UPDATE lix_branch SET name = 'renamed', hidden = true, commit_id = commit_id WHERE id = $1 RETURNING lixcol_metadata",
+            &[Value::Text(id.into())],
+        ).await.unwrap(), "lixcol_metadata", &initial,
+    );
+    assert_metadata_value(
+        session
+            .execute(
+                "SELECT lixcol_metadata FROM lix_branch WHERE id = $1",
+                &[Value::Text(id.into())],
+            )
+            .await
+            .unwrap(),
+        "lixcol_metadata",
+        &initial,
+    );
+    // Filtering by name exercises the descriptor/head batch join.
+    assert_metadata_value(
+        session
+            .execute(
+                "SELECT lixcol_metadata FROM lix_branch WHERE name = 'renamed'",
+                &[],
+            )
+            .await
+            .unwrap(),
+        "lixcol_metadata",
+        &initial,
+    );
+    let updated = json!({"owner": "other"});
+    assert_metadata_value(
+        session.execute(
+            "INSERT INTO lix_branch (id, name, lixcol_metadata) VALUES ($1, 'ignored', $2) ON CONFLICT (id) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata RETURNING lixcol_metadata",
+            &[Value::Text(id.into()), Value::Jsonb(updated.clone().into())],
+        ).await.unwrap(), "lixcol_metadata", &updated,
+    );
+    assert_metadata_value(
+        session.execute(
+            "INSERT INTO lix_branch (id, name) VALUES ($1, 'upsert-renamed') ON CONFLICT (id) DO UPDATE SET name = excluded.name RETURNING lixcol_metadata",
+            &[Value::Text(id.into())],
+        ).await.unwrap(), "lixcol_metadata", &updated,
+    );
+    session.execute(
+        "UPDATE lix_branch SET lixcol_metadata = CAST('{\"owner\":\"direct\"}' AS JSONB) WHERE id = $1",
+        &[Value::Text(id.into())],
+    ).await.unwrap();
+    assert_metadata_value(
+        session
+            .execute(
+                "SELECT lixcol_metadata FROM lix_branch WHERE id = $1",
+                &[Value::Text(id.into())],
+            )
+            .await
+            .unwrap(),
+        "lixcol_metadata",
+        &json!({"owner": "direct"}),
+    );
+    assert_metadata_null(
+        session.execute("UPDATE lix_branch SET lixcol_metadata = NULL WHERE id = $1 RETURNING lixcol_metadata", &[Value::Text(id.into())]).await.unwrap(),
+        "lixcol_metadata",
+    );
+    assert_metadata_null(
+        session
+            .execute(
+                "SELECT lixcol_metadata FROM lix_branch WHERE id = $1",
+                &[Value::Text(id.into())],
+            )
+            .await
+            .unwrap(),
+        "lixcol_metadata",
+    );
+});
+
+simulation_test!(metadata_on_lix_branch_validates_json, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let id = "6d657461-6461-8461-8d62-72616e636801";
+    for invalid in ["{bad", "null", "[]", "42", "\"text\""] {
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "INSERT INTO lix_branch (id, name, lixcol_metadata) VALUES ($1, 'invalid', $2)",
+                    &[Value::Text(id.into()), Value::Text(invalid.into())],
+                )
+                .await
+                .expect_err("invalid metadata must fail"),
+        );
+    }
+    assert_metadata_null(
+        session
+            .execute(
+                "INSERT INTO lix_branch (id, name) VALUES ($1, 'valid') RETURNING lixcol_metadata",
+                &[Value::Text(id.into())],
+            )
+            .await
+            .unwrap(),
+        "lixcol_metadata",
+    );
+    for invalid in ["{bad", "null", "[]"] {
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "UPDATE lix_branch SET lixcol_metadata = $2 WHERE id = $1",
+                    &[Value::Text(id.into()), Value::Text(invalid.into())],
+                )
+                .await
+                .expect_err("invalid update metadata must fail"),
+        );
+    }
+});
+
 fn assert_invalid_metadata_error(error: LixError) {
     assert!(
         matches!(

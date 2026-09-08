@@ -10,6 +10,7 @@
     clippy::useless_let_if_seq
 )]
 
+use super::values::{optional_metadata_value, update_optional_metadata_value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
@@ -6712,22 +6713,6 @@ fn update_optional_string_value(
     }
 }
 
-fn update_optional_metadata_value(
-    batch: &RecordBatch,
-    assignment_values: &UpdateAssignmentValues,
-    row_index: usize,
-    column_name: &str,
-    context: &str,
-) -> Result<Option<TransactionJson>> {
-    update_optional_string_value(batch, assignment_values, row_index, column_name)?
-        .map(|value| {
-            let metadata = parse_row_metadata_value(&value, context)
-                .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
-            TransactionJson::from_value(metadata, &format!("{context} metadata"))
-                .map_err(crate::sql2::error::lix_error_to_datafusion_error)
-        })
-        .transpose()
-}
 
 fn update_required_binary_value(
     _batch: &RecordBatch,
@@ -6802,21 +6787,6 @@ fn optional_string_value(
     }
 }
 
-fn optional_metadata_value(
-    batch: &RecordBatch,
-    row_index: usize,
-    column_name: &str,
-    context: &str,
-) -> Result<Option<TransactionJson>> {
-    optional_string_value(batch, row_index, column_name)?
-        .map(|value| {
-            let metadata = parse_row_metadata_value(&value, context)
-                .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
-            TransactionJson::from_value(metadata, &format!("{context} metadata"))
-                .map_err(crate::sql2::error::lix_error_to_datafusion_error)
-        })
-        .transpose()
-}
 
 fn optional_bool_value(
     batch: &RecordBatch,
