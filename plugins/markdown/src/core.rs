@@ -209,6 +209,9 @@ fn retain_noncanonical_source(
         format.remove(LEXICAL_SOURCE_REQUIRED_FIELD);
         return Ok(());
     }
+    // Canonicalization and decoding can move block offsets. These ranges no
+    // longer address the accepted bytes and must not drive incremental edits.
+    parsed.top_level_ranges.clear();
     format.insert(
         LEXICAL_FALLBACK_FIELD.to_owned(),
         serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(source)),
@@ -1984,38 +1987,88 @@ fn projection_after_detected_changes(
     changes: &[DetectedChange],
 ) -> Result<Projection, PluginError> {
     let mut nodes_by_id = flatten_tree(root);
-    if !changes.is_empty()
-        && let Some(document) = nodes_by_id
-            .values_mut()
-            .find(|node| node.kind == NodeKind::Document)
-    {
-        let format = document.format.as_object_mut().ok_or_else(|| {
-            PluginError::Internal("Markdown document format must be an object".into())
-        })?;
-        // The accepted source is valid only for the unchanged semantic tree.
-        // A semantic successor must render from its derived state instead of
-        // accidentally reusing the predecessor's raw bytes.
-        format.remove(LEXICAL_FALLBACK_FIELD);
-        format.remove(LEXICAL_SOURCE_REQUIRED_FIELD);
-    }
+    let mut changed = false;
     for change in changes {
         let id = change.row_pk.first().ok_or_else(|| {
             PluginError::InvalidInput("Markdown row_pk must contain one id".into())
         })?;
         if let Some(row) = &change.row {
-            let node = node_from_typed_row(row)?;
+            let mut node = node_from_typed_row(row)?;
             if node.id != *id {
                 return Err(PluginError::InvalidInput(format!(
                     "Markdown node id '{}' does not match row_pk '{id}'",
                     node.id
                 )));
             }
+            if node.kind == NodeKind::Document {
+                // Lexical caches are derived from bytes, never from an incoming
+                // row. An identical durable root row is still a no-op.
+                clear_lexical_source(&mut node);
+                if let Some(previous) = nodes_by_id.get(id) {
+                    let mut comparable = previous.clone();
+                    clear_lexical_source(&mut comparable);
+                    if comparable == node {
+                        continue;
+                    }
+                }
+            }
+            changed |= nodes_by_id.get(id) != Some(&node);
             nodes_by_id.insert(*id, node);
         } else {
-            nodes_by_id.remove(id);
+            changed |= nodes_by_id.remove(id).is_some();
+        }
+    }
+    if changed {
+        for document in nodes_by_id
+            .values_mut()
+            .filter(|node| node.kind == NodeKind::Document)
+        {
+            clear_lexical_source(document);
         }
     }
     Ok(Projection { nodes_by_id })
+}
+
+fn clear_lexical_source(node: &mut NodeSnapshot) {
+    if let Some(format) = node.format.as_object_mut() {
+        format.remove(LEXICAL_FALLBACK_FIELD);
+        format.remove(LEXICAL_SOURCE_REQUIRED_FIELD);
+    }
+}
+
+fn render_in_source_encoding(rendered: &[u8], original: &[u8]) -> Result<Vec<u8>, PluginError> {
+    fn encode(
+        source: &str,
+        encoding: &'static encoding_rs::Encoding,
+    ) -> Result<Vec<u8>, PluginError> {
+        if encoding == encoding_rs::UTF_16LE {
+            return Ok(source.encode_utf16().flat_map(u16::to_le_bytes).collect());
+        }
+        if encoding == encoding_rs::UTF_16BE {
+            return Ok(source.encode_utf16().flat_map(u16::to_be_bytes).collect());
+        }
+        let (encoded, _, had_errors) = encoding.encode(source);
+        if had_errors {
+            return Err(PluginError::InvalidInput(format!(
+                "Markdown edit cannot be represented in the original {} encoding",
+                encoding.name()
+            )));
+        }
+        Ok(encoded.into_owned())
+    }
+    let (buffer, encoding) = crate::markdown_file::buffer_with_encoding(original);
+    let (source, had_errors) = encoding.decode_without_bom_handling(buffer);
+    if had_errors || encode(&source, encoding)? != buffer {
+        return Err(PluginError::InvalidInput(
+            "Cannot edit Markdown rows without losing original encoding bytes".into(),
+        ));
+    }
+    let rendered = std::str::from_utf8(rendered).map_err(|error| {
+        PluginError::Internal(format!("Markdown renderer emitted invalid UTF-8: {error}"))
+    })?;
+    let mut output = original[..original.len() - buffer.len()].to_vec();
+    output.extend(encode(rendered, encoding)?);
+    Ok(output)
 }
 
 impl Document {
@@ -2387,8 +2440,22 @@ impl Document {
         }
         let current_root = self.tree.materialize();
         let projection = projection_after_detected_changes(&current_root, &detected)?;
-        let root = projection.to_tree()?;
-        let bytes = render_tree_with_lexical_fallback(&root)?;
+        let mut root = projection.to_tree()?;
+        if root == current_root {
+            return Ok((self.clone(), Vec::new()));
+        }
+        let bytes = match self.render_preserving_source(&current_root, &root)? {
+            Some(bytes) => bytes,
+            None => render_in_source_encoding(
+                &render_tree_with_lexical_fallback(&root)?,
+                &self.bytes.materialize(),
+            )?,
+        };
+        if render_tree(&root)? != bytes {
+            root.node.format[LEXICAL_FALLBACK_FIELD] =
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes));
+            root.node.format[LEXICAL_SOURCE_REQUIRED_FIELD] = serde_json::Value::Bool(true);
+        }
         let top_level_ranges = simple_top_level_ranges(&root, &bytes);
         let before = self.bytes.materialize();
         let edits = minimal_byte_edit(&before, bytes.clone());
@@ -2400,6 +2467,115 @@ impl Document {
             },
             edits,
         ))
+    }
+
+    /// Replace changed blocks at verified source spans, retaining untouched
+    /// spelling and whitespace. Canonical parser offsets cannot be used here:
+    /// they may describe a different layout from the accepted source.
+    fn render_preserving_source(
+        &self,
+        before: &NodeTree,
+        after: &NodeTree,
+    ) -> Result<Option<Vec<u8>>, PluginError> {
+        let mut before_root = before.node.clone();
+        clear_lexical_source(&mut before_root);
+        if before_root != after.node {
+            return Ok(None);
+        }
+        let after_by_id = after
+            .children
+            .iter()
+            .map(|node| (node.node.id, node))
+            .collect::<BTreeMap<_, _>>();
+        let surviving = before
+            .children
+            .iter()
+            .filter(|old| after_by_id.contains_key(&old.node.id));
+        if surviving
+            .map(|node| node.node.id)
+            .ne(after.children.iter().map(|node| node.node.id))
+        {
+            return Ok(None);
+        }
+        let bytes = self.bytes.materialize();
+        let (buffer, encoding) = crate::markdown_file::buffer_with_encoding(&bytes);
+        let (source, had_errors) = encoding.decode_without_bom_handling(buffer);
+        if had_errors {
+            return Err(PluginError::InvalidInput(
+                "Cannot edit Markdown rows without losing undecodable source bytes".into(),
+            ));
+        }
+        let parsed = crate::markdown_file::parse_markdown_source_once(&source)?;
+        if parsed.root.children.len() != before.children.len() {
+            return Ok(None);
+        }
+        let mut edits = Vec::new();
+        let mut last_end = 0;
+        for ((original, old), range) in parsed
+            .root
+            .children
+            .iter()
+            .zip(&before.children)
+            .zip(&parsed.top_level_ranges)
+        {
+            let range = range.start..range.end.min(source.len());
+            if range.start < last_end || range.start > range.end {
+                return Ok(None);
+            }
+            last_end = range.end;
+            let Some(raw) = source.get(range.clone()) else {
+                return Ok(None);
+            };
+            if original.subtree_signature() != old.subtree_signature() {
+                // Noncanonical spelling can alter the initial tree. Verify its
+                // stable block representation before trusting the correspondence.
+                let stable = parse_markdown_source(raw)?;
+                if stable.root.children.len() != 1
+                    || stable.root.children[0].subtree_signature() != old.subtree_signature()
+                {
+                    return Ok(None);
+                }
+            }
+            let Some(&new) = after_by_id.get(&old.node.id) else {
+                edits.push((range, Vec::new()));
+                continue;
+            };
+            if old == new {
+                continue;
+            }
+            let mut fragment_root = after.node.clone();
+            fragment_root.format["final_newline"] =
+                serde_json::Value::Bool(raw.ends_with(['\n', '\r']));
+            let rendered = render_tree(&NodeTree {
+                node: fragment_root,
+                children: vec![new.clone()],
+            })?;
+            edits.push((range, rendered));
+        }
+        let splices = edits
+            .iter()
+            .map(|(range, insert)| FileEdit {
+                offset: range.start as u64,
+                delete_len: (range.end - range.start) as u64,
+                insert,
+            })
+            .collect::<Vec<_>>();
+        let rendered = PersistentBytes::from_vec(source.as_bytes().to_vec())
+            .splice(&splices)?
+            .materialize();
+        let rendered_source = std::str::from_utf8(&rendered)
+            .map_err(|error| PluginError::Internal(error.to_string()))?;
+        let canonical = render_tree(after)?;
+        let canonical_source = std::str::from_utf8(&canonical)
+            .map_err(|error| PluginError::Internal(error.to_string()))?;
+        // Block boundaries and reference definitions can change the meaning of
+        // neighboring source. Only retain a layout with the intended full parse.
+        if parse_markdown_source(rendered_source)?.canonical_render
+            != parse_markdown_source(canonical_source)?.canonical_render
+        {
+            return Ok(None);
+        }
+        Ok(Some(render_in_source_encoding(&rendered, &bytes)?))
     }
 
     fn try_paragraph_row_change(
@@ -2449,6 +2625,14 @@ impl Document {
             return Ok(None);
         }
         let new = node_from_typed_row(row)?;
+        if new == *old {
+            return Ok(Some((
+                self.bytes.clone(),
+                Arc::clone(&self.top_level_ranges),
+                Vec::new(),
+                self.tree.clone(),
+            )));
+        }
         if old.kind != NodeKind::Paragraph
             || new.kind != NodeKind::Paragraph
             || new.id != old.id
@@ -2561,6 +2745,9 @@ impl Document {
                 "file.content must be valid UTF-8 for an incremental Markdown edit: {error}"
             ))
         })?;
+        if fragment.contains(['[', ']']) {
+            return Ok(None);
+        }
         let mut replacement = parse_markdown_source(fragment)?;
         if replacement.root.children.len() != 1
             || replacement.root.children[0].node.kind != NodeKind::Paragraph
@@ -2624,6 +2811,16 @@ impl Document {
         let [splice] = splices else {
             return Ok(None);
         };
+        if self
+            .tree
+            .root_node()
+            .format
+            .get(LEXICAL_FALLBACK_FIELD)
+            .is_some()
+            || !splice.insert.iter().all(u8::is_ascii_alphanumeric)
+        {
+            return Ok(None);
+        }
         let offset = usize::try_from(splice.offset)
             .map_err(|_| PluginError::InvalidInput("Markdown splice offset is too large".into()))?;
         let delete_len = usize::try_from(splice.delete_len).map_err(|_| {
@@ -2649,6 +2846,17 @@ impl Document {
         else {
             return Ok(None);
         };
+        if !matches!(
+            self.tree.top_level_node(block_index).map(|node| node.kind),
+            Some(NodeKind::Paragraph | NodeKind::Heading)
+        ) || !self
+            .bytes
+            .range(offset..delete_end)?
+            .iter()
+            .all(u8::is_ascii_alphanumeric)
+        {
+            return Ok(None);
+        }
         let delta = isize::try_from(splice.insert.len()).expect("usize fits isize")
             - isize::try_from(delete_len).expect("usize fits isize");
         let successor_end = range
@@ -2664,6 +2872,9 @@ impl Document {
                 "file.content must be valid UTF-8 for an incremental Markdown edit: {error}"
             ))
         })?;
+        if fragment.contains(['[', ']']) {
+            return Ok(None);
+        }
         let mut replacement = parse_markdown_source(fragment)?;
         if replacement.root.children.len() != 1
             || render_tree(&replacement.root)? != fragment.as_bytes()
@@ -3116,16 +3327,17 @@ Another paragraph must survive an unrelated semantic edit.
                 assert_eq!(after, before, "unrelated semantic block changed");
             }
         }
-        assert!(
-            successor_tree
-                .node
-                .format
-                .get(LEXICAL_FALLBACK_FIELD)
-                .is_none(),
-            "semantic successor must clear the lexical fallback"
+        assert_eq!(
+            render_tree_with_lexical_fallback(&successor_tree).expect("render successor"),
+            successor.bytes(),
+            "the lexical fallback must describe the successor, never the predecessor"
         );
         let rendered = String::from_utf8(successor.bytes()).expect("rendered Markdown is UTF-8");
         assert!(rendered.contains("retained document"));
         assert!(rendered.contains("Another paragraph must survive"));
     }
 }
+
+#[cfg(test)]
+#[path = "core_qa_tests.rs"]
+mod qa_tests;
