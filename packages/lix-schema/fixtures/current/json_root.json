@@ -34,6 +34,12 @@
       "description": "The JSON scalar value. Omitted for object and array roots."
     },
     {
+      "name": "scalar_text",
+      "type": "text",
+      "nullable": true,
+      "description": "Exact noncanonical scalar spelling, used only while it agrees with scalar_json."
+    },
+    {
       "name": "suffix_json",
       "type": "text",
       "nullable": true,

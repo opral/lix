@@ -26,6 +26,12 @@
       "type": "text",
       "nullable": false,
       "description": "Exact whitespace, encoded map key, and colon immediately preceding file_json; commas are supplied by the renderer."
+    },
+    {
+      "name": "source_json",
+      "type": "text",
+      "nullable": true,
+      "description": "Exact original JSON spelling. A formatting hint only; edited JSONB values remain authoritative."
     }
   ],
   "primary_key": [

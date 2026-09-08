@@ -6,6 +6,12 @@
     unused_qualifications
 )]
 
+mod edits;
+pub use edits::EditSet;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod testing;
+
 #[doc(hidden)]
 pub mod column_merger_bindings {
     include!(concat!(env!("OUT_DIR"), "/column_merger_bindings.rs"));
@@ -151,6 +157,7 @@ trait TransitionHost {
     fn max_batch_bytes(&self) -> u32;
     fn put_state(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), CommonHostError>;
     fn delete_state(&self, key: &[u8]) -> std::result::Result<(), CommonHostError>;
+    fn delete_state_prefix(&self, prefix: &[u8]) -> std::result::Result<(), CommonHostError>;
     fn emit_rows(
         &self,
         payload: Vec<u8>,
@@ -283,6 +290,12 @@ macro_rules! impl_projection_hosts {
             }
             fn delete_state(&self, key: &[u8]) -> std::result::Result<(), CommonHostError> {
                 self.delete_state(key).map_err(map_host_error)
+            }
+            fn delete_state_prefix(
+                &self,
+                prefix: &[u8],
+            ) -> std::result::Result<(), CommonHostError> {
+                self.delete_state_prefix(prefix).map_err(map_host_error)
             }
             fn emit_rows(
                 &self,
@@ -680,6 +693,13 @@ impl<'a> TransitionOutput<'a> {
             .map_err(|error| host_error("host rejected state deletion", error))
     }
 
+    fn delete_state_prefix(&self, prefix: &[u8]) -> Result<()> {
+        validate_state_prefix(prefix)?;
+        self.inner
+            .delete_state_prefix(prefix)
+            .map_err(|error| host_error("host rejected state prefix deletion", error))
+    }
+
     fn replace_all_rows(&mut self) -> Result<()> {
         self.flush_typed_rows()?;
         self.inner
@@ -884,6 +904,45 @@ impl<'a> TransitionOutput<'a> {
     }
 }
 
+/// Private state writes shared by every projection output.
+///
+/// State changes commit atomically with the file and row changes. To replace a
+/// collection, delete its prefix first, then write its successor entries.
+/// Prefixes are literal bytes: use a trailing separator to delimit a namespace.
+pub trait StateOutput {
+    fn put_state(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
+    fn delete_state(&mut self, key: &[u8]) -> Result<()>;
+    /// Empty prefixes and prefixes overlapping host-reserved state are rejected.
+    fn delete_state_prefix(&mut self, prefix: &[u8]) -> Result<()>;
+}
+
+fn validate_state_prefix(prefix: &[u8]) -> Result<()> {
+    const RESERVED: &[u8] = b"\0lix/";
+    if prefix.is_empty() || prefix.starts_with(RESERVED) || RESERVED.starts_with(prefix) {
+        return Err(Error::invalid_input(
+            "state prefix must be nonempty and outside host-reserved state",
+        ));
+    }
+    Ok(())
+}
+
+macro_rules! impl_state_output {
+    ($($output:ident),+ $(,)?) => {$(
+        impl StateOutput for $output<'_, '_> {
+            fn put_state(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+                self.put_state(key, value)
+            }
+            fn delete_state(&mut self, key: &[u8]) -> Result<()> {
+                self.delete_state(key)
+            }
+            fn delete_state_prefix(&mut self, prefix: &[u8]) -> Result<()> {
+                self.delete_state_prefix(prefix)
+            }
+        }
+    )+};
+}
+impl_state_output!(RowOutput, RowChangeOutput, FileOutput, FileEditOutput);
+
 /// Complete rows produced by [`FileProjection::parse`] or cold reconciliation
 /// in [`FileProjection::parse_changes`].
 #[derive(Debug)]
@@ -958,6 +1017,12 @@ impl RowOutput<'_, '_> {
 
     pub fn delete_state(&mut self, key: &[u8]) -> Result<()> {
         self.inner.delete_state(key)
+    }
+
+    /// Deletes all private state whose key starts with `prefix`, including
+    /// earlier writes in this transition. Later writes recreate those keys.
+    pub fn delete_state_prefix(&mut self, prefix: &[u8]) -> Result<()> {
+        self.inner.delete_state_prefix(prefix)
     }
 }
 
@@ -1036,6 +1101,12 @@ impl<'host> RowChangeOutput<'_, 'host> {
     pub fn delete_state(&mut self, key: &[u8]) -> Result<()> {
         self.inner.delete_state(key)
     }
+
+    /// Deletes all private state whose key starts with `prefix`, including
+    /// earlier writes in this transition. Later writes recreate those keys.
+    pub fn delete_state_prefix(&mut self, prefix: &[u8]) -> Result<()> {
+        self.inner.delete_state_prefix(prefix)
+    }
 }
 
 /// Complete file bytes produced from complete rows.
@@ -1055,6 +1126,12 @@ impl FileOutput<'_, '_> {
 
     pub fn delete_state(&mut self, key: &[u8]) -> Result<()> {
         self.inner.delete_state(key)
+    }
+
+    /// Deletes all private state whose key starts with `prefix`, including
+    /// earlier writes in this transition. Later writes recreate those keys.
+    pub fn delete_state_prefix(&mut self, prefix: &[u8]) -> Result<()> {
+        self.inner.delete_state_prefix(prefix)
     }
 }
 
@@ -1079,6 +1156,12 @@ impl FileEditOutput<'_, '_> {
 
     pub fn delete_state(&mut self, key: &[u8]) -> Result<()> {
         self.inner.delete_state(key)
+    }
+
+    /// Deletes all private state whose key starts with `prefix`, including
+    /// earlier writes in this transition. Later writes recreate those keys.
+    pub fn delete_state_prefix(&mut self, prefix: &[u8]) -> Result<()> {
+        self.inner.delete_state_prefix(prefix)
     }
 }
 
@@ -1458,6 +1541,11 @@ pub struct FileEditReader<'a> {
 }
 
 impl<'a> FileEditReader<'a> {
+    /// Validates predecessor-coordinate edits before applying or mapping them.
+    pub fn validated(&self, before_len: u64) -> Result<EditSet<'a>> {
+        EditSet::new(self.edits, before_len)
+    }
+
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a FileEdit> + Clone {
         self.edits.iter()
     }
@@ -1932,6 +2020,9 @@ mod tests {
         fn delete_state(&self, _: &[u8]) -> std::result::Result<(), CommonHostError> {
             Ok(())
         }
+        fn delete_state_prefix(&self, _: &[u8]) -> std::result::Result<(), CommonHostError> {
+            Ok(())
+        }
         fn emit_rows(
             &self,
             payload: Vec<u8>,
@@ -2007,6 +2098,15 @@ mod tests {
             .fold((0, 0), |(records, bytes), page| {
                 (records + page.0, bytes + page.1)
             })
+    }
+
+    #[test]
+    fn state_prefix_rejects_empty_and_host_reserved_overlap() {
+        for prefix in [b"".as_slice(), b"\0", b"\0lix", b"\0lix/", b"\0lix/private"] {
+            assert!(validate_state_prefix(prefix).is_err());
+        }
+        assert!(validate_state_prefix(b"markdown/blocks/").is_ok());
+        assert!(validate_state_prefix(b"\0other/").is_ok());
     }
 
     #[test]

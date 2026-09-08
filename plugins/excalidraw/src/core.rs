@@ -312,6 +312,10 @@ impl ElementRow {
             TypedValue::Boolean(self.is_deleted),
         );
         row.insert("element_json".to_owned(), TypedValue::Jsonb(element_json));
+        row.insert(
+            "source_json".to_owned(),
+            source_hint(&row, "element_json", &self.element_json),
+        );
         Ok(RowRecord {
             schema_key: ELEMENT_SCHEMA_KEY.into(),
             row_pk: vec![TypedValue::Text(self.id.clone())],
@@ -338,8 +342,7 @@ impl ElementRow {
         }
         let declared_type = required_text(&record.row, "element_type")?;
         let declared_deleted = required_typed_bool(&record.row, "is_deleted")?;
-        let element_json = serde_json::to_string(required_jsonb(&record.row, "element_json")?)
-            .map_err(|error| format!("serialize Excalidraw element JSONB: {error}"))?;
+        let element_json = render_payload(&record.row, "element_json")?;
         let row = Self::from_source(
             required_text(&record.row, "order_key")?.to_owned(),
             required_text(&record.row, "leading_json")?.to_owned(),
@@ -400,6 +403,10 @@ impl FileRow {
             TypedValue::Text(self.prefix_json.clone()),
         );
         row.insert("file_json".to_owned(), TypedValue::Jsonb(file_json));
+        row.insert(
+            "source_json".to_owned(),
+            source_hint(&row, "file_json", &self.file_json),
+        );
         Ok(RowRecord {
             schema_key: FILE_SCHEMA_KEY.into(),
             row_pk: vec![TypedValue::Text(self.id.clone())],
@@ -417,8 +424,7 @@ impl FileRow {
         if required_text(&record.row, "id")? != id {
             return Err("excalidraw_file row id does not match its key".to_owned());
         }
-        let file_json = serde_json::to_string(required_jsonb(&record.row, "file_json")?)
-            .map_err(|error| format!("serialize Excalidraw file JSONB: {error}"))?;
+        let file_json = render_payload(&record.row, "file_json")?;
         Self::from_source(
             id.to_owned(),
             required_text(&record.row, "order_key")?.to_owned(),
@@ -1032,6 +1038,13 @@ fn scan_array_collection(bytes: &[u8], start: usize, end: usize) -> Result<RawCo
         scanner.skip_whitespace();
         match scanner.peek() {
             Some(b',') => {
+                // Whitespace before a separator belongs to the preceding raw
+                // value; otherwise rebuilding the collection drops it.
+                let entry = entries.last_mut().expect("just scanned a collection entry");
+                entry
+                    .raw
+                    .push_str(&bytes_to_string(&bytes[value_end..scanner.cursor])?);
+                entry.span = span(value_start, scanner.cursor)?;
                 scanner.cursor += 1;
                 segment_start = scanner.cursor;
             }
@@ -1096,6 +1109,13 @@ fn scan_object_collection(bytes: &[u8], start: usize, end: usize) -> Result<RawC
         scanner.skip_whitespace();
         match scanner.peek() {
             Some(b',') => {
+                // Whitespace before a separator belongs to the preceding raw
+                // value; otherwise rebuilding the collection drops it.
+                let entry = entries.last_mut().expect("just scanned a collection entry");
+                entry
+                    .raw
+                    .push_str(&bytes_to_string(&bytes[value_end..scanner.cursor])?);
+                entry.span = span(value_start, scanner.cursor)?;
                 scanner.cursor += 1;
                 segment_start = scanner.cursor;
             }
@@ -1663,7 +1683,18 @@ fn diff_records(before: Vec<RowRecord>, after: Vec<RowRecord>) -> Result<Vec<Row
     }
     for (key, record) in after {
         if before.get(&key) != Some(&record.row) {
-            changes.push(RowChange::upsert(record));
+            let format_only = before.get(&key).is_some_and(|before| {
+                let mut before = before.clone();
+                let mut after = record.row.clone();
+                before.remove("source_json");
+                after.remove("source_json");
+                before == after
+            });
+            let mut change = RowChange::upsert(record);
+            if format_only {
+                change.effect = ChangeEffect::FormatOnly;
+            }
+            changes.push(change);
         }
     }
     changes.sort_unstable_by(|left, right| {
@@ -1744,13 +1775,81 @@ fn require_fields(row: &TypedRow, required: &[&str]) -> Result<(), String> {
         }
     }
     for field in row.keys() {
-        if !expected.contains(field) {
+        if !expected.contains(field)
+            && !(field == "source_json"
+                && (expected.contains("element_json") || expected.contains("file_json")))
+        {
             return Err(format!(
                 "Excalidraw row contains unsupported field {field:?}"
             ));
         }
     }
     Ok(())
+}
+
+fn source_hint(row: &TypedRow, field: &str, source: &str) -> TypedValue {
+    let Some(TypedValue::Jsonb(value)) = row.get(field) else {
+        unreachable!()
+    };
+    if value
+        .to_json_string()
+        .is_ok_and(|canonical| canonical == source)
+    {
+        TypedValue::Null
+    } else {
+        // Transport validation reports unsupported JSONB values as errors;
+        // inability to compute this optional hint must not panic during parse.
+        TypedValue::Text(source.to_owned())
+    }
+}
+
+/// Retain exact object spelling while keeping the JSONB payload authoritative.
+fn render_payload(row: &TypedRow, field: &str) -> Result<String, String> {
+    let value = required_jsonb(row, field)?;
+    let canonical = || serde_json::to_string(value).map_err(|error| error.to_string());
+    let source = match row.get("source_json") {
+        None | Some(TypedValue::Null) => return canonical(),
+        Some(TypedValue::Text(source)) => source,
+        _ => return Err("source_json must be typed text or null".to_owned()),
+    };
+    let Ok(original) = serde_json::from_str::<Value>(source) else {
+        return canonical();
+    };
+    let Some(TypedValue::Jsonb(current)) = row.get(field) else {
+        unreachable!()
+    };
+    if current == &original {
+        return Ok(source.clone());
+    }
+    // A common geometry/text edit changes existing object fields. Reuse the
+    // existing scanner to replace only those values, preserving all other
+    // property spelling, escapes, and unknown nested fields.
+    let (Some(old), Some(new)) = (original.as_object(), value.as_object()) else {
+        return canonical();
+    };
+    if old.len() != new.len() || old.keys().any(|key| !new.contains_key(key)) {
+        return canonical();
+    }
+    let Ok(fields) = scan_root_fields(source.as_bytes()) else {
+        return canonical();
+    };
+    let mut edits = Vec::new();
+    for field in fields {
+        let before = TypedValue::Jsonb(old[&field.key].clone().into());
+        let after = TypedValue::Jsonb(new[&field.key].clone().into());
+        if before != after {
+            edits.push((
+                field.value_start,
+                field.value_end,
+                serde_json::to_string(&new[&field.key]).map_err(|error| error.to_string())?,
+            ));
+        }
+    }
+    let mut output = source.clone();
+    for (start, end, insert) in edits.into_iter().rev() {
+        output.replace_range(start..end, &insert);
+    }
+    Ok(output)
 }
 
 fn text_primary_key(record: &RowRecord) -> Result<&str, String> {

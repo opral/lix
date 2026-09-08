@@ -3,6 +3,8 @@
 
 mod core;
 
+use lix::plugin::StateOutput;
+
 use core::{
     ArenaRowIndex, ChangeEffect, ColdInitialImport, Dialect, Document, FileEdit, IdNamespace,
     ROW_SCHEMA_KEY, RowChange, RowIdentity, RowRecord, TABLE_SCHEMA_KEY, Terminator,
@@ -83,10 +85,10 @@ fn cold_parse_changes(
     if let Some((namespace, state)) = successor.canonical_arena_state() {
         sink.put_state(ID_NAMESPACE_STATE, &namespace)?;
         store_csv_index(sink, &state)?;
-        delete_identity_checkpoint(&update.before, sink)?;
+        delete_identity_checkpoint(sink)?;
     } else {
-        delete_csv_index(&update.before, sink)?;
-        store_identity_checkpoint(Some(&update.before), sink, &successor)?;
+        delete_csv_index(sink)?;
+        store_identity_checkpoint(sink, &successor)?;
     }
     for change in changes {
         emit_change(change, update.creates, sink)?;
@@ -122,8 +124,8 @@ impl sdk::FileProjection for CsvPlugin {
         for edit in edits {
             sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
         }
-        store_identity_checkpoint(Some(&update.before), sink, &successor)?;
-        delete_csv_index(&update.before, sink)?;
+        store_identity_checkpoint(sink, &successor)?;
+        delete_csv_index(sink)?;
         Ok(())
     }
 
@@ -143,14 +145,14 @@ impl sdk::FileProjection for CsvPlugin {
         if let Some((namespace, state)) = document.canonical_arena_state() {
             sink.put_state(ID_NAMESPACE_STATE, &namespace)?;
             store_csv_index(sink, &state)?;
-            if let Some(before) = input.before.as_ref() {
-                delete_identity_checkpoint(before, sink)?;
+            if input.before.is_some() {
+                delete_identity_checkpoint(sink)?;
             }
         } else {
-            if let Some(before) = input.before.as_ref() {
-                delete_csv_index(before, sink)?;
+            if input.before.is_some() {
+                delete_csv_index(sink)?;
             }
-            store_identity_checkpoint(input.before.as_ref(), sink, &document)?;
+            store_identity_checkpoint(sink, &document)?;
         }
         sink.write(&document.bytes())
     }
@@ -257,19 +259,20 @@ impl sdk::FileProjection for CsvPlugin {
         if delete_end > row_end {
             return fallback_file_changed(update, sink);
         }
-        let mut row = update.before.read_range(row_start, row_end - row_start)?;
-        let local_start = usize::try_from(edit.offset - row_start)
-            .map_err(|_| sdk::Error::invalid_input("CSV edit offset exceeds guest memory"))?;
-        let local_end =
-            local_start
-                .checked_add(usize::try_from(edit.delete_len).map_err(|_| {
-                    sdk::Error::invalid_input("CSV edit deletion exceeds guest memory")
-                })?)
-                .ok_or_else(|| sdk::Error::invalid_input("CSV edit range overflowed"))?;
-        if index.edit_touches_structure(&row[local_start..local_end], insert) {
+        let deleted = update.before.read_range(edit.offset, edit.delete_len)?;
+        if index.edit_touches_structure(&deleted, insert) {
             return fallback_file_changed(update, sink);
         }
-        row.splice(local_start..local_end, insert.iter().copied());
+        let edits = update.file_edits.validated(update.before.len())?;
+        // Equal-length edits can create a BOM, including by changing only
+        // the final byte of another leading UTF-8 character.
+        if edit.offset < 3
+            && edits.len() >= 3
+            && edits.read_range(&update.before, 0, 3)? == b"\xef\xbb\xbf"
+        {
+            return fallback_file_changed(update, sink);
+        }
+        let row = edits.read_range(&update.before, row_start, row_end - row_start)?;
         let change = index
             .row_change(ordinal, row)
             .map_err(sdk::Error::invalid_input)?;
@@ -367,6 +370,7 @@ fn merge_typed_csv_cells(
 
 fn store_csv_index(successor: &mut impl StateOutput, state: &[u8]) -> sdk::Result<()> {
     let (header, pages) = split_csv_index(state)?;
+    successor.delete_state_prefix(b"csv/index-page/")?;
     successor.put_state(CSV_INDEX_KEY, header)?;
     for (ordinal, page) in pages.into_iter().enumerate() {
         successor.put_state(&csv_index_page_key(ordinal as u32), page)?;
@@ -396,34 +400,9 @@ fn decode_csv_index_header(header: &[u8]) -> sdk::Result<ArenaRowIndex> {
     ArenaRowIndex::decode_header(header, logical_state_len).map_err(sdk::Error::invalid_input)
 }
 
-fn csv_index_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
-    let Some(header) = root.read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)? else {
-        return Ok(0);
-    };
-    if header.len() != CSV_INDEX_HEADER_BYTES as usize {
-        return Err(sdk::Error::invalid_input(
-            "CSV row index header is truncated",
-        ));
-    }
-    let row_count = u32::from_le_bytes(header[32..36].try_into().expect("CSV row count"));
-    let offsets_bytes = usize::try_from(row_count)
-        .expect("u32 fits usize")
-        .checked_mul(4)
-        .ok_or_else(|| sdk::Error::invalid_input("CSV row index size overflowed"))?;
-    Ok(u32::try_from(offsets_bytes.div_ceil(CSV_INDEX_PAGE_BYTES))
-        .map_err(|_| sdk::Error::limit_exceeded("too many CSV row index pages"))?)
-}
-
-fn delete_csv_index(
-    before: &sdk::Snapshot<'_>,
-    successor: &mut impl StateOutput,
-) -> sdk::Result<()> {
-    let page_count = csv_index_page_count(before)?;
+fn delete_csv_index(successor: &mut impl StateOutput) -> sdk::Result<()> {
     successor.delete_state(CSV_INDEX_KEY)?;
-    for ordinal in 0..page_count {
-        successor.delete_state(&csv_index_page_key(ordinal))?;
-    }
-    Ok(())
+    successor.delete_state_prefix(b"csv/index-page/")
 }
 
 fn csv_index_page_key(ordinal: u32) -> Vec<u8> {
@@ -438,31 +417,13 @@ fn identity_page_key(ordinal: u32) -> Vec<u8> {
     key
 }
 
-fn identity_page_count(before: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
-    let Some(manifest) = before.get_state(CSV_IDENTITIES_KEY)? else {
-        return Ok(0);
-    };
-    decode_identity_manifest(&manifest).map(|(_, page_count, _)| page_count)
-}
-
-fn delete_identity_checkpoint(
-    before: &sdk::Snapshot<'_>,
-    sink: &mut impl StateOutput,
-) -> sdk::Result<()> {
-    let page_count = identity_page_count(before)?;
+fn delete_identity_checkpoint(sink: &mut impl StateOutput) -> sdk::Result<()> {
     sink.delete_state(CSV_IDENTITIES_KEY)?;
-    for ordinal in 0..page_count {
-        sink.delete_state(&identity_page_key(ordinal))?;
-    }
-    Ok(())
+    sink.delete_state_prefix(b"csv/identity-page/")
 }
 
-fn store_identity_checkpoint(
-    before: Option<&sdk::Snapshot<'_>>,
-    sink: &mut impl StateOutput,
-    document: &Document,
-) -> sdk::Result<()> {
-    let old_page_count = before.map(identity_page_count).transpose()?.unwrap_or(0);
+fn store_identity_checkpoint(sink: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
+    sink.delete_state_prefix(b"csv/identity-page/")?;
     let (dialect, identities) = document.identity_checkpoint();
     let mut payload = Vec::new();
     for identity in &identities {
@@ -500,9 +461,6 @@ fn store_identity_checkpoint(
     sink.put_state(CSV_IDENTITIES_KEY, &manifest)?;
     for (ordinal, page) in pages.iter().enumerate() {
         sink.put_state(&identity_page_key(ordinal as u32), page)?;
-    }
-    for ordinal in pages.len() as u32..old_page_count {
-        sink.delete_state(&identity_page_key(ordinal))?;
     }
     Ok(())
 }
@@ -643,10 +601,10 @@ fn fallback_file_changed(
     if let Some((namespace, state)) = successor.canonical_arena_state() {
         sink.put_state(ID_NAMESPACE_STATE, &namespace)?;
         store_csv_index(sink, &state)?;
-        delete_identity_checkpoint(&update.before, sink)?;
+        delete_identity_checkpoint(sink)?;
     } else {
-        delete_csv_index(&update.before, sink)?;
-        store_identity_checkpoint(Some(&update.before), sink, &successor)?;
+        delete_csv_index(sink)?;
+        store_identity_checkpoint(sink, &successor)?;
     }
     for change in changes {
         emit_change(change, update.creates, sink)?;
@@ -688,24 +646,6 @@ fn namespace_from_changes(changes: &[RowChange]) -> Option<IdNamespace> {
         })
 }
 
-fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<u8>> {
-    for edit in edits.iter().rev() {
-        let start = usize::try_from(edit.offset)
-            .map_err(|_| sdk::Error::invalid_input("CSV edit offset exceeds guest memory"))?;
-        let end =
-            start
-                .checked_add(usize::try_from(edit.delete_len).map_err(|_| {
-                    sdk::Error::invalid_input("CSV edit deletion exceeds guest memory")
-                })?)
-                .ok_or_else(|| sdk::Error::invalid_input("CSV edit range overflowed"))?;
-        if end > bytes.len() {
-            return Err(sdk::Error::invalid_input("CSV edit exceeds accepted bytes"));
-        }
-        bytes.splice(start..end, edit.insert.iter().copied());
-    }
-    Ok(bytes)
-}
-
 fn emit_change(
     change: RowChange,
     creates: sdk::CreateContext,
@@ -743,27 +683,6 @@ fn emit_change(
     }
     Ok(())
 }
-
-trait StateOutput {
-    fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()>;
-    fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()>;
-}
-macro_rules! impl_state_output {
-    ($type:ty) => {
-        impl StateOutput for $type {
-            fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
-                <$type>::put_state(self, key, value)
-            }
-            fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
-                <$type>::delete_state(self, key)
-            }
-        }
-    };
-}
-impl_state_output!(sdk::RowOutput<'_, '_>);
-impl_state_output!(sdk::RowChangeOutput<'_, '_>);
-impl_state_output!(sdk::FileOutput<'_, '_>);
-impl_state_output!(sdk::FileEditOutput<'_, '_>);
 
 trait MutationOutput {
     fn create(&mut self, schema_key: &str, local_ref: u32, row: &sdk::TypedRow) -> sdk::Result<()>;
@@ -945,6 +864,98 @@ mod tests {
 mod adapter_qa_tests {
     use super::*;
 
+    #[test]
+    fn equal_length_prefix_edits_detect_new_bom_in_native_adapter() {
+        let harness = sdk::testing::Harness::<CsvPlugin>::default();
+        let creates = sdk::CreateContext::from_namespace_bytes([0x51; 12]);
+        for (bytes, edit) in [
+            (
+                b"abc,x\n".as_slice(),
+                sdk::FileEdit {
+                    offset: 0,
+                    delete_len: 3,
+                    insert: b"\xef\xbb\xbf".to_vec(),
+                },
+            ),
+            (
+                "\u{fefe},x\n".as_bytes(),
+                sdk::FileEdit {
+                    offset: 2,
+                    delete_len: 1,
+                    insert: vec![0xbf],
+                },
+            ),
+        ] {
+            let file = sdk::testing::Snapshot {
+                file_id: "bom-prefix".to_owned(),
+                path: "data.csv".to_owned(),
+                bytes: bytes.to_vec(),
+                ..sdk::testing::Snapshot::default()
+            };
+            let file = harness.parse(&file, creates).unwrap().into_snapshot();
+            let namespace = IdNamespace::from_namespace_bytes(creates.namespace_bytes());
+            let before = Document::open_file(bytes.to_vec(), None, namespace)
+                .unwrap()
+                .0;
+            let next_creates = sdk::CreateContext::from_namespace_bytes([0x52; 12]);
+            let changed = harness
+                .parse_changes(&file, &file.path, &[edit], None, next_creates)
+                .unwrap();
+            assert_eq!(changed.snapshot().bytes, b"\xef\xbb\xbf,x\n");
+            let changes = changed
+                .row_changes
+                .iter()
+                .map(|change| {
+                    let mut row = change.row.clone();
+                    let row_pk = change.local_ref.map_or_else(
+                        || change.primary_key.clone(),
+                        |local| {
+                            let id = sdk::TypedValue::Uuid(next_creates.id(local));
+                            row.as_mut().unwrap().insert("id", id.clone());
+                            vec![id]
+                        },
+                    );
+                    RowChange {
+                        schema_key: change.schema_key.clone(),
+                        row_pk,
+                        row,
+                        effect: ChangeEffect::Content,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut records = before.row_records().unwrap();
+            for change in changes {
+                records.retain(|record| {
+                    record.schema_key != change.schema_key || record.row_pk != change.row_pk
+                });
+                if let Some(row) = change.row {
+                    records.push(RowRecord {
+                        schema_key: change.schema_key,
+                        row_pk: change.row_pk,
+                        row,
+                    });
+                }
+            }
+            let actual = Document::open_rows(records).unwrap().0;
+            let expected = Document::open_file(changed.snapshot().bytes.clone(), None, namespace)
+                .unwrap()
+                .0;
+            assert_eq!(actual.dialect(), expected.dialect());
+            assert_eq!(actual.bytes(), expected.bytes());
+            let cells = |document: &Document| {
+                document
+                    .row_records()
+                    .unwrap()
+                    .into_iter()
+                    .skip(1)
+                    .map(|record| core::parse_csv_row(&record.row).unwrap().cells)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(cells(&actual), cells(&expected));
+            assert_eq!(cells(&actual), vec![vec![String::new(), "x".to_owned()]]);
+        }
+    }
+
     #[derive(Default)]
     struct MemoryState(std::collections::BTreeMap<Vec<u8>, Vec<u8>>);
     impl StateOutput for MemoryState {
@@ -954,6 +965,10 @@ mod adapter_qa_tests {
         }
         fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
             self.0.remove(key);
+            Ok(())
+        }
+        fn delete_state_prefix(&mut self, prefix: &[u8]) -> sdk::Result<()> {
+            self.0.retain(|key, _| !key.starts_with(prefix));
             Ok(())
         }
     }
@@ -1247,7 +1262,7 @@ mod adapter_qa_tests {
         let row_count = CSV_IDENTITY_PAGE_BYTES / 36 + 3;
         let (document, _) = Document::open_file(b"x\n".repeat(row_count), None, namespace).unwrap();
         let mut stored = MemoryState::default();
-        store_identity_checkpoint(None, &mut stored, &document).unwrap();
+        store_identity_checkpoint(&mut stored, &document).unwrap();
         let (stored_count, page_count, dialect) =
             decode_identity_manifest(stored.0.get(CSV_IDENTITIES_KEY).unwrap()).unwrap();
         assert_eq!(stored_count as usize, row_count);
@@ -1283,7 +1298,7 @@ mod adapter_qa_tests {
             let (document, _) = Document::open_file(bytes.clone(), None, namespace).unwrap();
             assert!(document.dialect().bom);
             let mut stored = MemoryState::default();
-            store_identity_checkpoint(None, &mut stored, &document).unwrap();
+            store_identity_checkpoint(&mut stored, &document).unwrap();
             let (_, _, dialect) =
                 decode_identity_manifest(stored.0.get(CSV_IDENTITIES_KEY).unwrap()).unwrap();
             assert!(dialect.bom);
