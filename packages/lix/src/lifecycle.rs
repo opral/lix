@@ -128,10 +128,7 @@ impl IntoFuture for CreateLixBuilder {
                     body: None,
                 };
                 let upload = Box::pin(async {
-                    match self.source {
-                        Some(source) => http.upload(request, source).await,
-                        None => http.request(request).await,
-                    }
+                    http.upload(request, self.source).await
                 });
                 let response = if let Some(production) = self.production {
                     match select(upload, production).await {
@@ -284,6 +281,45 @@ fn require_success(response: &ProtocolHttpResponse, expected_status: u16) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn empty_creation_bounds_chunked_responses() {
+        use std::io::{Read, Write};
+        for oversized in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let id = "00000000-0000-4000-8000-000000000001";
+            let url = format!("http://{address}/lix/{id}");
+            let mut body = serde_json::to_vec(&serde_json::json!({"id": id, "url": url})).unwrap();
+            body.resize(64 * 1024 + usize::from(oversized), b' ');
+            let thread = std::thread::spawn(move || {
+                let (mut connection, _) = listener.accept().unwrap();
+                connection.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    connection.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(String::from_utf8(request).unwrap().starts_with("POST /lix/v1 "));
+                write!(connection, "HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+                for chunk in body.chunks(4096) {
+                    if write!(connection, "{:x}\r\n", chunk.len()).and_then(|()| connection.write_all(chunk)).and_then(|()| connection.write_all(b"\r\n")).is_err() { return; }
+                }
+                let _ = connection.write_all(b"0\r\n\r\n");
+            });
+            let result = create_lix().with_server(ServerOptions::new(format!("http://{address}"))).await;
+            if oversized {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "LIX_SERVER_PROTOCOL_ERROR");
+                assert!(error.message.contains("64 KiB"));
+            } else {
+                assert_eq!(result.unwrap().id, id);
+            }
+            thread.join().unwrap();
+        }
+    }
 
     #[test]
     fn deletion_requires_completed_response_not_accepted_for_later() {

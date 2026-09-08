@@ -468,8 +468,9 @@ impl RemoteLix {
         let lifecycle = PublicTransactionLease::acquire(Arc::clone(&self.transaction_lifecycle))?;
         let _admission = self.transaction_lifecycle.admission.lock().await;
         Ok(RemoteLixTransaction {
-            transaction: self.client.begin_transaction().await?,
-            _lifecycle: lifecycle,
+            transaction: Some(self.client.begin_transaction().await?),
+            http: self.client.http().clone(),
+            lifecycle: Some(lifecycle),
         })
     }
     pub fn observe(&self, sql: &str, params: &[Value]) -> Result<RemoteObserveEvents, LixError> {
@@ -518,10 +519,15 @@ impl RemoteLix {
 }
 
 /// A transaction executing on the remote repository.
+///
+/// Dropping an unfinished transaction schedules a best-effort rollback. Until
+/// cleanup finishes, the parent handle rejects new transactions and closing.
+/// Call [`Self::rollback`] to await rollback explicitly.
 #[derive(Debug)]
 pub struct RemoteLixTransaction {
-    _lifecycle: PublicTransactionLease,
-    transaction: ProtocolTransaction<crate::sync::AuthorityHttp>,
+    lifecycle: Option<PublicTransactionLease>,
+    transaction: Option<ProtocolTransaction<crate::sync::AuthorityHttp>>,
+    http: crate::sync::AuthorityHttp,
 }
 impl RemoteLixTransaction {
     pub fn execute<'a>(
@@ -536,11 +542,27 @@ impl RemoteLixTransaction {
             options: ProtocolExecuteOptions::default(),
         }
     }
-    pub async fn commit(self) -> Result<(), LixError> {
-        self.transaction.commit().await
+    pub async fn commit(mut self) -> Result<(), LixError> {
+        self.transaction.as_ref().ok_or_else(closed_transaction_error)?.commit().await?;
+        self.transaction.take();
+        Ok(())
     }
-    pub async fn rollback(self) -> Result<(), LixError> {
-        self.transaction.rollback().await
+    pub async fn rollback(mut self) -> Result<(), LixError> {
+        self.transaction.as_ref().ok_or_else(closed_transaction_error)?.rollback().await?;
+        self.transaction.take();
+        Ok(())
+    }
+}
+
+impl Drop for RemoteLixTransaction {
+    fn drop(&mut self) {
+        let Some(transaction) = self.transaction.take() else { return; };
+        let lifecycle = self.lifecycle.take();
+        crate::authority_client::ProtocolHttp::spawn(&self.http, Box::pin(async move {
+            // Keep close and new transactions fenced until cleanup finishes.
+            let _lifecycle = lifecycle;
+            let _ = transaction.rollback().await;
+        }));
     }
 }
 
@@ -598,6 +620,7 @@ impl<'a> IntoFuture for RemoteTransactionExecuteBuilder<'a> {
         Box::pin(async move {
                 self.transaction
                     .transaction
+                    .as_ref().ok_or_else(closed_transaction_error)?
                     .execute(self.sql, self.params, Some(self.options))
                     .await
         })
@@ -3401,6 +3424,64 @@ mod tests {
         let transaction = opening.await.unwrap().unwrap();
         assert_eq!(lix.close().await.unwrap_err().code, "LIX_INVALID_TRANSACTION_STATE");
         transaction.rollback().await.unwrap();
+        lix.close().await.unwrap();
+        thread.join().unwrap();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn dropping_remote_transaction_rolls_back_before_releasing_lease() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (rollback_tx, rollback_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut rollback_tx = Some(rollback_tx);
+            for step in 0..6 {
+                let (mut connection, _) = listener.accept().unwrap();
+                connection.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    connection.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") { break; }
+                }
+                let request = String::from_utf8(request).unwrap();
+                let size = request.lines().find_map(|line| line.to_lowercase().strip_prefix("content-length:").and_then(|n| n.trim().parse::<usize>().ok())).unwrap_or(0);
+                connection.read_exact(&mut vec![0; size]).unwrap();
+                let (status, body) = match step {
+                    0 => (200, serde_json::json!({ "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "sessionId": "drop-session", "activeBranchId": "main", "activeAccountId": "account" }).to_string()),
+                    1 | 3 => {
+                        assert!(request.contains("/transaction/begin "));
+                        (200, serde_json::json!({ "transactionId": format!("transaction-{step}") }).to_string())
+                    }
+                    2 => {
+                        assert!(request.contains("/transaction/rollback "));
+                        rollback_tx.take().unwrap().send(()).unwrap();
+                        resume_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                        (204, String::new())
+                    }
+                    4 => { assert!(request.contains("/transaction/commit ")); (204, String::new()) }
+                    _ => { assert!(request.starts_with("DELETE ") && request.contains("/session ")); (204, String::new()) }
+                };
+                write!(connection, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let lix = open_lix().with_server(ServerOptions::new(format!("http://{address}/lix/00000000-0000-4000-8000-000000000001"))).await.unwrap();
+        drop(lix.begin_transaction().await.unwrap());
+        rollback_rx.await.unwrap();
+        assert_eq!(lix.close().await.unwrap_err().code, "LIX_INVALID_TRANSACTION_STATE");
+        assert_eq!(lix.begin_transaction().await.unwrap_err().code, "LIX_INVALID_TRANSACTION_STATE");
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while lix.transaction_lifecycle.active.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        lix.begin_transaction().await.unwrap().commit().await.unwrap();
         lix.close().await.unwrap();
         thread.join().unwrap();
     }

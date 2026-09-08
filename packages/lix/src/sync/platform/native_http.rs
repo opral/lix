@@ -26,7 +26,7 @@ impl AuthorityHttp {
     pub(crate) async fn upload(
         &self,
         request: ProtocolHttpRequest,
-        body: ProtocolByteStream,
+        body: Option<ProtocolByteStream>,
     ) -> Result<ProtocolHttpResponse, LixError> {
         let method = request.method.parse::<reqwest::Method>().map_err(|error| {
             LixError::new(
@@ -38,8 +38,10 @@ impl AuthorityHttp {
         for (name, value) in request.headers {
             builder = builder.header(name, value);
         }
+        if let Some(body) = body {
+            builder = builder.body(reqwest::Body::wrap_stream(body));
+        }
         let response = builder
-            .body(reqwest::Body::wrap_stream(body))
             .send()
             .await
             .map_err(|error| transport_error("upload repository", error))?;

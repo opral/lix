@@ -3215,6 +3215,8 @@ pub struct HostedServerDto {
     pub headers: Vec<(String, String)>,
 }
 
+// N-API registration is disabled in Rust test builds; JavaScript calls these exports.
+#[cfg_attr(test, allow(dead_code))]
 #[derive(Debug)]
 pub struct HostedLifecycleTask {
     idempotency_key: Option<String>,
@@ -3256,6 +3258,7 @@ impl Task for HostedLifecycleTask {
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 #[napi(js_name = "createHosted")]
 pub fn create_hosted(
     url: String,
@@ -3268,6 +3271,7 @@ pub fn create_hosted(
         delete: false,
     })
 }
+#[cfg_attr(test, allow(dead_code))]
 #[napi(js_name = "deleteHosted")]
 pub fn delete_hosted(
     url: String,

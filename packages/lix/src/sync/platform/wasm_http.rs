@@ -66,7 +66,7 @@ pub(crate) struct BrowserHttpClient {
     fetch: Option<Function>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct AuthorityHttp(BrowserHttpClient);
 
 pub(crate) fn authority_http(headers: &[(String, String)]) -> Result<AuthorityHttp, LixError> {
@@ -102,14 +102,15 @@ impl AuthorityHttp {
     pub(crate) async fn upload(
         &self,
         request: ProtocolHttpRequest,
-        body: ProtocolByteStream,
+        body: Option<ProtocolByteStream>,
     ) -> Result<ProtocolHttpResponse, LixError> {
         use futures_util::{
             StreamExt,
             future::{AbortHandle, Abortable},
         };
+        let has_body = body.is_some();
         let state = std::rc::Rc::new(UploadBodyState {
-            stream: RefCell::new(Some(body)),
+            stream: RefCell::new(body),
             canceled: std::cell::Cell::new(false),
             pending: RefCell::new(None),
         });
@@ -174,8 +175,10 @@ impl AuthorityHttp {
         let init = Object::new();
         Reflect::set(&init, &"method".into(), &request.method.into())
             .map_err(js_transport_error)?;
-        Reflect::set(&init, &"body".into(), &stream).map_err(js_transport_error)?;
-        Reflect::set(&init, &"duplex".into(), &"half".into()).map_err(js_transport_error)?;
+        if has_body {
+            Reflect::set(&init, &"body".into(), &stream).map_err(js_transport_error)?;
+            Reflect::set(&init, &"duplex".into(), &"half".into()).map_err(js_transport_error)?;
+        }
         Reflect::set(&init, &"credentials".into(), &"include".into())
             .map_err(js_transport_error)?;
         Reflect::set(&init, &"redirect".into(), &"error".into()).map_err(js_transport_error)?;
@@ -236,7 +239,7 @@ impl AuthorityHttp {
         Reflect::set(&init, &"headers".into(), &pairs).map_err(js_transport_error)?;
         // Native browser Fetch must support streamed request bodies. Never turn
         // a repository into a giant ArrayBuffer as a compatibility fallback.
-        if self.0.fetch.is_none() {
+        if has_body && self.0.fetch.is_none() {
             let constructor = Reflect::get(&global, &"Request".into())
                 .map_err(js_transport_error)?
                 .dyn_into::<Function>()
