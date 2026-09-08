@@ -7,8 +7,6 @@ use crate::catalog::{CatalogContext, CatalogFingerprint};
 use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
 use crate::hot_state::HotStateContext;
-#[cfg(feature = "server-protocol")]
-use crate::hot_state::{HotStateFilter, HotStateScanRequest};
 use crate::hot_state::HotStateRowRequest;
 use crate::init::InitReceipt;
 use crate::observe_coordinator::ObserveCoordinator;

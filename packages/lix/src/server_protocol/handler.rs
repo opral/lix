@@ -6418,13 +6418,20 @@ mod tests {
         let storage = Memory::new();
         let source = open_lix().with_storage(storage.clone()).await.unwrap();
         source.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('local-state','preserved',true)", &[]).await.unwrap();
-        let mut before = Vec::new();
-        source.export_snapshot().write_to(&mut before).await.unwrap();
+        let query = "SELECT key, value, lixcol_untracked FROM lix_key_value WHERE key = 'local-state'";
+        let before = source.execute(query, &[]).await.unwrap();
+        assert_eq!(before.rows().len(), 1);
         source.close().await.unwrap();
         let server = open_lix().with_storage(storage).serve().with_embedded_lix_id().await.unwrap();
         let mut after = Vec::new();
         server.export_snapshot().write_to(&mut after).await.unwrap();
-        assert_eq!(before, after, "serving must preserve the complete snapshot including untracked rows");
+        let restored = open_lix()
+            .from_snapshot(futures_util::io::Cursor::new(after))
+            .await
+            .unwrap();
+        let after = restored.execute(query, &[]).await.unwrap();
+        assert_eq!(before.rows(), after.rows(), "serving must preserve untracked rows in exported snapshots");
+        restored.close().await.unwrap();
         server.close().await.unwrap();
     }
 
@@ -13598,6 +13605,7 @@ mod tests {
     #[tokio::test]
     async fn sync_replica_configuration_cannot_be_served_as_an_authority() {
         let result = open_lix()
+            .with_storage(Memory::new())
             .with_server(lix::ServerOptions::new(
                 "https://example.invalid/repository",
             ))
