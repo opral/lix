@@ -1,41 +1,20 @@
 ---
-description: Choose local storage for Lix and optionally connect the repository to a server.
+description: Start with in-memory Lix, persist local files, connect to a server, or keep a browser replica.
 ---
 
-# Persistence and Storage
+# Storage
 
-Lix has pluggable storage. A storage adapter decides where local bytes live. The
-Lix API stays the same: `execute`, `createBranch`, and `mergeBranch` do not
-change with the adapter.
+Lix runs in memory by default. Choose a storage adapter when you need to keep
+data across restarts. Files, SQL, and version control use the same API.
 
-To export or restore a complete Lix as a portable artifact,
-see [Snapshots](./snapshots.md). Snapshot export is separate from the
-incremental persistence performed by an adapter during normal operation.
-
-Storage and server mode are separate choices:
-
-| Setup  | Storage                                     | Server           | Reads and writes                       |
-| :----- | :------------------------------------------ | :--------------- | :------------------------------------- |
-| Local  | Memory, OPFS, filesystem, or native storage | None             | Local                                  |
-| Remote | None                                        | `mode: "remote"` | Server                                 |
-| Sync   | Memory, OPFS, filesystem, or native storage | `mode: "sync"`   | Local, with background synchronization |
-
-See [Collaboration and Sync](./collaboration-and-sync.md) to choose between the
-two server modes.
-
-| Adapter             | Available in     | Use for                                 |
-| ------------------- | ---------------- | --------------------------------------- |
-| `Memory` (default)  | JavaScript, Rust | tests, demos, and ephemeral work        |
-| `OpfsStorage`       | JavaScript       | persistent local browser repositories   |
-| `FilesystemStorage` | JavaScript, Rust | a local directory synchronized with Lix |
-| `RocksDB`           | Rust             | native embedded persistence             |
-| `SlateDB`           | Rust             | object storage, for example S3          |
-
-In JavaScript, `FilesystemStorage` requires Node.js. The default `Memory` storage and the separate `@lix-js/storage-opfs` package work in browsers.
+<img src="../website/public/assets/local-only-storage.png" alt="Lix runs on one device with a choice of memory, filesystem, or browser OPFS storage adapter. No server is required." width="760" />
 
 ## In-memory (default)
 
-Omit the `storage` option to open an ephemeral in-memory Lix:
+<a id="local-only-storage"></a>
+
+Start with `openLix()` and no options. Data lives in memory for the lifetime of
+the instance, making this useful for tests and trying Lix:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -47,67 +26,71 @@ await lix.close();
 
 ## Local filesystem
 
-Persist a directory as a Lix repository with `FilesystemStorage`:
+Use [`@lix-js/storage-filesystem`](https://www.npmjs.com/package/%40lix-js/storage-filesystem)
+in Node.js to persist a directory. Agents and tools can read and write its
+ordinary files:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
 import { FilesystemStorage } from "@lix-js/storage-filesystem";
 
 const lix = await openLix({
-  storage: new FilesystemStorage({ path: "/var/data/repository" }),
+  storage: new FilesystemStorage({ path: "./repository" }),
 });
 ```
 
-Lix stores its repository state in `<repository>/.lix/.internal` and synchronizes repository files. Reopen the same path to resume the existing state.
+Lix stores repository state in `<repository>/.lix/.internal`. Keep that state
+with the directory to reopen it. Only regular files synchronize; symlinks and
+special entries are excluded.
 
-In Rust, open the storage, pass it to Lix, then start synchronization on that
-repository:
+For selective sync, pass `syncAllFiles: false` and import paths with
+`storage.importPaths(paths)`. See [Rust usage](#rust-filesystem-adapter) below.
 
-```rust
-use lix::open_lix;
-use lix_storage_filesystem::FilesystemStorage;
+### Filesystem sync
 
-let storage = FilesystemStorage::new("./repository").open()?;
-let lix = open_lix().with_storage(storage.clone()).await?;
-storage.start_sync(&lix).await?;
+<a id="sync-a-filesystem-with-a-server"></a>
 
-storage.sync_disk_to_lix().await?;
-storage.stop_sync().await?;
-```
+Sync mode runs a local Lix replica alongside the authoritative server.
+Use `FilesystemStorage` for project directories or mounted sandbox volumes.
+It keeps ordinary files synchronized with the replica, which exchanges commits
+with the server in the background.
 
-`FilesystemStorage` owns synchronization after `start_sync()` returns. Calling
-`stop_sync()` is optional for normal applications and recommended for tests, or
-before reopening the same directory immediately. Dropping the final storage
-or repository instance performs a best-effort shutdown.
-
-Pass `syncAllFiles: false` to begin with no regular repository files and import
-selected paths with `storage.importPaths(paths)`.
-
-## Browser OPFS
-
-Persist a local browser repository across reloads with `OpfsStorage`:
+<img src="../website/public/assets/filesystem-server-storage.png" alt="A machine or sandbox runs Replica Lix with FilesystemStorage. Agents and tools read and write ordinary project files. The replica synchronizes with Authoritative Lix on a server backed by SlateDB and S3." width="760" />
 
 ```ts
 import { openLix } from "@lix-js/sdk";
-import { OpfsStorage } from "@lix-js/storage-opfs";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
 
 const lix = await openLix({
-  storage: new OpfsStorage({ name: "atelier" }),
+  storage: new FilesystemStorage({ path: "/workspace/project" }),
+  server: {
+    mode: "sync",
+    url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+  },
 });
 ```
 
-The name identifies one Lix database within the current browser origin.
-Multiple Lix workers and tabs can attach to the same name through the
-package-owned storage worker. The provider uses SQLite Wasm on OPFS and a
-cross-tab Web Lock. It implements the same generic storage protocol as other
-JavaScript providers; the Lix SDK does not expose OPFS-specific APIs.
+Point `path` at the directory your infrastructure mounts into the sandbox.
+Each machine keeps its own replica. Share a branch to exchange changes, or
+use separate branches for review. See
+[opening and reconnecting](./collaboration-and-sync.md#opening-and-reconnecting)
+for initial downloads and offline behavior.
 
-Filesystem sync handles regular files only. Symbolic links and other special entries are not imported.
+## Remote mode
 
-## Connect to a server
+<a id="client-server"></a>
 
-Remote mode executes every operation on the server and does not accept local
-storage:
+<a id="use-a-server-without-local-storage"></a>
+
+<a id="connect-to-a-server"></a>
+
+A classic client-server setup: your app sends requests through the Lix SDK,
+and the server executes them against its repository. Use `mode: "remote"`.
+Storage is managed on the server. Use [LixRay](https://lixray.com/docs) or
+[your own host](./hosting.md), and replace the example URL with your Lix
+connection URL.
+
+<img src="../website/public/assets/remote-server-storage.png" alt="The client uses the Lix SDK to make API calls to Authoritative Lix on the server, with no local storage. The server uses a SlateDB storage adapter backed by S3." width="760" />
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -120,9 +103,23 @@ const lix = await openLix({
 });
 ```
 
-The client needs no local storage option. Files, SQL rows, and branches live on the server.
+Each operation requires a network round trip; successful writes are accepted
+by the server. For ordinary files on disk, use [filesystem sync](#filesystem-sync).
 
-Sync mode combines local storage with the same hosted repository:
+## Browser OPFS
+
+<a id="browser-sync"></a>
+
+<a id="sync-a-browser-with-a-server"></a>
+
+`OpfsStorage` persists Lix in the browser across reloads. Add `mode: "sync"`
+to keep that local replica synchronized with a server.
+
+For a Linear-like UI, reads and writes use local data instead of waiting for a
+network round trip on each interaction. Edits commit locally and sync in the
+background. Uncached data can still require a network fetch.
+
+<img src="../website/public/assets/browser-server-storage.png" alt="A browser runs Replica Lix with a SQLite storage adapter backed by OPFS. It synchronizes with Authoritative Lix on a server, whose SlateDB storage adapter uses S3." width="760" />
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -137,42 +134,78 @@ const lix = await openLix({
 });
 ```
 
-Reads and writes execute locally while Lix exchanges commits with the server in
-the background. See [Collaboration and Sync](./collaboration-and-sync.md) for
-offline and lazy-loading behavior.
+Install [`@lix-js/storage-opfs`](https://www.npmjs.com/package/%40lix-js/storage-opfs).
+SQLite Wasm persists the replica in the browser's Origin Private File System
+(OPFS). Reuse `name` within the same browser origin to reopen it after reloads.
+Omit `server` for a browser-only repository. Workers and tabs can share the
+same name through the package's storage worker and cross-tab Web Lock.
+
+Both sync setups download current working state on first open. Existing
+replicas reopen locally; older history and binary content load when needed.
+Local writes may finish before reaching the server. See
+[opening and reconnecting](./collaboration-and-sync.md#opening-and-reconnecting).
+
+## How storage adapters fit
+
+The client configures its local adapter with `storage`. The host configures
+server storage. In the diagram, SlateDB runs inside the server process and
+uses S3 as its external backing store.
+
+| Adapter | Available in | Stores data in |
+| --- | --- | --- |
+| `Memory` (default) | JavaScript, Rust | Temporary in-memory data |
+| `FilesystemStorage` | JavaScript (Node.js), Rust | Files and repository state on disk |
+| `OpfsStorage` | JavaScript (browser) | Browser OPFS through SQLite Wasm |
+| `RocksDB` | Rust | Local disk for native embedded persistence |
+| `SlateDB` | Rust | S3-compatible object storage |
+
+The [reference server](https://github.com/opral/lix/tree/main/packages/server)
+uses SlateDB; custom hosts can choose another adapter. The separate `server`
+option controls remote execution or replica synchronization. See the
+[connection reference](./collaboration-and-sync.md#connection-reference).
+JavaScript sync clients require a durable adapter, such as `OpfsStorage` or
+`FilesystemStorage`. Use [Snapshots](./snapshots.md) to export or restore a
+complete repository.
+
+### Rust filesystem adapter
+
+In Rust, start directory synchronization explicitly:
+
+```rust
+use lix::open_lix;
+use lix_storage_filesystem::FilesystemStorage;
+
+let storage = FilesystemStorage::new("./repository").open()?;
+let lix = open_lix().with_storage(storage.clone()).await?;
+storage.start_sync(&lix).await?;
+
+storage.sync_disk_to_lix().await?;
+storage.stop_sync().await?;
+```
+
+The adapter owns directory synchronization after `start_sync()`. Stop it before
+immediately reopening the directory; dropping the final instance attempts
+shutdown.
 
 ## Automatic format upgrades
 
-`open_lix()` is the repository lifecycle boundary. When it encounters a
-supported older format, Lix copies the repository into an inactive storage
-epoch, validates it, and atomically publishes that epoch before opening the
-handle. Applications do not call a separate migration API. Rust applications
-can attach an `OpenProgressSink`; JavaScript applications can pass
-`onProgress` to `openLix()` to make the blocking upgrade visible.
+Opening a supported older format copies it into an inactive storage epoch,
+validates it, then atomically publishes it. No separate migration call is
+needed. Report progress with Rust's `OpenProgressSink` or JavaScript's
+`onProgress`.
 
-Capacity planning must include two repository generations. Lix retains the
-immediately previous generation for rollback. A later upgrade clears the
-inactive epoch before reusing it; once a newer epoch is active, Lix reclaims
-the legacy pre-epoch layout asynchronously. Budget approximately 2× the live
-repository bytes, plus the backend's normal WAL, compaction, and
-temporary-write headroom. Upgrade latency is proportional to authoritative
-bytes and depends on the storage backend and hardware. Automatic upgrades do
-not impose a fixed row or byte ceiling that could strand an otherwise valid
-repository; available backend capacity is the practical bound.
+Lix retains the previous generation for rollback. Budget roughly 2× the live
+repository size plus WAL, compaction, and temporary-write space. Upgrade time
+depends on data size, storage, and hardware; available capacity is the practical
+limit. Later upgrades reuse the inactive epoch and reclaim legacy storage
+asynchronously.
 
-The ignored RocksDB capacity profile reproduces the copy with a released-v75
-repository and a configurable payload:
+Run the RocksDB capacity profile against a released-v75 repository:
 
 ```sh
 LIX_MIGRATION_PROFILE_MIB=256 cargo test -p lix-storage-rocksdb \
   --features storage-benches --test migration_profile --release -- \
   --ignored --nocapture
-```
-
-For S3, the server runs Lix with the Rust `SlateDB` storage on an S3-compatible object store. The server exposes the repository through the [Lix Server Protocol](./server-protocol.md). See [Hosting](./hosting.md). Clients do not pass S3 to `openLix()`.
-
-```text
-JS client ── HTTP ──▶ Lix server ──▶ SlateDB ──▶ S3
 ```
 
 ## Closing
@@ -181,7 +214,8 @@ Always `await lix.close()` in scripts and tests. Long-lived servers can hold one
 
 ## Custom storage (Rust)
 
-The engine runs on any ordered transactional key-value store. A storage implementation only provides ordered byte-key persistence, coherent read views, and atomic writes. It does not parse Lix SQL and does not interpret engine concepts such as branches or changes.
+Adapters implement ordered transactional key-value storage, without parsing
+Lix SQL or interpreting branches and changes.
 
 Implement three asynchronous traits from `lix::storage`: `Storage`, `StorageRead`, and `StorageWrite`. An implementation must guarantee:
 
@@ -200,4 +234,5 @@ let report = run_storage_conformance(&factory).await;
 report.assert_no_failures();
 ```
 
-PostgreSQL, OPFS, Cloudflare D1, and similar targets need such a custom implementation.
+Backends without an existing adapter, such as PostgreSQL or Cloudflare D1,
+need such an implementation.

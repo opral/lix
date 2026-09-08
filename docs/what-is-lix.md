@@ -42,7 +42,7 @@ const lix = await openLix({
 });
 ```
 
-See [Collaboration and Sync](./collaboration-and-sync.md).
+See [Collaboration](./collaboration-and-sync.md).
 
 ### File-based apps with SQL and version control
 
@@ -63,20 +63,20 @@ Diffs are row-level: review the clause, cell, or row that changed, not lines of 
 
 ## Pluggable storage
 
-Run Lix in memory, on the local filesystem, or against a server backed by S3. See [Persistence and Storage](./persistence.md).
+Run Lix in memory, on the local filesystem, or against a server backed by S3. See [Storage](./persistence.md).
 
 <img src="../website/public/assets/pluggable-storage.svg" alt="Lix runs in your app on a storage adapter: in memory, local filesystem, or S3 bucket" width="760" />
 
 ## Local, remote, and sync
 
 Lix supports local repositories, direct remote clients, and synchronized local
-replicas with the same API. See [Persistence and Storage](./persistence.md) for
+replicas with the same API. See [Storage](./persistence.md) for
 setup examples.
 
 Clients can execute directly on a server or use a synchronized local replica.
 Both modes use the same files, SQL, and branches. Clients on the same server
 see each other's changes through `lix.observe()`. See
-[Collaboration and Sync](./collaboration-and-sync.md).
+[Collaboration](./collaboration-and-sync.md).
 
 ## Permissions (planned)
 
@@ -89,5 +89,5 @@ Permissions will live inside the repository: per file, per group, and versioned 
 - [Schemas](./schemas.md): define app rows and plugin rows.
 - [Diffs](./diffs.md): track changes inside files.
 - [Files and Media](./files-and-media.md): store text, binary files, and large media.
-- [Collaboration and Sync](./collaboration-and-sync.md): connect clients directly or through local replicas.
+- [Collaboration](./collaboration-and-sync.md): connect clients directly or through local replicas.
 - [Persistence](./persistence.md): choose a local or remote setup.

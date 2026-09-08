@@ -52,4 +52,4 @@ LIMIT 20;
 
 - [Diffs](./diffs.md): how plugins split files into rows.
 - [History](./history.md): query what changed with SQL.
-- [Persistence and Storage](./persistence.md): storage adapters from memory to S3.
+- [Storage](./persistence.md): storage adapters from memory to S3.

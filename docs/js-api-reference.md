@@ -61,7 +61,7 @@ const lix = await openLix({
 
 In sync mode, `execute()` resolves when the local transaction commits. Server
 synchronization continues in the background. See
-[Collaboration and Sync](./collaboration-and-sync.md) for the complete behavior.
+[Collaboration](./collaboration-and-sync.md) for the complete behavior.
 
 Use `OpfsStorage` to persist a local browser Lix across reloads:
 

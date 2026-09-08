@@ -8,26 +8,10 @@ A hosted Lix lives on a server. The server owns its storage and
 authentication. Clients can execute directly on the server or keep a
 synchronized local replica.
 
-| Client mode | Use for                                                             |
-| :---------- | :------------------------------------------------------------------ |
-| `remote`    | The simplest setup. Every operation executes on the server.         |
-| `sync`      | Responsive and offline apps. Operations execute on a local replica. |
-
-Both modes use the same Lix URL and server protocol. See
-[Collaboration and Sync](./collaboration-and-sync.md) to choose a mode.
-
-The simplest client uses remote mode:
-
-```ts
-import { openLix } from "@lix-js/sdk";
-
-const lix = await openLix({
-  server: {
-    mode: "remote",
-    url: "https://lixray.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
-  },
-});
-```
+A service can access the repository through SDK calls, an agent sandbox can
+synchronize a filesystem directory, and a browser can keep a local replica in
+OPFS. All three connect to the same server. See the
+[setup examples](./persistence.md) for client configuration and storage adapters.
 
 There are two ways to get a server:
 
@@ -64,14 +48,14 @@ namespace and project URLs are separate web-page addresses, not Lix connection
 URLs.
 
 Files, SQL, branches, history, and `observe()` work the same way they do
-locally. See [Collaboration and Sync](./collaboration-and-sync.md).
+locally. See [Collaboration](./collaboration-and-sync.md).
 
 ## Host it yourself
 
 Companies that must keep repositories on their own infrastructure can run their
 own host. There are three interoperable approaches:
 
-1. Deploy the ready-made [Lix reference server](../packages/server/README.md)
+1. Deploy the ready-made [Lix reference server](https://github.com/opral/lix/tree/main/packages/server)
    behind your authentication gateway.
 2. Embed the `lix` crate's protocol handler in a custom Rust host.
 3. Implement the documented Lix Server Protocol independently in another
@@ -86,7 +70,7 @@ The reference server uses SlateDB and S3-compatible object storage and is
 published as `ghcr.io/opral/lix-server`. It provides runtime pooling, caching,
 stream leases, timeouts, and graceful recovery. Authentication, authorization,
 and resource-existence policy remain the responsibility of a trusted gateway.
-See its [README](../packages/server/README.md) for configuration and security
+See its [README](https://github.com/opral/lix/tree/main/packages/server) for configuration and security
 requirements.
 
 ### Embed the Rust handler
@@ -171,4 +155,4 @@ configure this:
 JS client ── HTTP ──▶ your Lix server ──▶ SlateDB ──▶ S3
 ```
 
-See [Persistence and Storage](./persistence.md).
+See [Storage](./persistence.md).

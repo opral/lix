@@ -59,4 +59,4 @@ outside the repository when your application can rebuild them.
 Binary content uses the repository's selected storage adapter. Use RocksDB or
 the local filesystem for native applications. Use SlateDB with S3-compatible
 object storage for hosted repositories. See
-[Persistence and Storage](./persistence.md).
+[Storage](./persistence.md).

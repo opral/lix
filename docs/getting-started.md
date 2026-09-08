@@ -28,4 +28,4 @@ cargo add lix
 [Start the Rust quickstart →](./rust-quickstart.md)
 
 After the quickstart, pick a local or hosted setup in
-[Persistence and Storage](./persistence.md).
+[Storage](./persistence.md).

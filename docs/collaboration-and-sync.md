@@ -1,102 +1,72 @@
 ---
-description: Connect clients to one Lix server using remote mode or a synchronized local replica.
+description: Share one repository across services, agent sandboxes, and browsers, with guidance on startup and synchronization.
 ---
 
-# Collaboration and sync
+# Collaboration
 
-Collaboration requires a Lix server. The server connects users and devices
-through one shared repository.
+Users, agents, and devices share one authoritative repository through a Lix
+server:
 
-Use [LixRay](https://lixray.com/docs) for a hosted Lix server, or
-[host a Lix server yourself](./hosting.md). Once you have a Lix connection URL,
-choose how each client connects.
+- [SDK clients](./persistence.md#remote-mode) query the server directly.
+- [Sandboxes and machines](./persistence.md#filesystem-sync) synchronize local files.
+- [Browser apps](./persistence.md#browser-opfs) read and edit an OPFS replica.
 
-## Choose a client mode
+Use [LixRay](https://lixray.com/docs) or [host your own server](./hosting.md).
+See [storage adapters](./persistence.md#how-storage-adapters-fit) for persistence options.
 
-|                          | Remote mode                   | Sync mode                         |
-| :----------------------- | :---------------------------- | :-------------------------------- |
-| Reads and writes execute | On the server                 | On a local replica                |
-| Local storage            | Not required                  | Recommended                       |
-| Network round trip       | Every operation               | Outside the normal operation path |
-| Offline work             | No                            | Cached reads and local writes     |
-| Best for                 | Thin clients and server tools | Interactive and offline apps      |
+## Connection reference
 
-Both modes collaborate through the same server and use the same Lix API.
+<a id="choose-a-client-mode"></a>
 
-## Remote mode
+`openLix()` selects where SDK operations execute with `server.mode`.
+Both client modes connect to the same server.
 
-Remote mode is the simplest way to connect:
+| | `remote` | `sync` |
+| --- | --- | --- |
+| Reads and writes execute | On the server | On a local replica |
+| Client storage | None; do not pass `storage` | An explicit durable adapter in JavaScript |
+| Network round trip | Every operation | Background synchronization; uncached data may need a fetch |
+| Successful write | Accepted by the server | Committed locally; may not yet be on the server |
+| Offline work | No | Cached reads and local writes |
 
-```ts
-import { openLix } from "@lix-js/sdk";
+### Remote mode
 
-const lix = await openLix({
-  server: {
-    mode: "remote",
-		url: lixConnectionUrl,
-  },
-});
-```
+Use `server: { mode: "remote", url: lixConnectionUrl }` for SDK access with
+server-acknowledged writes. It creates no local repository or synchronized files.
 
-The client does not open a local repository. Reads and writes execute on the
-server, so a successful operation has been accepted by the server. Every
-operation includes a network round trip.
+### Sync mode
 
-Use remote mode when the application is always online, should not store
-repository data locally, or must know that the server accepted each successful
-write.
+Use `server: { mode: "sync", url: lixConnectionUrl }` with `FilesystemStorage`
+for files on disk or `OpfsStorage` for a browser replica. Current data and new
+commits sync automatically; older history and binary content download on demand.
 
-## Sync mode
+`await lix.execute(...)` confirms a local commit, not server receipt.
+Uploads run in the background; no `sync()` call is needed.
 
-Sync mode keeps a local working copy of the server repository. Current data and
-new commits synchronize automatically. Older history and binary content
-download only when needed.
+### Connection URL and authentication
+
+Use the host's absolute HTTPS connection URL with path `/lix/{uuid}`, not its
+project page URL. HTTP is accepted only on loopback. Both modes accept headers
+and async credential refresh:
 
 ```ts
-import { openLix } from "@lix-js/sdk";
-import { OpfsStorage } from "@lix-js/storage-opfs";
-
-const lix = await openLix({
-  storage: new OpfsStorage({
-    name: repositoryId,
+server: {
+  mode: "sync",
+  url: lixConnectionUrl,
+  headers: async () => ({
+    Authorization: `Bearer ${await getAccessToken()}`,
   }),
-  server: {
-    mode: "sync",
-		url: lixConnectionUrl,
-    headers: async () => ({
-      Authorization: `Bearer ${await getAccessToken()}`,
-    }),
-  },
-});
+}
 ```
-
-The Lix connection URL identifies the hosted Lix. It is an absolute HTTPS URL
-whose path is exactly `/lix/{uuid}`; HTTP is accepted only on loopback. The OPFS
-name identifies its local working copy within the current browser origin. Use a
-stable OPFS name for each Lix.
-
-Reads and writes execute locally. They do not wait for a server round trip,
-which makes sync mode suitable for responsive editors and interactive apps.
-
-`await lix.execute(...)` means that the local transaction committed. It does
-not mean that the server has received the commit. Lix uploads committed changes
-in the background. The application does not call `sync()`.
-
-Use sync mode when interactions should feel immediate, the app should continue
-working offline, or repository data should persist in the browser.
 
 ## Opening and reconnecting
 
-A fresh local replica downloads the repository's current working state before
-`openLix()` resolves. A previously opened replica can open from local storage
-and reconnect in the background. It may initially be behind the server.
+A fresh replica downloads current working state before `openLix()` resolves.
+Existing replicas can open locally and reconnect in the background, potentially
+starting behind the server.
 
-While offline:
-
-- Cached reads continue to work.
-- Writes commit to local storage.
-- Pending commits upload after reconnect.
-- History or binary content that has never been downloaded is unavailable.
+Offline, cached reads and local writes work; undownloaded history and binary
+content are unavailable. Pending commits upload after reconnect.
 
 ## Receive collaborative updates
 
@@ -109,37 +79,27 @@ const initial = await files.next();
 const update = await files.next();
 ```
 
-When another client changes the shared repository, a remote client receives the
-updated query result from the server. A sync client applies the incoming commit
-locally and then updates affected observations. Application code uses the same
-`observe()` API in both modes.
+Remote clients receive updated query results from the server. Sync clients
+apply incoming commits locally, then update affected observations.
 
-Use the same branch when collaborators should see each other's accepted
-changes. Use separate branches when work must be reviewed before it joins the
-target branch.
+Share a branch to see collaborators' accepted changes; use separate branches
+for work requiring review.
 
 ## Concurrent changes
 
-Two sync clients may commit before receiving each other's changes. Lix keeps
-both commits and reconciles diverged branch heads through its normal commit and
-merge behavior. Sync does not add a separate conflict API.
+Concurrent commits are retained and reconciled through normal branch merging.
+Sync has no separate conflict API.
 
 ## Presence
 
-Lix synchronizes repository data. Cursor positions, selections, typing status,
-online status, and user avatars are temporary presence data. Lix does not
-provide them. Use a separate presence service.
+Use a separate service for presence: cursors, selections, typing, online status,
+and avatars. Lix synchronizes repository data.
 
 ## Closing
 
-Call `await lix.close()` during normal cleanup.
+Call `await lix.close()` for cleanup. Remote mode closes the server session.
+Sync mode waits for active local work and allows pending uploads, but does not
+guarantee server receipt. Durable commits resume uploading on the next open.
 
-In remote mode, this closes the server session. In sync mode, it waits for
-active local work and gives background synchronization an opportunity to upload
-pending commits. It does not guarantee that every local commit reached the
-server. Durable commits can continue uploading the next time the repository
-opens.
-
-Sync mode currently has no public API for waiting until a commit is confirmed
-by the server. Use remote mode when each successful write must be acknowledged
-by the server.
+Sync has no public API to await server confirmation. Use remote mode when each
+successful write requires server acknowledgment.
