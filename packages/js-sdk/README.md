@@ -161,6 +161,11 @@ const merge = await lix.mergeBranch({ sourceBranchId: draft.id });
 
 ## Transactions
 
+`beginTransaction()` captures the current branch and account in an independent
+transaction context. Use `tx.execute()` for transaction work; its reads see staged
+writes. Ordinary reads and observers on `lix` continue to see committed data while
+the transaction is open. Commit or roll back before closing `lix`.
+
 ```ts
 const tx = await lix.beginTransaction();
 

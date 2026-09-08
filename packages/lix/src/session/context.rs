@@ -279,6 +279,15 @@ where
         }
     }
 
+    /// Retains the caller's acknowledged plugin-file bases in a fresh
+    /// transaction context. Sharing also returns committed file-view updates
+    /// to the caller; the transaction's staged mutations stay private until
+    /// commit. Branch selection and transaction ownership remain independent.
+    pub(crate) fn with_file_views_from(mut self, origin: &Self) -> Self {
+        self.file_views = origin.file_views.clone();
+        self
+    }
+
     /// Releases this logical session handle. This is a lifecycle boundary only:
     /// successful writes are committed before their operation returns.
     pub async fn close(&self) -> Result<(), LixError> {

@@ -676,8 +676,8 @@ where
 
 /// Clonable handle for a Lix repository.
 ///
-/// Clones share the active branch, transaction exclusion, file-view state,
-/// and close lifecycle.
+/// Clones share the active branch, file-view state, and close lifecycle.
+/// Explicit transactions use independent contexts on the captured branch.
 ///
 /// Public operation builders erase their internal future type, so embedding
 /// applications can spawn composed Lix flows without raising rustc's
@@ -690,11 +690,42 @@ where
 {
     engine: Arc<Engine<StorageSession<StorageImpl>>>,
     session: Arc<SessionContext<StorageSession<StorageImpl>>>,
+    transaction_lifecycle: Arc<PublicTransactionLifecycle>,
     primary_switch_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     sync_lease: Option<Arc<SyncSessionLease>>,
     sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
     connected_authority: Option<Arc<ConnectedAuthority>>,
     open_report: Arc<OpenReport>,
+}
+
+/// Reserves only the handle's close lifecycle, not its SQL session.
+#[derive(Default)]
+struct PublicTransactionLifecycle {
+    admission: tokio::sync::Mutex<()>,
+    active: AtomicUsize,
+}
+
+struct PublicTransactionLease(Arc<PublicTransactionLifecycle>);
+
+impl PublicTransactionLease {
+    fn acquire(lifecycle: Arc<PublicTransactionLifecycle>) -> Result<Self, LixError> {
+        lifecycle
+            .active
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                LixError::new(
+                    "LIX_INVALID_TRANSACTION_STATE",
+                    "Lix handle already has an active transaction",
+                )
+            })?;
+        Ok(Self(lifecycle))
+    }
+}
+
+impl Drop for PublicTransactionLease {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 type ConnectedProtocolClient = ProtocolClient<crate::sync::AuthorityHttp>;
@@ -1097,6 +1128,7 @@ where
     let mut lix = Lix {
         engine: Arc::new(engine),
         session: Arc::new(session),
+        transaction_lifecycle: Arc::default(),
         primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
         sync_lease: None,
         sync_demand_tx: None,
@@ -1219,6 +1251,7 @@ where
         Ok(Self {
             engine,
             session: Arc::new(session),
+            transaction_lifecycle: Arc::default(),
             primary_switch_gate: None,
             sync_lease: None,
             sync_demand_tx: None,
@@ -1488,6 +1521,7 @@ where
         Ok(Self {
             engine: self.engine.clone(),
             session: Arc::new(session),
+            transaction_lifecycle: Arc::default(),
             primary_switch_gate: None,
             sync_lease: None,
             sync_demand_tx: self.sync_demand_tx.clone(),
@@ -1965,7 +1999,18 @@ where
             })
     }
 
+    /// Starts an atomic transaction on the current branch and account.
+    ///
+    /// The transaction owns an independent context. Reads, observations, and
+    /// writes through this handle remain outside it, and later branch switches
+    /// do not retarget it. Finish or drop the transaction before closing this
+    /// handle (or one of its clones).
     pub async fn begin_transaction(&self) -> Result<LixTransaction<StorageImpl>, LixError> {
+        // Reserve before awaiting admission so close also notices an opening
+        // transaction. The mutex coordinates only begin/close, never SQL work.
+        let lifecycle = PublicTransactionLease::acquire(Arc::clone(&self.transaction_lifecycle))?;
+        let _admission = self.transaction_lifecycle.admission.lock().await;
+        self.session.ensure_open()?;
         if let Some(authority) = &self.connected_authority {
             let _operation = authority.begin_operation().await?;
             let demand_tx = self.sync_demand_tx.clone().ok_or_else(|| {
@@ -1974,29 +2019,54 @@ where
                     "connected authority transaction has no publication worker",
                 )
             })?;
-            let (active_branch_id, session_state) =
-                self.session.begin_connected_transaction_state()?;
-            let client = authority
-                .open_dedicated_client(active_branch_id)
-                .await?;
-            let transaction = match client.begin_transaction().await {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    let _ = client.close().await;
-                    return Err(error);
-                }
-            };
-            return Ok(LixTransaction {
+            let active_branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
+            let session = self
+                .engine
+                .open_session_at_with_account(
+                    active_branch_id.clone(),
+                    self.active_account_id().to_owned(),
+                )
+                .await?
+                .with_file_views_from(&self.session);
+            let (_, session_state) = session.begin_connected_transaction_state()?;
+            let client = authority.open_dedicated_client(active_branch_id).await?;
+            // Install the dedicated client in its drop guard before the
+            // network await, so a cancelled/failed begin closes that session.
+            let mut opened = LixTransaction {
+                _lifecycle: lifecycle,
                 inner: LixTransactionInner::Authority {
-                    transaction: Some(transaction),
+                    transaction: None,
                     client: Some(client),
                     demand_tx,
                     session_state: Some(session_state),
                 },
-            });
+            };
+            if let LixTransactionInner::Authority {
+                transaction,
+                client,
+                ..
+            } = &mut opened.inner
+            {
+                *transaction = Some(
+                    client
+                        .as_ref()
+                        .ok_or_else(closed_transaction_error)?
+                        .begin_transaction()
+                        .await?,
+                );
+            }
+            return Ok(opened);
         }
+        let branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
+        let session = Arc::new(
+            self.engine
+                .open_session_at_with_account(branch_id, self.active_account_id().to_owned())
+                .await?
+                .with_file_views_from(&self.session),
+        );
         Ok(LixTransaction {
-            inner: LixTransactionInner::Local(Some(self.session.begin_transaction().await?)),
+            _lifecycle: lifecycle,
+            inner: LixTransactionInner::Local(Some(session.begin_transaction().await?)),
         })
     }
 
@@ -2317,10 +2387,22 @@ where
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
-        // Preserve the ordinary session contract before mutating any remote
-        // lifecycle. In particular, an active connected transaction must make
-        // close fail without closing the shared authority client underneath
-        // the still-live handle.
+        // A begin awaiting network I/O must not make close wait for admission.
+        if self.transaction_lifecycle.active.load(Ordering::Acquire) > 0 {
+            return Err(LixError::new(
+                "LIX_INVALID_TRANSACTION_STATE",
+                "cannot close Lix while an explicit transaction is active",
+            ));
+        }
+        let _admission = self.transaction_lifecycle.admission.lock().await;
+        if self.transaction_lifecycle.active.load(Ordering::Acquire) > 0 {
+            return Err(LixError::new(
+                "LIX_INVALID_TRANSACTION_STATE",
+                "cannot close Lix while an explicit transaction is active",
+            ));
+        }
+        // Check the independent transactions before mutating any session or
+        // remote lifecycle, including their shared publication worker.
         self.session.close().await?;
         let authority_result = match &self.connected_authority {
             Some(authority) => {
@@ -2431,6 +2513,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     inner: LixTransactionInner<StorageImpl>,
+    _lifecycle: PublicTransactionLease,
 }
 
 enum LixTransactionInner<StorageImpl>
@@ -2787,6 +2870,53 @@ mod tests {
         Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[tokio::test]
+    async fn opening_transaction_rejects_close_and_cancellation_releases_reservation() {
+        let lix = open_lix().await.expect("open Lix");
+        let admission = lix.transaction_lifecycle.admission.lock().await;
+        let mut opening = Box::pin(lix.begin_transaction());
+        std::future::poll_fn(|cx| {
+            assert!(opening.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        let mut closing = Box::pin(lix.close());
+        std::future::poll_fn(|cx| {
+            let std::task::Poll::Ready(Err(error)) = closing.as_mut().poll(cx) else {
+                panic!("close must reject immediately while a transaction is opening");
+            };
+            assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(closing);
+        lix.execute("SELECT 1", &[])
+            .await
+            .expect("opening reservation does not block parent SQL");
+
+        drop(opening);
+        assert_eq!(lix.transaction_lifecycle.active.load(Ordering::Acquire), 0);
+        drop(admission);
+        lix.begin_transaction()
+            .await
+            .expect("cancelled begin releases reservation")
+            .rollback()
+            .await
+            .expect("replacement transaction rolls back");
+        lix.close().await.expect("parent closes after cancellation");
+    }
+
+    #[tokio::test]
+    async fn failed_transaction_begin_releases_lifecycle_reservation() {
+        let lix = open_lix().await.expect("open Lix");
+        lix.close().await.expect("close Lix");
+        assert!(lix.begin_transaction().await.is_err());
+        assert_eq!(lix.transaction_lifecycle.active.load(Ordering::Acquire), 0);
+        assert!(lix.begin_transaction().await.is_err());
+        assert_eq!(lix.transaction_lifecycle.active.load(Ordering::Acquire), 0);
+    }
 
     fn opened_spans(spans: &[CompletedTelemetrySpan]) -> Vec<&CompletedTelemetrySpan> {
         spans

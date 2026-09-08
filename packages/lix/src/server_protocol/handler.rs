@@ -10564,9 +10564,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_transaction_commit_and_rollback_preserve_one_session_snapshot() {
+    async fn remote_transaction_commit_and_rollback_keep_parent_reads_and_observers_available() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
+
+        const COUNT_SQL: &str = "SELECT COUNT(*) AS count FROM lix_key_value WHERE key IN ('remote-tx', 'remote-rollback')";
+        let existing = request(
+            &app.router,
+            "POST",
+            "/lix/v1/observe",
+            Some(&session_id),
+            Some(json!({"sql": COUNT_SQL})),
+        )
+        .await;
+        assert_eq!(existing.status(), StatusCode::OK);
+        let mut existing = TestSseStream::new(existing);
+        let initial = existing.next().await;
+        assert_eq!(
+            initial["result"]["rows"][0][0],
+            json!({"kind": "int", "value": 0})
+        );
 
         let transaction_id = begin_remote_transaction(&app.router, &session_id).await;
         let staged = remote_transaction_request(
@@ -10586,12 +10603,45 @@ mod tests {
             "POST",
             "/lix/v1/execute",
             Some(&session_id),
-            Some(json!({ "sql": "SELECT 1" })),
+            Some(json!({ "sql": COUNT_SQL })),
         )
         .await;
-        assert_eq!(outside.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(outside.status(), StatusCode::OK);
         assert_eq!(
-            response_json(outside).await["error"]["code"],
+            response_json(outside).await["rows"][0][0],
+            json!({"kind": "int", "value": 0})
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), existing.next())
+                .await
+                .is_err(),
+            "existing observation must wait without seeing staged data or a transaction error"
+        );
+        let during = request(
+            &app.router,
+            "POST",
+            "/lix/v1/observe",
+            Some(&session_id),
+            Some(json!({"sql": COUNT_SQL})),
+        )
+        .await;
+        assert_eq!(during.status(), StatusCode::OK);
+        let mut during = TestSseStream::new(during);
+        assert_eq!(
+            during.next().await["result"]["rows"],
+            initial["result"]["rows"]
+        );
+        let duplicate = request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/begin",
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(duplicate).await["error"]["code"],
             "LIX_INVALID_TRANSACTION_STATE"
         );
         let committed = remote_transaction_request(
@@ -10604,6 +10654,12 @@ mod tests {
         )
         .await;
         assert_eq!(committed.status(), StatusCode::NO_CONTENT);
+        for body in [&mut existing, &mut during] {
+            assert_eq!(
+                body.next().await["result"]["rows"][0][0],
+                json!({"kind": "int", "value": 1})
+            );
+        }
         let replayed_commit = remote_transaction_request(
             &app.router,
             "POST",
@@ -10638,6 +10694,16 @@ mod tests {
         )
         .await;
         assert_eq!(rolled_back.status(), StatusCode::NO_CONTENT);
+        for body in [&mut existing, &mut during] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), body.next())
+                    .await
+                    .is_err(),
+                "rollback must not publish staged data or terminate either observer"
+            );
+        }
+        drop(existing);
+        drop(during);
 
         let visible = request(
             &app.router,

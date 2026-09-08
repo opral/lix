@@ -132,6 +132,12 @@ provenance shadow state or extra source body fetch.
 
 ## Contract
 
+An explicit transaction owns an independent context on the session's branch and
+account. Requests to `/execute` and `/observe` on the originating session remain
+available and read committed data; `/transaction/execute` reads its staged writes.
+Commit makes those writes visible to observers, while rollback publishes no
+changes. A session still permits only one active explicit transaction at a time.
+
 The machine-readable surface is
 [`packages/lix/server-protocol.openapi.yaml`](https://github.com/opral/lix/blob/main/packages/lix/server-protocol.openapi.yaml).
 

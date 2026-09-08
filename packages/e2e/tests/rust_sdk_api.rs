@@ -591,7 +591,7 @@ async fn transaction_rollback_discards_staged_writes() {
 }
 
 #[tokio::test]
-async fn transaction_blocks_session_execute_on_same_handle() {
+async fn transaction_keeps_same_handle_reads_and_writes_outside_its_snapshot() {
     let lix = open_lix().await.unwrap();
     register_crm_task_schema(&lix).await;
 
@@ -608,31 +608,37 @@ async fn transaction_blocks_session_execute_on_same_handle() {
     .await
     .unwrap();
 
-    let error = lix
-        .execute(
-            "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
-            &[
-                Value::Text("outside-task".to_string()),
-                Value::Text("Outside tx".to_string()),
-                Value::Boolean(false),
-                Value::Text(r#"{"batch":1}"#.to_string()),
-            ],
-        )
-        .await
-        .expect_err("session writes should be blocked while explicit transaction is active");
-    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+    lix.execute(
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
+        &[
+            Value::Text("outside-task".to_string()),
+            Value::Text("Outside tx".to_string()),
+            Value::Boolean(false),
+            Value::Text(r#"{"batch":1}"#.to_string()),
+        ],
+    )
+    .await
+    .expect("parent writes commit independently while the transaction is active");
 
-    let error = lix
-        .execute("SELECT 1 AS ok", &[])
+    let parent_read = lix
+        .execute("SELECT id FROM crm_task ORDER BY id", &[])
         .await
-        .expect_err("session reads should be blocked while explicit transaction is active");
-    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+        .expect("parent reads see committed data during the transaction");
+    assert_eq!(parent_read.rows().len(), 1);
+    assert_eq!(
+        parent_read.rows()[0].get::<String>("id").unwrap(),
+        "outside-task"
+    );
 
     let tx_read = tx
-        .execute("SELECT 1 AS ok", &[])
+        .execute("SELECT id FROM crm_task ORDER BY id", &[])
         .await
-        .expect("transaction reads should remain available");
-    assert_eq!(tx_read.rows()[0].get::<i64>("ok").unwrap(), 1);
+        .expect("transaction reads retain their own snapshot and staged data");
+    assert_eq!(tx_read.rows().len(), 1);
+    assert_eq!(
+        tx_read.rows()[0].get::<String>("id").unwrap(),
+        "tx-only-task"
+    );
 
     tx.commit().await.unwrap();
 
@@ -646,10 +652,14 @@ async fn transaction_blocks_session_execute_on_same_handle() {
         )
         .await
         .unwrap();
-    assert_eq!(committed.len(), 1);
+    assert_eq!(committed.len(), 2);
     assert_eq!(
-        committed.rows()[0].values(),
-        &[Value::Text("tx-only-task".to_string())]
+        committed.rows()[0].get::<String>("id").unwrap(),
+        "outside-task"
+    );
+    assert_eq!(
+        committed.rows()[1].get::<String>("id").unwrap(),
+        "tx-only-task"
     );
     lix.close().await.unwrap();
 }

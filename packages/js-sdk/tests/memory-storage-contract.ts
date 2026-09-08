@@ -119,6 +119,66 @@ export function registerMemoryStorageContract({
 			await lix.close();
 		});
 
+		test("transactions isolate staged writes without interrupting parent reads or observers", async () => {
+			const { openLix } = await loadSdk();
+			const lix = await wait((openStorage ?? openLix)(), "open Lix");
+			const sql = "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key";
+			const params = ["isolated-published", "isolated-staged"];
+			const existing = lix.observe(sql, params);
+			let fresh: ReturnType<ContractLix["observe"]> | undefined;
+			let tx: Awaited<ReturnType<ContractLix["beginTransaction"]>> | undefined;
+			let other: ContractLix | undefined;
+			try {
+				expect((await wait(existing.next(), "initial observer"))?.result.rows).toEqual([]);
+				tx = await wait(lix.beginTransaction(), "begin independent transaction");
+				await tx.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
+					params[1],
+					"pending",
+				]);
+				expect((await wait(lix.execute(sql, params), "parent read during transaction")).rows).toEqual(
+					[],
+				);
+				expect((await tx.execute(sql, params)).rows).toEqual([{ key: params[1], value: "pending" }]);
+				fresh = lix.observe(sql, params);
+				expect((await wait(fresh.next(), "new observer during transaction"))?.result.rows).toEqual([]);
+				other = await lix.openAnotherSession();
+				await other.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
+					params[0],
+					"committed",
+				]);
+				expect(
+					(await wait(existing.next(), "existing observer during transaction"))?.result.rows,
+				).toEqual([{ key: params[0], value: "committed" }]);
+				expect((await wait(fresh.next(), "fresh observer external commit"))?.result.rows).toEqual([
+					{ key: params[0], value: "committed" },
+				]);
+				await tx.commit();
+				tx = undefined;
+				const expected = [
+					{ key: params[0], value: "committed" },
+					{ key: params[1], value: "pending" },
+				];
+				expect(
+					(await wait(existing.next(), "existing observer transaction commit"))?.result.rows,
+				).toEqual(expected);
+				expect((await wait(fresh.next(), "fresh observer transaction commit"))?.result.rows).toEqual(
+					expected,
+				);
+				tx = await lix.beginTransaction();
+				await tx.execute("DELETE FROM lix_key_value WHERE key = $1", [params[1]]);
+				expect((await lix.execute(sql, params)).rows).toEqual(expected);
+				await tx.rollback();
+				tx = undefined;
+				expect((await lix.execute(sql, params)).rows).toEqual(expected);
+			} finally {
+				existing.close();
+				fresh?.close();
+				await tx?.rollback().catch(() => undefined);
+				await other?.close();
+				await lix.close();
+			}
+		});
+
 		test("executes ordered atomic batches with per-statement parameters", async () => {
 			const { openLix } = await loadSdk();
 			const lix = await wait((openStorage ?? openLix)(), "open Lix");
