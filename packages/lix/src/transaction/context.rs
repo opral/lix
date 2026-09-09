@@ -77,8 +77,8 @@ use crate::plugin::runtime::{
     validate_create_changes, validate_create_reservation,
 };
 use crate::plugin::runtime::{
-    PendingPluginActorPublication, PluginPublicationPolicy, discard_plugin_actor_publications,
-    retire_oldest_completed_actor,
+    ChainablePublication, PendingPluginActorPublication, PluginPublicationPolicy,
+    discard_plugin_actor_publications, retire_oldest_completed_actor,
 };
 use crate::row_pk::RowPk;
 use crate::session::{
@@ -6647,8 +6647,8 @@ where
             let was_chained = prior_publication.is_some();
             let (lease, successor_key, publication_view) = match prior_publication {
                 Some(publication) => match publication.into_chainable(&actor_key) {
-                    Ok(parts) => parts,
-                    Err(publication) => {
+                    ChainablePublication::Chainable(lease, key, policy) => (lease, key, policy),
+                    ChainablePublication::Pending(publication) => {
                         self.pending_plugin_actor_publications.push(publication);
                         return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,

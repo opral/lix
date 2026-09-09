@@ -38,6 +38,11 @@ enum PendingActorState {
     Uncached(Option<PluginActorStagedCheckpoint>),
 }
 
+pub(crate) enum ChainablePublication {
+    Chainable(PluginActorLease, PluginActorKey, PluginPublicationPolicy),
+    Pending(PendingPluginActorPublication),
+}
+
 pub(crate) struct PluginPublicationReceipt {
     pub(crate) key: PluginActorKey,
     pub(crate) observation: Option<PluginObservation>,
@@ -90,10 +95,7 @@ impl PendingPluginActorPublication {
         self.policy.retain_large_import_actor
     }
 
-    pub(crate) fn into_chainable(
-        self,
-        expected: &PluginActorKey,
-    ) -> Result<(PluginActorLease, PluginActorKey, PluginPublicationPolicy), Self> {
+    pub(crate) fn into_chainable(self, expected: &PluginActorKey) -> ChainablePublication {
         if self.key == *expected
             && self.policy.semantic_chainable
             && matches!(self.state, PendingActorState::Existing(_))
@@ -101,9 +103,9 @@ impl PendingPluginActorPublication {
             let PendingActorState::Existing(lease) = self.state else {
                 unreachable!()
             };
-            Ok((lease, self.key, self.policy))
+            ChainablePublication::Chainable(lease, self.key, self.policy)
         } else {
-            Err(self)
+            ChainablePublication::Pending(self)
         }
     }
 
