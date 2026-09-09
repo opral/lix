@@ -31,7 +31,7 @@ await lix.close();
 | Neither | Fresh in-memory repository |
 | `storage` | Local repository, initialized if empty |
 | `server` | Execute against an existing hosted repository |
-| `storage` and `server` | Synchronized local reads; mutations execute on the server |
+| `storage` and `server` | Local reads and writes with background synchronization |
 
 Creation and deletion are explicit server operations:
 
@@ -64,8 +64,8 @@ execution do not require streaming uploads.
 
 ## Synchronized local repositories
 
-Combine storage with a server to keep a synchronized local read replica.
-Certified current-state reads can execute locally; mutations execute on the
+Combine storage with a server to keep a synchronized local replica. Reads and
+writes execute locally; background synchronization exchanges changes with the
 server:
 
 ```ts
@@ -83,11 +83,27 @@ const lix = await openLix({
 });
 ```
 
-A successful mutation confirms server acceptance. The local replica receives
-the resulting certified state automatically; older history and binary content
-load when needed. Connected mutations require the server, and cached reads may
-also need fresh server certification.
+A successful mutation confirms a local commit; it does not confirm server
+acceptance. Pending commits upload in the background. Cached reads and local
+writes work offline; older history and binary content load when needed.
 See [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
+
+### Upgrading a local replica
+
+Keep using the same storage name across SDK upgrades. When a supported older
+replica needs a format upgrade, Lix checks its durable synchronization receipts
+before replacing downloaded data. A replica whose local work is fully
+acknowledged is bootstrapped from the same server into a separate storage epoch.
+The replacement becomes active only after bootstrap and validation succeed;
+the previous epoch is retained. This requires a connection to the server.
+
+If Lix cannot prove that local work is safe to replace, opening fails with
+`LIX_ERROR_REPLICA_UPGRADE_BLOCKED`. Preserve the storage and arrange recovery
+of the local work before upgrading. Do not catch this error by deleting the
+storage or changing its name: that can abandon unsynchronized changes.
+Automatic conversion of pending local work is not part of this upgrade path.
+Standalone and authoritative repositories continue to use history-preserving
+format migrations.
 
 ## Remote repositories
 

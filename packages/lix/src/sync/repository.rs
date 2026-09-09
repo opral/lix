@@ -929,6 +929,220 @@ where
     ))
 }
 
+/// A conservative pre-migration proof, evaluated while the source epoch is fenced.
+/// Receipt/control inspection never reads historical commit state.
+#[derive(Debug)]
+pub(crate) struct CleanReplicaProof {
+    pub(crate) repository_id: String,
+    pub(crate) account_id: String,
+}
+
+pub(crate) fn replica_upgrade_blocked(reason: &str) -> LixError {
+    let message = match reason {
+        "pending_changes" => {
+            "This local replica has changes that the server has not acknowledged. Its local data has been preserved."
+        }
+        "local_only_data" => {
+            "This local replica contains local-only data that is not synchronized to the server. Its local data has been preserved."
+        }
+        "server_required" => {
+            "Connect this local replica to the same server to upgrade it. Its local data has been preserved."
+        }
+        _ => {
+            "The old replica metadata cannot be verified safely for an automatic upgrade. Its local data has been preserved."
+        }
+    };
+    LixError::new("LIX_ERROR_REPLICA_UPGRADE_BLOCKED", message)
+    .with_hint("Keep this replica's local storage. Contact support to recover or synchronize local changes before upgrading.")
+    .with_details(serde_json::json!({ "reason": reason }))
+}
+
+pub(crate) async fn inspect_replica_rebuild_safety(
+    read: &(impl StorageAdapterRead + ?Sized),
+    source_format: u32,
+) -> Result<Option<CleanReplicaProof>, LixError> {
+    let mut cursor = read
+        .begin_scan(
+            SYNC_REPLICA_STATE_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            }
+            .to_range()?,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let (entries, has_more) = cursor.next_page(2).await?.into_parts();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    if entries.len() == 1 && entries[0].key.0.as_ref() == AUTHORITY_STATE_KEY {
+        return Ok(None);
+    }
+    if source_format != 77 || entries.len() != 1 || has_more {
+        return Err(replica_upgrade_blocked("unknown_state"));
+    }
+    let StorageProjectedValue::FullValue(raw) = &entries[0].value else {
+        return Err(replica_upgrade_blocked("unknown_state"));
+    };
+    let state: SyncReplicaState =
+        serde_json::from_slice(raw).map_err(|_| replica_upgrade_blocked("unknown_state"))?;
+    if state.active_account_id.is_empty() || state.authoritative_branches.is_empty() {
+        return Err(replica_upgrade_blocked("unknown_state"));
+    }
+    let controls = BranchHeadControlContext::new()
+        .reader(read)
+        .scan()
+        .await
+        .map_err(|_| replica_upgrade_blocked("unknown_state"))?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    validate_clean_replica_controls(&state, &controls)?;
+    for space in [
+        crate::session::UPLOAD_STATE_SPACE,
+        crate::session::UPLOAD_MANIFEST_LEAF_SPACE,
+        crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+    ] {
+        let mut pending = read
+            .begin_scan(
+                space,
+                StoragePrefix {
+                    bytes: Bytes::new(),
+                }
+                .to_range()?,
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if !pending.next_page(1).await?.is_empty() {
+            return Err(replica_upgrade_blocked("local_only_data"));
+        }
+    }
+    // Inspect physical current rows, not derived branch-ref rows. Retention
+    // is a per-row flag, so this scans current serving rows (never history).
+    // Do not apply a limit before the retention filter: a tracked row could
+    // otherwise hide a later untracked override or tombstone.
+    let current = TrackedHeadContext::new().reader(read);
+    for (branch_id, control) in &controls {
+        let local_only = current
+            .scan_live_batch_for_retention(
+                branch_id,
+                *control,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
+                    read_columns: TrackedStateReadColumns {
+                        columns: vec!["untracked".to_owned()],
+                    },
+                    limit: None,
+                },
+                Some(true),
+            )
+            .await
+            .map_err(|_| replica_upgrade_blocked("unknown_state"))?;
+        if !local_only.is_empty() {
+            return Err(replica_upgrade_blocked("local_only_data"));
+        }
+    }
+    let hot = crate::hot_state::HotStateContext::new(
+        TrackedStateContext::new(),
+        CommitGraphContext::new(),
+    )
+    .reader(read);
+    let identity = hot
+        .scan_batch(&crate::hot_state::HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
+                branch_ids: vec![crate::GLOBAL_BRANCH_ID.to_owned()],
+                schema_keys: vec!["lix_key_value".to_owned()],
+                row_pks: vec![RowPk::single(crate::init::LIX_ID_KEY)],
+                file_ids: vec![crate::NullableKeyFilter::Null],
+                untracked: Some(false),
+                ..Default::default()
+            },
+            projection: Default::default(),
+            limit: Some(2),
+        })
+        .await
+        .map_err(|_| replica_upgrade_blocked("unknown_state"))?;
+    if identity.len() != 1 {
+        return Err(replica_upgrade_blocked("unknown_state"));
+    }
+    let snapshot = identity
+        .row(0)
+        .snapshot_content()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.as_ref()).ok())
+        .ok_or_else(|| replica_upgrade_blocked("unknown_state"))?;
+    let repository_id = snapshot
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .ok_or_else(|| replica_upgrade_blocked("unknown_state"))?
+        .to_owned();
+    Ok(Some(CleanReplicaProof {
+        repository_id,
+        account_id: state.active_account_id,
+    }))
+}
+
+fn validate_clean_replica_controls(
+    state: &SyncReplicaState,
+    controls: &BTreeMap<String, BranchHeadControl>,
+) -> Result<(), LixError> {
+    if !state.pending_resets.is_empty() {
+        return Err(replica_upgrade_blocked("pending_changes"));
+    }
+    // In v77 every checkpoint marker is tracked on the global branch, so
+    // matching its receipt also covers retained off-branch checkpoint work.
+    if !matches!(
+        state.authoritative_branches.get(crate::GLOBAL_BRANCH_ID),
+        Some(AuthoritativeBranchCoordinate::Headed { .. })
+    ) {
+        return Err(replica_upgrade_blocked("unknown_state"));
+    }
+    let mut headed = 0;
+    for (branch, coordinate) in &state.authoritative_branches {
+        match coordinate {
+            AuthoritativeBranchCoordinate::Deleted => {
+                if controls.contains_key(branch) {
+                    return Err(replica_upgrade_blocked("pending_changes"));
+                }
+            }
+            AuthoritativeBranchCoordinate::Headed {
+                head_commit_id,
+                checkpoint_commit_id,
+            } => {
+                headed += 1;
+                let head = CommitId::parse_lix(head_commit_id, "replica migration receipt")
+                    .map_err(|_| replica_upgrade_blocked("unknown_state"))?;
+                let checkpoint =
+                    CommitId::parse_lix(checkpoint_commit_id, "replica migration receipt")
+                        .map_err(|_| replica_upgrade_blocked("unknown_state"))?;
+                let Some(control) = controls.get(branch) else {
+                    return Err(replica_upgrade_blocked("pending_changes"));
+                };
+                if control.head_commit_id != head
+                    || control.working_diff_checkpoint_commit_id != Some(checkpoint)
+                {
+                    return Err(replica_upgrade_blocked("pending_changes"));
+                }
+            }
+        }
+    }
+    if headed == 0 {
+        return Err(replica_upgrade_blocked("unknown_state"));
+    }
+    if controls.len() != headed {
+        return Err(replica_upgrade_blocked("pending_changes"));
+    }
+    Ok(())
+}
+
 async fn load_replica_state(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<(Option<SyncReplicaState>, Option<Bytes>), LixError> {
@@ -7609,6 +7823,92 @@ mod tests {
     use std::time::Duration;
 
     const TEST_REMOTE: &str = "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001";
+
+    #[tokio::test]
+    async fn replica_rebuild_proof_accepts_only_exact_clean_coordinates() {
+        let lix = open_lix().await.unwrap();
+        let adapter = lix.storage_adapter();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let controls = BranchHeadControlContext::new()
+            .reader(&read)
+            .scan()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let mut state = SyncReplicaState {
+            active_account_id: "test-account".into(),
+            ..Default::default()
+        };
+        for (id, control) in &controls {
+            state.authoritative_branches.insert(
+                id.clone(),
+                AuthoritativeBranchCoordinate::Headed {
+                    head_commit_id: control.head_commit_id.to_string(),
+                    checkpoint_commit_id: control
+                        .working_diff_checkpoint_commit_id
+                        .unwrap()
+                        .to_string(),
+                },
+            );
+        }
+        assert!(validate_clean_replica_controls(&state, &controls).is_ok());
+        let mut changed = controls.clone();
+        let first = changed.values_mut().next().unwrap();
+        first.working_diff_checkpoint_commit_id = Some(CommitId::for_test_label("different-base"));
+        assert!(validate_clean_replica_controls(&state, &changed).is_err());
+        changed = controls.clone();
+        changed.remove(controls.keys().next().unwrap());
+        assert!(validate_clean_replica_controls(&state, &changed).is_err());
+        changed = controls.clone();
+        changed.insert(
+            "local-only-branch".into(),
+            *controls.values().next().unwrap(),
+        );
+        assert!(validate_clean_replica_controls(&state, &changed).is_err());
+        let first_id = controls.keys().next().unwrap().clone();
+        let saved = state
+            .authoritative_branches
+            .insert(first_id.clone(), AuthoritativeBranchCoordinate::Deleted)
+            .unwrap();
+        assert!(validate_clean_replica_controls(&state, &controls).is_err());
+        state.authoritative_branches.insert(first_id, saved);
+        state.pending_resets.insert(
+            "reset".into(),
+            PendingSyncReset {
+                expected_authority_head_commit_id: "head".into(),
+                expected_authority_checkpoint_commit_id: "base".into(),
+                restore_target_commit_id: "target".into(),
+                authority_known_ancestor_commit_id: None,
+                prepared_reset_head_commit_id: None,
+                prepared_reset_checkpoint_commit_id: None,
+                superseded_prepared_reset_head_commit_ids: Default::default(),
+                superseded_prepared_reset_coordinates: Default::default(),
+            },
+        );
+        assert!(validate_clean_replica_controls(&state, &controls).is_err());
+        state.pending_resets.clear();
+        drop(read);
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            SYNC_REPLICA_STATE_SPACE,
+            replica_state_key(),
+            serde_json::to_vec(&state).unwrap(),
+        );
+        adapter
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let proof = inspect_replica_rebuild_safety(&read, 77)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.repository_id, lix.lix_id());
+        assert_eq!(proof.account_id, "test-account");
+        let error = inspect_replica_rebuild_safety(&read, 76).await.unwrap_err();
+        assert_eq!(error.code, "LIX_ERROR_REPLICA_UPGRADE_BLOCKED");
+    }
 
     #[derive(Clone, Default)]
     struct SyncAccountingStorage {

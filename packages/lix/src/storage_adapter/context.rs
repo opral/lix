@@ -51,6 +51,19 @@ where
         }
     }
 
+    // Preserve epoch routing and its exact claim while constructing a private
+    // Lix handle. An already-session-bound store returns the same session token.
+    pub(crate) async fn with_session(
+        self,
+    ) -> Result<StorageAdapter<crate::storage::StorageSession<StorageImpl>>, StorageError> {
+        Ok(StorageAdapter {
+            storage: crate::storage::StorageSession::acquire(self.storage).await?,
+            routing: self.routing,
+            authority_writer: self.authority_writer,
+            replica_writer: self.replica_writer,
+        })
+    }
+
     pub(crate) fn storage(&self) -> &StorageImpl {
         &self.storage
     }

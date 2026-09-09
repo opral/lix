@@ -68,6 +68,29 @@ starting behind the server.
 Offline, cached reads and local writes work; undownloaded history and binary
 content are unavailable. Pending commits upload after reconnect.
 
+### Replica format upgrades
+
+When an older local replica needs a supported format upgrade, Lix first checks
+whether its local work is acknowledged by the server. A clean replica downloads
+current server state into a separate storage epoch instead of migrating its
+partial history. The new epoch becomes active only after bootstrap and validation
+succeed. The previous epoch is retained, and an unsuccessful download leaves it
+intact for retry. Upgrading this way requires the server to be reachable.
+
+If local work is pending, or Lix cannot prove that replacing the replica is safe,
+opening returns `LIX_ERROR_REPLICA_UPGRADE_BLOCKED`. Keep the local storage and
+recover that work before upgrading. Do not delete browser storage or change its
+name to bypass the error. This path does not automatically translate pending
+work between formats. Standalone and server repositories still migrate their
+stored history.
+
+The current rebuild proof supports format v77. It requires matching acknowledged
+head and checkpoint coordinates for all branches, including the global branch,
+and rejects pending restores, local-only rows (including tombstones), incomplete
+uploads, and checkpoint recovery references. Unknown older replica metadata is
+preserved and blocked. Supporting a future format requires checking its receipt
+and local-work representation; a format number alone never permits a reset.
+
 ## Receive collaborative updates
 
 Both remote and sync clients can observe queries:

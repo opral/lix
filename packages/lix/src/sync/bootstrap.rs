@@ -140,8 +140,15 @@ pub(crate) async fn prepare_sync_bootstrap(
     let remote_id = server.url.as_str();
     let transport = HttpSyncTransport::connect(remote_id, &server.headers).await?;
     let (snapshot, lix_id, default_branch_id) =
-        runtime::fetch_repository_snapshot(&transport).await?;
+        match runtime::fetch_repository_snapshot(&transport).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = transport.close_session().await;
+                return Err(error);
+            }
+        };
     if transport.lix_id() != lix_id {
+        let _ = transport.close_session().await;
         return Err(super::sync_repository_id_mismatch(
             &lix_id,
             transport.lix_id(),
@@ -162,6 +169,18 @@ pub(crate) async fn install_sync_bootstrap<StorageImpl>(
 ) -> Result<HttpSyncTransport, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    install_prepared_sync_bootstrap(lix, server, &mut prepared).await?;
+    Ok(prepared.transport)
+}
+
+async fn install_prepared_sync_bootstrap<S>(
+    lix: &mut Lix<S>,
+    server: &crate::ServerOptions,
+    prepared: &mut PreparedSyncBootstrap,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
 {
     if let Err(error) = runtime::register_hot_blob_manifests(
         lix,
@@ -192,30 +211,61 @@ where
         .await;
     match install {
         Ok(InitialSyncSnapshotInstall::Installed) => {
-            lix.align_repository_identity_for_sync(prepared.lix_id)?;
+            lix.align_repository_identity_for_sync(prepared.lix_id.clone())?;
             lix.align_primary_account_for_sync(prepared.transport.active_account_id())
                 .await?;
-            Ok(prepared.transport)
+            Ok(())
         }
         Ok(InitialSyncSnapshotInstall::ExistingRepository) => {
             let adapter = lix.storage_adapter();
-            let _ = inspect_sync_bootstrap_with_adapter(
-                &adapter,
-                &server.url,
-            )
-            .await?;
+            let _ = inspect_sync_bootstrap_with_adapter(&adapter, &server.url).await?;
             Err(restart_open_error())
         }
         Ok(InitialSyncSnapshotInstall::Ambiguous) => Err(ambiguous_replica_error()),
-        Err(error) => Err(
-            reconcile_install_error(
-                &lix.storage_adapter(),
-                &server.url,
-                error,
-            )
-            .await,
-        ),
+        Err(error) => {
+            Err(reconcile_install_error(&lix.storage_adapter(), &server.url, error).await)
+        }
     }
+}
+
+pub(crate) async fn rebuild_replica_candidate<S>(
+    target: StorageAdapter<S>,
+    server: &crate::ServerOptions,
+    expected_repository_id: &str,
+    expected_account_id: &str,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let mut prepared = prepare_sync_bootstrap(server).await?;
+    let result = async {
+        if prepared.lix_id != expected_repository_id {
+            return Err(super::sync_repository_id_mismatch(
+                expected_repository_id,
+                &prepared.lix_id,
+            ));
+        }
+        if prepared.transport.active_account_id() != expected_account_id {
+            return Err(LixError::new(
+                "LIX_ERROR_REPLICA_UPGRADE_BLOCKED",
+                "Sign in with the account that owns this local replica before upgrading.",
+            )
+            .with_details(serde_json::json!({ "reason": "account_mismatch" })));
+        }
+        let mut candidate =
+            crate::handle::new_replica_migration_candidate(target, &prepared.default_branch_id)
+                .await?;
+        let installed =
+            install_prepared_sync_bootstrap(&mut candidate, server, &mut prepared).await;
+        let closed = candidate.close().await;
+        installed?;
+        closed?;
+        Ok(())
+    }
+    .await;
+    // No runtime takes ownership of this temporary bootstrap session.
+    let _ = prepared.transport.close_session().await;
+    result
 }
 
 async fn reconcile_install_error<StorageImpl>(

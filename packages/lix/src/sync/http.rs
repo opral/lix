@@ -101,6 +101,14 @@ where
         })
     }
 
+    pub(crate) async fn close_session(&self) -> Result<(), LixError> {
+        let response = self
+            .client
+            .send(self.request(Method::DELETE, "/session", "close sync session"))
+            .await?;
+        ensure_success(&response, "close sync session")
+    }
+
     pub(super) fn is_reserved_header(name: &str) -> bool {
         name.eq_ignore_ascii_case(SESSION_HEADER)
             || name.eq_ignore_ascii_case(SYNC_PROTOCOL_VERSION_HEADER)

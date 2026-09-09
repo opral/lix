@@ -15,6 +15,6 @@ pub(crate) use api::{
     migrate_lix_with_adapter,
 };
 pub(crate) use epoch::{
-    FreshEpochImport, admit_existing_repository, admit_repository, begin_fresh_epoch_import,
+    FreshEpochImport, admit_existing_repository, admit_repository_with_server, begin_fresh_epoch_import,
 };
 pub(crate) use registry::has_complete_migration_path;
