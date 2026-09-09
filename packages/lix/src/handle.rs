@@ -3610,90 +3610,128 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
             RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
             TransactionWriteRow,
         };
-        self.session
-            .with_write_transaction_lending(async |transaction| {
-                let active = transaction.active_branch_id().to_owned();
-                let head = BranchLifecycle::new(&transaction.branch_ref_reader().await?)
+        let adapter = self.storage_adapter();
+        let mut head = self
+            .retry_sync_demands(|| async {
+                let read = adapter
+                    .begin_read(crate::storage_adapter::StorageReadOptions::default())
+                    .await?;
+                BranchLifecycle::new(&crate::branch::BranchContext::new().ref_reader(&read))
                     .require_existing_commit_id(
-                        &active,
+                        crate::GLOBAL_BRANCH_ID,
                         BranchOperation::CreateBranch,
                         BranchReferenceRole::Source,
                     )
-                    .await?;
-                let mut creation = RawWriteBatch::with_capacity(2);
-                creation.push(branch_descriptor_stage_row(branch_id, name, false));
-                creation.push(branch_ref_stage_row(branch_id, &head));
-                transaction
-                    .stage_write(TransactionWrite::Rows {
-                        mode: TransactionWriteMode::Insert,
-                        rows: creation,
-                    })
-                    .await?;
-                let mut rows = RawWriteBatch::with_capacity(recovery_rows.len() + 1);
-                for row in recovery_rows {
-                    rows.push(TransactionWriteRow {
-                        row_pk: Some(
-                            crate::row_pk::RowPk::from_typed_json_array_value(&row.row_pk)
-                                .map_err(|error| LixError::unknown(error.to_string()))?,
-                        ),
-                        schema_key: row.schema_key.clone().into(),
-                        file_id: row.file_id.clone().map(Into::into),
-                        snapshot: if row.deleted {
-                            None
-                        } else {
-                            row.snapshot
+                    .await
+            })
+            .await?;
+        // Resolve immutable ancestry before publication. Per-node hydration
+        // retains this cursor, so sparse history cannot repeatedly replay the
+        // traversed prefix. Without jump metadata this is O(history depth).
+        loop {
+            let node = self
+                .retry_sync_demands(|| async {
+                    let read = adapter
+                        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+                        .await?;
+                    crate::commit_graph::CommitGraphContext::new()
+                        .reader(&read)
+                        .load_node(&head)
+                        .await?
+                        .ok_or_else(|| crate::commit_graph::missing_commit_graph_error(&head))
+                })
+                .await?;
+            let Some(parent) = node.parent_commit_ids.first().copied() else {
+                break;
+            };
+            head = if node.first_parent_jump_span > 0 {
+                node.first_parent_jump_commit_id
+            } else {
+                parent
+            };
+        }
+        // Complete captured local state is restored on the fixed repository
+        // root, never on unrelated caller state. Normal commit validation still
+        // proves this source while atomically publishing rows and receipt.
+        self.retry_sync_demands(|| async {
+            self.session
+                .with_write_transaction_lending(async |transaction| {
+                    let mut creation = RawWriteBatch::with_capacity(2);
+                    creation.push(branch_descriptor_stage_row(branch_id, name, false));
+                    creation.push(branch_ref_stage_row(branch_id, &head));
+                    transaction
+                        .stage_write(TransactionWrite::Rows {
+                            mode: TransactionWriteMode::Insert,
+                            rows: creation,
+                        })
+                        .await?;
+                    let mut rows = RawWriteBatch::with_capacity(recovery_rows.len() + 1);
+                    for row in recovery_rows {
+                        rows.push(TransactionWriteRow {
+                            row_pk: Some(
+                                crate::row_pk::RowPk::from_typed_json_array_value(&row.row_pk)
+                                    .map_err(|error| LixError::unknown(error.to_string()))?,
+                            ),
+                            schema_key: row.schema_key.clone().into(),
+                            file_id: row.file_id.clone().map(Into::into),
+                            snapshot: if row.deleted {
+                                None
+                            } else {
+                                row.snapshot
+                                    .clone()
+                                    .map(TransactionJson::from_value_unchecked)
+                            },
+                            metadata: row
+                                .metadata
                                 .clone()
-                                .map(TransactionJson::from_value_unchecked)
-                        },
-                        metadata: row
-                            .metadata
-                            .clone()
-                            .map(TransactionJson::from_value_unchecked),
+                                .map(TransactionJson::from_value_unchecked),
+                            origin: None,
+                            created_at: None,
+                            updated_at: None,
+                            global: false,
+                            change_id: None,
+                            commit_id: None,
+                            untracked: false,
+                            branch_id: branch_id.to_owned().into(),
+                        });
+                    }
+                    transaction
+                        .stage_recovery_write(TransactionWrite::RowsWithFileContent {
+                            mode: TransactionWriteMode::Replace,
+                            rows,
+                            count: recovery_rows.len() as u64,
+                            file_content: file_content.clone(),
+                        })
+                        .await?;
+                    let mut receipt_rows = RawWriteBatch::with_capacity(1);
+                    receipt_rows.push(TransactionWriteRow {
+                        row_pk: Some(crate::row_pk::RowPk::single(receipt_key)),
+                        schema_key: "lix_key_value".into(),
+                        file_id: None,
+                        snapshot: Some(TransactionJson::from_value_unchecked(
+                            serde_json::json!({"key": receipt_key, "value": receipt}),
+                        )),
+                        metadata: None,
                         origin: None,
                         created_at: None,
                         updated_at: None,
-                        global: false,
+                        global: true,
                         change_id: None,
                         commit_id: None,
                         untracked: false,
-                        branch_id: branch_id.to_owned().into(),
+                        branch_id: crate::GLOBAL_BRANCH_ID.into(),
                     });
-                }
-                transaction
-                    .stage_recovery_write(TransactionWrite::RowsWithFileContent {
-                        mode: TransactionWriteMode::Replace,
-                        rows,
-                        count: recovery_rows.len() as u64,
-                        file_content,
-                    })
-                    .await?;
-                let mut receipt_rows = RawWriteBatch::with_capacity(1);
-                receipt_rows.push(TransactionWriteRow {
-                    row_pk: Some(crate::row_pk::RowPk::single(receipt_key)),
-                    schema_key: "lix_key_value".into(),
-                    file_id: None,
-                    snapshot: Some(TransactionJson::from_value_unchecked(
-                        serde_json::json!({"key": receipt_key, "value": receipt}),
-                    )),
-                    metadata: None,
-                    origin: None,
-                    created_at: None,
-                    updated_at: None,
-                    global: true,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: false,
-                    branch_id: crate::GLOBAL_BRANCH_ID.into(),
-                });
-                transaction
-                    .stage_write(TransactionWrite::Rows {
-                        mode: TransactionWriteMode::Insert,
-                        rows: receipt_rows,
-                    })
-                    .await?;
-                Ok(())
-            })
-            .await
+                    transaction
+                        .stage_write(TransactionWrite::Rows {
+                            mode: TransactionWriteMode::Insert,
+                            rows: receipt_rows,
+                        })
+                        .await?;
+                    Ok(())
+                })
+                .await
+        })
+        .await
     }
 }
 

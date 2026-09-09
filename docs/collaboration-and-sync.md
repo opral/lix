@@ -94,7 +94,8 @@ for (const source of sources.filter((item) => item.recoveryRequired)) {
 ```
 
 Recovery restores captured tracked rows onto separate branches with stable
-identities. A retry returns its existing receipt rather than overwriting edits
+identities, based on the repository root. Their captured state is independent of
+the branch from which recovery is requested. A retry returns its existing receipt rather than overwriting edits
 made on a recovery branch. Local-only data remains in the local export/source;
 it is not uploaded by restoration. The export also records original branch and
 checkpoint coordinates and available commit/blob data. Unavailable content is

@@ -756,11 +756,11 @@ fn collect_files(export: &mut ReplicaRecoveryExport) {
             }
             components.reverse();
             let path = format!("/{}", components.join("/"));
-            let blob_id = refs.get(id).map(|hash| (*hash).to_owned());
-            if blob_id
-                .as_ref()
-                .is_none_or(|id| !available_blobs.contains(id.as_str()))
-            {
+            let blob_id = refs
+                .get(id)
+                .filter(|hash| available_blobs.contains(**hash))
+                .map(|hash| (*hash).to_owned());
+            if blob_id.is_none() {
                 export.unresolved.push(format!("File {path} needs cold content or plugin rendering; logical rows remain in this export"));
             }
             export.files.push(ReplicaRecoveryFile {
@@ -777,6 +777,81 @@ fn collect_files(export: &mut ReplicaRecoveryExport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_export_omits_unavailable_file_payload_but_preserves_blob_reference() {
+        use crate::storage_adapter::{StorageWrite as _, StorageWriteOptions};
+        let lix = crate::open_lix().await.unwrap();
+        lix.execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/cold.txt', $1)",
+            &[Value::Blob(b"cold file content".to_vec().into())],
+        )
+        .await
+        .unwrap();
+        let adapter = lix.storage_adapter();
+        let source = ReplicaRecoverySource {
+            id: "cold-test".to_owned(),
+            source_format: 77,
+            repository_id: lix.lix_id().to_owned(),
+            account_id: lix.active_account_id().to_owned(),
+            recovery_required: true,
+        };
+        let complete = export_source(&adapter, source.clone()).await.unwrap();
+        let original_hash = complete
+            .files
+            .iter()
+            .find(|file| file.path == "/cold.txt")
+            .unwrap()
+            .blob_id
+            .clone()
+            .unwrap();
+        let mut write = adapter
+            .begin_migration_write(StorageWriteOptions::default())
+            .await
+            .unwrap();
+        write
+            .delete_range(
+                crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
+                crate::storage_adapter::StorageKeyRange {
+                    lower: std::ops::Bound::Unbounded,
+                    upper: std::ops::Bound::Unbounded,
+                },
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+        let export = export_source(&adapter, source).await.unwrap();
+        let file = export
+            .files
+            .iter()
+            .find(|file| file.path == "/cold.txt")
+            .unwrap();
+        assert!(
+            file.blob_id.is_none(),
+            "optional file payload must not dangle"
+        );
+        assert!(!export.blobs.iter().any(|blob| blob.id == original_hash));
+        assert!(
+            export
+                .branches
+                .iter()
+                .flat_map(|branch| &branch.rows)
+                .any(|row| row.schema_key == "lix_binary_blob_ref"
+                    && row
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.get("blob_hash"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(original_hash.as_str()))
+        );
+        assert!(
+            export
+                .unresolved
+                .iter()
+                .any(|message| message.contains("/cold.txt"))
+        );
+        lix.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn recovery_restores_files_and_generic_rows_without_overwriting_active_branch_or_local_only_data()

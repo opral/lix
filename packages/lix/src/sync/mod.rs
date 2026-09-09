@@ -264,3 +264,6 @@ impl SyncModeState {
             .send_modify(|version| *version = version.wrapping_add(1));
     }
 }
+
+#[cfg(test)]
+pub(crate) use bootstrap::durable_memory_for_test;

@@ -177,3 +177,115 @@ async fn recovery_staging_keeps_normal_raw_plugin_writes_protected() {
     }
     lix.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn recovery_content_does_not_inherit_the_callers_branch() {
+    let lix = crate::open_lix().await.unwrap();
+    let other = lix
+        .create_branch(crate::CreateBranchOptions {
+            id: None,
+            name: "other caller".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+    let other = lix
+        .open_internal_session(&other.id, lix.active_account_id())
+        .await
+        .unwrap();
+    let captured = crate::ReplicaRecoveryRow {
+        row_pk: crate::row_pk::RowPk::single("captured")
+            .as_typed_json_array_value()
+            .unwrap(),
+        schema_key: "lix_key_value".to_owned(),
+        file_id: None,
+        snapshot: Some(serde_json::json!({"key": "captured", "value": "local work"})),
+        metadata: None,
+        deleted: false,
+        untracked: false,
+        global: false,
+        change_id: None,
+        commit_id: None,
+    };
+    let mut roots = Vec::new();
+    for (index, caller) in [&lix, &other].into_iter().enumerate() {
+        caller
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    crate::Value::Text(format!("/caller-{index}.txt")),
+                    crate::Value::Blob(b"unrelated caller content".to_vec().into()),
+                ],
+            )
+            .await
+            .unwrap();
+        caller
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('unrelated', $1)",
+                &[crate::Value::Text(format!("caller {index}"))],
+            )
+            .await
+            .unwrap();
+        let branch = uuid::Uuid::now_v7().to_string();
+        caller
+            .restore_replica_rows_atomic(
+                &branch,
+                &format!("recovery-{index}"),
+                std::slice::from_ref(&captured),
+                Vec::new(),
+                &format!("test-receipt-{index}"),
+                serde_json::json!({"branch":branch}),
+            )
+            .await
+            .unwrap();
+        let recovered = caller
+            .open_internal_session(&branch, caller.active_account_id())
+            .await
+            .unwrap();
+        assert!(
+            recovered
+                .execute("SELECT path FROM lix_file", &[])
+                .await
+                .unwrap()
+                .rows()
+                .is_empty()
+        );
+        assert!(
+            recovered
+                .execute(
+                    "SELECT value FROM lix_key_value WHERE key = 'unrelated'",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .rows()
+                .is_empty()
+        );
+        assert_eq!(
+            recovered
+                .execute(
+                    "SELECT value FROM lix_key_value WHERE key = 'captured'",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!("local work")
+        );
+        roots.push(
+            recovered
+                .execute("SELECT lix_root_commit_id() AS root", &[])
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<String>("root")
+                .unwrap(),
+        );
+        recovered.close().await.unwrap();
+    }
+    assert_eq!(roots[0], roots[1]);
+    other.close().await.unwrap();
+    lix.close().await.unwrap();
+}

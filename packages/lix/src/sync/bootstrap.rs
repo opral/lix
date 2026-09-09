@@ -320,8 +320,8 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct DurableMemory {
-        inner: Memory,
+    pub(super) struct DurableMemory {
+        pub(super) inner: Memory,
     }
 
     impl Storage for DurableMemory {
@@ -331,9 +331,7 @@ mod tests {
         async fn acquire_session(
             &self,
         ) -> Result<crate::storage::StorageSessionToken, StorageError> {
-            Err(StorageError::Unsupported(
-                crate::storage::Capability::StorageSessions,
-            ))
+            self.inner.acquire_session().await
         }
 
         async fn begin_read(
@@ -818,4 +816,9 @@ mod tests {
             Some(serde_json::json!({ "retryable": true }))
         );
     }
+}
+
+#[cfg(test)]
+pub(crate) fn durable_memory_for_test(inner: crate::Memory) -> impl Storage + Clone {
+    tests::DurableMemory { inner }
 }

@@ -62,4 +62,9 @@ recovery also visits available pending history and payload bytes. Blob/file
 lookups use maps rather than repeatedly scanning all files for every row. Path
 reconstruction additionally pays for the directory components in the exported
 paths. Normal transaction validation and index maintenance still apply when
-publishing recovered rows.
+publishing recovered rows. Resolving the fixed recovery baseline follows the
+global first-parent graph using available jump links: O(H) reads in the worst
+case per recovered branch for H historical ancestors without jump metadata,
+with O(1) cursor
+state. Each cold graph node uses normal authenticated sync-demand retries while
+retaining the cursor, so hydration does not rescan the previously visited path.
