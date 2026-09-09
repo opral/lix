@@ -23,9 +23,9 @@ use tracing::Instrument as _;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
 use crate::branch::{
-    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchLifecycle,
-    BranchOperation, BranchRefReader, BranchReferenceRole, branch_head_control_precondition,
-    branch_ref_stage_row,
+    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchHeadWrite,
+    BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
+    branch_head_control_precondition,
 };
 use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogRevision, CatalogSnapshot, ForeignKeyPlan,
@@ -136,8 +136,8 @@ use crate::plugin::runtime::{
     WasmFileDescriptor, WasmFileUpdate, WasmHostBytes, WasmHostColumnMerge, WasmHostRow,
     WasmHostRowChanges, WasmOpenFileInput, WasmOpenRowsInput, WasmPluginSelection, WasmRow,
     WasmRowChange, WasmRowKey, WasmRowUpdate, WasmTransitionCounters, WasmTransitionLimits,
-    WasmTypedRow,
 };
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::telemetry::TelemetryAttribute;
 use crate::transaction::validation::{
     TransactionValidationInput, fresh_plugin_file_import_certificate,
@@ -1105,9 +1105,11 @@ where
             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, message)
                 .with_hint("Retry the transaction against the latest committed state.")
         };
-        if prepared_writes.state_rows.iter().any(|row| {
-            row.untracked || row.global || row.branch_id.as_str() != self.active_branch_id
-        }) || !prepared_writes.extra_commit_parents_by_branch.is_empty()
+        if !prepared_writes.branch_heads.is_empty()
+            || prepared_writes.state_rows.iter().any(|row| {
+                row.untracked || row.global || row.branch_id.as_str() != self.active_branch_id
+            })
+            || !prepared_writes.extra_commit_parents_by_branch.is_empty()
             || !prepared_writes
                 .first_commit_parent_override_by_branch
                 .is_empty()
@@ -1832,7 +1834,8 @@ where
                 || !prepared_writes.commit_change_refs_by_branch.is_empty()
                 || !prepared_writes.extra_commit_parents_by_branch.is_empty();
             let has_untracked_state_writes =
-                prepared_writes.state_rows.iter().any(|row| row.untracked);
+                prepared_writes.state_rows.iter().any(|row| row.untracked)
+                    || !prepared_writes.branch_heads.is_empty();
             // Untracked rows are mutable current state, but their validation can read
             // tracked schemas, parents, uniqueness owners, or filesystem state.
             // Fence that snapshot without rotating the tracked revision: normal
@@ -2470,8 +2473,31 @@ where
     /// stay in one batch pipeline.
     pub(crate) async fn stage_write(
         &mut self,
-        write: TransactionWrite,
+        mut write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
+        let (heads, mode) = match &mut write {
+            TransactionWrite::Rows { rows, mode }
+            | TransactionWrite::RowsWithFileContent { rows, mode, .. } => {
+                if rows
+                    .iter()
+                    .any(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "branch heads must be changed through typed branch lifecycle commands",
+                    ));
+                }
+                (rows.take_branch_heads(), *mode)
+            }
+        };
+        if !heads.is_empty() {
+            let prepared_heads = Box::pin(self.prepare_branch_heads(&heads, mode)).await?;
+            let outcome = Box::pin(self.stage_write_inner(write, None)).await?;
+            self.staged_writes.stage_branch_heads(prepared_heads);
+            self.filesystem_path_index_epoch
+                .fetch_add(1, Ordering::SeqCst);
+            return Ok(outcome);
+        }
         let certified_fileless_typed_sql = matches!(
             &write,
             TransactionWrite::Rows { rows, .. }
@@ -2493,6 +2519,56 @@ where
             };
         }
         Box::pin(self.stage_write_inner(write, None)).await
+    }
+
+    async fn prepare_branch_heads(
+        &mut self,
+        commands: &[BranchHeadWrite],
+        mode: TransactionWriteMode,
+    ) -> Result<super::branch_heads::PreparedBranchHeads, LixError> {
+        let catalog = CatalogSnapshot::builtin();
+        let (_, plan) = catalog
+            .plan_for_key(BRANCH_REF_SCHEMA_KEY)
+            .expect("builtin branch ref schema");
+        let mut projection = RawWriteBatch::with_capacity(commands.len());
+        for command in commands {
+            let row_pk = RowPk::uuid_from_canonical(&command.branch_id)
+                .map_err(|error| LixError::new(LixError::CODE_INVALID_PARAM, error.to_string()))?;
+            let snapshot = command
+                .head_commit_id
+                .map(|head| {
+                    let row = lix_schema::Row::from([
+                        (
+                            "id",
+                            lix_schema::Value::Uuid(
+                                uuid::Uuid::parse_str(&command.branch_id).map_err(|error| {
+                                    LixError::new(LixError::CODE_INVALID_PARAM, error.to_string())
+                                })?,
+                            ),
+                        ),
+                        ("commit_id", lix_schema::Value::Uuid(*head.as_uuid())),
+                    ]);
+                    WasmTypedRow::from_row(plan, row).map(Arc::new)
+                })
+                .transpose()?;
+            projection.push_typed_parts(
+                Some(row_pk),
+                BRANCH_REF_SCHEMA_KEY.into(),
+                None,
+                snapshot,
+                None,
+                command.origin.clone(),
+                None,
+                None,
+                true,
+                None,
+                None,
+                true,
+                GLOBAL_BRANCH_ID.into(),
+            );
+        }
+        let projection = self.prepare_transaction_rows(projection).await?;
+        super::branch_heads::PreparedBranchHeads::from_commands(commands, projection, mode)
     }
 
     async fn stage_parameter_batch_insert(
@@ -7335,6 +7411,20 @@ where
         read: &(impl StorageAdapterRead + ?Sized),
         prepared_writes: &mut PreparedWriteSet,
     ) -> Result<(), LixError> {
+        if !prepared_writes.branch_heads.is_empty() {
+            let mut projection = prepared_writes
+                .branch_heads
+                .validation_projection(prepared_writes);
+            Box::pin(self.validate_prepared_writes_by_branch(read, &mut projection)).await?;
+            let mut index_values = projection.state_rows.staged_index_values().clone();
+            index_values
+                .rows
+                .retain(|row| row.schema_key != BRANCH_REF_SCHEMA_KEY);
+            prepared_writes
+                .state_rows
+                .set_staged_index_values(index_values);
+            return Ok(());
+        }
         if prepared_tracked_rows_have_row_local_certificates(&prepared_writes.state_rows) {
             // Row-local certificates avoid rebuilding the O(rows) validation
             // index, but they do not prove that a public INSERT identity is
@@ -8429,7 +8519,7 @@ where
         commit_id: CommitId,
     ) -> Result<(), LixError> {
         let mut rows = RawWriteBatch::with_capacity(1);
-        rows.push(branch_ref_stage_row(branch_id, &commit_id));
+        rows.push_branch_head(BranchHeadWrite::new(branch_id, Some(commit_id)));
         self.stage_write(TransactionWrite::Rows {
             mode: TransactionWriteMode::Replace,
             rows,
@@ -11673,21 +11763,23 @@ fn parse_prepared_timestamp(column: &str, timestamp: &str) -> Result<LixTimestam
 }
 
 fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
+    if !prepared_writes.branch_heads.is_empty() {
+        return true;
+    }
     // Empty commits also represent checkpoints and merges, neither of which
     // necessarily changes schema visibility. Materialization reports actual
     // inherited-catalog changes separately from these explicit schema writes.
-    prepared_writes.state_rows.iter().any(|row| {
-        matches!(
-            row.schema_key.as_str(),
-            REGISTERED_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY
-        )
-    }) || prepared_writes
-        .commit_change_refs_by_branch
-        .values()
-        .flat_map(
-            crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
-        )
-        .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
+    prepared_writes
+        .state_rows
+        .iter()
+        .any(|row| matches!(row.schema_key.as_str(), REGISTERED_SCHEMA_KEY))
+        || prepared_writes
+            .commit_change_refs_by_branch
+            .values()
+            .flat_map(
+                crate::transaction::staged_commit_changes::StagedCommitChangeRefs::selected_changes,
+            )
+            .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
 }
 
 /// Whether this commit's staged filesystem rows are an incomplete description
@@ -11717,13 +11809,15 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
 /// of the commit once materialization has assigned their final change ids —
 /// see [`commit::MaterializedCommit::filesystem_delta_rows`].
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
+    if !prepared_writes.branch_heads.is_empty() {
+        return true;
+    }
     prepared_writes.state_rows.iter().any(|row| {
-        row.schema_key == BRANCH_REF_SCHEMA_KEY
-            || ((row.global || row.untracked)
-                && matches!(
-                    row.schema_key.as_str(),
-                    "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
-                ))
+        (row.global || row.untracked)
+            && matches!(
+                row.schema_key.as_str(),
+                "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+            )
     }) || prepared_writes
         .commit_change_refs_by_branch
         .values()
@@ -12510,12 +12604,9 @@ fn prepared_transaction_write_filesystem_index_impact(
             FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY => {
                 affects_index = true;
                 delta_rows.push(
-                    crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
-                        row,
-                    )?,
+                    crate::hot_state::materialized_hot_state_row_with_snapshot_projection(row)?,
                 );
             }
-            BRANCH_REF_SCHEMA_KEY => affects_index = true,
             _ => {}
         }
     }
@@ -14872,6 +14963,208 @@ mod tests {
     };
     use crate::transaction_types::TransactionJson;
 
+    #[tokio::test]
+    async fn typed_branch_intents_keep_control_and_ledger_identity_out_of_mutable_rows() {
+        let storage = Memory::new();
+        let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+        let branch_id = "01960000-0000-7000-8000-0000000000c1";
+        let head = CommitId::for_test_label("typed-head");
+        transaction
+            .advance_branch_ref(branch_id, head)
+            .await
+            .unwrap();
+        let writes = transaction.staged_writes.drain().unwrap();
+        assert!(writes.state_rows.is_empty());
+        assert!(writes.commit_change_refs_by_branch.is_empty());
+        let target = writes.branch_heads.targets[branch_id];
+        assert_eq!(target.head_commit_id, Some(head));
+        let changes = writes.branch_heads.changes(crate::ANONYMOUS_ACCOUNT_ID);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_id, target.ref_change_id);
+        assert_eq!(changes[0].created_at, target.updated_at);
+        assert_eq!(
+            changes[0].row_pk.as_single_string_owned().unwrap(),
+            branch_id
+        );
+        assert!(prepared_writes_require_filesystem_index_rebuild(&writes));
+        assert!(prepared_writes_change_catalog(&writes));
+    }
+
+    #[tokio::test]
+    async fn repeated_typed_head_statements_publish_only_the_latest_target() {
+        let storage = Memory::new();
+        let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+        let id = "01960000-0000-7000-8000-0000000000c1";
+        let latest = CommitId::for_test_label("latest-head");
+        transaction
+            .advance_branch_ref(id, CommitId::for_test_label("first-head"))
+            .await
+            .unwrap();
+        transaction.advance_branch_ref(id, latest).await.unwrap();
+        let writes = transaction.staged_writes.drain().unwrap();
+        assert_eq!(writes.branch_heads.targets.len(), 1);
+        assert_eq!(writes.branch_heads.targets[id].head_commit_id, Some(latest));
+        assert_eq!(
+            writes
+                .branch_heads
+                .changes(crate::ANONYMOUS_ACCOUNT_ID)
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_a_typed_insert_retains_branch_absence_validation() {
+        let storage = Memory::new();
+        let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+        let id = "01960000-0000-7000-8000-0000000000c1";
+        let mut rows = RawWriteBatch::new();
+        rows.push_branch_head(BranchHeadWrite::new(
+            id,
+            Some(CommitId::for_test_label("first")),
+        ));
+        transaction
+            .stage_write(TransactionWrite::Rows {
+                rows,
+                mode: TransactionWriteMode::Insert,
+            })
+            .await
+            .unwrap();
+        transaction
+            .advance_branch_ref(id, CommitId::for_test_label("replacement"))
+            .await
+            .unwrap();
+        let writes = transaction.staged_writes.drain().unwrap();
+        let projected = writes.branch_heads.validation_projection(&writes);
+        assert_eq!(projected.state_rows.len(), 1);
+        assert_eq!(projected.insert_selection.len(), 1);
+        assert!(projected.insert_selection.contains(0));
+    }
+
+    #[tokio::test]
+    async fn mixed_branch_intents_validate_with_descriptors_without_indexing_virtual_refs() {
+        let storage = Memory::new();
+        let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+        let id = "01960000-0000-7000-8000-0000000000c1";
+        let mut rows = raw_write_rows(vec![
+            crate::branch::branch_descriptor_stage_row(id, "new branch", false),
+            key_value_stage_row("mixed", "value", true),
+        ]);
+        rows.push_branch_head(BranchHeadWrite::new(
+            id,
+            Some(CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID)),
+        ));
+        transaction.stage_rows(rows).await.unwrap();
+        let mut writes = transaction.staged_writes.drain().unwrap();
+        let read = transaction.opening_read();
+        transaction
+            .validate_prepared_writes_by_branch(&read, &mut writes)
+            .await
+            .unwrap();
+        assert_eq!(writes.state_rows.len(), 2);
+        assert_eq!(writes.branch_heads.targets.len(), 1);
+        assert!(
+            writes
+                .state_rows
+                .staged_index_values()
+                .rows
+                .iter()
+                .all(|row| row.schema_key != BRANCH_REF_SCHEMA_KEY)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_branch_intents_preserve_snapshot_head_reads() {
+        let storage = Memory::new();
+        let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+        let before = transaction
+            .load_branch_head(GLOBAL_BRANCH_ID)
+            .await
+            .unwrap();
+        transaction
+            .advance_branch_ref(GLOBAL_BRANCH_ID, CommitId::for_test_label("pending-head"))
+            .await
+            .unwrap();
+        assert_eq!(
+            transaction
+                .load_branch_head(GLOBAL_BRANCH_ID)
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            transaction
+                .branch_ref_reader()
+                .await
+                .unwrap()
+                .load_head_commit_id(GLOBAL_BRANCH_ID)
+                .await
+                .unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn statement_rollback_discards_typed_branch_publication_and_keeps_prior_rows() {
+        let storage = Memory::new();
+        let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+        transaction
+            .stage_rows(raw_write_rows(vec![key_value_stage_row(
+                "kept", "value", true,
+            )]))
+            .await
+            .unwrap();
+        let checkpoint = transaction.begin_sql_statement_checkpoint().unwrap();
+        transaction
+            .advance_branch_ref(
+                "01960000-0000-7000-8000-0000000000c1",
+                CommitId::for_test_label("discarded-head"),
+            )
+            .await
+            .unwrap();
+        transaction
+            .rollback_sql_statement_checkpoint(checkpoint)
+            .await
+            .unwrap();
+        let writes = transaction.staged_writes.drain().unwrap();
+        assert!(writes.branch_heads.is_empty());
+        assert_eq!(writes.state_rows.len(), 1);
+        assert_eq!(
+            writes.state_rows.row(0).schema_key.as_str(),
+            "lix_key_value"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_typed_targets_are_rejected_before_staging_descriptors() {
+        let storage = Memory::new();
+        let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+        let id = "01960000-0000-7000-8000-0000000000c1";
+        let mut rows = RawWriteBatch::new();
+        rows.push(crate::branch::branch_descriptor_stage_row(
+            id,
+            "duplicate",
+            false,
+        ));
+        rows.push_branch_head(BranchHeadWrite::new(
+            id,
+            Some(CommitId::for_test_label("first")),
+        ));
+        rows.push_branch_head(BranchHeadWrite::new(
+            id,
+            Some(CommitId::for_test_label("second")),
+        ));
+        let error = transaction.stage_rows(rows).await.unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("multiple explicit branch-ref publications")
+        );
+        let writes = transaction.staged_writes.drain().unwrap();
+        assert!(writes.state_rows.is_empty());
+        assert!(writes.branch_heads.is_empty());
+    }
+
     #[test]
     fn post_commit_catalog_warm_never_aliases_a_newer_revision() {
         let published = CatalogRevision::for_test(b"published");
@@ -15100,6 +15393,7 @@ mod tests {
         );
         selected_changes.add_selected_change_batch(batch.finish());
         let prepared_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: PreparedStateBatch::new(),
             insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
             commit_change_refs_by_branch: BTreeMap::from([("main".to_string(), selected_changes)]),
@@ -15145,6 +15439,7 @@ mod tests {
             "main".into(),
         );
         let prepared_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows,
             insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
             commit_change_refs_by_branch: BTreeMap::new(),
@@ -15157,47 +15452,6 @@ mod tests {
 
         assert!(prepared_writes_stage_filesystem_rows(&prepared_writes));
         assert!(!prepared_writes_require_filesystem_index_rebuild(
-            &prepared_writes
-        ));
-    }
-
-    /// A branch ref move republishes the branch's whole visible filesystem, so
-    /// the staged rows cannot describe the difference.
-    #[test]
-    fn branch_ref_write_requires_filesystem_index_rebuild() {
-        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
-        let mut state_rows = PreparedStateBatch::with_capacity(1);
-        state_rows.push_parts_with_change_addressability(
-            SchemaPlanId::for_test(0),
-            PreparedRowFacts::default(),
-            RowPk::single("main"),
-            BRANCH_REF_SCHEMA_KEY.into(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            timestamp,
-            timestamp,
-            true,
-            Some(ChangeId::for_test_label("branch-ref")),
-            false,
-            Some(CommitId::for_test_label("commit")),
-            false,
-            "main".into(),
-        );
-        let prepared_writes = PreparedWriteSet {
-            state_rows,
-            insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
-            commit_change_refs_by_branch: BTreeMap::new(),
-            first_commit_parent_override_by_branch: BTreeMap::new(),
-            checkpoint_publications: Vec::new(),
-            extra_commit_parents_by_branch: BTreeMap::new(),
-            intermediate_commits: Vec::new(),
-            file_content_writes: Vec::new(),
-        };
-
-        assert!(prepared_writes_require_filesystem_index_rebuild(
             &prepared_writes
         ));
     }
@@ -15233,6 +15487,7 @@ mod tests {
                 "main".into(),
             );
             let prepared_writes = PreparedWriteSet {
+                branch_heads: Default::default(),
                 state_rows,
                 insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
                 commit_change_refs_by_branch: BTreeMap::new(),

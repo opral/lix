@@ -764,15 +764,6 @@ function preconditionMatches(
 				) as SqliteValue | undefined) === undefined
 			);
 		}
-		case "branchEquals": {
-			if (precondition.refKey.byteLength < 4) return false;
-			const value = selectValue(
-				database,
-				spaceFromPhysicalKey(precondition.refKey),
-				precondition.refKey.slice(4),
-			);
-			return value !== undefined && bytesEqual(value, precondition.expected);
-		}
 	}
 }
 
@@ -806,13 +797,6 @@ function copyBlob(value: SqliteValue): Uint8Array {
 	if (value instanceof Int8Array) return new Uint8Array(value.buffer.slice(0));
 	if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
 	throw new Error("SQLite OPFS value is not a BLOB");
-}
-
-function spaceFromPhysicalKey(key: Uint8Array): number {
-	return new DataView(key.buffer, key.byteOffset, key.byteLength).getUint32(
-		0,
-		false,
-	);
 }
 
 function storageError(

@@ -811,11 +811,8 @@ pub(crate) fn decode_native_replacement_part(
         .iter()
         .cloned()
         .map(|range| {
-            crate::plugin::wire::typed::ValidatedNativePayload::try_new_range(
-                owner.clone(),
-                range,
-            )
-            .map_err(|_| ())
+            crate::plugin::wire::typed::ValidatedNativePayload::try_new_range(owner.clone(), range)
+                .map_err(|_| ())
         })
         .collect::<Result<Vec<_>, _>>()
     else {
@@ -1074,7 +1071,7 @@ mod tests {
 
     #[test]
     fn part_round_trips_native_snapshot_without_json() {
-        let typed = crate::plugin::runtime::WasmTypedRow {
+        let typed = crate::row_payload::TypedRow {
             schema_fingerprint: [7; 32],
             row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
             row: lix_schema::Row::from([("value".to_owned(), lix_schema::Value::Int8(42))]),
@@ -1094,7 +1091,7 @@ mod tests {
             .expect("typed payload accessor should succeed")
             .expect("typed payload should be present");
         assert_eq!(
-            crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+            crate::row_payload::TypedRow::decode_durable_payload(
                 std::sync::Arc::from(payload),
                 "test",
                 &crate::row_pk::RowPk::single("row-1"),

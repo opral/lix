@@ -518,13 +518,11 @@ fn direct_append_with_shape(
                 row_pk: row_pk.clone(),
                 file_id: None,
                 snapshot: Some(
-                    crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
-                        &row_pk, &snapshot,
-                    )
-                    .expect("changelog benchmark row should type")
-                    .durable_payload()
-                    .expect("changelog benchmark row should encode")
-                    .to_vec(),
+                    crate::row_payload::TypedRow::from_test_json_unchecked(&row_pk, &snapshot)
+                        .expect("changelog benchmark row should type")
+                        .durable_payload()
+                        .expect("changelog benchmark row should encode")
+                        .to_vec(),
                 ),
                 metadata: None,
                 created_at: crate::common::LixTimestamp::expect_parse(

@@ -14,10 +14,13 @@ use crate::common::{
     FastHashBuilder, LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder,
     fast_hash_builder,
 };
-use crate::plugin::runtime::WasmTypedRow;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::tracked_state::MaterializedTrackedStateRow;
-use crate::{NullableKeyFilter, Value};
+#[cfg(test)]
+use crate::transaction_types::TestPreparedStateRow;
+use crate::transaction_types::{PreparedStateRowRef, materialize_jsonb_shared};
+use crate::{LixError, NullableKeyFilter, Value};
 
 /// Terminal owned DTO for consumers that cannot yet borrow a live-state batch.
 ///
@@ -494,7 +497,7 @@ impl<'a> MaterializedHotStateRowRef<'a> {
     /// view or the exact durable bytes retained by a staged mutation journal.
     pub(crate) fn materialize_decoded_snapshot(
         self,
-    ) -> Result<Option<Arc<WasmTypedRow>>, crate::LixError> {
+    ) -> Result<Option<Arc<WasmTypedRow>>, LixError> {
         if let Some(snapshot) = self.decoded_snapshot() {
             return Ok(Some(Arc::clone(snapshot)));
         }
@@ -513,7 +516,7 @@ impl<'a> MaterializedHotStateRowRef<'a> {
     /// Materializes the logical row from whichever transient serving view is
     /// already retained. Durable storage still has one typed `snapshot`
     /// field; JSON exists only at this explicit consumer boundary.
-    pub(crate) fn snapshot_json_value(self) -> Result<Option<serde_json::Value>, crate::LixError> {
+    pub(crate) fn snapshot_json_value(self) -> Result<Option<serde_json::Value>, LixError> {
         if let Some(snapshot) = self.decoded_snapshot() {
             return snapshot.to_json_value().map(Some);
         }
@@ -521,8 +524,8 @@ impl<'a> MaterializedHotStateRowRef<'a> {
             return serde_json::from_str(snapshot.as_str())
                 .map(Some)
                 .map_err(|error| {
-                    crate::LixError::new(
-                        crate::LixError::CODE_STORAGE_ERROR,
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
                         format!(
                             "live row '{}' has invalid snapshot JSON: {error}",
                             self.schema_key()
@@ -699,15 +702,15 @@ impl MaterializedHotStateExactBatch {
     pub(crate) fn new(
         batch: MaterializedHotStateBatch,
         slots: Vec<Option<u32>>,
-    ) -> Result<Self, crate::LixError> {
+    ) -> Result<Self, LixError> {
         if u32::try_from(batch.len()).is_err()
             || slots
                 .iter()
                 .flatten()
                 .any(|ordinal| *ordinal as usize >= batch.len())
         {
-            return Err(crate::LixError::new(
-                crate::LixError::CODE_INTERNAL_ERROR,
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
                 "exact live-state result contains an invalid batch ordinal",
             ));
         }
@@ -747,7 +750,7 @@ impl MaterializedHotStateExactBatch {
     pub(crate) fn filter(
         &self,
         mut keep: impl FnMut(MaterializedHotStateRowRef<'_>) -> bool,
-    ) -> Result<Self, crate::LixError> {
+    ) -> Result<Self, LixError> {
         let mut builder = MaterializedHotStateBatchBuilder::with_capacity(self.len());
         let mut slots = Vec::with_capacity(self.len());
         for index in 0..self.len() {
@@ -756,8 +759,8 @@ impl MaterializedHotStateExactBatch {
                 continue;
             };
             let ordinal = u32::try_from(builder.push_ref(row, None)).map_err(|_| {
-                crate::LixError::new(
-                    crate::LixError::CODE_INTERNAL_ERROR,
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
                     "exact live-state result exceeds u32 rows",
                 )
             })?;
@@ -1410,23 +1413,23 @@ impl MaterializedHotStateBatchBuilder {
 }
 
 impl TryFrom<&MaterializedHotStateRow> for MaterializedTrackedStateRow {
-    type Error = crate::LixError;
+    type Error = LixError;
 
     fn try_from(row: &MaterializedHotStateRow) -> Result<Self, Self::Error> {
         if row.untracked {
-            return Err(crate::LixError::new(
+            return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "tracked_state cannot store untracked live-state rows",
             ));
         }
         let Some(change_id) = row.change_id else {
-            return Err(crate::LixError::new(
+            return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "tracked_state rows require change_id",
             ));
         };
         let Some(commit_id) = row.commit_id else {
-            return Err(crate::LixError::new(
+            return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "tracked_state rows require commit_id",
             ));
@@ -2124,5 +2127,109 @@ mod batch_tests {
                 .expect("single key"),
             "second"
         );
+    }
+}
+
+impl From<PreparedStateRowRef<'_>> for MaterializedHotStateRow {
+    fn from(row: PreparedStateRowRef<'_>) -> Self {
+        Self {
+            row_pk: row.row_pk.clone(),
+            schema_key: row.schema_key.to_string(),
+            file_id: row.file_id.map(ToString::to_string),
+            snapshot_content: None,
+            metadata: row.metadata.map(materialize_jsonb_shared),
+            deleted: row.snapshot.is_none(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            global: row.global,
+            change_id: row.change_id,
+            commit_id: row.commit_id,
+            untracked: row.untracked,
+            branch_id: Arc::from(row.branch_id.as_str()),
+        }
+    }
+}
+
+/// Builds the legacy owned DTO at an explicit JSON projection boundary.
+/// Durable and batch-native paths keep the typed sidecar instead; persistent
+/// filesystem indexes currently own this DTO and therefore request the
+/// transient projection deliberately.
+pub(crate) fn materialized_hot_state_row_with_snapshot_projection(
+    row: PreparedStateRowRef<'_>,
+) -> Result<MaterializedHotStateRow, LixError> {
+    let mut materialized = MaterializedHotStateRow::from(row);
+    materialized.snapshot_content = row
+        .snapshot
+        .map(|payload| {
+            WasmTypedRow::decode_durable_payload(
+                Arc::from(payload),
+                row.schema_key.as_str(),
+                row.row_pk,
+            )?
+            .to_json_shared()
+        })
+        .transpose()?;
+    Ok(materialized)
+}
+
+#[cfg(test)]
+impl From<TestPreparedStateRow> for MaterializedHotStateRow {
+    fn from(row: TestPreparedStateRow) -> Self {
+        let deleted = row.snapshot.is_none();
+        let snapshot_content = row.snapshot.as_deref().map(|snapshot| {
+            WasmTypedRow::decode_durable_payload(
+                Arc::from(snapshot),
+                row.schema_key.as_str(),
+                &row.row_pk,
+            )
+            .and_then(|typed| typed.to_json_shared())
+            .expect("test prepared snapshot should decode")
+        });
+        Self {
+            row_pk: row.row_pk,
+            schema_key: row.schema_key.into(),
+            file_id: row.file_id.map(Into::into),
+            snapshot_content,
+            metadata: row
+                .metadata
+                .map(|metadata| materialize_jsonb_shared(&metadata)),
+            deleted,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            global: row.global,
+            change_id: row.change_id,
+            commit_id: row.commit_id,
+            untracked: row.untracked,
+            branch_id: Arc::from(row.branch_id.as_str()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<&TestPreparedStateRow> for MaterializedHotStateRow {
+    fn from(row: &TestPreparedStateRow) -> Self {
+        Self {
+            row_pk: row.row_pk.clone(),
+            schema_key: row.schema_key.to_string(),
+            file_id: row.file_id.as_ref().map(ToString::to_string),
+            snapshot_content: row.snapshot.as_deref().map(|snapshot| {
+                WasmTypedRow::decode_durable_payload(
+                    Arc::from(snapshot),
+                    row.schema_key.as_str(),
+                    &row.row_pk,
+                )
+                .and_then(|typed| typed.to_json_shared())
+                .expect("test prepared snapshot should decode")
+            }),
+            metadata: row.metadata.as_ref().map(materialize_jsonb_shared),
+            deleted: row.snapshot.is_none(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            global: row.global,
+            change_id: row.change_id,
+            commit_id: row.commit_id,
+            untracked: row.untracked,
+            branch_id: Arc::from(row.branch_id.as_str()),
+        }
     }
 }

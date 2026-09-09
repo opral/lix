@@ -1,7 +1,7 @@
 use crate::LixError;
 use crate::branch::{
-    BranchLifecycle, BranchOperation, BranchReferenceRole, branch_descriptor_stage_row,
-    branch_ref_stage_row,
+    BranchHeadWrite, BranchLifecycle, BranchOperation, BranchReferenceRole,
+    branch_descriptor_stage_row,
 };
 use crate::storage_adapter::Storage;
 use crate::transaction_types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
@@ -80,7 +80,7 @@ where
 
             let mut rows = RawWriteBatch::with_capacity(2);
             rows.push(branch_descriptor_stage_row(&branch_id, &name, false));
-            rows.push(branch_ref_stage_row(&branch_id, &source_head));
+            rows.push_branch_head(BranchHeadWrite::new(&branch_id, Some(source_head)));
             transaction
                 .stage_write(TransactionWrite::Rows {
                     mode: TransactionWriteMode::Insert,

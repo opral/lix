@@ -14,10 +14,10 @@ use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
 use crate::functions::FunctionProviderHandle;
-use crate::hot_state::{CertifiedCurrentStatePredecessor, MaterializedHotStateRow};
-use crate::json_store::JsonRef;
-use crate::plugin::runtime::{WasmCertifiedRowBatch, WasmTypedRow};
+use crate::row_payload::CertifiedRowBatch as WasmCertifiedRowBatch;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
+use crate::row_state::CertifiedCurrentStatePredecessor;
 use crate::tracked_state::OrderedAddressableCommitDeltaStage;
 use bytes::Bytes;
 use lix_schema::Jsonb;
@@ -412,6 +412,7 @@ struct RawWriteSlot {
 /// nor normalized byte buffers.
 #[derive(Debug, Clone)]
 pub(crate) struct RawWriteBatch {
+    branch_heads: Vec<BranchHeadWrite>,
     slots: Vec<RawWriteSlot>,
     row_pks: Vec<Option<RowPk>>,
     snapshots: Vec<Option<RawSnapshot>>,
@@ -549,7 +550,7 @@ pub(crate) struct CertifiedParameterBatch {
     branch_id: SharedStr,
     untracked: bool,
     certificate: CertifiedRawWriteBatchPreparation,
-    row_columnar: Option<crate::sql2::EncodedRowGroups>,
+    row_columnar: Option<crate::row_columnar::EncodedRowGroups>,
 }
 
 struct CertifiedSnapshots {
@@ -616,6 +617,26 @@ impl CertifiedParameterBatch {
         snapshot_offsets: Vec<(usize, usize)>,
         schema_key: SharedStr,
         branch_id: SharedStr,
+        certificate: CertifiedRawWriteBatchPreparation,
+    ) -> Result<Self, LixError> {
+        Self::new_typed_with_lane(
+            row_pks,
+            snapshot_arena,
+            snapshot_offsets,
+            schema_key,
+            branch_id,
+            false,
+            certificate,
+        )
+    }
+
+    pub(crate) fn new_typed_with_lane(
+        row_pks: Vec<RowPk>,
+        snapshot_arena: Vec<u8>,
+        snapshot_offsets: Vec<(usize, usize)>,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        untracked: bool,
         mut certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
         if row_pks.is_empty() || row_pks.len() != snapshot_offsets.len() {
@@ -675,13 +696,16 @@ impl CertifiedParameterBatch {
             }),
             schema_key,
             branch_id,
-            untracked: false,
+            untracked,
             certificate,
             row_columnar: None,
         })
     }
 
-    pub(crate) fn with_row_columnar(mut self, row_columnar: crate::sql2::EncodedRowGroups) -> Self {
+    pub(crate) fn with_row_columnar(
+        mut self,
+        row_columnar: crate::row_columnar::EncodedRowGroups,
+    ) -> Self {
         self.row_columnar = Some(row_columnar);
         self
     }
@@ -1133,6 +1157,17 @@ pub(crate) struct RawWriteRows<'a> {
 }
 
 impl RawWriteBatch {
+    /// Control intents travel with a write envelope, not through row normalization.
+    /// Transaction consumes them before any row selection or plugin processing.
+    pub(crate) fn push_branch_head(&mut self, head: BranchHeadWrite) {
+        self.certified_preparation = None;
+        self.branch_heads.push(head);
+    }
+
+    pub(crate) fn take_branch_heads(&mut self) -> Vec<BranchHeadWrite> {
+        std::mem::take(&mut self.branch_heads)
+    }
+
     pub(crate) fn new() -> Self {
         Self::with_capacity(0)
     }
@@ -1140,6 +1175,7 @@ impl RawWriteBatch {
     pub(crate) fn with_capacity(row_capacity: usize) -> Self {
         const INLINE_DICTIONARY_LIMIT: usize = 32;
         Self {
+            branch_heads: Vec::new(),
             slots: Vec::with_capacity(row_capacity),
             row_pks: Vec::with_capacity(row_capacity),
             snapshots: Vec::with_capacity(row_capacity),
@@ -1217,6 +1253,7 @@ impl RawWriteBatch {
             flags: if untracked { RAW_WRITE_UNTRACKED } else { 0 },
         };
         Ok(Self {
+            branch_heads: Vec::new(),
             slots: vec![slot; row_count],
             row_pks: row_pks.into_iter().map(Some).collect(),
             snapshots: snapshots
@@ -1252,7 +1289,7 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.slots.is_empty() && self.branch_heads.is_empty()
     }
 
     #[inline(always)]
@@ -1422,6 +1459,7 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn append(&mut self, mut other: Self) {
+        self.branch_heads.append(&mut other.branch_heads);
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_crud_ownership(
             crate::storage_bench::CRUD_OWNERSHIP_RAW_TRANSFER,
@@ -1548,6 +1586,7 @@ impl RawWriteBatch {
             ));
         }
         let RawWriteBatch {
+            branch_heads: _,
             slots,
             row_pks,
             snapshots,
@@ -2201,7 +2240,9 @@ impl<'a> IntoIterator for &'a RawWriteBatch {
 
 impl PartialEq for RawWriteBatch {
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().zip(other).all(|(left, right)| left == right)
+        self.branch_heads == other.branch_heads
+            && self.len() == other.len()
+            && self.iter().zip(other).all(|(left, right)| left == right)
     }
 }
 
@@ -2603,6 +2644,32 @@ pub(crate) struct PluginCheckpointWrite {
     pub(crate) authority: crate::Blob,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchHeadWrite {
+    pub(crate) branch_id: String,
+    pub(crate) head_commit_id: Option<CommitId>,
+    pub(crate) origin: Option<TransactionWriteOrigin>,
+}
+
+impl BranchHeadWrite {
+    pub(crate) fn new(branch_id: &str, head_commit_id: Option<CommitId>) -> Self {
+        Self {
+            branch_id: branch_id.to_owned(),
+            head_commit_id,
+            origin: None,
+        }
+    }
+}
+
+/// Validated publication intent; branch controls remain the only head authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BranchHeadTarget {
+    pub(crate) head_commit_id: Option<CommitId>,
+    pub(crate) ref_change_id: ChangeId,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
+}
+
 /// One decoded write batch accepted by the transaction boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TransactionWrite {
@@ -2648,7 +2715,6 @@ pub(crate) struct TransactionWriteOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct StageJson {
     storage: StageJsonStorage,
-    pub(crate) json_ref: JsonRef,
 }
 
 #[derive(Debug, Clone)]
@@ -2763,38 +2829,25 @@ impl StageJson {
             }
         }
     }
-
-    /// Whether this payload inlines into values instead of the json store.
-    pub(crate) fn is_inline(&self) -> bool {
-        self.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES
-    }
 }
 
 impl PartialEq for StageJson {
     fn eq(&self, other: &Self) -> bool {
         self.normalized() == other.normalized()
-            && (self.is_inline() || other.is_inline() || self.json_ref == other.json_ref)
     }
 }
 
 impl Eq for StageJson {}
 
 pub(crate) fn stage_json_from_value(value: TransactionJson) -> StageJson {
-    // Inline values carry their bytes as the authoritative durable payload.
-    // Computing and retaining a content hash for every small row only to
-    // discard it at the inline-storage boundary doubled the canonical-byte walk on
-    // bulk inserts. Out-of-band values still require the exact content ref.
-    let json_ref = if value.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
-        JsonRef::default()
-    } else {
-        JsonRef::for_content(value.normalized().as_bytes())
-    };
+    // Normalize decoded input before taking ownership of its byte cache.
+    value.normalized();
     let storage = match value.storage {
         TransactionJsonStorage::Decoded { value, normalized } => StageJsonStorage::Owned {
             value: OnceLock::from(value),
-            normalized: normalized.into_inner().unwrap_or_else(|| {
-                panic!("transaction JSON was normalized while computing its JSON ref")
-            }),
+            normalized: normalized
+                .into_inner()
+                .unwrap_or_else(|| panic!("transaction JSON was normalized before staging")),
         },
         TransactionJsonStorage::CertifiedShared {
             normalized,
@@ -2808,7 +2861,7 @@ pub(crate) fn stage_json_from_value(value: TransactionJson) -> StageJson {
             StageJsonStorage::CertifiedShared { value, normalized }
         }
     };
-    StageJson { storage, json_ref }
+    StageJson { storage }
 }
 
 /// Coalesces decoded engine JSON values into one canonical UTF-8 arena.
@@ -3155,7 +3208,7 @@ pub(crate) struct StagedIndexRow {
     /// not extraction found a value, so dropping the `None` entries would
     /// silently narrow witness coverage and leave a column permanently
     /// unwitnessed — a slow read, not a wrong one, but an invisible one.
-    pub(crate) columns: Vec<(u16, Option<crate::hot_state::HotIndexValue>)>,
+    pub(crate) columns: Vec<(u16, Option<crate::row_state::HotIndexValue>)>,
 }
 
 /// Everything the commit-time hot index hook needs, produced by validation.
@@ -3269,7 +3322,7 @@ struct DenseCertifiedParameterSlots {
     direct_change_ids: Option<OrderedAddressableCommitDeltaStage>,
     /// Frontend-built row groups over the same certified typed columns.
     /// Topology-changing operations drop this derived accelerator.
-    row_columnar: Option<crate::sql2::EncodedRowGroups>,
+    row_columnar: Option<crate::row_columnar::EncodedRowGroups>,
     /// Exact authenticated predecessor evidence is row-aligned with the
     /// certified identity column. Ordinary replacement batches therefore
     /// retain their compact representation through publication.
@@ -4231,7 +4284,7 @@ impl PreparedStateBatch {
 
     pub(crate) fn take_dense_row_columnar(
         &mut self,
-    ) -> Option<(CommitId, String, crate::sql2::EncodedRowGroups)> {
+    ) -> Option<(CommitId, String, crate::row_columnar::EncodedRowGroups)> {
         let dense = self.dense_certified_parameter.as_mut()?;
         let commit_id = dense.commit_id?;
         let encoded = dense.row_columnar.take()?;
@@ -4530,108 +4583,55 @@ pub(crate) fn materialize_jsonb_shared(value: &Jsonb) -> SharedStr {
     )
 }
 
-impl From<PreparedStateRowRef<'_>> for MaterializedHotStateRow {
-    fn from(row: PreparedStateRowRef<'_>) -> Self {
-        Self {
-            row_pk: row.row_pk.clone(),
-            schema_key: row.schema_key.to_string(),
-            file_id: row.file_id.map(ToString::to_string),
-            snapshot_content: None,
-            metadata: row.metadata.map(materialize_jsonb_shared),
-            deleted: row.snapshot.is_none(),
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            global: row.global,
-            change_id: row.change_id,
-            commit_id: row.commit_id,
-            untracked: row.untracked,
-            branch_id: Arc::from(row.branch_id.as_str()),
-        }
+pub(crate) fn duplicate_insert_identity_message(
+    schema_key: &str,
+    _row_pk: &RowPk,
+    branch_id: Option<&str>,
+    origin: Option<&TransactionWriteOrigin>,
+) -> String {
+    if let Some(message) = logical_primary_key_violation_message(origin) {
+        return message;
+    }
+    match branch_id {
+        Some(branch_id) => format!(
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate a primary key in branch '{branch_id}'"
+        ),
+        None => format!(
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate a primary key"
+        ),
     }
 }
 
-/// Builds the legacy owned DTO at an explicit JSON projection boundary.
-/// Durable and batch-native paths keep the typed sidecar instead; persistent
-/// filesystem indexes currently own this DTO and therefore request the
-/// transient projection deliberately.
-pub(crate) fn materialized_hot_state_row_with_snapshot_projection(
-    row: PreparedStateRowRef<'_>,
-) -> Result<MaterializedHotStateRow, LixError> {
-    let mut materialized = MaterializedHotStateRow::from(row);
-    materialized.snapshot_content = row
-        .snapshot
-        .map(|payload| {
-            WasmTypedRow::decode_durable_payload(
-                Arc::from(payload),
-                row.schema_key.as_str(),
-                row.row_pk,
-            )?
-            .to_json_shared()
+pub(crate) fn logical_primary_key_violation_message(
+    origin: Option<&TransactionWriteOrigin>,
+) -> Option<String> {
+    let origin = origin?;
+    if origin.operation != TransactionWriteOperation::Insert {
+        return None;
+    }
+    let primary_key = origin.primary_key.as_ref()?;
+    Some(format!(
+        "primary-key constraint violation on table '{}': INSERT would duplicate {}",
+        origin.surface,
+        format_logical_primary_key(primary_key)
+    ))
+}
+
+fn format_logical_primary_key(primary_key: &LogicalPrimaryKey) -> String {
+    primary_key
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let value = primary_key
+                .values
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or("<missing>");
+            format!("{column} '{value}'")
         })
-        .transpose()?;
-    Ok(materialized)
-}
-
-#[cfg(test)]
-impl From<TestPreparedStateRow> for MaterializedHotStateRow {
-    fn from(row: TestPreparedStateRow) -> Self {
-        let deleted = row.snapshot.is_none();
-        let snapshot_content = row.snapshot.as_deref().map(|snapshot| {
-            WasmTypedRow::decode_durable_payload(
-                Arc::from(snapshot),
-                row.schema_key.as_str(),
-                &row.row_pk,
-            )
-            .and_then(|typed| typed.to_json_shared())
-            .expect("test prepared snapshot should decode")
-        });
-        Self {
-            row_pk: row.row_pk,
-            schema_key: row.schema_key.into(),
-            file_id: row.file_id.map(Into::into),
-            snapshot_content,
-            metadata: row
-                .metadata
-                .map(|metadata| materialize_jsonb_shared(&metadata)),
-            deleted,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            global: row.global,
-            change_id: row.change_id,
-            commit_id: row.commit_id,
-            untracked: row.untracked,
-            branch_id: Arc::from(row.branch_id.as_str()),
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<&TestPreparedStateRow> for MaterializedHotStateRow {
-    fn from(row: &TestPreparedStateRow) -> Self {
-        Self {
-            row_pk: row.row_pk.clone(),
-            schema_key: row.schema_key.to_string(),
-            file_id: row.file_id.as_ref().map(ToString::to_string),
-            snapshot_content: row.snapshot.as_deref().map(|snapshot| {
-                WasmTypedRow::decode_durable_payload(
-                    Arc::from(snapshot),
-                    row.schema_key.as_str(),
-                    &row.row_pk,
-                )
-                .and_then(|typed| typed.to_json_shared())
-                .expect("test prepared snapshot should decode")
-            }),
-            metadata: row.metadata.as_ref().map(materialize_jsonb_shared),
-            deleted: row.snapshot.is_none(),
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            global: row.global,
-            change_id: row.change_id,
-            commit_id: row.commit_id,
-            untracked: row.untracked,
-            branch_id: Arc::from(row.branch_id.as_str()),
-        }
-    }
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -5181,7 +5181,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn prepared_batch_compacts_superseded_owner_columns() {
         let origin_key: SharedStr = "one-execution".into();
@@ -5276,7 +5275,6 @@ mod tests {
         assert_eq!(second_key.values, ["file-b"]);
     }
 
-
     #[test]
     fn ten_thousand_write_row_clones_retain_identifier_buffers() {
         let schema_key = SharedStr::from("bulk_schema");
@@ -5347,31 +5345,7 @@ mod tests {
             staged.value(),
             &serde_json::json!({"path": "/a", "value": {"nested": true}})
         );
-        assert_eq!(
-            staged.json_ref,
-            JsonRef::default(),
-            "inline JSON must not pay for an unused content hash"
-        );
     }
-
-    #[test]
-    fn out_of_band_json_retains_its_content_hash() {
-        let normalized = format!(
-            r#"{{"value":"{}"}}"#,
-            "x".repeat(crate::json_store::JSON_INLINE_MAX_BYTES)
-        );
-        let expected = JsonRef::for_content(normalized.as_bytes());
-        let staged = stage_json_from_value(
-            TransactionJson::from_certified_shared_normalized_row_content(normalized.into()),
-        );
-
-        assert!(!staged.is_inline());
-        assert_eq!(staged.json_ref, expected);
-    }
-
-
-
-
 
     #[test]
     fn certified_transaction_rows_release_without_moving_native_columns() {
@@ -5470,8 +5444,6 @@ mod tests {
         assert!(!staged.retains_decoded_value_for_tests());
         assert_eq!(staged.normalized(), r#"{"id":"row-1"}"#);
     }
-
-
 
     #[test]
     fn decoded_sql_rows_canonicalize_into_one_exact_batch_arena() {

@@ -263,7 +263,7 @@ struct InitSeedChange {
     schema_key: String,
     #[cfg(test)]
     snapshot_content: serde_json::Value,
-    decoded_snapshot: std::sync::Arc<crate::plugin::runtime::WasmTypedRow>,
+    decoded_snapshot: std::sync::Arc<crate::row_payload::TypedRow>,
     created_at: LixTimestamp,
 }
 
@@ -274,7 +274,7 @@ struct InitSeedLiveRow {
     schema_key: String,
     #[cfg(test)]
     snapshot_content: serde_json::Value,
-    decoded_snapshot: std::sync::Arc<crate::plugin::runtime::WasmTypedRow>,
+    decoded_snapshot: std::sync::Arc<crate::row_payload::TypedRow>,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
     global: bool,
@@ -954,7 +954,7 @@ fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> Result<Chang
     })
 }
 
-fn seed_snapshot(row: &crate::plugin::runtime::WasmTypedRow) -> Result<Vec<u8>, LixError> {
+fn seed_snapshot(row: &crate::row_payload::TypedRow) -> Result<Vec<u8>, LixError> {
     row.durable_payload()
         .map(|payload| payload.to_vec())
         .map_err(|error| {
@@ -1062,7 +1062,7 @@ struct RegisteredSchemaSeedRow {
     row_pk: RowPk,
     #[cfg(test)]
     snapshot_content: serde_json::Value,
-    decoded_snapshot: std::sync::Arc<crate::plugin::runtime::WasmTypedRow>,
+    decoded_snapshot: std::sync::Arc<crate::row_payload::TypedRow>,
 }
 
 fn registered_schema_seed_rows() -> &'static [RegisteredSchemaSeedRow] {
@@ -1095,7 +1095,7 @@ fn seed_decoded_snapshot(
     schema_key: &str,
     row_pk: &RowPk,
     snapshot: &serde_json::Value,
-) -> Result<std::sync::Arc<crate::plugin::runtime::WasmTypedRow>, LixError> {
+) -> Result<std::sync::Arc<crate::row_payload::TypedRow>, LixError> {
     let (_, plan) = crate::catalog::CatalogSnapshot::builtin()
         .plan_for_key(schema_key)
         .ok_or_else(|| {
@@ -1105,7 +1105,7 @@ fn seed_decoded_snapshot(
             )
         })?;
     Ok(std::sync::Arc::new(
-        crate::plugin::runtime::WasmTypedRow::from_normalized_json(plan, row_pk, snapshot)?,
+        crate::row_payload::TypedRow::from_normalized_json(plan, row_pk, snapshot)?,
     ))
 }
 
