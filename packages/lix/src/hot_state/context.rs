@@ -1871,7 +1871,6 @@ mod tests {
         CurrentStateDeltaRef, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter,
         HotStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
     };
-    use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
     use crate::plugin::runtime::WasmTypedRow;
     use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
@@ -2786,7 +2785,6 @@ mod tests {
             .await
             .expect("current-state read should open");
         let mut writes = storage.new_write_set();
-        let mut json_writer = JsonStoreContext::new().writer();
         let mut branch_refs = std::collections::BTreeMap::new();
         let mut rows_by_branch =
             std::collections::BTreeMap::<String, Vec<&MaterializedUntrackedStateRow>>::new();
@@ -2821,18 +2819,6 @@ mod tests {
                     "test fixture contains duplicate branch refs"
                 );
                 continue;
-            }
-            if let Some(metadata) = row.metadata.as_deref() {
-                json_writer
-                    .stage_batch(
-                        &mut writes,
-                        JsonWritePlacementRef::OutOfBand,
-                        [NormalizedJsonRef::trusted_prehashed(
-                            metadata,
-                            JsonRef::for_content(metadata.as_bytes()),
-                        )],
-                    )
-                    .expect("untracked metadata should stage");
             }
             rows_by_branch
                 .entry(row.branch_id.clone())
@@ -3384,7 +3370,6 @@ mod tests {
     async fn stage_materialized_live_rows(
         store: &impl StorageAdapterRead,
         writes: &mut StorageWriteSet,
-        json_writer: &mut crate::json_store::JsonStoreWriter,
         rows: &[MaterializedHotStateRow],
     ) -> Result<(), LixError> {
         let mut tracked_rows_by_commit = std::collections::BTreeMap::<
@@ -3417,7 +3402,6 @@ mod tests {
             }
             if row.schema_key != COMMIT_SCHEMA_KEY {
                 let change = crate::test_support::tracked_change_from_materialized(&materialized)?;
-                stage_json_payloads_from_materialized(writes, json_writer, &materialized)?;
                 tracked_rows_by_commit
                     .entry(commit_id_text)
                     .or_default()
@@ -3548,25 +3532,6 @@ mod tests {
         Ok(())
     }
 
-    fn stage_json_payloads_from_materialized(
-        writes: &mut StorageWriteSet,
-        json_writer: &mut crate::json_store::JsonStoreWriter,
-        row: &MaterializedTrackedStateRow,
-    ) -> Result<(), LixError> {
-        if let Some(metadata) = row.metadata.as_ref() {
-            let serialized = crate::serialize_row_metadata(metadata);
-            json_writer.stage_batch(
-                writes,
-                JsonWritePlacementRef::OutOfBand,
-                [NormalizedJsonRef::trusted_prehashed(
-                    &serialized,
-                    JsonRef::for_content(serialized.as_bytes()),
-                )],
-            )?;
-        }
-        Ok(())
-    }
-
     fn parent_commit_id_from_test_commit_row(
         row: &MaterializedHotStateRow,
     ) -> Result<Option<String>, LixError> {
@@ -3597,13 +3562,12 @@ mod tests {
             .await
             .expect("read should open");
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
         // Keep the tracked commit fixture separate from the untracked member
         // under test: a single identity cannot change retention class.
         let mut tracked_row =
             tracked_row_with_commit("tracked-value", Some("change-tracked"), "commit-tracked");
         tracked_row.row_pk = identity("tracked-tab");
-        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[tracked_row])
+        stage_materialized_live_rows(&read, &mut writes, &[tracked_row])
             .await
             .expect("tracked row should stage");
         storage
@@ -3675,13 +3639,12 @@ mod tests {
             .await
             .expect("read should open");
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
         // The tracked fixture establishes the branch head; use a distinct
         // identity so the selected untracked row is not a retention conflict.
         let mut tracked_row =
             tracked_row_with_commit("tracked-value", Some("change-tracked"), "commit-tracked");
         tracked_row.row_pk = identity("tracked-tab");
-        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[tracked_row])
+        stage_materialized_live_rows(&read, &mut writes, &[tracked_row])
             .await
             .expect("tracked row should stage");
         storage
@@ -3754,12 +3717,10 @@ mod tests {
             .expect("read should open");
         {
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
                 stage_materialized_live_rows(
                     &read,
                     &mut writes,
-                    &mut json_writer,
                     &[tracked_row_with_commit(
                         "tracked-value",
                         Some("change-tracked"),
@@ -3812,9 +3773,8 @@ mod tests {
                 "commit-global",
             )];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("tracked row should stage");
             }
@@ -3877,9 +3837,8 @@ mod tests {
                 "commit-global",
             )];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("global tracked row should stage");
             }
@@ -3937,9 +3896,8 @@ mod tests {
                 ),
             ];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("tracked rows should stage");
             }
@@ -3995,9 +3953,8 @@ mod tests {
                 ),
             ];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("tracked rows should stage");
             }
@@ -4049,9 +4006,8 @@ mod tests {
                 ),
             ];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("rows should stage");
             }
@@ -4106,9 +4062,8 @@ mod tests {
                 "commit-global",
             )];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("rows should stage");
             }
@@ -4173,9 +4128,8 @@ mod tests {
                 "commit-global",
             )];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("tracked row should stage");
             }
@@ -4224,9 +4178,8 @@ mod tests {
                 ),
             ];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("rows should stage");
             }
@@ -4290,9 +4243,8 @@ mod tests {
                 ),
             ];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("tracked rows should stage");
             }
@@ -4376,8 +4328,7 @@ mod tests {
             branch_tombstone,
         ];
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
-        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+        stage_materialized_live_rows(&read, &mut writes, &rows)
             .await
             .expect("tracked rows should stage");
         storage
@@ -4490,9 +4441,8 @@ mod tests {
                 commit_hot_state_row("commit-branch"),
             ];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("commit facts are changelog projections, not root-local rows");
             }
@@ -4557,9 +4507,8 @@ mod tests {
                 commit_hot_state_row_with_parents("commit-merge", &["parent-left", "parent-right"]),
             ];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("merge commit should use first parent as tracked-root base");
             }
@@ -4590,9 +4539,8 @@ mod tests {
                 ),
             ];
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&read, &mut writes, &rows)
                     .await
                     .expect("tracked rows should stage");
             }

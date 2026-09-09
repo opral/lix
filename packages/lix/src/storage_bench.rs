@@ -135,7 +135,6 @@ static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
-static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_CERTIFICATIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ROW_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ROW_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
@@ -2056,7 +2055,6 @@ pub struct RepositoryGcBenchResult {
     pub swept_commits: usize,
     pub swept_standalone_changes: usize,
     pub standalone_swept_ids: Vec<String>,
-    pub swept_payloads: usize,
     pub staged_puts: u64,
     pub staged_deletes: u64,
     /// Point-delete descriptors grouped by logical storage-space id.  This
@@ -2145,7 +2143,6 @@ where
             .iter()
             .map(ToString::to_string)
             .collect(),
-        swept_payloads: plan.changelog.sweep.json_payloads.len(),
         staged_puts: stats.staged_puts,
         staged_deletes: stats.staged_deletes,
         delete_counts_by_space,
@@ -2449,10 +2446,6 @@ pub(crate) fn record_transaction_schema_catalog_load() {
 
 pub(crate) fn record_transaction_schema_catalog_compile() {
     TRANSACTION_SCHEMA_CATALOG_COMPILES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_json_store_stage_bytes(hash: [u8; 32]) {
-    JSON_STORE_STAGE_BYTES.fetch_add(hash.len() as u64, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3519,8 +3512,6 @@ pub enum ContentAddressRule {
     /// `key == blake3(chunk payload)` after the stored chunk envelope is
     /// decoded.
     BinaryCasChunkPayload,
-    /// `key == blake3(json text)` after the stored JSON envelope is decoded.
-    JsonStorePayload,
     /// The key is a content address, but its payload lives in another space:
     /// this space stores keys only. Nothing here can be verified against the
     /// row's own (empty) value.
@@ -3551,8 +3542,6 @@ pub fn content_address_rule(space_id: u32) -> ContentAddressRule {
         }
         // binary_cas.chunk
         0x0005_0003 => ContentAddressRule::BinaryCasChunkPayload,
-        // json_store.json
-        0x0002_0001 => ContentAddressRule::JsonStorePayload,
         // binary_cas.chunk_presence
         0x0005_0004 => ContentAddressRule::ContentAddressedKeyOnlyMirror,
         _ => ContentAddressRule::NotContentAddressed,
@@ -3581,10 +3570,6 @@ pub fn recompute_content_address(
         ContentAddressRule::BinaryCasChunkPayload => {
             let (_codec, _len, payload) = crate::binary_cas::decode_binary_cas_chunk(value)?;
             Some(*blake3::hash(payload).as_bytes())
-        }
-        ContentAddressRule::JsonStorePayload => {
-            let json = crate::json_store::store::decode_stored_json(value)?;
-            Some(*blake3::hash(&json).as_bytes())
         }
     })
 }

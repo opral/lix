@@ -15,7 +15,6 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
 use crate::functions::FunctionProviderHandle;
 use crate::hot_state::{CertifiedCurrentStatePredecessor, MaterializedHotStateRow};
-use crate::json_store::JsonRef;
 use crate::plugin::runtime::{WasmCertifiedRowBatch, WasmTypedRow};
 use crate::row_pk::RowPk;
 use crate::tracked_state::OrderedAddressableCommitDeltaStage;
@@ -2648,7 +2647,6 @@ pub(crate) struct TransactionWriteOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct StageJson {
     storage: StageJsonStorage,
-    pub(crate) json_ref: JsonRef,
 }
 
 #[derive(Debug, Clone)]
@@ -2763,38 +2761,25 @@ impl StageJson {
             }
         }
     }
-
-    /// Whether this payload inlines into values instead of the json store.
-    pub(crate) fn is_inline(&self) -> bool {
-        self.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES
-    }
 }
 
 impl PartialEq for StageJson {
     fn eq(&self, other: &Self) -> bool {
         self.normalized() == other.normalized()
-            && (self.is_inline() || other.is_inline() || self.json_ref == other.json_ref)
     }
 }
 
 impl Eq for StageJson {}
 
 pub(crate) fn stage_json_from_value(value: TransactionJson) -> StageJson {
-    // Inline values carry their bytes as the authoritative durable payload.
-    // Computing and retaining a content hash for every small row only to
-    // discard it at the inline-storage boundary doubled the canonical-byte walk on
-    // bulk inserts. Out-of-band values still require the exact content ref.
-    let json_ref = if value.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
-        JsonRef::default()
-    } else {
-        JsonRef::for_content(value.normalized().as_bytes())
-    };
+    // Normalize decoded input before taking ownership of its byte cache.
+    value.normalized();
     let storage = match value.storage {
         TransactionJsonStorage::Decoded { value, normalized } => StageJsonStorage::Owned {
             value: OnceLock::from(value),
-            normalized: normalized.into_inner().unwrap_or_else(|| {
-                panic!("transaction JSON was normalized while computing its JSON ref")
-            }),
+            normalized: normalized
+                .into_inner()
+                .unwrap_or_else(|| panic!("transaction JSON was normalized before staging")),
         },
         TransactionJsonStorage::CertifiedShared {
             normalized,
@@ -2808,7 +2793,7 @@ pub(crate) fn stage_json_from_value(value: TransactionJson) -> StageJson {
             StageJsonStorage::CertifiedShared { value, normalized }
         }
     };
-    StageJson { storage, json_ref }
+    StageJson { storage }
 }
 
 /// Coalesces decoded engine JSON values into one canonical UTF-8 arena.
@@ -5181,7 +5166,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn prepared_batch_compacts_superseded_owner_columns() {
         let origin_key: SharedStr = "one-execution".into();
@@ -5276,7 +5260,6 @@ mod tests {
         assert_eq!(second_key.values, ["file-b"]);
     }
 
-
     #[test]
     fn ten_thousand_write_row_clones_retain_identifier_buffers() {
         let schema_key = SharedStr::from("bulk_schema");
@@ -5347,31 +5330,7 @@ mod tests {
             staged.value(),
             &serde_json::json!({"path": "/a", "value": {"nested": true}})
         );
-        assert_eq!(
-            staged.json_ref,
-            JsonRef::default(),
-            "inline JSON must not pay for an unused content hash"
-        );
     }
-
-    #[test]
-    fn out_of_band_json_retains_its_content_hash() {
-        let normalized = format!(
-            r#"{{"value":"{}"}}"#,
-            "x".repeat(crate::json_store::JSON_INLINE_MAX_BYTES)
-        );
-        let expected = JsonRef::for_content(normalized.as_bytes());
-        let staged = stage_json_from_value(
-            TransactionJson::from_certified_shared_normalized_row_content(normalized.into()),
-        );
-
-        assert!(!staged.is_inline());
-        assert_eq!(staged.json_ref, expected);
-    }
-
-
-
-
 
     #[test]
     fn certified_transaction_rows_release_without_moving_native_columns() {
@@ -5470,8 +5429,6 @@ mod tests {
         assert!(!staged.retains_decoded_value_for_tests());
         assert_eq!(staged.normalized(), r#"{"id":"row-1"}"#);
     }
-
-
 
     #[test]
     fn decoded_sql_rows_canonicalize_into_one_exact_batch_arena() {
