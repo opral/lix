@@ -14,6 +14,8 @@ pub use api::*;
 pub use contract::*;
 
 mod actor;
+#[cfg(test)]
+pub(crate) use actor::tests::{failing_publication_for_test, pending_publication_for_test};
 mod archive;
 pub(crate) mod arena;
 mod component;
@@ -23,7 +25,12 @@ mod incremental;
 mod install;
 mod manifest;
 mod materializer;
+mod publication;
 mod registry;
+pub(crate) use publication::{
+    ChainablePublication, PendingPluginActorPublication, PluginPublicationPolicy,
+    PluginPublicationReceipt, discard_plugin_actor_publications, retire_oldest_completed_actor,
+};
 mod row_reconcile;
 mod storage;
 
