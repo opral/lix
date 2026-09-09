@@ -551,3 +551,13 @@ required-features = ["storage-benches"]
 name = "version_control_sql_profile"
 path = "examples/version_control_sql_profile.rs"
 required-features = ["rocksdb"]
+
+[[test]]
+name = "plugin_file_apply"
+path = "tests/plugin_file_apply.rs"
+required-features = ["plugin-tests"]
+
+[[test]]
+name = "plugin_file_observation"
+path = "tests/plugin_file_observation.rs"
+required-features = ["plugin-tests"]

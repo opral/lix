@@ -568,6 +568,33 @@ where
     let mut derived_owners = BTreeMap::new();
     for (file_id, owner) in common_owners {
         let Some(path @ Some(_)) = common_descriptors.get(&file_id).cloned() else {
+            // Native row LWW still invokes the target plugin serializer. Without
+            // a common descriptor, that would combine target rendering with a
+            // source path/dialect picked later by the merge commit. Reject only
+            // files needing semantic or derived-blob conflict resolution. Even
+            // disjoint row edits require rerendering their combined bytes;
+            // choosing either blob would lose the other branch's edits.
+            let needs_materialization = conflict_indices_by_file[&file_id]
+                .iter()
+                .any(|&index| {
+                    let schema_key = analysis
+                        .merge_plan()
+                        .expect("conflicts have a merge plan")
+                        .conflicts[index]
+                        .identity
+                        .schema_key();
+                    schema_key == BLOB_REF_SCHEMA_KEY
+                        || owner.schema_keys().iter().any(|owned| owned == schema_key)
+                });
+            if needs_materialization {
+                return Err(LixError::new(
+                    LixError::CODE_MERGE_CONFLICT,
+                    format!(
+                        "cannot merge content conflicts for plugin file '{file_id}' while its descriptor or ancestor path differs"
+                    ),
+                )
+                .with_hint("merge the file rename separately before reconciling its semantic edits"));
+            }
             continue;
         };
         let _plugin = pinned_conflict_plugin_entry(
