@@ -188,31 +188,20 @@ impl LixInformationSchemaProvider {
         let mut lix_value_kind = Vec::new();
 
         for history in self.public_catalog.history_relations() {
-            let provider_schema = self
-                .public_catalog
-                .history_relation_schema(&history.relation_name)
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "history relation '{}' is missing its result schema",
-                        history.relation_name
-                    ))
-                })?;
-            for (position, column) in history
-                .columns
-                .iter()
-                .filter(|column| column.is_public())
-                .enumerate()
-            {
-                let field = provider_schema.field_with_name(&column.name)?;
+            let provider_schema = super::providers::relation_history_schema(
+                self.public_catalog.as_ref(),
+                &history.relation_name,
+            )?;
+            for (position, field) in provider_schema.fields().iter().enumerate() {
                 function_catalog.push(self.public_catalog_name.clone());
                 function_schema.push(self.public_schema_name.clone());
                 function_name.push("lix_history".to_string());
                 source_relation.push(Some(history.relation_name.clone()));
                 argument_signature
-                    .push("(relation TEXT) | (relation TEXT, as_of TEXT)".to_string());
-                result_column.push(column.name.clone());
+                    .push("(relation TEXT) | (relation TEXT, anchor TEXT)".to_string());
+                result_column.push(field.name().clone());
                 ordinal_position.push((position + 1) as u64);
-                is_nullable.push(if column.read_nullable { "YES" } else { "NO" }.to_string());
+                is_nullable.push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
                 data_type.push(public_sql_type(field.data_type()));
                 lix_value_kind.push(field_value_kind(field));
             }
@@ -272,6 +261,9 @@ impl LixInformationSchemaProvider {
             }
             let (signature, provider_schema) = match surface.kind {
                 PublicSurfaceKind::HistoryFunction => continue,
+                PublicSurfaceKind::LogFunction => {
+                    ("() | (anchor TEXT)", super::providers::log_schema())
+                }
                 PublicSurfaceKind::CommitAncestryFunction => (
                     "() | (commit_id TEXT)",
                     super::providers::commit_ancestry_schema(),

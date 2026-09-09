@@ -218,7 +218,7 @@ simulation_test!(
         );
         let checkpoint_row = session
             .execute(
-                "SELECT COUNT(*) AS count FROM lix_checkpoint WHERE commit_id = $1",
+                "SELECT COUNT(*) AS count FROM lix_commit WHERE is_checkpoint AND id = $1",
                 &[Value::Text(orphaned_checkpoint.commit_id)],
             )
             .await
@@ -226,7 +226,7 @@ simulation_test!(
         assert_eq!(
             checkpoint_row.rows()[0].get::<i64>("count").unwrap(),
             1,
-            "restore must retain checkpoint markers for orphaned commits"
+            "restore must retain checkpoint flags for orphaned commits"
         );
 
         let undo_error = session

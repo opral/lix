@@ -510,6 +510,7 @@ fn sync_live_value_root<'a>(
 
 fn sync_header_from_record(record: &CommitRecord, global_scope: bool) -> SyncCommitHeader {
     SyncCommitHeader {
+        is_checkpoint: record.is_checkpoint,
         commit_id: record.commit_id.to_string(),
         parent_commit_ids: record
             .parent_commit_ids
@@ -1860,6 +1861,7 @@ struct ParsedCommit {
 
 #[derive(Clone)]
 struct ParsedSyncHeader {
+    is_checkpoint: bool,
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
     base_commit_id: Option<CommitId>,
@@ -1942,6 +1944,7 @@ impl ParsedSyncHeader {
             ));
         }
         Ok(Self {
+            is_checkpoint: header.is_checkpoint,
             commit_id,
             parent_commit_ids,
             base_commit_id,
@@ -1965,6 +1968,7 @@ impl ParsedSyncHeader {
 
     fn record(&self) -> CommitRecord {
         CommitRecord {
+            is_checkpoint: self.is_checkpoint,
             format_version: COMMIT_RECORD_FORMAT_VERSION,
             commit_id: self.commit_id,
             generation: self.generation,
@@ -1982,24 +1986,51 @@ impl ParsedSyncHeader {
 fn validate_sync_header_set(
     headers: &BTreeMap<CommitId, ParsedSyncHeader>,
     context: &str,
+    sparse_inventory_ids: &BTreeSet<CommitId>,
 ) -> Result<(), LixError> {
-    let mut remaining = headers.keys().copied().collect::<BTreeSet<_>>();
-    let mut resolved = BTreeSet::new();
-    while !remaining.is_empty() {
-        let ready = remaining.iter().copied().find(|commit_id| {
-            headers[commit_id]
-                .parent_commit_ids
-                .iter()
-                .all(|parent| !headers.contains_key(parent) || resolved.contains(parent))
-        });
-        let Some(commit_id) = ready else {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                format!("{context} commit header graph contains a cycle"),
-            ));
-        };
-        remaining.remove(&commit_id);
-        resolved.insert(commit_id);
+    if sparse_inventory_ids
+        .iter()
+        .any(|id| !headers.get(id).is_some_and(|h| h.is_checkpoint))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sparse inventory must reference checkpoint headers",
+        ));
+    }
+    // Kahn traversal visits each header and known parent edge once, avoiding
+    // repeated scans of the entire retained inventory for the next ready node.
+    let mut unresolved = BTreeMap::new();
+    let mut children = BTreeMap::<CommitId, Vec<CommitId>>::new();
+    let mut ready = Vec::new();
+    for (id, header) in headers {
+        let mut count = 0usize;
+        for parent in &header.parent_commit_ids {
+            if headers.contains_key(parent) {
+                count += 1;
+                children.entry(*parent).or_default().push(*id);
+            }
+        }
+        unresolved.insert(*id, count);
+        if count == 0 {
+            ready.push(*id);
+        }
+    }
+    let mut resolved = 0usize;
+    while let Some(id) = ready.pop() {
+        resolved += 1;
+        for child in children.get(&id).into_iter().flatten() {
+            let count = unresolved.get_mut(child).expect("known child");
+            *count -= 1;
+            if *count == 0 {
+                ready.push(*child);
+            }
+        }
+    }
+    if resolved != headers.len() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("{context} commit header graph contains a cycle"),
+        ));
     }
 
     for header in headers.values() {
@@ -2057,18 +2088,9 @@ fn validate_sync_header_set(
             }
         }
         if header.first_parent_jump_span > 0 {
-            let jump = headers
-                .get(&header.first_parent_jump_commit_id)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "{context} header '{}' is missing jump boundary '{}'",
-                            header.commit_id, header.first_parent_jump_commit_id
-                        ),
-                    )
-                })?;
-            if header.generation.checked_sub(header.first_parent_jump_span) != Some(jump.generation)
+            let expected_generation = header.generation.checked_sub(header.first_parent_jump_span);
+            if header.first_parent_jump_commit_id == header.commit_id
+                || expected_generation.is_none()
             {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
@@ -2077,6 +2099,30 @@ fn validate_sync_header_set(
                         header.commit_id
                     ),
                 ));
+            }
+            match headers.get(&header.first_parent_jump_commit_id) {
+                Some(jump) if expected_generation != Some(jump.generation) => {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "{context} header '{}' has an invalid jump span",
+                            header.commit_id
+                        ),
+                    ));
+                }
+                None if !sparse_inventory_ids.contains(&header.commit_id) => {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "{context} header '{}' is missing jump boundary '{}'",
+                            header.commit_id, header.first_parent_jump_commit_id
+                        ),
+                    ));
+                }
+                // Only inventory-only checkpoint headers may omit topology.
+                // Graph readers demand the missing history before following it;
+                // ordinary history imports must still supply the full closure.
+                _ => {}
             }
         }
     }
@@ -2570,8 +2616,12 @@ async fn snapshot_head_contains_local_head(
     let mut pending = vec![incoming_head];
     let mut seen = BTreeSet::new();
     while let Some(commit_id) = pending.pop() {
-        if commit_id == local_head { return Ok(true); }
-        if !seen.insert(commit_id) { continue; }
+        if commit_id == local_head {
+            return Ok(true);
+        }
+        if !seen.insert(commit_id) {
+            continue;
+        }
         if let Some(header) = incoming_headers.get(&commit_id) {
             pending.extend(header.parent_commit_ids.iter().copied());
         } else if let Some(record) = load_commit_record(read, commit_id).await? {
@@ -4323,6 +4373,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn try_install_initial_sync_snapshot(
         &self,
         remote_id: &str,
@@ -4332,6 +4383,30 @@ where
         commit_headers: &[SyncCommitHeader],
         rows: &[SyncSnapshotRow],
         checkpoint_roots: &BTreeMap<String, String>,
+    ) -> Result<InitialSyncSnapshotInstall, LixError> {
+        self.try_install_initial_sync_snapshot_with_inventory(
+            remote_id,
+            active_account_id,
+            metadata,
+            head_commits,
+            commit_headers,
+            rows,
+            checkpoint_roots,
+            &BTreeSet::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn try_install_initial_sync_snapshot_with_inventory(
+        &self,
+        remote_id: &str,
+        active_account_id: &str,
+        metadata: &SyncRepositoryPullResponse,
+        head_commits: &[SyncCommit],
+        commit_headers: &[SyncCommitHeader],
+        rows: &[SyncSnapshotRow],
+        checkpoint_roots: &BTreeMap<String, String>,
+        sparse_inventory_commit_ids: &BTreeSet<String>,
     ) -> Result<InitialSyncSnapshotInstall, LixError> {
         self.set_sync_replica_remote_id(remote_id)?;
         let _collaboration_guard = self.lock_collaboration_writes().await;
@@ -4358,6 +4433,7 @@ where
             commit_headers,
             rows,
             checkpoint_roots,
+            sparse_inventory_commit_ids,
         )
         .await
     }
@@ -4403,6 +4479,7 @@ where
         commit_headers: &[SyncCommitHeader],
         rows: &[SyncSnapshotRow],
         checkpoint_roots: &BTreeMap<String, String>,
+        sparse_inventory_commit_ids: &BTreeSet<String>,
     ) -> Result<InitialSyncSnapshotInstall, LixError> {
         super::validate_sync_remote_id(remote_id)?;
         let mut parsed_heads = BTreeMap::new();
@@ -4521,7 +4598,20 @@ where
                 ));
             }
         }
-        validate_sync_header_set(&header_by_id, "sync snapshot")?;
+        let sparse_inventory_ids = sparse_inventory_commit_ids
+            .iter()
+            .map(|id| CommitId::parse_lix(id, "sparse checkpoint inventory"))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if sparse_inventory_ids
+            .iter()
+            .any(|id| parsed_heads.contains_key(id))
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "materialized snapshot headers cannot use sparse inventory validation",
+            ));
+        }
+        validate_sync_header_set(&header_by_id, "sync snapshot", &sparse_inventory_ids)?;
         let observed = BranchHeadControlContext::new()
             .reader(&read)
             .load_observed(&branch_ids)
@@ -4609,7 +4699,9 @@ where
                 if existing_scope.is_some_and(|scope| scope != header.global_scope) {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
-                if existing_scope.is_some() && !commit_history_is_deferred(&read, header.commit_id).await? {
+                if existing_scope.is_some()
+                    && !commit_history_is_deferred(&read, header.commit_id).await?
+                {
                     existing_complete.insert(header.commit_id);
                 }
                 records.insert(header.commit_id, existing);
@@ -4626,7 +4718,8 @@ where
                     format!("sync snapshot head '{commit_id}' has no certified header"),
                 )
             })?;
-            if header.parent_commit_ids != commit.parent_commit_ids
+            if header.is_checkpoint != commit.wire.is_checkpoint
+                || header.parent_commit_ids != commit.parent_commit_ids
                 || header.base_commit_id != commit.base_commit_id
                 || header.account_id != commit.account_id
                 || header.created_at != commit.created_at
@@ -4640,8 +4733,9 @@ where
         }
         for (commit_id, commit) in &parsed_heads {
             if existing_complete.contains(commit_id) {
-                let stored = load_sync_commit(&read, *commit_id).await?.ok_or_else(||
-                    LixError::unknown("complete local commit body is missing"))?;
+                let stored = load_sync_commit(&read, *commit_id)
+                    .await?
+                    .ok_or_else(|| LixError::unknown("complete local commit body is missing"))?;
                 if stored != commit.wire {
                     return Err(immutable_object_mismatch("commit", commit_id));
                 }
@@ -4675,6 +4769,14 @@ where
                 "sync snapshot branch checkpoint",
             )?);
         }
+        checkpoint_ids.extend(
+            header_by_id
+                .values()
+                .filter(|header| {
+                    header.is_checkpoint && parsed_heads.contains_key(&header.commit_id)
+                })
+                .map(|header| header.commit_id),
+        );
         let mut snapshot_body_ids = head_ids
             .union(&checkpoint_ids)
             .copied()
@@ -4689,18 +4791,20 @@ where
             .filter_map(|commit| commit.base_commit_id)
             .collect::<BTreeSet<_>>();
         snapshot_body_ids.extend(inline_base_ids);
-        let required_checkpoint_roots = branches
-            .iter()
-            .filter_map(|branch| {
-                let head = branch.head_commit_id.as_deref()?;
-                let checkpoint = branch.checkpoint_commit_id.as_deref()?;
-                (head != checkpoint).then_some(checkpoint.to_owned())
-            })
+        let required_checkpoint_roots = checkpoint_ids
+            .difference(&head_ids)
+            .map(ToString::to_string)
             .collect::<BTreeSet<_>>();
-        if checkpoint_roots.keys().cloned().collect::<BTreeSet<_>>() != required_checkpoint_roots {
+        let advertised_roots = checkpoint_roots.keys().cloned().collect::<BTreeSet<_>>();
+        if !required_checkpoint_roots.is_subset(&advertised_roots)
+            || advertised_roots.iter().any(|id| {
+                CommitId::parse_lix(id, "snapshot boundary")
+                    .map_or(true, |id| !snapshot_body_ids.contains(&id))
+            })
+        {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                "sync snapshot checkpoint roots do not match its branch coordinates",
+                "sync snapshot checkpoint roots do not match its authenticated boundaries",
             ));
         }
         for body_id in parsed_heads.keys() {
@@ -4723,7 +4827,7 @@ where
             let checkpoint_row_owner =
                 CommitId::parse_lix(&row.branch_id, "sync snapshot checkpoint row owner")
                     .ok()
-                    .is_some_and(|commit_id| checkpoint_ids.contains(&commit_id));
+                    .is_some_and(|commit_id| snapshot_body_ids.contains(&commit_id));
             if !advertised_branches.contains(row.branch_id.as_str()) && !checkpoint_row_owner {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
@@ -4801,7 +4905,9 @@ where
             }
         }
         for (commit_id, commit) in &parsed_heads {
-            if !existing_complete.contains(commit_id) && let Some(alias) = &commit.wire.state_alias {
+            if !existing_complete.contains(commit_id)
+                && let Some(alias) = &commit.wire.state_alias
+            {
                 stage_materialized_sync_state_alias(&mut writes, *commit_id, alias)?;
             }
         }
@@ -5168,7 +5274,7 @@ where
                 ));
             }
         }
-        validate_sync_header_set(&parsed, "sync history")?;
+        validate_sync_header_set(&parsed, "sync history", &BTreeSet::new())?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
         let mut new_records = Vec::new();
@@ -5613,7 +5719,8 @@ where
                                 format!("deferred sync commit '{commit_id}' lost its header"),
                             )
                         })?;
-                    if record.parent_commit_ids != commit.parent_commit_ids
+                    if record.is_checkpoint != commit.wire.is_checkpoint
+                        || record.parent_commit_ids != commit.parent_commit_ids
                         || record.base_commit_id != commit.base_commit_id
                         || record.account_id != commit.account_id
                         || record.created_at != commit.created_at
@@ -6412,6 +6519,7 @@ where
                 parent_jump,
             )?;
             let record = CommitRecord {
+                is_checkpoint: commit.wire.is_checkpoint,
                 format_version: COMMIT_RECORD_FORMAT_VERSION,
                 commit_id,
                 generation,
@@ -6427,7 +6535,8 @@ where
                 let certified = records
                     .get(&commit_id)
                     .expect("deferred body retained its certified header");
-                if certified.generation != record.generation
+                if certified.is_checkpoint != record.is_checkpoint
+                    || certified.generation != record.generation
                     || certified.parent_commit_ids != record.parent_commit_ids
                     || certified.first_parent_jump_commit_id != record.first_parent_jump_commit_id
                     || certified.first_parent_jump_span != record.first_parent_jump_span
@@ -6760,8 +6869,19 @@ where
                             deleted: after.deleted,
                             created_at: after.created_at,
                             updated_at: after.updated_at,
-                            snapshot: payload.snapshot,
-                            metadata: payload.metadata,
+                            // A collection marker and its cascade removals
+                            // can share a payload key; deleted rows never copy
+                            // the live marker's snapshot or metadata.
+                            snapshot: if after.deleted {
+                                None
+                            } else {
+                                payload.snapshot
+                            },
+                            metadata: if after.deleted {
+                                None
+                            } else {
+                                payload.metadata
+                            },
                             columnar_base_coordinate: None,
                         });
                     }
@@ -6984,51 +7104,19 @@ where
         if commit_ids.is_empty() {
             return Ok(BTreeSet::new());
         }
-        let requested = commit_ids
-            .iter()
-            .map(|commit_id| {
-                let parsed =
-                    CommitId::parse_lix(commit_id, "sync checkpoint history demand commit id")?;
-                Ok((
-                    RowPk::uuid_from_canonical(&parsed.to_string())
-                        .expect("a canonical commit UUID is a canonical checkpoint row key"),
-                    commit_id.clone(),
-                ))
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let Some(global) = BranchHeadControlContext::new()
-            .reader(&read)
-            .load(crate::GLOBAL_BRANCH_ID)
-            .await?
-        else {
-            return Ok(BTreeSet::new());
-        };
-        let mut tracked = TrackedStateContext::new().reader(&read);
-        let rows = tracked
-            .scan_batch_at_commit(
-                &global.head_commit_id.to_string(),
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        schema_keys: vec![crate::checkpoint::CHECKPOINT_SCHEMA_KEY.to_owned()],
-                        row_pks: requested.iter().map(|(row_pk, _)| row_pk.clone()).collect(),
-                        ..TrackedStateFilter::default()
-                    },
-                    limit: Some(requested.len()),
-                    ..TrackedStateScanRequest::default()
-                },
-            )
-            .await?;
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                requested
-                    .iter()
-                    .find(|(row_pk, _)| row_pk == row.row_pk())
-                    .map(|(_, commit_id)| commit_id.clone())
-            })
-            .collect())
+        let mut checkpoints = BTreeSet::new();
+        for commit_id in commit_ids {
+            let id = CommitId::parse_lix(commit_id, "sync checkpoint history demand commit id")?;
+            if load_commit_record(&read, id)
+                .await?
+                .is_some_and(|record| record.is_checkpoint)
+            {
+                checkpoints.insert(commit_id.clone());
+            }
+        }
+        Ok(checkpoints)
     }
 
     async fn complete_history_live_root_at_commit(
@@ -7418,6 +7506,42 @@ where
             }
         }
         Ok(response)
+    }
+
+    pub(crate) async fn sync_checkpoint_inventory(
+        &self,
+        cursor: u64,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<super::SyncCheckpointInventoryPage, LixError> {
+        if limit == 0 || limit > super::MAX_SYNC_REQUEST_ITEMS {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "checkpoint inventory limit is out of range",
+            ));
+        }
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        let (actual, _) = load_sequence(&read).await?;
+        if actual != cursor {
+            return Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "checkpoint inventory changed; restart repository snapshot",
+            ));
+        }
+        let after = after
+            .map(|id| CommitId::parse_lix(id, "checkpoint inventory cursor"))
+            .transpose()?;
+        let (records, next) =
+            crate::checkpoint::checkpoint_commit_page(&read, after, limit).await?;
+        Ok(super::SyncCheckpointInventoryPage {
+            cursor,
+            commit_headers: records
+                .into_iter()
+                .map(|record| sync_header_from_record(&record, record.base_commit_id.is_none()))
+                .collect(),
+            continuation: next.map(|id| id.to_string()),
+        })
     }
 
     async fn build_sync_snapshot(&self) -> Result<SyncRepositoryPullResponse, LixError> {
@@ -8045,12 +8169,35 @@ mod tests {
     #[tokio::test]
     async fn authority_preserves_untracked_current_state_without_history() {
         let authority = open_lix().await.unwrap();
-        authority.set_sync_role(super::super::SyncRole::Authority).unwrap();
-        let head = authority.execute("SELECT id FROM lix_commit ORDER BY id", &[]).await.unwrap();
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .unwrap();
+        let head = authority
+            .execute("SELECT id FROM lix_commit ORDER BY id", &[])
+            .await
+            .unwrap();
         authority.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('authority-local-only','preserved',true)", &[]).await.unwrap();
-        assert_eq!(authority.execute("SELECT value FROM lix_key_value WHERE key = 'authority-local-only'", &[]).await.unwrap().rows().len(),1);
-        let after = authority.execute("SELECT id FROM lix_commit ORDER BY id", &[]).await.unwrap();
-        assert_eq!(head.rows(),after.rows(),"untracked mutations must not create history");
+        assert_eq!(
+            authority
+                .execute(
+                    "SELECT value FROM lix_key_value WHERE key = 'authority-local-only'",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .rows()
+                .len(),
+            1
+        );
+        let after = authority
+            .execute("SELECT id FROM lix_commit ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            head.rows(),
+            after.rows(),
+            "untracked mutations must not create history"
+        );
     }
 
     #[tokio::test]
@@ -8992,11 +9139,25 @@ mod tests {
         assert_eq!(events[0].inline_blobs, request.inline_blobs);
         let history = authority
             .execute(
-                "SELECT path, content FROM lix_history('lix_file') WHERE path = $1",
+                "SELECT lixcol_to_commit_id FROM lix_history('lix_file') WHERE to_path = $1 ORDER BY lixcol_position LIMIT 1",
                 &[Value::Text("/inline-admission.md".to_owned())],
             )
             .await
             .expect("public file history query should remain readable after inline sync");
+        let history = authority
+            .execute(
+                "SELECT content FROM lix_as_of('lix_file', $1) WHERE path = $2",
+                &[
+                    Value::Text(
+                        history.rows()[0]
+                            .get::<String>("lixcol_to_commit_id")
+                            .unwrap(),
+                    ),
+                    Value::Text("/inline-admission.md".to_owned()),
+                ],
+            )
+            .await
+            .expect("synced history endpoint snapshot");
         assert!(
             history.rows().iter().any(|row| {
                 row.get::<Vec<u8>>("content")
@@ -9494,16 +9655,37 @@ mod tests {
             "columns": [{"name":"id","type":"text","nullable":false}],
             "primary_key": ["id"]
         });
-        authority.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))", &[Value::Text(schema.to_string())]).await.unwrap();
-        authority.execute("INSERT INTO amended_sync_row (id) VALUES ('old')", &[]).await.unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        authority
+            .execute("INSERT INTO amended_sync_row (id) VALUES ('old')", &[])
+            .await
+            .unwrap();
         let (_, old_head) = default_head(&authority.pull_sync_repository(None, 128).await.unwrap());
-        schema["columns"].as_array_mut().unwrap().push(serde_json::json!({"name":"extra","type":"text","nullable":true}));
+        schema["columns"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name":"extra","type":"text","nullable":true}));
         authority.execute("UPDATE lix_registered_schema SET value = CAST($1 AS JSONB) WHERE schema_key = 'amended_sync_row'", &[Value::Text(schema.to_string())]).await.unwrap();
-        authority.execute("INSERT INTO amended_sync_row (id, extra) VALUES ('new', 'value')", &[]).await.unwrap();
+        authority
+            .execute(
+                "INSERT INTO amended_sync_row (id, extra) VALUES ('new', 'value')",
+                &[],
+            )
+            .await
+            .unwrap();
         let snapshot = authority.pull_sync_repository(None, 128).await.unwrap();
         let replica = replica_from_snapshot(&authority, &snapshot).await;
         let query = "SELECT id FROM amended_sync_row ORDER BY id";
-        assert_eq!(replica.execute(query, &[]).await.unwrap().rows(), authority.execute(query, &[]).await.unwrap().rows());
+        assert_eq!(
+            replica.execute(query, &[]).await.unwrap().rows(),
+            authority.execute(query, &[]).await.unwrap().rows()
+        );
         hydrate_history_commit(&authority, &replica, &old_head).await;
         assert_eq!(
             export_sync_commit(&replica, &old_head).await.unwrap(),
@@ -11345,11 +11527,17 @@ mod tests {
             .commits
             .into_iter()
             .chain(checkpoint_history.commits)
+            .map(|commit| (commit.commit_id.clone(), commit))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
             .collect::<Vec<_>>();
         let boundaries = authored_history
             .boundaries
             .into_iter()
             .chain(checkpoint_history.boundaries)
+            .map(|boundary| (boundary.commit_id.clone(), boundary))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
             .collect::<Vec<_>>();
         let mut boundary_rows = Vec::new();
         for boundary in &boundaries {
@@ -11585,13 +11773,28 @@ mod tests {
             .expect("exact replay should be idempotent");
         assert_eq!(second.cursor, first.cursor);
         let mut conflicting = request.clone();
-        let member = conflicting.commits.iter_mut().flat_map(|commit| &mut commit.members)
-            .find(|member| member.schema_key == "lix_key_value").unwrap();
-        member.snapshot.as_mut().unwrap().as_object_mut().unwrap()
+        let member = conflicting
+            .commits
+            .iter_mut()
+            .flat_map(|commit| &mut commit.members)
+            .find(|member| member.schema_key == "lix_key_value")
+            .unwrap();
+        member
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
             .insert("value".to_owned(), serde_json::json!("different"));
         let pk = RowPk::from_typed_json_array_value(&member.row_pk).unwrap();
-        let row = crate::plugin::runtime::WasmTypedRow::from_builtin_json(&member.schema_key, &pk, member.snapshot.as_ref().unwrap()).unwrap();
-        member.snapshot_payload = Some(super::super::commit::encode_sync_row_payload(&row).unwrap());
+        let row = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+            &member.schema_key,
+            &pk,
+            member.snapshot.as_ref().unwrap(),
+        )
+        .unwrap();
+        member.snapshot_payload =
+            Some(super::super::commit::encode_sync_row_payload(&row).unwrap());
         let error = target
             .push_sync_repository(&conflicting)
             .await
@@ -12046,6 +12249,70 @@ mod tests {
         assert!(error.message.contains("canonical tracked row"));
     }
 
+    fn sparse_checkpoint_header() -> ParsedSyncHeader {
+        ParsedSyncHeader {
+            is_checkpoint: true,
+            commit_id: CommitId::for_test_label("sparse-inventory-checkpoint"),
+            parent_commit_ids: vec![CommitId::for_test_label("sparse-inventory-parent")],
+            base_commit_id: None,
+            account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            created_at: LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
+            global_scope: true,
+            generation: 4,
+            first_parent_jump_commit_id: CommitId::for_test_label("sparse-inventory-jump"),
+            first_parent_jump_span: 3,
+        }
+    }
+
+    #[test]
+    fn sparse_checkpoint_jump_requires_explicit_inventory_permission() {
+        let header = sparse_checkpoint_header();
+        let inventory_ids = BTreeSet::from([header.commit_id]);
+        let headers = BTreeMap::from([(header.commit_id, header)]);
+        let error = validate_sync_header_set(&headers, "test snapshot", &BTreeSet::new())
+            .expect_err("ordinary history must include jump boundaries");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("missing jump boundary"));
+        validate_sync_header_set(&headers, "test snapshot", &inventory_ids)
+            .expect("explicit sparse inventory may defer an absent jump boundary");
+    }
+
+    #[test]
+    fn sparse_checkpoint_jump_rejects_invalid_metadata() {
+        for mutation in ["self jump", "oversized span", "unmarked"] {
+            let mut header = sparse_checkpoint_header();
+            match mutation {
+                "self jump" => header.first_parent_jump_commit_id = header.commit_id,
+                "oversized span" => header.first_parent_jump_span = header.generation + 1,
+                "unmarked" => header.is_checkpoint = false,
+                _ => unreachable!(),
+            }
+            let inventory_ids = BTreeSet::from([header.commit_id]);
+            let headers = BTreeMap::from([(header.commit_id, header)]);
+            let error = validate_sync_header_set(&headers, "test snapshot", &inventory_ids)
+                .expect_err(mutation);
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn sparse_checkpoint_jump_still_validates_present_boundary_generation() {
+        let header = sparse_checkpoint_header();
+        let inventory_ids = BTreeSet::from([header.commit_id]);
+        let mut jump = header.clone();
+        jump.commit_id = header.first_parent_jump_commit_id;
+        jump.is_checkpoint = false;
+        jump.parent_commit_ids.clear();
+        jump.generation = 0;
+        jump.first_parent_jump_commit_id = jump.commit_id;
+        jump.first_parent_jump_span = 0;
+        let headers = BTreeMap::from([(header.commit_id, header), (jump.commit_id, jump)]);
+        let error = validate_sync_header_set(&headers, "test snapshot", &inventory_ids)
+            .expect_err("present jump boundary must match the declared span");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("invalid jump span"));
+    }
+
     #[tokio::test]
     async fn incoming_header_preserves_local_scope_digest_but_checks_identity() {
         let local = open_lix().await.unwrap();
@@ -12151,20 +12418,41 @@ mod tests {
         write_key_value(&local, "before-publication", "shared").await;
         let mut bytes = Vec::new();
         local.export_snapshot().write_to(&mut bytes).await.unwrap();
-        let authority = open_lix().from_snapshot(futures_lite::io::Cursor::new(bytes)).await.unwrap();
+        let authority = open_lix()
+            .from_snapshot(futures_lite::io::Cursor::new(bytes))
+            .await
+            .unwrap();
         write_key_value(&local, "after-copy", "local").await;
         write_key_value(&authority, "after-copy", "server").await;
         let snapshot = authority.pull_sync_repository(None, 1).await.unwrap();
         let (history, rows, checkpoint_roots) = snapshot_parts(&authority, &snapshot).await;
-        local.set_sync_role(super::super::SyncRole::Replica).unwrap();
-        let error = local.try_install_initial_sync_snapshot(
-            TEST_REMOTE, crate::ANONYMOUS_ACCOUNT_ID, &snapshot,
-            &history.commits, &history.commit_headers, &rows, &checkpoint_roots,
-        ).await.expect_err("diverged local commits must not be replaced");
+        local
+            .set_sync_role(super::super::SyncRole::Replica)
+            .unwrap();
+        let error = local
+            .try_install_initial_sync_snapshot(
+                TEST_REMOTE,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                &snapshot,
+                &history.commits,
+                &history.commit_headers,
+                &rows,
+                &checkpoint_roots,
+            )
+            .await
+            .expect_err("diverged local commits must not be replaced");
         assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
-        local.set_sync_role(super::super::SyncRole::Disabled).unwrap();
+        local
+            .set_sync_role(super::super::SyncRole::Disabled)
+            .unwrap();
         assert_eq!(read_key_value(&local, "after-copy").await, "local");
-        assert_eq!(local.load_sync_repository_cursor(TEST_REMOTE).await.unwrap(), None);
+        assert_eq!(
+            local
+                .load_sync_repository_cursor(TEST_REMOTE)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -14679,12 +14967,12 @@ mod tests {
         // bootstrap boundary through the publication-only fixture responder.
         replica.clear_sync_demand_sender_for_test();
 
-        crate::sql2::reset_file_history_anchor_probe_census();
+        crate::sql2::take_mainline_work();
 
         let history = loop {
             match replica
                 .execute(
-                    "SELECT id, path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+                    "SELECT id, to_path AS path FROM lix_history('lix_file', $1) WHERE id = $2 AND lixcol_to_commit_id = $1 ORDER BY lixcol_position ASC LIMIT 1",
                     &[
                         Value::Text(checkpoint.clone()),
                         Value::Text(added_file_id.clone()),
@@ -14738,11 +15026,10 @@ mod tests {
                 Err(error) => panic!("checkpoint history should load: {error:?}"),
             }
         };
-        let (anchor_probes, anchor_probe_hits) = crate::sql2::file_history_anchor_probe_census();
-        assert!(anchor_probes >= 1, "top-k history should probe its anchor");
-        assert_eq!(
-            anchor_probe_hits, 1,
-            "the selected checkpoint change should resolve at the anchor"
+        let work = crate::sql2::take_mainline_work();
+        assert!(
+            work.1 >= 1,
+            "selected checkpoint must evaluate an endpoint difference"
         );
         assert_eq!(history.rows().len(), 1);
         assert_eq!(
@@ -14890,7 +15177,7 @@ mod tests {
 
         let history = replica
             .execute(
-                "SELECT id, path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+                "SELECT id, to_path AS path FROM lix_history('lix_file', $1) WHERE id = $2 AND lixcol_to_commit_id = $1 ORDER BY lixcol_position ASC LIMIT 1",
                 &[
                     Value::Text(latest_checkpoint),
                     Value::Text(added_file_id),

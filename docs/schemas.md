@@ -68,7 +68,7 @@ VALUES ('acme_section', '{
 ```
 
 `schema_key` must equal `value.key`. After registration, `acme_section` and
-`lix_history('acme_section')` expose the typed current row and its revision
+`lix_history('acme_section')` expose the typed current row and its endpoint-change
 history.
 
 ## Contract

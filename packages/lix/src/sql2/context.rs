@@ -53,18 +53,6 @@ pub(crate) struct DiffCommandOutcome {
 }
 
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
-pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
-
-#[derive(Clone)]
-pub(crate) struct HistoryQuerySource<S> {
-    pub(crate) store: S,
-    /// Active-branch head pinned by the SQL session that owns this provider.
-    ///
-    /// History scans use this commit when the query does not provide an
-    /// explicit time-travel anchor.
-    pub(crate) default_as_of_commit_id: String,
-}
-
 #[derive(Clone)]
 pub(crate) struct ChangelogQuerySource<S> {
     pub(crate) store: S,
@@ -116,10 +104,6 @@ pub(crate) trait SqlExecutionContext: Sync {
         Arc::new(UncachedFilesystemPathIndexReader::new(self.hot_state()))
     }
     fn functions(&self) -> FunctionProviderHandle;
-    fn history_query_source(
-        &self,
-        default_as_of_commit_id: String,
-    ) -> SqlHistoryQuerySource<Self::ReadStore>;
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore>;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
@@ -232,6 +216,12 @@ pub(crate) trait SqlWriteExecutionContext: Send {
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError>;
+    async fn load_branch_working_base(
+        &mut self,
+        _branch_id: &str,
+    ) -> Result<Option<CommitId>, LixError> {
+        Ok(None)
+    }
 
     async fn load_collection_generation(
         &mut self,
@@ -611,6 +601,23 @@ impl SqlWriteContext {
         }
     }
 
+    pub(crate) async fn load_branch_working_base(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<CommitId>, LixError> {
+        let _guard = self.gate.lock().await;
+        self.ensure_context_live("load_branch_working_base")?;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .load_branch_working_base(branch_id)
+                .await
+        }
+    }
+
     pub(crate) async fn filesystem_path_index(
         &self,
         request: &FilesystemPathIndexRequest,
@@ -754,6 +761,7 @@ impl WriteContextBranchRefReader {
 #[async_trait]
 impl BranchRefReader for WriteContextBranchRefReader {
     async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
+        let working_base_commit_id = self.ctx.load_branch_working_base(branch_id).await?;
         Ok(self
             .ctx
             .load_branch_head(branch_id)
@@ -761,6 +769,7 @@ impl BranchRefReader for WriteContextBranchRefReader {
             .map(|commit_id| BranchHead {
                 branch_id: branch_id.to_string(),
                 commit_id,
+                working_base_commit_id,
             }))
     }
 

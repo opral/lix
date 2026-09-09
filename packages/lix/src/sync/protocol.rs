@@ -124,6 +124,8 @@ pub struct SyncPushResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncCommitHeader {
+    /// Immutable commit membership; required by the current protocol.
+    pub is_checkpoint: bool,
     pub commit_id: String,
     pub parent_commit_ids: Vec<String>,
     pub base_commit_id: Option<String>,
@@ -277,6 +279,15 @@ pub enum SyncRepositoryPullResponse {
         cursor: u64,
         events: Vec<SyncEvent>,
     },
+}
+
+/// Bounded repository checkpoint inventory at an ordered-sync cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncCheckpointInventoryPage {
+    pub cursor: u64,
+    pub commit_headers: Vec<SyncCommitHeader>,
+    pub continuation: Option<String>,
 }
 
 /// One complete-state fence in a bounded history page.

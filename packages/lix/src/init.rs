@@ -10,7 +10,6 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
     CommitRecord,
 };
-use crate::checkpoint::{CHECKPOINT_SCHEMA_KEY, checkpoint_snapshot};
 use crate::common::LixTimestamp;
 use crate::functions::FunctionProviderHandle;
 use crate::hot_state::{
@@ -111,9 +110,13 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// bootstrap registration rows remain history/introspection projections, but
 /// branch, checkpoint, and sync visibility can no longer remove or redefine a
 /// schema required to interpret engine rows.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 77;
+/// v78 stores checkpoint membership in canonical v7 commit metadata.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 78;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v77";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v78";
+pub(crate) const REPOSITORY_PROTOCOL_V77: &[u8] = b"tracked-default-branch.v77";
+pub(crate) const REPOSITORY_PROTOCOL_V77_CHECKPOINT_REWRITE: &[u8] =
+    b"tracked-default-branch.v77-checkpoint-rewrite";
 pub(crate) const REPOSITORY_PROTOCOL_V76: &[u8] = b"tracked-default-branch.v76";
 pub(crate) const REPOSITORY_PROTOCOL_V75: &[u8] = b"tracked-default-branch.v75";
 pub(crate) const REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP: &[u8] =
@@ -157,6 +160,7 @@ pub(crate) fn parse_repository_protocol(value: &[u8]) -> RepositoryProtocolStatu
         (REPOSITORY_PROTOCOL_V72_COMMIT_REWRITE, 72),
         (REPOSITORY_PROTOCOL_V73_COMMIT_REWRITE, 73),
         (REPOSITORY_PROTOCOL_V74_COMMIT_REWRITE, 74),
+        (REPOSITORY_PROTOCOL_V77_CHECKPOINT_REWRITE, 77),
     ] {
         if value == marker {
             return RepositoryProtocolStatus::MigrationRequired { found_version };
@@ -364,14 +368,6 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
         key_value_snapshot(LIX_ID_KEY, &lix_id),
         timestamp,
     )?;
-    let initial_checkpoint_change = canonical_change(
-        functions.call_uuid_v7(),
-        RowPk::uuid_from_canonical(&initial_commit_id.to_string())
-            .expect("initial checkpoint commit ID is a canonical UUID"),
-        CHECKPOINT_SCHEMA_KEY,
-        checkpoint_snapshot(&initial_commit_id),
-        timestamp,
-    )?;
     let system_account_change = canonical_change(
         functions.call_uuid_v7(),
         RowPk::uuid_from_canonical(crate::SYSTEM_ACCOUNT_ID)
@@ -464,7 +460,6 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
                 main_branch_descriptor_change,
                 kv_lix_id_change,
                 default_branch_change,
-                initial_checkpoint_change,
                 system_account_change,
                 anonymous_account_change,
             ])
@@ -979,6 +974,7 @@ async fn stage_init_changelog_commit(
     main_touched_scopes: &[crate::changelog::CommitScopeKey],
 ) -> Result<(), LixError> {
     let global_commit = CommitRecord {
+        is_checkpoint: false,
         touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(touched_scopes),
         format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
         commit_id: plan.global_commit.id,
@@ -991,6 +987,7 @@ async fn stage_init_changelog_commit(
         created_at: plan.global_commit.created_at,
     };
     let main_commit = CommitRecord {
+        is_checkpoint: false,
         touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(
             main_touched_scopes,
         ),
@@ -1166,7 +1163,7 @@ mod tests {
     fn plan_init_seed_returns_tracked_repository_bootstrap_changes() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 7);
+        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 6);
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
         assert_eq!(plan.receipt.lix_id, test_uuid(2));
@@ -1200,7 +1197,7 @@ mod tests {
             .iter()
             .map(|change| change.id.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 7);
+        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 6);
         let first_seed_change_id = test_uuid(5);
         assert!(change_ids.contains(&first_seed_change_id));
         assert!(!change_ids.contains(&plan.global_commit.change_id.to_string()));
@@ -1330,7 +1327,7 @@ mod tests {
             crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
                 .await
                 .expect("initial commit membership should load");
-        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 7);
+        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 6);
         assert!(
             !change_refs.contains(&record.change_id()),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"
@@ -1539,12 +1536,12 @@ mod tests {
             RepositoryProtocolStatus::MigrationRequired { found_version: 69 }
         );
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v77"),
+            parse_repository_protocol(b"tracked-default-branch.v78"),
             RepositoryProtocolStatus::Current
         );
         assert_eq!(
-            parse_repository_protocol(b"tracked-default-branch.v78"),
-            RepositoryProtocolStatus::TooNew { found_version: 78 }
+            parse_repository_protocol(b"tracked-default-branch.v79"),
+            RepositoryProtocolStatus::TooNew { found_version: 79 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),

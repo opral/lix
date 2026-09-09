@@ -58,62 +58,37 @@ await lix.close();
 A runnable Rust version lives at
 [`checkpoints.rs`](https://github.com/opral/lix/blob/main/packages/lix/examples/checkpoints.rs).
 
-## SQL surfaces
+## Commit membership and queries
 
-| Surface | Scope | Columns |
-| :-- | :-- | :-- |
-| `lix_diff(relation[, from_commit_id, to_commit_id])` | One relation, defaulting to latest checkpoint → active head | `row_ref`, typed primary-key columns, `diff_type`, `row_count`, and paired `from_<column>` / `to_<column>` relation columns |
-| `lix_checkpoint` | Repository-global checkpoint markers | `id`, `commit_id`, and standard `lixcol_*` columns |
-| `lix_commit` | Repository-global commit graph | `id`, `parent_commit_ids`, and standard `lixcol_*` columns |
-| `lix_history('lix_checkpoint'[, commit_id])` | Global checkpoint-row authorship history | Checkpoint columns and standard history `lixcol_*` columns |
-| `lix_commit_ancestry([commit_id])` | Active head or an explicit anchor | `commit_id`, `depth` |
-| `lix_latest_checkpoint_commit_id()` | Active branch | Latest checkpoint commit ID, or the repository root if the branch has no checkpoint |
-| `lix_root_commit_id()` | Repository root | Scalar ID of the repository bootstrap root |
-
-`parent_commit_ids` is an ordered JSONB array: element zero is the mainline
-parent, and later elements are merge parents:
+A checkpoint is a new immutable commit with `is_checkpoint = true`. Automatic
+commits have the flag set to false. Empty checkpoints are retained log entries.
+A selected checkpoint creates a marked commit and an ordinary child containing
+remaining working changes. The flag cannot be updated through SQL.
 
 ```sql
-SELECT parent_commit_ids ->> 0 AS parent_commit_id
+SELECT commit_id, parent_commit_id, created_at
+FROM lix_log()
+WHERE is_checkpoint
+ORDER BY position
+LIMIT 20;
+
+SELECT id, created_at
 FROM lix_commit
-WHERE id = $checkpoint_commit_id;
+WHERE is_checkpoint
+ORDER BY created_at DESC, id DESC;
 ```
 
-Use `lix_latest_checkpoint_commit_id()` to resolve the active branch's working
-baseline. It returns the branch's latest checkpoint, or `lix_root_commit_id()`
-when the branch has no checkpoint. Pair it with the active head to inspect
-working changes in one query, including before the first checkpoint:
+The first query is branch-relative; the second includes repository-global,
+off-branch checkpoints. There is no separate `lix_checkpoint` relation or marker
+write. Commit creation time is the single public checkpoint timestamp.
 
-```sql
-SELECT row_ref, id, diff_type
-FROM lix_diff('lix_file');
-```
+Use `lix_diff('lix_file')` for working changes. Its baseline is exposed as
+`lix_branch.working_base_commit_id` and can be an ordinary commit after a fork or
+restore. The latest marked commit is not necessarily the working baseline.
 
-Checkpoint markers in `lix_checkpoint` are repository-global. Querying the
-newest marker can therefore return a checkpoint from a different branch:
+Full checkpoint publication aliases the captured state root; it does not scan
+or copy the working interval. Physical reclamation runs in the background.
+Selective checkpoint source dependencies remain available for offline sync.
 
-```sql
-SELECT commit_id
-FROM lix_checkpoint
-ORDER BY lixcol_created_at DESC
-LIMIT 1;
-```
-
-`lix_checkpoint` retains checkpoint markers even when a branch restore abandons
-their commits. Join it with `lix_commit_ancestry()` when you need only checkpoints
-reachable from the active branch head:
-
-```sql
-SELECT checkpoint.id, checkpoint.commit_id, ancestry.depth
-FROM lix_checkpoint AS checkpoint
-JOIN lix_commit_ancestry() AS ancestry
-  ON ancestry.commit_id = checkpoint.commit_id
-ORDER BY ancestry.depth, checkpoint.commit_id;
-```
-
-The anchor has `depth = 0`; direct parents have depth `1`. A commit reachable
-through several merge paths appears once at its shortest depth.
-
-Create a checkpoint for every tracked change through
-`SELECT commit_id FROM lix_create_checkpoint()`. Select a subset by passing an
-array of `row_ref` values as described in [Diff commands](./diff-commands.md).
+See [History](./history.md) for log, endpoint history, snapshots, and paged
+previews, and [Diff commands](./diff-commands.md) for scoped checkpoints.

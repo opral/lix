@@ -42,21 +42,19 @@ async fn main() -> Result<(), LixError> {
         .get::<String>("commit_id")?;
     println!("created checkpoint {checkpoint}");
 
-    // `lix_checkpoint` holds the checkpoint rows and carries no ordering column.
-    // `lix_history('lix_checkpoint')` exposes `lixcol_depth`, so ascending depth is
-    // newest-first.
+    // Checkpoint membership filters the first-parent commit log.
     let checkpoints = lix
         .execute(
-            "SELECT commit_id, lixcol_depth
-             FROM lix_history('lix_checkpoint')
-             ORDER BY lixcol_depth",
+            "SELECT commit_id, position
+             FROM lix_log() WHERE is_checkpoint
+             ORDER BY position",
             &[],
         )
         .await?;
 
     for row in checkpoints.rows() {
         let commit_id = row.get::<String>("commit_id")?;
-        let depth = row.get::<i64>("lixcol_depth")?;
+        let depth = row.get::<i64>("position")?;
         println!("depth {depth}: {commit_id}");
     }
     let remaining = lix

@@ -47,10 +47,7 @@ async fn repository_gc_keeps_graph_reachable_file_history_content() {
     let lix = open_lix().with_storage(memory.clone()).await.unwrap();
     write_file(&lix, "/history.txt", b"before gc").await;
     let file_id = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = '/history.txt'",
-            &[],
-        )
+        .execute("SELECT id FROM lix_file WHERE path = '/history.txt'", &[])
         .await
         .unwrap()
         .rows()[0]
@@ -83,12 +80,9 @@ async fn repository_gc_keeps_graph_reachable_file_history_content() {
 
     let history = lix
         .execute(
-            "SELECT content FROM lix_history('lix_file', $1) \
-             WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
-            &[
-                Value::Text(historical_checkpoint),
-                Value::Text(file_id),
-            ],
+            "SELECT content FROM lix_as_of('lix_file', $1) \
+             WHERE id = $2",
+            &[Value::Text(historical_checkpoint), Value::Text(file_id)],
         )
         .await
         .unwrap();

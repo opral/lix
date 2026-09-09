@@ -342,7 +342,7 @@ pub(crate) struct ChangelogAppend {
 }
 
 /// Current on-disk shape of [`CommitRecord`].
-pub(crate) const COMMIT_RECORD_FORMAT_VERSION: u32 = 6;
+pub(crate) const COMMIT_RECORD_FORMAT_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
@@ -380,6 +380,8 @@ pub(crate) struct CommitRecord {
     /// history membership test then costs no extra point read. See
     /// [`crate::changelog::CommitTouchedScopeDigest`].
     pub(crate) touched_scope_digest: super::CommitTouchedScopeDigest,
+    /// Immutable checkpoint membership (record v7), published with this commit.
+    pub(crate) is_checkpoint: bool,
 }
 
 impl CommitRecord {
@@ -628,6 +630,7 @@ mod topology_tests {
     fn record(depth: u64, parent: Option<CommitId>, jump: Option<(CommitId, u64)>) -> CommitRecord {
         let commit_id = id(depth);
         CommitRecord {
+            is_checkpoint: false,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             base_commit_id: None,
@@ -907,11 +910,15 @@ pub(crate) fn commit_row_snapshot_json(
     commit_id: &str,
     parent_commit_ids: &[CommitId],
     base_commit_id: Option<CommitId>,
+    is_checkpoint: bool,
+    created_at: LixTimestamp,
 ) -> Result<String, LixError> {
     serde_json::to_string(&serde_json::json!({
         "id": commit_id,
         "parent_commit_ids": parent_commit_ids,
         "base_commit_id": base_commit_id,
+        "is_checkpoint": is_checkpoint,
+        "created_at": created_at.to_string(),
     }))
     .map_err(|error| {
         LixError::new(

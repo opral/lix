@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -6,18 +5,11 @@ use serde_json::Value as JsonValue;
 
 use crate::LixError;
 use crate::row_pk::RowPkComponentType;
-use crate::sql2::history_route::{
-    HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_FILE_ID, HISTORY_COL_IS_DELETED,
-    HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY,
-    HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY,
-};
-use crate::sql2::result_metadata::{json_field, mark_json_field, row_ref_field};
+use crate::sql2::result_metadata::{json_field, mark_json_field};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaSurfaceShape {
     Active,
-    History,
 }
 
 /// Engine-owned bookkeeping shared by every tracked row state projection.
@@ -155,9 +147,11 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
 ) -> Result<SchemaSurfaceSpec, LixError> {
     let parsed = crate::schema::parse_lix_schema(schema)?;
     let schema_key = parsed.key.clone();
-    if let Some(column) = parsed.columns.iter().find(|column| {
-        column.name.starts_with("lixcol_") || column.name.contains("_lixcol_")
-    }) {
+    if let Some(column) = parsed
+        .columns
+        .iter()
+        .find(|column| column.name.starts_with("lixcol_") || column.name.contains("_lixcol_"))
+    {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
             format!(
@@ -167,10 +161,8 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
         ));
     }
     for primary_key in &parsed.primary_key {
-        let collides_with_envelope = matches!(
-            primary_key.as_str(),
-            "row_ref" | "diff_type" | "row_count"
-        );
+        let collides_with_envelope =
+            matches!(primary_key.as_str(), "row_ref" | "diff_type" | "row_count");
         let collides_with_side_column = ["from_", "to_"].iter().any(|prefix| {
             primary_key.strip_prefix(prefix).is_some_and(|unprefixed| {
                 parsed.columns.iter().any(|column| {
@@ -364,6 +356,7 @@ pub(crate) fn schema_exposed_as_schema_surface(schema_key: &str) -> bool {
             | "lix_branch_descriptor"
             | "lix_branch_ref"
             | "lix_change"
+            | "lix_checkpoint"
             | "lix_directory_descriptor"
             | "lix_file_descriptor"
             | "lix_undo_redo_marker"
@@ -372,36 +365,21 @@ pub(crate) fn schema_exposed_as_schema_surface(schema_key: &str) -> bool {
 }
 
 pub(crate) fn schema_exposed_as_history_surface(schema_key: &str) -> bool {
-    schema_exposed_as_schema_surface(schema_key)
-        && schema_key != "lix_commit"
+    schema_exposed_as_schema_surface(schema_key) && schema_key != "lix_commit"
 }
 
 pub(crate) fn schema_surface_schema(
     spec: &SchemaSurfaceSpec,
     shape: SchemaSurfaceShape,
 ) -> SchemaRef {
-    let history_identity_roots = if shape == SchemaSurfaceShape::History {
-        spec.primary_key_paths
-            .iter()
-            .filter_map(|path| path.first())
-            .cloned()
-            .collect::<BTreeSet<_>>()
-    } else {
-        BTreeSet::new()
-    };
     let mut fields = spec
         .columns
         .iter()
         .map(|column| {
-            let read_nullable = if shape == SchemaSurfaceShape::History {
-                !history_identity_roots.contains(&column.name)
-            } else {
-                column.read_nullable
-            };
             let field = Field::new(
                 &column.name,
                 arrow_data_type_for_schema_column_type(column.column_type),
-                read_nullable,
+                column.read_nullable,
             );
             if column.column_type == SchemaColumnType::Jsonb {
                 mark_json_field(field)
@@ -442,24 +420,7 @@ pub(crate) fn row_visible_fields(spec: &SchemaSurfaceSpec) -> Vec<Field> {
         .collect()
 }
 
-pub(crate) fn row_system_fields(shape: SchemaSurfaceShape) -> Vec<Field> {
-    if shape == SchemaSurfaceShape::History {
-        return vec![
-            row_ref_field(HISTORY_COL_ROW_PK, false),
-            Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
-            Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
-            json_field(HISTORY_COL_METADATA, true),
-            Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
-            Field::new(HISTORY_COL_CHANGE_CREATED_AT, DataType::Utf8, false),
-            Field::new(HISTORY_COL_ORIGIN_KEY, DataType::Utf8, true),
-            Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
-            Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
-            Field::new(HISTORY_COL_AS_OF_COMMIT_ID, DataType::Utf8, false),
-            Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
-            Field::new(HISTORY_COL_IS_DELETED, DataType::Boolean, false),
-        ];
-    }
-
+pub(crate) fn row_system_fields(_shape: SchemaSurfaceShape) -> Vec<Field> {
     vec![
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
@@ -489,9 +450,7 @@ fn arrow_data_type_for_schema_column_type(column_type: SchemaColumnType) -> Data
 mod tests {
     use serde_json::json;
 
-    use super::{
-        SchemaSurfaceShape, derive_schema_surface_spec_from_schema, schema_surface_schema,
-    };
+    use super::derive_schema_surface_spec_from_schema;
 
     fn path_value_schema(value_type: &str) -> serde_json::Value {
         json!({
@@ -575,51 +534,6 @@ mod tests {
         let schema = path_value_schema("text");
         let spec = derive_schema_surface_spec_from_schema(&schema).expect("schema should derive");
         assert!(!spec.certifies_path_value_replacement);
-    }
-
-    #[test]
-    fn history_primary_key_columns_are_non_null() {
-        let spec = derive_schema_surface_spec_from_schema(&json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "localized_document",
-            "columns": [
-                { "name": "tenant", "type": "text", "nullable": false },
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "locale", "type": "text", "nullable": false },
-                { "name": "body", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["tenant", "id", "locale"],
-        }))
-        .expect("schema should derive");
-
-        let history = schema_surface_schema(&spec, SchemaSurfaceShape::History);
-        assert!(
-            !history
-                .field_with_name("tenant")
-                .expect("first identity column")
-                .is_nullable()
-        );
-        assert!(
-            !history
-                .field_with_name("locale")
-                .expect("top-level identity")
-                .is_nullable()
-        );
-        assert!(
-            history
-                .field_with_name("body")
-                .expect("payload")
-                .is_nullable()
-        );
-
-        let active = schema_surface_schema(&spec, SchemaSurfaceShape::Active);
-        assert!(
-            !active
-                .field_with_name("tenant")
-                .expect("active identity input")
-                .is_nullable(),
-            "read nullability is independent from omission/default input semantics"
-        );
     }
 
     #[test]

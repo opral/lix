@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, LargeBinaryArray, StringArray};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -28,7 +28,6 @@ pub(super) enum Col<R: 'static> {
     Utf8Fallible(fn(&R) -> Result<Option<String>, LixError>),
     Bool(fn(&R) -> Option<bool>),
     I64(fn(&R) -> Option<i64>),
-    Binary(fn(&R) -> Option<Vec<u8>>),
 }
 
 /// Build failure, kept structural so each table maps it to its own
@@ -104,14 +103,6 @@ pub(super) fn build_array<R>(col: &Col<R>, rows: &[R]) -> Result<ArrayRef, Colum
         )) as ArrayRef,
         Col::Bool(get) => Arc::new(BooleanArray::from_iter(rows.iter().map(get))) as ArrayRef,
         Col::I64(get) => Arc::new(Int64Array::from_iter(rows.iter().map(get))) as ArrayRef,
-        Col::Binary(get) => Arc::new(LargeBinaryArray::from(
-            rows.iter()
-                .map(get)
-                .collect::<Vec<_>>()
-                .iter()
-                .map(|value| value.as_deref())
-                .collect::<Vec<_>>(),
-        )) as ArrayRef,
     })
 }
 

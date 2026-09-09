@@ -111,7 +111,7 @@ all three cases. It allocated 18,491,287 / 18,240,350 / 28,992,135 bytes with
 3,726,576 / 3,508,440 / 4,885,244 peak-live bytes for shallow / deep / wide,
 respectively. Certified current reads and one-argument working diffs use
 payloads installed before publication, so they issue no foreground chunk or
-history requests. Explicit historical reads use local `lix_state_at` and multi-argument
+history requests. Explicit historical reads use local `lix_as_of` and multi-argument
 `lix_diff` surfaces, hydrating missing history and retaining it for reuse.
 The reference measurements below predate local-first sync and describe the
 former authority-routing implementation.

@@ -1120,7 +1120,7 @@ test("fs storage imports local files and materializes lix_file writes", async ()
 	await reopened.close();
 });
 
-test("execute originKey is exposed on change and history surfaces without metadata", async () => {
+test("execute originKey stays on source records while history identifies endpoints", async () => {
 	const lix = await openLix();
 	const fileId = "01920000-0000-7000-8000-000000000411";
 	const metadata = { purpose: "metadata-only" };
@@ -1134,16 +1134,12 @@ test("execute originKey is exposed on change and history surfaces without metada
 	const insertedHeadCommitId = await activeHeadCommitId(lix);
 	expect(get(inserted, "origin_key")).toBe("test-origin");
 	expect(get(inserted, "lixcol_metadata")).toEqual(metadata);
-	const fileHistorySources = get(
-		await lix.execute(
-			"SELECT lixcol_source_changes FROM lix_history('lix_file', $2) WHERE id = $1 AND lixcol_depth = 0",
-			[fileId, insertedHeadCommitId],
-		),
-		"lixcol_source_changes",
-	) as Array<{ origin_key: string | null }>;
-	expect(fileHistorySources.map((source) => source.origin_key)).toContain(
-		"test-origin",
+	const insertedHistory = await lix.execute(
+		"SELECT diff_type, lixcol_to_commit_id FROM lix_history('lix_file', $2) WHERE id = $1 AND lixcol_position = 0",
+		[fileId, insertedHeadCommitId],
 	);
+	expect(get(insertedHistory, "diff_type")).toBe("added");
+	expect(get(insertedHistory, "lixcol_to_commit_id")).toBe(insertedHeadCommitId);
 
 	await lix.execute("UPDATE lix_file SET content = $1 WHERE id = $2", [
 		new TextEncoder().encode("two\n"),
@@ -1163,16 +1159,13 @@ test("execute originKey is exposed on change and history surfaces without metada
 	const txStamped = await currentFileChange(lix, fileId);
 	const txHeadCommitId = await activeHeadCommitId(lix);
 	expect(get(txStamped, "origin_key")).toBe("tx-origin");
-	const txFileHistorySources = get(
-		await lix.execute(
-			"SELECT lixcol_source_changes FROM lix_history('lix_file', $2) WHERE id = $1 AND lixcol_depth = 0",
-			[fileId, txHeadCommitId],
-		),
-		"lixcol_source_changes",
-	) as Array<{ origin_key: string | null }>;
-	expect(txFileHistorySources.map((source) => source.origin_key)).toContain(
-		"tx-origin",
+	const txHistory = await lix.execute(
+		"SELECT diff_type, lixcol_to_commit_id FROM lix_history('lix_file', $2) WHERE id = $1 AND lixcol_position = 0",
+		[fileId, txHeadCommitId],
 	);
+	expect(get(txHistory, "diff_type")).toBe("modified");
+	expect(get(txHistory, "lixcol_to_commit_id")).toBe(txHeadCommitId);
+
 	expect(get(txStamped, "lixcol_metadata")).toEqual(metadata);
 
 	await lix.close();
@@ -2457,7 +2450,7 @@ test("execute rejects extra SQL parameters", async () => {
 	await lix.close();
 });
 
-test("lix_directory_history snapshot_content preserves JSON null after binary file writes", async () => {
+test("directory endpoint history preserves null parent after binary file writes", async () => {
 	const lix = await openLix();
 
 	await lix.execute(
@@ -2475,23 +2468,11 @@ test("lix_directory_history snapshot_content preserves JSON null after binary fi
 	);
 
 	const result = await lix.execute(
-		"SELECT lixcol_source_changes \
-		 FROM lix_history('lix_directory') \
-		 WHERE id = $1 \
-		 ORDER BY lixcol_depth \
-		 LIMIT 1",
+		"SELECT to_parent_id, diff_type FROM lix_history('lix_directory') WHERE id = $1 ORDER BY lixcol_position LIMIT 1",
 		["01920000-0000-7000-8000-000000000431"],
 	);
-	const sourceChanges = get(result, "lixcol_source_changes") as Array<{
-		schema_key: string;
-		snapshot_content: { parent_id: string | null } | null;
-	}>;
-	const directoryDescriptor = sourceChanges.find(
-		(source) => source.schema_key === "lix_directory_descriptor",
-	);
-	expect(directoryDescriptor?.snapshot_content).toMatchObject({
-		parent_id: null,
-	});
+	expect(get(result, "to_parent_id")).toBeNull();
+	expect(get(result, "diff_type")).toBe("added");
 
 	await lix.close();
 });

@@ -7,12 +7,11 @@ use http::Method;
 use serde::Deserialize;
 
 use super::{
-    MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT, SyncBlobManifest,
-    SyncBlobRegistration, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
-    SyncRepositoryPullResponse, SyncSnapshotRowPage, SyncTransport, SyncTransportBounds,
-    SyncTransportFuture, SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION_HEADER,
-    sync_server_protocol_mismatch, sync_server_protocol_missing_field,
-    validate_sync_remote_id,
+    MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT, SYNC_PROTOCOL_VERSION,
+    SYNC_PROTOCOL_VERSION_HEADER, SyncBlobManifest, SyncBlobRegistration, SyncHistoryResponse,
+    SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse, SyncSnapshotRowPage,
+    SyncTransport, SyncTransportBounds, SyncTransportFuture, sync_server_protocol_mismatch,
+    sync_server_protocol_missing_field, validate_sync_remote_id,
 };
 use crate::LixError;
 
@@ -81,10 +80,7 @@ impl<Client> HttpSyncTransport<Client>
 where
     Client: RawHttpClient,
 {
-    pub(super) async fn connect_with(
-        client: Client,
-        lix_url: &str,
-    ) -> Result<Self, LixError> {
+    pub(super) async fn connect_with(client: Client, lix_url: &str) -> Result<Self, LixError> {
         let normalized = normalize_sync_locator(lix_url)?;
         let protocol_url = normalized.protocol_url;
         let response = client
@@ -108,6 +104,7 @@ where
     pub(super) fn is_reserved_header(name: &str) -> bool {
         name.eq_ignore_ascii_case(SESSION_HEADER)
             || name.eq_ignore_ascii_case(SYNC_PROTOCOL_VERSION_HEADER)
+            || name.eq_ignore_ascii_case("lix-server-protocol-version")
     }
 
     pub(super) fn lix_id(&self) -> &str {
@@ -181,13 +178,9 @@ pub(crate) struct NormalizedSyncLocator {
     pub(crate) protocol_url: String,
 }
 
-pub(crate) fn normalize_sync_locator(
-    locator: &str,
-) -> Result<NormalizedSyncLocator, LixError> {
+pub(crate) fn normalize_sync_locator(locator: &str) -> Result<NormalizedSyncLocator, LixError> {
     let mut parsed = url::Url::parse(locator).map_err(|_| invalid_lix_locator())?;
-    if parsed.scheme() != "https"
-        && !(parsed.scheme() == "http" && is_loopback_host(&parsed))
-    {
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && is_loopback_host(&parsed)) {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
             "sync server url must use https (http is allowed only for loopback development)",
@@ -209,8 +202,7 @@ pub(crate) fn normalize_sync_locator(
     let Some(lix_id) = locator_path.strip_prefix("/lix/") else {
         return Err(invalid_lix_locator());
     };
-    if lix_id.contains('/') || crate::row_pk::RowPk::uuid_from_canonical(lix_id).is_err()
-    {
+    if lix_id.contains('/') || crate::row_pk::RowPk::uuid_from_canonical(lix_id).is_err() {
         return Err(invalid_lix_locator());
     }
     let lix_id = lix_id.to_owned();
@@ -312,6 +304,23 @@ where
         })
     }
 
+    fn checkpoint_inventory<'a>(
+        &'a self,
+        cursor: u64,
+        after: Option<&'a str>,
+        limit: usize,
+    ) -> SyncTransportFuture<'a, super::SyncCheckpointInventoryPage> {
+        Box::pin(async move {
+            let mut path = format!("/sync/checkpoints?cursor={cursor}&limit={limit}");
+            if let Some(after) = after {
+                path.push_str("&after=");
+                path.push_str(&encode_query(after));
+            }
+            self.send_json(self.request(Method::GET, &path, "load checkpoint inventory"))
+                .await
+        })
+    }
+
     fn history<'a>(
         &'a self,
         head: &'a str,
@@ -397,7 +406,10 @@ fn raw_request(method: Method, url: String, operation: &'static str) -> RawHttpR
     RawHttpRequest {
         method,
         url,
-        headers: Vec::new(),
+        headers: vec![(
+            "lix-server-protocol-version".to_owned(),
+            crate::SERVER_PROTOCOL_VERSION.to_string(),
+        )],
         body: None,
         cache_immutable: false,
         operation,
@@ -464,10 +476,7 @@ fn response_error(response: &RawHttpResponse, operation: &str) -> LixError {
             .details
             .unwrap_or_else(|| serde_json::json!({}));
         if let Some(object) = details.as_object_mut() {
-            object.insert(
-                "httpStatus".to_owned(),
-                serde_json::json!(response.status),
-            );
+            object.insert("httpStatus".to_owned(), serde_json::json!(response.status));
         } else {
             details = serde_json::json!({
                 "httpStatus": response.status,
@@ -528,11 +537,9 @@ mod tests {
     #[test]
     fn sync_connection_locator_maps_to_the_targeted_protocol_root() {
         assert_eq!(
-            normalize_sync_locator(
-                "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
-            )
-            .expect("canonical locator")
-            .protocol_url,
+            normalize_sync_locator("https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc")
+                .expect("canonical locator")
+                .protocol_url,
             "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc"
         );
         assert_eq!(
@@ -560,18 +567,22 @@ mod tests {
                 "accepted invalid locator: {invalid}"
             );
         }
-        assert!(normalize_sync_locator(
-            "http://localhost:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
-        )
-        .is_ok());
-        assert!(normalize_sync_locator(
-            "http://127.0.0.1:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
-        )
-        .is_ok());
-        assert!(normalize_sync_locator(
-            "http://[::1]:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
-        )
-        .is_ok());
+        assert!(
+            normalize_sync_locator(
+                "http://localhost:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+            )
+            .is_ok()
+        );
+        assert!(
+            normalize_sync_locator(
+                "http://127.0.0.1:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+            )
+            .is_ok()
+        );
+        assert!(
+            normalize_sync_locator("http://[::1]:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -642,10 +653,7 @@ mod tests {
         )
         .await
         .expect("matching handshake should connect");
-        assert_eq!(
-            transport.lix_id(),
-            "01936f4e-7b6c-7c3d-8f9a-123456789abc"
-        );
+        assert_eq!(transport.lix_id(), "01936f4e-7b6c-7c3d-8f9a-123456789abc");
     }
 
     #[derive(Debug)]
@@ -802,15 +810,13 @@ mod tests {
 
     #[test]
     fn session_and_protocol_headers_are_reserved_for_the_transport() {
-        assert!(HttpSyncTransport::<VersionMismatchClient>::is_reserved_header(
-            "Lix-Session-Id"
-        ));
-        assert!(HttpSyncTransport::<VersionMismatchClient>::is_reserved_header(
-            "LIX-SYNC-PROTOCOL-VERSION"
-        ));
-        assert!(!HttpSyncTransport::<VersionMismatchClient>::is_reserved_header(
-            "Authorization"
-        ));
+        assert!(HttpSyncTransport::<VersionMismatchClient>::is_reserved_header("Lix-Session-Id"));
+        assert!(
+            HttpSyncTransport::<VersionMismatchClient>::is_reserved_header(
+                "LIX-SYNC-PROTOCOL-VERSION"
+            )
+        );
+        assert!(!HttpSyncTransport::<VersionMismatchClient>::is_reserved_header("Authorization"));
     }
 
     #[test]

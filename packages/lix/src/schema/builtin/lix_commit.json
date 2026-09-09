@@ -21,6 +21,18 @@
       "type": "uuid",
       "nullable": true,
       "description": "Exact global commit composed underneath this commit. Null marks a base-native commit. This is state dependency, not ancestry."
+    },
+    {
+      "name": "is_checkpoint",
+      "type": "boolean",
+      "nullable": false,
+      "description": "Immutable membership in the repository checkpoint inventory."
+    },
+    {
+      "name": "created_at",
+      "type": "text",
+      "nullable": false,
+      "description": "Creation timestamp from immutable canonical commit metadata."
     }
   ],
   "primary_key": [
@@ -30,7 +42,9 @@
     {
       "id": "commit_01jexample",
       "parent_commit_ids": [],
-      "base_commit_id": null
+      "base_commit_id": null,
+      "is_checkpoint": false,
+      "created_at": "2026-09-09T00:00:00Z"
     }
   ]
 }

@@ -754,53 +754,6 @@ pub fn take_commit_delta_member_scan_census() -> (u64, u64, u64, u64, u64) {
     )
 }
 
-static PATH_RESOLVER_DESCRIPTORS_SEEN: AtomicU64 = AtomicU64::new(0);
-static PATH_RESOLVER_DESCRIPTORS_PARSED: AtomicU64 = AtomicU64::new(0);
-static PATH_RESOLVER_DESCRIPTORS_PREFILTERED: AtomicU64 = AtomicU64::new(0);
-static PATH_RESOLVER_METADATA_SLOTS_PRESENT: AtomicU64 = AtomicU64::new(0);
-static PATH_RESOLVER_PREFILTER_ENABLED: AtomicU64 = AtomicU64::new(0);
-static PATH_RESOLVER_PREFILTER_DISABLED: AtomicU64 = AtomicU64::new(0);
-
-/// Counted at the per-descriptor loop in
-/// `resolve_file_history_path_lookup_ids`, at the `serde_json::from_str` the
-/// prefilter is meant to avoid -- not at the resolved id set, which is the same
-/// set either way and therefore cannot tell a skipped parse from a performed
-/// one.
-pub(crate) fn record_path_resolver_descriptor(parsed: bool, metadata_present: bool) {
-    PATH_RESOLVER_DESCRIPTORS_SEEN.fetch_add(1, Ordering::Relaxed);
-    if parsed {
-        PATH_RESOLVER_DESCRIPTORS_PARSED.fetch_add(1, Ordering::Relaxed);
-    } else {
-        PATH_RESOLVER_DESCRIPTORS_PREFILTERED.fetch_add(1, Ordering::Relaxed);
-    }
-    if metadata_present {
-        PATH_RESOLVER_METADATA_SLOTS_PRESENT.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Route counter. A prefiltered count of zero is otherwise unreadable: it means
-/// either "every descriptor matched" or "the prefilter refused this query's
-/// names", and those are different findings.
-pub(crate) fn record_path_resolver_prefilter(enabled: bool) {
-    if enabled {
-        PATH_RESOLVER_PREFILTER_ENABLED.fetch_add(1, Ordering::Relaxed);
-    } else {
-        PATH_RESOLVER_PREFILTER_DISABLED.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// `(seen, parsed, prefiltered, metadata_slots_present, prefilter_on, prefilter_off)`.
-pub fn take_path_resolver_census() -> (u64, u64, u64, u64, u64, u64) {
-    (
-        PATH_RESOLVER_DESCRIPTORS_SEEN.swap(0, Ordering::Relaxed),
-        PATH_RESOLVER_DESCRIPTORS_PARSED.swap(0, Ordering::Relaxed),
-        PATH_RESOLVER_DESCRIPTORS_PREFILTERED.swap(0, Ordering::Relaxed),
-        PATH_RESOLVER_METADATA_SLOTS_PRESENT.swap(0, Ordering::Relaxed),
-        PATH_RESOLVER_PREFILTER_ENABLED.swap(0, Ordering::Relaxed),
-        PATH_RESOLVER_PREFILTER_DISABLED.swap(0, Ordering::Relaxed),
-    )
-}
-
 pub(crate) fn record_commit_delta_row_loaded(account_id_bytes: usize) {
     COMMIT_DELTA_ROWS_LOADED.fetch_add(1, Ordering::Relaxed);
     COMMIT_DELTA_ROW_KEY_DECODES.fetch_add(1, Ordering::Relaxed);
@@ -1639,7 +1592,7 @@ pub enum CommitGraphBenchMode {
     LegacyReachableNodes,
     /// Whole reachable history for one member schema.
     HistoryFull,
-    /// History restricted to the head commit (`lixcol_depth = 0`).
+    /// Internal graph provenance restricted to the head commit (depth zero).
     HistoryDepth0,
     /// History for a bounded row demand (`LIMIT 10`).
     HistoryLimit10,
@@ -1754,6 +1707,7 @@ where
         let (first_parent_jump_commit_id, first_parent_jump_span) =
             crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
+            is_checkpoint: false,
             // A realistic full-width digest, not `absent()`. Every commit-topology
             // consumer pays for this field whether or not it benefits, and
             // merge-base is the guard for exactly that cost — an `absent()`
@@ -4114,10 +4068,7 @@ mod tests {
                 ), // mutation inventory authority
                 (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
                 (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
-                (
-                    crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE.id.0,
-                    10,
-                ), // unconditional canonical sync-state alias cleanup descriptors
+                (crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE.id.0, 10,), // unconditional canonical sync-state alias cleanup descriptors
                 (crate::sync::SYNC_CHECKPOINT_SOURCE_SPACE.id.0, 10), // private checkpoint provenance cleanup
             ]
         );
@@ -4152,10 +4103,8 @@ mod tests {
         let hot_row_deletes = 1;
         let working_diff_deletes = 100;
         let marker_deletes = 1;
-        let uuid_deletes = first.staged_deletes as usize
-            - hot_row_deletes
-            - working_diff_deletes
-            - marker_deletes;
+        let uuid_deletes =
+            first.staged_deletes as usize - hot_row_deletes - working_diff_deletes - marker_deletes;
         // The certified branch-ref hot-row descriptor retains its encoded
         // generation scope and row identity as two shared key buffers.
         assert_eq!(first.key_shared_buffers, uuid_deletes + 5);

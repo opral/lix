@@ -392,7 +392,7 @@ mod upload_plan_profile {
                     .unwrap();
                 let profile = drain(&authority, &replica, &storage, 2, retained_plan).await;
                 let remote_checkpoint = authority
-                    .execute("SELECT lix_latest_checkpoint_commit_id() AS id", &[])
+                    .execute("SELECT working_base_commit_id AS id FROM lix_branch WHERE id = lix_active_branch_id()", &[])
                     .await
                     .unwrap()
                     .rows()[0]

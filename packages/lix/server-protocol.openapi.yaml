@@ -48,6 +48,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     get:
       operationId: handshake
       parameters:
@@ -68,6 +69,7 @@ paths:
   /lix/v1/{lix_id}/session:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     delete:
       operationId: deleteSession
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -77,6 +79,7 @@ paths:
   /lix/v1/{lix_id}/execute:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: execute
       parameters:
@@ -92,6 +95,7 @@ paths:
   /lix/v1/{lix_id}/execute-batch:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: executeBatch
       parameters:
@@ -122,6 +126,7 @@ paths:
   /lix/v1/{lix_id}/sync/push:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: syncPush
       description: Atomically stores at most 512 total immutable commits plus compare-and-swap branch-ref updates. Commit identity makes retries idempotent; oversized batches must be split on dependency-complete boundaries.
@@ -143,6 +148,7 @@ paths:
   /lix/v1/{lix_id}/sync/pull:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     get:
       operationId: syncPull
       description: Returns a hot-state snapshot when after is omitted. Otherwise long-polls complete repository commit/ref events after a repository cursor.
@@ -180,9 +186,38 @@ paths:
           description: The encoded response exceeds the 64 MiB protocol limit.
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/checkpoints:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    get:
+      operationId: syncCheckpointInventory
+      description: Pages immutable checkpoint headers at a pinned repository cursor, including off-branch checkpoints. State and blobs remain deferred.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+        - name: cursor
+          in: query
+          required: true
+          schema: { type: integer, minimum: 0 }
+        - name: after
+          in: query
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 512 }
+      responses:
+        "200":
+          description: Canonical checkpoint headers and an exclusive next-page cursor.
+          content: { application/json: { schema: { $ref: "#/components/schemas/SyncCheckpointInventoryPage" } } }
+        "409":
+          description: Repository cursor changed; restart the snapshot.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/history:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     get:
       operationId: syncHistory
       description: Fetches one bounded first-parent history page without changing live sync state.
@@ -208,6 +243,7 @@ paths:
   /lix/v1/{lix_id}/sync/blob:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     get:
       operationId: syncGetBlobs
       description: Loads up to 16 canonical FastCDC manifests by their BLAKE3-derived blob identities.
@@ -245,6 +281,7 @@ paths:
   /lix/v1/{lix_id}/sync/chunk:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     get:
       operationId: syncGetChunk
       description: Loads one authenticated raw BLAKE3-addressed chunk.
@@ -280,6 +317,7 @@ paths:
   /lix/v1/{lix_id}/transaction/begin:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: beginTransaction
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -296,6 +334,7 @@ paths:
   /lix/v1/{lix_id}/transaction/execute:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: transactionExecute
       parameters:
@@ -311,6 +350,7 @@ paths:
   /lix/v1/{lix_id}/transaction/commit:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: commitTransaction
       parameters:
@@ -322,6 +362,7 @@ paths:
   /lix/v1/{lix_id}/transaction/rollback:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: rollbackTransaction
       parameters:
@@ -333,6 +374,7 @@ paths:
   /lix/v1/{lix_id}/file:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     get:
       operationId: readFile
       parameters:
@@ -348,6 +390,7 @@ paths:
   /lix/v1/{lix_id}/file/upsert:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: upsertFile
       parameters:
@@ -371,6 +414,7 @@ paths:
   /lix/v1/{lix_id}/file/upsert-batch:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: upsertFileBatch
       parameters:
@@ -387,6 +431,7 @@ paths:
   /lix/v1/{lix_id}/branch/create:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: createBranch
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -407,6 +452,7 @@ paths:
   /lix/v1/{lix_id}/undo:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: undo
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -416,6 +462,7 @@ paths:
   /lix/v1/{lix_id}/redo:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: redo
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -425,6 +472,7 @@ paths:
   /lix/v1/{lix_id}/branch/switch:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: switchBranch
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -442,6 +490,7 @@ paths:
   /lix/v1/{lix_id}/observe:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: observe
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -455,6 +504,7 @@ paths:
   /lix/v1/{lix_id}/observe/multiplex:
     parameters:
       - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
     post:
       operationId: observeMultiplex
       parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
@@ -512,6 +562,12 @@ components:
         type: string
         format: uuid
         pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    ServerProtocolVersion:
+      name: lix-server-protocol-version
+      in: header
+      required: true
+      description: Exact SQL protocol version. Missing or incompatible versions are rejected before session creation or writes; upgrade the client.
+      schema: { type: integer, const: 7 }
     SessionId:
       name: Lix-Session-Id
       in: header
@@ -527,7 +583,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 8 }
+      schema: { type: integer, const: 9 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -584,14 +640,14 @@ components:
       type: object
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
-        protocolVersion: { type: integer, const: 6 }
-        syncProtocolVersion: { type: integer, const: 8 }
+        protocolVersion: { type: integer, const: 7 }
+        syncProtocolVersion: { type: integer, const: 9 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
         capabilities:
           type: object
-          required: [binaryFileUpsert, binaryFileUpsertBatch, binaryFileRead, syncPush, syncPull, syncHistory, syncBlob, syncChunk]
+          required: [binaryFileUpsert, binaryFileUpsertBatch, binaryFileRead, syncPush, syncPull, syncHistory, syncCheckpointInventory, syncBlob, syncChunk]
           properties:
             binaryFileUpsert: { type: boolean }
             binaryFileUpsertBatch: { type: boolean }
@@ -599,6 +655,7 @@ components:
             syncPush: { type: boolean }
             syncPull: { type: boolean }
             syncHistory: { type: boolean }
+            syncCheckpointInventory: { type: boolean }
             syncBlob: { type: boolean }
             syncChunk: { type: boolean }
     ExecuteOptions:
@@ -678,8 +735,10 @@ components:
         originKey: { type: [string, "null"] }
     SyncCommit:
       type: object
-      required: [commitId, parentCommitIds, accountId, createdAt, selectedSourceCommitId, members]
+      required: [commitId, parentCommitIds, baseCommitId, isCheckpoint, accountId, createdAt, selectedSourceCommitId, members]
       properties:
+        isCheckpoint: { type: boolean, description: Immutable checkpoint membership; required by this protocol. }
+        baseCommitId: { type: [string, "null"] }
         commitId: { type: string, minLength: 1 }
         parentCommitIds: { type: array, items: { type: string, minLength: 1 } }
         accountId: { type: string, minLength: 1 }
@@ -728,8 +787,10 @@ components:
         cursor: { type: integer, minimum: 0 }
     SyncCommitHeader:
       type: object
-      required: [commitId, parentCommitIds, accountId, createdAt, generation, firstParentJumpCommitId, firstParentJumpSpan]
+      required: [commitId, parentCommitIds, baseCommitId, isCheckpoint, accountId, createdAt, generation, firstParentJumpCommitId, firstParentJumpSpan]
       properties:
+        isCheckpoint: { type: boolean, description: Immutable checkpoint membership; required by this protocol. }
+        baseCommitId: { type: [string, "null"] }
         commitId: { type: string }
         parentCommitIds: { type: array, items: { type: string } }
         accountId: { type: string }
@@ -806,6 +867,13 @@ components:
             kind: { type: string, const: delta }
             cursor: { type: integer, minimum: 0 }
             events: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncEvent" } }
+    SyncCheckpointInventoryPage:
+      type: object
+      required: [cursor, commitHeaders, continuation]
+      properties:
+        cursor: { type: integer, minimum: 0 }
+        commitHeaders: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncCommitHeader" } }
+        continuation: { type: [string, "null"], format: uuid }
     SyncHistoryResponse:
       type: object
       required: [commits, commitHeaders, boundaries]

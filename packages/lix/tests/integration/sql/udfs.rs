@@ -1,4 +1,4 @@
-use lix::{CreateBranchOptions, LixError, Value};
+use lix::{CreateBranchOptions, Value};
 use serde_json::json;
 
 simulation_test!(
@@ -90,7 +90,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_latest_checkpoint_commit_id_is_scoped_to_the_active_branch,
+    checkpoint_log_is_scoped_to_the_active_branch,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -100,14 +100,20 @@ simulation_test!(
                 .expect("main session should open"),
             &engine,
         );
-        let root = sim.initial_commit_id().to_string();
+        let root = main
+            .execute("SELECT lix_root_commit_id() AS id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
         assert_eq!(latest_checkpoint_commit_id(&main).await, root);
 
         let invalid = main
             .execute("SELECT lix_latest_checkpoint_commit_id('extra')", &[])
             .await
-            .expect_err("the checkpoint accessor must reject arguments");
-        assert_eq!(invalid.code, LixError::CODE_INVALID_PARAM);
+            .expect_err("retired checkpoint accessor must fail");
+        assert!(invalid.message.contains("lix_latest_checkpoint_commit_id"));
 
         main.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-scope', 'main')",
@@ -168,12 +174,7 @@ simulation_test!(
             .await
             .expect("draft should diverge");
         let diff = draft
-            .execute(
-                "SELECT key FROM lix_diff(\
-                 'lix_key_value', lix_latest_checkpoint_commit_id(), \
-                 lix_active_branch_commit_id())",
-                &[],
-            )
+            .execute("SELECT key FROM lix_diff('lix_key_value')", &[])
             .await
             .expect("the checkpoint accessor should work directly as a diff argument");
         assert_eq!(diff.len(), 1);
@@ -196,7 +197,10 @@ simulation_test!(
             .await
             .expect("draft transaction should begin");
         let result = transaction
-            .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
+            .execute(
+                "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position LIMIT 1",
+                &[],
+            )
             .await
             .expect("the branch checkpoint should resolve inside read transactions");
         assert_eq!(
@@ -211,7 +215,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_latest_checkpoint_commit_id_ignores_non_checkpoint_fork_and_restore_cursors,
+    checkpoint_log_ignores_non_checkpoint_fork_and_restore_cursors,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -221,7 +225,13 @@ simulation_test!(
                 .expect("main session should open"),
             &engine,
         );
-        let root = sim.initial_commit_id().to_string();
+        let root = main
+            .execute("SELECT lix_root_commit_id() AS id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
         main.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-fork', 'dirty-root')",
             &[],
@@ -334,13 +344,23 @@ simulation_test!(
 async fn latest_checkpoint_commit_id(
     session: &crate::support::simulation_test::engine::SimSession,
 ) -> String {
-    session
-        .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
+    let rows = session
+        .execute(
+            "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position LIMIT 1",
+            &[],
+        )
         .await
-        .expect("latest checkpoint accessor should execute")
+        .expect("checkpoint log should execute");
+    if let Some(row) = rows.rows().first() {
+        return row.get::<String>("commit_id").unwrap();
+    }
+    session
+        .execute("SELECT lix_root_commit_id() AS commit_id", &[])
+        .await
+        .unwrap()
         .rows()[0]
         .get::<String>("commit_id")
-        .expect("latest checkpoint accessor should return text")
+        .unwrap()
 }
 
 simulation_test!(

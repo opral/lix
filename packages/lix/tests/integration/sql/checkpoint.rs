@@ -60,9 +60,9 @@ async fn checkpoints_example_sql_contract() {
         .expect("example checkpoint succeeds");
     let checkpoints = lix
         .execute(
-            "SELECT commit_id, lixcol_depth
-             FROM lix_history('lix_checkpoint')
-             ORDER BY lixcol_depth",
+            "SELECT commit_id, position
+             FROM lix_log() WHERE is_checkpoint
+             ORDER BY position",
             &[],
         )
         .await
@@ -75,8 +75,8 @@ async fn checkpoints_example_sql_contract() {
     );
     assert_eq!(
         checkpoints.rows()[0]
-            .get::<i64>("lixcol_depth")
-            .expect("lixcol_depth is an integer"),
+            .get::<i64>("position")
+            .expect("position is an integer"),
         0
     );
 
@@ -110,17 +110,10 @@ simulation_test!(
         );
         let initial_commit_id = sim.initial_commit_id().to_string();
 
-        assert_eq!(
-            select_rows(
-                &session,
-                "SELECT id, commit_id, lixcol_global FROM lix_checkpoint",
-            )
-            .await,
-            vec![vec![
-                Value::Text(initial_commit_id.clone()),
-                Value::Text(initial_commit_id.clone()),
-                Value::Boolean(true),
-            ]]
+        assert!(
+            select_rows(&session, "SELECT id FROM lix_commit WHERE is_checkpoint")
+                .await
+                .is_empty()
         );
 
         session
@@ -143,10 +136,11 @@ simulation_test!(
             .expect("head should load")
             .expect("head should exist");
 
-        assert_eq!(
-            select_rows(&session, "SELECT commit_id FROM lix_checkpoint").await,
-            vec![vec![Value::Text(initial_commit_id.clone())]],
-            "ordinary branch commits do not mutate the global checkpoint row"
+        assert!(
+            select_rows(&session, "SELECT id FROM lix_commit WHERE is_checkpoint")
+                .await
+                .is_empty(),
+            "ordinary branch commits do not become checkpoints"
         );
         assert_eq!(
             select_rows(
@@ -195,7 +189,6 @@ simulation_test!(
             .await
             .expect("checkpoint should succeed");
         assert_ne!(receipt.commit_id, old_head);
-        assert_ne!(receipt.change_id, receipt.commit_id);
         assert_eq!(
             engine
                 .load_branch_head_commit_id(sim.main_branch_id())
@@ -219,66 +212,32 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT id, commit_id, lixcol_change_id, lixcol_global \
-                     FROM lix_checkpoint WHERE id = '{}'",
+                    "SELECT id, is_checkpoint FROM lix_commit WHERE id = '{}'",
                     receipt.commit_id
-                ),
+                )
             )
             .await,
             vec![vec![
                 Value::Text(receipt.commit_id.clone()),
-                Value::Text(receipt.commit_id.clone()),
-                Value::Text(receipt.change_id.clone()),
-                Value::Boolean(true),
+                Value::Boolean(true)
             ]]
         );
-        assert_eq!(
+        assert!(
             select_rows(
                 &session,
-                &format!(
-                    "SELECT schema_key, row_pk \
-                     FROM lix_change WHERE id = '{}'",
-                    receipt.change_id
-                ),
+                "SELECT id FROM lix_change WHERE schema_key = 'lix_checkpoint'"
             )
-            .await,
-            vec![vec![
-                Value::Text("lix_checkpoint".to_string()),
-                Value::Jsonb(json!([receipt.commit_id.to_string()]).into()),
-            ]],
-            "checkpoint publication must be a normal logical change"
+            .await
+            .is_empty(),
+            "checkpoint publication must not create artificial marker changes"
         );
         assert_eq!(
             select_rows(
                 &session,
-                &format!(
-                    "SELECT id FROM lix_commit WHERE id = '{}'",
-                    receipt.commit_id
-                ),
+                "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position"
             )
             .await,
-            vec![vec![Value::Text(receipt.commit_id.clone())]],
-            "checkpoint.commit_id foreign key must resolve to the captured branch commit"
-        );
-        let checkpoint_history = select_rows(
-            &session,
-            "SELECT commit_id, lixcol_change_id \
-             FROM lix_history('lix_checkpoint') \
-             ORDER BY lixcol_depth",
-        )
-        .await;
-        assert_eq!(checkpoint_history.len(), 2);
-        assert_eq!(
-            checkpoint_history[0],
-            vec![
-                Value::Text(receipt.commit_id.clone()),
-                Value::Text(receipt.change_id.clone()),
-            ],
-            "latest checkpoint history row is the newly published logical change"
-        );
-        assert_eq!(
-            checkpoint_history[1][0],
-            Value::Text(initial_commit_id.clone())
+            vec![vec![Value::Text(receipt.commit_id.clone())]]
         );
         assert_eq!(
             select_rows(
@@ -374,7 +333,10 @@ simulation_test!(
                 .expect("schema registration should succeed");
         }
         session
-            .execute("INSERT INTO checkpoint_parent (id) VALUES ('parent-a')", &[])
+            .execute(
+                "INSERT INTO checkpoint_parent (id) VALUES ('parent-a')",
+                &[],
+            )
             .await
             .expect("parent insert should succeed");
         session
@@ -457,7 +419,10 @@ simulation_test!(
             .expect("baseline checkpoint should succeed");
 
         session
-            .execute("DELETE FROM checkpoint_unique_swap WHERE id IN ('a', 'b')", &[])
+            .execute(
+                "DELETE FROM checkpoint_unique_swap WHERE id IN ('a', 'b')",
+                &[],
+            )
             .await
             .expect("baseline owners should delete");
         session
@@ -537,7 +502,11 @@ simulation_test!(
             .expect("direct semantic selection should include its file descriptor");
         for relation in ["checkpoint_file_member", "lix_file"] {
             assert_eq!(
-                select_rows(&session, &format!("SELECT COUNT(*) FROM lix_diff('{relation}')")).await,
+                select_rows(
+                    &session,
+                    &format!("SELECT COUNT(*) FROM lix_diff('{relation}')")
+                )
+                .await,
                 vec![vec![Value::Integer(0)]],
                 "owned row and file descriptor must cross together"
             );
@@ -545,66 +514,57 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    scoped_checkpoint_closes_file_path_swaps,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine.open_session().await.expect("session should open"),
-            &engine,
-        );
-        let first_id = "01950000-0000-7000-8000-000000000031";
-        let second_id = "01950000-0000-7000-8000-000000000032";
-        session
-            .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES \
+simulation_test!(scoped_checkpoint_closes_file_path_swaps, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine.open_session().await.expect("session should open"),
+        &engine,
+    );
+    let first_id = "01950000-0000-7000-8000-000000000031";
+    let second_id = "01950000-0000-7000-8000-000000000032";
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, content) VALUES \
                  ($1, '/first.txt', CAST('first' AS BYTEA)), \
                  ($2, '/second.txt', CAST('second' AS BYTEA))",
-                &[
-                    Value::Text(first_id.into()),
-                    Value::Text(second_id.into()),
-                ],
-            )
-            .await
-            .expect("baseline files should insert");
-        session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
-            .await
-            .expect("baseline checkpoint should succeed");
+            &[Value::Text(first_id.into()), Value::Text(second_id.into())],
+        )
+        .await
+        .expect("baseline files should insert");
+    session
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .expect("baseline checkpoint should succeed");
 
-        session
-            .execute("DELETE FROM lix_file WHERE id IN ($1, $2)", &[
-                Value::Text(first_id.into()),
-                Value::Text(second_id.into()),
-            ])
-            .await
-            .expect("baseline path owners should delete together");
-        session
-            .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES \
+    session
+        .execute(
+            "DELETE FROM lix_file WHERE id IN ($1, $2)",
+            &[Value::Text(first_id.into()), Value::Text(second_id.into())],
+        )
+        .await
+        .expect("baseline path owners should delete together");
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, content) VALUES \
                  ($1, '/second.txt', CAST('first' AS BYTEA)), \
                  ($2, '/first.txt', CAST('second' AS BYTEA))",
-                &[
-                    Value::Text(first_id.into()),
-                    Value::Text(second_id.into()),
-                ],
-            )
-            .await
-            .expect("swapped files should insert together");
-        session
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', $1)])",
-                &[Value::Text(first_id.into())],
-            )
-            .await
-            .expect("checkpoint planner should close over the other path owner");
-        assert_eq!(
-            select_rows(&session, "SELECT COUNT(*) FROM lix_diff('lix_file')").await,
-            vec![vec![Value::Integer(0)]],
-            "a path swap must cross the checkpoint boundary atomically"
-        );
-    }
-);
+            &[Value::Text(first_id.into()), Value::Text(second_id.into())],
+        )
+        .await
+        .expect("swapped files should insert together");
+    session
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', $1)])",
+            &[Value::Text(first_id.into())],
+        )
+        .await
+        .expect("checkpoint planner should close over the other path owner");
+    assert_eq!(
+        select_rows(&session, "SELECT COUNT(*) FROM lix_diff('lix_file')").await,
+        vec![vec![Value::Integer(0)]],
+        "a path swap must cross the checkpoint boundary atomically"
+    );
+});
 
 simulation_test!(
     scoped_checkpoint_keeps_equal_file_names_in_distinct_directories_independent,
@@ -655,11 +615,7 @@ simulation_test!(
             .await
             .expect("distinct directory namespaces must not collide");
         assert_eq!(
-            select_rows(
-                &session,
-                "SELECT id FROM lix_diff('lix_file') ORDER BY id",
-            )
-            .await,
+            select_rows(&session, "SELECT id FROM lix_diff('lix_file') ORDER BY id",).await,
             vec![vec![Value::Text(
                 "01950000-0000-7000-8000-000000000044".into(),
             )]],
@@ -704,7 +660,10 @@ simulation_test!(
             .expect("baseline checkpoint should succeed");
 
         session
-            .execute("DELETE FROM lix_file WHERE id = $1", &[Value::Text(file_id.into())])
+            .execute(
+                "DELETE FROM lix_file WHERE id = $1",
+                &[Value::Text(file_id.into())],
+            )
             .await
             .expect("file should delete");
         session
@@ -741,7 +700,11 @@ simulation_test!(
             .expect("cross-kind nested namespace swap should close atomically");
         for relation in ["lix_file", "lix_directory"] {
             assert_eq!(
-                select_rows(&session, &format!("SELECT COUNT(*) FROM lix_diff('{relation}')")).await,
+                select_rows(
+                    &session,
+                    &format!("SELECT COUNT(*) FROM lix_diff('{relation}')")
+                )
+                .await,
                 vec![vec![Value::Integer(0)]],
                 "both sides of the nested namespace swap must cross together"
             );
@@ -924,26 +887,24 @@ simulation_test!(
             )
             .await
             .expect("working row should insert");
-        let head_before_empty = select_rows(
-            &session,
-            "SELECT lix_active_branch_commit_id()",
-        )
-        .await;
-        assert!(session
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[])",
-                &[],
-            )
-            .await
-            .expect("empty scoped checkpoint is a no-op")
-            .is_empty());
+        let head_before_empty = select_rows(&session, "SELECT lix_active_branch_commit_id()").await;
+        assert!(
+            session
+                .execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY[])", &[],)
+                .await
+                .expect("empty scoped checkpoint is a no-op")
+                .is_empty()
+        );
         assert_eq!(
             select_rows(&session, "SELECT lix_active_branch_commit_id()").await,
             head_before_empty,
             "empty scope must never alias full checkpoint"
         );
 
-        let mut rolled_back = session.begin_transaction().await.expect("transaction opens");
+        let mut rolled_back = session
+            .begin_transaction()
+            .await
+            .expect("transaction opens");
         rolled_back
             .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
@@ -955,7 +916,10 @@ simulation_test!(
             "rollback publishes neither checkpoint nor post-commit effects"
         );
 
-        let mut write_then_checkpoint = session.begin_transaction().await.expect("transaction opens");
+        let mut write_then_checkpoint = session
+            .begin_transaction()
+            .await
+            .expect("transaction opens");
         write_then_checkpoint
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('same-transaction', 'value')",
@@ -968,9 +932,15 @@ simulation_test!(
             .await
             .expect_err("checkpoint planning cannot ignore an earlier staged write");
         assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
-        write_then_checkpoint.rollback().await.expect("rollback succeeds");
+        write_then_checkpoint
+            .rollback()
+            .await
+            .expect("rollback succeeds");
 
-        let mut committed = session.begin_transaction().await.expect("transaction opens");
+        let mut committed = session
+            .begin_transaction()
+            .await
+            .expect("transaction opens");
         committed
             .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
@@ -989,7 +959,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    checkpoint_surface_is_global_row_and_read_only,
+    checkpoint_membership_is_immutable_and_legacy_surface_removed,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -997,32 +967,33 @@ simulation_test!(
             &engine,
         );
 
-        let rows = select_rows(&session, "SELECT id, commit_id FROM lix_checkpoint").await;
-        assert_eq!(
-            rows,
-            vec![vec![
-                Value::Text(sim.initial_commit_id().to_string()),
-                Value::Text(sim.initial_commit_id().to_string()),
-            ]]
+        assert!(
+            select_rows(&session, "SELECT id FROM lix_commit WHERE is_checkpoint")
+                .await
+                .is_empty()
         );
-
-        let missing_by_branch = session
-            .execute("SELECT * FROM lix_checkpoint_by_branch", &[])
-            .await
-            .expect_err("global checkpoint must not expose a branch-shaped surface");
-        assert_eq!(missing_by_branch.code, LixError::CODE_TABLE_NOT_FOUND);
-
         for sql in [
-            "INSERT INTO lix_checkpoint (id, commit_id) \
-             VALUES ('01930000-0000-7000-8000-000000000001', 'fake')",
-            "UPDATE lix_checkpoint SET commit_id = 'fake'",
+            "SELECT * FROM lix_checkpoint",
+            "SELECT * FROM lix_checkpoint_by_branch",
         ] {
             let error = session
                 .execute(sql, &[])
                 .await
-                .expect_err("checkpoint SQL surface should be read-only");
-            assert_eq!(error.code, LixError::CODE_READ_ONLY);
+                .expect_err("retired checkpoint table is absent");
+            assert_eq!(error.code, LixError::CODE_TABLE_NOT_FOUND);
         }
+        let checkpoint = session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint publishes");
+        let error = session
+            .execute(
+                "UPDATE lix_commit SET is_checkpoint = false WHERE id = $1",
+                &[Value::Text(checkpoint.commit_id)],
+            )
+            .await
+            .expect_err("immutable membership cannot be edited");
+        assert_eq!(error.code, LixError::CODE_READ_ONLY);
 
         for sql in [
             "SELECT * FROM lix_working_diff_by_branch",
@@ -1040,14 +1011,13 @@ simulation_test!(
 );
 
 simulation_test!(
-    checkpoint_history_as_of_branch_head_follows_global_row_authorship,
+    checkpoint_inventory_survives_restore_while_log_follows_mainline,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine.open_session().await.expect("session should open"),
             &engine,
         );
-        let initial_commit_id = sim.initial_commit_id().to_string();
 
         session
             .execute(
@@ -1083,7 +1053,7 @@ simulation_test!(
 
         let global_rows = select_rows(
             &session,
-            "SELECT commit_id FROM lix_checkpoint ORDER BY commit_id",
+            "SELECT id FROM lix_commit WHERE is_checkpoint ORDER BY id",
         )
         .await;
         assert!(
@@ -1094,40 +1064,22 @@ simulation_test!(
         let reachable_history = select_rows(
             &session,
             &format!(
-                "SELECT commit_id FROM lix_history('lix_checkpoint', '{}') \
-                 ORDER BY lixcol_depth",
+                "SELECT commit_id FROM lix_log('{}') WHERE is_checkpoint ORDER BY position",
                 first_checkpoint.commit_id
             ),
         )
         .await;
         assert_eq!(
             reachable_history,
-            vec![
-                vec![Value::Text(first_checkpoint.commit_id.clone())],
-                vec![Value::Text(initial_commit_id)],
-            ],
-            "history follows causal parents and the local commit's pinned global state base"
+            vec![vec![Value::Text(first_checkpoint.commit_id.clone())]]
         );
-
-        let reachable_checkpoints = select_rows(
-            &session,
-            "SELECT checkpoint.commit_id, ancestry.depth \
-             FROM lix_checkpoint AS checkpoint \
-             JOIN lix_commit_ancestry() AS ancestry \
-               ON ancestry.commit_id = checkpoint.commit_id \
-             ORDER BY ancestry.depth, checkpoint.commit_id",
-        )
-        .await;
         assert_eq!(
-            reachable_checkpoints,
-            vec![
-                vec![Value::Text(first_checkpoint.commit_id), Value::Integer(0)],
-                vec![
-                    Value::Text(sim.initial_commit_id().to_string()),
-                    Value::Integer(1)
-                ],
-            ],
-            "joining normal checkpoint rows with active-head ancestry must expose exactly the restorable checkpoint timeline"
+            select_rows(
+                &session,
+                "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position"
+            )
+            .await,
+            vec![vec![Value::Text(first_checkpoint.commit_id)]]
         );
     }
 );
@@ -1207,28 +1159,8 @@ simulation_test!(
 async fn key_value_diff_relation(
     session: &crate::support::simulation_test::engine::SimSession,
 ) -> String {
-    let checkpoint = session
-        .execute(
-            "SELECT checkpoint.commit_id \
-             FROM lix_checkpoint AS checkpoint \
-             JOIN lix_commit_ancestry() AS ancestry \
-               ON ancestry.commit_id = checkpoint.commit_id \
-             ORDER BY ancestry.depth LIMIT 1",
-            &[],
-        )
-        .await
-        .expect("latest checkpoint should resolve")
-        .rows()[0]
-        .get::<String>("commit_id")
-        .expect("checkpoint commit ID should decode");
-    let head = session
-        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
-        .await
-        .expect("active head should resolve")
-        .rows()[0]
-        .get::<String>("commit_id")
-        .expect("active head commit ID should decode");
-    format!("lix_diff('lix_key_value', '{checkpoint}', '{head}')")
+    let _ = session;
+    "lix_diff('lix_key_value')".to_owned()
 }
 
 #[cfg(any())]

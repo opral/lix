@@ -5,6 +5,7 @@ use crate::changelog::CommitId;
 pub(crate) struct BranchHead {
     pub(crate) branch_id: String,
     pub(crate) commit_id: CommitId,
+    pub(crate) working_base_commit_id: Option<CommitId>,
 }
 
 /// Typed reader for moving branch heads.

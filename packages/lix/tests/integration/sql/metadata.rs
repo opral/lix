@@ -569,7 +569,7 @@ simulation_test!(
             session
                 .execute(
                     &format!(
-                        "SELECT lixcol_metadata \
+                        "SELECT to_lixcol_metadata AS lixcol_metadata \
                          FROM lix_history('lix_key_value', '{commit_id}') \
                            WHERE key = 'metadata-valid-object'"
                     ),

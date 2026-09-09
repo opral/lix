@@ -2361,6 +2361,7 @@ mod tests {
     impl BranchRefReader for TestBranchRefReader {
         async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
             Ok(Some(BranchHead {
+                working_base_commit_id: None,
                 branch_id: branch_id.to_string(),
                 commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
             }))

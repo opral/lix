@@ -28,6 +28,7 @@ where
             .map(|control| BranchHead {
                 branch_id: branch_id.to_string(),
                 commit_id: control.head_commit_id,
+                working_base_commit_id: control.working_diff_checkpoint_commit_id,
             }))
     }
 
@@ -40,6 +41,7 @@ where
             .map(|(branch_id, control)| BranchHead {
                 branch_id,
                 commit_id: control.head_commit_id,
+                working_base_commit_id: control.working_diff_checkpoint_commit_id,
             })
             .collect())
     }
@@ -130,10 +132,12 @@ mod tests {
             heads,
             vec![
                 BranchHead {
+                    working_base_commit_id: None,
                     branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
                     commit_id: CommitId::for_test_label("commit-a"),
                 },
                 BranchHead {
+                    working_base_commit_id: None,
                     branch_id: "01920000-0000-7000-8000-0000000000b1".to_string(),
                     commit_id: CommitId::for_test_label("commit-b"),
                 },

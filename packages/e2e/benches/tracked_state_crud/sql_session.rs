@@ -766,7 +766,7 @@ where
             &self.session,
             &format!(
                 "SELECT COUNT(*) AS entries FROM lix_history('tracked_crud_insert', '{commit_id}') \
-                 WHERE lixcol_is_deleted = false"
+                 WHERE diff_type <> 'removed'"
             ),
         )
         .await;

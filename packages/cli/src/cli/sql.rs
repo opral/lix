@@ -13,7 +13,7 @@ pub enum SqlSubcommand {
 Examples:
   lix sql execute \"INSERT INTO lix_file (path, content) VALUES ('/hello.md', CAST('# Hello' AS BYTEA))\"
   lix sql execute \"SELECT path, CAST(content AS TEXT) FROM lix_file\"
-  lix sql execute \"SELECT path, lixcol_depth FROM lix_history('lix_file')\"")]
+  lix sql execute \"SELECT diff_type, from_path, to_path FROM lix_history('lix_file')\"")]
     Execute(SqlExecuteArgs),
 }
 

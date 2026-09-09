@@ -15,7 +15,7 @@
 //! Regression: a repository migrated to v74 served checkpoint trees whose
 //! file descriptors referenced directories missing from the same tree
 //! ("filesystem descriptor references missing directory"), which fails every
-//! `lix_diff` / `lix_state_at` read touching the relation at that commit.
+//! `lix_diff` / `lix_as_of` read touching the relation at that commit.
 
 use futures_lite::io::Cursor;
 use lix::{Value, open_lix};
@@ -59,11 +59,11 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         .migration
         .expect("the open report should record the automatic migration");
     assert_eq!(migration.from_format, 72);
-    assert_eq!(migration.to_format, 77);
+    assert_eq!(migration.to_format, 78);
 
     let checkpoints = lix
         .execute(
-            "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_created_at ASC",
+            "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint ORDER BY created_at ASC",
             &[],
         )
         .await
@@ -82,21 +82,21 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         // ancestor directories within the same tree.
         let files = lix
             .execute(
-                "SELECT id, name, directory_id FROM lix_state_at('lix_file', $1)",
+                "SELECT id, name, directory_id FROM lix_as_of('lix_file', $1)",
                 &[Value::Text(commit_id.clone())],
             )
             .await
             .unwrap_or_else(|error| {
-                panic!("lix_state_at('lix_file') at {commit_id} should read: {error}")
+                panic!("lix_as_of('lix_file') at {commit_id} should read: {error}")
             });
         let directories = lix
             .execute(
-                "SELECT id FROM lix_state_at('lix_directory', $1)",
+                "SELECT id FROM lix_as_of('lix_directory', $1)",
                 &[Value::Text(commit_id.clone())],
             )
             .await
             .unwrap_or_else(|error| {
-                panic!("lix_state_at('lix_directory') at {commit_id} should read: {error}")
+                panic!("lix_as_of('lix_directory') at {commit_id} should read: {error}")
             });
         assert_files_resolve_directories(
             &files,
@@ -135,7 +135,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         .execute(
             "SELECT commit_id FROM lix_create_checkpoint(ARRAY(
              SELECT row_ref
-             FROM lix_diff('lix_file', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id())
+             FROM lix_diff('lix_file')
              WHERE id = $1))",
             &[Value::Text(new_file_id)],
         )
@@ -147,7 +147,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
 
     let files = lix
         .execute(
-            "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
+            "SELECT name, directory_id FROM lix_as_of('lix_file', $1)",
             &[Value::Text(partial_commit_id.clone())],
         )
         .await
@@ -166,7 +166,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
     }
     let directories = lix
         .execute(
-            "SELECT id, name FROM lix_state_at('lix_directory', $1)",
+            "SELECT id, name FROM lix_as_of('lix_directory', $1)",
             &[Value::Text(partial_commit_id.clone())],
         )
         .await

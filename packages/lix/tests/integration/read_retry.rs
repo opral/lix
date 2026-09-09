@@ -338,7 +338,7 @@ async fn working_review_batch_retries_expired_hot_epoch_read() {
     let statements = [
         ExecuteBatchStatement {
             label: None,
-            sql: "SELECT lix_latest_checkpoint_commit_id() AS before_commit_id, lix_active_branch_commit_id() AS after_commit_id".to_string(),
+            sql: "SELECT working_base_commit_id AS before_commit_id, commit_id AS after_commit_id FROM lix_branch WHERE id = lix_active_branch_id()".to_string(),
             params: vec![],
         },
         ExecuteBatchStatement {
@@ -360,7 +360,10 @@ async fn working_review_batch_retries_expired_hot_epoch_read() {
         "fault must reach the HOT epoch lookup"
     );
     assert_eq!(result[1].rows().len(), 1);
-    assert_eq!(result[1].rows()[0].get::<String>("to_path").unwrap(), "/review.md");
+    assert_eq!(
+        result[1].rows()[0].get::<String>("to_path").unwrap(),
+        "/review.md"
+    );
 }
 
 #[tokio::test]

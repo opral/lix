@@ -255,8 +255,9 @@ mod tests {
             // Production. Reclamation only: removes records, introduces no name.
             ("changelog/gc.rs .delete(", 1),
             // Production. The v74->v75 offline migration rewrites every v5
-            // record to the v6 complete-snapshot arity in one fenced batch.
-            ("migration/api.rs .put(", 1),
+            // record to the complete-snapshot arity, then the checkpoint flag arity.
+            // Offline migration rebuilds the derived inventory before publication.
+            ("migration/api.rs .put(", 2),
             // Test fixtures, all absent from the non-test build.
             ("changelog/gc.rs .delete_batch(", 1),
             ("commit_graph/walker.rs .delete(", 2),

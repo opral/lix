@@ -21,7 +21,6 @@ pub(crate) struct MaterializedChange {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<SharedStr>,
     pub(crate) metadata: Option<SharedStr>,
-    pub(crate) decoded_snapshot: Option<Arc<WasmTypedRow>>,
     pub(crate) created_at: String,
     pub(crate) origin_key: Option<String>,
 }
@@ -38,12 +37,6 @@ impl ChangePayloadProjection {
         snapshot_content: true,
         metadata: true,
     };
-}
-
-pub(crate) fn materialize_located_history_change(
-    change: crate::commit_graph::CommitGraphChange,
-) -> Result<MaterializedChange, LixError> {
-    materialize_commit_graph_change(change, ChangePayloadProjection::ALL)
 }
 
 pub(crate) fn materialize_changelog_change_record(
@@ -112,7 +105,6 @@ pub(crate) fn materialize_commit_graph_change(
         file_id: change.file_id,
         snapshot_content,
         metadata,
-        decoded_snapshot,
         created_at: change.created_at.to_string(),
         origin_key: change.origin_key,
     })

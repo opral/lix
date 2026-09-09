@@ -70,7 +70,7 @@ where
     let source_commit_id = commits.source_commit_id.to_string();
     let target_commit_id = commits.target_commit_id.to_string();
     let mut source_diff = reader
-        .diff_commits(&base_commit_id, &source_commit_id, &request)
+        .diff_commit_members(&base_commit_id, &source_commit_id, &request)
         .await?;
     let mut target_diff = if commits.base_commit_id == commits.source_commit_id
         || commits.base_commit_id == commits.target_commit_id
@@ -78,7 +78,7 @@ where
         TrackedStateDiff::default()
     } else {
         reader
-            .diff_commits(&base_commit_id, &target_commit_id, &request)
+            .diff_commit_members(&base_commit_id, &target_commit_id, &request)
             .await?
     };
     exclude_checkpoint_rows(&mut source_diff);

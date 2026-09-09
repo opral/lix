@@ -283,6 +283,7 @@ pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
     ("POST", "/lix/v1/{lix_id}/sync/push"),
     ("GET", "/lix/v1/{lix_id}/sync/pull"),
     ("GET", "/lix/v1/{lix_id}/sync/history"),
+    ("GET", "/lix/v1/{lix_id}/sync/checkpoints"),
     ("GET", "/lix/v1/{lix_id}/sync/blob"),
     ("POST", "/lix/v1/{lix_id}/sync/blob"),
     ("GET", "/lix/v1/{lix_id}/sync/chunk"),
@@ -305,6 +306,7 @@ pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
 /// Header carrying the opaque server-issued session capability.
 pub const SESSION_ID_HEADER: &str = "lix-session-id";
 /// Sync wire version required on repository synchronization endpoints.
+pub const SERVER_PROTOCOL_VERSION_HEADER: &str = "lix-server-protocol-version";
 pub const SYNC_PROTOCOL_VERSION_HEADER: &str = crate::sync::SYNC_PROTOCOL_VERSION_HEADER;
 /// Standard request identity for replay-safe SQL mutations.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -520,9 +522,7 @@ where
                     validate_server_lix_id(lix_id)?;
                 }
                 let engine = self.open.open_protocol_engine().await?;
-                let expected_mutation_revision = engine
-                    .sync_authority_admission_revision()
-                    .await?;
+                let expected_mutation_revision = engine.sync_authority_admission_revision().await?;
                 engine
                     .admit_sync_authority_storage(expected_mutation_revision)
                     .await?;
@@ -1793,6 +1793,13 @@ where
         }
         let path = parts.uri.path().to_owned();
         let method = parts.method.clone();
+        // Handshake creates/resumes a writable session. Fence old clients on
+        // the server before admitting either that session or a mutation.
+        if !(path == "/lix/v1/snapshot" && method == Method::GET)
+            && let Err(error) = require_server_protocol_version(&parts.headers)
+        {
+            return error.into_response();
+        }
         if matches!(path.as_str(), "/lix/v1" | "/lix/v1/") {
             if method != Method::GET {
                 return method_not_allowed();
@@ -1951,6 +1958,13 @@ where
                             .any(|preference| preference.eq_ignore_ascii_case("wait=0"))
                     });
                 result_response(sync_pull(lease, query, wait).await)
+            }
+            (&Method::GET, "/lix/v1/sync/checkpoints") => {
+                let query = match decode_query::<SyncCheckpointInventoryQuery>(parts.uri.query()) {
+                    Ok(query) => query,
+                    Err(error) => return error.into_response(),
+                };
+                result_response(sync_checkpoint_inventory(lease, query).await)
             }
             (&Method::GET, "/lix/v1/sync/history") => {
                 let query = match decode_query::<SyncHistoryQuery>(parts.uri.query()) {
@@ -2440,6 +2454,24 @@ fn required_session_id(headers: &HeaderMap) -> Result<String, ApiError> {
     optional_session_id(headers)?.ok_or_else(ApiError::session_required)
 }
 
+fn require_server_protocol_version(headers: &HeaderMap) -> Result<(), ApiError> {
+    let mut values = headers.get_all(SERVER_PROTOCOL_VERSION_HEADER).iter();
+    let version = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok());
+    if values.next().is_some() || version != Some(PROTOCOL_VERSION) {
+        return Err(ApiError::new(
+            StatusCode::UPGRADE_REQUIRED,
+            "LIX_PROTOCOL_VERSION_MISMATCH",
+            format!(
+                "Lix requires {SERVER_PROTOCOL_VERSION_HEADER}: {PROTOCOL_VERSION}; upgrade your Lix client before opening a session or writing"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn require_sync_protocol_version(headers: &HeaderMap) -> Result<(), ApiError> {
     let mut values = headers.get_all(SYNC_PROTOCOL_VERSION_HEADER).iter();
     let Some(first) = values.next() else {
@@ -2551,6 +2583,7 @@ where
             sync_push: true,
             sync_pull: true,
             sync_history: true,
+            sync_checkpoint_inventory: true,
             sync_blob: true,
             sync_chunk: true,
         },
@@ -2842,6 +2875,26 @@ where
         }
     };
     bounded_sync_json_response(response, "sync pull", MAX_SYNC_PULL_RESPONSE_BYTES)
+}
+
+async fn sync_checkpoint_inventory<S>(
+    lease: SessionLease<S>,
+    request: SyncCheckpointInventoryQuery,
+) -> Result<Response, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let response = lease
+        .run_cancellable_read(move |lix| async move {
+            lix.sync_checkpoint_inventory(request.cursor, request.after.as_deref(), request.limit)
+                .await
+        })
+        .await?;
+    bounded_sync_json_response(
+        response,
+        "checkpoint inventory",
+        MAX_SYNC_PULL_RESPONSE_BYTES,
+    )
 }
 
 async fn sync_history<S>(
@@ -4528,6 +4581,14 @@ impl Default for SyncPullRequest {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncCheckpointInventoryQuery {
+    cursor: u64,
+    after: Option<String>,
+    limit: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncHistoryQuery {
     head: String,
     limit: usize,
@@ -4561,6 +4622,7 @@ struct ProtocolCapabilities {
     sync_push: bool,
     sync_pull: bool,
     sync_history: bool,
+    sync_checkpoint_inventory: bool,
     sync_blob: bool,
     sync_chunk: bool,
 }
@@ -5361,6 +5423,7 @@ mod tests {
                 ("POST", "/lix/v1/{lix_id}/sync/push") => "syncPush",
                 ("GET", "/lix/v1/{lix_id}/sync/pull") => "syncPull",
                 ("GET", "/lix/v1/{lix_id}/sync/history") => "syncHistory",
+                ("GET", "/lix/v1/{lix_id}/sync/checkpoints") => "syncCheckpointInventory",
                 ("GET", "/lix/v1/{lix_id}/sync/blob") => "syncGetBlobs",
                 ("POST", "/lix/v1/{lix_id}/sync/blob") => "syncRegisterBlob",
                 ("GET", "/lix/v1/{lix_id}/sync/chunk") => "syncGetChunk",
@@ -5407,13 +5470,14 @@ mod tests {
             openapi
                 .matches("$ref: \"#/components/parameters/SyncProtocolVersion\"")
                 .count(),
-            7,
+            8,
             "every sync HTTP operation must declare the required version header",
         );
         for operation_id in [
             "syncPush",
             "syncPull",
             "syncHistory",
+            "syncCheckpointInventory",
             "syncGetBlobs",
             "syncRegisterBlob",
             "syncGetChunk",
@@ -5449,9 +5513,11 @@ mod tests {
         ));
         assert!(openapi.contains("required: [branchId, headCommitId, rows, continuation]"));
         assert!(openapi.contains("required: [commits, commitHeaders, boundaries]"));
+        assert!(openapi.contains("required: [cursor, commitHeaders, continuation]"));
+        assert!(openapi.contains("required: [commitId, parentCommitIds, baseCommitId, isCheckpoint, accountId, createdAt, generation, firstParentJumpCommitId, firstParentJumpSpan]"));
         assert!(!openapi.contains("headCommits:"));
         assert!(openapi.contains(
-            "required: [commitId, parentCommitIds, accountId, createdAt, selectedSourceCommitId, members]"
+            "required: [commitId, parentCommitIds, baseCommitId, isCheckpoint, accountId, createdAt, selectedSourceCommitId, members]"
         ));
         assert!(openapi.contains("required: [sourceCommitId, stateRootId]"));
         assert!(openapi.contains("stateAlias:"));
@@ -5603,6 +5669,12 @@ mod tests {
     }
 
     fn target_test_request(request: &mut Request<Body>, lix_id: &str) {
+        // Test clients normally use the current protocol; mismatch tests call
+        // the validator directly or dispatch without this convenience wrapper.
+        request
+            .headers_mut()
+            .entry(SERVER_PROTOCOL_VERSION_HEADER)
+            .or_insert(http::HeaderValue::from_static("7"));
         let path = request.uri().path();
         let suffix = if path == PROTOCOL_PATH {
             ""
@@ -6429,11 +6501,17 @@ mod tests {
         let storage = Memory::new();
         let source = open_lix().with_storage(storage.clone()).await.unwrap();
         source.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('local-state','preserved',true)", &[]).await.unwrap();
-        let query = "SELECT key, value, lixcol_untracked FROM lix_key_value WHERE key = 'local-state'";
+        let query =
+            "SELECT key, value, lixcol_untracked FROM lix_key_value WHERE key = 'local-state'";
         let before = source.execute(query, &[]).await.unwrap();
         assert_eq!(before.rows().len(), 1);
         source.close().await.unwrap();
-        let server = open_lix().with_storage(storage).serve().with_embedded_lix_id().await.unwrap();
+        let server = open_lix()
+            .with_storage(storage)
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .unwrap();
         let mut after = Vec::new();
         server.export_snapshot().write_to(&mut after).await.unwrap();
         let restored = open_lix()
@@ -6441,7 +6519,11 @@ mod tests {
             .await
             .unwrap();
         let after = restored.execute(query, &[]).await.unwrap();
-        assert_eq!(before.rows(), after.rows(), "serving must preserve untracked rows in exported snapshots");
+        assert_eq!(
+            before.rows(),
+            after.rows(),
+            "serving must preserve untracked rows in exported snapshots"
+        );
         restored.close().await.unwrap();
         server.close().await.unwrap();
     }
@@ -7654,6 +7736,28 @@ mod tests {
         .await
     }
 
+    #[test]
+    fn server_protocol_rejects_missing_old_malformed_and_duplicate_client_versions() {
+        for value in [None, Some("6"), Some("not-a-version")] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(SERVER_PROTOCOL_VERSION_HEADER, value.parse().unwrap());
+            }
+            assert!(require_server_protocol_version(&headers).is_err());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SERVER_PROTOCOL_VERSION_HEADER,
+            PROTOCOL_VERSION.to_string().parse().unwrap(),
+        );
+        assert!(require_server_protocol_version(&headers).is_ok());
+        headers.append(
+            SERVER_PROTOCOL_VERSION_HEADER,
+            PROTOCOL_VERSION.to_string().parse().unwrap(),
+        );
+        assert!(require_server_protocol_version(&headers).is_err());
+    }
+
     async fn request_with_headers(
         app: &Router<impl TestStorage>,
         method: &str,
@@ -8108,6 +8212,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_rejects_old_writers_before_session_creation() {
+        let app = app().await;
+        for version in [None, Some("6")] {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(format!("{PROTOCOL_PATH}/{}/handshake", app.server.lix_id()))
+                .header("content-type", "application/json");
+            if let Some(version) = version {
+                builder = builder.header(SERVER_PROTOCOL_VERSION_HEADER, version);
+            }
+            let response = app
+                .server
+                .handle(
+                    builder.body(Body::from("{}")).unwrap(),
+                    ServerProtocolContext {
+                        principal: ServerProtocolPrincipal::Anonymous,
+                        durable_terminal_storage_notifier: None,
+                    },
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        }
+    }
+
+    #[tokio::test]
     async fn handshake_without_a_sink_emits_no_opened_span() {
         let app = app().await;
         let (_session_id, _) = new_session(&app.router).await;
@@ -8132,6 +8261,7 @@ mod tests {
         assert_eq!(first["capabilities"]["syncPush"], true);
         assert_eq!(first["capabilities"]["syncPull"], true);
         assert_eq!(first["capabilities"]["syncHistory"], true);
+        assert_eq!(first["capabilities"]["syncCheckpointInventory"], true);
         assert_eq!(first["capabilities"]["syncBlob"], true);
         assert_eq!(first["capabilities"]["syncChunk"], true);
         assert_eq!(session_id.len(), SESSION_TOKEN_HEX_LEN);
@@ -9139,6 +9269,7 @@ mod tests {
             .server
             .handle(
                 Request::builder()
+                    .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
                     .uri(&path)
                     .body(Body::empty())
                     .expect("anonymous snapshot request"),
@@ -9151,6 +9282,7 @@ mod tests {
             .server
             .handle(
                 Request::builder()
+                    .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
                     .method(Method::PUT)
                     .uri(path)
                     .body(Body::empty())
@@ -9187,6 +9319,7 @@ mod tests {
     async fn trusted_account_binding_overrides_creation_and_rejects_cross_account_resume() {
         let app = app().await;
         let create = Request::builder()
+            .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .uri(format!("/lix/v1/{}", app.server.lix_id()))
             .body(Body::empty())
             .expect("trusted handshake request");
@@ -9209,6 +9342,7 @@ mod tests {
         let session_id = body["sessionId"].as_str().expect("session id");
 
         let resume = Request::builder()
+            .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .uri(format!("/lix/v1/{}", app.server.lix_id()))
             .header(SESSION_ID_HEADER, session_id)
             .body(Body::empty())
@@ -9224,6 +9358,7 @@ mod tests {
         );
 
         let changed_scope = Request::builder()
+            .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .uri(format!("/lix/v1/{}", app.server.lix_id()))
             .header(SESSION_ID_HEADER, session_id)
             .body(Body::empty())
@@ -9298,6 +9433,7 @@ mod tests {
             .server
             .handle(
                 Request::builder()
+                    .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
                     .uri(format!("/lix/v1/{}", app.server.lix_id()))
                     .body(Body::empty())
                     .expect("second principal handshake"),
@@ -9318,6 +9454,7 @@ mod tests {
                 dependency["createdAt"] = json!("2026-08-19T00:00:00Z");
             }
             let push = Request::builder()
+                .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
                 .method(Method::POST)
                 .uri(format!("/lix/v1/{}/sync/push", app.server.lix_id()))
                 .header(SESSION_ID_HEADER, &session_id)
@@ -9367,6 +9504,7 @@ mod tests {
             idempotency_scope: "sync-account-binding".to_string(),
         };
         let handshake = Request::builder()
+            .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .uri(format!("/lix/v1/{}", app.server.lix_id()))
             .body(Body::empty())
             .expect("trusted handshake request");
@@ -9388,6 +9526,7 @@ mod tests {
 
         let foreign_commit = json!({
             "commitId": crate::changelog::CommitId::for_test_label("foreign-sync-author").to_string(),
+            "isCheckpoint": false,
             "parentCommitIds": [],
             "globalScope": true,
             "baseCommitId": null,
@@ -9397,6 +9536,7 @@ mod tests {
             "members": [],
         });
         let push = Request::builder()
+            .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .method(Method::POST)
             .uri(format!("/lix/v1/{}/sync/push", app.server.lix_id()))
             .header(SESSION_ID_HEADER, session_id)
@@ -13153,7 +13293,10 @@ mod tests {
                 Instant::now() - Duration::from_mins(2);
             let lease = SessionLease::new(session_id.clone(), Arc::clone(&record), None);
             assert!(!record.is_idle_expired(Instant::now(), Duration::from_mins(1)));
-            assert!(!app.server.is_idle(), "in-flight requests must prevent expiry");
+            assert!(
+                !app.server.is_idle(),
+                "in-flight requests must prevent expiry"
+            );
             drop(lease);
             // Re-age after releasing the request, which refreshes last_used.
             *record

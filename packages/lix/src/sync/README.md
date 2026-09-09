@@ -18,3 +18,11 @@ then fetches distinct head commit bodies with bounded topology certificates and
 immutable head-pinned current-row pages concurrently. Live events transfer
 complete commits and ref moves. Older commit bodies and binary chunks load
 separately on demand and never advance the live cursor.
+
+Checkpoint inventory pages carry canonical headers without hydrating historical
+state. Bootstrap records which headers came only from that inventory; only
+those deferred checkpoints may omit jump boundaries. Serving-history headers
+and normal history imports still require their jump closure. A missing deferred
+graph node triggers ordinary bounded history demand before traversal continues.
+Known jump generations, self-jumps, invalid spans, and inventory/body identity
+mismatches are validated before publication.

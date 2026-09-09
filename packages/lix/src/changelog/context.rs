@@ -157,7 +157,7 @@ fn change_value_capacity(change: &ChangeRecord) -> usize {
 
 fn commit_value_capacity(commit: &CommitRecord) -> usize {
     // Packed nullable base: one option tag plus the UUID payload when present.
-    130usize.saturating_add(commit.parent_commit_ids.len().saturating_mul(16))
+    131usize.saturating_add(commit.parent_commit_ids.len().saturating_mul(16))
 }
 
 #[derive(Debug)]
@@ -465,6 +465,7 @@ where
             })?;
         }
         for commit in &commits {
+            stage_checkpoint_inventory(self.writes, commit);
             commit_batch.try_put(commit.commit_id.as_uuid().as_bytes(), |bytes| {
                 append_commit_record(bytes, commit)
             })?;
@@ -492,6 +493,7 @@ where
             })?;
         }
         for commit in &commits {
+            stage_checkpoint_inventory(self.writes, commit);
             commit_batch.try_put(commit.commit_id.as_uuid().as_bytes(), |bytes| {
                 append_commit_record(bytes, commit)
             })?;
@@ -1069,6 +1071,7 @@ mod sparse_append_tests {
         let timestamp =
             crate::common::LixTimestamp::expect_parse("test timestamp", "1970-01-01T00:00:00.000Z");
         let record = CommitRecord {
+            is_checkpoint: false,
             format_version: COMMIT_RECORD_FORMAT_VERSION,
             base_commit_id: None,
             commit_id,
@@ -1110,5 +1113,25 @@ mod sparse_append_tests {
         drop(writes);
         drop(adapter);
         lix.close().await.expect("repository should close");
+    }
+}
+
+/// Derived membership index. The canonical commit flag remains authority.
+pub(crate) const CHECKPOINT_INVENTORY_SPACE: StorageSpace = StorageSpace::mutable(
+    crate::storage_adapter::StorageSpaceId(0x0008_0009),
+    "checkpoint.inventory.v1",
+);
+
+pub(crate) fn stage_checkpoint_inventory(writes: &mut StorageWriteSet, commit: &CommitRecord) {
+    if commit.is_checkpoint {
+        writes.put(
+            CHECKPOINT_INVENTORY_SPACE,
+            StorageKey(Bytes::copy_from_slice(
+                commit.commit_id.as_uuid().as_bytes(),
+            )),
+            crate::storage_adapter::StorageValue {
+                bytes: Bytes::new(),
+            },
+        );
     }
 }

@@ -88,9 +88,7 @@ simulation_test!(
             .execute(
                 "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
                  SELECT row_ref \
-                 FROM lix_diff(\
-                   'lix_key_value', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()\
-                 ) \
+                 FROM lix_diff('lix_key_value') \
                  WHERE key = 'a'))",
                 &[],
             )
@@ -158,7 +156,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    diff_commands_resolve_the_active_branch_latest_checkpoint,
+    diff_commands_resolve_the_actual_working_baseline,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -173,10 +171,11 @@ simulation_test!(
             )
             .await
             .expect("baseline value should commit");
-        session
+        let baseline = session
             .create_checkpoint()
             .await
-            .expect("baseline checkpoint should commit");
+            .expect("baseline checkpoint should commit")
+            .commit_id;
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-working', 'draft')",
@@ -196,11 +195,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_revert (row_ref) \
                  SELECT row_ref \
-                 FROM lix_diff(\
-                   'lix_key_value', \
-                   lix_latest_checkpoint_commit_id(), \
-                   lix_active_branch_commit_id()\
-                 ) \
+                 FROM lix_diff('lix_key_value') \
                  RETURNING commit_id",
                 &[],
             )
@@ -223,11 +218,11 @@ simulation_test!(
                  SELECT row_ref \
                  FROM lix_diff(\
                    'lix_key_value', \
-                   lix_latest_checkpoint_commit_id(), \
+                   $2, \
                    $1\
                  ) \
                  RETURNING commit_id",
-                &[Value::Text(working_head)],
+                &[Value::Text(working_head), Value::Text(baseline)],
             )
             .await
             .expect("apply should resolve the active branch checkpoint source");
@@ -264,10 +259,7 @@ simulation_test!(
             .await
             .expect("first insert should succeed");
         let first = session
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint()",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
             .expect("full metadata-only SQL checkpoint should succeed");
         assert_eq!(first.columns(), &["commit_id"]);
@@ -277,10 +269,7 @@ simulation_test!(
             .await
             .expect("delete should succeed");
         let deleted_checkpoint = session
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint()",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
             .expect("checkpoint of the delete should succeed");
         let checkpoint_id = match deleted_checkpoint.get(&deleted_checkpoint.rows()[0], "commit_id")

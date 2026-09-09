@@ -57,6 +57,23 @@ pub trait SyncTransport: SyncTransportBounds {
         limit: usize,
     ) -> SyncTransportFuture<'a, SyncSnapshotRowPage>;
 
+    /// Reads checkpoint inventory against the snapshot cursor. Older transports
+    /// must fail explicitly rather than silently omit off-branch checkpoints.
+    fn checkpoint_inventory<'a>(
+        &'a self,
+        cursor: u64,
+        after: Option<&'a str>,
+        limit: usize,
+    ) -> SyncTransportFuture<'a, super::SyncCheckpointInventoryPage> {
+        let _ = (cursor, after, limit);
+        Box::pin(async {
+            Err(crate::LixError::new(
+                super::SYNC_PROTOCOL_MISMATCH_CODE,
+                "checkpoint inventory requires an upgraded sync transport",
+            ))
+        })
+    }
+
     /// Loads one bounded first-parent history page without changing live sync
     /// state. A later missing ancestor becomes the head of the next demand.
     fn history<'a>(

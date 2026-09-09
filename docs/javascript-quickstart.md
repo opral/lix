@@ -41,21 +41,20 @@ script string.
 
 ```ts
 const history = await lix.execute(
-  `SELECT path, content, lixcol_depth
-     FROM lix_history('lix_file')
-    WHERE path = $1
-    ORDER BY lixcol_depth`,
+  `SELECT diff_type, from_path, to_path, lixcol_to_commit_id, lixcol_position
+   FROM lix_history('lix_file')
+   WHERE from_path = $1 OR to_path = $1
+   ORDER BY lixcol_position`,
   ["/hello.txt"],
 );
 
 for (const row of history.rows) {
-  const bytes = row.content as Uint8Array;
-  const text = bytes ? new TextDecoder().decode(bytes) : "<deleted>";
-  console.log(row.lixcol_depth, text);
+  console.log(row.diff_type, row.from_path, row.to_path);
 }
 ```
 
-Depth `0` is the state at the head. Higher numbers walk back through history.
+Position `0` is the head commit. Higher positions walk back through the
+first-parent chain. Read file bytes with `lix_as_of` at an event endpoint.
 
 ## Undo the update
 

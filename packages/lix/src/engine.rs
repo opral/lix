@@ -125,18 +125,13 @@ where
         storage: StorageImpl,
         requested_main_branch_id: Option<&str>,
     ) -> Result<InitReceipt, LixError> {
-        Self::initialize_with_adapter(
-            StorageAdapter::new(storage),
-            requested_main_branch_id,
-        )
-        .await
+        Self::initialize_with_adapter(StorageAdapter::new(storage), requested_main_branch_id).await
     }
 
     pub(crate) async fn initialize_with_adapter(
         storage: StorageAdapter<StorageImpl>,
         requested_main_branch_id: Option<&str>,
     ) -> Result<InitReceipt, LixError> {
-
         crate::init::initialize_with_main_branch_id(
             storage,
             &TrackedStateContext::new(),
@@ -175,12 +170,8 @@ where
         storage: StorageAdapter<StorageImpl>,
         source_version: u32,
     ) -> Result<Self, LixError> {
-        Self::new_with_adapter_for_migration(
-            storage,
-            EngineOptions::new(),
-            Some(source_version),
-        )
-        .await
+        Self::new_with_adapter_for_migration(storage, EngineOptions::new(), Some(source_version))
+            .await
     }
 
     async fn new_with_adapter_for_migration(
@@ -188,9 +179,10 @@ where
         options: EngineOptions,
         migration_source_version: Option<u32>,
     ) -> Result<Self, LixError> {
-        let span = options.telemetry.as_ref().and_then(|sink| {
-            ActiveTelemetrySpan::start_if_enabled(sink, &ENGINE_OPEN, Vec::new())
-        });
+        let span = options
+            .telemetry
+            .as_ref()
+            .and_then(|sink| ActiveTelemetrySpan::start_if_enabled(sink, &ENGINE_OPEN, Vec::new()));
         instrument_lix_result(span, async move {
             let wasm_runtime = options
                 .wasm_runtime
@@ -296,7 +288,9 @@ where
         &self,
     ) -> Result<Option<bytes::Bytes>, LixError> {
         let read = SharedStorageAdapterRead::new(
-            self.storage.begin_read(StorageReadOptions::default()).await?,
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
         );
         // Untracked rows belong to this repository and survive snapshot transfer.
         // They remain authority-local current state, outside replicated history.
@@ -783,7 +777,7 @@ mod tests {
     async fn json_pointer_diff_relation(session: &SessionContext<Memory>) -> String {
         let checkpoint = session
             .execute(
-                "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_created_at DESC LIMIT 1",
+                "SELECT working_base_commit_id AS commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
                 &[],
             )
             .await
@@ -2020,8 +2014,7 @@ mod tests {
         assert!(
             broad
                 .iter()
-                .any(|(_, file, kind)| file.as_deref() == Some(files[0])
-                    && kind == "removed"),
+                .any(|(_, file, kind)| file.as_deref() == Some(files[0]) && kind == "removed"),
             "fixture should produce a removed row inside the probed file"
         );
 
@@ -2054,7 +2047,6 @@ mod tests {
                 scoped, want,
                 "the file-scoped working-diff bypass disagrees with the index scan for {file}"
             );
-
         }
     }
 
@@ -2393,7 +2385,7 @@ mod tests {
         );
         assert_eq!(
             before_gc.len(),
-            3,
+            2,
             "the first checkpoint leaves the two superseded branch index records for GC"
         );
         drop(read);
@@ -2430,8 +2422,8 @@ mod tests {
         let after_gc = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
             after_gc.len(),
-            1,
-            "GC must reclaim the superseded branch epoch; only the repository-global checkpoint row may remain dirty"
+            0,
+            "GC must reclaim superseded branch epochs; checkpoint metadata creates no dirty rows"
         );
         drop(read);
         session
@@ -2445,8 +2437,8 @@ mod tests {
         let after_second = scan_test_space(&read, crate::hot_state::DIFF_SPACE).await;
         assert_eq!(
             after_second.len(),
-            2,
-            "the second immutable checkpoint row remains while the superseded branch epoch is reclaimed"
+            0,
+            "an empty checkpoint creates no dirty tracked rows"
         );
         let logical = session
             .execute(

@@ -273,40 +273,34 @@ where
     let (command, receive_command) = tokio::sync::oneshot::channel();
     let (report_claimed, claimed) = tokio::sync::oneshot::channel();
     let (report_done, done) = tokio::sync::oneshot::channel();
-    crate::background_task::spawn(
-        "lix-snapshot-restore-cleanup",
-        move || async move {
-            // Claim acquisition is owned by this task, not by the restore
-            // future. JavaScript promises and remote commits can continue after
-            // their Rust waiter is dropped; keeping the waiter here guarantees
-            // that cancellation cannot run cleanup against an absent pointer
-            // and then let an in-flight claim appear after cleanup has exited.
-            if let Err(error) = claim_fresh_import(&storage, &claim).await {
-                let cleaned = cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await;
-                let error = with_cleanup_error(error, cleaned);
-                let _ = report_done.send(Ok(()));
-                let _ = report_claimed.send(Err(error));
-                return;
-            }
-            if report_claimed.send(Ok(())).is_err() {
-                // The restore was cancelled before it observed ownership. The
-                // claim is now settled and exact, so it is safe to remove it.
-                let result = cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await;
-                let _ = report_done.send(result);
-                return;
-            }
-            let should_cleanup = !matches!(
-                receive_command.await,
-                Ok(FreshEpochCleanupCommand::Disarm)
-            );
-            let result = if should_cleanup {
-                cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await
-            } else {
-                Ok(())
-            };
+    crate::background_task::spawn("lix-snapshot-restore-cleanup", move || async move {
+        // Claim acquisition is owned by this task, not by the restore
+        // future. JavaScript promises and remote commits can continue after
+        // their Rust waiter is dropped; keeping the waiter here guarantees
+        // that cancellation cannot run cleanup against an absent pointer
+        // and then let an in-flight claim appear after cleanup has exited.
+        if let Err(error) = claim_fresh_import(&storage, &claim).await {
+            let cleaned = cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await;
+            let error = with_cleanup_error(error, cleaned);
+            let _ = report_done.send(Ok(()));
+            let _ = report_claimed.send(Err(error));
+            return;
+        }
+        if report_claimed.send(Ok(())).is_err() {
+            // The restore was cancelled before it observed ownership. The
+            // claim is now settled and exact, so it is safe to remove it.
+            let result = cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await;
             let _ = report_done.send(result);
-        },
-    )?;
+            return;
+        }
+        let should_cleanup = !matches!(receive_command.await, Ok(FreshEpochCleanupCommand::Disarm));
+        let result = if should_cleanup {
+            cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await
+        } else {
+            Ok(())
+        };
+        let _ = report_done.send(result);
+    })?;
     Ok(FreshEpochCleanup {
         command: Some(command),
         claimed: Some(claimed),
@@ -345,6 +339,38 @@ enum PointerState {
         generation: u64,
         attempt: uuid::Uuid,
     },
+}
+
+/// Adoption may migrate existing banks but must never claim a fresh bank.
+pub(crate) async fn admit_existing_repository<S>(storage: &S) -> Result<StorageAdapter<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    match load_pointer(storage).await? {
+        None if matches!(
+            super::inspect_lix(storage).await?,
+            super::MigrationStatus::Missing
+        ) =>
+        {
+            return Err(LixError::new(
+                "LIX_NOT_FOUND",
+                "Existing repository format marker is missing.",
+            ));
+        }
+        Some((
+            PointerState::Migrating {
+                source_format: 0, ..
+            },
+            _,
+        )) => {
+            return Err(LixError::new(
+                "LIX_INVALID_REPOSITORY",
+                "Incomplete repository initialization cannot be adopted.",
+            ));
+        }
+        _ => {}
+    }
+    Ok(admit_repository(storage, None).await?.adapter)
 }
 
 pub(crate) async fn admit_repository<S>(
@@ -2643,7 +2669,7 @@ mod tests {
             Ok(_) => panic!("incomplete candidate must fail validation"),
             Err(error) => error,
         };
-        assert!(error.message.contains("not initialized"));
+        assert!(error.message.contains("no global branch"));
         assert!(load_pointer(&storage).await.unwrap().is_none());
         assert_eq!(
             super::super::inspect_lix(&storage).await.unwrap(),

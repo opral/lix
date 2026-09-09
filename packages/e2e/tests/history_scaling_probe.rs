@@ -15,10 +15,10 @@
 //! * [`history_commits_at_fixed_files`] varies commit count with both the file
 //!   count and the answer size pinned, by committing edits to a file the query
 //!   never asks about. Growth here is a real `O(commits traversed)` term. Its
-//!   `depth0` lane asks for a single row via `lixcol_depth = 0`, so any growth
+//!   `position0` lane asks for a single row via `lixcol_position = 0`, so any growth
 //!   there is work that a depth bound failed to prune. Its `null_control_kv`
 //!   lane reads a *different* history surface over the same commit graph, so it
-//!   cannot execute any `lix_file_history` routing change: whatever spread that
+//!   cannot execute any file endpoint routing change: whatever spread that
 //!   lane shows between two arms is the harness's noise floor.
 //!
 //! Both are `#[ignore]`d; run them by name with `--release`. Every knob is an
@@ -149,10 +149,8 @@ fn row_path(row: &Row) -> Option<String> {
 
 fn row_key(row: &Row) -> String {
     let id: String = row.get("id").expect("id");
-    let depth: i64 = row.get("lixcol_depth").expect("depth");
-    let observed: String = row
-        .get("lixcol_observed_commit_id")
-        .expect("observed commit");
+    let depth: i64 = row.get("lixcol_position").expect("depth");
+    let observed: String = row.get("lixcol_to_commit_id").expect("observed commit");
     format!(
         "{id}|{depth}|{observed}|{}",
         row_path(row).unwrap_or_default()
@@ -209,12 +207,12 @@ async fn history_files_at_fixed_commits() {
             .expect("id text");
 
         let by_path = format!(
-            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE path = $2 \
-             ORDER BY lixcol_depth LIMIT {depth}"
+            "SELECT lixcol_position FROM lix_history('lix_file', $1) WHERE coalesce(to_path, from_path) = $2 \
+             ORDER BY lixcol_position LIMIT {depth}"
         );
         let by_id = format!(
-            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE id = $2 \
-             ORDER BY lixcol_depth LIMIT {depth}"
+            "SELECT lixcol_position FROM lix_history('lix_file', $1) WHERE id = $2 \
+             ORDER BY lixcol_position LIMIT {depth}"
         );
 
         for (label, sql, arg) in [
@@ -277,12 +275,12 @@ async fn history_member_scan_census() {
             .expect("id text");
 
         let by_path = format!(
-            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE path = $2 \
-             ORDER BY lixcol_depth LIMIT {depth}"
+            "SELECT lixcol_position FROM lix_history('lix_file', $1) WHERE coalesce(to_path, from_path) = $2 \
+             ORDER BY lixcol_position LIMIT {depth}"
         );
         let by_id = format!(
-            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE id = $2 \
-             ORDER BY lixcol_depth LIMIT {depth}"
+            "SELECT lixcol_position FROM lix_history('lix_file', $1) WHERE id = $2 \
+             ORDER BY lixcol_position LIMIT {depth}"
         );
 
         for (label, sql, arg) in [
@@ -317,16 +315,10 @@ async fn history_member_scan_census() {
     }
 }
 
-/// Descriptor snapshots parsed by path resolution, swept over file count.
-///
-/// Counted at the `serde_json::from_str` the prefilter is meant to avoid, not
-/// at the resolved id set -- that set is the same either way and cannot tell a
-/// skipped parse from a performed one. `prefilter_on/off` is printed so a zero
-/// `prefiltered` is readable: it means either "every descriptor matched" or
-/// "the prefilter refused these names", which are different findings.
+/// Endpoint path-filter latency swept over file count at fixed history size.
 #[tokio::test]
 #[ignore = "manual history-scaling probe"]
-async fn history_path_resolver_census() {
+async fn history_path_filter_latency() {
     let file_bytes = env_usize("LIX_HISTORY_SCALE_FILE_BYTES", 4 * 1024);
     let edits = env_usize("LIX_HISTORY_SCALE_EDITS", 20);
     let depth = env_usize("LIX_HISTORY_SCALE_DEPTH", 20);
@@ -338,28 +330,25 @@ async fn history_path_resolver_census() {
         seed(&lix, files, file_bytes, files, edits, &probe_path).await;
         let head = active_commit(&lix).await;
         let by_path = format!(
-            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE path = $2 \
-             ORDER BY lixcol_depth LIMIT {depth}"
+            "SELECT lixcol_position FROM lix_history('lix_file', $1) WHERE coalesce(to_path, from_path) = $2 \
+             ORDER BY lixcol_position LIMIT {depth}"
         );
         let params = [Value::Text(head.clone()), Value::Text(probe_path.clone())];
         let _ = lix
             .execute(&by_path, &params)
             .await
             .expect("warm probe query");
-        let _ = lix::storage_bench::take_path_resolver_census();
+        let started = Instant::now();
         let rows = lix
             .execute(&by_path, &params)
             .await
             .expect("probe query")
             .rows()
             .len();
-        let (seen, parsed, prefiltered, metadata_present, prefilter_on, prefilter_off) =
-            lix::storage_bench::take_path_resolver_census();
         eprintln!(
-            "path_resolver_census files={files} commits={} rows={rows} seen={seen} \
-             parsed={parsed} prefiltered={prefiltered} metadata_slots={metadata_present} \
-             prefilter_on={prefilter_on} prefilter_off={prefilter_off}",
+            "history_path_filter files={files} commits={} rows={rows} elapsed_us={}",
             edits + 1,
+            started.elapsed().as_micros()
         );
         lix.close().await.expect("close probe");
     }
@@ -416,30 +405,29 @@ async fn history_commits_at_fixed_files() {
             .expect("id text");
 
         let by_path = format!(
-            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE path = $2 \
-             ORDER BY lixcol_depth LIMIT {depth}"
+            "SELECT lixcol_position FROM lix_history('lix_file', $1) WHERE coalesce(to_path, from_path) = $2 \
+             ORDER BY lixcol_position LIMIT {depth}"
         );
         let by_id = format!(
-            "SELECT lixcol_depth FROM lix_history('lix_file', $1) WHERE id = $2 \
-             ORDER BY lixcol_depth LIMIT {depth}"
+            "SELECT lixcol_position FROM lix_history('lix_file', $1) WHERE id = $2 \
+             ORDER BY lixcol_position LIMIT {depth}"
         );
-        let by_id_content = format!(
-            "SELECT content, lixcol_depth FROM lix_history('lix_file', $1) WHERE id = $2 \
-             ORDER BY lixcol_depth LIMIT {depth}"
+        let by_id_endpoints = format!(
+            "SELECT from_path, to_path, lixcol_position FROM lix_history('lix_file', $1) WHERE id = $2 \
+             ORDER BY lixcol_position LIMIT {depth}"
         );
         // A depth-bounded shape: the bounded-history-traversal work should make
         // this cheap regardless of how many commits exist.
-        let by_path_depth0 = "SELECT lixcol_depth FROM lix_history('lix_file', $1) \
-                              WHERE path = $2 AND lixcol_depth = 0"
+        let by_path_position0 = "SELECT lixcol_position FROM lix_history('lix_file', $1) \
+                              WHERE coalesce(to_path, from_path) = $2 AND lixcol_position = 0"
             .to_string();
         // Null control. This walks the same commit graph over the same fixture
-        // through the same `load_history_entries` traversal and the same
-        // touched-scope digest, but it is a different history surface, so it
-        // cannot reach `lix_file_history`'s descriptor/blob route at all. Any
+        // through the first-parent endpoint traversal, but it is a different history surface, so it
+        // cannot reach the file descriptor route at all. Any
         // arm-to-arm movement it shows is this harness's noise floor: a
-        // `lix_file_history` delta smaller than it is unresolvable.
-        let null_control_kv = "SELECT lixcol_depth FROM lix_history('lix_key_value', $1) \
-                               ORDER BY lixcol_depth DESC"
+        // file history delta smaller than it is unresolvable.
+        let null_control_kv = "SELECT lixcol_position FROM lix_history('lix_key_value', $1) \
+                               ORDER BY lixcol_position DESC"
             .to_string();
 
         for (label, sql, params) in [
@@ -454,13 +442,13 @@ async fn history_commits_at_fixed_files() {
                 vec![Value::Text(head.clone()), Value::Text(file_id.clone())],
             ),
             (
-                "by_id_content",
-                &by_id_content,
+                "by_id_endpoints",
+                &by_id_endpoints,
                 vec![Value::Text(head.clone()), Value::Text(file_id.clone())],
             ),
             (
-                "by_path_depth0",
-                &by_path_depth0,
+                "by_path_position0",
+                &by_path_position0,
                 vec![Value::Text(head.clone()), Value::Text(noise_path.clone())],
             ),
             (
@@ -479,7 +467,7 @@ async fn history_commits_at_fixed_files() {
         }
 
         if std::env::var("LIX_HISTORY_SCALE_VERIFY").is_ok() {
-            let projection = "SELECT id, path, lixcol_depth, lixcol_observed_commit_id \
+            let projection = "SELECT id, coalesce(to_path, from_path) AS path, lixcol_position, lixcol_to_commit_id \
                               FROM lix_history('lix_file', $1)";
             let all = lix
                 .execute(projection, &[Value::Text(head.clone())])
@@ -494,7 +482,7 @@ async fn history_commits_at_fixed_files() {
                     .collect();
                 let actual: BTreeSet<String> = lix
                     .execute(
-                        &format!("{projection} WHERE path = $2"),
+                        &format!("{projection} WHERE coalesce(to_path, from_path) = $2"),
                         &[Value::Text(head.clone()), Value::Text(target.clone())],
                     )
                     .await

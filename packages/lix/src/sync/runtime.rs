@@ -72,6 +72,8 @@ pub(super) struct PreparedRepositorySnapshot {
     pub(super) metadata: SyncRepositoryPullResponse,
     pub(super) commits: Vec<super::SyncCommit>,
     pub(super) commit_headers: Vec<super::SyncCommitHeader>,
+    /// Inventory-only headers have deferred topology as well as deferred state.
+    pub(super) sparse_inventory_commit_ids: BTreeSet<String>,
     pub(super) rows: Vec<super::SyncSnapshotRow>,
     /// Binary payloads reachable from current branch heads or their pinned
     /// working-diff checkpoints. Older history remains deliberately excluded.
@@ -85,6 +87,25 @@ pub(super) async fn fetch_repository_snapshot<Transport>(
 where
     Transport: SyncTransport,
 {
+    // Inventory pages share the metadata cursor. A concurrent authority write
+    // invalidates that pin before any replica state has been installed.
+    for attempt in 0..4 {
+        match fetch_repository_snapshot_once(transport).await {
+            Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT && attempt < 3 => {
+                continue;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("snapshot retry loop always returns on its final attempt")
+}
+
+async fn fetch_repository_snapshot_once<Transport>(
+    transport: &Transport,
+) -> Result<(PreparedRepositorySnapshot, String, String), LixError>
+where
+    Transport: SyncTransport,
+{
     let metadata = transport
         .pull(None, super::MAX_SYNC_REQUEST_ITEMS)
         .await
@@ -93,7 +114,7 @@ where
         lix_id,
         default_branch_id,
         branches,
-        ..
+        cursor,
     } = &metadata
     else {
         return Err(LixError::new(
@@ -120,6 +141,64 @@ where
         })
         .flatten()
         .collect::<BTreeSet<_>>();
+    // Marker rows no longer ride the global state snapshot. Fetch the bounded
+    // canonical inventory before publishing the replica's readable checkpoints.
+    let mut inventory_headers = BTreeMap::new();
+    let mut inventory_after = None::<String>;
+    loop {
+        let page = transport
+            .checkpoint_inventory(
+                *cursor,
+                inventory_after.as_deref(),
+                super::MAX_SYNC_REQUEST_ITEMS,
+            )
+            .await?;
+        if page.cursor != *cursor || page.commit_headers.len() > super::MAX_SYNC_REQUEST_ITEMS {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "invalid checkpoint inventory page",
+            ));
+        }
+        let mut previous = inventory_after.as_deref();
+        for header in &page.commit_headers {
+            if !header.is_checkpoint {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "unmarked checkpoint inventory header",
+                ));
+            }
+            let id = &header.commit_id;
+            crate::changelog::CommitId::parse_lix(id, "checkpoint inventory commit")?;
+            if previous.is_some_and(|previous| previous >= id.as_str()) {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "checkpoint inventory is not strictly ordered",
+                ));
+            }
+            previous = Some(id);
+        }
+        if page.continuation.is_some()
+            && page.continuation.as_deref()
+                != page
+                    .commit_headers
+                    .last()
+                    .map(|header| header.commit_id.as_str())
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "invalid checkpoint inventory continuation",
+            ));
+        }
+        inventory_headers.extend(
+            page.commit_headers
+                .into_iter()
+                .map(|header| (header.commit_id.clone(), header)),
+        );
+        let Some(next) = page.continuation else {
+            break;
+        };
+        inventory_after = Some(next);
+    }
     let branch_targets = branches
         .iter()
         .filter_map(|branch| {
@@ -130,10 +209,27 @@ where
         })
         .collect::<Vec<_>>();
     let precise_history_heads = BTreeSet::new();
-    let (history, mut rows) = futures_util::try_join!(
+    let (mut history, mut rows) = futures_util::try_join!(
         fetch_history_objects(transport, head_ids, 1, None, &precise_history_heads),
         fetch_snapshot_rows(transport, &branch_targets),
     )?;
+    // Inventory headers are intentionally sparse. Their states and blobs use
+    // ordinary history demand; only serving heads and working bases bootstrap.
+    let mut sparse_inventory_commit_ids =
+        inventory_headers.keys().cloned().collect::<BTreeSet<_>>();
+    for header in std::mem::take(&mut history.commit_headers) {
+        sparse_inventory_commit_ids.remove(&header.commit_id);
+        if inventory_headers
+            .insert(header.commit_id.clone(), header.clone())
+            .is_some_and(|existing| existing != header)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "checkpoint inventory disagrees with history header",
+            ));
+        }
+    }
+    history.commit_headers = inventory_headers.into_values().collect();
     let mut checkpoint_targets = Vec::new();
     let mut seen_checkpoints = BTreeSet::new();
     let mut checkpoint_roots = BTreeMap::new();
@@ -165,6 +261,7 @@ where
         metadata,
         commits: history.commits,
         commit_headers: history.commit_headers,
+        sparse_inventory_commit_ids,
         rows,
         live_blob_ids,
         checkpoint_roots,
@@ -2183,6 +2280,7 @@ mod tests {
 
     fn blob_ref_commit(blob_id: &str) -> super::super::SyncCommit {
         super::super::SyncCommit {
+            is_checkpoint: false,
             commit_id: crate::changelog::CommitId::for_test_label("runtime-inline-commit")
                 .to_string(),
             parent_commit_ids: Vec::new(),
@@ -2535,7 +2633,7 @@ mod tests {
             file_id: None,
             row_pk: serde_json::json!([row_id]),
             snapshot: Some(serde_json::json!({ "key": row_id, "value": row_id })),
-                snapshot_payload: Some(String::new()),
+            snapshot_payload: Some(String::new()),
             metadata: None,
             change_id: format!("change-{row_id}"),
             commit_id: "head".to_owned(),
@@ -4041,9 +4139,9 @@ mod tests {
         // A history query over the sparse graph must drive cold-history
         // hydration on a fresh replica.
         let sql = "SELECT COUNT(DISTINCT history.id) AS entries \
-                   FROM lix_checkpoint AS checkpoint \
+                   FROM lix_log() AS checkpoint \
                    LEFT JOIN lix_history('lix_file') AS history \
-                     ON history.lixcol_observed_commit_id = checkpoint.commit_id";
+                     ON history.lixcol_to_commit_id = checkpoint.commit_id WHERE checkpoint.is_checkpoint";
         let mut error = replica
             .execute(sql, &[])
             .await

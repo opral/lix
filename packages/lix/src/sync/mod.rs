@@ -37,7 +37,7 @@ pub(crate) use bootstrap::{
     prepare_sync_bootstrap,
 };
 pub(crate) use commit::{
-    SYNC_MATERIALIZED_STATE_ALIAS_SPACE, SYNC_CHECKPOINT_SOURCE_SPACE,
+    SYNC_CHECKPOINT_SOURCE_SPACE, SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
     stage_delete_materialized_sync_state_alias, stage_delete_sync_checkpoint_source,
     stage_sync_checkpoint_source,
 };
@@ -58,9 +58,10 @@ pub(crate) use platform::{SyncTransportBounds, SyncTransportFuture};
 #[cfg(feature = "server-protocol")]
 pub(crate) use protocol::SyncRefUpdate;
 pub(crate) use protocol::{
-    SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration, SyncBranchHead, SyncCommitHeader,
-    SyncEvent, SyncHistoryBoundary, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
-    SyncRepositoryPullResponse, SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
+    SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration, SyncBranchHead,
+    SyncCheckpointInventoryPage, SyncCommitHeader, SyncEvent, SyncHistoryBoundary,
+    SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse,
+    SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
 };
 #[cfg(feature = "server-protocol")]
 pub(crate) use repository::admit_sync_authority_storage;
@@ -83,9 +84,9 @@ pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-// v8 carries canonical typed row payloads for custom schemas. Older peers
-// cannot preserve their typed identity from JSON alone.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 8;
+// v9 requires canonical checkpoint membership and its global inventory.
+// Older writers cannot publish commits without this metadata.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 9;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";
@@ -111,7 +112,7 @@ pub(crate) fn sync_server_protocol_mismatch(server_version: Option<u32>) -> LixE
     LixError::new(
         SYNC_PROTOCOL_MISMATCH_CODE,
         format!(
-            "incompatible sync protocol: client version {SYNC_PROTOCOL_VERSION}, server version {server}"
+            "incompatible sync protocol: client version {SYNC_PROTOCOL_VERSION}, server version {server}; upgrade the client and server to compatible Lix versions"
         ),
     )
     .with_details(serde_json::json!({
@@ -147,7 +148,7 @@ pub(crate) fn sync_client_protocol_mismatch(client_version: Option<u32>) -> LixE
     LixError::new(
         SYNC_PROTOCOL_MISMATCH_CODE,
         format!(
-            "incompatible sync protocol: client version {client}, server version {SYNC_PROTOCOL_VERSION}"
+            "incompatible sync protocol: client version {client}, server version {SYNC_PROTOCOL_VERSION}; upgrade the client and server to compatible Lix versions"
         ),
     )
     .with_details(serde_json::json!({

@@ -12,7 +12,6 @@ operators; there are no public `lix_json_*` functions.
 | `lix_active_account_id()` | text | Active SQL-session account. |
 | `lix_active_branch_id()` | text | Active branch. |
 | `lix_active_branch_commit_id()` | text | Active branch head pinned for the statement. |
-| `lix_latest_checkpoint_commit_id()` | text | Active branch's latest checkpoint, or the repository root if it has none. |
 | `lix_root_commit_id()` | text | Repository bootstrap root. |
 | `lix_row_ref(relation, primary_key...)` | row_ref | Opaque address of one relation row, including composite keys. |
 | `uuidv7()` | uuid | Generate a UUIDv7 value. |
@@ -54,37 +53,32 @@ await lix.execute(
 
 ## Branch and history
 
-`lix_active_branch_commit_id()` resolves the same pinned head used by history
-functions called without an explicit commit:
+`lix_log([anchor])` lists retained first-parent commits. `lix_history(relation
+[, anchor])` describes each commit's changes against its actual first parent.
+Both default to the active head pinned for the statement.
 
 ```sql
-SELECT lixcol_depth, title
+SELECT lixcol_position, diff_type, from_title, to_title
 FROM lix_history('acme_task')
-WHERE id = 't1'
-ORDER BY lixcol_depth;
-```
+WHERE id = 't1' AND lixcol_commit_is_checkpoint
+ORDER BY lixcol_position;
 
-`lix_latest_checkpoint_commit_id()` returns the latest checkpoint for the
-active branch, not the newest repository-global checkpoint. If the branch has
-no checkpoint, it returns `lix_root_commit_id()`. Use both branch-scoped
-accessors to read working changes in one query:
-
-```sql
 SELECT row_ref, id, diff_type
-FROM lix_diff(
-  'lix_file',
-  lix_latest_checkpoint_commit_id(),
-  lix_active_branch_commit_id()
-);
+FROM lix_diff('lix_file');
 ```
 
-`lix_state_at(relation, commit_id)` returns the complete tracked state of a
+The one-argument diff uses the branch working baseline. Read
+`working_base_commit_id` alongside `commit_id` from `lix_branch` when the
+comparison context is needed even for an empty diff. See [History](./history.md)
+for endpoint columns, global checkpoint metrics, and paged previews.
+
+`lix_as_of(relation, commit_id)` returns the complete tracked state of a
 relation at one commit. Its columns are identical to the live relation, and
 entities that did not exist at that commit produce no row:
 
 ```sql
 SELECT id, path, content
-FROM lix_state_at('lix_file', $1)
+FROM lix_as_of('lix_file', $1)
 WHERE id IN ($2, $3);
 ```
 
@@ -97,11 +91,12 @@ included.
 The supplied commit is a closed snapshot. A local commit records its exact
 global dependency in `lix_commit.base_commit_id`; its physical state is an
 immutable local-overlay root plus that pinned immutable global root.
-`lix_state_at` composes both roots and returns inherited global rows plus local
+`lix_as_of` composes both roots and returns inherited global rows plus local
 values and tombstones, with local intent winning. Global commits have a null
 base. The base is a state dependency, not ancestry, so it is deliberately
-absent from `parent_commit_ids` and `lix_commit_ancestry()`. `lix_history`
-does follow the base dependency so history can explain the complete state.
+absent from `parent_commit_ids` and `lix_commit_ancestry()`. History compares
+complete endpoint states, including their pinned bases, while traversing only
+first parents.
 
 When global advances, the next live access to a local branch lazily publishes
 one metadata-only local commit pinned to the latest global commit. An actual
@@ -110,10 +105,6 @@ global advances coalesce and global publication remains O(1) rather than
 fanning out over every branch. No global rows are copied into the local
 overlay. The active commit ID and every live row therefore always describe the
 same closed snapshot.
-
-For `lix_history`, depth is the shortest dependency distance using either a
-causal parent edge or a state-base edge. `lix_commit_ancestry()` remains
-strictly causal-parent-only.
 
 `lix_commit_ancestry()` returns the active head at depth `0` and every
 reachable ancestor once at its shortest depth. Pass one commit ID to use an
@@ -139,8 +130,8 @@ branches untouched, preserves branch-local untracked rows, and starts a fresh
 undo interval. A restore cannot be combined with another write in the same
 transaction and must be the final statement before commit or rollback.
 Orphaned commits may remain stored until ordinary
-reachability-based garbage collection reclaims them. Checkpoint rows remain
-stored even when their commits are no longer on the branch.
+reachability-based garbage collection reclaims them. Checkpoint commits remain
+stored even when they are no longer on the branch.
 
 Use `execute` for remote callers as well; restore does not add a server-protocol
 endpoint or a typed SDK method.

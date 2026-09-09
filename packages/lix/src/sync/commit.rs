@@ -122,6 +122,8 @@ pub(crate) fn stage_delete_sync_checkpoint_source(
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncCommit {
+    /// Immutable commit membership; required by the current protocol.
+    pub is_checkpoint: bool,
     pub commit_id: String,
     pub parent_commit_ids: Vec<String>,
     pub base_commit_id: Option<String>,
@@ -622,6 +624,7 @@ where
         .then(|| record.parent_commit_ids[1]);
 
     let exported = SyncCommit {
+        is_checkpoint: record.is_checkpoint,
         commit_id: record.commit_id.to_string(),
         parent_commit_ids: record
             .parent_commit_ids
@@ -1058,6 +1061,7 @@ mod tests {
             }
         };
         let mut commit = SyncCommit {
+            is_checkpoint: false,
             commit_id: commit_id.to_string(),
             parent_commit_ids: Vec::new(),
             base_commit_id: Some(CommitId::for_test_label("validation-base").to_string()),
@@ -1122,6 +1126,7 @@ mod tests {
         let parent = CommitId::for_test_label("alias-parent");
         let source = CommitId::for_test_label("alias-source");
         let mut commit = SyncCommit {
+            is_checkpoint: false,
             commit_id: commit_id.to_string(),
             parent_commit_ids: vec![parent.to_string()],
             base_commit_id: Some(CommitId::for_test_label("alias-validation-base").to_string()),

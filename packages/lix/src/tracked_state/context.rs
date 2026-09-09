@@ -1125,20 +1125,14 @@ where
             }
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "commit '{commit_id}' has no row-PK index for point-in-time lookup"
-                ),
+                format!("commit '{commit_id}' has no row-PK index for point-in-time lookup"),
             ));
         };
         let request = crate::tracked_state::row_pk_index_scan_request(schema_key, row_pks, false)?;
         let entries = self.tree.scan(&self.store, root, &request).await?;
         entries
             .into_iter()
-            .map(|(key, _)| {
-                crate::tracked_state::decode_row_pk_index_key(
-                    &encode_key(&key),
-                )
-            })
+            .map(|(key, _)| crate::tracked_state::decode_row_pk_index_key(&encode_key(&key)))
             .collect()
     }
 
@@ -1409,7 +1403,18 @@ where
         right_commit_id: &str,
         request: &TrackedStateDiffRequest,
     ) -> Result<TrackedStateDiff, LixError> {
-        diff_commits(self, left_commit_id, right_commit_id, request).await
+        diff_commits(self, left_commit_id, right_commit_id, request, false).await
+    }
+
+    /// Compares authored members for merge publication. Collection-generation
+    /// cascades remain represented by their single authenticated marker.
+    pub(crate) async fn diff_commit_members(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+        request: &TrackedStateDiffRequest,
+    ) -> Result<TrackedStateDiff, LixError> {
+        diff_commits(self, left_commit_id, right_commit_id, request, true).await
     }
 
     /// Resolves the exact tracked identities affected by descriptor cascades.
@@ -1568,19 +1573,38 @@ where
         &mut self,
         batch: &TrackedStateTreeDiffBatch,
     ) -> Result<TrackedStatePayloadBatch, LixError> {
-        let rows = batch.side_rows().collect::<Vec<_>>();
+        // Tombstones have no payload. Their authenticated delta index (or
+        // exact collection-generation marker) proves deletion even after GC
+        // releases the original mutation body. Requiring that old body here
+        // would make a payload projection stricter than the same identity diff.
+        self.validate_tree_diff_batch_against_delta_index(batch)
+            .await?;
+        let rows = batch
+            .side_rows()
+            .filter(|row| !row.deleted())
+            .collect::<Vec<_>>();
         let changes = self.load_routed_tree_diff_changes(&rows).await?;
+        let mut payloads = changes
+            .into_iter()
+            .map(|(change_id, change)| (change_id, (change.snapshot, change.metadata)))
+            .collect::<HashMap<_, _>>();
+        for row in batch.side_rows().filter(|row| row.deleted()) {
+            // Keep an explicit empty slot for consumers applying deletions.
+            // A live generation marker may share this change ID with its
+            // cascade tombstones; its immutable payload remains authoritative.
+            payloads.entry(row.change_id()).or_insert((None, None));
+        }
         TrackedStatePayloadBatch::from_payloads(
-            changes
+            payloads
                 .into_iter()
-                .map(|(change_id, change)| (change_id, change.snapshot, change.metadata)),
+                .map(|(change_id, (snapshot, metadata))| (change_id, snapshot, metadata)),
         )
     }
 
     /// Removes physical tombstones synthesized into persistent roots for a
-    /// collection-generation delete. The authenticated marker is the logical
-    /// commit member; exposing every retired predecessor would both expand the
-    /// commit and require payloads that intentionally do not exist.
+    /// collection-generation delete when collecting authored commit members.
+    /// The authenticated marker is the logical commit member; each retired
+    /// predecessor is still a logical removal in an endpoint diff.
     pub(crate) async fn suppress_collection_generation_cascade_tombstones(
         &mut self,
         batch: &mut TrackedStateTreeDiffBatch,
@@ -1770,6 +1794,7 @@ where
                 None => vec![None; collection_fallback_rows.len()],
             };
             let mut fallbacks = vec![None; commit_rows.len()];
+            let mut generation_cascades = vec![false; commit_rows.len()];
             for (index, value) in collection_fallback_rows
                 .into_iter()
                 .zip(collection_fallback_values)
@@ -1778,10 +1803,16 @@ where
                 if value.as_ref().is_some_and(|value| {
                     value.change_id == row.change_id()
                         && value.commit_id == row.commit_id()
-                        && value.deleted
                         && value.updated_at() == row.updated_at()
                 }) {
-                    fallbacks[index] = value;
+                    if value.as_ref().is_some_and(|value| !value.deleted) {
+                        // A generation replacement is a live scoped marker.
+                        // The authenticated tree expands its deletion into row
+                        // tombstones sharing that marker's immutable coordinates.
+                        generation_cascades[index] = true;
+                    } else {
+                        fallbacks[index] = value;
+                    }
                 }
             }
             let mut file_fallback_rows = Vec::new();
@@ -1790,6 +1821,7 @@ where
             for (index, (row, value)) in commit_rows.iter().zip(&loaded).enumerate() {
                 if value.is_none()
                     && fallbacks[index].is_none()
+                    && !generation_cascades[index]
                     && row.deleted()
                     && let Some(file_id) = row.file_id()
                 {
@@ -1815,7 +1847,12 @@ where
             for (index, value) in file_fallback_rows.into_iter().zip(file_fallback_values) {
                 fallbacks[index] = value;
             }
-            for ((row, value), fallback) in commit_rows.iter().zip(loaded).zip(fallbacks) {
+            for (index, ((row, value), fallback)) in
+                commit_rows.iter().zip(loaded).zip(fallbacks).enumerate()
+            {
+                if generation_cascades[index] {
+                    continue;
+                }
                 if value.as_ref().is_some_and(|value| {
                     value.change_id == row.change_id()
                         && value.commit_id == row.commit_id()
@@ -1843,6 +1880,14 @@ where
                         "commit_id": commit_id.to_string(),
                         "row_ref": crate::row_ref::schema_identity_detail(row.schema_key(), row.row_pk()),
                         "file_id": row.file_id(),
+                        "row_deleted": row.deleted(),
+                        "row_updated_at": row.updated_at().to_string(),
+                        "delta_value": value.as_ref().map(|value| serde_json::json!({
+                            "change_id": value.change_id.to_string(),
+                            "commit_id": value.commit_id.to_string(),
+                            "deleted": value.deleted,
+                            "updated_at": value.updated_at().to_string(),
+                        })),
                     }),
                 ));
             }
@@ -7745,6 +7790,7 @@ mod tests {
                     commit_a.as_uuid().as_bytes(),
                 )),
                 crate::changelog::encode_commit_record(&CommitRecord {
+                    is_checkpoint: false,
                     touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                     format_version: 3,
                     base_commit_id: None,
