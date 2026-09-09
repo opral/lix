@@ -5255,37 +5255,6 @@ where
         load_tracked_working_diff_epoch(&self.store, branch_id).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn untracked_json_refs(
-        &self,
-        controls: &[(String, BranchHeadControl)],
-    ) -> Result<Vec<JsonRef>, LixError> {
-        let mut refs = BTreeSet::new();
-        self.collect_hot_json_refs(controls, true, &mut refs)
-            .await?;
-        Ok(refs.into_iter().map(JsonRef::from_hash_bytes).collect())
-    }
-
-    /// Collects the out-of-band JSON payload refs the published hot generation
-    /// of every live branch names.
-    ///
-    /// `untracked_only` selects the *authority* subset: an untracked row exists
-    /// nowhere else, so it is the only owner of its payload. Repository GC
-    /// deliberately passes `false` and takes the tracked rows too. Those rows
-    /// are a derived cache and their payloads are also named by a retained
-    /// commit, so including them cannot change which payloads are provably
-    /// dead — but a serving read materializes them straight out of this plane,
-    /// so a ref here that no longer resolves is a read failure, and the cost of
-    /// being wrong about the argument is unrecoverable.
-    pub(crate) async fn collect_hot_json_refs(
-        &self,
-        _controls: &[(String, BranchHeadControl)],
-        _untracked_only: bool,
-        _refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-    ) -> Result<(), LixError> {
-        Ok(())
-    }
-
     pub(crate) async fn working_diff_for_control(
         &self,
         branch_id: &str,
@@ -10327,7 +10296,7 @@ fn packed_working_diff_slot(slot: &Option<lix_schema::Jsonb>) -> WorkingDiffSlot
     match slot {
         None => WorkingDiffSlotFingerprint {
             kind: WORKING_DIFF_SLOT_NONE,
-            hash: [0; JSON_REF_BYTES],
+            hash: [0; CONTENT_HASH_BYTES],
         },
         Some(metadata) => WorkingDiffSlotFingerprint {
             kind: WORKING_DIFF_SLOT_INLINE,
@@ -10346,7 +10315,7 @@ fn packed_working_diff_snapshot(payload: Option<&[u8]>) -> WorkingDiffSlotFinger
     payload.map_or(
         WorkingDiffSlotFingerprint {
             kind: WORKING_DIFF_SLOT_NONE,
-            hash: [0; JSON_REF_BYTES],
+            hash: [0; CONTENT_HASH_BYTES],
         },
         |payload| WorkingDiffSlotFingerprint {
             // Working-diff equality only distinguishes absent from present
@@ -13672,7 +13641,7 @@ mod tests {
         ) -> Result<StorageGetManyResult, crate::storage_adapter::StorageError> {
             if requests
                 .iter()
-                .any(|request| request.space == crate::json_store::store::JSON_SPACE)
+                .any(|request| request.space == crate::storage_spaces::RETIRED_JSON_SPACE)
             {
                 self.json_get_many_calls.fetch_add(1, Ordering::Relaxed);
             }
@@ -14663,7 +14632,7 @@ mod tests {
         let row_pk = RowPk::single("packed-system-row");
         let snapshot = serde_json::json!({
             "key": "packed-system-row",
-            "value": "x".repeat(crate::json_store::JSON_INLINE_MAX_BYTES + 1),
+            "value": "x".repeat(1024 + 1),
         })
         .to_string();
         crate::test_support::seed_branch_head_with_rows(
@@ -15304,11 +15273,11 @@ mod tests {
             updated_at: timestamp(),
             snapshot: WorkingDiffSlotFingerprint {
                 kind: WORKING_DIFF_SLOT_NONE,
-                hash: [0; JSON_REF_BYTES],
+                hash: [0; CONTENT_HASH_BYTES],
             },
             metadata: WorkingDiffSlotFingerprint {
                 kind: WORKING_DIFF_SLOT_NONE,
-                hash: [0; JSON_REF_BYTES],
+                hash: [0; CONTENT_HASH_BYTES],
             },
         }
     }
@@ -16239,11 +16208,11 @@ mod tests {
             updated_at: timestamp(),
             snapshot: WorkingDiffSlotFingerprint {
                 kind: WORKING_DIFF_SLOT_NONE,
-                hash: [0; JSON_REF_BYTES],
+                hash: [0; CONTENT_HASH_BYTES],
             },
             metadata: WorkingDiffSlotFingerprint {
                 kind: WORKING_DIFF_SLOT_NONE,
-                hash: [0; JSON_REF_BYTES],
+                hash: [0; CONTENT_HASH_BYTES],
             },
         };
         let checkpoint_capacity = [&tracked, &tombstone, &untracked, &removed]

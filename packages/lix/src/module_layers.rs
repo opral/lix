@@ -40,13 +40,7 @@ const MODULE_LAYERS: &[&[&str]] = &[
     // its bytes through.
     &["storage_adapter"],
     // Value types and generic containers layered directly on the key space.
-    &[
-        "account",
-        "binary_cas",
-        "columnar_row_group",
-        "common",
-        "json_store",
-    ],
+    &["account", "binary_cas", "columnar_row_group", "common"],
     &["row_pk"],
     // Engine payload ownership shared by SQL, state and plugin ingress.
     &["row_payload"],

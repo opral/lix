@@ -101,11 +101,6 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 
 [[example]]
-name = "e1_json_leak"
-path = "examples/e1_json_leak.rs"
-required-features = ["storage-benches"]
-
-[[example]]
 name = "e24_cas_read_probe"
 path = "examples/e24_cas_read_probe.rs"
 required-features = ["rocksdb"]
@@ -170,11 +165,6 @@ required-features = ["storage-benches", "slatedb"]
 [[example]]
 name = "duplicate_audit"
 path = "examples/duplicate_audit.rs"
-required-features = ["storage-benches", "slatedb"]
-
-[[example]]
-name = "expu_json_delta"
-path = "examples/expu_json_delta.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[example]]
