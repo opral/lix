@@ -419,7 +419,13 @@ where
     let remote_id = server.url.clone();
     let headers = server.headers.clone();
     if let Some(transport) = initial_transport.as_ref() {
-        validate_connected_authority(lix, &remote_id, transport).await?;
+        validate_connected_authority(
+            lix,
+            &remote_id,
+            transport.lix_id(),
+            transport.active_account_id(),
+        )
+        .await?;
     }
     lix.set_sync_replica_remote_id(&remote_id)?;
     lix.storage_adapter().admit_sync_replica_writer();
@@ -488,9 +494,41 @@ where
             };
             match connected {
                 Ok(connected) => {
-                    if let Err(error) =
-                        validate_connected_authority(&lix, &remote_id, &connected).await
-                    {
+                    let validation = {
+                        let validation = validate_connected_authority(
+                            &lix,
+                            &remote_id,
+                            connected.lix_id(),
+                            connected.active_account_id(),
+                        )
+                        .fuse();
+                        let shutdown = shutdown_rx.changed().fuse();
+                        futures_util::pin_mut!(validation, shutdown);
+                        select_biased! {
+                            _ = shutdown => break,
+                            result = validation => result,
+                        }
+                    };
+                    if let Err(error) = validation {
+                        // Validation reads the local receipt. Exhausting its
+                        // bounded coherent-read retry budget is not evidence
+                        // that the remote identity or account changed.
+                        {
+                            let close = connected.close_session().fuse();
+                            let shutdown = shutdown_rx.changed().fuse();
+                            futures_util::pin_mut!(close, shutdown);
+                            select_biased! {
+                                _ = shutdown => break,
+                                _ = close => {},
+                            }
+                        }
+                        if is_retryable_authority_validation_error(&error) {
+                            tracing::warn!(error = ?error, "sync authority validation read expired");
+                            if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
+                                break;
+                            }
+                            continue;
+                        }
                         tracing::error!(error = ?error, "sync authority identity changed");
                         lix.fail_observers_for_sync(error.clone());
                         terminal_error = Some(error);
@@ -625,15 +663,38 @@ where
 async fn validate_connected_authority<StorageImpl>(
     lix: &Lix<StorageImpl>,
     remote_id: &str,
-    transport: &HttpSyncTransport,
+    authority_lix_id: &str,
+    active_account_id: &str,
 ) -> Result<(), LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    validate_authority_lix_id(lix.lix_id(), transport.lix_id())?;
-    lix.validate_sync_repository_account(remote_id, transport.active_account_id())
-        .await?;
-    lix.validate_sync_hot_state_authoritative().await
+    validate_authority_lix_id(lix.lix_id(), authority_lix_id)?;
+    let mut retry = crate::common::ExpiredReadRetryState::default();
+    loop {
+        let result = async {
+            lix.validate_sync_repository_account(remote_id, active_account_id)
+                .await?;
+            lix.validate_sync_hot_state_authoritative().await
+        }
+        .await;
+        match result {
+            Err(error) => {
+                let Some(delay) = retry.next_delay(&error) else {
+                    return Err(error);
+                };
+                tokio::task::yield_now().await;
+                if !delay.is_zero() {
+                    sleep(delay).await;
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+fn is_retryable_authority_validation_error(error: &LixError) -> bool {
+    error.code == LixError::CODE_STORAGE_READ_EXPIRED
 }
 
 fn validate_authority_lix_id(local: &str, authority: &str) -> Result<(), LixError> {
@@ -1982,6 +2043,8 @@ fn stopped_error() -> LixError {
 
 #[cfg(test)]
 mod tests {
+    mod reconnect_validation_tests;
+
     use super::*;
     use base64::Engine as _;
     use std::sync::Mutex;
