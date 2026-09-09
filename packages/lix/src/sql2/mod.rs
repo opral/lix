@@ -1,4 +1,3 @@
-mod authority_route;
 mod bind;
 mod branch_ref;
 mod branch_scope;
@@ -38,7 +37,6 @@ mod write_normalization;
 #[cfg(feature = "storage-benches")]
 pub(crate) use error::datafusion_error_to_lix_error;
 
-pub(crate) use authority_route::{StatementAuthorityRoute, statement_authority_route};
 #[cfg(test)]
 pub(crate) use bind::bind_statement;
 pub(crate) use bind::{

@@ -930,39 +930,6 @@ where
         execution_disposition(&statement)
     }
 
-    pub(crate) fn statement_authority_route(
-        &self,
-        sql: &str,
-    ) -> Result<sql2::StatementAuthorityRoute, LixError> {
-        let statement = self.sql_planning_cache.parse_statement(sql)?;
-        sql2::statement_authority_route(&statement)
-    }
-
-    pub(crate) fn batch_authority_route(
-        &self,
-        statements: &[ExecuteBatchStatement],
-    ) -> Result<sql2::StatementAuthorityRoute, LixError> {
-        let mut route = sql2::StatementAuthorityRoute::HotRead;
-        for (statement_index, statement) in statements.iter().enumerate() {
-            let parsed = self
-                .sql_planning_cache
-                .parse_statement(&statement.sql)
-                .map_err(|error| with_batch_statement_index(error, statement_index))?;
-            match sql2::statement_authority_route(&parsed)
-                .map_err(|error| with_batch_statement_index(error, statement_index))?
-            {
-                sql2::StatementAuthorityRoute::AuthorityWrite => {
-                    return Ok(sql2::StatementAuthorityRoute::AuthorityWrite);
-                }
-                sql2::StatementAuthorityRoute::AuthorityRead => {
-                    route = sql2::StatementAuthorityRoute::AuthorityRead;
-                }
-                sql2::StatementAuthorityRoute::HotRead => {}
-            }
-        }
-        Ok(route)
-    }
-
     /// Classifies an atomic SQL batch for a caller that owns its transport
     /// lifecycle.
     ///
@@ -5723,6 +5690,40 @@ mod tests {
                 .unwrap(),
             ExecutionDisposition::Durable
         );
+    }
+
+    #[tokio::test]
+    async fn current_and_historical_reads_share_replica_retry_disposition() {
+        let session = open_session().await;
+        let reads = [
+            "SELECT * FROM lix_file",
+            "SELECT * FROM lix_diff('lix_file')",
+            "SELECT * FROM lix_change",
+            "SELECT * FROM lix_log()",
+            "SELECT * FROM lix_commit",
+            "SELECT * FROM lix_history('lix_file')",
+            "SELECT * FROM lix_as_of('lix_file', $1)",
+            "SELECT * FROM lix_diff('lix_file', $1, $2)",
+            "SELECT * FROM lix_commit_ancestry($1)",
+            "EXPLAIN SELECT * FROM lix_history('lix_file')",
+        ];
+        for sql in reads {
+            assert_eq!(session.execution_disposition(sql).unwrap(),
+                ExecutionDisposition::CancellableRead, "{sql}");
+        }
+        let mut batch = reads.into_iter().map(batch_statement).collect::<Vec<_>>();
+        assert_eq!(session.execute_batch_disposition(&batch).unwrap(),
+            ExecutionDisposition::CancellableRead);
+        for sql in ["SELECT uuidv7()", "SELECT CURRENT_TIMESTAMP",
+            "UPDATE lix_file SET path = '/b' WHERE path = '/a'",
+            "EXPLAIN SELECT uuidv7()"] {
+            batch.push(batch_statement(sql));
+            assert_eq!(session.execution_disposition(sql).unwrap(),
+                ExecutionDisposition::Durable, "{sql}");
+            assert_eq!(session.execute_batch_disposition(&batch).unwrap(),
+                ExecutionDisposition::Durable, "{sql}");
+            batch.pop();
+        }
     }
 
     #[test]

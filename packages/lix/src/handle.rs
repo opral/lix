@@ -935,7 +935,7 @@ where
         }
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                let route = self.lix.session.statement_authority_route(&self.sql)?;
+                let route = self.lix.session.execution_disposition(&self.sql)?;
                 self.lix
                     .retry_replica_read(route, || {
                         self.lix.retry_sync_demands(|| {
@@ -996,7 +996,7 @@ where
         }
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                let route = self.lix.session.batch_authority_route(&self.statements)?;
+                let route = self.lix.session.execute_batch_disposition(&self.statements)?;
                 self.lix
                     .retry_replica_read(route, || {
                         self.lix.retry_sync_demands(|| {
@@ -1688,7 +1688,7 @@ where
         range: Option<std::ops::Range<u64>>,
     ) -> Result<Option<lix::FileRead>, LixError> {
         let path = path.into();
-        self.retry_replica_read(crate::sql2::StatementAuthorityRoute::HotRead, || {
+        self.retry_replica_read(ExecutionDisposition::CancellableRead, || {
             self.retry_sync_demands(|| self.session.read_file_content(path.clone(), range.clone()))
         })
         .await
@@ -1719,7 +1719,7 @@ where
         // an already committed attempt replays its durable receipt.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                let route = self.session.statement_authority_route(&sql)?;
+                let route = self.session.execution_disposition(&sql)?;
                 self.retry_replica_read(route, || {
                     self.retry_sync_demands(|| {
                         Arc::clone(&self.session).execute_with_idempotency_and_options_and_metadata(
@@ -1774,7 +1774,7 @@ where
                 label: None,
             })
             .collect::<Vec<_>>();
-        let route = self.session.batch_authority_route(&routed);
+        let route = self.session.execute_batch_disposition(&routed);
         let session = Arc::clone(&self.session);
         let demand_tx = self.sync_demand_tx.clone();
         // SAFETY: the future owns its local session and statement values, as
@@ -1782,7 +1782,7 @@ where
         // coherent snapshot after hydration releases the old read scope.
         unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                if route? == crate::sql2::StatementAuthorityRoute::AuthorityWrite {
+                if route? == ExecutionDisposition::Durable {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PARAM,
                         "execute_coherent_read_batch only accepts read statements without durable runtime functions",
@@ -1835,7 +1835,7 @@ where
         // caller's original key.
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                let route = self.session.batch_authority_route(&statements)?;
+                let route = self.session.execute_batch_disposition(&statements)?;
                 self.retry_replica_read(route, || {
                     self.retry_sync_demands(|| {
                         Arc::clone(&self.session)
@@ -2023,14 +2023,14 @@ where
     /// enter it, so retrying cannot duplicate a mutation.
     async fn retry_replica_read<T, Operation, OperationFuture>(
         &self,
-        route: crate::sql2::StatementAuthorityRoute,
+        route: ExecutionDisposition,
         mut operation: Operation,
     ) -> Result<T, LixError>
     where
         Operation: FnMut() -> OperationFuture,
         OperationFuture: Future<Output = Result<T, LixError>>,
     {
-        if route != crate::sql2::StatementAuthorityRoute::AuthorityWrite
+        if route != ExecutionDisposition::Durable
             && self.engine.sync_mode().role() == crate::sync::SyncRole::Replica
         {
             retry_expired_read(operation).await
@@ -3187,7 +3187,7 @@ mod tests {
         let attempts = AtomicUsize::new(0);
 
         let result = lix
-            .retry_replica_read(crate::sql2::StatementAuthorityRoute::HotRead, || {
+            .retry_replica_read(ExecutionDisposition::CancellableRead, || {
                 let attempt = attempts.fetch_add(1, Ordering::Relaxed);
                 std::future::ready(if attempt == 0 {
                     Err(LixError::new(
@@ -3213,7 +3213,7 @@ mod tests {
         let attempts = AtomicUsize::new(0);
 
         let error = lix
-            .retry_replica_read(crate::sql2::StatementAuthorityRoute::AuthorityWrite, || {
+            .retry_replica_read(ExecutionDisposition::Durable, || {
                 attempts.fetch_add(1, Ordering::Relaxed);
                 std::future::ready(Err::<(), _>(LixError::new(
                     LixError::CODE_STORAGE_READ_EXPIRED,
