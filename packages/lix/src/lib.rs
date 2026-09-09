@@ -69,6 +69,8 @@ pub(crate) mod domain;
 mod engine;
 pub(crate) mod row_columnar;
 pub(crate) mod row_pk;
+pub(crate) mod row_payload;
+pub(crate) mod row_state;
 pub(crate) mod row_ref;
 pub(crate) mod filesystem;
 pub(crate) mod functions;
@@ -86,7 +88,6 @@ mod hot_row_tombstone_probe;
 mod json_predicate_pushdown_probe;
 pub(crate) mod hot_state;
 pub(crate) mod init;
-pub(crate) mod json_store;
 mod migration;
 mod open_types;
 /// The declared module layer order and the test that enforces it. Test-only:

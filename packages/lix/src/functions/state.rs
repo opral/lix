@@ -68,7 +68,7 @@ pub(crate) async fn stage_sequence(
         "value": sequence.highest_seen,
     });
     let row_pk = RowPk::single(DETERMINISTIC_SEQUENCE_KEY);
-    let decoded_snapshot = Arc::new(crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+    let decoded_snapshot = Arc::new(crate::row_payload::TypedRow::from_builtin_json(
         KEY_VALUE_SCHEMA_KEY,
         &row_pk,
         &snapshot_content,
@@ -601,7 +601,7 @@ mod tests {
             .expect("global control should exist");
         let snapshot_value: JsonValue =
             serde_json::from_str(&snapshot_content).expect("test key-value snapshot should parse");
-        let decoded_snapshot = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+        let decoded_snapshot = crate::row_payload::TypedRow::from_builtin_json(
             KEY_VALUE_SCHEMA_KEY,
             &row_pk,
             &snapshot_value,

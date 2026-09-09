@@ -129,8 +129,7 @@ export type LixStoragePrecondition =
 			kind: "rangeEmpty";
 			space: LixStorageSpace;
 			range: LixStorageKeyRange;
-	  }
-	| { kind: "branchEquals"; refKey: Uint8Array; expected: Uint8Array };
+	  };
 
 export type LixStorageGetManyRequest = {
 	space: LixStorageSpace;

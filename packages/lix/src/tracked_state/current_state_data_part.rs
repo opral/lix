@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn native_parts_round_trip_snapshot_without_json() {
-        let typed = crate::plugin::runtime::WasmTypedRow {
+        let typed = crate::row_payload::TypedRow {
             schema_fingerprint: [8; 32],
             row_pk: vec![lix_schema::Value::Text("typed-row".to_owned())].into(),
             row: lix_schema::Row::from([("value".to_owned(), lix_schema::Value::Int8(7))]),
@@ -311,7 +311,7 @@ mod tests {
             .expect("typed current-state part should decode");
         assert_eq!(decoded[0], row);
         assert_eq!(
-            crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+            crate::row_payload::TypedRow::decode_durable_payload(
                 decoded[0].snapshot.clone().into(),
                 "schema",
                 &crate::row_pk::RowPk::single("typed-row"),

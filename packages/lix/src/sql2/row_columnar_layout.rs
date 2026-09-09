@@ -5,8 +5,8 @@
 //! projection decoder remains the single value-conversion contract; this
 //! module only chooses physical row groups and delegates their encoding.
 
+use crate::row_columnar::{EncodedRowGroups, RowGroupLocations};
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Deref;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, StringArray};
@@ -16,19 +16,16 @@ use serde_json::Value as JsonValue;
 
 use crate::LixError;
 use crate::columnar_row_group::{
-    EncodedRowGroupSet, ROW_GROUP_MAX_ROWS, RowGroupRowLocation,
-    encode_row_group_set_preserving_batches,
+    ROW_GROUP_MAX_ROWS, RowGroupRowLocation, encode_row_group_set_preserving_batches,
 };
 use crate::row_pk::RowPk;
-use crate::sql2::{
-    SchemaColumnType, RowProjectionDecoder, SchemaSurfaceSpec, row_visible_fields,
-};
+use crate::sql2::{RowProjectionDecoder, SchemaColumnType, SchemaSurfaceSpec, row_visible_fields};
 
 pub(crate) const ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
     "lix.row_columnar.layout_fingerprint.v1";
 pub(crate) const ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
     "lix.row_columnar.base_coordinates.v1";
-pub(crate) use crate::hot_state::{
+pub(crate) use crate::row_columnar::{
     ROW_COLUMNAR_IDENTITY_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
 };
 pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
@@ -65,72 +62,6 @@ impl RowColumnarRowRef<'_> {
                 _ => None,
             })
             .or_else(|| self.snapshot_value?.get(name)?.as_str())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct EncodedRowGroups {
-    encoded: EncodedRowGroupSet,
-    pub(crate) input_locations: RowGroupLocations,
-}
-
-/// Input-row to physical-row mapping for one sealed row generation.
-///
-/// Identity-preserving batches use arithmetic coordinates and retain no
-/// row-cardinal location column. Clustered layouts keep the explicit
-/// permutation required to map their reordered rows back to statement order.
-#[derive(Clone, Debug)]
-pub(crate) enum RowGroupLocations {
-    Dense { row_count: usize },
-    Explicit(Vec<RowGroupRowLocation>),
-}
-
-impl RowGroupLocations {
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Dense { row_count } => *row_count,
-            Self::Explicit(locations) => locations.len(),
-        }
-    }
-
-    pub(crate) fn location(&self, input_index: usize) -> Option<RowGroupRowLocation> {
-        match self {
-            Self::Dense { row_count } if input_index < *row_count => Some(RowGroupRowLocation {
-                group_index: u32::try_from(input_index / ROW_GROUP_MAX_ROWS).ok()?,
-                row_index: u32::try_from(input_index % ROW_GROUP_MAX_ROWS).ok()?,
-            }),
-            Self::Dense { .. } => None,
-            Self::Explicit(locations) => locations.get(input_index).copied(),
-        }
-    }
-
-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = RowGroupRowLocation> + '_ {
-        (0..self.len()).map(|input_index| {
-            self.location(input_index)
-                .expect("row-group location covers every input row")
-        })
-    }
-}
-
-impl PartialEq for RowGroupLocations {
-    fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().eq(other.iter())
-    }
-}
-
-impl Eq for RowGroupLocations {}
-
-impl Deref for EncodedRowGroups {
-    type Target = EncodedRowGroupSet;
-
-    fn deref(&self) -> &Self::Target {
-        &self.encoded
-    }
-}
-
-impl EncodedRowGroups {
-    pub(crate) fn into_parts(self) -> (EncodedRowGroupSet, RowGroupLocations) {
-        (self.encoded, self.input_locations)
     }
 }
 
@@ -315,13 +246,11 @@ where
             let key = cluster_fields
                 .iter()
                 .map(|field| match field {
-                    ClusterField::Boolean(name) => {
-                        match row.boolean(name) {
-                            Some(false) => 0,
-                            Some(true) => 1,
-                            None => 2,
-                        }
-                    }
+                    ClusterField::Boolean(name) => match row.boolean(name) {
+                        Some(false) => 0,
+                        Some(true) => 1,
+                        None => 2,
+                    },
                     ClusterField::String(name, dictionary) => row
                         .string(name)
                         .and_then(|value| dictionary.get(value).copied())
@@ -370,9 +299,7 @@ where
             input_locations
                 .into_iter()
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    row_columnar_error("row-group permutation omitted an input row")
-                })?,
+                .ok_or_else(|| row_columnar_error("row-group permutation omitted an input row"))?,
         ),
     })
 }

@@ -658,7 +658,7 @@ pub(crate) struct CommitDeltaMember {
 pub(crate) struct RetainedCommitSnapshot {
     pub(crate) key: TrackedStateKey,
     pub(crate) deleted: bool,
-    pub(crate) decoded_snapshot: Option<Arc<crate::plugin::runtime::WasmTypedRow>>,
+    pub(crate) decoded_snapshot: Option<Arc<crate::row_payload::TypedRow>>,
 }
 
 impl CommitDeltaMember {
@@ -10982,7 +10982,7 @@ pub(crate) async fn load_retained_commit_snapshots_for_schemas(
                 .change
                 .snapshot
                 .map(|payload| {
-                    crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+                    crate::row_payload::TypedRow::decode_durable_payload(
                         payload.into(),
                         &member.key.schema_key,
                         &member.key.row_pk,
@@ -17442,7 +17442,7 @@ mod tests {
 
     #[test]
     fn prepared_compact_cache_is_bound_to_directory_rows_and_generation_authority() {
-        let typed = crate::plugin::runtime::WasmTypedRow {
+        let typed = crate::row_payload::TypedRow {
             schema_fingerprint: [9; 32],
             row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
             row: lix_schema::Row::from([("value".to_owned(), lix_schema::Value::Int8(7))]),
@@ -17495,7 +17495,7 @@ mod tests {
         let typed = fixtures
             .iter()
             .enumerate()
-            .map(|(index, _fixture)| crate::plugin::runtime::WasmTypedRow {
+            .map(|(index, _fixture)| crate::row_payload::TypedRow {
                 schema_fingerprint: [11; 32],
                 row_pk: vec![lix_schema::Value::Text(format!("row-{index:04}"))].into(),
                 row: lix_schema::Row::from([("value".to_owned(), lix_schema::Value::Int8(7))]),
@@ -18528,7 +18528,7 @@ mod tests {
     }
 
     fn native_snapshot_payload(row_pk: &RowPk, value: serde_json::Value) -> Vec<u8> {
-        crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(row_pk, &value)
+        crate::row_payload::TypedRow::from_test_json_unchecked(row_pk, &value)
             .expect("test row should build")
             .durable_payload()
             .expect("test typed snapshot should encode")

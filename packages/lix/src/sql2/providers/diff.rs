@@ -22,7 +22,7 @@ use crate::NullableKeyFilter;
 use crate::branch::BranchHeadControlContext;
 use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::hot_state::TrackedHeadContext;
-use crate::plugin::runtime::WasmTypedRow;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::{RowPk, RowPkComponent, RowPkComponentType};
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::catalog::schema_surface::SchemaSurfaceSpec;

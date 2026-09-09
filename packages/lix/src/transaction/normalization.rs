@@ -265,16 +265,15 @@ pub(crate) fn normalize_raw_write_row_in_place(
                 }),
             ));
         }
-        let typed =
-            std::sync::Arc::new(crate::plugin::runtime::WasmTypedRow::from_normalized_json(
-                schema_plan,
-                row.row_pk
-                    .as_ref()
-                    .expect("certified live row has a proven primary key"),
-                row.snapshot_json()
-                    .expect("certified live row retains row content")
-                    .value(),
-            )?);
+        let typed = std::sync::Arc::new(crate::row_payload::TypedRow::from_normalized_json(
+            schema_plan,
+            row.row_pk
+                .as_ref()
+                .expect("certified live row has a proven primary key"),
+            row.snapshot_json()
+                .expect("certified live row retains row content")
+                .value(),
+        )?);
         rows.set_decoded_snapshot(row_index, Some(typed));
         canonicalize_descriptor_file_id(rows, row_index)?;
         return Ok(NormalizedRowFacts {
@@ -349,7 +348,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
 
     let converted_typed = if let Some(snapshot) = normalized_snapshot.as_ref() {
         Some(std::sync::Arc::new(
-            crate::plugin::runtime::WasmTypedRow::from_normalized_json(
+            crate::row_payload::TypedRow::from_normalized_json(
                 schema_plan,
                 row.row_pk.expect("normalized live row has a primary key"),
                 snapshot.value(),
@@ -904,7 +903,7 @@ mod tests {
             .1
             .fingerprint()
             .bytes();
-        let typed = std::sync::Arc::new(crate::plugin::runtime::WasmTypedRow {
+        let typed = std::sync::Arc::new(crate::row_payload::TypedRow {
             schema_fingerprint: fingerprint,
             row_pk: vec![lix_schema::Value::Text("right-id".to_owned())].into(),
             row: lix_schema::Row::from([
@@ -961,7 +960,7 @@ mod tests {
             .1
             .fingerprint()
             .bytes();
-        let typed = std::sync::Arc::new(crate::plugin::runtime::WasmTypedRow {
+        let typed = std::sync::Arc::new(crate::row_payload::TypedRow {
             schema_fingerprint: fingerprint,
             row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
             row: lix_schema::Row::from([(

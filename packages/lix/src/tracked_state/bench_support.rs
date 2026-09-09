@@ -1082,7 +1082,7 @@ impl PackedHistoryDelta {
                 )
                 .expect("shared large benchmark payload is JSON"),
             };
-            crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+            crate::row_payload::TypedRow::from_test_json_unchecked(
                 &RowPk::single(row_pk.clone()),
                 &snapshot,
             )

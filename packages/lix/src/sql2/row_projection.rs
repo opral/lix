@@ -12,8 +12,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use datafusion::arrow::buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion::common::DataFusionError;
@@ -22,7 +21,6 @@ use serde_json::Value as JsonValue;
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
 
-use crate::{LixError, ResultColumnType};
 use crate::plugin::wire::typed::{
     BorrowedNativeValue, CertifiedNativeProjectionSegment, CertifiedNativeScalarKind,
     ValidatedNativePayload,
@@ -31,6 +29,7 @@ use crate::row_pk::{RowPk, RowPkComponent};
 use crate::sql2::catalog::{SchemaColumnType, SchemaSurfaceSpec};
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
+use crate::{LixError, ResultColumnType};
 
 /// A projection decoder for the general row provider.
 pub(crate) struct RowProjectionDecoder {
@@ -346,9 +345,9 @@ impl RowProjectionDecoder {
     ) -> Result<(), LixError> {
         let decoded;
         let payload = if payload.first().copied()
-            == Some(crate::plugin::runtime::COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION)
+            == Some(crate::row_payload::COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION)
         {
-            decoded = crate::plugin::runtime::decompress_engine_row_payload(payload)?;
+            decoded = crate::row_payload::decompress_engine_row_payload(payload)?;
             decoded.as_ref()
         } else {
             payload
@@ -357,11 +356,9 @@ impl RowProjectionDecoder {
             Some(
                 crate::plugin::wire::typed::NATIVE_ROW_PAYLOAD_VERSION
                 | crate::plugin::wire::typed::STORAGE_ROW_PAYLOAD_VERSION,
-            ) => self.decode_native_payload_into(
-                NativeProjectionPayload::Raw(payload),
-                row_pk,
-                sink,
-            ),
+            ) => {
+                self.decode_native_payload_into(NativeProjectionPayload::Raw(payload), row_pk, sink)
+            }
             Some(crate::plugin::wire::typed::ENGINE_ROW_PAYLOAD_VERSION) => {
                 self.decode_engine_payload_into(payload, row_pk, sink)
             }
@@ -480,14 +477,22 @@ impl RowProjectionDecoder {
                             let value = envelope
                                 .projection()
                                 .field_value(row_ordinal, field_ordinal)
-                                .ok_or_else(|| native_shape_error(&self.schema_key, "certified projection omitted a field value"))?;
+                                .ok_or_else(|| {
+                                    native_shape_error(
+                                        &self.schema_key,
+                                        "certified projection omitted a field value",
+                                    )
+                                })?;
                             let slot = self.expected_field_slots
                                 [self.expected_field_slot_ranges[field_ordinal].start];
                             column.push_from_native(value, &self.fields[slot], &self.schema_key)?;
                         }
                     }
                     envelope.cache_arrow_columns(
-                        sink.columns.into_iter().map(RowProjectionColumn::into_array).collect(),
+                        sink.columns
+                            .into_iter()
+                            .map(RowProjectionColumn::into_array)
+                            .collect(),
                     )
                 };
                 cached_parts.push(cached);
@@ -497,30 +502,60 @@ impl RowProjectionDecoder {
                 if cached_parts.len() == 1 {
                     combined.push(Arc::clone(&cached_parts[0][expected_ordinal]));
                 } else {
-                    let arrays = cached_parts.iter().map(|columns| columns[expected_ordinal].as_ref()).collect::<SmallVec<[&dyn Array; 8]>>();
-                    combined.push(datafusion::arrow::compute::concat(&arrays).map_err(|_| native_shape_error(&self.schema_key, "certified Arrow segments could not be concatenated"))?);
+                    let arrays = cached_parts
+                        .iter()
+                        .map(|columns| columns[expected_ordinal].as_ref())
+                        .collect::<SmallVec<[&dyn Array; 8]>>();
+                    combined.push(datafusion::arrow::compute::concat(&arrays).map_err(|_| {
+                        native_shape_error(
+                            &self.schema_key,
+                            "certified Arrow segments could not be concatenated",
+                        )
+                    })?);
                 }
             }
             let cached = batch.cache_combined_arrow_columns(combined);
             return self.reorder_certified_full_columns(cached);
         }
         let mut sink = ArrowProjectionSink {
-            columns: self.fields.iter().map(|field| RowProjectionColumn::new(field.column_type, batch.len())).collect(),
+            columns: self
+                .fields
+                .iter()
+                .map(|field| RowProjectionColumn::new(field.column_type, batch.len()))
+                .collect(),
         };
         for envelope in std::iter::once(first).chain(segments) {
             let segment = envelope.projection();
             self.validate_certified_native_outer_keys(envelope)?;
             for row_ordinal in 0..segment.row_count() {
                 for (field_ordinal, slots) in self.expected_field_slot_ranges.iter().enumerate() {
-                    if slots.is_empty() { continue; }
-                    let value = segment.field_value(row_ordinal, field_ordinal).ok_or_else(|| native_shape_error(&self.schema_key, "certified projection omitted a field value"))?;
+                    if slots.is_empty() {
+                        continue;
+                    }
+                    let value =
+                        segment
+                            .field_value(row_ordinal, field_ordinal)
+                            .ok_or_else(|| {
+                                native_shape_error(
+                                    &self.schema_key,
+                                    "certified projection omitted a field value",
+                                )
+                            })?;
                     for &slot in &self.expected_field_slots[slots.clone()] {
-                        sink.columns[slot].push_from_native(value, &self.fields[slot], &self.schema_key)?;
+                        sink.columns[slot].push_from_native(
+                            value,
+                            &self.fields[slot],
+                            &self.schema_key,
+                        )?;
                     }
                 }
             }
         }
-        Ok(sink.columns.into_iter().map(RowProjectionColumn::into_array).collect())
+        Ok(sink
+            .columns
+            .into_iter()
+            .map(RowProjectionColumn::into_array)
+            .collect())
     }
 
     fn reorder_certified_full_columns(
@@ -551,8 +586,7 @@ impl RowProjectionDecoder {
     ) -> Result<(), LixError> {
         if segment.schema_fingerprint() != self.schema_fingerprint
             || segment.fields().len() != self.expected_fields.len()
-            || (!has_outer_row_keys
-                && segment.key_kinds() != self.primary_key_kinds.as_slice())
+            || (!has_outer_row_keys && segment.key_kinds() != self.primary_key_kinds.as_slice())
             || (has_outer_row_keys && !segment.key_kinds().is_empty())
         {
             return Err(native_shape_error(
@@ -575,7 +609,8 @@ impl RowProjectionDecoder {
             }
         }
         if !has_outer_row_keys {
-            for (key_ordinal, &field_ordinal) in self.primary_key_field_ordinals.iter().enumerate() {
+            for (key_ordinal, &field_ordinal) in self.primary_key_field_ordinals.iter().enumerate()
+            {
                 if !segment.key_equals_field(key_ordinal, field_ordinal) {
                     return Err(native_shape_error(
                         &self.schema_key,
@@ -1765,7 +1800,10 @@ mod tests {
         crate::order_preserving_key::write_row_pk(&mut encoded, &row_pk);
         let expected = || [Some(BorrowedNativeValue::Text("row-a"))].into_iter();
 
-        assert!(!encoded_row_key_matches(&encoded[..encoded.len() - 1], expected()));
+        assert!(!encoded_row_key_matches(
+            &encoded[..encoded.len() - 1],
+            expected()
+        ));
         let mut trailing = encoded.clone();
         trailing.push(0);
         assert!(!encoded_row_key_matches(&trailing, expected()));
@@ -1993,11 +2031,10 @@ mod tests {
             &row,
         )
         .expect("native payload should encode");
-        let wrong_fingerprint =
-            crate::plugin::wire::typed::ValidatedNativePayload::try_new(bytes::Bytes::from(
-                wrong_fingerprint_payload,
-            ))
-            .expect("wire validation does not bind a resolved schema");
+        let wrong_fingerprint = crate::plugin::wire::typed::ValidatedNativePayload::try_new(
+            bytes::Bytes::from(wrong_fingerprint_payload),
+        )
+        .expect("wire validation does not bind a resolved schema");
         let error = decoder
             .decode_validated_native_payload_arrow_columns([(&wrong_fingerprint, &row_pk)])
             .expect_err("proof does not replace fingerprint validation");
