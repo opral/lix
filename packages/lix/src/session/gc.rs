@@ -816,13 +816,23 @@ mod tests {
                 .expect("padding checkpoint succeeds");
         }
 
-        // Production schedules this sweep in the background. The explicit
-        // call takes the same repository write gate, so it either performs the
-        // sweep or observes that the scheduled collector already completed it.
-        session
-            .collect_checkpoint_garbage()
-            .await
-            .expect("checkpoint garbage collection succeeds");
+        // Production schedules this sweep in the background. Both collectors
+        // plan optimistically, so this explicit call may lose the commit race.
+        // Retry only that conflict; all other errors still fail the test.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match session.collect_checkpoint_garbage().await {
+                Ok(_) => break,
+                Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "checkpoint GC remained in conflict with its spawned sweep: {error:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("checkpoint garbage collection must succeed: {error:?}"),
+            }
+        }
         assert!(
             present(&session, std::slice::from_ref(&commit_d))
                 .await
