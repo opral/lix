@@ -832,9 +832,31 @@ impl WasmTypedRow {
             schema_key,
             &plan.compiled_schema,
             plan.fingerprint().bytes(),
-            stored_row_pk,
+            Some(stored_row_pk),
             row,
             true,
+        )
+    }
+
+    /// Validates an engine-owned native row and selects the same durable
+    /// encoding as catalog-backed JSON ingress, including compact builtin rows.
+    pub(crate) fn from_row(
+        plan: &crate::catalog::SchemaPlan,
+        row: lix_schema::Row,
+    ) -> Result<Self, LixError> {
+        plan.compiled_schema
+            .validate_complete_row(&row)
+            .map_err(|error| json_ingress_error(&plan.key.schema_key, error))?;
+        let engine_compact = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key(&plan.key.schema_key)
+            .is_some_and(|(_, builtin)| builtin.fingerprint() == plan.fingerprint());
+        Self::from_compiled_row(
+            &plan.key.schema_key,
+            &plan.compiled_schema,
+            plan.fingerprint().bytes(),
+            None,
+            row,
+            engine_compact,
         )
     }
 
@@ -871,7 +893,7 @@ impl WasmTypedRow {
             schema_key,
             compiled_schema,
             schema_fingerprint,
-            stored_row_pk,
+            Some(stored_row_pk),
             row,
             engine_compact,
         )
@@ -881,7 +903,7 @@ impl WasmTypedRow {
         schema_key: &str,
         compiled_schema: &lix_schema::CompiledSchema,
         schema_fingerprint: [u8; 32],
-        stored_row_pk: &RowPk,
+        stored_row_pk: Option<&RowPk>,
         row: lix_schema::Row,
         engine_compact: bool,
     ) -> Result<Self, LixError> {
@@ -909,7 +931,7 @@ impl WasmTypedRow {
                 ),
             )
         })?;
-        if &durable_row_pk != stored_row_pk {
+        if stored_row_pk.is_some_and(|stored| &durable_row_pk != stored) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
