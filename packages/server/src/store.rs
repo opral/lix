@@ -156,8 +156,44 @@ struct ManagerState {
     state_drop_probe: Option<CacheRootLeaseDropProbe>,
 }
 
+// Only expose fixed diagnostic text, never arbitrary storage errors or credentials.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MigrationDiagnostic {
+    pub source_code: Option<&'static str>,
+    pub message: &'static str,
+}
+
+impl MigrationDiagnostic {
+    pub(crate) fn from_error(error: &anyhow::Error) -> Self {
+        let source = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<lix_sdk::LixError>());
+        let source_code = source.and_then(|error| match error.code.as_str() {
+            "LIX_ERROR_MIGRATION_FAILED" => Some("LIX_ERROR_MIGRATION_FAILED"),
+            "LIX_ERROR_REPOSITORY_UPGRADE" => Some("LIX_ERROR_REPOSITORY_UPGRADE"),
+            _ => None,
+        });
+        let message = match source {
+            Some(error)
+                if error.message.starts_with("copy target write failed:")
+                    && error.message.contains("precondition failed") =>
+            {
+                "The migration could not copy repository data because the destination write precondition failed."
+            }
+            _ => {
+                "The migration could not complete. The service operator can inspect the server logs for the underlying cause."
+            }
+        };
+        Self {
+            source_code,
+            message,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FailedMigration {
+    diagnostic: MigrationDiagnostic,
     from_version: u32,
     to_version: u32,
 }
@@ -165,7 +201,7 @@ struct FailedMigration {
 #[derive(Clone, Copy)]
 enum FailedUpgrade {
     Versioned(FailedMigration),
-    Unversioned,
+    Unversioned(MigrationDiagnostic),
 }
 
 #[cfg(test)]
@@ -218,9 +254,16 @@ enum CleanupState {
 #[derive(Clone)]
 enum RuntimeOpenState {
     Opening,
-    Migrating { from_version: u32, to_version: u32 },
-    MigrationFailed { from_version: u32, to_version: u32 },
-    UpgradeFailed,
+    Migrating {
+        from_version: u32,
+        to_version: u32,
+    },
+    MigrationFailed {
+        from_version: u32,
+        to_version: u32,
+        diagnostic: MigrationDiagnostic,
+    },
+    UpgradeFailed(MigrationDiagnostic),
     Ready,
     Failed(Arc<str>),
 }
@@ -245,8 +288,9 @@ fn runtime_error_from_failed_upgrade(failure: FailedUpgrade) -> LixRuntimeError 
         FailedUpgrade::Versioned(failure) => LixRuntimeError::MigrationFailed {
             from_version: failure.from_version,
             to_version: failure.to_version,
+            diagnostic: failure.diagnostic,
         },
-        FailedUpgrade::Unversioned => LixRuntimeError::UpgradeFailed,
+        FailedUpgrade::Unversioned(diagnostic) => LixRuntimeError::UpgradeFailed(diagnostic),
     }
 }
 
@@ -289,10 +333,19 @@ enum GetRuntimeAction {
 pub(crate) enum LixRuntimeError {
     InvalidId,
     NotFound,
-    AtCapacity { max: usize },
-    Migrating { from_version: u32, to_version: u32 },
-    MigrationFailed { from_version: u32, to_version: u32 },
-    UpgradeFailed,
+    AtCapacity {
+        max: usize,
+    },
+    Migrating {
+        from_version: u32,
+        to_version: u32,
+    },
+    MigrationFailed {
+        from_version: u32,
+        to_version: u32,
+        diagnostic: MigrationDiagnostic,
+    },
+    UpgradeFailed(MigrationDiagnostic),
     Recovering,
     ShuttingDown,
     Cleanup(Arc<str>),
@@ -549,14 +602,16 @@ impl LixRuntimeManager {
                         RuntimeOpenState::MigrationFailed {
                             from_version,
                             to_version,
+                            diagnostic,
                         } => {
                             return Err(LixRuntimeError::MigrationFailed {
                                 from_version,
                                 to_version,
+                                diagnostic,
                             });
                         }
-                        RuntimeOpenState::UpgradeFailed => {
-                            return Err(LixRuntimeError::UpgradeFailed);
+                        RuntimeOpenState::UpgradeFailed(diagnostic) => {
+                            return Err(LixRuntimeError::UpgradeFailed(diagnostic));
                         }
                         RuntimeOpenState::Opening => {
                             if opened.changed().await.is_err() {
@@ -603,16 +658,18 @@ impl LixRuntimeManager {
                         opener.done.send_replace(RuntimeOpenState::Ready);
                     }
                     Err(error) => {
+                        let diagnostic = MigrationDiagnostic::from_error(&error);
                         let failed_upgrade = match opener.done.borrow().clone() {
                             RuntimeOpenState::Migrating {
                                 from_version,
                                 to_version,
                             } => Some(FailedUpgrade::Versioned(FailedMigration {
+                                diagnostic,
                                 from_version,
                                 to_version,
                             })),
                             _ if is_repository_upgrade_failure(&error) => {
-                                Some(FailedUpgrade::Unversioned)
+                                Some(FailedUpgrade::Unversioned(diagnostic))
                             }
                             _ => None,
                         };
@@ -632,15 +689,18 @@ impl LixRuntimeManager {
                                     opener.done.send_replace(RuntimeOpenState::MigrationFailed {
                                         from_version: failure.from_version,
                                         to_version: failure.to_version,
+                                        diagnostic: failure.diagnostic,
                                     });
                                 }
-                                FailedUpgrade::Unversioned => {
+                                FailedUpgrade::Unversioned(diagnostic) => {
                                     tracing::error!(
                                         lix_id = %opener.lix_id,
                                         error = %error,
                                         "Lix repository upgrade failed"
                                     );
-                                    opener.done.send_replace(RuntimeOpenState::UpgradeFailed);
+                                    opener
+                                        .done
+                                        .send_replace(RuntimeOpenState::UpgradeFailed(diagnostic));
                                 }
                             }
                         }
@@ -1310,7 +1370,7 @@ async fn close_runtime_after_open(
                     .context("wait for Lix runtime opening during shutdown")?;
             }
             RuntimeOpenState::MigrationFailed { .. }
-            | RuntimeOpenState::UpgradeFailed
+            | RuntimeOpenState::UpgradeFailed(_)
             | RuntimeOpenState::Failed(_) => return Ok(()),
             RuntimeOpenState::Ready => {
                 let runtime = runtime
@@ -1344,11 +1404,12 @@ impl fmt::Display for LixRuntimeError {
             Self::MigrationFailed {
                 from_version,
                 to_version,
+                ..
             } => write!(
                 formatter,
                 "lix repository migration from v{from_version} to v{to_version} failed"
             ),
-            Self::UpgradeFailed => write!(formatter, "lix repository upgrade failed"),
+            Self::UpgradeFailed(_) => write!(formatter, "lix repository upgrade failed"),
             Self::Recovering => write!(formatter, "lix runtime is recovering"),
             Self::ShuttingDown => write!(formatter, "lix server is shutting down"),
             Self::Cleanup(error) => write!(formatter, "lix runtime cleanup: {error}"),
@@ -2137,28 +2198,35 @@ mod tests {
     #[tokio::test]
     async fn failed_migration_remains_terminal_for_every_caller() {
         let manager = memory_manager(1).await;
+        let diagnostic =
+            MigrationDiagnostic::from_error(&anyhow::Error::new(lix_sdk::LixError::new(
+                "LIX_ERROR_MIGRATION_FAILED",
+                "copy target write failed: precondition failed: secret",
+            )));
         manager.state.lock().await.failed_upgrades.insert(
             LIX_A.to_string(),
             FailedUpgrade::Versioned(FailedMigration {
+                diagnostic,
                 from_version: 68,
                 to_version: 71,
             }),
         );
 
-        assert!(matches!(
-            manager.get(LIX_A).await,
-            Err(LixRuntimeError::MigrationFailed {
-                from_version: 68,
-                to_version: 71,
-            })
-        ));
-        assert!(matches!(
-            manager.get(LIX_A).await,
-            Err(LixRuntimeError::MigrationFailed {
-                from_version: 68,
-                to_version: 71,
-            })
-        ));
+        for _ in 0..2 {
+            match manager.get(LIX_A).await {
+                Err(LixRuntimeError::MigrationFailed {
+                    from_version,
+                    to_version,
+                    diagnostic: actual,
+                }) => {
+                    assert_eq!((from_version, to_version), (68, 71));
+                    assert_eq!(actual.source_code, Some("LIX_ERROR_MIGRATION_FAILED"));
+                    assert_eq!(actual.message, diagnostic.message);
+                    assert!(!actual.message.contains("secret"));
+                }
+                _ => panic!("expected terminal migration error with diagnostic"),
+            }
+        }
     }
 
     #[tokio::test]
