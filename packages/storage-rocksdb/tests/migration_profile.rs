@@ -87,7 +87,7 @@ where
     let mut writes = storage.new_write_set();
     for index in 0..entry_count {
         writes.put(
-            registered_spaces::JSON_SPACE,
+            registered_spaces::RETIRED_JSON_SPACE,
             Key(Bytes::from(format!("profile-{index:08}"))),
             StoredValue {
                 bytes: value.clone(),
@@ -121,7 +121,7 @@ async fn verify_seeded_payload<S>(
         .expect("begin migrated payload read");
     let mut cursor = read
         .begin_scan(
-            registered_spaces::JSON_SPACE,
+            registered_spaces::RETIRED_JSON_SPACE,
             KeyRange {
                 lower: Bound::Included(Key(Bytes::from_static(b"profile-"))),
                 upper: Bound::Excluded(Key(Bytes::from_static(b"profile."))),

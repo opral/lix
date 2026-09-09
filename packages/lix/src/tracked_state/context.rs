@@ -9151,7 +9151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inline_threshold_boundary_routes_payloads_deterministically() {
+    async fn typed_payloads_roundtrip_across_the_former_json_threshold() {
         // The hard cut keeps row payloads out of json_store on both sides of
         // the former outer-JSON threshold. Both must read back identically
         // from their typed payloads.
@@ -9160,7 +9160,7 @@ mod tests {
         // row_with_value wraps values as {"value":"<v>"} (12 framing bytes);
         // size the inner strings so the stored payloads land exactly at the
         // threshold and one byte over.
-        let at_len = crate::json_store::JSON_INLINE_MAX_BYTES;
+        let at_len = 1024;
         let over_len = at_len + 1;
         let rows = [
             row_with_value("row-at", "change-at", "commit-1", &"a".repeat(at_len - 12)),
@@ -9183,26 +9183,28 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let json_refs = [
-            crate::json_store::JsonRef::for_content(at_threshold.as_bytes()),
-            crate::json_store::JsonRef::for_content(over_threshold.as_bytes()),
-        ];
-        let stored = crate::json_store::JsonStoreContext::new()
-            .load_bytes_many(
-                &read,
-                crate::json_store::JsonLoadRequestRef {
-                    refs: &json_refs,
-                    scope: crate::json_store::JsonReadScopeRef::OutOfBand,
-                },
+        let mut retired = read
+            .begin_scan(
+                crate::storage_spaces::RETIRED_JSON_SPACE,
+                crate::storage_adapter::StoragePrefix {
+                    bytes: Bytes::new(),
+                }
+                .to_range()
+                .unwrap(),
+                crate::storage_adapter::StorageBeginScanOptions::default(),
             )
             .await
-            .expect("json_store boundary rows should load")
-            .into_values();
-        assert_eq!(stored[0], None, "threshold payload must avoid json_store");
-        assert_eq!(
-            stored[1], None,
-            "over-threshold payload must avoid json_store"
+            .expect("scan retired payload space");
+        assert!(
+            retired
+                .next_page(1)
+                .await
+                .unwrap()
+                .into_parts()
+                .0
+                .is_empty()
         );
+        drop(retired);
 
         let mut reader = tracked_state.reader(read);
         let scanned = reader
