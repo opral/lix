@@ -2603,7 +2603,7 @@ where
         statements: &[ExecuteBatchStatement],
         parsed: Vec<datafusion::sql::parser::Statement>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let acknowledge_file_views = parsed.iter().zip(statements).all(|(parsed, statement)| {
+        let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, statement)| {
             is_acknowledgeable_file_content_read(parsed, &statement.params)
                 || late_materialized_lix_file_content_read(parsed).is_some()
         });
@@ -2653,9 +2653,19 @@ where
                         };
                         let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
                         let mut results = Vec::with_capacity(statements.len());
+                        let mut file_view_mutations = Vec::new();
                         for (statement_index, (statement, parsed)) in
                             statements.iter().zip(parsed).enumerate()
                         {
+                            let acknowledge_statement =
+                                is_acknowledgeable_file_content_read(&parsed, &statement.params)
+                                    || late_materialized_lix_file_content_read(&parsed).is_some();
+                            // A mixed batch may return file bytes alongside metadata or
+                            // aggregates. Only the exact byte-returning statement may
+                            // update the session's private plugin observation.
+                            if let Some(collector) = &file_view_collector {
+                                collector.clear();
+                            }
                             let telemetry = SqlStatementTelemetry::start(
                                 self.telemetry.as_ref(),
                                 &statement.sql,
@@ -2686,12 +2696,14 @@ where
                                 telemetry.finish(&result);
                             }
                             results.push(result?);
+                            if acknowledge_statement {
+                                if let Some(collector) = &file_view_collector {
+                                    file_view_mutations.extend(collector.plugin_file_mutations());
+                                }
+                            }
                         }
                         drop(read_session);
                         drop(ctx);
-                        let file_view_mutations = file_view_collector
-                            .map(|collector| collector.plugin_file_mutations())
-                            .unwrap_or_default();
                         Ok((results, file_view_mutations))
                     }
                 },
@@ -2784,7 +2796,7 @@ where
                 }
             })
             .collect::<Result<Vec<_>, LixError>>()?;
-        let acknowledge_file_views = parsed.iter().zip(statements).all(|(parsed, (_, params))| {
+        let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, (_, params))| {
             is_acknowledgeable_file_content_read(parsed, params)
                 || late_materialized_lix_file_content_read(parsed).is_some()
         });
@@ -2869,9 +2881,19 @@ where
                             sql2::prepare_read_session_at_head(&ctx, active_branch_head, &parsed)
                                 .await?;
                         let mut results = Vec::with_capacity(statements.len());
+                        let mut file_view_mutations = Vec::new();
                         for (statement_index, ((sql, params), statement)) in
                             statements.iter().zip(parsed).enumerate()
                         {
+                            let acknowledge_statement =
+                                is_acknowledgeable_file_content_read(&statement, params)
+                                    || late_materialized_lix_file_content_read(&statement).is_some();
+                            // A mixed batch may return file bytes alongside metadata or
+                            // aggregates. Only the exact byte-returning statement may
+                            // update the session's private plugin observation.
+                            if let Some(collector) = &file_view_collector {
+                                collector.clear();
+                            }
                             let telemetry = SqlStatementTelemetry::start(
                                 self.telemetry.as_ref(),
                                 sql,
@@ -2897,12 +2919,14 @@ where
                                 telemetry.finish(&result);
                             }
                             results.push(result?);
+                            if acknowledge_statement {
+                                if let Some(collector) = &file_view_collector {
+                                    file_view_mutations.extend(collector.plugin_file_mutations());
+                                }
+                            }
                         }
                         drop(read_session);
                         drop(ctx);
-                        let file_view_mutations = file_view_collector
-                            .map(|collector| collector.plugin_file_mutations())
-                            .unwrap_or_default();
                         Ok((
                             CoherentReadBatch {
                                 active_branch_id,

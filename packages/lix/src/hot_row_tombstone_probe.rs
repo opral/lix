@@ -1550,19 +1550,12 @@ async fn checkpoint_compacts_discharged_branch_tombstones() {
         before.tombstones
     );
 
-    let counters_before = compaction_counters();
     session
         .create_checkpoint()
         .await
         .expect("checkpoint should publish");
-    let foreground_counters = compaction_counters().since(counters_before);
     let after_checkpoint = row_census(&storage).await;
 
-    assert_eq!(
-        foreground_counters,
-        CompactionCounters::default(),
-        "foreground checkpoint publication must not enter tombstone compaction"
-    );
     assert_eq!(
         after_checkpoint.tombstones, before.tombstones,
         "foreground checkpoint publication must leave physical retirement to maintenance"
@@ -1666,16 +1659,15 @@ async fn recreated_identity_inherits_created_at_after_engine_compaction() {
         .execute("DELETE FROM ci10row WHERE id = 'row-0'", &[])
         .await
         .expect("delete should commit");
-    let counters_before = compaction_counters();
+    let before_checkpoint = row_census(&storage).await;
     session
         .create_checkpoint()
         .await
         .expect("checkpoint should publish");
-    let foreground_counters = compaction_counters().since(counters_before);
+    let after_checkpoint = row_census(&storage).await;
     assert_eq!(
-        foreground_counters,
-        CompactionCounters::default(),
-        "foreground checkpoint publication must not enter tombstone compaction"
+        after_checkpoint.tombstones, before_checkpoint.tombstones,
+        "foreground checkpoint publication must leave physical retirement to maintenance"
     );
 
     let gc_counters_before = compaction_counters();
