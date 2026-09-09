@@ -3473,13 +3473,102 @@ impl LixRuntimeManager {
         self.retire_physical_cache_child(id, 0).await?;
         Ok(())
     }
+    async fn legacy_storage_present(&self, id: &str) -> Result<bool> {
+        let (store, prefix) = self.catalog_store();
+        Ok(store
+            .list(Some(&ObjectPath::from(format!("{prefix}{id}/"))))
+            .try_next()
+            .await?
+            .is_some())
+    }
+
+    /// Explicit host provisioning; no normal read path calls this operation.
+    pub(crate) async fn provision_repository(
+        self: &Arc<Self>,
+        id: String,
+        adopt_existing: bool,
+    ) -> Result<String, lix_sdk::server_protocol::LifecycleError> {
+        if !adopt_existing {
+            return self.create_repository_at_id(id, None, true).await;
+        }
+        use lix_sdk::server_protocol::LifecycleError;
+        let lifecycle = self.lifecycle_lock(&id).await;
+        let _lifecycle = lifecycle.write().await;
+        if let Some(record) = self
+            .repository_record(&id)
+            .await
+            .map_err(lifecycle_failure)?
+        {
+            if record.state == "live" {
+                return Ok(id);
+            }
+            return Err(LifecycleError::new(
+                http::StatusCode::CONFLICT,
+                "LIX_CREATE_UNAVAILABLE",
+                "Repository is deleted or has an unfinished creation.",
+            ));
+        }
+        if !self
+            .legacy_storage_present(&id)
+            .await
+            .map_err(lifecycle_failure)?
+        {
+            return Err(LifecycleError::new(
+                http::StatusCode::NOT_FOUND,
+                "LIX_NOT_FOUND",
+                "No existing physical repository to adopt.",
+            ));
+        }
+        let storage = self
+            .open_storage(&id, SlateDBIoCounters::default())
+            .map_err(lifecycle_failure)?;
+        lix_sdk::server_protocol::prepare_existing_repository(&storage)
+            .await
+            .map_err(|error| {
+                LifecycleError::new(
+                    http::StatusCode::CONFLICT,
+                    "LIX_INVALID_REPOSITORY",
+                    error.to_string(),
+                )
+            })?;
+        drop(storage);
+        self.retire_physical_cache_child(&id, 0)
+            .await
+            .map_err(lifecycle_failure)?;
+        let (catalog, prefix) = self.catalog_store();
+        catalog
+            .put_opts(
+                &ObjectPath::from(format!("{prefix}.lix-repositories/{id}.json")),
+                serde_json::to_vec(&RepositoryRecord {
+                    state: "live".to_owned(),
+                    fingerprint: None,
+                    storage_id: id.clone(),
+                    retired: Vec::new(),
+                })
+                .map_err(lifecycle_failure)?
+                .into(),
+                object_store::PutOptions {
+                    mode: object_store::PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| {
+                LifecycleError::new(
+                    http::StatusCode::CONFLICT,
+                    "LIX_PROVISION_CONFLICT",
+                    error.to_string(),
+                )
+            })?;
+        Ok(id)
+    }
+
     async fn create_repository(
         self: &Arc<Self>,
         scope: String,
         key: String,
         snapshot: Option<ServerProtocolBody>,
     ) -> Result<String, lix_sdk::server_protocol::LifecycleError> {
-        use lix_sdk::server_protocol::LifecycleError;
         let mut hasher = Hasher::new();
         hasher.update(b"lix-hosted-create-v1\0");
         hasher.update(&(scope.len() as u64).to_be_bytes());
@@ -3490,6 +3579,16 @@ impl LixRuntimeManager {
         id_bytes[6] = (id_bytes[6] & 0x0f) | 0x40;
         id_bytes[8] = (id_bytes[8] & 0x3f) | 0x80;
         let id = uuid::Uuid::from_bytes(id_bytes).to_string();
+        self.create_repository_at_id(id, snapshot, false).await
+    }
+
+    async fn create_repository_at_id(
+        self: &Arc<Self>,
+        id: String,
+        snapshot: Option<ServerProtocolBody>,
+        explicit_id: bool,
+    ) -> Result<String, lix_sdk::server_protocol::LifecycleError> {
+        use lix_sdk::server_protocol::LifecycleError;
         let lifecycle = self.lifecycle_lock(&id).await;
         let _lifecycle = lifecycle.write().await;
         let (catalog, prefix) = self.catalog_store();
@@ -3510,6 +3609,9 @@ impl LixRuntimeManager {
         };
         if let Some((record, _)) = &previous {
             if record.state == "live" {
+                if explicit_id {
+                    return Ok(id);
+                }
                 let fingerprint = fingerprint_body(snapshot)
                     .await
                     .map_err(lifecycle_failure)?;
@@ -3532,6 +3634,19 @@ impl LixRuntimeManager {
                     "This repository was deleted.",
                 ));
             }
+        }
+        if explicit_id
+            && previous.is_none()
+            && self
+                .legacy_storage_present(&id)
+                .await
+                .map_err(lifecycle_failure)?
+        {
+            return Err(LifecycleError::new(
+                http::StatusCode::CONFLICT,
+                "LIX_EXISTING_STORAGE",
+                "Existing physical storage must be explicitly adopted, not replaced.",
+            ));
         }
         // Each attempt owns fresh physical storage. Retrying an interrupted
         // import replaces only its catalog reservation with CAS; an older
@@ -3620,7 +3735,11 @@ impl LixRuntimeManager {
             };
             let (opened, _) = watch::channel(RuntimeOpenState::Opening);
             let runtime = self
-                .open_storage_runtime(&storage_id, &storage_id, &opened)
+                .open_storage_runtime(
+                    if explicit_id { &id } else { &storage_id },
+                    &storage_id,
+                    &opened,
+                )
                 .await?;
             let service = runtime
                 .acquire()
@@ -3910,6 +4029,125 @@ mod lifecycle_recovery_tests {
                 .await
                 .unwrap(),
             id
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_provisioning_tests {
+    use super::*;
+    const ID: &str = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
+
+    #[tokio::test]
+    async fn host_provisioning_preserves_legacy_data_and_never_recreates_deleted_storage() {
+        let manager = LixRuntimeManager::new_in_memory(4);
+        let storage = manager
+            .open_storage(ID, SlateDBIoCounters::default())
+            .unwrap();
+        let lix = lix_sdk::open_lix().with_storage(storage).await.unwrap();
+        lix.execute(
+            "INSERT INTO lix_key_value (key,value) VALUES ('legacy-proof','retained')",
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.close().await.unwrap();
+        drop(lix);
+        assert!(
+            manager
+                .provision_repository(ID.to_owned(), false)
+                .await
+                .is_err(),
+            "create-new must not hide legacy data"
+        );
+        assert!(manager.repository_record(ID).await.unwrap().is_none());
+        assert_eq!(
+            manager
+                .provision_repository(ID.to_owned(), true)
+                .await
+                .unwrap(),
+            ID
+        );
+        assert_eq!(
+            manager
+                .provision_repository(ID.to_owned(), true)
+                .await
+                .unwrap(),
+            ID
+        );
+        assert_eq!(
+            manager
+                .repository_record(ID)
+                .await
+                .unwrap()
+                .unwrap()
+                .storage_id,
+            ID
+        );
+        let storage = manager
+            .open_storage(ID, SlateDBIoCounters::default())
+            .unwrap();
+        let lix = lix_sdk::open_lix().with_storage(storage).await.unwrap();
+        let rows = lix
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key='legacy-proof'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("retained")
+        );
+        lix.close().await.unwrap();
+        drop(lix);
+        manager.delete_repository(ID.to_owned()).await.unwrap();
+        assert!(
+            manager
+                .provision_repository(ID.to_owned(), true)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .provision_repository(ID.to_owned(), false)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn host_provisioning_adoption_rejects_missing_and_uninitialized_storage() {
+        let manager = LixRuntimeManager::new_in_memory(4);
+        assert!(
+            manager
+                .provision_repository(ID.to_owned(), true)
+                .await
+                .is_err()
+        );
+        assert!(
+            !manager.legacy_storage_present(ID).await.unwrap(),
+            "missing adoption must not create physical storage"
+        );
+        let storage = manager
+            .open_storage(ID, SlateDBIoCounters::default())
+            .unwrap();
+        drop(storage);
+        assert!(
+            manager
+                .provision_repository(ID.to_owned(), true)
+                .await
+                .is_err()
+        );
+        assert!(manager.repository_record(ID).await.unwrap().is_none());
+        let storage = manager
+            .open_storage(ID, SlateDBIoCounters::default())
+            .unwrap();
+        assert!(
+            lix_sdk::server_protocol::prepare_existing_repository(&storage)
+                .await
+                .is_err(),
+            "adoption must not initialize empty storage"
         );
     }
 }

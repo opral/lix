@@ -195,3 +195,33 @@ To run a server, see [Hosting](./hosting.md).
 ### Typed sync rows (sync protocol version 9)
 
 Every live sync member and snapshot row includes `snapshotPayload`, the base64-encoded canonical Schema v1 typed row, alongside its JSON `snapshot` projection. Tombstones encode both fields as null. Receivers verify canonical encoding, primary-key identity, and agreement with the JSON projection before installing the payload. Preserving type information and schema fingerprints lets custom and plugin-defined rows sync without rebuilding them against the engine's built-in catalog. A retained row may predate the currently registered schema, so import preserves its authoring fingerprint rather than validating it against the current catalog. SQL reads retain their existing resolved-schema validation. Storage compression does not affect the wire encoding. Sync protocol 8 and earlier peers must upgrade; there is no JSON-only or checkpoint-marker fallback.
+
+## Reference-host provisioning
+
+The reference server also exposes an **internal host operation**, separate from
+interoperable `POST /lix/v1` creation:
+
+`POST /internal/repositories/{uuid}/provision` accepts JSON
+`{"mode":"create-new"}` or `{"mode":"adopt-existing"}` and returns `{ id, url }`
+with the requested canonical UUID. It requires a configured internal bearer
+token; a server without that token configured rejects this operation. Gateways
+must authorize ownership of the control-plane repository before invoking it.
+Normal reads, handshakes, and sync never invoke provisioning.
+
+`create-new` initializes fresh physical storage and durably publishes the
+requested ID using the lifecycle catalog. It refuses uncatalogued physical
+storage at that ID. `adopt-existing` verifies existing repository metadata and
+canonical branch heads/working baselines, applies supported format migrations,
+and publishes the existing storage in the catalog without replacing its data.
+Missing or incomplete storage fails adoption. Both operations may be retried;
+an already-live catalog entry is returned unchanged, and deleted repositories
+are never recreated.
+
+Before rolling out the lifecycle catalog to an existing host, quiesce old
+writers and explicitly adopt **all** legacy repository IDs, including public
+and demo repositories. Opening SlateDB may fence another writer and adoption
+may migrate the storage format. Authenticated UI provisioning alone is not a
+migration for anonymously accessed repositories. Preserve failed adoption cases
+for operator investigation; never fall back from adoption failure to creating
+an empty repository. New control-plane rows and demo fixtures must explicitly
+provision their storage before exposing links that require it.

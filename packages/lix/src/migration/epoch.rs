@@ -341,6 +341,38 @@ enum PointerState {
     },
 }
 
+/// Adoption may migrate existing banks but must never claim a fresh bank.
+pub(crate) async fn admit_existing_repository<S>(storage: &S) -> Result<StorageAdapter<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    match load_pointer(storage).await? {
+        None if matches!(
+            super::inspect_lix(storage).await?,
+            super::MigrationStatus::Missing
+        ) =>
+        {
+            return Err(LixError::new(
+                "LIX_NOT_FOUND",
+                "Existing repository format marker is missing.",
+            ));
+        }
+        Some((
+            PointerState::Migrating {
+                source_format: 0, ..
+            },
+            _,
+        )) => {
+            return Err(LixError::new(
+                "LIX_INVALID_REPOSITORY",
+                "Incomplete repository initialization cannot be adopted.",
+            ));
+        }
+        _ => {}
+    }
+    Ok(admit_repository(storage, None).await?.adapter)
+}
+
 pub(crate) async fn admit_repository<S>(
     storage: &S,
     progress: Option<&Arc<dyn OpenProgressSink>>,

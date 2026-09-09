@@ -195,6 +195,56 @@ fn response(status: StatusCode, value: serde_json::Value) -> ServerProtocolRespo
         .expect("valid response")
 }
 
+/// Validates existing storage for explicit host adoption, applying supported
+/// migrations without ever initializing an absent repository. Canonical branch
+/// heads and working baselines must exist before the host publishes its catalog.
+pub async fn prepare_existing_repository<S>(storage: &S) -> Result<(), crate::LixError>
+where
+    S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
+{
+    let adapter = crate::migration::admit_existing_repository(storage).await?;
+    let read = adapter
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+        .await?;
+    if !matches!(
+        crate::init::repository_protocol_status(&read).await?,
+        crate::init::RepositoryProtocolStatus::Current
+    ) {
+        return Err(crate::LixError::new(
+            "LIX_INVALID_REPOSITORY",
+            "Existing repository has no supported format marker.",
+        ));
+    }
+    let controls = crate::branch::BranchHeadControlContext::new()
+        .reader(&read)
+        .scan()
+        .await?;
+    if controls.is_empty() || !controls.iter().any(|(id, _)| id == crate::GLOBAL_BRANCH_ID) {
+        return Err(crate::LixError::new(
+            "LIX_INVALID_REPOSITORY",
+            "Existing repository has no canonical branch controls.",
+        ));
+    }
+    let mut graph = crate::commit_graph::CommitGraphContext::new().reader(&read);
+    for (_, control) in controls {
+        for id in
+            std::iter::once(control.head_commit_id).chain(control.working_diff_checkpoint_commit_id)
+        {
+            if graph.load_node(&id).await?.is_none()
+                || crate::tracked_state::load_commit_state_manifest(&read, id)
+                    .await?
+                    .is_none()
+            {
+                return Err(crate::LixError::new(
+                    "LIX_INVALID_REPOSITORY",
+                    format!("Existing repository is missing canonical serving root '{id}'."),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
