@@ -380,6 +380,17 @@ pub(crate) async fn admit_repository<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    admit_repository_with_server(storage, progress, None).await
+}
+
+pub(crate) async fn admit_repository_with_server<S>(
+    storage: &S,
+    progress: Option<&Arc<dyn OpenProgressSink>>,
+    server: Option<&crate::ServerOptions>,
+) -> Result<EpochAdmission<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
     'admission: loop {
         match load_pointer(storage).await? {
             Some((
@@ -398,8 +409,12 @@ where
                     )));
                 }
                 if format < crate::init::CURRENT_FORMAT_VERSION {
-                    return migrate_active(storage, bank, generation, format, bytes, progress)
-                        .await;
+                    // Keep cold migration/bootstrap state off the ordinary
+                    // open future's stack, including for filesystem adapters.
+                    return Box::pin(migrate_active(
+                        storage, bank, generation, format, bytes, progress, server,
+                    ))
+                    .await;
                 }
                 if generation >= 2 {
                     let _ = schedule_legacy_retirement(storage.clone(), bytes.clone());
@@ -464,7 +479,7 @@ where
                     }
                 }
             }
-            None => return admit_legacy(storage, progress).await,
+            None => return Box::pin(admit_legacy(storage, progress, server)).await,
         }
     }
 }
@@ -667,6 +682,7 @@ where
 async fn admit_legacy<S>(
     storage: &S,
     progress: Option<&Arc<dyn OpenProgressSink>>,
+    server: Option<&crate::ServerOptions>,
 ) -> Result<EpochAdmission<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -692,7 +708,7 @@ where
         });
         if let Err(error) = publish_migration_claim_absent(storage, &migrating_bytes).await {
             if is_admission_race(&error) {
-                return Box::pin(admit_repository(storage, progress)).await;
+                return Box::pin(admit_repository_with_server(storage, progress, server)).await;
             }
             return Err(storage_error(error));
         }
@@ -784,7 +800,7 @@ where
     let source_revision = match source.load_mutation_revision().await {
         Ok(revision) => revision,
         Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository(storage, progress)).await;
+            return Box::pin(admit_repository_with_server(storage, progress, server)).await;
         }
         Err(error) => return Err(storage_error(error)),
     };
@@ -800,7 +816,7 @@ where
         claim_legacy(storage, source_revision, &original_marker, &migrating_bytes).await
     {
         if is_admission_race(&error) {
-            return Box::pin(admit_repository(storage, progress)).await;
+            return Box::pin(admit_repository_with_server(storage, progress, server)).await;
         }
         return Err(storage_error(error));
     }
@@ -829,24 +845,40 @@ where
             .await
             .map_err(storage_error)?;
         let candidate_result = async {
-            clear_bank(&target).await?;
-            let _ = copy_repository(&migration_source, &target).await?;
-            write_candidate_page(
-                &target,
-                crate::init::REPOSITORY_PROTOCOL_SPACE,
-                single_put(
-                    crate::init::REPOSITORY_PROTOCOL_KEY,
-                    original_marker.clone(),
-                ),
-            )
-            .await
-            .map_err(|error| epoch_error(format!("candidate marker write failed: {error}")))?;
-            super::migrate_lix_with_adapter(
-                storage.clone(),
-                target.clone(),
-                super::MigrationOptions::automatic(),
-            )
+            let replica = Box::pin(inspect_replica_rebuild(
+                &migration_source,
+                from_format,
+                server,
+            ))
             .await?;
+            clear_bank(&target).await?;
+            if let Some((proof, server)) = replica {
+                Box::pin(crate::sync::rebuild_replica_candidate(
+                    target.clone(),
+                    server,
+                    &proof.repository_id,
+                    &proof.account_id,
+                ))
+                .await?;
+            } else {
+                let _ = copy_repository(&migration_source, &target).await?;
+                write_candidate_page(
+                    &target,
+                    crate::init::REPOSITORY_PROTOCOL_SPACE,
+                    single_put(
+                        crate::init::REPOSITORY_PROTOCOL_KEY,
+                        original_marker.clone(),
+                    ),
+                )
+                .await
+                .map_err(|error| epoch_error(format!("candidate marker write failed: {error}")))?;
+                super::migrate_lix_with_adapter(
+                    storage.clone(),
+                    target.clone(),
+                    super::MigrationOptions::automatic(),
+                )
+                .await?;
+            }
             emit_validating(progress, from_format);
             match super::inspect_lix_with_adapter(&target).await? {
                 super::MigrationStatus::Current { .. } => {}
@@ -905,6 +937,7 @@ async fn migrate_active<S>(
     from_format: u32,
     active_source_bytes: Bytes,
     progress: Option<&Arc<dyn OpenProgressSink>>,
+    server: Option<&crate::ServerOptions>,
 ) -> Result<EpochAdmission<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -925,7 +958,7 @@ where
     let source_revision = match source.load_mutation_revision().await {
         Ok(revision) => revision,
         Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository(storage, progress)).await;
+            return Box::pin(admit_repository_with_server(storage, progress, server)).await;
         }
         Err(error) => return Err(storage_error(error)),
     };
@@ -949,7 +982,7 @@ where
     {
         Ok(claim) => claim,
         Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository(storage, progress)).await;
+            return Box::pin(admit_repository_with_server(storage, progress, server)).await;
         }
         Err(error) => return Err(storage_error(error)),
     };
@@ -963,7 +996,7 @@ where
         resolve_exact_pointer_commit(storage, claim.commit().await, &migrating_bytes).await
     {
         if is_admission_race(&error) {
-            return Box::pin(admit_repository(storage, progress)).await;
+            return Box::pin(admit_repository_with_server(storage, progress, server)).await;
         }
         return Err(storage_error(error));
     }
@@ -988,14 +1021,30 @@ where
         );
 
         let candidate_result = async {
-            clear_bank(&target).await?;
-            let _ = copy_repository(&migration_source, &target).await?;
-            super::migrate_lix_with_adapter(
-                storage.clone(),
-                target.clone(),
-                super::MigrationOptions::automatic(),
-            )
+            let replica = Box::pin(inspect_replica_rebuild(
+                &migration_source,
+                from_format,
+                server,
+            ))
             .await?;
+            clear_bank(&target).await?;
+            if let Some((proof, server)) = replica {
+                Box::pin(crate::sync::rebuild_replica_candidate(
+                    target.clone(),
+                    server,
+                    &proof.repository_id,
+                    &proof.account_id,
+                ))
+                .await?;
+            } else {
+                let _ = copy_repository(&migration_source, &target).await?;
+                super::migrate_lix_with_adapter(
+                    storage.clone(),
+                    target.clone(),
+                    super::MigrationOptions::automatic(),
+                )
+                .await?;
+            }
             emit_validating(progress, from_format);
             let engine = Engine::new_with_adapter(target.clone(), EngineOptions::new()).await?;
             drop(engine);
@@ -1100,6 +1149,31 @@ where
         .map_err(storage_error)?;
     write.commit().await.map_err(storage_error)?;
     Ok(())
+}
+
+async fn inspect_replica_rebuild<'a, S>(
+    source: &StorageAdapter<S>,
+    source_format: u32,
+    server: Option<&'a crate::ServerOptions>,
+) -> Result<Option<(crate::sync::CleanReplicaProof, &'a crate::ServerOptions)>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    // A current-format repository in the legacy physical layout only needs an
+    // epoch copy. It must retain its existing offline replica admission; there
+    // is no historical format migration to replace with a server rebuild.
+    if source_format == crate::init::CURRENT_FORMAT_VERSION {
+        return Ok(None);
+    }
+    // The exact migration claim already fences ordinary writers. Prove the
+    // entire replica is clean in one source snapshot before any candidate work.
+    let read = source.begin_read(ReadOptions::default()).await?;
+    let Some(proof) = crate::sync::inspect_replica_rebuild_safety(&read, source_format).await?
+    else {
+        return Ok(None);
+    };
+    let server = server.ok_or_else(|| crate::sync::replica_upgrade_blocked("server_required"))?;
+    Ok(Some((proof, server)))
 }
 
 async fn clear_bank<S>(adapter: &StorageAdapter<S>) -> Result<(), LixError>
@@ -2484,101 +2558,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_preserves_sync_ownership_across_legacy_and_active_banks() {
-        let replica = Bytes::from_static(
-            br#"{
-            "activeAccountId": "migration-test",
-            "cursor": 0,
-            "authoritativeBranches": {},
-            "authorityKnownCommitIds": []
-        }"#,
-        );
-        for (ownership_key, ownership_value) in [
-            (
-                &b"authority"[..],
-                Bytes::from_static(crate::sync::AUTHORITY_STATE_VALUE),
-            ),
-            (&b"repository"[..], replica),
-        ] {
-            for bank in [EpochBank::Legacy, EpochBank::A] {
-                let storage = crate::Memory::new();
-                let active = seed_active_v75(&storage, bank, 7).await;
-                if bank == EpochBank::Legacy {
-                    delete_pointer(&storage, &active).await.unwrap();
-                }
-                let source = StorageAdapter::for_epoch_unfenced(storage.clone(), bank);
-                let mut write = source
-                    .begin_migration_write(WriteOptions::default())
-                    .await
-                    .unwrap();
-                write
-                    .put_many(
-                        crate::sync::SYNC_AUTHORITY_STATE_SPACE,
-                        single_put(ownership_key, ownership_value.clone()),
-                    )
-                    .await
-                    .unwrap();
-                // This space sorts after sync ownership, so copying it exercises
-                // the first write after the candidate acquires the source role.
-                write
-                    .put_many(
-                        crate::sync::SYNC_UPLOAD_GENERATION_SPACE,
-                        single_put(b"preserved-upload", Bytes::from_static(b"preserved-value")),
-                    )
-                    .await
-                    .unwrap();
-                write.commit().await.unwrap();
+    async fn migration_preserves_authority_ownership_across_legacy_and_active_banks() {
+        let ownership_key = &b"authority"[..];
+        let ownership_value = Bytes::from_static(crate::sync::AUTHORITY_STATE_VALUE);
+        for bank in [EpochBank::Legacy, EpochBank::A] {
+            let storage = crate::Memory::new();
+            let active = seed_active_v75(&storage, bank, 7).await;
+            if bank == EpochBank::Legacy {
+                delete_pointer(&storage, &active).await.unwrap();
+            }
+            let source = StorageAdapter::for_epoch_unfenced(storage.clone(), bank);
+            let mut write = source
+                .begin_migration_write(WriteOptions::default())
+                .await
+                .unwrap();
+            write
+                .put_many(
+                    crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                    single_put(ownership_key, ownership_value.clone()),
+                )
+                .await
+                .unwrap();
+            // This space sorts after sync ownership, so copying it exercises
+            // the first write after the candidate acquires the source role.
+            write
+                .put_many(
+                    crate::sync::SYNC_UPLOAD_GENERATION_SPACE,
+                    single_put(b"preserved-upload", Bytes::from_static(b"preserved-value")),
+                )
+                .await
+                .unwrap();
+            write.commit().await.unwrap();
 
-                let admitted = admit_repository(&storage, None)
+            let admitted = admit_repository(&storage, None)
+                .await
+                .expect("owned repository must migrate");
+            assert_eq!(admitted.report.format, crate::init::CURRENT_FORMAT_VERSION);
+            for (space, key, expected) in [
+                (
+                    crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                    Bytes::from_static(ownership_key),
+                    ownership_value.clone(),
+                ),
+                (
+                    crate::sync::SYNC_UPLOAD_GENERATION_SPACE,
+                    Bytes::from_static(b"preserved-upload"),
+                    Bytes::from_static(b"preserved-value"),
+                ),
+            ] {
+                let read = admitted
+                    .adapter
+                    .begin_read(ReadOptions::default())
                     .await
-                    .expect("owned repository must migrate");
-                assert_eq!(admitted.report.format, crate::init::CURRENT_FORMAT_VERSION);
-                for (space, key, expected) in [
-                    (
-                        crate::sync::SYNC_AUTHORITY_STATE_SPACE,
-                        Bytes::from_static(ownership_key),
-                        ownership_value.clone(),
-                    ),
-                    (
-                        crate::sync::SYNC_UPLOAD_GENERATION_SPACE,
-                        Bytes::from_static(b"preserved-upload"),
-                        Bytes::from_static(b"preserved-value"),
-                    ),
-                ] {
-                    let read = admitted
-                        .adapter
-                        .begin_read(ReadOptions::default())
-                        .await
-                        .unwrap();
-                    let keys = [Key(key)];
-                    let result = read
-                        .get_many(&[GetManyRequest {
-                            space,
-                            keys: &keys,
-                            opts: GetOptions::default(),
-                        }])
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        result.values,
-                        vec![Some(ProjectedValue::FullValue(expected))]
-                    );
-                }
-                let mut ordinary = admitted.adapter.new_write_set();
-                ordinary.put(
-                    crate::json_store::JSON_SPACE,
-                    &b"forbidden"[..],
-                    &b"write"[..],
-                );
-                assert!(
-                    admitted
-                        .adapter
-                        .commit_write_set(ordinary, WriteOptions::default())
-                        .await
-                        .is_err(),
-                    "migration must not grant ordinary writers authority"
+                    .unwrap();
+                let keys = [Key(key)];
+                let result = read
+                    .get_many(&[GetManyRequest {
+                        space,
+                        keys: &keys,
+                        opts: GetOptions::default(),
+                    }])
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.values,
+                    vec![Some(ProjectedValue::FullValue(expected))]
                 );
             }
+            let mut ordinary = admitted.adapter.new_write_set();
+            ordinary.put(
+                crate::json_store::JSON_SPACE,
+                &b"forbidden"[..],
+                &b"write"[..],
+            );
+            assert!(
+                admitted
+                    .adapter
+                    .commit_write_set(ordinary, WriteOptions::default())
+                    .await
+                    .is_err(),
+                "migration must not grant ordinary writers authority"
+            );
         }
     }
 
@@ -3226,7 +3286,7 @@ mod tests {
             .await
             .unwrap();
 
-        let admitted = migrate_active(&storage, EpochBank::A, 7, 75, stale_active, None)
+        let admitted = migrate_active(&storage, EpochBank::A, 7, 75, stale_active, None, None)
             .await
             .expect("a losing opener should join the winner's active epoch");
 
@@ -3331,3 +3391,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "server-protocol", not(target_family = "wasm")))]
+mod replica_upgrade_tests;

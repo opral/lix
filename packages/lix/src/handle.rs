@@ -250,7 +250,8 @@ where
             let wasm_runtime = self.wasm_runtime.clone();
             let telemetry = self.telemetry.clone();
             async move {
-                let admission = ensure_current_repository(&storage, Some(&open_progress)).await?;
+                let admission =
+                    ensure_current_repository(&storage, Some(&open_progress), None).await?;
                 let migrated_from = admission
                     .report
                     .migration
@@ -1143,7 +1144,8 @@ where
         None => None,
     };
     let open_progress: Arc<dyn OpenProgressSink> = retained_progress.clone();
-    let admission = ensure_current_repository(&storage, Some(&open_progress)).await?;
+    let admission =
+        ensure_current_repository(&storage, Some(&open_progress), server.as_ref()).await?;
     let mut open_report = admission.report;
     retained_progress.retain_initialized(open_report.initialized);
     let migrated_from = open_report.migration.map(|migration| migration.from_format);
@@ -1229,6 +1231,36 @@ where
     Ok(lix)
 }
 
+// Builds a private candidate without starting a sync worker or publishing an
+// epoch. The migration owner validates and publishes only after this returns.
+pub(crate) async fn new_replica_migration_candidate<S>(
+    adapter: crate::storage_adapter::StorageAdapter<S>,
+    default_branch_id: &str,
+) -> Result<Lix<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let adapter = adapter.with_session().await?;
+    let (engine, _) =
+        open_or_initialize_engine_with_adapter(adapter, None, None, None, Some(default_branch_id))
+            .await?;
+    let session = engine.open_session().await?;
+    Ok(Lix {
+        engine: Arc::new(engine),
+        session: Arc::new(session),
+        transaction_lifecycle: Arc::default(),
+        primary_switch_gate: Some(Arc::new(tokio::sync::Mutex::new(()))),
+        sync_lease: None,
+        sync_demand_tx: None,
+        server: None,
+        open_report: Arc::new(OpenReport {
+            format: crate::init::CURRENT_FORMAT_VERSION,
+            initialized: false,
+            migration: None,
+        }),
+    })
+}
+
 struct RepositoryAdmission<StorageImpl> {
     adapter: crate::storage_adapter::StorageAdapter<StorageImpl>,
     report: OpenReport,
@@ -1237,6 +1269,7 @@ struct RepositoryAdmission<StorageImpl> {
 async fn ensure_current_repository<StorageImpl>(
     storage: &StorageImpl,
     progress: Option<&Arc<dyn OpenProgressSink>>,
+    server: Option<&ServerOptions>,
 ) -> Result<RepositoryAdmission<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -1252,7 +1285,8 @@ where
             total: None,
         },
     );
-    let admission = crate::migration::admit_repository(storage, progress).await?;
+    let admission =
+        crate::migration::admit_repository_with_server(storage, progress, server).await?;
     Ok(RepositoryAdmission {
         adapter: admission.adapter,
         report: admission.report,

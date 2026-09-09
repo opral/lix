@@ -26,3 +26,23 @@ and normal history imports still require their jump closure. A missing deferred
 graph node triggers ordinary bounded history demand before traversal continues.
 Known jump generations, self-jumps, invalid spans, and inventory/body identity
 mismatches are validated before publication.
+
+On a v77 replica format upgrade, epoch admission proves that every local branch
+coordinate matches a durable authority receipt, including the global branch.
+In v77 every checkpoint also authored a tracked global marker, so this checks
+off-branch checkpoint work without traversing history. Pending resets, physical
+untracked rows and tombstones, unfinished uploads, and recovery references block
+the upgrade. Unknown replica formats fail closed.
+
+A clean replica uses the existing bootstrap in a hidden epoch, checks repository
+and account identity, closes its temporary sessions, validates, and only then
+publishes the epoch. The old epoch remains intact. Standalone and authoritative
+repositories retain their normal format migration path.
+
+The safety check scans branch controls and current serving rows with a metadata
+projection. Its cost is O(B log B + R), where B is the number of branch controls
+and R is the total current rows visited across branches, plus receipt decoding.
+Peak scan memory is proportional to the largest branch's current row batch. It
+does not decode or walk historical commits. Rebuilding then pays the ordinary
+current-state bootstrap cost, including the checkpoint header inventory; it does
+not materialize historical checkpoint snapshots.

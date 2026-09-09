@@ -34,7 +34,7 @@ use parking_lot::RwLock;
 pub(crate) use blob::validate_sync_blob_manifest;
 pub(crate) use bootstrap::{
     SyncBootstrapAdmission, inspect_sync_bootstrap_with_adapter, install_sync_bootstrap,
-    prepare_sync_bootstrap,
+    prepare_sync_bootstrap, rebuild_replica_candidate,
 };
 pub(crate) use commit::{
     SYNC_CHECKPOINT_SOURCE_SPACE, SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
@@ -66,6 +66,7 @@ pub(crate) use protocol::{
 #[cfg(feature = "server-protocol")]
 pub(crate) use repository::admit_sync_authority_storage;
 pub(crate) use repository::has_any_sync_replica_state;
+pub(crate) use repository::{CleanReplicaProof, inspect_replica_rebuild_safety, replica_upgrade_blocked};
 pub(crate) use repository::{
     AUTHORITY_STATE_VALUE, SYNC_AUTHORITY_STATE_SPACE, SYNC_REPLICA_STATE_SPACE,
     SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE, authority_state_key,
