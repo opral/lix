@@ -274,35 +274,66 @@ impl Event {
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Media type of a complete deterministic Lix snapshot.
 pub const SNAPSHOT_MEDIA_TYPE: &str = "application/vnd.lix.snapshot";
-/// Canonical method and path registry for protocol hosts and conformance tools.
-pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
-    ("GET", "/lix/v1/{lix_id}"),
-    ("DELETE", "/lix/v1/{lix_id}/session"),
-    ("POST", "/lix/v1/{lix_id}/execute"),
-    ("POST", "/lix/v1/{lix_id}/execute-batch"),
-    ("POST", "/lix/v1/{lix_id}/sync/push"),
-    ("GET", "/lix/v1/{lix_id}/sync/pull"),
-    ("GET", "/lix/v1/{lix_id}/sync/history"),
-    ("GET", "/lix/v1/{lix_id}/sync/checkpoints"),
-    ("GET", "/lix/v1/{lix_id}/sync/blob"),
-    ("POST", "/lix/v1/{lix_id}/sync/blob"),
-    ("GET", "/lix/v1/{lix_id}/sync/chunk"),
-    ("PUT", "/lix/v1/{lix_id}/sync/chunk"),
-    ("POST", "/lix/v1/{lix_id}/transaction/begin"),
-    ("POST", "/lix/v1/{lix_id}/transaction/execute"),
-    ("POST", "/lix/v1/{lix_id}/transaction/commit"),
-    ("POST", "/lix/v1/{lix_id}/transaction/rollback"),
-    ("GET", "/lix/v1/{lix_id}/file"),
-    ("POST", "/lix/v1/{lix_id}/file/upsert"),
-    ("POST", "/lix/v1/{lix_id}/file/upsert-batch"),
-    ("POST", "/lix/v1/{lix_id}/branch/create"),
-    ("POST", "/lix/v1/{lix_id}/undo"),
-    ("POST", "/lix/v1/{lix_id}/redo"),
-    ("POST", "/lix/v1/{lix_id}/branch/switch"),
-    ("POST", "/lix/v1/{lix_id}/observe"),
-    ("POST", "/lix/v1/{lix_id}/observe/multiplex"),
-    ("GET", "/lix/v1/{lix_id}/snapshot"),
-];
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestBodyPolicy {
+    None,
+    Json,
+    Binary,
+    Chunk,
+}
+
+// Keep wire identity, admission and body policy beside each operation. Dispatch
+// matches the resulting enum, so it cannot silently invent an unlisted route.
+macro_rules! protocol_routes {
+    ($($route:ident => ($method:literal, $suffix:literal, $body:ident)),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum ProtocolRoute { $($route),+ }
+
+        impl ProtocolRoute {
+            const ALL: &'static [Self] = &[$(Self::$route),+];
+            fn method(self) -> &'static str { match self { $(Self::$route => $method),+ } }
+            fn path(self) -> &'static str { match self { $(Self::$route => concat!("/lix/v1", $suffix)),+ } }
+            fn body(self) -> RequestBodyPolicy { match self { $(Self::$route => RequestBodyPolicy::$body),+ } }
+        }
+
+        /// Canonical method and path registry for protocol hosts and conformance tools.
+        pub const SERVER_PROTOCOL_ENDPOINTS: &[(&str, &str)] = &[
+            $(($method, concat!("/lix/v1/{lix_id}", $suffix))),+
+        ];
+    };
+}
+
+protocol_routes! {
+   Handshake => ("GET", "", None),
+   DeleteSession => ("DELETE", "/session", None),
+   Execute => ("POST", "/execute", Json),
+   ExecuteBatch => ("POST", "/execute-batch", Json),
+   SyncPush => ("POST", "/sync/push", Json),
+   SyncPull => ("GET", "/sync/pull", None),
+   SyncHistory => ("GET", "/sync/history", None),
+   SyncCheckpoints => ("GET", "/sync/checkpoints", None),
+   SyncGetBlobs => ("GET", "/sync/blob", None),
+   SyncRegisterBlob => ("POST", "/sync/blob", Json),
+   SyncGetChunk => ("GET", "/sync/chunk", None),
+   SyncPutChunk => ("PUT", "/sync/chunk", Chunk),
+   BeginTransaction => ("POST", "/transaction/begin", None),
+   TransactionExecute => ("POST", "/transaction/execute", Json),
+   CommitTransaction => ("POST", "/transaction/commit", None),
+   RollbackTransaction => ("POST", "/transaction/rollback", None),
+   ReadFile => ("GET", "/file", None),
+   UpsertFile => ("POST", "/file/upsert", Binary),
+   UpsertFileBatch => ("POST", "/file/upsert-batch", Binary),
+   CreateBranch => ("POST", "/branch/create", Json),
+   Undo => ("POST", "/undo", None),
+   Redo => ("POST", "/redo", None),
+   SwitchBranch => ("POST", "/branch/switch", Json),
+   MergeBranch => ("POST", "/branch/merge", Json),
+   MergeBranchPreview => ("POST", "/branch/merge-preview", Json),
+   Observe => ("POST", "/observe", Json),
+   ObserveMultiplex => ("POST", "/observe/multiplex", Json),
+   Snapshot => ("GET", "/snapshot", None),
+}
+
 /// Header carrying the opaque server-issued session capability.
 pub const SESSION_ID_HEADER: &str = "lix-session-id";
 /// Sync wire version required on repository synchronization endpoints.
@@ -1717,14 +1748,6 @@ fn snapshot_body_stream(
     }
 }
 
-fn is_known_operation_path(path: &str) -> bool {
-    SERVER_PROTOCOL_ENDPOINTS.iter().any(|(_, endpoint)| {
-        endpoint
-            .strip_prefix("/lix/v1/{lix_id}")
-            .is_some_and(|suffix| format!("{PROTOCOL_PATH}{suffix}") == path)
-    })
-}
-
 impl<S> LixServerProtocol<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1793,15 +1816,27 @@ where
         }
         let path = parts.uri.path().to_owned();
         let method = parts.method.clone();
+        // The handshake alone accepts a trailing slash, as before.
+        let canonical_path = if path == "/lix/v1/" {
+            PROTOCOL_PATH
+        } else {
+            &path
+        };
+        let mut path_routes = ProtocolRoute::ALL
+            .iter()
+            .copied()
+            .filter(|route| route.path() == canonical_path);
+        let path_route = path_routes.clone().next();
+        let route = path_routes.find(|route| route.method() == method.as_str());
         // Handshake creates/resumes a writable session. Fence old clients on
         // the server before admitting either that session or a mutation.
-        if !(path == "/lix/v1/snapshot" && method == Method::GET)
+        if route != Some(ProtocolRoute::Snapshot)
             && let Err(error) = require_server_protocol_version(&parts.headers)
         {
             return error.into_response();
         }
-        if matches!(path.as_str(), "/lix/v1" | "/lix/v1/") {
-            if method != Method::GET {
+        if matches!(path_route, Some(ProtocolRoute::Handshake)) {
+            if route.is_none() {
                 return method_not_allowed();
             }
             let query = match decode_query::<HandshakeRequest>(parts.uri.query()) {
@@ -1811,8 +1846,8 @@ where
             return result_response(Box::pin(handshake(self, query, parts.headers, context)).await);
         }
 
-        if path == "/lix/v1/snapshot" {
-            if method != Method::GET {
+        if matches!(path_route, Some(ProtocolRoute::Snapshot)) {
+            if route.is_none() {
                 return method_not_allowed();
             }
             if matches!(context.principal, ServerProtocolPrincipal::Anonymous) {
@@ -1835,13 +1870,14 @@ where
             .await;
         }
 
-        if path == "/lix/v1/session" {
-            if method != Method::DELETE {
+        if matches!(path_route, Some(ProtocolRoute::DeleteSession)) {
+            if route.is_none() {
                 return method_not_allowed();
             }
             return result_response(delete_session(self, parts.headers, context).await);
         }
 
+        // The namespace fence also applies to unknown sync paths, before session admission.
         if path.starts_with("/lix/v1/sync/")
             && let Err(error) = require_sync_protocol_version(&parts.headers)
         {
@@ -1866,45 +1902,28 @@ where
             return error.into_response();
         }
         let scope = context.principal.idempotency_scope();
-        let consumes_json = matches!(
-            (&method, path.as_str()),
-            (&Method::POST, "/lix/v1/execute")
-                | (&Method::POST, "/lix/v1/execute-batch")
-                | (&Method::POST, "/lix/v1/sync/push")
-                | (&Method::POST, "/lix/v1/sync/blob")
-                | (&Method::POST, "/lix/v1/transaction/execute")
-                | (&Method::POST, "/lix/v1/branch/create")
-                | (&Method::POST, "/lix/v1/branch/switch")
-                | (&Method::POST, "/lix/v1/branch/merge")
-                | (&Method::POST, "/lix/v1/branch/merge-preview")
-                | (&Method::POST, "/lix/v1/observe")
-                | (&Method::POST, "/lix/v1/observe/multiplex")
-        );
-        if consumes_json && let Err(error) = require_json_content_type(&parts.headers) {
-            return error.into_response();
+        let body_policy = route
+            .map(ProtocolRoute::body)
+            .unwrap_or(RequestBodyPolicy::None);
+        match body_policy {
+            RequestBodyPolicy::Json => {
+                if let Err(error) = require_json_content_type(&parts.headers) {
+                    return error.into_response();
+                }
+            }
+            RequestBodyPolicy::Chunk => {
+                if let Err(error) = require_octet_stream_content_type(&parts.headers) {
+                    return error.into_response();
+                }
+            }
+            RequestBodyPolicy::None | RequestBodyPolicy::Binary => {}
         }
-        if matches!(
-            (&method, path.as_str()),
-            (&Method::PUT, "/lix/v1/sync/chunk")
-        ) && let Err(error) = require_octet_stream_content_type(&parts.headers)
-        {
-            return error.into_response();
-        }
-        let consumes_body = consumes_json
-            || matches!(
-                (&method, path.as_str()),
-                (&Method::POST, "/lix/v1/file/upsert")
-                    | (&Method::POST, "/lix/v1/file/upsert-batch")
-                    | (&Method::PUT, "/lix/v1/sync/chunk")
-            );
-        let body = if consumes_body {
-            let body_limit = if matches!(
-                (&method, path.as_str()),
-                (&Method::PUT, "/lix/v1/sync/chunk")
-            ) {
-                MAX_SYNC_CHUNK_BYTES.min(self.inner.options.max_request_body_bytes)
-            } else {
-                self.inner.options.max_request_body_bytes
+        let body = if body_policy != RequestBodyPolicy::None {
+            let body_limit = match body_policy {
+                RequestBodyPolicy::Chunk => {
+                    MAX_SYNC_CHUNK_BYTES.min(self.inner.options.max_request_body_bytes)
+                }
+                _ => self.inner.options.max_request_body_bytes,
             };
             match body.into_bytes(body_limit).await {
                 Ok(body) => body,
@@ -1926,11 +1945,11 @@ where
             };
         }
 
-        match (&method, path.as_str()) {
-            (&Method::POST, "/lix/v1/execute") => result_response(
+        match route {
+            Some(ProtocolRoute::Execute) => result_response(
                 execute(lease, scope, parts.headers, json_request!(ExecuteRequest)).await,
             ),
-            (&Method::POST, "/lix/v1/execute-batch") => result_response(
+            Some(ProtocolRoute::ExecuteBatch) => result_response(
                 execute_batch(
                     lease,
                     scope,
@@ -1939,10 +1958,10 @@ where
                 )
                 .await,
             ),
-            (&Method::POST, "/lix/v1/sync/push") => {
+            Some(ProtocolRoute::SyncPush) => {
                 result_response(sync_push(lease, json_request!(SyncPushRequest)).await)
             }
-            (&Method::GET, "/lix/v1/sync/pull") => {
+            Some(ProtocolRoute::SyncPull) => {
                 let query = match decode_query::<SyncPullRequest>(parts.uri.query()) {
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
@@ -1959,28 +1978,28 @@ where
                     });
                 result_response(sync_pull(lease, query, wait).await)
             }
-            (&Method::GET, "/lix/v1/sync/checkpoints") => {
+            Some(ProtocolRoute::SyncCheckpoints) => {
                 let query = match decode_query::<SyncCheckpointInventoryQuery>(parts.uri.query()) {
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
                 result_response(sync_checkpoint_inventory(lease, query).await)
             }
-            (&Method::GET, "/lix/v1/sync/history") => {
+            Some(ProtocolRoute::SyncHistory) => {
                 let query = match decode_query::<SyncHistoryQuery>(parts.uri.query()) {
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
                 result_response(sync_history(lease, query).await)
             }
-            (&Method::GET, "/lix/v1/sync/blob") => {
+            Some(ProtocolRoute::SyncGetBlobs) => {
                 let query = match decode_query::<SyncBlobQuery>(parts.uri.query()) {
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
                 result_response(sync_get_blobs(lease, query).await)
             }
-            (&Method::POST, "/lix/v1/sync/blob") => {
+            Some(ProtocolRoute::SyncRegisterBlob) => {
                 if parts.uri.query().is_some() {
                     return ApiError::bad_request(
                         "sync blob registration does not accept query parameters",
@@ -1989,71 +2008,76 @@ where
                 }
                 result_response(sync_register_blob(lease, json_request!(SyncBlobManifest)).await)
             }
-            (&Method::GET, "/lix/v1/sync/chunk") => {
+            Some(ProtocolRoute::SyncGetChunk) => {
                 let query = match decode_query::<SyncChunkQuery>(parts.uri.query()) {
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
                 result_response(sync_get_chunk(lease, query).await)
             }
-            (&Method::PUT, "/lix/v1/sync/chunk") => {
+            Some(ProtocolRoute::SyncPutChunk) => {
                 let query = match decode_query::<SyncChunkQuery>(parts.uri.query()) {
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
                 result_response(sync_put_chunk(lease, query, body).await)
             }
-            (&Method::POST, "/lix/v1/transaction/begin") => {
+            Some(ProtocolRoute::BeginTransaction) => {
                 result_response(begin_transaction(lease).await)
             }
-            (&Method::POST, "/lix/v1/transaction/execute") => result_response(
+            Some(ProtocolRoute::TransactionExecute) => result_response(
                 transaction_execute(lease, parts.headers, json_request!(ExecuteRequest)).await,
             ),
-            (&Method::POST, "/lix/v1/transaction/commit") => {
+            Some(ProtocolRoute::CommitTransaction) => {
                 result_response(commit_transaction(lease, parts.headers).await)
             }
-            (&Method::POST, "/lix/v1/transaction/rollback") => {
+            Some(ProtocolRoute::RollbackTransaction) => {
                 result_response(rollback_transaction(lease, parts.headers).await)
             }
-            (&Method::GET, "/lix/v1/file") => {
+            Some(ProtocolRoute::ReadFile) => {
                 let query = match decode_query::<BinaryFileReadRequest>(parts.uri.query()) {
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
                 result_response(read_file_content(lease, query, parts.headers).await)
             }
-            (&Method::POST, "/lix/v1/file/upsert") => {
+            Some(ProtocolRoute::UpsertFile) => {
                 let query = match decode_query::<BinaryFileUpdateRequest>(parts.uri.query()) {
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
                 result_response(upsert_file_content(lease, query, parts.headers, body).await)
             }
-            (&Method::POST, "/lix/v1/file/upsert-batch") => {
+            Some(ProtocolRoute::UpsertFileBatch) => {
                 result_response(upsert_file_content_batch(lease, body).await)
             }
-            (&Method::POST, "/lix/v1/branch/create") => {
+            Some(ProtocolRoute::CreateBranch) => {
                 result_response(create_branch(lease, json_request!(CreateBranchRequest)).await)
             }
-            (&Method::POST, "/lix/v1/undo") => result_response(undo(lease).await),
-            (&Method::POST, "/lix/v1/redo") => result_response(redo(lease).await),
-            (&Method::POST, "/lix/v1/branch/switch") => {
+            Some(ProtocolRoute::Undo) => result_response(undo(lease).await),
+            Some(ProtocolRoute::Redo) => result_response(redo(lease).await),
+            Some(ProtocolRoute::SwitchBranch) => {
                 result_response(switch_branch(lease, json_request!(SwitchBranchRequest)).await)
             }
-            (&Method::POST, "/lix/v1/branch/merge") => {
+            Some(ProtocolRoute::MergeBranch) => {
                 result_response(merge_branch(lease, json_request!(MergeBranchRequestBody)).await)
             }
-            (&Method::POST, "/lix/v1/branch/merge-preview") => result_response(
+            Some(ProtocolRoute::MergeBranchPreview) => result_response(
                 merge_branch_preview(lease, json_request!(MergeBranchPreviewRequestBody)).await,
             ),
-            (&Method::POST, "/lix/v1/observe") => {
+            Some(ProtocolRoute::Observe) => {
                 result_response(observe(lease, json_request!(ObserveRequest)).await)
             }
-            (&Method::POST, "/lix/v1/observe/multiplex") => result_response(
+            Some(ProtocolRoute::ObserveMultiplex) => result_response(
                 observe_multiplex(lease, json_request!(MultiplexObserveRequest)).await,
             ),
-            (_, known) if is_known_operation_path(known) => method_not_allowed(),
-            _ => not_found(),
+            Some(
+                ProtocolRoute::Handshake | ProtocolRoute::Snapshot | ProtocolRoute::DeleteSession,
+            ) => {
+                unreachable!("session-independent routes return before session admission")
+            }
+            None if path_route.is_some() => method_not_allowed(),
+            None => not_found(),
         }
     }
 
@@ -5439,6 +5463,8 @@ mod tests {
                 ("POST", "/lix/v1/{lix_id}/undo") => "undo",
                 ("POST", "/lix/v1/{lix_id}/redo") => "redo",
                 ("POST", "/lix/v1/{lix_id}/branch/switch") => "switchBranch",
+                ("POST", "/lix/v1/{lix_id}/branch/merge") => "mergeBranch",
+                ("POST", "/lix/v1/{lix_id}/branch/merge-preview") => "mergeBranchPreview",
                 ("POST", "/lix/v1/{lix_id}/observe") => "observe",
                 ("POST", "/lix/v1/{lix_id}/observe/multiplex") => "observeMultiplex",
                 ("GET", "/lix/v1/{lix_id}/snapshot") => "exportSnapshot",
@@ -11745,6 +11771,50 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn merge_routes_share_method_and_json_admission_policy() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        for path in ["/lix/v1/branch/merge", "/lix/v1/branch/merge-preview"] {
+            let wrong_method = request(&app.router, "GET", path, Some(&session_id), None).await;
+            assert_eq!(
+                wrong_method.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{path}"
+            );
+            let missing_session = request(&app.router, "POST", path, None, Some(json!({}))).await;
+            assert_eq!(missing_session.status(), StatusCode::BAD_REQUEST, "{path}");
+            let bad_media = app
+                .router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(SESSION_ID_HEADER, &session_id)
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                bad_media.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{path}"
+            );
+        }
+        let unknown = request(
+            &app.router,
+            "GET",
+            "/lix/v1/unknown",
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
