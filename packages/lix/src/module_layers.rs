@@ -48,6 +48,8 @@ const MODULE_LAYERS: &[&[&str]] = &[
         "json_store",
     ],
     &["row_pk"],
+    // Engine payload ownership shared by SQL, state and plugin ingress.
+    &["row_payload"],
     // The order-preserving key byte format. A pure encoding over `row_pk`
     // with no repository semantics, and the single authority for how a key
     // encodes. Both state planes store rows in the order it defines, so it must
@@ -62,7 +64,7 @@ const MODULE_LAYERS: &[&[&str]] = &[
     // The row-specific contract over generic columnar row groups. Addresses
     // row groups by owning commit, so it sits above `changelog`, and is shared
     // by both state planes, so it sits below them.
-    &["row_columnar"],
+    &["row_columnar", "row_state"],
     // Canonical state: commit-state manifests, tree chunks, scoped ranges,
     // commit deltas. Sole writer of every canonical-state storage space.
     &["tracked_state"],
@@ -90,15 +92,11 @@ const MODULE_LAYERS: &[&[&str]] = &[
 /// reason. This list is the to-do, not an amnesty: a guard that starts red gets
 /// ignored, so an order is only declared once it holds.
 ///
-/// The former dominant blocker — `transaction::types` living inside the
-/// write-path module that consumes it — is gone: it is now
-/// [`crate::transaction_types`], and `branch`, `checkpoint`,
-/// `collection_generation`, `plugin` and `undo_redo` moved into
-/// [`MODULE_LAYERS`] as a result — ten mutual cycles became six. What remains
-/// is `session` ↔ `transaction` (the `EXECUTE_IDEMPOTENCY_RECEIPT_SPACE`
-/// ownership inversion), `gc` ↔ `session` (correct by design), `filesystem` ↔
-/// `hot_state`, and the two upward references `transaction_types` still makes
-/// of its own — into `sql2` and `collection_generation`.
+/// Shared payloads, columnar batches and current-state evidence now have row
+/// owners below their SQL, transaction and plugin consumers. Mutation
+/// vocabulary no longer names SQL or HOT types; HOT owns its projection from
+/// prepared rows. Remaining orchestration includes session/transaction,
+/// reclamation/session and filesystem/HOT relationships.
 const UNLAYERED_MODULES: &[(&str, &str)] = &[
     (
         "authority_client",
@@ -163,9 +161,7 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("session", "cyclic with `transaction` and with `gc`"),
     (
         "sql2",
-        "still cyclic with `transaction` (one reference, \
-         `duplicate_insert_identity_message`) and with `transaction_types`, \
-         which names `sql2::EncodedRowGroups`",
+        "SQL planning consumes row contracts and mutation vocabulary; not fully layered",
     ),
     ("sql_profile", "feature-gated instrumentation"),
     ("sql_telemetry", "instrumentation, no layer semantics"),
@@ -185,16 +181,12 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("test_support", "cfg-gated harness"),
     (
         "transaction",
-        "down from six cycles to two: still cyclic with `session` and with \
-         `sql2`",
+        "write orchestration remains coupled to session and SQL planning",
     ),
     (
         "transaction_types",
-        "the shared write-row vocabulary, now its own module. It cannot be \
-         layered yet because it names `hot_state`'s materialized row types \
-         while `hot_state` reads `branch`, which reads this module — so \
-         layering it would have to place it both above and below `hot_state`. \
-         Deduplicating the `Materialized*Row` DTOs downward unblocks it",
+        "shared mutations no longer depend on SQL or HOT; still carry \
+         tracked-state staging contracts",
     ),
 ];
 
@@ -629,5 +621,33 @@ fn the_scanner_finds_the_references_it_is_supposed_to() {
             .iter()
             .any(|reference| reference.from == "tracked_state" && reference.to == "hot_state"),
         "canonical state must not read the hot plane",
+    );
+}
+
+/// Keep the ownership reductions explicit even before all orchestration can
+/// join the partial layer order. Tests may still exercise boundary adapters.
+#[test]
+fn mutation_contracts_do_not_depend_on_sql_or_serving_types() {
+    let references = production_references(&declared_modules());
+    let forbidden = references
+        .into_iter()
+        .filter(|reference| {
+            (reference.from == "transaction_types"
+                && matches!(reference.to.as_str(), "sql2" | "hot_state"))
+                || (matches!(reference.from.as_str(), "tracked_state" | "hot_state")
+                    && reference.to == "plugin_runtime")
+                || (reference.from == "sql2" && reference.to == "transaction")
+        })
+        .map(|reference| {
+            format!(
+                "{}:{}: {} -> {}",
+                reference.file, reference.line, reference.from, reference.to
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        forbidden.is_empty(),
+        "row ownership regression: {}",
+        forbidden.join("\n")
     );
 }

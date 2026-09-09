@@ -4490,7 +4490,7 @@ mod tests {
             crate::sql2::catalog::derive_schema_surface_spec_from_schema(&schema_definition)
                 .expect("test schema should compile");
         let native_row = |id: &str, value: &str| {
-            let typed = crate::plugin::runtime::WasmTypedRow {
+            let typed = crate::row_payload::TypedRow {
                 schema_fingerprint: schema_spec.schema_fingerprint,
                 row_pk: vec![lix_schema::Value::Text(id.to_owned())].into(),
                 row: lix_schema::Row::from([

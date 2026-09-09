@@ -1872,7 +1872,7 @@ mod tests {
         HotStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
     };
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-    use crate::plugin::runtime::WasmTypedRow;
+    use crate::row_payload::TypedRow as WasmTypedRow;
     use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};

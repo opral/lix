@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 use tracing::Instrument as _;
 
 use super::*;
-use crate::plugin::runtime::WasmCertifiedRowBatch;
+use crate::row_payload::CertifiedRowBatch as WasmCertifiedRowBatch;
 use crate::storage_adapter::{BufferRange, EncodedMutationBatch, EncodedPut};
 use crate::tracked_state::TrackedStateReadColumns;
 
@@ -455,10 +455,10 @@ pub(crate) async fn stage_certified_row_batches(
             );
             for (page_index, page) in batch.pages.iter().enumerate() {
                 let (first_local_ref, last_local_ref) = match batch.format {
-                    crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT => {
+                    crate::row_payload::HOST_CERTIFIED_PACKET_FORMAT => {
                         certified_packet_page_local_ref_range(page)?.unwrap_or((0, u32::MAX))
                     }
-                    crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT => {
+                    crate::row_payload::HOST_CERTIFIED_ZSTD_PACKET_FORMAT => {
                         certified_zstd_packet_page_header(page)?.0
                     }
                     format => {
@@ -5460,19 +5460,33 @@ impl HotTrackedSnapshot {
         branch_generation: CommitId,
     ) -> Result<bool, LixError> {
         let mut rows = self.rows.clone();
-        rows.extend(local.rows.iter().map(|(key, value)| (key.clone(), value.clone())));
+        rows.extend(
+            local
+                .rows
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         // Reuse the publisher's controls and visibility predicate before
         // dropping commit identities. Equal payloads can cross a replacement
         // fence, while an unchanged hidden row is not a visible catalog fact.
         let controls = complete_collection_generation_controls(branch_generation, &rows)?;
-        let next = rows.iter()
+        let next = rows
+            .iter()
             .filter(|(key, _)| key.schema_key == "lix_registered_schema" && key.file_id.is_none())
             .filter_map(|(key, bytes)| match decode_head_value(bytes) {
                 Ok(value) if value.deleted => None,
-                Ok(value) if !row_belongs_to_active_collection_generation(
-                    &controls, branch_generation, &key.schema_key, key.file_id.as_deref(),
-                    value.untracked, value.commit_id,
-                ) => None,
+                Ok(value)
+                    if !row_belongs_to_active_collection_generation(
+                        &controls,
+                        branch_generation,
+                        &key.schema_key,
+                        key.file_id.as_deref(),
+                        value.untracked,
+                        value.commit_id,
+                    ) =>
+                {
+                    None
+                }
                 Ok(value) => Some(
                     value
                         .snapshot
@@ -6980,8 +6994,7 @@ where
         if matches!(
             working_diff_baseline_action,
             WorkingDiffBaselineAction::Rebase { .. }
-        )
-            && working_diff_capture_checkpoint_commit_id.is_none()
+        ) && working_diff_capture_checkpoint_commit_id.is_none()
         {
             return Err(head_value_error(
                 "partial-checkpoint rebase requires an active checkpoint",
@@ -7697,9 +7710,7 @@ where
                         .map(CertifiedCurrentStatePredecessor::view)
                         .transpose()?
                         .ok_or_else(|| {
-                            head_value_error(
-                                "partial-checkpoint remainder has no HOT before-image",
-                            )
+                            head_value_error("partial-checkpoint remainder has no HOT before-image")
                         })?;
                     rebase_hot_working_diff_baseline(
                         working_diff_capture_checkpoint_commit_id
@@ -7776,25 +7787,23 @@ where
                         "compacted hot tombstone is not provably clean at removal",
                     ));
                 }
-                next_value_ranges.push(
-                    if delta.physically_deletes() || compacted_row {
-                        None
-                    } else {
-                        // Retain interval-local tracked tombstones until the
-                        // checkpoint retires their dirty-index entries. The
-                        // sparse index may be packed, so removing this primary
-                        // row without an authenticated cancellation marker
-                        // would make intentional absence indistinguishable
-                        // from storage corruption to the fail-closed reader.
-                        let mut value = delta.value_ref(*created_at, working_diff_baseline);
-                        value.columnar_base_coordinate = next_columnar_base_coordinate(
-                            reset_working_diff_baselines,
-                            delta,
-                            previous.as_ref(),
-                        )?;
-                        Some(append_head_value(&mut next_value_bytes, &value)?)
-                    },
-                );
+                next_value_ranges.push(if delta.physically_deletes() || compacted_row {
+                    None
+                } else {
+                    // Retain interval-local tracked tombstones until the
+                    // checkpoint retires their dirty-index entries. The
+                    // sparse index may be packed, so removing this primary
+                    // row without an authenticated cancellation marker
+                    // would make intentional absence indistinguishable
+                    // from storage corruption to the fail-closed reader.
+                    let mut value = delta.value_ref(*created_at, working_diff_baseline);
+                    value.columnar_base_coordinate = next_columnar_base_coordinate(
+                        reset_working_diff_baselines,
+                        delta,
+                        previous.as_ref(),
+                    )?;
+                    Some(append_head_value(&mut next_value_bytes, &value)?)
+                });
             }
         }
         let next_value_bytes = Bytes::from(next_value_bytes);
@@ -11049,14 +11058,12 @@ async fn resolve_working_diff_comparison_payloads<T>(
         .iter()
         .map(|pending| {
             let version = match pending.side {
-                WorkingDiffPayloadSide::Before => before_of(
-                    &mut candidates[pending.candidate_index],
-                )
-                .as_ref()
-                .expect("pending before image is present"),
-                WorkingDiffPayloadSide::After => {
-                    after_of(&mut candidates[pending.candidate_index])
+                WorkingDiffPayloadSide::Before => {
+                    before_of(&mut candidates[pending.candidate_index])
+                        .as_ref()
+                        .expect("pending before image is present")
                 }
+                WorkingDiffPayloadSide::After => after_of(&mut candidates[pending.candidate_index]),
             };
             crate::tracked_state::AuthoritativeLiveChangeRequest {
                 change_id: version.change_id,
@@ -11066,18 +11073,14 @@ async fn resolve_working_diff_comparison_payloads<T>(
             }
         })
         .collect::<Vec<_>>();
-    let records = crate::tracked_state::load_authoritative_live_change_records(store, &requests)
-        .await?;
+    let records =
+        crate::tracked_state::load_authoritative_live_change_records(store, &requests).await?;
     for (pending, record) in pending.into_iter().zip(records) {
         let version = match pending.side {
-            WorkingDiffPayloadSide::Before => before_of(
-                &mut candidates[pending.candidate_index],
-            )
-            .as_mut()
-            .expect("pending before image is present"),
-            WorkingDiffPayloadSide::After => {
-                after_of(&mut candidates[pending.candidate_index])
-            }
+            WorkingDiffPayloadSide::Before => before_of(&mut candidates[pending.candidate_index])
+                .as_mut()
+                .expect("pending before image is present"),
+            WorkingDiffPayloadSide::After => after_of(&mut candidates[pending.candidate_index]),
         };
         version.resolve_payload_slots(
             packed_working_diff_snapshot(record.snapshot.as_deref()),
@@ -12382,15 +12385,7 @@ fn hot_index_candidate_budget(entries_published: u64) -> usize {
     usize::try_from((entries_published / 2).max(MIN_CANDIDATE_BUDGET)).unwrap_or(usize::MAX)
 }
 
-/// One indexed value, encoded so that equality is a key prefix.
-///
-/// Integers use the same order-preserving flip as row-pk components so a
-/// future range predicate can reuse this encoding unchanged.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum HotIndexValue {
-    String(String),
-    Integer(i64),
-}
+pub(crate) use crate::row_state::HotIndexValue;
 
 impl HotIndexValue {
     fn write(&self, out: &mut Vec<u8>) {
@@ -13741,70 +13736,194 @@ mod tests {
         let live = encoded_test_hot_value(generation, false, false);
         let tombstone = encoded_test_hot_value(generation, false, true);
         let mut writes = StorageWriteSet::new();
-        stage_complete_hot_rows(&mut writes, "branch", generation, HotRowMap::from([
-            (identity("closure-row"), live.clone()),
-        ]));
-        storage.commit_write_set(writes, StorageWriteOptions::default()).await.unwrap();
-        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
-        let previous = TrackedHeadContext::new().reader(&read)
-            .scan_live_batch_for_generation("branch", generation, None, &TrackedStateScanRequest {
-                filter: TrackedStateFilter { schema_keys: vec!["lix_registered_schema".to_owned()], ..TrackedStateFilter::default() },
-                read_columns: TrackedStateReadColumns { columns: vec!["raw_snapshot".to_owned()] },
-                limit: None,
-            }).await.unwrap();
+        stage_complete_hot_rows(
+            &mut writes,
+            "branch",
+            generation,
+            HotRowMap::from([(identity("closure-row"), live.clone())]),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let previous = TrackedHeadContext::new()
+            .reader(&read)
+            .scan_live_batch_for_generation(
+                "branch",
+                generation,
+                None,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["lix_registered_schema".to_owned()],
+                        ..TrackedStateFilter::default()
+                    },
+                    read_columns: TrackedStateReadColumns {
+                        columns: vec!["raw_snapshot".to_owned()],
+                    },
+                    limit: None,
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(previous.len(), 1);
-        let inherited = HotTrackedSnapshot { rows: HotRowMap::from([(identity("closure-row"), live)]) };
+        let inherited = HotTrackedSnapshot {
+            rows: HotRowMap::from([(identity("closure-row"), live)]),
+        };
         let local = HotTrackedSnapshot::default();
-        assert!(!inherited.inherited_catalog_differs_from(&previous, &local, generation).unwrap());
-        assert!(HotTrackedSnapshot::default().inherited_catalog_differs_from(&previous, &local, generation).unwrap(), "removing an inherited definition changes visibility");
-        let local = HotTrackedSnapshot { rows: HotRowMap::from([(identity("closure-row"), tombstone)]) };
+        assert!(
+            !inherited
+                .inherited_catalog_differs_from(&previous, &local, generation)
+                .unwrap()
+        );
+        assert!(
+            HotTrackedSnapshot::default()
+                .inherited_catalog_differs_from(&previous, &local, generation)
+                .unwrap(),
+            "removing an inherited definition changes visibility"
+        );
+        let local = HotTrackedSnapshot {
+            rows: HotRowMap::from([(identity("closure-row"), tombstone)]),
+        };
         let absent = MaterializedHotStateBatch::default();
-        assert!(!inherited.inherited_catalog_differs_from(&absent, &local, generation).unwrap(), "a local tombstone masks a new inherited definition");
-        assert!(!HotTrackedSnapshot::default().inherited_catalog_differs_from(&absent, &local, generation).unwrap(), "removing the masked inherited definition also leaves visibility unchanged");
+        assert!(
+            !inherited
+                .inherited_catalog_differs_from(&absent, &local, generation)
+                .unwrap(),
+            "a local tombstone masks a new inherited definition"
+        );
+        assert!(
+            !HotTrackedSnapshot::default()
+                .inherited_catalog_differs_from(&absent, &local, generation)
+                .unwrap(),
+            "removing the masked inherited definition also leaves visibility unchanged"
+        );
     }
 
     #[tokio::test]
     async fn inherited_catalog_visibility_reuses_publication_generation_fences() {
         let storage = StorageAdapter::new(Memory::new());
         let generation = CommitId::for_test_label("catalog-fence-serving");
-        let mut commits = [CommitId::for_test_label("catalog-fence-a"), CommitId::for_test_label("catalog-fence-b"), CommitId::for_test_label("catalog-fence-c")];
+        let mut commits = [
+            CommitId::for_test_label("catalog-fence-a"),
+            CommitId::for_test_label("catalog-fence-b"),
+            CommitId::for_test_label("catalog-fence-c"),
+        ];
         commits.sort();
         let [old, fence, new] = commits;
         assert_ne!(generation, fence);
-        let identity = HeadRowIdentity { schema_key: "lix_registered_schema".to_owned(), row_pk: RowPk::single("closure-row"), file_id: None };
-        let marker = HeadRowIdentity {
-            schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
-            row_pk: RowPk::single(crate::collection_generation::collection_scope_key(crate::collection_generation::CollectionScopeRef { schema_key: "lix_registered_schema", file_id: None })),
+        let identity = HeadRowIdentity {
+            schema_key: "lix_registered_schema".to_owned(),
+            row_pk: RowPk::single("closure-row"),
             file_id: None,
         };
-        let local = HotTrackedSnapshot { rows: HotRowMap::from([(marker, encoded_test_hot_value(fence, false, false))]) };
-        let inherited = |commit| HotTrackedSnapshot { rows: HotRowMap::from([(identity.clone(), encoded_test_hot_value(commit, false, false))]) };
+        let marker = HeadRowIdentity {
+            schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+            row_pk: RowPk::single(crate::collection_generation::collection_scope_key(
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key: "lix_registered_schema",
+                    file_id: None,
+                },
+            )),
+            file_id: None,
+        };
+        let local = HotTrackedSnapshot {
+            rows: HotRowMap::from([(marker, encoded_test_hot_value(fence, false, false))]),
+        };
+        let inherited = |commit| HotTrackedSnapshot {
+            rows: HotRowMap::from([(
+                identity.clone(),
+                encoded_test_hot_value(commit, false, false),
+            )]),
+        };
         let old_catalog = inherited(old);
         let mut rows = local.rows.clone();
         rows.extend(old_catalog.rows.clone());
         let mut writes = StorageWriteSet::new();
         stage_complete_collection_controls(&mut writes, "branch", generation, &rows).unwrap();
         stage_complete_hot_rows(&mut writes, "branch", generation, rows);
-        storage.commit_write_set(writes, StorageWriteOptions::default()).await.unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
         let request = TrackedStateScanRequest {
-            filter: TrackedStateFilter { schema_keys: vec!["lix_registered_schema".to_owned()], ..TrackedStateFilter::default() },
-            read_columns: TrackedStateReadColumns { columns: vec!["raw_snapshot".to_owned()] },
+            filter: TrackedStateFilter {
+                schema_keys: vec!["lix_registered_schema".to_owned()],
+                ..TrackedStateFilter::default()
+            },
+            read_columns: TrackedStateReadColumns {
+                columns: vec!["raw_snapshot".to_owned()],
+            },
             limit: None,
         };
-        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
-        let previous = TrackedHeadContext::new().reader(&read).scan_live_batch_for_generation("branch", generation, None, &request).await.unwrap();
-        assert_eq!(previous.len(), 0, "the publisher's fence hides the old schema");
-        assert!(!old_catalog.inherited_catalog_differs_from(&previous, &local, generation).unwrap(), "unchanged hidden schema must not invalidate on a data-only global refresh");
-        assert!(!inherited(fence).inherited_catalog_differs_from(&previous, &local, generation).unwrap(), "a row at the exclusive fence is still hidden");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let previous = TrackedHeadContext::new()
+            .reader(&read)
+            .scan_live_batch_for_generation("branch", generation, None, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            previous.len(),
+            0,
+            "the publisher's fence hides the old schema"
+        );
+        assert!(
+            !old_catalog
+                .inherited_catalog_differs_from(&previous, &local, generation)
+                .unwrap(),
+            "unchanged hidden schema must not invalidate on a data-only global refresh"
+        );
+        assert!(
+            !inherited(fence)
+                .inherited_catalog_differs_from(&previous, &local, generation)
+                .unwrap(),
+            "a row at the exclusive fence is still hidden"
+        );
         let new_catalog = inherited(new);
-        assert_eq!(decode_head_value(&old_catalog.rows[&identity]).unwrap().snapshot, decode_head_value(&new_catalog.rows[&identity]).unwrap().snapshot);
-        assert!(new_catalog.inherited_catalog_differs_from(&previous, &local, generation).unwrap(), "identical payload newly crossing the fence changes visibility");
+        assert_eq!(
+            decode_head_value(&old_catalog.rows[&identity])
+                .unwrap()
+                .snapshot,
+            decode_head_value(&new_catalog.rows[&identity])
+                .unwrap()
+                .snapshot
+        );
+        assert!(
+            new_catalog
+                .inherited_catalog_differs_from(&previous, &local, generation)
+                .unwrap(),
+            "identical payload newly crossing the fence changes visibility"
+        );
         let mut writes = StorageWriteSet::new();
-        TrackedHeadContext::new().writer(&read, &mut writes).stage_inherited_catalog_refresh("branch", generation, local, new_catalog).await.unwrap();
-        storage.commit_write_set(writes, StorageWriteOptions::default()).await.unwrap();
-        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
-        let published = TrackedHeadContext::new().reader(&read).scan_live_batch_for_generation("branch", generation, None, &request).await.unwrap();
-        assert_eq!(published.len(), 1, "the comparison agrees with the actual publication");
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_inherited_catalog_refresh("branch", generation, local, new_catalog)
+            .await
+            .unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let published = TrackedHeadContext::new()
+            .reader(&read)
+            .scan_live_batch_for_generation("branch", generation, None, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            published.len(),
+            1,
+            "the comparison agrees with the actual publication"
+        );
     }
 
     #[tokio::test]
@@ -13831,33 +13950,78 @@ mod tests {
         ]);
         let mut writes = StorageWriteSet::new();
         stage_complete_hot_rows(&mut writes, "branch", generation, previous);
-        storage.commit_write_set(writes, StorageWriteOptions::default()).await.unwrap();
-        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
         let mut writes = StorageWriteSet::new();
         HotStateWriter {
             store: &read,
             writes: &mut writes,
             transaction_global_schema_keys: None,
-        }.stage_inherited_catalog_refresh(
-            "branch", generation,
+        }
+        .stage_inherited_catalog_refresh(
+            "branch",
+            generation,
             HotTrackedSnapshot { rows: local },
-            HotTrackedSnapshot { rows: HotRowMap::from([
-                (identity("owned"), tracked.clone()),
-                (identity("hidden"), tracked.clone()),
-                (identity("inherited"), tracked.clone()),
-                (identity("new"), tracked),
-            ]) },
-        ).await.unwrap();
-        storage.commit_write_set(writes, StorageWriteOptions::default()).await.expect("one mutation per key, including replacements");
-        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
-        let filter = TrackedStateFilter { schema_keys: vec!["lix_registered_schema".to_owned()], include_tombstones: true, ..TrackedStateFilter::default() };
-        let HotScanEntries::Decoded(rows) = hot_scan_entries(&read, "branch", generation, &filter, None, None).await.unwrap().unwrap() else { panic!("decoded catalog"); };
-        let rows = rows.into_iter().map(|(key, value)| (key.into_row_identity(), value)).collect::<HotRowMap>();
+            HotTrackedSnapshot {
+                rows: HotRowMap::from([
+                    (identity("owned"), tracked.clone()),
+                    (identity("hidden"), tracked.clone()),
+                    (identity("inherited"), tracked.clone()),
+                    (identity("new"), tracked),
+                ]),
+            },
+        )
+        .await
+        .unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("one mutation per key, including replacements");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let filter = TrackedStateFilter {
+            schema_keys: vec!["lix_registered_schema".to_owned()],
+            include_tombstones: true,
+            ..TrackedStateFilter::default()
+        };
+        let HotScanEntries::Decoded(rows) =
+            hot_scan_entries(&read, "branch", generation, &filter, None, None)
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("decoded catalog");
+        };
+        let rows = rows
+            .into_iter()
+            .map(|(key, value)| (key.into_row_identity(), value))
+            .collect::<HotRowMap>();
         assert_eq!(rows.len(), 5);
         assert!(!rows.contains_key(&identity("retired")));
-        assert_eq!(rows[&identity("hidden")], tombstone, "local tombstone is not overwritten by inheritance");
-        assert_eq!(rows[&identity("private")], untracked, "history-free bytes are untouched");
-        assert!(decode_head_value(&rows[&identity("new")]).unwrap().commit_id.is_some());
+        assert_eq!(
+            rows[&identity("hidden")],
+            tombstone,
+            "local tombstone is not overwritten by inheritance"
+        );
+        assert_eq!(
+            rows[&identity("private")],
+            untracked,
+            "history-free bytes are untouched"
+        );
+        assert!(
+            decode_head_value(&rows[&identity("new")])
+                .unwrap()
+                .commit_id
+                .is_some()
+        );
     }
 
     #[test]
@@ -14347,9 +14511,7 @@ mod tests {
             ("no-digest", "no exact identity digest"),
             ("forged", "identity digest"),
         ] {
-            let storage = StorageAdapter::new(
-                base.fork().expect("fork base closure fixture"),
-            );
+            let storage = StorageAdapter::new(base.fork().expect("fork base closure fixture"));
             let control_key = StorageKey(Bytes::from(hot_collection_control_key(
                 BRANCH_ID, generation, scope,
             )));

@@ -49,14 +49,11 @@ fn test_decoded_snapshot(
     schema_key: &str,
     row_pk: &crate::row_pk::RowPk,
     snapshot_content: Option<&str>,
-) -> Option<std::sync::Arc<crate::plugin::runtime::WasmTypedRow>> {
+) -> Option<std::sync::Arc<crate::row_payload::TypedRow>> {
     let snapshot: serde_json::Value = serde_json::from_str(snapshot_content?).ok()?;
-    let typed =
-        crate::plugin::runtime::WasmTypedRow::from_builtin_json(schema_key, row_pk, &snapshot)
-            .or_else(|_| {
-                crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(row_pk, &snapshot)
-            })
-            .ok()?;
+    let typed = crate::row_payload::TypedRow::from_builtin_json(schema_key, row_pk, &snapshot)
+        .or_else(|_| crate::row_payload::TypedRow::from_test_json_unchecked(row_pk, &snapshot))
+        .ok()?;
     Some(std::sync::Arc::new(typed))
 }
 
@@ -119,7 +116,7 @@ pub(crate) async fn seed_branch_head_with_rows(
         "id": branch_id,
         "commit_id": commit_id,
     });
-    let branch_ref_typed = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+    let branch_ref_typed = crate::row_payload::TypedRow::from_builtin_json(
         crate::branch::BRANCH_REF_SCHEMA_KEY,
         &branch_ref_row_pk,
         &branch_ref_snapshot,
