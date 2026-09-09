@@ -616,6 +616,26 @@ impl CertifiedParameterBatch {
         snapshot_offsets: Vec<(usize, usize)>,
         schema_key: SharedStr,
         branch_id: SharedStr,
+        certificate: CertifiedRawWriteBatchPreparation,
+    ) -> Result<Self, LixError> {
+        Self::new_typed_with_lane(
+            row_pks,
+            snapshot_arena,
+            snapshot_offsets,
+            schema_key,
+            branch_id,
+            false,
+            certificate,
+        )
+    }
+
+    pub(crate) fn new_typed_with_lane(
+        row_pks: Vec<RowPk>,
+        snapshot_arena: Vec<u8>,
+        snapshot_offsets: Vec<(usize, usize)>,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        untracked: bool,
         mut certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
         if row_pks.is_empty() || row_pks.len() != snapshot_offsets.len() {
@@ -675,7 +695,7 @@ impl CertifiedParameterBatch {
             }),
             schema_key,
             branch_id,
-            untracked: false,
+            untracked,
             certificate,
             row_columnar: None,
         })
@@ -5181,7 +5201,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn prepared_batch_compacts_superseded_owner_columns() {
         let origin_key: SharedStr = "one-execution".into();
@@ -5276,7 +5295,6 @@ mod tests {
         assert_eq!(second_key.values, ["file-b"]);
     }
 
-
     #[test]
     fn ten_thousand_write_row_clones_retain_identifier_buffers() {
         let schema_key = SharedStr::from("bulk_schema");
@@ -5368,10 +5386,6 @@ mod tests {
         assert!(!staged.is_inline());
         assert_eq!(staged.json_ref, expected);
     }
-
-
-
-
 
     #[test]
     fn certified_transaction_rows_release_without_moving_native_columns() {
@@ -5470,8 +5484,6 @@ mod tests {
         assert!(!staged.retains_decoded_value_for_tests());
         assert_eq!(staged.normalized(), r#"{"id":"row-1"}"#);
     }
-
-
 
     #[test]
     fn decoded_sql_rows_canonicalize_into_one_exact_batch_arena() {

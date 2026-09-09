@@ -9210,6 +9210,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_insert_batches_match_individual_inserts_without_json_roundtrips() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "$schema": "https://lix.dev/schema-v1.json", "key": "native_batch_probe",
+                    "columns": [
+                        {"name": "id", "type": "text", "nullable": false},
+                        {"name": "text", "type": "text", "nullable": true},
+                        {"name": "enabled", "type": "boolean", "nullable": false},
+                        {"name": "uuid", "type": "uuid", "nullable": false},
+                        {"name": "omitted", "type": "int8", "nullable": true}
+                    ], "primary_key": ["id"]
+                }),
+                "INSERT INTO native_batch_probe (uuid, text, enabled, id) VALUES ($1, $2, $3, $4)",
+                vec![
+                    vec![Value::Text("550E8400-E29B-41D4-A716-446655440000".into()), Value::Text("quote\" slash\\ newline\n emoji 🦀".into()), Value::Boolean(true), Value::Text("a".into())],
+                    vec![Value::Text("550e8400-e29b-41d4-a716-446655440001".into()), Value::Null, Value::Boolean(false), Value::Text("b".into())],
+                ],
+                "SELECT id, text, enabled, uuid, omitted FROM native_batch_probe ORDER BY id",
+            ),
+            (
+                serde_json::json!({
+                    "$schema": "https://lix.dev/schema-v1.json", "key": "native_batch_probe",
+                    "columns": [
+                        {"name": "id", "type": "text", "nullable": false},
+                        {"name": "text", "type": "text", "nullable": false},
+                        {"name": "at", "type": "timestamptz", "nullable": false},
+                        {"name": "omitted", "type": "boolean", "nullable": true}
+                    ], "primary_key": ["id"]
+                }),
+                "INSERT INTO native_batch_probe (id, text, at) VALUES ($1, $2, $3)",
+                vec![
+                    vec![Value::Text("a".into()), Value::Text("\t🦀".into()), Value::Text("2026-01-02T03:04:05.123456+02:00".into())],
+                    vec![Value::Text("b".into()), Value::Text("\"\\".into()), Value::Text("2026-01-02T01:04:05.123456Z".into())],
+                ],
+                "SELECT id, text, at, omitted FROM native_batch_probe ORDER BY id",
+            ),
+            (
+                serde_json::json!({
+                    "$schema": "https://lix.dev/schema-v1.json", "key": "native_batch_probe",
+                    "columns": [
+                        {"name": "path", "type": "text", "nullable": false},
+                        {"name": "value", "type": "jsonb", "nullable": false}
+                    ], "primary_key": ["path"]
+                }),
+                "INSERT INTO native_batch_probe (path, value) VALUES ($1, CAST($2 AS JSONB))",
+                vec![
+                    vec![Value::Text("/a\"\\🦀".into()), Value::Text(serde_json::json!({"nested": [null, true, {"text": "x".repeat(8192)}], "number": 9223372036854775807_i64}).to_string())],
+                    vec![Value::Text("/b".into()), Value::Text("null".into())],
+                ],
+                "SELECT path, value FROM native_batch_probe ORDER BY path",
+            ),
+        ];
+        for (case_index, (schema, sql, params, probe)) in cases.into_iter().enumerate() {
+            let batch = open_session().await;
+            let individual = open_session().await;
+            for session in [&batch, &individual] {
+                session.execute(
+                    "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                    &[Value::Text(schema.to_string())],
+                ).await.unwrap();
+            }
+            let statements = params
+                .iter()
+                .map(|params| ExecuteBatchStatement {
+                    label: None,
+                    sql: sql.into(),
+                    params: params.clone(),
+                })
+                .collect::<Vec<_>>();
+            sql2::take_certified_row_insert_parameter_batch_executions();
+            let results = batch.execute_batch(&statements).await.unwrap();
+            let executions = sql2::take_certified_row_insert_parameter_batch_executions();
+            if case_index == 0 {
+                assert_eq!(
+                    executions, 1,
+                    "direct typed INSERT batch must retain its dense lane: {sql}"
+                );
+            }
+            assert!(results.iter().all(|result| result.rows_affected() == 1));
+            for params in &params {
+                individual.execute(sql, params).await.unwrap();
+            }
+            let actual = batch.execute(probe, &[]).await.unwrap();
+            let expected = individual.execute(probe, &[]).await.unwrap();
+            assert_eq!(actual.len(), expected.len(), "{sql}");
+            for (actual, expected) in actual.rows().iter().zip(expected.rows()) {
+                assert_eq!(actual.values(), expected.values(), "{sql}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_insert_batch_rejects_invalid_uuid_with_statement_index_and_no_prefix() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json", "key": "native_invalid_batch_probe",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "uuid", "type": "uuid", "nullable": false}
+            ], "primary_key": ["id"]
+        });
+        session.execute(
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+            &[Value::Text(schema.to_string())],
+        ).await.unwrap();
+        let sql = "INSERT INTO native_invalid_batch_probe (id, uuid) VALUES ($1, $2)";
+        for invalid in [Value::Text("not-a-uuid".into()), Value::Null] {
+            let invalid_params = vec![Value::Text("b".into()), invalid];
+            let ordinary = session.execute(sql, &invalid_params).await.unwrap_err();
+            let batch = session
+                .execute_batch(&[
+                    ExecuteBatchStatement {
+                        label: None,
+                        sql: sql.into(),
+                        params: vec![
+                            Value::Text("a".into()),
+                            Value::Text("550e8400-e29b-41d4-a716-446655440000".into()),
+                        ],
+                    },
+                    ExecuteBatchStatement {
+                        label: None,
+                        sql: sql.into(),
+                        params: invalid_params,
+                    },
+                ])
+                .await
+                .unwrap_err();
+            assert_eq!(batch.code, ordinary.code);
+            assert_eq!(batch.details.as_ref().unwrap()["statementIndex"], 1);
+            assert!(
+                session
+                    .execute("SELECT id FROM native_invalid_batch_probe", &[])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn execute_batch_declines_uncertified_row_insert_rows() {
         let session = open_session().await;
         let schema = serde_json::json!({
