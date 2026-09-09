@@ -477,7 +477,7 @@ async fn try_execute_row_insert_batch(
             } else {
                 LixError::new(
                     LixError::CODE_UNIQUE,
-                    crate::transaction::duplicate_insert_identity_message(
+                    crate::transaction_types::duplicate_insert_identity_message(
                         row.schema_key,
                         row_pk,
                         Some(row.branch_id),
@@ -1388,7 +1388,7 @@ fn append_certified_path_value_parameter_payload(
             unreachable!("the certified replacement value parameter is text")
         }
     };
-    if crate::plugin::runtime::WasmTypedRow::try_append_certified_path_value_payload_from_canonical_json(
+    if crate::row_payload::TypedRow::try_append_certified_path_value_payload_from_canonical_json(
         output,
         schema_plan,
         primary_key,
@@ -1405,7 +1405,7 @@ fn append_certified_path_value_parameter_payload(
             format!("invalid JSONB value: {error}"),
         )
     })?;
-    crate::plugin::runtime::WasmTypedRow::append_certified_path_value_payload(
+    crate::row_payload::TypedRow::append_certified_path_value_payload(
         output,
         schema_plan,
         primary_key,
@@ -1498,7 +1498,7 @@ impl<'a> RowLiveRowRef<'a> {
         }
     }
 
-    fn decoded_snapshot(self) -> Option<&'a crate::plugin::runtime::WasmTypedRow> {
+    fn decoded_snapshot(self) -> Option<&'a crate::row_payload::TypedRow> {
         match self {
             Self::Owned(_) => None,
             Self::Batch(row) => row.decoded_snapshot().map(Arc::as_ref),
@@ -5389,7 +5389,7 @@ fn append_row_insert_row(
         native_schema_plan
             .compiled_schema
             .materialize_missing_nullable_columns(&mut typed_row);
-        let typed = crate::plugin::runtime::WasmTypedRow {
+        let typed = crate::row_payload::TypedRow {
             schema_fingerprint: native_schema_plan.fingerprint().bytes(),
             row_pk: Arc::from([]),
             row: typed_row,
@@ -6580,7 +6580,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
 
 enum CandidateRowImage<'a> {
     Json(JsonValue),
-    Typed(&'a crate::plugin::runtime::WasmTypedRow),
+    Typed(&'a crate::row_payload::TypedRow),
 }
 
 #[derive(Clone, Copy)]
@@ -6601,7 +6601,7 @@ impl<'a> CandidateRowImage<'a> {
 
 enum OwnedRowImage {
     Json(JsonValue),
-    Typed(crate::plugin::runtime::WasmTypedRow),
+    Typed(crate::row_payload::TypedRow),
 }
 
 impl CandidateRowImage<'_> {
@@ -6777,8 +6777,8 @@ fn typed_value_from_eval(
 fn finalize_typed_row(
     ctx: &dyn SqlWriteExecutionContext,
     schema_key: &str,
-    typed: crate::plugin::runtime::WasmTypedRow,
-) -> Result<(RowPk, crate::plugin::runtime::WasmTypedRow), LixError> {
+    typed: crate::row_payload::TypedRow,
+) -> Result<(RowPk, crate::row_payload::TypedRow), LixError> {
     let catalog = ctx.schema_catalog_snapshot().ok_or_else(|| {
         LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
@@ -6797,8 +6797,8 @@ fn finalize_typed_row(
 fn finalize_typed_row_with_plan(
     schema_key: &str,
     plan: &crate::catalog::SchemaPlan,
-    mut typed: crate::plugin::runtime::WasmTypedRow,
-) -> Result<(RowPk, crate::plugin::runtime::WasmTypedRow), LixError> {
+    mut typed: crate::row_payload::TypedRow,
+) -> Result<(RowPk, crate::row_payload::TypedRow), LixError> {
     plan.compiled_schema
         .validate_complete_row(&typed.row)
         .map_err(|error| {

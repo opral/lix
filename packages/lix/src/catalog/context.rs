@@ -381,7 +381,7 @@ fn decode_registered_schema_row(
             let Some(payload) = row.raw_snapshot() else {
                 return Ok(None);
             };
-            decoded = crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+            decoded = crate::row_payload::TypedRow::decode_durable_payload(
                 Arc::from(payload.as_ref()),
                 REGISTERED_SCHEMA_KEY,
                 row.row_pk(),
@@ -808,7 +808,10 @@ mod tests {
             .await
             .expect("schema visibility should load");
 
-        assert_eq!(schemas.len(), crate::schema::seed_schema_definitions().len());
+        assert_eq!(
+            schemas.len(),
+            crate::schema::seed_schema_definitions().len()
+        );
         assert!(schemas.iter().any(|schema| {
             schema.get("key").and_then(JsonValue::as_str) == Some("lix_file_descriptor")
         }));
@@ -874,7 +877,7 @@ mod tests {
             for row in rows {
                 let typed = row.snapshot_content.as_deref().and_then(|snapshot| {
                     let value = serde_json::from_str(snapshot).ok()?;
-                    crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+                    crate::row_payload::TypedRow::from_builtin_json(
                         &row.schema_key,
                         &row.row_pk,
                         &value,

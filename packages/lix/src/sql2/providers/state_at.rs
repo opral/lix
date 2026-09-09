@@ -742,8 +742,8 @@ async fn load_effective_ancestor_directories<S: StorageAdapterRead>(
     let mut seen = std::collections::BTreeSet::new();
     let mut local_ancestors = Vec::new();
     let mut base_ancestors = Vec::new();
-    let load_budget = crate::transaction::MAX_DIRECTORY_PARENT_DEPTH
-        + usize::from(parent_field == "directory_id");
+    let load_budget =
+        crate::filesystem::MAX_DIRECTORY_PARENT_DEPTH + usize::from(parent_field == "directory_id");
     for _ in 0..load_budget {
         let ids = pending.difference(&seen).cloned().collect::<Vec<_>>();
         if ids.is_empty() {
@@ -804,13 +804,13 @@ async fn load_effective_ancestor_directories<S: StorageAdapterRead>(
     } else {
         Err(DataFusionError::Execution(format!(
             "lix_as_of directory tree exceeds {} levels",
-            crate::transaction::MAX_DIRECTORY_PARENT_DEPTH
+            crate::filesystem::MAX_DIRECTORY_PARENT_DEPTH
         )))
     }
 }
 
 fn snapshot_text(
-    decoded: Option<&Arc<crate::plugin::runtime::WasmTypedRow>>,
+    decoded: Option<&Arc<crate::row_payload::TypedRow>>,
     raw: Option<&crate::common::SharedStr>,
     field: &str,
 ) -> Result<Option<String>> {

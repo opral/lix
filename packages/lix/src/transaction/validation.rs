@@ -32,7 +32,8 @@ use crate::hot_state::{
     HotStateReadDomain, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateRowRef,
 };
-use crate::plugin::runtime::{PLUGIN_OWNER_KEY, WasmTypedRow};
+use crate::plugin::runtime::PLUGIN_OWNER_KEY;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::{RowPk, RowPkError, canonical_json_text};
 #[cfg(test)]
 use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definition};
@@ -40,12 +41,12 @@ use crate::schema::{schema_from_registered_snapshot, validate_schema_amendment};
 use crate::transaction::normalization::{
     reject_reserved_schema_namespace, reject_reserved_schema_namespace_unless_exact_builtin,
 };
-use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::{
     PreparedInsertRef, PreparedValidationRow, PreparedWriteSet, PreparedWriteValidationSet,
 };
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteOrigin;
+use crate::transaction_types::duplicate_insert_identity_message;
 use crate::transaction_types::{
     PreparedStateBatch, PreparedStateRowRef, StagedIndexRow, StagedIndexValues,
     TransactionWriteOperation,
@@ -55,7 +56,7 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-pub(crate) const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
+use crate::filesystem::MAX_DIRECTORY_PARENT_DEPTH;
 
 /// Immutable view of the final transaction write set before persistence.
 ///
@@ -3152,13 +3153,15 @@ fn committed_snapshot_json(
     if row.deleted() {
         return Ok(None);
     }
-    row.snapshot_json_value()?.map(Some).ok_or_else(|| LixError::new(
+    row.snapshot_json_value()?.map(Some).ok_or_else(|| {
+        LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "live committed row for schema '{}' has no payload",
                 row.schema_key()
             ),
-        ))
+        )
+    })
 }
 
 fn committed_constraint_value(
