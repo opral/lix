@@ -382,12 +382,9 @@ where
         .expect("global branch control should exist");
     let snapshot_value: serde_json::Value =
         serde_json::from_str(&snapshot_content).expect("deterministic mode snapshot should parse");
-    let decoded_snapshot = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
-        "lix_key_value",
-        &row_pk,
-        &snapshot_value,
-    )
-    .expect("deterministic mode snapshot should type");
+    let decoded_snapshot =
+        crate::row_payload::TypedRow::from_builtin_json("lix_key_value", &row_pk, &snapshot_value)
+            .expect("deterministic mode snapshot should type");
     let snapshot = decoded_snapshot
         .durable_payload_ref()
         .expect("deterministic mode snapshot should encode");
@@ -486,7 +483,7 @@ async fn seed_visible_schema_rows<StorageImpl>(
             });
             let row_pk = crate::schema::registered_schema_row_pk(&key.schema_key)
                 .expect("registered schema identity should derive");
-            let typed = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+            let typed = crate::row_payload::TypedRow::from_builtin_json(
                 "lix_registered_schema",
                 &row_pk,
                 &snapshot,
@@ -561,7 +558,7 @@ async fn seed_visible_schema_rows<StorageImpl>(
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: Some(
-                        crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+                        crate::row_payload::TypedRow::from_test_json_unchecked(
                             row_pk,
                             &serde_json::from_str(snapshot)
                                 .expect("branch-ref benchmark row is JSON"),

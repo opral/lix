@@ -2012,8 +2012,7 @@ where
             "index": index,
             "payload": "x".repeat(192),
         });
-        let typed =
-            crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(&row_pk, &snapshot)?;
+        let typed = crate::row_payload::TypedRow::from_test_json_unchecked(&row_pk, &snapshot)?;
         let snapshot = typed.durable_payload().map_err(|error| {
             crate::LixError::new(
                 crate::LixError::CODE_INTERNAL_ERROR,
@@ -3235,7 +3234,7 @@ where
             continue;
         }
         if let Some(payload) = member.change.snapshot.as_deref() {
-            let typed = crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+            let typed = crate::row_payload::TypedRow::decode_durable_payload(
                 std::sync::Arc::from(payload),
                 &member.change.schema_key,
                 &member.change.row_pk,

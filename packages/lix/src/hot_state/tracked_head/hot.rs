@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 use tracing::Instrument as _;
 
 use super::*;
-use crate::plugin::runtime::WasmCertifiedRowBatch;
+use crate::row_payload::CertifiedRowBatch as WasmCertifiedRowBatch;
 use crate::storage_adapter::{BufferRange, EncodedMutationBatch, EncodedPut};
 use crate::tracked_state::TrackedStateReadColumns;
 
@@ -455,10 +455,10 @@ pub(crate) async fn stage_certified_row_batches(
             );
             for (page_index, page) in batch.pages.iter().enumerate() {
                 let (first_local_ref, last_local_ref) = match batch.format {
-                    crate::plugin::runtime::HOST_CERTIFIED_PACKET_FORMAT => {
+                    crate::row_payload::HOST_CERTIFIED_PACKET_FORMAT => {
                         certified_packet_page_local_ref_range(page)?.unwrap_or((0, u32::MAX))
                     }
-                    crate::plugin::runtime::HOST_CERTIFIED_ZSTD_PACKET_FORMAT => {
+                    crate::row_payload::HOST_CERTIFIED_ZSTD_PACKET_FORMAT => {
                         certified_zstd_packet_page_header(page)?.0
                     }
                     format => {
@@ -12354,15 +12354,7 @@ fn hot_index_candidate_budget(entries_published: u64) -> usize {
     usize::try_from((entries_published / 2).max(MIN_CANDIDATE_BUDGET)).unwrap_or(usize::MAX)
 }
 
-/// One indexed value, encoded so that equality is a key prefix.
-///
-/// Integers use the same order-preserving flip as row-pk components so a
-/// future range predicate can reuse this encoding unchanged.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum HotIndexValue {
-    String(String),
-    Integer(i64),
-}
+pub(crate) use crate::row_state::HotIndexValue;
 
 impl HotIndexValue {
     fn write(&self, out: &mut Vec<u8>) {

@@ -69,6 +69,8 @@ pub(crate) mod domain;
 mod engine;
 pub(crate) mod row_columnar;
 pub(crate) mod row_pk;
+pub(crate) mod row_payload;
+pub(crate) mod row_state;
 pub(crate) mod row_ref;
 pub(crate) mod filesystem;
 pub(crate) mod functions;

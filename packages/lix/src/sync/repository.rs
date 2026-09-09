@@ -173,12 +173,12 @@ fn sync_change_records_equal(
         (None, None) => Ok(true),
         (Some(left), Some(right)) if left == right => Ok(true),
         (Some(left), Some(right)) => {
-            let left = crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+            let left = crate::row_payload::TypedRow::decode_durable_payload(
                 left.clone().into(),
                 &existing.schema_key,
                 &existing.row_pk,
             )?;
-            let right = crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+            let right = crate::row_payload::TypedRow::decode_durable_payload(
                 right.clone().into(),
                 &incoming.schema_key,
                 &incoming.row_pk,
@@ -1928,7 +1928,7 @@ fn snapshot_rows_hot_snapshot<'a>(
                     file_id: row.file_id.clone(),
                     snapshot_content: Some(row.snapshot_json.clone().into()),
                     decoded_snapshot: Some(std::sync::Arc::new(
-                        crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+                        crate::row_payload::TypedRow::decode_durable_payload(
                             std::sync::Arc::from(row.snapshot.clone()),
                             &row.schema_key,
                             &row.row_pk,
@@ -2719,7 +2719,7 @@ fn encode_sync_typed_snapshot(
     row_pk: &RowPk,
     snapshot: &serde_json::Value,
 ) -> Result<Vec<u8>, LixError> {
-    crate::plugin::runtime::WasmTypedRow::from_builtin_json(schema_key, row_pk, snapshot)
+    crate::row_payload::TypedRow::from_builtin_json(schema_key, row_pk, snapshot)
         .map_err(|error| {
             LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -9868,7 +9868,7 @@ mod tests {
     #[test]
     fn snapshot_encoding_preserves_distinct_rows_sharing_a_source_change() {
         let source_pk = RowPk::single("source-row");
-        let source_payload = crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+        let source_payload = crate::row_payload::TypedRow::from_test_json_unchecked(
             &source_pk,
             &serde_json::json!({"value": "source"}),
         )
@@ -9894,10 +9894,9 @@ mod tests {
                 .map(|identity| {
                     let row_pk = RowPk::single(identity);
                     let json = serde_json::json!({"id": identity});
-                    let typed = crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
-                        &row_pk, &json,
-                    )
-                    .unwrap();
+                    let typed =
+                        crate::row_payload::TypedRow::from_test_json_unchecked(&row_pk, &json)
+                            .unwrap();
                     MaterializedTrackedStateRow {
                         row_pk,
                         schema_key: "derived_row".into(),
@@ -12077,7 +12076,7 @@ mod tests {
             .unwrap()
             .insert("value".to_owned(), serde_json::json!("different"));
         let pk = RowPk::from_typed_json_array_value(&member.row_pk).unwrap();
-        let row = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+        let row = crate::row_payload::TypedRow::from_builtin_json(
             &member.schema_key,
             &pk,
             member.snapshot.as_ref().unwrap(),
