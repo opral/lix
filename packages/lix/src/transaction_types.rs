@@ -616,6 +616,26 @@ impl CertifiedParameterBatch {
         snapshot_offsets: Vec<(usize, usize)>,
         schema_key: SharedStr,
         branch_id: SharedStr,
+        certificate: CertifiedRawWriteBatchPreparation,
+    ) -> Result<Self, LixError> {
+        Self::new_typed_with_lane(
+            row_pks,
+            snapshot_arena,
+            snapshot_offsets,
+            schema_key,
+            branch_id,
+            false,
+            certificate,
+        )
+    }
+
+    pub(crate) fn new_typed_with_lane(
+        row_pks: Vec<RowPk>,
+        snapshot_arena: Vec<u8>,
+        snapshot_offsets: Vec<(usize, usize)>,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        untracked: bool,
         mut certificate: CertifiedRawWriteBatchPreparation,
     ) -> Result<Self, LixError> {
         if row_pks.is_empty() || row_pks.len() != snapshot_offsets.len() {
@@ -675,7 +695,7 @@ impl CertifiedParameterBatch {
             }),
             schema_key,
             branch_id,
-            untracked: false,
+            untracked,
             certificate,
             row_columnar: None,
         })
