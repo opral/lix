@@ -2416,7 +2416,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
     let commit_id = first_checkpoint.clone();
     let files = replica
         .execute(
-            "SELECT name, directory_id FROM lix_state_at('lix_file', $1) ORDER BY name",
+            "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
             &[Value::Text(commit_id.clone())],
         )
         .await
@@ -2426,15 +2426,21 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .iter()
         .map(|row| row.get::<String>("name").expect("file name"))
         .collect::<Vec<_>>();
+    assert_eq!(file_names.len(), 3);
     assert_eq!(
-        file_names,
-        vec!["README.md", "inside.md", "playbook.md"],
-        "first checkpoint holds the bootstrap README and both authored files"
+        file_names
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["README.md", "playbook.md", "inside.md"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "first checkpoint holds both test files and the bootstrap README"
     );
 
     let directories = replica
         .execute(
-            "SELECT id, name FROM lix_state_at('lix_directory', $1) ORDER BY name",
+            "SELECT id, name FROM lix_state_at('lix_directory', $1)",
             &[Value::Text(commit_id.clone())],
         )
         .await
@@ -2444,10 +2450,16 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .iter()
         .map(|row| row.get::<String>("name").expect("directory name"))
         .collect::<Vec<_>>();
+    assert_eq!(directory_names.len(), 6);
     assert_eq!(
-        directory_names,
-        vec![".lix", "app_data", "docs", "handbook", "plugins", "sales"],
-        "first checkpoint holds bootstrap and authored directories"
+        directory_names
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [".lix", "app_data", "plugins", "sales", "docs", "handbook"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "first checkpoint holds the test and bootstrap directories"
     );
     assert_files_resolve_directories(&files, &directories);
 

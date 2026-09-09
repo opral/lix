@@ -1,0 +1,310 @@
+{
+  "baseline_revision": "37cd4904a6035742feae01f2acc4c3ed335531d3",
+  "profile": "unoptimized Cargo test; Memory replica and authority; zero network RTT",
+  "memory_note": "VmHWM is cumulative whole-process memory, including fixtures and earlier cases; it is not planner peak memory.",
+  "modes": {
+    "main": {
+      "queues": [
+        {
+          "page_limit": 512,
+          "profile": {
+            "catch_up_micros": 493115,
+            "commit_payload_load_calls": 512,
+            "commits": 512,
+            "emitted_members_json_bytes": 747410,
+            "final_ack_frontier": 0,
+            "final_receipt_json_bytes": 974,
+            "maximum_ack_frontier": 1,
+            "maximum_page_planning_micros": 85183,
+            "pages": 2,
+            "planning_micros": 94299,
+            "planning_reads": {
+              "all_space_returned_bytes": 2077055,
+              "change_value_bytes": 0,
+              "change_value_keys": 0,
+              "commit_header_keys": 2048,
+              "delta_segment_bytes": 0,
+              "delta_segment_keys": 0
+            },
+            "ref_updates": 1,
+            "retained_plan": false,
+            "whole_process_vm_hwm_kib": 261424
+          },
+          "queue_commits": 512
+        },
+        {
+          "page_limit": 512,
+          "profile": {
+            "catch_up_micros": 2435651,
+            "commit_payload_load_calls": 5120,
+            "commits": 2048,
+            "emitted_members_json_bytes": 2991018,
+            "final_ack_frontier": 0,
+            "final_receipt_json_bytes": 974,
+            "maximum_ack_frontier": 1,
+            "maximum_page_planning_micros": 294618,
+            "pages": 5,
+            "planning_micros": 828196,
+            "planning_reads": {
+              "all_space_returned_bytes": 20775629,
+              "change_value_bytes": 0,
+              "change_value_keys": 0,
+              "commit_header_keys": 20480,
+              "delta_segment_bytes": 0,
+              "delta_segment_keys": 0
+            },
+            "ref_updates": 1,
+            "retained_plan": false,
+            "whole_process_vm_hwm_kib": 282880
+          },
+          "queue_commits": 2048
+        },
+        {
+          "page_limit": 512,
+          "profile": {
+            "catch_up_micros": 18030798,
+            "commit_payload_load_calls": 69632,
+            "commits": 8192,
+            "emitted_members_json_bytes": 11967402,
+            "final_ack_frontier": 0,
+            "final_receipt_json_bytes": 975,
+            "maximum_ack_frontier": 1,
+            "maximum_page_planning_micros": 1226961,
+            "pages": 17,
+            "planning_micros": 11327631,
+            "planning_reads": {
+              "all_space_returned_bytes": 282629637,
+              "change_value_bytes": 0,
+              "change_value_keys": 0,
+              "commit_header_keys": 278528,
+              "delta_segment_bytes": 0,
+              "delta_segment_keys": 0
+            },
+            "ref_updates": 1,
+            "retained_plan": false,
+            "whole_process_vm_hwm_kib": 334040
+          },
+          "queue_commits": 8192
+        }
+      ],
+      "checkpoints": [
+        {
+          "scoped": false,
+          "waves": 32,
+          "maximum_ack_frontier": 34,
+          "final_ack_frontier": 32,
+          "final_receipt_json_bytes": 2223
+        },
+        {
+          "scoped": true,
+          "waves": 32,
+          "maximum_ack_frontier": 2,
+          "final_ack_frontier": 0,
+          "final_receipt_json_bytes": 975
+        }
+      ]
+    },
+    "page_only": {
+      "queues": [
+        {
+          "page_limit": 512,
+          "profile": {
+            "catch_up_micros": 468164,
+            "commit_payload_load_calls": 512,
+            "commits": 512,
+            "emitted_members_json_bytes": 747410,
+            "final_ack_frontier": 0,
+            "final_receipt_json_bytes": 974,
+            "maximum_ack_frontier": 1,
+            "maximum_page_planning_micros": 79420,
+            "pages": 2,
+            "planning_micros": 87996,
+            "planning_reads": {
+              "all_space_returned_bytes": 2079115,
+              "change_value_bytes": 0,
+              "change_value_keys": 0,
+              "commit_header_keys": 2048,
+              "delta_segment_bytes": 0,
+              "delta_segment_keys": 0
+            },
+            "ref_updates": 1,
+            "retained_plan": false,
+            "whole_process_vm_hwm_kib": 262664
+          },
+          "queue_commits": 512
+        },
+        {
+          "page_limit": 512,
+          "profile": {
+            "catch_up_micros": 1992776,
+            "commit_payload_load_calls": 2048,
+            "commits": 2048,
+            "emitted_members_json_bytes": 2991018,
+            "final_ack_frontier": 0,
+            "final_receipt_json_bytes": 974,
+            "maximum_ack_frontier": 1,
+            "maximum_page_planning_micros": 127614,
+            "pages": 5,
+            "planning_micros": 492649,
+            "planning_reads": {
+              "all_space_returned_bytes": 14576760,
+              "change_value_bytes": 0,
+              "change_value_keys": 0,
+              "commit_header_keys": 17408,
+              "delta_segment_bytes": 0,
+              "delta_segment_keys": 0
+            },
+            "ref_updates": 1,
+            "retained_plan": false,
+            "whole_process_vm_hwm_kib": 278920
+          },
+          "queue_commits": 2048
+        },
+        {
+          "page_limit": 512,
+          "profile": {
+            "catch_up_micros": 10675468,
+            "commit_payload_load_calls": 8192,
+            "commits": 8192,
+            "emitted_members_json_bytes": 11967402,
+            "final_ack_frontier": 0,
+            "final_receipt_json_bytes": 975,
+            "maximum_ack_frontier": 1,
+            "maximum_page_planning_micros": 351036,
+            "pages": 17,
+            "planning_micros": 4594197,
+            "planning_reads": {
+              "all_space_returned_bytes": 158585306,
+              "change_value_bytes": 0,
+              "change_value_keys": 0,
+              "commit_header_keys": 217088,
+              "delta_segment_bytes": 0,
+              "delta_segment_keys": 0
+            },
+            "ref_updates": 1,
+            "retained_plan": false,
+            "whole_process_vm_hwm_kib": 325392
+          },
+          "queue_commits": 8192
+        }
+      ],
+      "checkpoints": [
+        {
+          "scoped": false,
+          "waves": 32,
+          "maximum_ack_frontier": 3,
+          "final_ack_frontier": 0,
+          "final_receipt_json_bytes": 976
+        },
+        {
+          "scoped": true,
+          "waves": 32,
+          "maximum_ack_frontier": 2,
+          "final_ack_frontier": 0,
+          "final_receipt_json_bytes": 975
+        }
+      ]
+    },
+    "retained": {
+      "queues": [
+        {
+          "page_limit": 512,
+          "profile": {
+            "catch_up_micros": 463631,
+            "commit_payload_load_calls": 512,
+            "commits": 512,
+            "emitted_members_json_bytes": 747410,
+            "final_ack_frontier": 0,
+            "final_receipt_json_bytes": 974,
+            "maximum_ack_frontier": 1,
+            "maximum_page_planning_micros": 81123,
+            "pages": 2,
+            "planning_micros": 81393,
+            "planning_reads": {
+              "all_space_returned_bytes": 1731700,
+              "change_value_bytes": 0,
+              "change_value_keys": 0,
+              "commit_header_keys": 1536,
+              "delta_segment_bytes": 0,
+              "delta_segment_keys": 0
+            },
+            "ref_updates": 1,
+            "retained_plan": true,
+            "whole_process_vm_hwm_kib": 263892
+          },
+          "queue_commits": 512
+        },
+        {
+          "page_limit": 512,
+          "profile": {
+            "catch_up_micros": 1802311,
+            "commit_payload_load_calls": 2048,
+            "commits": 2048,
+            "emitted_members_json_bytes": 2991018,
+            "final_ack_frontier": 0,
+            "final_receipt_json_bytes": 974,
+            "maximum_ack_frontier": 1,
+            "maximum_page_planning_micros": 131468,
+            "pages": 5,
+            "planning_micros": 310191,
+            "planning_reads": {
+              "all_space_returned_bytes": 6922587,
+              "change_value_bytes": 0,
+              "change_value_keys": 0,
+              "commit_header_keys": 6144,
+              "delta_segment_bytes": 0,
+              "delta_segment_keys": 0
+            },
+            "ref_updates": 1,
+            "retained_plan": true,
+            "whole_process_vm_hwm_kib": 280140
+          },
+          "queue_commits": 2048
+        },
+        {
+          "page_limit": 512,
+          "profile": {
+            "catch_up_micros": 7380389,
+            "commit_payload_load_calls": 8192,
+            "commits": 8192,
+            "emitted_members_json_bytes": 11967402,
+            "final_ack_frontier": 0,
+            "final_receipt_json_bytes": 975,
+            "maximum_ack_frontier": 1,
+            "maximum_page_planning_micros": 361004,
+            "pages": 17,
+            "planning_micros": 1280900,
+            "planning_reads": {
+              "all_space_returned_bytes": 27695905,
+              "change_value_bytes": 0,
+              "change_value_keys": 0,
+              "commit_header_keys": 24576,
+              "delta_segment_bytes": 0,
+              "delta_segment_keys": 0
+            },
+            "ref_updates": 1,
+            "retained_plan": true,
+            "whole_process_vm_hwm_kib": 326780
+          },
+          "queue_commits": 8192
+        }
+      ],
+      "checkpoints": [
+        {
+          "scoped": false,
+          "waves": 32,
+          "maximum_ack_frontier": 3,
+          "final_ack_frontier": 0,
+          "final_receipt_json_bytes": 976
+        },
+        {
+          "scoped": true,
+          "waves": 32,
+          "maximum_ack_frontier": 2,
+          "final_ack_frontier": 0,
+          "final_receipt_json_bytes": 975
+        }
+      ]
+    }
+  }
+}

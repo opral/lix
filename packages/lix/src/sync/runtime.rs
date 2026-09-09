@@ -375,6 +375,7 @@ where
     let mut change_watcher = lix.sync_mode_state().change_watcher();
     let mut internal_demand_retry = SyncDemandRetry::default();
     let mut pending_demands = Vec::new();
+    let mut upload_plan = None;
 
     let mut terminal_error = None;
     while *shutdown_rx.borrow() == SyncShutdown::Running {
@@ -432,6 +433,7 @@ where
                 &mut change_watcher,
                 &mut demand_rx,
                 &mut pending_demands,
+                &mut upload_plan,
             )
             .fuse();
             let shutdown = shutdown_rx.changed().fuse();
@@ -553,6 +555,7 @@ pub(super) async fn sync_iteration<StorageImpl, Transport>(
     change_watcher: &mut tokio::sync::watch::Receiver<u64>,
     demand_rx: &mut tokio::sync::mpsc::Receiver<SyncDemand>,
     pending_demands: &mut Vec<SyncDemand>,
+    upload_plan: &mut Option<super::repository::CachedSyncUploadPlan>,
 ) -> Result<(), LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -581,8 +584,15 @@ where
 
     // Publish completed local commits before waiting for remote work. Commit
     // identity and ref compare-and-swap make retry after a lost response safe.
-    let ref_conflicted =
-        push_pending_outbox(lix, remote_id, transport, push_item_limit, delta_pull_limit).await?;
+    let ref_conflicted = push_pending_outbox(
+        lix,
+        remote_id,
+        transport,
+        push_item_limit,
+        delta_pull_limit,
+        upload_plan,
+    )
+    .await?;
 
     let cursor = lix
         .load_sync_repository_cursor(remote_id)
@@ -631,19 +641,30 @@ async fn push_pending_outbox<StorageImpl, Transport>(
     transport: &Transport,
     push_item_limit: &mut usize,
     delta_pull_limit: &mut usize,
+    upload_plan: &mut Option<super::repository::CachedSyncUploadPlan>,
 ) -> Result<bool, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
     for _ in 0..4 {
-        let Some(mut request) = lix.build_sync_push(remote_id, *push_item_limit).await? else {
+        let Some(mut request) = lix
+            .build_sync_push_with_plan(remote_id, *push_item_limit, upload_plan)
+            .await?
+        else {
             return Ok(false);
         };
         let result = push_with_inline_fallback(lix, transport, &mut request).await;
         match result {
             Ok(receipt) => {
                 catch_up_to(lix, remote_id, transport, receipt.cursor, delta_pull_limit).await?;
+                if let Some(plan) = upload_plan.as_mut() {
+                    plan.acknowledge()?;
+                    if plan.is_complete() {
+                        *upload_plan = None;
+                        lix.clear_converged_sync_frontier().await?;
+                    }
+                }
             }
             // A ref moved concurrently. Pulling the authority's intervening
             // events lets the importer reconcile local refs/outbox state; an
@@ -658,6 +679,7 @@ where
                 // outbox forever. Keep transport/auth-refresh failures durable.
                 tracing::warn!(error = ?error, "server rejected pending local changes");
                 lix.discard_sync_pending_changes().await?;
+                *upload_plan = None;
                 return Ok(true);
             }
             Err(error) => return Err(error),
@@ -3824,6 +3846,7 @@ mod tests {
             &mut replica.sync_mode_state().change_watcher(),
             &mut demand_rx,
             &mut demands,
+            &mut None,
         )
         .await
         .expect_err("transport failure returns to the worker retry path");
@@ -3846,6 +3869,7 @@ mod tests {
             &mut replica.sync_mode_state().change_watcher(),
             &mut demand_rx,
             &mut demands,
+            &mut None,
         )
         .await
         .expect_err("the test transport stops after servicing the demand");
@@ -3895,6 +3919,7 @@ mod tests {
             &mut replica.sync_mode_state().change_watcher(),
             &mut demand_rx,
             &mut demands,
+            &mut None,
         )
         .await
         .expect_err("the test transport stops after pruning the canceled demand");

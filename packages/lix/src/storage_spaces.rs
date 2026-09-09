@@ -68,6 +68,8 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::sync::SYNC_REPLICA_STATE_SPACE,
     crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
     crate::sync::SYNC_CHECKPOINT_SOURCE_SPACE,
+    crate::sync::SYNC_UPLOAD_GENERATION_SPACE,
+    crate::sync::SYNC_UPLOAD_PROOF_SPACE,
     // `gc.rs` declares these through the checked constructors rather than
     // `StorageSpace::declare`, so referencing its constants here would make
     // `may_declare` read a registry it is in the middle of evaluating. The
@@ -142,6 +144,8 @@ pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
     crate::sync::SYNC_REPLICA_STATE_SPACE,
     crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
     crate::sync::SYNC_CHECKPOINT_SOURCE_SPACE,
+    crate::sync::SYNC_UPLOAD_GENERATION_SPACE,
+    crate::sync::SYNC_UPLOAD_PROOF_SPACE,
     StorageSpace::declare(
         StorageSpaceId(0x0008_0001),
         "checkpoint.recovery_ref.v3",

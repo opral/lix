@@ -142,40 +142,37 @@ async fn assert_cached_explicit_directory_transaction() {
         .with_storage(storage.clone())
         .await
         .expect("cold reopen cached transaction repository");
-    // Inspect both sides of the move so stale source entries still fail, while
-    // repository bootstrap files and directories are outside this fixture.
     let file = reopened
-        .execute(
-            "SELECT path, content FROM lix_file \
-             WHERE path LIKE '/source/%' OR path LIKE '/target/%'",
-            &[],
-        )
+        .execute("SELECT path, content FROM lix_file ORDER BY path", &[])
         .await
         .expect("read moved file after cold reopen");
-    assert_eq!(file.len(), 1);
+    assert_eq!(file.len(), 2);
     assert_eq!(
         file.rows()[0].get::<String>("path").unwrap(),
+        "/.lix/README.md"
+    );
+    assert_eq!(
+        file.rows()[1].get::<String>("path").unwrap(),
         "/target/note.bin"
     );
-    assert_eq!(file.rows()[0].get::<Vec<u8>>("content").unwrap(), content);
+    assert_eq!(file.rows()[1].get::<Vec<u8>>("content").unwrap(), content);
     let directories = reopened
-        .execute(
-            "SELECT path FROM lix_directory \
-             WHERE path IN ('/source', '/target') \
-                OR path LIKE '/source/%' OR path LIKE '/target/%' \
-             ORDER BY path",
-            &[],
-        )
+        .execute("SELECT path FROM lix_directory ORDER BY path", &[])
         .await
         .expect("read empty descendant after cold reopen");
-    assert_eq!(directories.len(), 2);
     assert_eq!(
-        directories.rows()[0].get::<String>("path").unwrap(),
-        "/target"
-    );
-    assert_eq!(
-        directories.rows()[1].get::<String>("path").unwrap(),
-        "/target/empty"
+        directories
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("path").unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "/.lix",
+            "/.lix/app_data",
+            "/.lix/plugins",
+            "/target",
+            "/target/empty"
+        ],
     );
     drop(reopened);
     storage

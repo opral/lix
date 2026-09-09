@@ -18,6 +18,10 @@ mod repository;
 mod runtime;
 #[cfg(test)]
 mod simulation_tests;
+#[cfg(test)]
+mod upload_metrics;
+mod upload_plan;
+mod upload_proof;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -69,6 +73,10 @@ pub(crate) use repository::{
     validate_repository_transaction_event_transfer,
 };
 pub(crate) use runtime::{SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode};
+pub(crate) use upload_plan::{
+    SYNC_UPLOAD_GENERATION_SPACE, stage_invalidate as stage_upload_plan_invalidation,
+};
+pub(crate) use upload_proof::SYNC_UPLOAD_PROOF_SPACE;
 
 pub(crate) const MAX_SYNC_PULL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
