@@ -246,11 +246,6 @@ enum PreconditionDto {
         space: StorageSpaceDto,
         range: KeyRangeDto,
     },
-    BranchEquals {
-        #[serde(rename = "refKey")]
-        ref_key: ByteDto,
-        expected: ByteDto,
-    },
 }
 
 #[derive(Serialize)]
@@ -706,10 +701,6 @@ fn precondition_dto(precondition: &Precondition) -> PreconditionDto {
         Precondition::RangeEmpty { space, range } => PreconditionDto::RangeEmpty {
             space: storage_space_dto(*space),
             range: key_range_dto(range),
-        },
-        Precondition::BranchEquals { ref_key, expected } => PreconditionDto::BranchEquals {
-            ref_key: ByteDto(ref_key.0.to_vec()),
-            expected: ByteDto(expected.to_vec()),
         },
     }
 }

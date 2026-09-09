@@ -393,54 +393,6 @@ impl RowPk {
         Self::from_components(components)
     }
 
-    pub(crate) fn validate_external_parts(
-        parts: &[&str],
-        component_types: &[RowPkComponentType],
-    ) -> Result<(), RowPkError> {
-        if parts.is_empty() {
-            return Err(RowPkError::EmptyPrimaryKey);
-        }
-        if parts.len() != component_types.len() {
-            return Err(RowPkError::InvalidEncodedRowPk);
-        }
-        for (index, (part, component_type)) in parts.iter().zip(component_types).enumerate() {
-            match component_type {
-                RowPkComponentType::Uuid => {
-                    if crate::storage_codec::id_string::uuid_bytes_from_canonical(part).is_none() {
-                        return Err(RowPkError::InvalidPrimaryKeyValue {
-                            index,
-                            expected: "canonical UUID string",
-                        });
-                    }
-                }
-                RowPkComponentType::Integer => {
-                    part.parse::<i64>()
-                        .map_err(|_| RowPkError::InvalidPrimaryKeyValue {
-                            index,
-                            expected: "integer",
-                        })?;
-                }
-                RowPkComponentType::String => {
-                    if part.contains('\0') {
-                        return Err(RowPkError::InvalidPrimaryKeyValue {
-                            index,
-                            expected: "text without Unicode NUL",
-                        });
-                    }
-                }
-                RowPkComponentType::Bytes => {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(part.as_bytes())
-                        .map_err(|_| RowPkError::InvalidPrimaryKeyValue {
-                            index,
-                            expected: "base64 string",
-                        })?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) fn from_parts(parts: Vec<String>) -> Result<Self, RowPkError> {
         Self::from_shared_parts(parts.into_iter().map(SharedStr::from))

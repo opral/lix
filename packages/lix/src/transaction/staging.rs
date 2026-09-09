@@ -8,6 +8,9 @@
     clippy::unused_self
 )]
 
+use crate::transaction_types::{
+    duplicate_insert_identity_message, logical_primary_key_violation_message,
+};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -35,15 +38,15 @@ use crate::hot_state::{
 };
 #[cfg(test)]
 use crate::hot_state::{MaterializedHotStateRow, MaterializedHotStateRowRef};
-use crate::plugin::runtime::WasmTypedRow;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::transaction::staged_commit_changes::StagedCommitChangeBatch;
 use crate::transaction::staged_commit_changes::StagedCommitChangeRefs;
 #[cfg(test)]
 use crate::transaction_types::TestPreparedStateRow;
 use crate::transaction_types::{
-    CompleteCollectionReplacementProof, LogicalPrimaryKey, PreparedRowFacts, PreparedStateBatch,
-    PreparedStateRowRef, PreparedTransactionWrite, TransactionFileContent, TransactionWriteMode,
+    CompleteCollectionReplacementProof, PreparedRowFacts, PreparedStateBatch, PreparedStateRowRef,
+    PreparedTransactionWrite, TransactionFileContent, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteOutcome,
     materialize_jsonb_shared,
 };
@@ -4330,25 +4333,6 @@ fn duplicate_staged_present_row_error(
     LixError::new(LixError::CODE_UNIQUE, message)
 }
 
-pub(crate) fn duplicate_insert_identity_message(
-    schema_key: &str,
-    _row_pk: &RowPk,
-    branch_id: Option<&str>,
-    origin: Option<&TransactionWriteOrigin>,
-) -> String {
-    if let Some(message) = logical_primary_key_violation_message(origin) {
-        return message;
-    }
-    match branch_id {
-        Some(branch_id) => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate a primary key in branch '{branch_id}'"
-        ),
-        None => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate a primary key"
-        ),
-    }
-}
-
 fn duplicate_insert_identity_error(row: PreparedStateRowRef<'_>) -> LixError {
     let message = duplicate_insert_identity_message(
         row.schema_key,
@@ -4357,38 +4341,6 @@ fn duplicate_insert_identity_error(row: PreparedStateRowRef<'_>) -> LixError {
         row.origin,
     );
     LixError::new(LixError::CODE_UNIQUE, message)
-}
-
-fn logical_primary_key_violation_message(
-    origin: Option<&TransactionWriteOrigin>,
-) -> Option<String> {
-    let origin = origin?;
-    if origin.operation != TransactionWriteOperation::Insert {
-        return None;
-    }
-    let primary_key = origin.primary_key.as_ref()?;
-    Some(format!(
-        "primary-key constraint violation on table '{}': INSERT would duplicate {}",
-        origin.surface,
-        format_logical_primary_key(primary_key)
-    ))
-}
-
-fn format_logical_primary_key(primary_key: &LogicalPrimaryKey) -> String {
-    primary_key
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            let value = primary_key
-                .values
-                .get(index)
-                .map(String::as_str)
-                .unwrap_or("<missing>");
-            format!("{column} '{value}'")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn add_row_to_commit_change_refs(
@@ -4855,10 +4807,7 @@ mod tests {
             let start = snapshots.len();
             if row + 1 == ROW_COUNT {
                 snapshots.extend_from_slice(b"{\"value\":\"");
-                snapshots.extend(std::iter::repeat_n(
-                    b'x',
-                    crate::json_store::JSON_INLINE_MAX_BYTES + 1,
-                ));
+                snapshots.extend(std::iter::repeat_n(b'x', 1024 + 1));
                 snapshots.extend_from_slice(b"\"}");
             } else {
                 snapshots.extend_from_slice(b"{}");
@@ -4881,7 +4830,7 @@ mod tests {
         )
         .expect("journal chunk above the u16 row boundary");
 
-        assert!(chunk.snapshot(ROW_COUNT - 1).len() > crate::json_store::JSON_INLINE_MAX_BYTES);
+        assert!(chunk.snapshot(ROW_COUNT - 1).len() > 1024);
     }
 
     #[test]
@@ -5451,12 +5400,10 @@ mod tests {
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
             row.row_pk == &RowPk::single("row-b")
-                && crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
-                    row,
-                )
-                .ok()
-                .and_then(|row| row.snapshot_content)
-                .as_deref()
+                && crate::hot_state::materialized_hot_state_row_with_snapshot_projection(row)
+                    .ok()
+                    .and_then(|row| row.snapshot_content)
+                    .as_deref()
                     == Some("{\"key\":\"row-b\",\"value\":\"after\"}")
         }));
         assert_eq!(
@@ -5765,22 +5712,18 @@ mod tests {
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
             row.row_pk == &RowPk::single("sql2-key-a")
-                && crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
-                    row,
-                )
-                .ok()
-                .and_then(|row| row.snapshot_content)
-                .as_deref()
+                && crate::hot_state::materialized_hot_state_row_with_snapshot_projection(row)
+                    .ok()
+                    .and_then(|row| row.snapshot_content)
+                    .as_deref()
                     == Some("{\"key\":\"sql2-key-a\",\"value\":\"second\"}")
         }));
         assert!(drained.state_rows.iter().any(|row| {
             row.row_pk == &RowPk::single("sql2-key-b")
-                && crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
-                    row,
-                )
-                .ok()
-                .and_then(|row| row.snapshot_content)
-                .as_deref()
+                && crate::hot_state::materialized_hot_state_row_with_snapshot_projection(row)
+                    .ok()
+                    .and_then(|row| row.snapshot_content)
+                    .as_deref()
                     == Some("{\"key\":\"sql2-key-b\",\"value\":\"only\"}")
         }));
     }

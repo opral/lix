@@ -2627,7 +2627,7 @@ mod tests {
             }
             let mut ordinary = admitted.adapter.new_write_set();
             ordinary.put(
-                crate::json_store::JSON_SPACE,
+                crate::storage_spaces::RETIRED_JSON_SPACE,
                 &b"forbidden"[..],
                 &b"write"[..],
             );
@@ -2661,7 +2661,7 @@ mod tests {
         assert_eq!(
             write_candidate_page(
                 &target,
-                crate::json_store::JSON_SPACE,
+                crate::storage_spaces::RETIRED_JSON_SPACE,
                 single_put(b"late", Bytes::from_static(b"forbidden"))
             )
             .await
@@ -2673,7 +2673,7 @@ mod tests {
         let keys = [Key(Bytes::from_static(b"late"))];
         let result = read
             .get_many(&[GetManyRequest {
-                space: crate::json_store::JSON_SPACE,
+                space: crate::storage_spaces::RETIRED_JSON_SPACE,
                 keys: &keys,
                 opts: GetOptions::default(),
             }])
@@ -2736,7 +2736,7 @@ mod tests {
             let key = u64::try_from(index).unwrap().to_be_bytes();
             let value = [u8::try_from(index % 251).unwrap()];
             writes.put(
-                crate::json_store::JSON_SPACE,
+                crate::storage_spaces::RETIRED_JSON_SPACE,
                 key.as_slice(),
                 value.as_slice(),
             );
@@ -2768,7 +2768,7 @@ mod tests {
         let read = target.begin_read(ReadOptions::default()).await.unwrap();
         let mut cursor = read
             .begin_scan(
-                crate::json_store::JSON_SPACE,
+                crate::storage_spaces::RETIRED_JSON_SPACE,
                 KeyRange {
                     lower: Bound::Unbounded,
                     upper: Bound::Unbounded,
@@ -2815,7 +2815,11 @@ mod tests {
         );
 
         let mut writes = admitted.adapter.new_write_set();
-        writes.put(crate::json_store::JSON_SPACE, &b"stale"[..], &b"write"[..]);
+        writes.put(
+            crate::storage_spaces::RETIRED_JSON_SPACE,
+            &b"stale"[..],
+            &b"write"[..],
+        );
         let error = admitted
             .adapter
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2860,7 +2864,11 @@ mod tests {
             StorageError::Fenced
         );
         let mut writes = stale.new_write_set();
-        writes.put(crate::json_store::JSON_SPACE, &b"stale"[..], &b"write"[..]);
+        writes.put(
+            crate::storage_spaces::RETIRED_JSON_SPACE,
+            &b"stale"[..],
+            &b"write"[..],
+        );
         assert_eq!(
             stale
                 .commit_write_set(writes, StorageWriteOptions::default())
@@ -2946,7 +2954,7 @@ mod tests {
             .unwrap();
         write
             .put_many(
-                crate::json_store::JSON_SPACE,
+                crate::storage_spaces::RETIRED_JSON_SPACE,
                 single_put(b"candidate", Bytes::from_static(b"preserved")),
             )
             .await
@@ -2968,7 +2976,7 @@ mod tests {
         let read = candidate.begin_read(ReadOptions::default()).await.unwrap();
         let mut cursor = read
             .begin_scan(
-                crate::json_store::JSON_SPACE,
+                crate::storage_spaces::RETIRED_JSON_SPACE,
                 KeyRange {
                     lower: Bound::Unbounded,
                     upper: Bound::Unbounded,
@@ -3148,7 +3156,7 @@ mod tests {
         let legacy = StorageAdapter::new(storage.clone());
         let mut writes = legacy.new_write_set();
         writes.put(
-            crate::json_store::JSON_SPACE,
+            crate::storage_spaces::RETIRED_JSON_SPACE,
             &b"preserved"[..],
             &b"repository-state"[..],
         );

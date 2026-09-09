@@ -35,7 +35,8 @@ use super::conflicts::{
 };
 use super::stats::MergeStats;
 use crate::common::{SharedStr, compose_directory_path, compose_file_path};
-use crate::plugin::runtime::{WasmRowKey, WasmTypedRow};
+use crate::plugin::runtime::WasmRowKey;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::session::context::SessionContext;
 use crate::tracked_state::TrackedStateMergePick;
 use crate::transaction::StagedCommitChangeBatchBuilder;

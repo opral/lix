@@ -136,8 +136,8 @@ use crate::plugin::runtime::{
     WasmFileDescriptor, WasmFileUpdate, WasmHostBytes, WasmHostColumnMerge, WasmHostRow,
     WasmHostRowChanges, WasmOpenFileInput, WasmOpenRowsInput, WasmPluginSelection, WasmRow,
     WasmRowChange, WasmRowKey, WasmRowUpdate, WasmTransitionCounters, WasmTransitionLimits,
-    WasmTypedRow,
 };
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::telemetry::TelemetryAttribute;
 use crate::transaction::validation::{
     TransactionValidationInput, fresh_plugin_file_import_certificate,
@@ -12351,9 +12351,7 @@ fn prepared_transaction_write_filesystem_index_impact(
             FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY => {
                 affects_index = true;
                 delta_rows.push(
-                    crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
-                        row,
-                    )?,
+                    crate::hot_state::materialized_hot_state_row_with_snapshot_projection(row)?,
                 );
             }
             _ => {}

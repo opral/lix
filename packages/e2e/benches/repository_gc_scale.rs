@@ -378,7 +378,7 @@ async fn measure<StorageImpl>(
     println!(
         "repository_gc_scale,phase=measure,backend={backend},\
          history_changes={history_changes},commit_width={commit_width},\
-         swept_commits={},live_commits={},swept_standalone_changes={},standalone_swept_ids={},swept_payloads={},\
+         swept_commits={},live_commits={},swept_standalone_changes={},standalone_swept_ids={},\
          samples={samples},warmups={warmups},p50_ms={},p95_ms={},p99_ms={},\
          root_discovery_p50_us={},root_discovery_p95_us={},root_discovery_p99_us={},\
          changelog_p50_us={},changelog_p95_us={},changelog_p99_us={},\
@@ -394,7 +394,6 @@ async fn measure<StorageImpl>(
         last.live_commits,
         last.swept_standalone_changes,
         last.standalone_swept_ids.join("|"),
-        last.swept_payloads,
         millis(percentile(&timings, 50)),
         millis(percentile(&timings, 95)),
         millis(percentile(&timings, 99)),
