@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lix::registered_spaces::{
-    JSON_SPACE, TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+    TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
     TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
 };
 use lix::storage::Storage;
@@ -317,7 +317,6 @@ async fn run_case<S, Flush, FlushFuture>(
     let manifest = find_layout(&layout, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.name);
     let segments = find_layout(&layout, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE.name);
     let locators = find_layout(&layout, TRACKED_STATE_CHANGE_LOCATOR_SPACE.name);
-    let json_payloads = find_layout(&layout, JSON_SPACE.name);
 
     println!(
         "packed_history_scale,backend={backend},id_shape={id_shape},history_shape={},payload_shape={},\
@@ -332,7 +331,6 @@ async fn run_case<S, Flush, FlushFuture>(
          manifest_keys={},manifest_key_bytes={},manifest_value_bytes={},\
          segment_keys={},segment_key_bytes={},segment_value_bytes={},\
          locator_keys={},locator_key_bytes={},locator_value_bytes={},\
-         json_payload_keys={},json_payload_key_bytes={},json_payload_value_bytes={},\
          backend_bytes={backend_bytes},backend_objects={},storage_amplification={storage_amplification:.3},\
          seed_object_reads={},seed_object_read_bytes={},seed_object_writes={},seed_object_write_bytes={},\
          lifecycle_object_reads={},lifecycle_object_read_bytes={},lifecycle_object_writes={},lifecycle_object_write_bytes={},\
@@ -362,9 +360,6 @@ async fn run_case<S, Flush, FlushFuture>(
         locators.rows,
         locators.key_bytes,
         locators.value_bytes,
-        json_payloads.rows,
-        json_payloads.key_bytes,
-        json_payloads.value_bytes,
         backend_objects,
         seed_io.read_objects,
         seed_io.read_bytes,

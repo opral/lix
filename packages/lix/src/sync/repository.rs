@@ -5427,8 +5427,6 @@ where
             }
             .to_range()?,
         });
-        crate::json_store::stage_json_publication_fence(&read, &mut writes, &mut preconditions)
-            .await?;
         drop(read);
         adapter
             .commit_certified_replica_write_set(
@@ -5525,16 +5523,12 @@ where
                 changes: Vec::new(),
             })
             .await?;
-        let mut preconditions = Vec::new();
-        crate::json_store::stage_json_publication_fence(&read, &mut writes, &mut preconditions)
-            .await?;
         drop(read);
         adapter
             .commit_certified_replica_write_set(
                 super::certified_replica_write_capability(),
                 writes,
                 StorageWriteOptions {
-                    preconditions,
                     await_durable: true,
                     ..StorageWriteOptions::default()
                 },
@@ -6867,8 +6861,6 @@ where
             && !changed_refs.is_empty()
             && (!newly_imported.is_empty() || hydrated_history)
         {
-            crate::json_store::stage_json_publication_fence(&read, &mut writes, &mut preconditions)
-                .await?;
             drop(read);
             let options = StorageWriteOptions {
                 preconditions,
@@ -7225,8 +7217,6 @@ where
         {
             super::upload_plan::stage_invalidate(&mut writes);
         }
-        crate::json_store::stage_json_publication_fence(&read, &mut writes, &mut preconditions)
-            .await?;
         let (current_cursor, _) = load_sequence(&read).await?;
         if newly_imported.is_empty()
             && published_ref_updates.is_empty()

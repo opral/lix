@@ -1,7 +1,6 @@
 use crate::LixError;
 use crate::common::LixTimestamp;
 use crate::common::{ExactBatch, ExactValue};
-use crate::json_store::JsonRef;
 use crate::row_pk::RowPk;
 use std::fmt;
 use std::str::FromStr;
@@ -875,16 +874,12 @@ pub(crate) struct ChangeScanBatch {
 pub(crate) enum GcRoot {
     BranchHead(CommitId),
     StandaloneChange(ChangeId),
-    /// A history-free untracked current-state member owns this payload
-    /// directly, without a changelog record to retain it.
-    CurrentPayload(JsonRef),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcLiveSet {
     pub(crate) commits: Vec<CommitId>,
     pub(crate) changes: Vec<ChangeId>,
-    pub(crate) payloads: Vec<JsonRef>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -892,7 +887,6 @@ pub(crate) struct GcSweepSet {
     pub(crate) commits: Vec<CommitId>,
     pub(crate) commit_change_ids: Vec<ChangeId>,
     pub(crate) changes: Vec<ChangeId>,
-    pub(crate) json_payloads: Vec<JsonRef>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

@@ -22,13 +22,22 @@
 
 use crate::storage_adapter::{StorageSpace, StorageSpaceId, ValueSemantics};
 
+/// Retired out-of-band JSON space. Supported older repositories and snapshots
+/// can still contain opaque values here, so layout migration must copy it.
+/// Current typed rows and JSONB metadata never publish into this space.
+pub(crate) const RETIRED_JSON_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0002_0001),
+    "json_store.json",
+    ValueSemantics::Mutable,
+);
+
 /// Every storage space a repository can physically contain, in space-id order.
 ///
 /// Adding a space to the engine without adding it here is a layout bug: the
 /// registry is what the uniqueness, ordering, and bench-layout invariants are
 /// checked against.
 pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
-    crate::json_store::JSON_SPACE,
+    RETIRED_JSON_SPACE,
     crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
     crate::init::REPOSITORY_PROTOCOL_SPACE,
     crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
@@ -109,7 +118,7 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
 /// enforce that relationship. The epoch-control space is deliberately absent
 /// because snapshots publish their own fresh epoch at restore time.
 pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
-    crate::json_store::JSON_SPACE,
+    RETIRED_JSON_SPACE,
     crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
     crate::init::REPOSITORY_PROTOCOL_SPACE,
     crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
@@ -478,11 +487,14 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         let mut unregistered = Vec::new();
         for (path, source) in engine_sources() {
-            if path.ends_with("storage_spaces.rs") {
-                // This file quotes the constructors it is scanning for.
-                continue;
-            }
-            for site in construction_sites(&source) {
+            // This registry owns compatibility descriptors too. Scan those
+            // declarations, excluding only test code that quotes constructors.
+            let source = if path.ends_with("storage_spaces.rs") {
+                source.split("#[cfg(test)]").next().unwrap_or(&source)
+            } else {
+                &source
+            };
+            for site in construction_sites(source) {
                 let Some(id) = literal_space_id(&site.id_expression) else {
                     continue;
                 };
@@ -559,10 +571,11 @@ mod tests {
         let mut disagreements = Vec::new();
         let mut agreeing_registered_ids = std::collections::BTreeSet::new();
         for (path, source) in &sources {
-            if path.ends_with("lix/src/storage_spaces.rs") {
-                // This file quotes the constructors it is scanning for.
-                continue;
-            }
+            let source = if path.ends_with("lix/src/storage_spaces.rs") {
+                source.split("#[cfg(test)]").next().unwrap_or(source)
+            } else {
+                source
+            };
             for site in construction_sites(source) {
                 let Some(id) = resolve_space_id(&site.id_expression, &constants) else {
                     continue;

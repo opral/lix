@@ -28,9 +28,8 @@ mod conformance;
 
 pub(crate) use crate::storage::StorageWrite;
 pub use crate::storage::{
-    BeginScanOptions as StorageBeginScanOptions, BufferRange,
-    CommitResult as StorageCommitResult, CoreProjection as StorageCoreProjection,
-    EncodedMutationBatch, EncodedPut,
+    BeginScanOptions as StorageBeginScanOptions, BufferRange, CommitResult as StorageCommitResult,
+    CoreProjection as StorageCoreProjection, EncodedMutationBatch, EncodedPut,
     GetManyRequest as StorageGetManyRequest, GetManyResult as StorageGetManyResult,
     GetOptions as StorageGetOptions, Key as StorageKey, KeyRange as StorageKeyRange,
     MAX_SCAN_PAGE_ROWS, Memory, MemoryRead, MemoryWrite, Precondition as StoragePrecondition,
@@ -39,8 +38,7 @@ pub use crate::storage::{
     ReadOptions as StorageReadOptions, ScanChunk as StorageScanChunk,
     ScanCursor as StorageScanCursor, ScanOrder as StorageScanOrder, SpaceId as StorageSpaceId,
     Storage, StorageError, StorageRead, StorageScanSource, StorageSessionToken, StorageSpace,
-    StorageSpaceRole,
-    StoredValue as StorageValue, ValueIntegrity, ValueSemantics,
+    StorageSpaceRole, StoredValue as StorageValue, ValueIntegrity, ValueSemantics,
     WriteOptions as StorageWriteOptions,
 };
 pub(crate) use crate::storage::{
@@ -59,9 +57,8 @@ pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
 pub(crate) use spaces::{
     REVISION_KEY_ACCOUNT, REVISION_KEY_BINARY_CAS_PUBLICATION, REVISION_KEY_BINARY_CAS_RECLAMATION,
-    REVISION_KEY_CATALOG, REVISION_KEY_FILESYSTEM_PATH, REVISION_KEY_JSON_STORE_PUBLICATION,
-    REVISION_KEY_JSON_STORE_RECLAMATION, REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE,
-    load_revision, load_revisions, revision_key,
+    REVISION_KEY_CATALOG, REVISION_KEY_FILESYSTEM_PATH, REVISION_KEY_TRACKED_MUTATION,
+    REVISION_SPACE, load_revision, load_revisions, revision_key,
 };
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,
