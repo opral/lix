@@ -1,5 +1,12 @@
 [
   {
+    "path": "./008-v0-16-release/index.md",
+    "slug": "lix-v0-16-release",
+    "authors": [
+      "samuelstroschein"
+    ]
+  },
+  {
     "path": "./007-v0-7-release/index.md",
     "slug": "lix-v0-7-release",
     "authors": [
