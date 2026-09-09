@@ -369,7 +369,7 @@ mod tests {
             .expect("global branch control should exist");
         let snapshot_value: serde_json::Value =
             serde_json::from_str(&snapshot_content).expect("snapshot should parse");
-        let decoded_snapshot = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+        let decoded_snapshot = crate::row_payload::TypedRow::from_builtin_json(
             "lix_key_value",
             &row_pk,
             &snapshot_value,

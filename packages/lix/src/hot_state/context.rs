@@ -1871,7 +1871,7 @@ mod tests {
         CurrentStateDeltaRef, HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter,
         HotStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
     };
-    use crate::plugin::runtime::WasmTypedRow;
+    use crate::row_payload::TypedRow as WasmTypedRow;
     use crate::row_pk::RowPk;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};

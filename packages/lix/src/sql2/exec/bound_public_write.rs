@@ -477,7 +477,7 @@ async fn try_execute_row_insert_batch(
             } else {
                 LixError::new(
                     LixError::CODE_UNIQUE,
-                    crate::transaction::duplicate_insert_identity_message(
+                    crate::transaction_types::duplicate_insert_identity_message(
                         row.schema_key,
                         row_pk,
                         Some(row.branch_id),
@@ -1388,7 +1388,7 @@ fn append_certified_path_value_parameter_payload(
             unreachable!("the certified replacement value parameter is text")
         }
     };
-    if crate::plugin::runtime::WasmTypedRow::try_append_certified_path_value_payload_from_canonical_json(
+    if crate::row_payload::TypedRow::try_append_certified_path_value_payload_from_canonical_json(
         output,
         schema_plan,
         primary_key,
@@ -1405,7 +1405,7 @@ fn append_certified_path_value_parameter_payload(
             format!("invalid JSONB value: {error}"),
         )
     })?;
-    crate::plugin::runtime::WasmTypedRow::append_certified_path_value_payload(
+    crate::row_payload::TypedRow::append_certified_path_value_payload(
         output,
         schema_plan,
         primary_key,
@@ -1498,7 +1498,7 @@ impl<'a> RowLiveRowRef<'a> {
         }
     }
 
-    fn decoded_snapshot(self) -> Option<&'a crate::plugin::runtime::WasmTypedRow> {
+    fn decoded_snapshot(self) -> Option<&'a crate::row_payload::TypedRow> {
         match self {
             Self::Owned(_) => None,
             Self::Batch(row) => row.decoded_snapshot().map(Arc::as_ref),
@@ -1822,15 +1822,14 @@ pub(crate) async fn try_execute_bound_public_write(
                             .iter()
                             .map(|item| item.output_name.clone())
                             .collect(),
-                        column_types: vec![
-                            crate::ResultColumnType::Text;
-                            returning.items.len()
+                        column_types: vec![crate::ResultColumnType::Text; returning.items.len()],
+                        rows: vec![
+                            returning
+                                .items
+                                .iter()
+                                .map(|_| Value::Text(commit_id.clone()))
+                                .collect(),
                         ],
-                        rows: vec![returning
-                            .items
-                            .iter()
-                            .map(|_| Value::Text(commit_id.clone()))
-                            .collect()],
                         notices: Vec::new(),
                     },
                 )
@@ -3559,13 +3558,12 @@ fn returning_expr_column_type(
         });
     }
     match expr {
-        BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => match column.name.as_str() {
+        BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => match column.name.as_str()
+        {
             "lixcol_metadata" => Some(crate::ResultColumnType::Jsonb),
             "lixcol_global" | "lixcol_untracked" => Some(crate::ResultColumnType::Boolean),
-            "lixcol_schema_key" | "lixcol_file_id" | "lixcol_created_at"
-            | "lixcol_updated_at" | "lixcol_change_id" | "lixcol_commit_id" => {
-                Some(crate::ResultColumnType::Text)
-            }
+            "lixcol_schema_key" | "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at"
+            | "lixcol_change_id" | "lixcol_commit_id" => Some(crate::ResultColumnType::Text),
             _ => None,
         },
         BoundExpr::Literal(BoundLiteral::Null) => Some(crate::ResultColumnType::Null),
@@ -3585,9 +3583,15 @@ fn returning_expr_column_type(
         BoundExpr::Function { name, .. }
             if matches!(
                 name.as_str(),
-                "uuidv7" | "lix_active_branch_id" | "lix_active_branch_commit_id"
-                    | "__lix_json_get_text" | "__lix_json_path_get_text"
-            ) => Some(crate::ResultColumnType::Text),
+                "uuidv7"
+                    | "lix_active_branch_id"
+                    | "lix_active_branch_commit_id"
+                    | "__lix_json_get_text"
+                    | "__lix_json_path_get_text"
+            ) =>
+        {
+            Some(crate::ResultColumnType::Text)
+        }
         BoundExpr::Function { name, .. } if name == "__lix_current_timestamp" => {
             Some(crate::ResultColumnType::Timestamptz)
         }
@@ -3595,11 +3599,15 @@ fn returning_expr_column_type(
             if matches!(
                 name.as_str(),
                 "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
-            ) => Some(crate::ResultColumnType::Jsonb),
+            ) =>
+        {
+            Some(crate::ResultColumnType::Jsonb)
+        }
         BoundExpr::Function { name, .. }
-            if matches!(name.as_str(), "__lix_json_contains" | "__lix_json_exists") => {
-                Some(crate::ResultColumnType::Boolean)
-            }
+            if matches!(name.as_str(), "__lix_json_contains" | "__lix_json_exists") =>
+        {
+            Some(crate::ResultColumnType::Boolean)
+        }
         BoundExpr::Binary { left, right, .. } => {
             let left = returning_expr_column_type(left, spec, params)?;
             let right = returning_expr_column_type(right, spec, params)?;
@@ -3609,19 +3617,21 @@ fn returning_expr_column_type(
                 Some(crate::ResultColumnType::Integer)
             }
         }
-        BoundExpr::Param(param) => params
-            .get(param.index.saturating_sub(1))
-            .map(|value| match value {
-                Value::Null => crate::ResultColumnType::Null,
-                Value::Boolean(_) => crate::ResultColumnType::Boolean,
-                Value::Integer(_) => crate::ResultColumnType::Integer,
-                Value::Real(_) => crate::ResultColumnType::Real,
-                Value::Text(_) => crate::ResultColumnType::Text,
-                Value::Jsonb(_) => crate::ResultColumnType::Jsonb,
-                Value::RowRef(_) => crate::ResultColumnType::RowRef,
-                Value::Timestamptz(_) => crate::ResultColumnType::Timestamptz,
-                Value::Blob(_) => crate::ResultColumnType::Blob,
-            }),
+        BoundExpr::Param(param) => {
+            params
+                .get(param.index.saturating_sub(1))
+                .map(|value| match value {
+                    Value::Null => crate::ResultColumnType::Null,
+                    Value::Boolean(_) => crate::ResultColumnType::Boolean,
+                    Value::Integer(_) => crate::ResultColumnType::Integer,
+                    Value::Real(_) => crate::ResultColumnType::Real,
+                    Value::Text(_) => crate::ResultColumnType::Text,
+                    Value::Jsonb(_) => crate::ResultColumnType::Jsonb,
+                    Value::RowRef(_) => crate::ResultColumnType::RowRef,
+                    Value::Timestamptz(_) => crate::ResultColumnType::Timestamptz,
+                    Value::Blob(_) => crate::ResultColumnType::Blob,
+                })
+        }
         BoundExpr::Function { .. } => None,
     }
 }
@@ -5727,7 +5737,7 @@ fn append_row_insert_row(
         native_schema_plan
             .compiled_schema
             .materialize_missing_nullable_columns(&mut typed_row);
-        let typed = crate::plugin::runtime::WasmTypedRow {
+        let typed = crate::row_payload::TypedRow {
             schema_fingerprint: native_schema_plan.fingerprint().bytes(),
             row_pk: Arc::from([]),
             row: typed_row,
@@ -6034,7 +6044,6 @@ impl<'a> RowEvalRowRef<'a> {
             Self::Staged(row) => row.untracked,
         }
     }
-
 }
 
 impl<'a> RowEvalContext<'a> {
@@ -6919,7 +6928,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
 
 enum CandidateRowImage<'a> {
     Json(JsonValue),
-    Typed(&'a crate::plugin::runtime::WasmTypedRow),
+    Typed(&'a crate::row_payload::TypedRow),
 }
 
 #[derive(Clone, Copy)]
@@ -6940,7 +6949,7 @@ impl<'a> CandidateRowImage<'a> {
 
 enum OwnedRowImage {
     Json(JsonValue),
-    Typed(crate::plugin::runtime::WasmTypedRow),
+    Typed(crate::row_payload::TypedRow),
 }
 
 impl CandidateRowImage<'_> {
@@ -7116,8 +7125,8 @@ fn typed_value_from_eval(
 fn finalize_typed_row(
     ctx: &dyn SqlWriteExecutionContext,
     schema_key: &str,
-    typed: crate::plugin::runtime::WasmTypedRow,
-) -> Result<(RowPk, crate::plugin::runtime::WasmTypedRow), LixError> {
+    typed: crate::row_payload::TypedRow,
+) -> Result<(RowPk, crate::row_payload::TypedRow), LixError> {
     let catalog = ctx.schema_catalog_snapshot().ok_or_else(|| {
         LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
@@ -7136,8 +7145,8 @@ fn finalize_typed_row(
 fn finalize_typed_row_with_plan(
     schema_key: &str,
     plan: &crate::catalog::SchemaPlan,
-    mut typed: crate::plugin::runtime::WasmTypedRow,
-) -> Result<(RowPk, crate::plugin::runtime::WasmTypedRow), LixError> {
+    mut typed: crate::row_payload::TypedRow,
+) -> Result<(RowPk, crate::row_payload::TypedRow), LixError> {
     plan.compiled_schema
         .validate_complete_row(&typed.row)
         .map_err(|error| {
@@ -7686,10 +7695,7 @@ fn scan_branch_ids(scope: &BranchScope) -> Result<Vec<String>, LixError> {
     })
 }
 
-fn row_branch_id(
-    plan: &LogicalWritePlan,
-    global: bool,
-) -> Result<String, LixError> {
+fn row_branch_id(plan: &LogicalWritePlan, global: bool) -> Result<String, LixError> {
     if global {
         return Ok(crate::GLOBAL_BRANCH_ID.to_string());
     }

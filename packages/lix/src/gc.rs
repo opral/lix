@@ -4812,7 +4812,7 @@ mod tests {
         let timestamp =
             LixTimestamp::expect_parse("corrupt registry timestamp", "2026-01-01T00:00:00Z");
         let row_pk = RowPk::single(crate::plugin::runtime::PLUGIN_REGISTRY_KEY);
-        let corrupt_typed = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+        let corrupt_typed = crate::row_payload::TypedRow::from_builtin_json(
             "lix_key_value",
             &row_pk,
             &corrupt_registry,

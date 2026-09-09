@@ -8,6 +8,10 @@
 //! untracked overlay.
 
 mod hot;
+pub(crate) use crate::row_state::{
+    CertifiedCurrentStatePredecessor, ColumnarBaseCoordinate, PackedHeadValue,
+    PackedWorkingDiffBaseline,
+};
 #[cfg(test)]
 pub(crate) use hot::hot_decode_row_pk_probe;
 
@@ -37,17 +41,6 @@ pub(crate) use hot::{
     stage_hot_index_entries, stage_retire_hot_generation,
 };
 
-/// Stable physical address of a row in an immutable columnar base.
-///
-/// The owner commit is part of the address so consumers can fail closed when
-/// a stale coordinate is presented against a different base.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ColumnarBaseCoordinate {
-    pub(crate) base_commit_id: CommitId,
-    pub(crate) group_index: u32,
-    pub(crate) row_index: u32,
-}
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -65,9 +58,9 @@ use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch,
     MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
-use crate::plugin::runtime::WasmTypedRow;
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::plugin::wire::typed as typed_wire;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageBeginScanOptions, StorageCoreProjection,
@@ -391,44 +384,6 @@ pub(crate) struct CertifiedCurrentStatePredecessorRef<'a> {
     pub(crate) file_id: Option<&'a str>,
     pub(crate) row_pk: &'a RowPk,
     pub(crate) value: &'a CertifiedCurrentStatePredecessor,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum CertifiedCurrentStatePredecessor {
-    Encoded(Bytes),
-    Packed(PackedHeadValue),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PackedHeadValue {
-    change_id: ChangeId,
-    commit_id: CommitId,
-    deleted: bool,
-    created_at: LixTimestamp,
-    updated_at: LixTimestamp,
-    working_diff_baseline: PackedWorkingDiffBaseline,
-    columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
-}
-
-/// Checkpoint-relative position of a current-state base row that is served
-/// without a branch-local hot row.
-///
-/// The two bases are not interchangeable and must not share one encoding. A
-/// *packed* current base is a collection published **inside** the active
-/// working interval, so its rows were absent at the checkpoint. A *root*
-/// current base is the referenced head itself, so its rows **are** the
-/// checkpoint state. Collapsing both onto "has an active checkpoint id" made
-/// the first branch-local mutation of a checkpointed identity look like a
-/// creation.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum PackedWorkingDiffBaseline {
-    /// No active checkpoint owns this generation.
-    Disabled,
-    /// Published inside the active working interval: absent at the checkpoint.
-    AbsentAtCheckpoint { checkpoint_commit_id: CommitId },
-    /// Served from the referenced root current base: present at the active
-    /// checkpoint and unchanged since.
-    CleanAtCheckpoint,
 }
 
 impl<'a> CurrentStateDeltaRef<'a> {
@@ -1704,7 +1659,7 @@ fn append_head_value_parts(
     let snapshot = if snapshot.is_empty() {
         snapshot.to_vec()
     } else {
-        crate::plugin::runtime::compress_hot_payload(snapshot.to_vec()).map_err(|error| {
+        crate::row_payload::compress_hot_payload(snapshot.to_vec()).map_err(|error| {
             head_value_error(format!("cannot compress typed row payload: {error:?}"))
         })?
     };
