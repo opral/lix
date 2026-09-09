@@ -864,6 +864,40 @@ impl TransactionBatchStatements {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadBatchKind {
+    Ordinary,
+    Coherent,
+}
+
+impl ReadBatchKind {
+    fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::Ordinary => "batch",
+            Self::Coherent => "coherent_read_batch",
+        }
+    }
+
+    fn normalize_error(self, error: LixError, sql: &str, index: usize) -> LixError {
+        let error = normalize_sql_surface_error(error, sql);
+        match self {
+            Self::Ordinary => with_batch_statement_index(error, index),
+            Self::Coherent => error,
+        }
+    }
+}
+
+struct ReadBatchSnapshot {
+    active_branch_id: String,
+    active_branch_commit_id: String,
+    storage_mutation_revision: Option<Vec<u8>>,
+}
+
+struct ReadBatchResult {
+    results: Vec<ExecuteResult>,
+    snapshot: Option<ReadBatchSnapshot>,
+}
+
 enum IdempotencyReceiptResolution {
     Absent,
     Replay(ExecuteIdempotencyReceipt),
@@ -2545,8 +2579,24 @@ where
         statements: &[ExecuteBatchStatement],
         parsed: Vec<datafusion::sql::parser::Statement>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, statement)| {
-            is_acknowledgeable_file_content_read(parsed, &statement.params)
+        let statements = statements
+            .iter()
+            .map(|statement| (statement.sql.as_str(), statement.params.as_slice()))
+            .collect::<Vec<_>>();
+        Ok(self
+            .execute_read_batch(&statements, parsed, ReadBatchKind::Ordinary)
+            .await?
+            .results)
+    }
+
+    async fn execute_read_batch(
+        &self,
+        statements: &[(&str, &[Value])],
+        parsed: Vec<datafusion::sql::parser::Statement>,
+        kind: ReadBatchKind,
+    ) -> Result<ReadBatchResult, LixError> {
+        let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, (_, params))| {
+            is_acknowledgeable_file_content_read(parsed, params)
                 || late_materialized_lix_file_content_read(parsed).is_some()
         });
         let _operation_guard = self.begin_waitable_session_operation().await?;
@@ -2580,6 +2630,42 @@ where
                             acknowledge_file_views.then(|| self.file_views.fork_for_read());
                         let active_branch_id =
                             self.active_branch_id_from_reader(&read_store).await?;
+                        let (snapshot, active_branch_head) = if kind == ReadBatchKind::Coherent {
+                            let head = self
+                                .branch_ctx
+                                .ref_reader(read_store.clone())
+                                .load_head(&active_branch_id)
+                                .await?
+                                .ok_or_else(|| {
+                                    LixError::branch_not_found(
+                                        active_branch_id.clone(),
+                                        "execute coherent read batch",
+                                        "active branch",
+                                    )
+                                })?;
+                            let snapshot = ReadBatchSnapshot {
+                                active_branch_id: active_branch_id.clone(),
+                                active_branch_commit_id: head.commit_id.to_string(),
+                                storage_mutation_revision:
+                                    StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(
+                                        &read_store,
+                                    )
+                                    .await?
+                                    .map(|revision| revision.to_vec()),
+                            };
+                            (Some(snapshot), Some(head))
+                        } else {
+                            (None, None)
+                        };
+                        if parsed.is_empty() {
+                            return Ok((
+                                ReadBatchResult {
+                                    results: Vec::new(),
+                                    snapshot,
+                                },
+                                Vec::new(),
+                            ));
+                        }
                         let ctx = SessionSqlExecutionContext {
                             active_branch_id: &active_branch_id,
                             active_account_id: self.active_account_id(),
@@ -2593,14 +2679,19 @@ where
                             plugin_host: self.plugin_host.clone(),
                             file_views: file_view_collector.clone(),
                         };
-                        let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
+                        let read_session = match active_branch_head {
+                            Some(head) => {
+                                sql2::prepare_read_session_at_head(&ctx, head, &parsed).await?
+                            }
+                            None => sql2::prepare_read_session(&ctx, &parsed).await?,
+                        };
                         let mut results = Vec::with_capacity(statements.len());
                         let mut file_view_mutations = Vec::new();
-                        for (statement_index, (statement, parsed)) in
+                        for (statement_index, ((sql, params), parsed)) in
                             statements.iter().zip(parsed).enumerate()
                         {
                             let acknowledge_statement =
-                                is_acknowledgeable_file_content_read(&parsed, &statement.params)
+                                is_acknowledgeable_file_content_read(&parsed, params)
                                     || late_materialized_lix_file_content_read(&parsed).is_some();
                             // A mixed batch may return file bytes alongside metadata or
                             // aggregates. Only the exact byte-returning statement may
@@ -2610,21 +2701,22 @@ where
                             }
                             let telemetry = SqlStatementTelemetry::start(
                                 self.telemetry.as_ref(),
-                                &statement.sql,
-                                "batch",
+                                sql,
+                                kind.telemetry_name(),
                                 Some(statement_index),
                             );
                             let operation = async {
-                                if let Some(plan) = late_materialized_lix_file_content_read(&parsed) {
+                                if let Some(plan) = late_materialized_lix_file_content_read(&parsed)
+                                {
                                     // Resolve filters and LIMIT on file metadata first. A
                                     // provider scan may render files absent from the result;
                                     // only hydrate (and acknowledge) returned paths.
                                     let (result, mutations, _) = self
                                         .execute_read_statement_with_store(
                                             read_store.clone(),
-                                            &statement.sql,
+                                            sql,
                                             parsed,
-                                            &statement.params,
+                                            params,
                                             true,
                                             sql2::StatementReadPlan {
                                                 native: None,
@@ -2635,28 +2727,20 @@ where
                                         )
                                         .await
                                         .map_err(|error| {
-                                            with_batch_statement_index(
-                                                normalize_sql_surface_error(error, &statement.sql),
-                                                statement_index,
-                                            )
+                                            kind.normalize_error(error, sql, statement_index)
                                         })?;
                                     file_view_mutations.extend(mutations);
                                     return Ok(ExecuteResult::from_session_read_result(result));
                                 }
                                 sql2::execute_read_statement_in_session_from_parsed(
                                     &read_session,
-                                    &statement.sql,
+                                    sql,
                                     parsed,
-                                    &statement.params,
+                                    params,
                                 )
                                 .await
                                 .map(ExecuteResult::from_sql_query_result)
-                                .map_err(|error| {
-                                    with_batch_statement_index(
-                                        normalize_sql_surface_error(error, &statement.sql),
-                                        statement_index,
-                                    )
-                                })
+                                .map_err(|error| kind.normalize_error(error, sql, statement_index))
                             };
                             let result = match telemetry.as_ref() {
                                 Some(telemetry) => telemetry.instrument(operation).await,
@@ -2674,7 +2758,7 @@ where
                         }
                         drop(read_session);
                         drop(ctx);
-                        Ok((results, file_view_mutations))
+                        Ok((ReadBatchResult { results, snapshot }, file_view_mutations))
                     }
                 },
             )
@@ -2766,194 +2850,17 @@ where
                 }
             })
             .collect::<Result<Vec<_>, LixError>>()?;
-        let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, (_, params))| {
-            is_acknowledgeable_file_content_read(parsed, params)
-                || late_materialized_lix_file_content_read(parsed).is_some()
-        });
-
         self.refresh_active_branch_base_if_stale().await?;
-
-        let _operation_guard = self.begin_waitable_session_operation().await?;
-        let mut expired_read_retries = ExpiredReadRetryState::default();
-        let mut read_quiescence_guard = None;
-        loop {
-            let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
-                Ok(read_scope) => read_scope,
-                Err(error) => {
-                    let error: LixError = error.into();
-                    if retry_expired_read_with_write_quiescence(
-                        &mut expired_read_retries,
-                        &error,
-                        &self.collaboration_write_gate,
-                        &mut read_quiescence_guard,
-                        false,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            };
-            let attempt = with_static_session_sql_read::<StorageImpl, _, _, _>(
-                read_scope,
-                |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
-                    let parsed = parsed.clone();
-                    async move {
-                        let file_view_collector =
-                            acknowledge_file_views.then(|| self.file_views.fork_for_read());
-                        let active_branch_id =
-                            self.active_branch_id_from_reader(&read_store).await?;
-                        let active_branch_head = self
-                            .branch_ctx
-                            .ref_reader(read_store.clone())
-                            .load_head(&active_branch_id)
-                            .await?
-                            .ok_or_else(|| {
-                                LixError::branch_not_found(
-                                    active_branch_id.clone(),
-                                    "execute coherent read batch",
-                                    "active branch",
-                                )
-                            })?;
-                        let active_branch_commit_id = active_branch_head.commit_id.to_string();
-                        let storage_mutation_revision =
-                            StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(
-                                &read_store,
-                            )
-                            .await?
-                            .map(|revision| revision.to_vec());
-                        if parsed.is_empty() {
-                            return Ok((
-                                CoherentReadBatch {
-                                    active_branch_id,
-                                    active_branch_commit_id,
-                                    storage_mutation_revision,
-                                    results: Vec::new(),
-                                },
-                                Vec::new(),
-                            ));
-                        }
-                        let ctx = SessionSqlExecutionContext {
-                            active_branch_id: &active_branch_id,
-                            active_account_id: self.active_account_id(),
-                            read_store: read_store.clone(),
-                            hot_state: Arc::clone(&self.hot_state),
-                            binary_cas: Arc::clone(&self.binary_cas),
-                            branch_ctx: Arc::clone(&self.branch_ctx),
-                            catalog_context: Arc::clone(&self.catalog_context),
-                            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
-                            functions: FunctionProviderHandle::system(),
-                            plugin_host: self.plugin_host.clone(),
-                            file_views: file_view_collector.clone(),
-                        };
-                        let read_session =
-                            sql2::prepare_read_session_at_head(&ctx, active_branch_head, &parsed)
-                                .await?;
-                        let mut results = Vec::with_capacity(statements.len());
-                        let mut file_view_mutations = Vec::new();
-                        for (statement_index, ((sql, params), statement)) in
-                            statements.iter().zip(parsed).enumerate()
-                        {
-                            let acknowledge_statement =
-                                is_acknowledgeable_file_content_read(&statement, params)
-                                    || late_materialized_lix_file_content_read(&statement).is_some();
-                            // A mixed batch may return file bytes alongside metadata or
-                            // aggregates. Only the exact byte-returning statement may
-                            // update the session's private plugin observation.
-                            if let Some(collector) = &file_view_collector {
-                                collector.clear();
-                            }
-                            let telemetry = SqlStatementTelemetry::start(
-                                self.telemetry.as_ref(),
-                                sql,
-                                "coherent_read_batch",
-                                Some(statement_index),
-                            );
-                            let operation = async {
-                                if let Some(plan) = late_materialized_lix_file_content_read(&statement) {
-                                    // Resolve filters and LIMIT on file metadata first. A
-                                    // provider scan may render files absent from the result;
-                                    // only hydrate (and acknowledge) returned paths.
-                                    let (result, mutations, _) = self
-                                        .execute_read_statement_with_store(
-                                            read_store.clone(),
-                                            sql,
-                                            statement,
-                                            params,
-                                            true,
-                                            sql2::StatementReadPlan {
-                                                native: None,
-                                                late_content: Some(plan),
-                                                acknowledge_file_views: true,
-                                            },
-                                            false,
-                                        )
-                                        .await
-                                        .map_err(|error| normalize_sql_surface_error(error, sql))?;
-                                    file_view_mutations.extend(mutations);
-                                    return Ok(ExecuteResult::from_session_read_result(result));
-                                }
-                                sql2::execute_read_statement_in_session_from_parsed(
-                                    &read_session,
-                                    sql,
-                                    statement,
-                                    params,
-                                )
-                                .await
-                                .map(ExecuteResult::from_sql_query_result)
-                                .map_err(|error| normalize_sql_surface_error(error, sql))
-                            };
-                            let result = match telemetry.as_ref() {
-                                Some(telemetry) => telemetry.instrument(operation).await,
-                                None => operation.await,
-                            };
-                            if let Some(telemetry) = telemetry {
-                                telemetry.finish(&result);
-                            }
-                            results.push(result?);
-                            if acknowledge_statement {
-                                if let Some(collector) = &file_view_collector {
-                                    file_view_mutations.extend(collector.plugin_file_mutations());
-                                }
-                            }
-                        }
-                        drop(read_session);
-                        drop(ctx);
-                        Ok((
-                            CoherentReadBatch {
-                                active_branch_id,
-                                active_branch_commit_id,
-                                storage_mutation_revision,
-                                results,
-                            },
-                            file_view_mutations,
-                        ))
-                    }
-                },
-            )
-            .await;
-            match attempt {
-                Ok((batch, file_view_mutations)) => {
-                    self.file_views.apply_mutations(file_view_mutations);
-                    return Ok(batch);
-                }
-                Err(error) => {
-                    if retry_expired_read_with_write_quiescence(
-                        &mut expired_read_retries,
-                        &error,
-                        &self.collaboration_write_gate,
-                        &mut read_quiescence_guard,
-                        false,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            }
-        }
+        let ReadBatchResult { results, snapshot } = self
+            .execute_read_batch(statements, parsed, ReadBatchKind::Coherent)
+            .await?;
+        let snapshot = snapshot.expect("coherent read batch captures snapshot metadata");
+        Ok(CoherentReadBatch {
+            active_branch_id: snapshot.active_branch_id,
+            active_branch_commit_id: snapshot.active_branch_commit_id,
+            storage_mutation_revision: snapshot.storage_mutation_revision,
+            results,
+        })
     }
 
     #[cfg(test)]
@@ -5708,20 +5615,34 @@ mod tests {
             "EXPLAIN SELECT * FROM lix_history('lix_file')",
         ];
         for sql in reads {
-            assert_eq!(session.execution_disposition(sql).unwrap(),
-                ExecutionDisposition::CancellableRead, "{sql}");
+            assert_eq!(
+                session.execution_disposition(sql).unwrap(),
+                ExecutionDisposition::CancellableRead,
+                "{sql}"
+            );
         }
         let mut batch = reads.into_iter().map(batch_statement).collect::<Vec<_>>();
-        assert_eq!(session.execute_batch_disposition(&batch).unwrap(),
-            ExecutionDisposition::CancellableRead);
-        for sql in ["SELECT uuidv7()", "SELECT CURRENT_TIMESTAMP",
+        assert_eq!(
+            session.execute_batch_disposition(&batch).unwrap(),
+            ExecutionDisposition::CancellableRead
+        );
+        for sql in [
+            "SELECT uuidv7()",
+            "SELECT CURRENT_TIMESTAMP",
             "UPDATE lix_file SET path = '/b' WHERE path = '/a'",
-            "EXPLAIN SELECT uuidv7()"] {
+            "EXPLAIN SELECT uuidv7()",
+        ] {
             batch.push(batch_statement(sql));
-            assert_eq!(session.execution_disposition(sql).unwrap(),
-                ExecutionDisposition::Durable, "{sql}");
-            assert_eq!(session.execute_batch_disposition(&batch).unwrap(),
-                ExecutionDisposition::Durable, "{sql}");
+            assert_eq!(
+                session.execution_disposition(sql).unwrap(),
+                ExecutionDisposition::Durable,
+                "{sql}"
+            );
+            assert_eq!(
+                session.execute_batch_disposition(&batch).unwrap(),
+                ExecutionDisposition::Durable,
+                "{sql}"
+            );
             batch.pop();
         }
     }
@@ -10552,6 +10473,52 @@ mod tests {
                 .expect("value should remain JSON"),
             serde_json::json!("original"),
             "the rejected INSERT must not overwrite committed state"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_coherent_batch_keeps_snapshot_metadata() {
+        let session = open_session().await;
+        let empty = session.execute_coherent_read_batch(&[]).await.unwrap();
+        let nonempty = session
+            .execute_coherent_read_batch(&[("SELECT 1", &[])])
+            .await
+            .unwrap();
+        assert!(empty.results.is_empty());
+        assert_eq!(empty.active_branch_id, nonempty.active_branch_id);
+        assert_eq!(
+            empty.active_branch_commit_id,
+            nonempty.active_branch_commit_id
+        );
+        assert_eq!(
+            empty.storage_mutation_revision,
+            nonempty.storage_mutation_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_read_batch_preserves_each_apis_error_details() {
+        let session = open_session().await;
+        let sql = "SELECT nonexistent_column FROM lix_file";
+        let ordinary = session
+            .execute_batch_with_options(
+                &[batch_statement("SELECT 1"), batch_statement(sql)],
+                ExecuteOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        let coherent = session
+            .execute_coherent_read_batch(&[("SELECT 1", &[]), (sql, &[])])
+            .await
+            .unwrap_err();
+        assert_eq!(ordinary.code, coherent.code);
+        assert_eq!(ordinary.details.as_ref().unwrap()["statementIndex"], 1);
+        assert!(
+            coherent
+                .details
+                .as_ref()
+                .and_then(|details| details.get("statementIndex"))
+                .is_none()
         );
     }
 
