@@ -2576,96 +2576,159 @@ where
     }
 
     async fn validate_root_tombstone_membership(
-        &self,
+        &mut self,
         commit_id: &str,
         metadata: &TrackedStateCommitRoot,
         rows: &[(TrackedStateKey, TrackedStateIndexValue)],
     ) -> Result<(), LixError> {
-        let tombstones = rows
+        const PROOF_BATCH_KEYS: usize = 1024;
+        let mut pending = rows
             .iter()
             .filter(|(_, value)| value.deleted)
+            .cloned()
             .collect::<Vec<_>>();
-        if tombstones.is_empty() {
-            return Ok(());
-        }
-        let typed_commit_id = CommitId::parse_lix(commit_id, "root tombstone proof")?;
-        let state = storage::load_point_replay_commit_state(&self.store, typed_commit_id).await?;
-        if metadata.complete_state_fence {
-            let published =
-                storage::load_published_commit_state_manifest(&self.store, typed_commit_id).await?;
-            if published
-                .as_ref()
-                .and_then(|manifest| manifest.snapshot_root.as_deref())
-                == Some(metadata)
-            {
-                // The content-addressed complete root authenticates every
-                // coordinate, including sparse snapshots with retired authors.
-                return Ok(());
+        let mut current_id = commit_id.to_owned();
+        let mut current_metadata = metadata.clone();
+        let mut seen = BTreeSet::new();
+        let mut validation_cache = DiffCommitRootValidationCache::new();
+        while !pending.is_empty() {
+            if !seen.insert(current_id.clone()) {
+                return Err(LixError::unknown("cycle in tombstone root ancestry"));
             }
-        }
-        let parent_rows = match metadata.parent_roots.first() {
-            Some(parent) => {
-                self.tree
-                    .scan(
-                        &self.store,
-                        &parent.root_id,
-                        &TrackedStateTreeScanRequest::default(),
-                    )
-                    .await?
-            }
-            None => Vec::new(),
-        };
-        let parents = parent_rows.into_iter().collect::<BTreeMap<_, _>>();
-        let state = state.ok_or_else(|| missing_commit_root_error(commit_id))?;
-        for (key, value) in tombstones {
-            let parent = parents.get(key);
-            if parent == Some(value) {
-                continue;
-            }
-            let mut candidates = vec![
-                key.clone(),
-                collection_cascade_payload_key(&key.schema_key, key.file_id.as_deref()),
-            ];
-            if let Some(file_id) = &key.file_id {
-                candidates.push(cascade_payload_key(file_id));
-            }
-            let mut encoded = TrackedStateKeyBatchBuilder::with_row_capacity(candidates.len());
-            for candidate in &candidates {
-                encoded.push(TrackedStateKeyRef {
-                    schema_key: &candidate.schema_key,
-                    file_id: candidate.file_id.as_deref(),
-                    row_pk: &candidate.row_pk,
-                });
-            }
-            let values = self
-                .load_commit_delta_values_for_encoded_queries(&state, encoded.finish())
-                .await?;
-            let valid = values.iter().enumerate().any(|(index, candidate)| {
-                let Some(candidate) = candidate else {
-                    return false;
-                };
-                if candidate.change_id != value.change_id
-                    || candidate.commit_id != value.commit_id
-                    || candidate.updated_at() != value.updated_at()
+            self.validate_commit_root_parent_matches_changelog(
+                &current_id,
+                &current_metadata,
+                &mut validation_cache,
+            )
+            .await?;
+            let typed_id = CommitId::parse_lix(&current_id, "root tombstone proof")?;
+            if current_metadata.complete_state_fence {
+                let published =
+                    storage::load_published_commit_state_manifest(&self.store, typed_id).await?;
+                if published
+                    .as_ref()
+                    .and_then(|manifest| manifest.snapshot_root.as_deref())
+                    == Some(&current_metadata)
                 {
-                    return false;
+                    // An immutable complete-state boundary authenticates the
+                    // rows inherited from it, including retired sparse authors.
+                    return Ok(());
                 }
-                if index == 0 {
-                    candidate.deleted
+            }
+            let state = storage::load_point_replay_commit_state(&self.store, typed_id)
+                .await?
+                .ok_or_else(|| missing_commit_root_error(&current_id))?;
+            let mut parents = BTreeMap::new();
+            if let Some(parent) = current_metadata.parent_roots.first() {
+                for chunk in pending.chunks(PROOF_BATCH_KEYS) {
+                    let keys = chunk.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+                    let values = self
+                        .tree
+                        .get_many(&self.store, &parent.root_id, &keys)
+                        .await?;
+                    parents.extend(
+                        keys.into_iter()
+                            .zip(values)
+                            .filter_map(|(key, value)| value.map(|value| (key, value))),
+                    );
+                }
+            }
+            // Deduplicate shared file/collection markers across the entire
+            // batch, then bound storage work independently of row count.
+            let mut candidates = BTreeSet::new();
+            for (key, _) in &pending {
+                candidates.insert(key.clone());
+                candidates.insert(collection_cascade_payload_key(
+                    &key.schema_key,
+                    key.file_id.as_deref(),
+                ));
+                if let Some(file_id) = &key.file_id {
+                    candidates.insert(cascade_payload_key(file_id));
+                }
+            }
+            let candidates = candidates.into_iter().collect::<Vec<_>>();
+            let mut proofs = BTreeMap::new();
+            for chunk in candidates.chunks(PROOF_BATCH_KEYS) {
+                let mut encoded = TrackedStateKeyBatchBuilder::with_row_capacity(chunk.len());
+                for key in chunk {
+                    encoded.push(TrackedStateKeyRef {
+                        schema_key: &key.schema_key,
+                        file_id: key.file_id.as_deref(),
+                        row_pk: &key.row_pk,
+                    });
+                }
+                let values = self
+                    .load_commit_delta_values_for_encoded_queries(&state, encoded.finish())
+                    .await?;
+                proofs.extend(
+                    chunk
+                        .iter()
+                        .cloned()
+                        .zip(values)
+                        .filter_map(|(key, value)| value.map(|value| (key, value))),
+                );
+            }
+            let mut inherited = Vec::new();
+            for (key, value) in pending {
+                let parent = parents.get(&key);
+                let direct = proofs.get(&key);
+                let cascade = if parent.is_some_and(|parent| !parent.deleted) {
+                    proofs
+                        .get(&collection_cascade_payload_key(
+                            &key.schema_key,
+                            key.file_id.as_deref(),
+                        ))
+                        .filter(|candidate| !candidate.deleted)
+                        .or_else(|| {
+                            key.file_id
+                                .as_deref()
+                                .and_then(|file_id| proofs.get(&cascade_payload_key(file_id)))
+                                .filter(|candidate| candidate.deleted)
+                        })
+                } else {
+                    None
+                };
+                // Current winners take precedence even when the serving row
+                // equals its parent's row: a stale inherited deletion cannot
+                // hide a newer resurrection in an intermediate commit.
+                let candidate = direct.or(cascade);
+                let valid = if let Some(candidate) = candidate {
+                    candidate.change_id == value.change_id
+                        && candidate.commit_id == value.commit_id
+                        && candidate.updated_at() == value.updated_at()
                         && value.created_at()
                             == parent
                                 .map_or(candidate.created_at(), TrackedStateIndexValue::created_at)
+                        && (direct.is_none() || candidate.deleted)
+                } else if parent == Some(&value) {
+                    inherited.push((key.clone(), value.clone()));
+                    true
                 } else {
-                    parent.is_some_and(|parent| {
-                        !parent.deleted && value.created_at() == parent.created_at()
-                    }) && (index == 1 || candidate.deleted)
+                    false
+                };
+                if !valid {
+                    return Err(LixError::unknown(format!(
+                        "tracked-state tombstone '{}' is not a current delta or inherited member of root '{}' for identity {:?}",
+                        value.change_id, current_id, key
+                    )));
                 }
-            });
-            if !valid {
-                return Err(LixError::unknown(format!(
-                    "tracked-state tombstone '{}' is not a current delta or inherited member of root '{commit_id}' for identity {:?}",
-                    value.change_id, key
-                )));
+            }
+            pending = inherited;
+            if !pending.is_empty() {
+                let parent = current_metadata
+                    .parent_roots
+                    .first()
+                    .ok_or_else(|| missing_commit_root_error(&current_id))?;
+                current_id = parent.commit_id.to_string();
+                let parent_metadata = storage::load_snapshot_commit_root(&self.store, &current_id)
+                    .await?
+                    .ok_or_else(|| missing_commit_root_error(&current_id))?;
+                if parent_metadata.root_id != parent.root_id {
+                    return Err(LixError::unknown(
+                        "tombstone parent root disagrees with immutable authority",
+                    ));
+                }
+                current_metadata = parent_metadata;
             }
         }
         Ok(())
@@ -2727,17 +2790,6 @@ where
                 )));
             };
             if !parent_value.deleted
-                && let Some(file_id) = parent_key.file_id.as_ref()
-                && let Some(cascade_change_id) = file_delete_cascades.get(file_id)
-            {
-                if value.deleted && &value.change_id == cascade_change_id {
-                    continue;
-                }
-                return Err(LixError::unknown(format!(
-                    "tracked-state commit-root for commit '{commit_id}' does not apply file descriptor cascade change '{cascade_change_id}' to inherited identity {identity:?}"
-                )));
-            }
-            if !parent_value.deleted
                 && let Some(cascade_change_id) = collection_generation_cascades
                     .get(&(parent_key.schema_key.clone(), parent_key.file_id.clone()))
             {
@@ -2746,6 +2798,17 @@ where
                 }
                 return Err(LixError::unknown(format!(
                     "tracked-state commit-root for commit '{commit_id}' does not apply collection-generation cascade change '{cascade_change_id}' to inherited identity {identity:?}"
+                )));
+            }
+            if !parent_value.deleted
+                && let Some(file_id) = parent_key.file_id.as_ref()
+                && let Some(cascade_change_id) = file_delete_cascades.get(file_id)
+            {
+                if value.deleted && &value.change_id == cascade_change_id {
+                    continue;
+                }
+                return Err(LixError::unknown(format!(
+                    "tracked-state commit-root for commit '{commit_id}' does not apply file descriptor cascade change '{cascade_change_id}' to inherited identity {identity:?}"
                 )));
             }
             if *value != &parent_value {
@@ -6064,6 +6127,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collection_cascade_wins_over_overlapping_descriptor_deletion() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000625";
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked = TrackedStateContext::new();
+        let mut descriptor = row(FILE_ID, "descriptor-create", "base");
+        descriptor.row_pk = RowPk::uuid_from_canonical(FILE_ID).unwrap();
+        descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.into();
+        descriptor.file_id = Some(FILE_ID.into());
+        let mut semantic = row("row", "row-create", "base");
+        semantic.file_id = Some(FILE_ID.into());
+        write_root_for_test(
+            &storage,
+            &tracked,
+            "base",
+            None,
+            &[descriptor.clone(), semantic],
+        )
+        .await
+        .unwrap();
+        descriptor.deleted = true;
+        descriptor.snapshot_content = None;
+        descriptor.change_id = ChangeId::for_test_label("descriptor-delete");
+        descriptor.commit_id = CommitId::for_test_label("child");
+        let marker_key = collection_cascade_payload_key("test_schema", Some(FILE_ID));
+        let mut marker = row("unused", "collection-delete", "child");
+        marker.row_pk = marker_key.row_pk.clone();
+        marker.schema_key = marker_key.schema_key.clone();
+        marker.snapshot_content = Some(r#"{"live_count":0}"#.into());
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = StorageWriteSet::new();
+        crate::test_support::stage_tracked_root_from_materialized_with_certified_replacement_markers(&mut read, &mut writes, &tracked, "child", Some("base"), &[descriptor, marker], &BTreeSet::from([marker_key])).await.unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let metadata = storage::load_snapshot_commit_root(&read, "child")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut reader = tracked.reader(read);
+        let rows = reader
+            .tree
+            .scan(
+                &reader.store,
+                &metadata.root_id,
+                &TrackedStateTreeScanRequest::default(),
+            )
+            .await
+            .unwrap();
+        let value = rows
+            .iter()
+            .find(|(key, _)| key.schema_key == "test_schema")
+            .unwrap()
+            .1
+            .clone();
+        assert!(value.deleted);
+        assert_eq!(
+            value.change_id,
+            ChangeId::for_test_label("collection-delete")
+        );
+        reader
+            .validate_commit_root_metadata_against_changelog("child", metadata)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn ordinary_collection_generation_marker_does_not_retire_omitted_file_rows() {
         use crate::collection_generation::{
             COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_key,
@@ -8033,6 +8170,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_tombstone_proof_rejects_corrupted_inherited_rows() {
+        for missing_author in [false, true] {
+            let storage = StorageAdapter::new(Memory::new());
+            let tracked = TrackedStateContext::new();
+            let base = row("base", "base-change", "base");
+            let parent = row("parent", "parent-change", "parent");
+            write_root_for_test(
+                &storage,
+                &tracked,
+                "base",
+                None,
+                std::slice::from_ref(&base),
+            )
+            .await
+            .unwrap();
+            write_root_for_test(
+                &storage,
+                &tracked,
+                "parent",
+                Some("base"),
+                std::slice::from_ref(&parent),
+            )
+            .await
+            .unwrap();
+            let mut foreign = row("foreign", "foreign-delete", "foreign");
+            foreign.deleted = true;
+            foreign.snapshot_content = None;
+            if !missing_author {
+                write_root_for_test(
+                    &storage,
+                    &tracked,
+                    "foreign",
+                    None,
+                    std::slice::from_ref(&foreign),
+                )
+                .await
+                .unwrap();
+            }
+            overwrite_root_with_rows_for_test(&storage, "parent", &[base, parent, foreign]).await;
+            write_root_for_test(
+                &storage,
+                &tracked,
+                "child",
+                Some("parent"),
+                &[row("child", "child-change", "child")],
+            )
+            .await
+            .unwrap();
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            let metadata = storage::load_snapshot_commit_root(&read, "child")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut reader = tracked.reader(read);
+            let rows = reader
+                .tree
+                .scan(
+                    &reader.store,
+                    &metadata.root_id,
+                    &TrackedStateTreeScanRequest::default(),
+                )
+                .await
+                .unwrap();
+            let error = reader
+                .validate_root_tombstone_membership("child", &metadata, &rows)
+                .await
+                .expect_err("matching a corrupted parent's row is not proof of membership");
+            assert!(
+                error
+                    .message
+                    .contains("not a current delta or inherited member"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn root_tombstone_proof_rejects_stale_inherited_deletion_over_resurrection() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked,
+            "base",
+            None,
+            &[row("key", "base-change", "base")],
+        )
+        .await
+        .unwrap();
+        let mut deleted = row("key", "deleted-change", "deleted");
+        deleted.deleted = true;
+        deleted.snapshot_content = None;
+        write_root_for_test(
+            &storage,
+            &tracked,
+            "deleted",
+            Some("base"),
+            std::slice::from_ref(&deleted),
+        )
+        .await
+        .unwrap();
+        write_root_for_test(
+            &storage,
+            &tracked,
+            "parent",
+            Some("deleted"),
+            &[row("key", "revived-change", "parent")],
+        )
+        .await
+        .unwrap();
+        overwrite_root_with_rows_for_test(&storage, "parent", &[deleted]).await;
+        write_root_for_test(
+            &storage,
+            &tracked,
+            "child",
+            Some("parent"),
+            &[row("other", "child-change", "child")],
+        )
+        .await
+        .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let metadata = storage::load_snapshot_commit_root(&read, "child")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut reader = tracked.reader(read);
+        let rows = reader
+            .tree
+            .scan(
+                &reader.store,
+                &metadata.root_id,
+                &TrackedStateTreeScanRequest::default(),
+            )
+            .await
+            .unwrap();
+        let error = reader
+            .validate_root_tombstone_membership("child", &metadata, &rows)
+            .await
+            .expect_err("an inherited tombstone cannot override an intermediate resurrection");
+        assert!(
+            error
+                .message
+                .contains("not a current delta or inherited member"),
+            "{error}"
+        );
+    }
+
+    struct RootProofCountingRead<R> {
+        inner: R,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<R: StorageAdapterRead> StorageAdapterRead for RootProofCountingRead<R> {
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+        async fn get_many(
+            &self,
+            requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
+        ) -> Result<
+            crate::storage_adapter::StorageGetManyResult,
+            crate::storage_adapter::StorageError,
+        > {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get_many(requests).await
+        }
+        async fn begin_scan(
+            &self,
+            space: crate::storage_adapter::StorageSpace,
+            range: crate::storage_adapter::StorageKeyRange,
+            opts: crate::storage_adapter::StorageBeginScanOptions,
+        ) -> Result<
+            crate::storage_adapter::StorageScanCursor<'_>,
+            crate::storage_adapter::StorageError,
+        > {
+            self.inner.begin_scan(space, range, opts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn root_tombstone_proof_batches_bulk_deletion_reads() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked = TrackedStateContext::new();
+        let rows = (0..2048)
+            .map(|i| row(&format!("row-{i:04}"), &format!("base-{i}"), "base"))
+            .collect::<Vec<_>>();
+        write_root_for_test(&storage, &tracked, "base", None, &rows)
+            .await
+            .unwrap();
+        let deleted = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut row)| {
+                row.deleted = true;
+                row.snapshot_content = None;
+                row.change_id = ChangeId::for_test_label(&format!("deleted-{i}"));
+                row.commit_id = CommitId::for_test_label("deleted");
+                row
+            })
+            .collect::<Vec<_>>();
+        write_root_for_test(&storage, &tracked, "deleted", Some("base"), &deleted)
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let metadata = storage::load_snapshot_commit_root(&read, "deleted")
+            .await
+            .unwrap()
+            .unwrap();
+        let rows = TrackedStateTree::new()
+            .scan(
+                &read,
+                &metadata.root_id,
+                &TrackedStateTreeScanRequest::default(),
+            )
+            .await
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reader = tracked.reader(RootProofCountingRead {
+            inner: read,
+            calls: calls.clone(),
+        });
+        reader
+            .validate_root_tombstone_membership("deleted", &metadata, &rows)
+            .await
+            .unwrap();
+        let count = calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            count < 192,
+            "2048 tombstones should use bounded batches, got {count}"
+        );
+    }
+
+    #[tokio::test]
     async fn root_tombstone_proof_rejects_foreign_and_missing_author_rows() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
@@ -8072,7 +8452,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let reader = tracked_state.reader(read);
+        let mut reader = tracked_state.reader(read);
         let mut rows = reader
             .tree
             .scan(
