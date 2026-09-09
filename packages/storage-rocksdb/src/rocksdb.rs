@@ -278,10 +278,6 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
                 let bounds = EncodedBounds::new(physical_range(space.id, range.clone()));
                 range_is_empty(db, column_family(db, *space), &bounds)?
             }
-            Precondition::BranchEquals { ref_key, expected } => db
-                .get_cf(mutable_column_family(db), ref_key.0.as_ref())
-                .map_err(rocksdb_error)?
-                .is_some_and(|value| value.as_slice() == expected.as_ref()),
         };
         if !matches {
             failures.push(PreconditionFailure { index });
