@@ -776,11 +776,12 @@ where
             ));
         }
     };
-    if from_format < 72
-        || !super::registry::has_complete_migration_path(
-            from_format,
-            crate::init::CURRENT_FORMAT_VERSION,
-        )
+    if server.is_none()
+        && (from_format < 72
+            || !super::registry::has_complete_migration_path(
+                from_format,
+                crate::init::CURRENT_FORMAT_VERSION,
+            ))
     {
         return Err(epoch_error(format!(
             "repository v{from_format} predates the v{} complete-snapshot commit format; no automatic upgrade is available",
@@ -796,7 +797,11 @@ where
     .ok_or_else(|| epoch_error("repository protocol marker disappeared during inspection"))?;
     emit_migrating(progress, from_format);
     let source = StorageAdapter::new(storage.clone());
-    let target_bank = EpochBank::A;
+    let target_bank = if server.is_some() {
+        replica_generation_bank(1)?
+    } else {
+        EpochBank::A
+    };
     let source_revision = match source.load_mutation_revision().await {
         Ok(revision) => revision,
         Err(error) if is_admission_race(&error) => {
@@ -853,6 +858,14 @@ where
             .await?;
             clear_bank(&target).await?;
             if let Some((proof, server)) = replica {
+                retain_replica_source(
+                    storage,
+                    &migrating_bytes,
+                    &migration_source,
+                    from_format,
+                    &proof,
+                )
+                .await?;
                 Box::pin(crate::sync::rebuild_replica_candidate(
                     target.clone(),
                     server,
@@ -942,10 +955,12 @@ async fn migrate_active<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    if !super::registry::has_complete_migration_path(
-        from_format,
-        crate::init::CURRENT_FORMAT_VERSION,
-    ) {
+    if server.is_none()
+        && !super::registry::has_complete_migration_path(
+            from_format,
+            crate::init::CURRENT_FORMAT_VERSION,
+        )
+    {
         return Err(epoch_error(format!(
             "repository epoch v{from_format} has no registered upgrade path to v{}",
             crate::init::CURRENT_FORMAT_VERSION
@@ -954,7 +969,15 @@ where
     let source =
         StorageAdapter::for_epoch(storage.clone(), source_bank, active_source_bytes.clone());
     emit_migrating(progress, from_format);
-    let target_bank = source_bank.alternate();
+    let target_bank = if server.is_some() || matches!(source_bank, EpochBank::Generation(_)) {
+        replica_generation_bank(
+            source_generation
+                .checked_add(1)
+                .ok_or_else(|| epoch_error("replica generation exhausted"))?,
+        )?
+    } else {
+        source_bank.alternate()
+    };
     let source_revision = match source.load_mutation_revision().await {
         Ok(revision) => revision,
         Err(error) if is_admission_race(&error) => {
@@ -1029,6 +1052,14 @@ where
             .await?;
             clear_bank(&target).await?;
             if let Some((proof, server)) = replica {
+                retain_replica_source(
+                    storage,
+                    &migrating_bytes,
+                    &migration_source,
+                    from_format,
+                    &proof,
+                )
+                .await?;
                 Box::pin(crate::sync::rebuild_replica_candidate(
                     target.clone(),
                     server,
@@ -1064,9 +1095,9 @@ where
         };
         let active_bytes = encode_pointer(active);
         replace_pointer(storage, &migrating_bytes, &active_bytes).await?;
-        // Keep the immediately previous bank for rollback. Once a later epoch has
-        // activated, the pre-epoch layout is older than that rollback window and
-        // can be reclaimed without making cleanup part of publication success.
+        // Standalone repositories retain the existing rollback window. A
+        // retained replica source is excluded from legacy retirement forever;
+        // later replacements also never reuse its numbered physical bank.
         let _ = schedule_legacy_retirement(storage.clone(), active_bytes.clone());
         Ok(EpochAdmission {
             adapter: StorageAdapter::for_epoch(storage.clone(), target_bank, active_bytes),
@@ -1097,6 +1128,13 @@ async fn retire_legacy_layout<S>(storage: &S, active_pointer: &Bytes) -> Result<
 where
     S: Storage + Clone,
 {
+    // Retained replica data is not part of the rotating rollback window.
+    if load_storage_value(storage, REPOSITORY_EPOCH_SPACE, b"retained/legacy")
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
     if load_storage_value(
         storage,
         REPOSITORY_EPOCH_SPACE,
@@ -1151,11 +1189,164 @@ where
     Ok(())
 }
 
+/// A retained source is deliberately independent of the active epoch and its
+/// rollback window. It is never removed by ordinary migration or cache cleanup.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RetainedReplicaSource {
+    pub(crate) bank: String,
+    pub(crate) source_format: u32,
+    pub(crate) repository_id: String,
+    pub(crate) account_id: String,
+    pub(crate) recovery_required: bool,
+}
+
+fn replica_generation_bank(generation: u64) -> Result<EpochBank, LixError> {
+    // Logical engine spaces occupy the low 20 bits. Skip the two historical
+    // banks; exhausting this namespace fails without recycling retained data.
+    if generation == 0 || generation > 4093 {
+        return Err(epoch_error(
+            "retained replica generation capacity exhausted; existing local sources remain preserved and must not be cleared until recovery is verified",
+        ));
+    }
+    let mut number = generation;
+    if number >= 1024 {
+        number += 1;
+    }
+    if number >= 2048 {
+        number += 1;
+    }
+    Ok(EpochBank::Generation(number as u16))
+}
+
+async fn retain_replica_source<S: Storage + Clone>(
+    storage: &S,
+    claim: &Bytes,
+    source: &StorageAdapter<S>,
+    source_format: u32,
+    proof: &crate::sync::ReplicaRebuildSource,
+) -> Result<(), LixError> {
+    let retained = RetainedReplicaSource {
+        bank: bank_code(source.epoch_bank()),
+        source_format,
+        repository_id: proof.repository_id.clone(),
+        account_id: proof.account_id.clone(),
+        recovery_required: proof.recovery_required,
+    };
+    let key = Key(Bytes::from(format!("retained/{}", retained.bank)));
+    let bytes =
+        Bytes::from(serde_json::to_vec(&retained).map_err(|error| epoch_error(error.to_string()))?);
+    let mut write = storage
+        .begin_write(WriteOptions {
+            await_durable: true,
+            preconditions: vec![Precondition::KeyValueEquals {
+                space: REPOSITORY_EPOCH_SPACE,
+                key: Key(Bytes::from_static(REPOSITORY_EPOCH_KEY)),
+                expected: claim.clone(),
+            }],
+            ..WriteOptions::default()
+        })
+        .await
+        .map_err(storage_error)?;
+    write
+        .put_many(
+            REPOSITORY_EPOCH_SPACE,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key,
+                    value: StoredValue { bytes },
+                }],
+            },
+        )
+        .await
+        .map_err(storage_error)?;
+    write.commit().await.map_err(storage_error)?;
+    Ok(())
+}
+
+/// Only completed replacements are reported. A failed replacement can leave a
+/// retention record beside the still-active source; that source is not archived.
+pub(crate) async fn list_retained_replica_sources<S: Storage>(
+    storage: &S,
+) -> Result<Vec<RetainedReplicaSource>, LixError> {
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(storage_error)?;
+    let pointer = read
+        .get_many(&[GetManyRequest {
+            space: REPOSITORY_EPOCH_SPACE,
+            keys: &[Key(Bytes::from_static(REPOSITORY_EPOCH_KEY))],
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }])
+        .await
+        .map_err(storage_error)?
+        .values
+        .into_iter()
+        .next()
+        .flatten();
+    let active = match pointer {
+        Some(ProjectedValue::FullValue(bytes)) => match decode_pointer(&bytes)? {
+            PointerState::Active { bank, .. } => bank,
+            PointerState::Migrating { .. } => return Ok(Vec::new()),
+        },
+        _ => return Ok(Vec::new()),
+    };
+    let mut cursor = read
+        .begin_scan(
+            REPOSITORY_EPOCH_SPACE,
+            KeyRange {
+                lower: Bound::Included(Key(Bytes::from_static(b"retained/"))),
+                upper: Bound::Excluded(Key(Bytes::from_static(b"retained0"))),
+            },
+            BeginScanOptions::default(),
+        )
+        .await
+        .map_err(storage_error)?;
+    let entries = cursor.collect_all().await.map_err(storage_error)?;
+    let mut retained = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let ProjectedValue::FullValue(bytes) = entry.value else {
+            return Err(epoch_error("retained source metadata is not a full value"));
+        };
+        let record: RetainedReplicaSource = serde_json::from_slice(&bytes)
+            .map_err(|error| epoch_error(format!("retained source metadata: {error}")))?;
+        if parse_bank(&record.bank)? != active {
+            retained.push(record);
+        }
+    }
+    Ok(retained)
+}
+
+/// Internal recovery reader access. The current pointer fences the reader on a
+/// concurrent replacement, and an active source may never be selected here.
+pub(crate) async fn open_retained_replica_source<S: Storage + Clone>(
+    storage: &S,
+    retained: &RetainedReplicaSource,
+) -> Result<StorageAdapter<S>, LixError> {
+    let Some((PointerState::Active { bank: active, .. }, pointer)) = load_pointer(storage).await?
+    else {
+        return Err(epoch_error("local recovery requires an active repository"));
+    };
+    let bank = parse_bank(&retained.bank)?;
+    if bank == active {
+        return Err(epoch_error(
+            "active replica is not an archived recovery source",
+        ));
+    }
+    Ok(StorageAdapter::for_retained_epoch(
+        storage.clone(),
+        bank,
+        pointer,
+    ))
+}
+
 async fn inspect_replica_rebuild<'a, S>(
     source: &StorageAdapter<S>,
     source_format: u32,
     server: Option<&'a crate::ServerOptions>,
-) -> Result<Option<(crate::sync::CleanReplicaProof, &'a crate::ServerOptions)>, LixError>
+) -> Result<Option<(crate::sync::ReplicaRebuildSource, &'a crate::ServerOptions)>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -1165,14 +1356,15 @@ where
     if source_format == crate::init::CURRENT_FORMAT_VERSION {
         return Ok(None);
     }
-    // The exact migration claim already fences ordinary writers. Prove the
-    // entire replica is clean in one source snapshot before any candidate work.
+    // The exact migration claim already fences ordinary writers. Identify the
+    // source and classify recovery work before rebuilding; local-only work is
+    // retained independently and must not block opening server state.
     let read = source.begin_read(ReadOptions::default()).await?;
-    let Some(proof) = crate::sync::inspect_replica_rebuild_safety(&read, source_format).await?
+    let Some(proof) = crate::sync::inspect_replica_rebuild_source(&read, source_format).await?
     else {
         return Ok(None);
     };
-    let server = server.ok_or_else(|| crate::sync::replica_upgrade_blocked("server_required"))?;
+    let server = server.ok_or_else(|| crate::sync::replica_replacement_unavailable("server_required"))?;
     Ok(Some((proof, server)))
 }
 
@@ -2170,11 +2362,12 @@ fn parse_format(value: &str) -> Result<u32, LixError> {
         .map_err(|_| epoch_error("epoch pointer format is invalid"))
 }
 
-fn bank_code(bank: EpochBank) -> &'static str {
+fn bank_code(bank: EpochBank) -> String {
     match bank {
-        EpochBank::Legacy => "legacy",
-        EpochBank::A => "a",
-        EpochBank::B => "b",
+        EpochBank::Legacy => "legacy".to_owned(),
+        EpochBank::A => "a".to_owned(),
+        EpochBank::B => "b".to_owned(),
+        EpochBank::Generation(number) => format!("g{number}"),
     }
 }
 
@@ -2183,7 +2376,14 @@ fn parse_bank(value: &str) -> Result<EpochBank, LixError> {
         "legacy" => Ok(EpochBank::Legacy),
         "a" => Ok(EpochBank::A),
         "b" => Ok(EpochBank::B),
-        _ => Err(epoch_error("epoch pointer bank is invalid")),
+        _ => {
+            let number = value
+                .strip_prefix('g')
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|number| (1..=4095).contains(number) && !matches!(*number, 1024 | 2048))
+                .ok_or_else(|| epoch_error("epoch pointer bank is invalid"))?;
+            Ok(EpochBank::Generation(number))
+        }
     }
 }
 
@@ -3394,3 +3594,6 @@ mod tests {
 
 #[cfg(all(test, feature = "server-protocol", not(target_family = "wasm")))]
 mod replica_upgrade_tests;
+
+#[cfg(test)]
+mod retained_generation_tests;

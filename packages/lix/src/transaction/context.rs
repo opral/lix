@@ -2672,10 +2672,32 @@ where
         )
     }
 
+    /// Restore already interpreted retained rows. The normal write pipeline still
+    /// validates scope, schema, constraints and atomic publication; only plugin
+    /// reconciliation is skipped, because ingesting old checkpoint bytes would
+    /// overwrite newer captured semantic rows. This is never a public SQL mode.
+    pub(crate) async fn stage_recovery_write(
+        &mut self,
+        write: TransactionWrite,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write_inner_with_recovery(write, None, true)
+            .await
+    }
+
     async fn stage_write_inner(
         &mut self,
         write: TransactionWrite,
         statement_indices: Option<Vec<u32>>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write_inner_with_recovery(write, statement_indices, false)
+            .await
+    }
+
+    async fn stage_write_inner_with_recovery(
+        &mut self,
+        write: TransactionWrite,
+        statement_indices: Option<Vec<u32>>,
+        retained_recovery: bool,
     ) -> Result<TransactionWriteOutcome, LixError> {
         if let Some(statement_indices) = &statement_indices {
             debug_assert_eq!(statement_indices.len(), transaction_write_row_count(&write));
@@ -2684,7 +2706,7 @@ where
         // one coherent snapshot, then fences that snapshot in the durable
         // write. Re-checking it for every staged batch only repeats point
         // reads; it cannot make a stale write publish successfully.
-        if !transaction_write_has_plugin_lifecycle_candidate(&write) {
+        if retained_recovery || !transaction_write_has_plugin_lifecycle_candidate(&write) {
             // Acquire before normalization, plugin/state reads, or actor work.
             // The owned guard remains on this transaction through its durable
             // commit, so an upgrade cannot preflight across an in-flight
@@ -2711,8 +2733,28 @@ where
                 transaction_write_untracked_row_count(&write),
             );
         }
-        let (write, file_view_mutations, actor_publications) =
-            self.reconcile_plugin_write(write).await?;
+        let (write, file_view_mutations, actor_publications) = if retained_recovery {
+            let write = match write {
+                TransactionWrite::Rows { mode, rows } => ReconciledTransactionWrite::Rows {
+                    mode,
+                    rows: ReconciledRowBatch::Raw(rows),
+                },
+                TransactionWrite::RowsWithFileContent {
+                    mode,
+                    rows,
+                    file_content,
+                    count,
+                } => ReconciledTransactionWrite::RowsWithFileContent {
+                    mode,
+                    rows: ReconciledRowBatch::Raw(rows),
+                    file_content,
+                    count,
+                },
+            };
+            (write, BTreeMap::new(), Vec::new())
+        } else {
+            self.reconcile_plugin_write(write).await?
+        };
         if let Err(error) = require_valid_reconciled_transaction_write_storage_scopes(&write) {
             discard_plugin_actor_publications(actor_publications).await;
             return Err(error);
@@ -7318,6 +7360,41 @@ where
                 continue;
             }
             if reader.load_head_commit_id(&branch_id).await?.is_none() {
+                // A branch created earlier in this transaction is a valid
+                // target only when both its descriptor and ref are staged.
+                // Their ordinary FK validation still proves the source commit.
+                let staged = self.staged_writes.staging_overlay()?;
+                let rows = staged.staged_batch(&HotStateScanRequest {
+                    filter: HotStateFilter {
+                        branch_ids: vec![GLOBAL_BRANCH_ID.to_owned()],
+                        schema_keys: vec![
+                            "lix_branch_descriptor".to_owned(),
+                            BRANCH_REF_SCHEMA_KEY.to_owned(),
+                        ],
+                        row_pks: vec![
+                            RowPk::uuid_from_canonical(&branch_id)
+                                .map_err(|_| {
+                                    LixError::branch_not_found(
+                                        branch_id.clone(),
+                                        "stage_write",
+                                        "target",
+                                    )
+                                })?,
+                        ],
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })?;
+                if rows
+                    .iter()
+                    .any(|row| row.schema_key() == "lix_branch_descriptor" && !row.deleted())
+                    && rows
+                        .iter()
+                        .any(|row| row.schema_key() == BRANCH_REF_SCHEMA_KEY && !row.deleted())
+                {
+                    continue;
+                }
                 return Err(LixError::branch_not_found(
                     branch_id,
                     "stage_write",

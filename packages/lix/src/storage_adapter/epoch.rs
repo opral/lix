@@ -19,6 +19,8 @@ pub(crate) const REPOSITORY_EPOCH_KEY: &[u8] = b"active";
 const BANK_MASK: u32 = 0xc000_0000;
 const BANK_A_PREFIX: u32 = 0x4000_0000;
 const BANK_B_PREFIX: u32 = 0x8000_0000;
+const GENERATION_SHIFT: u32 = 20;
+const GENERATION_SPACE_MASK: u32 = 0xfff0_0000;
 
 /// Physical bank selected for engine-declared repository spaces.
 ///
@@ -30,6 +32,8 @@ pub(crate) enum EpochBank {
     Legacy,
     A,
     B,
+    /// Never reused by replica replacement. Legacy A/B retain their original IDs.
+    Generation(u16),
 }
 
 impl EpochBank {
@@ -38,6 +42,7 @@ impl EpochBank {
             Self::Legacy => 0,
             Self::A => BANK_A_PREFIX,
             Self::B => BANK_B_PREFIX,
+            Self::Generation(number) => (number as u32) << GENERATION_SHIFT,
         }
     }
 
@@ -45,6 +50,7 @@ impl EpochBank {
         match self {
             Self::Legacy | Self::B => Self::A,
             Self::A => Self::B,
+            Self::Generation(_) => panic!("retained generations must never rotate"),
         }
     }
 }
@@ -56,6 +62,7 @@ pub(super) struct EpochRouting {
     bank: EpochBank,
     expected_pointer: Option<Bytes>,
     force_durable: bool,
+    read_only: bool,
 }
 
 impl EpochRouting {
@@ -68,6 +75,7 @@ impl EpochRouting {
             bank,
             expected_pointer: None,
             force_durable: true,
+            read_only: false,
         }
     }
 
@@ -76,6 +84,14 @@ impl EpochRouting {
             bank,
             expected_pointer: Some(expected_pointer),
             force_durable: false,
+            read_only: false,
+        }
+    }
+
+    pub(super) fn retained(bank: EpochBank, expected_pointer: Bytes) -> Self {
+        Self {
+            read_only: true,
+            ..Self::fenced(bank, expected_pointer)
         }
     }
 
@@ -84,6 +100,7 @@ impl EpochRouting {
             bank,
             expected_pointer: Some(expected_pointer),
             force_durable: true,
+            read_only: false,
         }
     }
 
@@ -96,7 +113,12 @@ impl EpochRouting {
             return space;
         }
         assert_eq!(
-            space.id.0 & BANK_MASK,
+            space.id.0
+                & if matches!(self.bank, EpochBank::Generation(_)) {
+                    GENERATION_SPACE_MASK
+                } else {
+                    BANK_MASK
+                },
             0,
             "logical storage space ids must leave the epoch-bank bits clear"
         );
@@ -133,6 +155,9 @@ impl EpochRouting {
         &self,
         mut options: WriteOptions,
     ) -> Result<(WriteOptions, Option<usize>), StorageError> {
+        if self.read_only {
+            return Err(StorageError::Fenced);
+        }
         if self.force_durable {
             options.await_durable = true;
         }
@@ -320,8 +345,30 @@ mod tests {
     }
 
     #[test]
+    fn registered_spaces_fit_retained_generation_namespace() {
+        for &space in crate::storage_spaces::ALL_STORAGE_SPACES {
+            assert_eq!(
+                space.id.0 & GENERATION_SPACE_MASK,
+                0,
+                "{} must reserve the high 12 bits for retained generations",
+                space.name
+            );
+        }
+        let logical = crate::init::REPOSITORY_PROTOCOL_SPACE;
+        let first = EpochRouting::unfenced(EpochBank::Generation(1)).map_space(logical);
+        let last = EpochRouting::unfenced(EpochBank::Generation(4095)).map_space(logical);
+        assert_eq!(first.id.0, 0x0010_0000 | logical.id.0);
+        assert_eq!(last.id.0, 0xfff0_0000 | logical.id.0);
+    }
+
+    #[test]
     fn epoch_pointer_space_is_never_banked() {
-        for bank in [EpochBank::Legacy, EpochBank::A, EpochBank::B] {
+        for bank in [
+            EpochBank::Legacy,
+            EpochBank::A,
+            EpochBank::B,
+            EpochBank::Generation(1),
+        ] {
             assert_eq!(
                 EpochRouting::unfenced(bank).map_space(REPOSITORY_EPOCH_SPACE),
                 REPOSITORY_EPOCH_SPACE

@@ -293,6 +293,17 @@ enum LixCommand {
         actor: NativeLixActor,
         deferred: NativeTransactionDeferred,
     },
+    ReplicaRecoverySources {
+        deferred: NativeDeferred<serde_json::Value>,
+    },
+    ExportReplicaRecovery {
+        id: String,
+        deferred: NativeDeferred<serde_json::Value>,
+    },
+    RecoverReplica {
+        id: String,
+        deferred: NativeDeferred<serde_json::Value>,
+    },
     ActiveBranchId(NativeStringDeferred),
     ActiveAccountId(NativeStringDeferred),
     CreateBranch {
@@ -912,6 +923,13 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
             }
             LixCommand::ExecuteBatch { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::BeginTransaction { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::ReplicaRecoverySources { deferred, .. } => {
+                deferred.reject(to_napi_error(&error))
+            }
+            LixCommand::ExportReplicaRecovery { deferred, .. } => {
+                deferred.reject(to_napi_error(&error))
+            }
+            LixCommand::RecoverReplica { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveAccountId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
@@ -1011,6 +1029,18 @@ fn handle_lix_command(
         } => {
             let result = block_on!(state.lix.create_hosted(server, idempotency_key));
             settle_deferred(deferred, result);
+            None
+        }
+        LixCommand::ReplicaRecoverySources { deferred } => {
+            settle_deferred(deferred, block_on!(state.lix.replica_recovery_sources()));
+            None
+        }
+        LixCommand::ExportReplicaRecovery { id, deferred } => {
+            settle_deferred(deferred, block_on!(state.lix.export_replica_recovery(&id)));
+            None
+        }
+        LixCommand::RecoverReplica { id, deferred } => {
+            settle_deferred(deferred, block_on!(state.lix.recover_replica(&id)));
             None
         }
         LixCommand::ActiveBranchId(deferred) => {
@@ -1268,6 +1298,15 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::BeginTransaction { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::ReplicaRecoverySources { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::ExportReplicaRecovery { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::RecoverReplica { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
         LixCommand::ActiveBranchId(deferred) => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -1332,6 +1371,36 @@ impl NativeLixInner {
             id: hosted.id,
             url: hosted.url,
         })
+    }
+
+    async fn replica_recovery_sources(&self) -> std::result::Result<serde_json::Value, LixError> {
+        let value = match self {
+            Self::Memory(lix) => lix.replica_recovery_sources().await?,
+            Self::FilesystemStorage(lix, _, _) => lix.replica_recovery_sources().await?,
+        };
+        serde_json::to_value(value)
+            .map_err(|error| LixError::new("LIX_ERROR_SERIALIZATION", error.to_string()))
+    }
+
+    async fn export_replica_recovery(
+        &self,
+        id: &str,
+    ) -> std::result::Result<serde_json::Value, LixError> {
+        let value = match self {
+            Self::Memory(lix) => lix.export_replica_recovery(id).await?,
+            Self::FilesystemStorage(lix, _, _) => lix.export_replica_recovery(id).await?,
+        };
+        serde_json::to_value(value)
+            .map_err(|error| LixError::new("LIX_ERROR_SERIALIZATION", error.to_string()))
+    }
+
+    async fn recover_replica(&self, id: &str) -> std::result::Result<serde_json::Value, LixError> {
+        let value = match self {
+            Self::Memory(lix) => lix.recover_replica(id).await?,
+            Self::FilesystemStorage(lix, _, _) => lix.recover_replica(id).await?,
+        };
+        serde_json::to_value(value)
+            .map_err(|error| LixError::new("LIX_ERROR_SERIALIZATION", error.to_string()))
     }
 
     fn open_report(&self) -> &OpenReport {
@@ -1859,6 +1928,45 @@ where
 
 #[napi]
 impl NativeLix {
+    #[napi(js_name = "replicaRecoverySources")]
+    pub fn replica_recovery_sources<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeDeferred<serde_json::Value>, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::ReplicaRecoverySources {
+                deferred,
+            });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "exportReplicaRecovery")]
+    pub fn export_replica_recovery<'env>(
+        &self,
+        env: &'env Env,
+        id: String,
+    ) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeDeferred<serde_json::Value>, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::ExportReplicaRecovery {
+                id,
+                deferred,
+            });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "recoverReplica")]
+    pub fn recover_replica<'env>(&self, env: &'env Env, id: String) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeDeferred<serde_json::Value>, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::RecoverReplica {
+                id,
+                deferred,
+            });
+        Ok(promise)
+    }
+
     #[napi(js_name = "openReport")]
     pub fn open_report(&self) -> NativeOpenReport {
         self.open_report.clone()

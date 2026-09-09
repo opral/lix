@@ -190,3 +190,5 @@ pub(crate) mod borrowing_proof_storage {
         }
     }
 }
+
+pub(crate) use media_upload::{export_recoverable_uploads, has_recoverable_uploads};

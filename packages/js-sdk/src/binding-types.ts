@@ -14,6 +14,9 @@ import type {
 	LixTelemetryParentContext,
 	LixOpenProgress,
 	LixOpenReport,
+	ReplicaRecoverySource,
+	ReplicaRecoveryExport,
+	ReplicaRecoveryReceipt,
 	OpenAnotherSessionOptions,
 	ResultColumn,
 } from "./types.js";
@@ -84,6 +87,9 @@ export type LixBinding = {
 	): Promise<BindingExecuteResult[]>;
 	observe(sql: string, params: BindingParam[]): Promise<ObserveEventsBinding>;
 	beginTransaction(): Promise<LixTransactionBinding>;
+	replicaRecoverySources(): Promise<ReplicaRecoverySource[]>;
+	exportReplicaRecovery(id: string): Promise<ReplicaRecoveryExport>;
+	recoverReplica(id: string): Promise<ReplicaRecoveryReceipt>;
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;

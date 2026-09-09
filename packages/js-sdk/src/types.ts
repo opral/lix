@@ -91,6 +91,68 @@ export type LixOpenReport = {
 	migration?: LixOpenMigrationReport;
 };
 
+/** A retained local generation. Presence does not mean recovery is complete. */
+export type ReplicaRecoverySource = {
+	id: string;
+	sourceFormat: number;
+	repositoryId: string;
+	accountId: string;
+	recoveryRequired: boolean;
+};
+
+export type ReplicaRecoveryRow = {
+	rowPk: JsonValue;
+	schemaKey: string;
+	fileId: string | null;
+	snapshot: JsonValue;
+	metadata: JsonValue;
+	deleted: boolean;
+	untracked: boolean;
+	global: boolean;
+	changeId: string | null;
+	commitId: string | null;
+};
+
+export type ReplicaRecoveryBranch = {
+	branchId: string;
+	headCommitId: string;
+	checkpointCommitId: string | null;
+	rows: ReplicaRecoveryRow[];
+};
+
+export type ReplicaRecoveryBlob = {
+	id: string;
+	contentBase64: string;
+};
+
+export type ReplicaRecoveryFile = {
+	branchId: string;
+	id: string;
+	path: string;
+	untracked: boolean;
+	blobId: string | null;
+};
+
+/** Portable recovery data; unresolved entries identify data not reconstructed. */
+export type ReplicaRecoveryExport = {
+	version: number;
+	source: ReplicaRecoverySource;
+	branches: ReplicaRecoveryBranch[];
+	commits: JsonValue[];
+	uploads: JsonValue[];
+	blobs: ReplicaRecoveryBlob[];
+	files: ReplicaRecoveryFile[];
+	unresolved: string[];
+};
+
+/** Local recovery result. This does not acknowledge durable server storage. */
+export type ReplicaRecoveryReceipt = {
+	branchIds: string[];
+	restoredFiles: number;
+	restoredRows: number;
+	unresolved: string[];
+};
+
 export type LixOpenProgressOptions = {
 	/** Observes local inspection, automatic migration, and opening. */
 	onProgress?(progress: LixOpenProgress): void;

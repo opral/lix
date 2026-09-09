@@ -832,13 +832,18 @@ where
                 reduce_push_limit_after_too_large(push_item_limit, error)?;
             }
             Err(error) if is_permanent_push_rejection(&error) => {
-                // A rejected transaction has no acknowledgment event. Remove
-                // its dependent pending suffix instead of retrying a doomed
-                // outbox forever. Keep transport/auth-refresh failures durable.
-                tracing::warn!(error = ?error, "server rejected pending local changes");
-                lix.discard_sync_pending_changes().await?;
-                *upload_plan = None;
-                return Ok(true);
+                // Rejection is not acknowledgment. Keep the existing commits and
+                // branch refs reachable so the user can retry or recover them.
+                return Err(LixError::new(
+                    "LIX_ERROR_SYNC_WRITE_REJECTED",
+                    format!(
+                        "The server rejected local changes; local work has been preserved: {}",
+                        error.message
+                    ),
+                )
+                .with_details(
+                    serde_json::json!({ "cause": error.code, "details": error.details }),
+                ));
             }
             Err(error) => return Err(error),
         }
@@ -1061,6 +1066,7 @@ fn is_terminal_sync_error(error: &LixError) -> bool {
     matches!(
         error.code.as_str(),
         SYNC_ITEM_TOO_LARGE_CODE
+            | "LIX_ERROR_SYNC_WRITE_REJECTED"
             | SYNC_SNAPSHOT_TOO_LARGE_CODE
             | SYNC_DEMAND_STALLED_CODE
             | super::SYNC_PROTOCOL_MISMATCH_CODE
@@ -2075,6 +2081,7 @@ mod tests {
         calls: Arc<Mutex<Vec<Vec<String>>>>,
         max_history_items: Option<usize>,
         fail_first_history: bool,
+        reject_push: bool,
         commit_headers: Vec<super::super::SyncCommitHeader>,
         history_boundaries: BTreeMap<String, super::super::SyncHistoryBoundary>,
         boundary_rows: BTreeMap<String, Vec<super::super::SyncSnapshotRow>>,
@@ -2093,7 +2100,14 @@ mod tests {
             &'a self,
             _request: &'a SyncPushRequest,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncPushResponse> {
-            Box::pin(async { Err(LixError::unknown("unused history test push")) })
+            Box::pin(async move {
+                if self.reject_push {
+                    Err(LixError::new("FORBIDDEN", "write permission revoked")
+                        .with_details(serde_json::json!({"httpStatus":403})))
+                } else {
+                    Err(LixError::unknown("unused history test push"))
+                }
+            })
         }
 
         fn pull(
@@ -3085,6 +3099,7 @@ mod tests {
             calls: Arc::clone(&calls),
             max_history_items: None,
             fail_first_history: false,
+            reject_push: false,
             commit_headers: response.commit_headers,
             history_boundaries: response_boundaries,
             boundary_rows: BTreeMap::new(),
@@ -3150,6 +3165,7 @@ mod tests {
             calls: Arc::clone(&calls),
             max_history_items: Some(2),
             fail_first_history: false,
+            reject_push: false,
             commit_headers,
             history_boundaries,
             boundary_rows,
@@ -3178,6 +3194,7 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: Some(0),
             fail_first_history: false,
+            reject_push: false,
             commit_headers: Vec::new(),
             history_boundaries: BTreeMap::new(),
             boundary_rows: BTreeMap::new(),
@@ -3521,6 +3538,7 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: None,
             fail_first_history: false,
+            reject_push: false,
             commit_headers: Vec::new(),
             history_boundaries: BTreeMap::new(),
             boundary_rows: BTreeMap::new(),
@@ -3652,6 +3670,7 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: None,
             fail_first_history: false,
+            reject_push: false,
             commit_headers: Vec::new(),
             history_boundaries: BTreeMap::new(),
             boundary_rows: BTreeMap::new(),
@@ -3729,6 +3748,7 @@ mod tests {
             calls: Arc::clone(&calls),
             max_history_items: None,
             fail_first_history: false,
+            reject_push: false,
             commit_headers,
             history_boundaries,
             boundary_rows,
@@ -3859,6 +3879,7 @@ mod tests {
             calls: Arc::clone(&calls),
             max_history_items: Some(1),
             fail_first_history: false,
+            reject_push: false,
             commit_headers,
             history_boundaries,
             boundary_rows,
@@ -3906,6 +3927,7 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: None,
             fail_first_history: false,
+            reject_push: false,
             commit_headers,
             history_boundaries,
             boundary_rows,
@@ -3977,6 +3999,7 @@ mod tests {
             calls: Arc::clone(&calls),
             max_history_items: None,
             fail_first_history: true,
+            reject_push: false,
             commit_headers,
             history_boundaries,
             boundary_rows,
@@ -4053,6 +4076,7 @@ mod tests {
             calls: Arc::clone(&calls),
             max_history_items: None,
             fail_first_history: false,
+            reject_push: false,
             commit_headers,
             history_boundaries,
             boundary_rows,
@@ -4089,8 +4113,63 @@ mod tests {
         assert!(calls.lock().expect("history calls lock").is_empty());
     }
 
+    #[tokio::test]
+    async fn rejected_push_preserves_reachable_local_rows_and_pending_commits() {
+        let (replica, _, _, commits, commit_headers, history_boundaries, boundary_rows) =
+            history_fixture().await;
+        replica
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('rejected-local-work', 'keep me')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let remote = "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000005";
+        let before = replica.build_sync_push(remote, 512).await.unwrap().unwrap();
+        let transport = HistoryTransport {
+            commits,
+            missing: BTreeSet::new(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            max_history_items: None,
+            fail_first_history: false,
+            reject_push: true,
+            commit_headers,
+            history_boundaries,
+            boundary_rows,
+            blobs: BTreeMap::new(),
+            blob_calls: Arc::new(Mutex::new(Vec::new())),
+            chunks: BTreeMap::new(),
+            chunk_calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let error =
+            push_pending_outbox(&replica, remote, &transport, &mut 512, &mut 512, &mut None)
+                .await
+                .unwrap_err();
+        assert_eq!(error.code, "LIX_ERROR_SYNC_WRITE_REJECTED");
+        assert!(is_terminal_sync_error(&error));
+        let after = replica.build_sync_push(remote, 512).await.unwrap().unwrap();
+        assert_eq!(
+            before, after,
+            "a rejection cannot acknowledge or discard pending writes"
+        );
+        assert_eq!(
+            replica
+                .execute(
+                    "SELECT value FROM lix_key_value WHERE key = 'rejected-local-work'",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!("keep me")
+        );
+        replica.close().await.unwrap();
+    }
+
     #[test]
-    fn only_permanent_push_rejections_discard_pending_work() {
+    fn permanent_push_rejections_stop_sync_without_discarding_work() {
         for status in [400, 403, 422] {
             let error = LixError::new("REJECTED", "invalid write")
                 .with_details(serde_json::json!({ "httpStatus": status }));
@@ -4218,6 +4297,7 @@ mod tests {
             calls: Arc::clone(&calls),
             max_history_items: None,
             fail_first_history: false,
+            reject_push: false,
             commit_headers,
             history_boundaries,
             boundary_rows,
@@ -4290,6 +4370,7 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
             max_history_items: None,
             fail_first_history: false,
+            reject_push: false,
             commit_headers: Vec::new(),
             history_boundaries,
             boundary_rows,

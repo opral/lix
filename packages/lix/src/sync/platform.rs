@@ -15,17 +15,17 @@ mod wasm;
 mod wasm_http;
 
 #[cfg(not(target_family = "wasm"))]
-pub(super) use native::{SyncTask, spawn_sync_task};
-#[cfg(not(target_family = "wasm"))]
 pub(crate) use native::sleep;
+#[cfg(not(target_family = "wasm"))]
+pub(super) use native::{SyncTask, spawn_sync_task};
 #[cfg(not(target_family = "wasm"))]
 pub(super) type HttpSyncTransport = super::http::HttpSyncTransport<reqwest::Client>;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use native_http::{AuthorityHttp, authority_http};
 #[cfg(target_family = "wasm")]
-pub(super) use wasm::{SyncTask, spawn_sync_task};
-#[cfg(target_family = "wasm")]
 pub(crate) use wasm::sleep;
+#[cfg(target_family = "wasm")]
+pub(super) use wasm::{SyncTask, spawn_sync_task};
 #[cfg(target_family = "wasm")]
 pub(super) type HttpSyncTransport = super::http::HttpSyncTransport<wasm_http::BrowserHttpClient>;
 #[cfg(target_family = "wasm")]
@@ -43,8 +43,7 @@ pub use wasm_http::{
 /// remain on the JavaScript event loop. This mechanical distinction is kept
 /// here so the shared transport contract has one definition.
 #[cfg(not(target_family = "wasm"))]
-pub type SyncTransportFuture<'a, T> =
-    futures_util::future::BoxFuture<'a, Result<T, LixError>>;
+pub type SyncTransportFuture<'a, T> = futures_util::future::BoxFuture<'a, Result<T, LixError>>;
 #[cfg(target_family = "wasm")]
 pub type SyncTransportFuture<'a, T> = futures_util::future::LocalBoxFuture<'a, Result<T, LixError>>;
 

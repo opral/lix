@@ -226,3 +226,8 @@ mod support;
 #[path = "../tests/integration/main.rs"]
 mod integration_tests;
 }
+
+pub use sync::{
+    ReplicaRecoveryBlob, ReplicaRecoveryBranch, ReplicaRecoveryExport, ReplicaRecoveryFile,
+    ReplicaRecoveryReceipt, ReplicaRecoveryRow, ReplicaRecoverySource,
+};

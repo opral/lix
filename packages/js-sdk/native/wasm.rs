@@ -745,6 +745,36 @@ fn open_phase_name(phase: OpenPhase) -> &'static str {
 
 #[wasm_bindgen]
 impl WasmLix {
+    #[wasm_bindgen(js_name = replicaRecoverySources)]
+    pub async fn replica_recovery_sources(&self) -> Result<JsValue, JsValue> {
+        let value = self
+            .inner
+            .replica_recovery_sources()
+            .await
+            .map_err(lix_error_to_js)?;
+        to_js(&value)
+    }
+
+    #[wasm_bindgen(js_name = exportReplicaRecovery)]
+    pub async fn export_replica_recovery(&self, id: String) -> Result<JsValue, JsValue> {
+        let value = self
+            .inner
+            .export_replica_recovery(&id)
+            .await
+            .map_err(lix_error_to_js)?;
+        to_js(&value)
+    }
+
+    #[wasm_bindgen(js_name = recoverReplica)]
+    pub async fn recover_replica(&self, id: String) -> Result<JsValue, JsValue> {
+        let value = self
+            .inner
+            .recover_replica(&id)
+            .await
+            .map_err(lix_error_to_js)?;
+        to_js(&value)
+    }
+
     #[wasm_bindgen(js_name = openReport)]
     pub fn open_report(&self) -> Result<JsValue, JsValue> {
         to_js(&OpenReportDto::from(self.inner.open_report()))

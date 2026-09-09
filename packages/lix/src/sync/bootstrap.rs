@@ -1,8 +1,6 @@
 //! Durable admission for the one-time sync replica bootstrap.
 
-use crate::storage_adapter::{
-    Storage, StorageAdapter, StorageReadDurability, StorageReadOptions,
-};
+use crate::storage_adapter::{Storage, StorageAdapter, StorageReadDurability, StorageReadOptions};
 use crate::{Lix, LixError};
 
 use super::platform::HttpSyncTransport;
@@ -94,11 +92,12 @@ where
     let visible = adapter.begin_read(StorageReadOptions::default()).await?;
     let visible_tier = inspect_tier(&visible, remote_id).await?;
     Ok(match (durable_tier, visible_tier) {
-        (BootstrapTier::Bound { account_id }, BootstrapTier::Bound { account_id: visible })
-            if account_id == visible =>
-        {
-            BootstrapInspection::Ready { account_id }
-        }
+        (
+            BootstrapTier::Bound { account_id },
+            BootstrapTier::Bound {
+                account_id: visible,
+            },
+        ) if account_id == visible => BootstrapInspection::Ready { account_id },
         (BootstrapTier::Empty, BootstrapTier::Empty)
         | (BootstrapTier::Unbound, BootstrapTier::Unbound) => BootstrapInspection::Prepare,
         (_, BootstrapTier::Bound { .. } | BootstrapTier::Ambiguous)
@@ -115,15 +114,13 @@ async fn inspect_tier(
 ) -> Result<BootstrapTier, LixError> {
     match crate::init::repository_protocol_status(read).await? {
         crate::init::RepositoryProtocolStatus::Missing => Ok(BootstrapTier::Empty),
-        crate::init::RepositoryProtocolStatus::Current => {
-            Ok(match super::repository::inspect_sync_replica_binding(read).await? {
+        crate::init::RepositoryProtocolStatus::Current => Ok(
+            match super::repository::inspect_sync_replica_binding(read).await? {
                 SyncReplicaBinding::Unbound => BootstrapTier::Unbound,
-                SyncReplicaBinding::Bound { account_id } => {
-                    BootstrapTier::Bound { account_id }
-                }
+                SyncReplicaBinding::Bound { account_id } => BootstrapTier::Bound { account_id },
                 SyncReplicaBinding::Ambiguous => BootstrapTier::Ambiguous,
-            })
-        }
+            },
+        ),
         crate::init::RepositoryProtocolStatus::MigrationRequired { found_version } => {
             Err(crate::init::migration_required_error(found_version))
         }
@@ -247,7 +244,7 @@ where
         }
         if prepared.transport.active_account_id() != expected_account_id {
             return Err(LixError::new(
-                "LIX_ERROR_REPLICA_UPGRADE_BLOCKED",
+                "LIX_SYNC_ACCOUNT_MISMATCH",
                 "Sign in with the account that owns this local replica before upgrading.",
             )
             .with_details(serde_json::json!({ "reason": "account_mismatch" })));
@@ -313,8 +310,7 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
     use crate::storage_adapter::{
-        Memory, MemoryRead, MemoryWrite, StorageAdapterRead, StorageError,
-        StorageWriteOptions,
+        Memory, MemoryRead, MemoryWrite, StorageAdapterRead, StorageError, StorageWriteOptions,
     };
 
     #[derive(Clone)]
@@ -395,10 +391,7 @@ mod tests {
     }
 
     fn tiered(visible: Memory, durable: Memory) -> TieredStorage {
-        TieredStorage {
-            visible,
-            durable,
-        }
+        TieredStorage { visible, durable }
     }
 
     async fn initialized_memory() -> Memory {
@@ -414,12 +407,7 @@ mod tests {
     }
 
     async fn store_legacy_replica_state(storage: &Memory, remote_id: &str) {
-        store_replica_state_at_key(
-            storage,
-            remote_id.as_bytes(),
-            canonical_replica_state(),
-        )
-        .await;
+        store_replica_state_at_key(storage, remote_id.as_bytes(), canonical_replica_state()).await;
     }
 
     fn canonical_replica_state() -> Vec<u8> {
@@ -437,9 +425,7 @@ mod tests {
         let mut writes = adapter.new_write_set();
         writes.put(
             super::super::SYNC_REPLICA_STATE_SPACE,
-            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
-                key,
-            )),
+            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(key)),
             value,
         );
         adapter
@@ -507,8 +493,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), None)
             .await
             .expect("test storage should initialize");
-        let old_url =
-            "https://old.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001";
+        let old_url = "https://old.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001";
         let raw = format!(
             r#"{{ "activeAccountId":"{}", "cursor":7, "authoritativeBranches":{{}}, "pendingResets":{{}}, "authorityKnownCommitIds":[] }}"#,
             crate::ANONYMOUS_ACCOUNT_ID
@@ -529,7 +514,10 @@ mod tests {
         );
         assert_eq!(
             replica_state_rows(&storage.inner).await,
-            vec![(bytes::Bytes::from_static(b"repository"), bytes::Bytes::from(raw))],
+            vec![(
+                bytes::Bytes::from_static(b"repository"),
+                bytes::Bytes::from(raw)
+            )],
             "migration must preserve the durable receipt and remove its URL key",
         );
         assert!(matches!(
@@ -546,13 +534,24 @@ mod tests {
     async fn malformed_durable_replica_state_fails_closed() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_malformed_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
-        store_malformed_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_malformed_replica_state(
+            &visible,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
+        store_malformed_replica_state(
+            &durable,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
         let storage = tiered(visible, durable);
 
-        let error = inspect_sync_bootstrap(&storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
-            .await
-            .expect_err("malformed durable state must not trigger a fresh bootstrap");
+        let error = inspect_sync_bootstrap(
+            &storage,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await
+        .expect_err("malformed durable state must not trigger a fresh bootstrap");
         assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
         assert!(error.message.contains("decode sync replica state"));
         assert!(error.message.contains("missing field `cursor`"));
@@ -562,14 +561,21 @@ mod tests {
     async fn visible_replica_state_is_publishing_not_ready() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(
+            &visible,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
         let storage = tiered(visible, durable);
         let adapter = StorageAdapter::new(storage);
 
         assert_eq!(
-            inspect_once(&adapter, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
-                .await
-                .expect("bootstrap state should inspect"),
+            inspect_once(
+                &adapter,
+                "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001"
+            )
+            .await
+            .expect("bootstrap state should inspect"),
             BootstrapInspection::Publishing,
         );
     }
@@ -578,15 +584,26 @@ mod tests {
     async fn durable_exact_remote_is_the_ready_witness() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
-        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(
+            &visible,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
+        store_replica_state(
+            &durable,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
         let storage = tiered(visible, durable);
         let adapter = StorageAdapter::new(storage);
 
         assert_eq!(
-            inspect_once(&adapter, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
-                .await
-                .expect("bootstrap state should inspect"),
+            inspect_once(
+                &adapter,
+                "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001"
+            )
+            .await
+            .expect("bootstrap state should inspect"),
             BootstrapInspection::Ready {
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             },
@@ -598,31 +615,61 @@ mod tests {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
         for storage in [&visible, &durable] {
-            store_legacy_replica_state(storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
-            store_legacy_replica_state(storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
+            store_legacy_replica_state(
+                storage,
+                "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+            )
+            .await;
+            store_legacy_replica_state(
+                storage,
+                "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002",
+            )
+            .await;
         }
         let storage = tiered(visible, durable);
-        let error = inspect_sync_bootstrap(&storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
-            .await
-            .expect_err("multiple durable remotes must fail closed");
+        let error = inspect_sync_bootstrap(
+            &storage,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await
+        .expect_err("multiple durable remotes must fail closed");
         assert_eq!(error.code, "LIX_ERROR_SYNC_REPLICA_STATE_AMBIGUOUS");
-        assert!(error.message.contains("multiple durable authority receipts"));
+        assert!(
+            error
+                .message
+                .contains("multiple durable authority receipts")
+        );
     }
 
     #[tokio::test]
     async fn visible_ambiguous_binding_prevents_ready_admission() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
-        store_legacy_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
-        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(
+            &visible,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
+        store_legacy_replica_state(
+            &visible,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002",
+        )
+        .await;
+        store_replica_state(
+            &durable,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
         let storage = tiered(visible, durable);
         let adapter = StorageAdapter::new(storage);
 
         assert_eq!(
-            inspect_once(&adapter, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
-                .await
-                .expect("bootstrap state should inspect"),
+            inspect_once(
+                &adapter,
+                "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001"
+            )
+            .await
+            .expect("bootstrap state should inspect"),
             BootstrapInspection::Publishing,
         );
     }
@@ -631,19 +678,33 @@ mod tests {
     async fn publishing_restarts_the_complete_open_until_the_receipt_is_durable() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(
+            &visible,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
         let storage = tiered(visible, durable.clone());
 
-        let error = inspect_sync_bootstrap(&storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
-            .await
-            .expect_err("visible state must restart rather than admit an opener");
+        let error = inspect_sync_bootstrap(
+            &storage,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await
+        .expect_err("visible state must restart rather than admit an opener");
         assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
-        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(
+            &durable,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
 
         assert_eq!(
-            inspect_sync_bootstrap(&storage, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001")
-                .await
-                .expect("durable publication should admit the retried open"),
+            inspect_sync_bootstrap(
+                &storage,
+                "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001"
+            )
+            .await
+            .expect("durable publication should admit the retried open"),
             SyncBootstrapAdmission::Ready {
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             },
@@ -654,8 +715,16 @@ mod tests {
     async fn semantic_install_errors_are_never_rewritten_as_a_race() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
-        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(
+            &visible,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
+        store_replica_state(
+            &durable,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
         let storage = tiered(visible, durable);
         let original = LixError::new(LixError::CODE_INVALID_PARAM, "malformed snapshot");
 
@@ -672,8 +741,16 @@ mod tests {
     async fn ambiguous_install_write_reconciles_only_from_durable_binding_state() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
-        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(
+            &visible,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
+        store_replica_state(
+            &durable,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
         let storage = tiered(visible, durable);
 
         let error = reconcile_install_error(
@@ -693,7 +770,11 @@ mod tests {
     async fn ambiguous_install_write_restarts_while_the_winner_is_only_visible() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001").await;
+        store_replica_state(
+            &visible,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000001",
+        )
+        .await;
         let storage = tiered(visible, durable);
 
         let error = reconcile_install_error(
@@ -713,8 +794,16 @@ mod tests {
     async fn ambiguous_install_write_restarts_for_the_same_repository() {
         let visible = initialized_memory().await;
         let durable = initialized_memory().await;
-        store_replica_state(&visible, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
-        store_replica_state(&durable, "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002").await;
+        store_replica_state(
+            &visible,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002",
+        )
+        .await;
+        store_replica_state(
+            &durable,
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-000000000002",
+        )
+        .await;
         let storage = tiered(visible, durable);
 
         let error = reconcile_install_error(

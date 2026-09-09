@@ -239,6 +239,12 @@ async fn clean_sparse_replica_bootstraps_before_publishing_new_epoch() {
             }
         );
         let lix = crate::open_lix().with_storage(storage).await.unwrap();
+        let sources = lix.replica_recovery_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(
+            !sources[0].recovery_required,
+            "acknowledged cache needs no recovery banner"
+        );
         let rows = lix
             .execute(
                 "SELECT value FROM lix_key_value WHERE key = 'upgrade-test'",
@@ -295,7 +301,7 @@ async fn failed_replica_download_preserves_source_and_can_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unacknowledged_replica_is_preserved_without_downloading() {
+async fn unacknowledged_replica_is_preserved_when_bootstrap_fails() {
     let authority = Authority::new().await;
     for bank in [EpochBank::Legacy, EpochBank::A] {
         let storage = old_replica(&authority, bank).await;
@@ -338,11 +344,10 @@ async fn unacknowledged_replica_is_preserved_without_downloading() {
         authority.fail_snapshot.store(true, Ordering::Release);
         let error =
             match admit_repository_with_server(&storage, None, Some(&authority.options())).await {
-                Ok(_) => panic!("pending work must block"),
+                Ok(_) => panic!("unavailable bootstrap must fail"),
                 Err(error) => error,
             };
-        assert_eq!(error.code, "LIX_ERROR_REPLICA_UPGRADE_BLOCKED");
-        assert_eq!(error.details.unwrap()["reason"], "pending_changes");
+        assert_eq!(error.code, "TEST_UNAVAILABLE");
         assert_eq!(
             load_pointer(&storage)
                 .await
@@ -365,28 +370,45 @@ async fn unacknowledged_replica_is_preserved_without_downloading() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_only_data_blocks_rebuild_and_keeps_source() {
+async fn local_only_data_is_exportable_after_rebuild_and_source_is_kept() {
     let authority = Authority::new().await;
     for bank in [EpochBank::Legacy, EpochBank::A] {
         let storage = old_replica_with_local_data(&authority, bank, true).await;
-        let before = load_pointer(&storage)
+        admit_repository_with_server(&storage, None, Some(&authority.options()))
+            .await
+            .unwrap();
+        let retained = list_retained_replica_sources(&storage).await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].recovery_required);
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        let sources = lix.replica_recovery_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        let export = lix.export_replica_recovery(&sources[0].id).await.unwrap();
+        assert!(
+            export
+                .branches
+                .iter()
+                .flat_map(|branch| &branch.rows)
+                .any(|row| row.untracked
+                    && row.snapshot.as_ref().is_some_and(|snapshot| snapshot
+                        .get("key")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("local-only-upgrade-test")))
+        );
+        assert!(
+            lix.execute(
+                "SELECT value FROM lix_key_value WHERE key = 'local-only-upgrade-test'",
+                &[]
+            )
             .await
             .unwrap()
-            .map(|(_, bytes)| bytes);
-        let error =
-            match admit_repository_with_server(&storage, None, Some(&authority.options())).await {
-                Ok(_) => panic!("local-only data must block"),
-                Err(error) => error,
-            };
-        assert_eq!(error.code, "LIX_ERROR_REPLICA_UPGRADE_BLOCKED");
-        assert_eq!(error.details.unwrap()["reason"], "local_only_data");
-        assert_eq!(
-            load_pointer(&storage)
-                .await
-                .unwrap()
-                .map(|(_, bytes)| bytes),
-            before
+            .rows()
+            .is_empty()
         );
+        lix.close().await.unwrap();
         let source = StorageAdapter::for_epoch_unfenced(storage.clone(), bank);
         let read = source.begin_read(ReadOptions::default()).await.unwrap();
         let hot = crate::hot_state::HotStateContext::new(
@@ -411,5 +433,94 @@ async fn local_only_data_blocks_rebuild_and_keeps_source() {
         let snapshot: serde_json::Value =
             serde_json::from_str(rows.row(0).snapshot_content().unwrap().as_ref()).unwrap();
         assert_eq!(snapshot["value"], "local-only");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_checkpoint_rewrite_reopens_from_server_without_historical_commits() {
+    let authority = Authority::new().await;
+    for bank in [EpochBank::Legacy, EpochBank::A] {
+        // This fixture has local-only content and no historical commit bodies.
+        // An old checkpoint rewrite cannot finish, but replacement must open.
+        let storage = old_replica_with_local_data(&authority, bank, true).await;
+        let source = StorageAdapter::for_epoch_unfenced(storage.clone(), bank);
+        let mut write = source
+            .begin_migration_write(WriteOptions::default())
+            .await
+            .unwrap();
+        write
+            .put_many(
+                crate::init::REPOSITORY_PROTOCOL_SPACE,
+                single_put(
+                    crate::init::REPOSITORY_PROTOCOL_KEY,
+                    Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_V77_CHECKPOINT_REWRITE),
+                ),
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+
+        // A failed replacement must restore the exact transitional marker too.
+        authority.fail_snapshot.store(true, Ordering::Release);
+        let error =
+            match admit_repository_with_server(&storage, None, Some(&authority.options())).await {
+                Ok(_) => panic!("injected snapshot failure must fail"),
+                Err(error) => error,
+            };
+        assert_eq!(error.code, "TEST_UNAVAILABLE");
+        assert_eq!(
+            crate::migration::api::load_repository_protocol_marker(&source)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            crate::init::REPOSITORY_PROTOCOL_V77_CHECKPOINT_REWRITE,
+        );
+        authority.fail_snapshot.store(false, Ordering::Release);
+        let admitted = admit_repository_with_server(&storage, None, Some(&authority.options()))
+            .await
+            .unwrap();
+        assert_eq!(admitted.report.migration.unwrap().from_format, 77);
+        assert!(matches!(
+            admitted.adapter.epoch_bank(),
+            EpochBank::Generation(_)
+        ));
+        let retained = list_retained_replica_sources(&storage).await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].recovery_required);
+
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        let rows = lix
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'upgrade-test'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            "preserved"
+        );
+        let export = lix
+            .export_replica_recovery(&retained[0].bank)
+            .await
+            .unwrap();
+        assert!(
+            export
+                .branches
+                .iter()
+                .flat_map(|branch| &branch.rows)
+                .any(|row| {
+                    row.untracked
+                        && row.snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot.get("key").and_then(serde_json::Value::as_str)
+                                == Some("local-only-upgrade-test")
+                        })
+                })
+        );
+        lix.close().await.unwrap();
     }
 }

@@ -13,3 +13,25 @@ outside the deterministic snapshot payload.
 
 Regenerate one only as a deliberate fixture migration, update its digest and
 provenance here, and explain why the old evidence is no longer retained.
+
+## Deployed plugin recovery fixture
+
+`v78_deployed_markdown.lixplugin.gz` freezes the actual Markdown plugin shipped in
+LixRay's prepared browser SDK at Lix revision
+`0b940f913a8bec633098036ed91a961b78d86069`. It was copied on 2026-09-09 from
+`vendor/lix/packages/js-sdk/dist/bundled-plugins/plugin_markdown.lixplugin` in the
+LixRay migration worktree. The adjacent `.lixray-browser-build.json` records:
+
+- Producer run: [34398308943](https://github.com/opral/lix/actions/runs/34398308943).
+- Artifact ID: `10122869169`.
+- Artifact digest: `sha256:5b94afbb7f1146dcf793789283771e3abca24402d7265fb9bbb554f045ae8e8f`.
+- Source revision: `0b940f913a8bec633098036ed91a961b78d86069` (also verified against the vendor Git checkout).
+- Original archive: 2,239,187 bytes; SHA-256 `3eff83bd98a282a9748ad068d33d90c5ff111c1e0fac2a75dfe63659ac8c50c6`.
+- Gzip fixture: 716,025 bytes; SHA-256 `93f8bb9a191feb0ff9f1cab82dcbfb30ef5bd2eff0a73c54a61a734d2c227bf6`.
+
+The gzip wrapper uses a zero timestamp and decompresses to the byte-identical
+original archive. The core recovery regression reads and decompresses this file
+at runtime, so CI tests real Markdown rendering after recovery without rebuilding
+a plugin or embedding its bytes in every test executable. Keep this artifact
+fixed when current plugins change: it represents the deployed format that local
+recovery must continue to understand.
