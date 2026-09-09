@@ -2517,6 +2517,7 @@ where
             return Ok(TransactionWriteOutcome { count: 0 });
         }
         debug_assert!(rows.certified_preparation().is_some());
+        reject_external_plugin_registry_rows(&rows)?;
         self.ensure_plugin_generation_read_guard().await;
 
         let (branch_id, schema_key, global) = {
@@ -2614,6 +2615,7 @@ where
             return Ok(TransactionWriteOutcome { count: 0 });
         }
         debug_assert!(rows.certified_preparation().is_some());
+        reject_external_plugin_registry_rows(&rows)?;
         self.ensure_plugin_generation_read_guard().await;
 
         let (branch_id, schema_key, global) = {
@@ -2677,6 +2679,18 @@ where
         write: TransactionWrite,
         statement_indices: Option<Vec<u32>>,
     ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write_with_file_history(write, statement_indices, BTreeSet::new())
+            .await
+    }
+
+    /// Complete file lifecycle diffs come from validated immutable history, not
+    /// public state writes. Restore their owned state and bytes as one unit.
+    async fn stage_write_with_file_history(
+        &mut self,
+        write: TransactionWrite,
+        statement_indices: Option<Vec<u32>>,
+        historical_files: BTreeSet<String>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
         if let Some(statement_indices) = &statement_indices {
             debug_assert_eq!(statement_indices.len(), transaction_write_row_count(&write));
         }
@@ -2711,8 +2725,9 @@ where
                 transaction_write_untracked_row_count(&write),
             );
         }
-        let (write, file_view_mutations, actor_publications) =
-            self.reconcile_plugin_write(write).await?;
+        let (write, file_view_mutations, actor_publications) = self
+            .reconcile_plugin_write(write, &historical_files)
+            .await?;
         if let Err(error) = require_valid_reconciled_transaction_write_storage_scopes(&write) {
             discard_plugin_actor_publications(actor_publications).await;
             return Err(error);
@@ -3698,6 +3713,7 @@ where
     async fn reconcile_plugin_write(
         &mut self,
         write: TransactionWrite,
+        historical_files: &BTreeSet<String>,
     ) -> Result<
         (
             ReconciledTransactionWrite,
@@ -3708,13 +3724,39 @@ where
     > {
         match write {
             TransactionWrite::Rows { mode, mut rows } => {
-                reject_external_plugin_registry_rows(&rows)?;
                 let count = rows.len() as u64;
+                let mut historical_rows = RawWriteBatch::new();
+                if !historical_files.is_empty() {
+                    let belongs_to_history = |row: RawWriteRowRef<'_>| {
+                        row.file_id
+                            .is_some_and(|id| historical_files.contains(id.as_str()))
+                            || (row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                                && row
+                                    .row_pk
+                                    .and_then(|pk| pk.as_single_string_owned().ok())
+                                    .is_some_and(|id| historical_files.contains(&id)))
+                    };
+                    historical_rows = rows.clone();
+                    historical_rows.retain(belongs_to_history);
+                    rows.retain(|row| !belongs_to_history(row));
+                    mark_plugin_reconciliation_batch(&mut historical_rows, 0)?;
+                }
+                reject_external_plugin_registry_rows(&rows)?;
                 let mut file_content = Vec::new();
                 let mut reconciliation =
                     Box::pin(self.plugin_write_reconciliation(&mut rows, &mut file_content))
                         .await?;
                 let mut rows = reconciliation.take_reconciled_rows(rows);
+                // Applying historical plugin rows can also supply their old blob
+                // reference. The reconciled materialization replaces that reference;
+                // staging both would duplicate its primary key. Preserve references
+                // and tombstones for files that did not produce a materialization.
+                rows.retain_raw(|row| {
+                    !reconciliation
+                        .materialization_versions
+                        .keys()
+                        .any(|key| key.matches_materialization_row(row))
+                })?;
                 for (file_key, version) in &reconciliation.materialization_versions {
                     let mut materialization_rows = RawWriteBatch::new();
                     let materialized_row_index = materialization_rows.len();
@@ -3755,6 +3797,13 @@ where
                     );
                     mark_plugin_reconciliation_batch(&mut materialization_rows, 0)?;
                     rows.append_raw_batch(materialization_rows);
+                }
+                rows.append_raw_batch(historical_rows);
+                for file_id in historical_files {
+                    reconciliation.remove_session_file_view(SessionFileViewKey::new(
+                        &self.active_branch_id,
+                        file_id,
+                    ));
                 }
                 let write = if file_content.is_empty() {
                     ReconciledTransactionWrite::Rows { mode, rows }
@@ -5596,9 +5645,45 @@ where
                     };
                     if cold_successor_candidate {
                         let cold_limits = cold_successor_transition_limits(submitted_bytes.len());
-                        let cold_before_descriptor = acknowledged_observation
-                            .map(|observation| v2_file_descriptor_from_actor_key(observation.key()))
-                            .unwrap_or_else(|| v2_file_descriptor_from_actor_key(&actor_key));
+                        let cold_before_descriptor = if let Some(observation) =
+                            acknowledged_observation
+                        {
+                            v2_file_descriptor_from_actor_key(observation.key())
+                        } else {
+                            // The incoming write already carries the successor path. A cold
+                            // session has no observed actor key, so resolve the predecessor
+                            // from the transaction view before this write batch is staged.
+                            // Otherwise a CSV-to-TSV rename looks like TSV-to-TSV and the
+                            // plugin silently retains the old dialect.
+                            let request =
+                                FilesystemPathIndexRequest::new(vec![write.branch_id.clone()]);
+                            let path_index = self.filesystem_path_index(&request).await?;
+                            let entries = path_index
+                                .exact_file_id_entries(&write.file_id)
+                                .into_iter()
+                                .filter(|entry| {
+                                    let live = entry.live_row();
+                                    entry.kind == FilesystemPathKind::File
+                                        && entry.id() == write.file_id
+                                        && live.branch_id.as_ref() == write.branch_id
+                                        && !live.global
+                                        && live.untracked == write.untracked
+                                })
+                                .collect::<Vec<_>>();
+                            let [entry] = entries.as_slice() else {
+                                return Err(LixError::new(
+                                    LixError::CODE_CONSTRAINT_VIOLATION,
+                                    format!(
+                                        "owned component plugin file '{}' must resolve to exactly one predecessor path in its own lane; found {}",
+                                        write.file_id,
+                                        entries.len()
+                                    ),
+                                ));
+                            };
+                            let mut predecessor = v2_file_descriptor_from_actor_key(&actor_key);
+                            predecessor.path = Some(entry.path.clone());
+                            predecessor
+                        };
                         let cold_open_guard = cache.cold_open_guard().await;
                         let visible_materialization = self
                         .visible_materialization(&file_key)
@@ -8625,6 +8710,7 @@ where
         &mut self,
         command: DiffCommand,
         diff_ids: Vec<String>,
+        selected_files: BTreeSet<String>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         let selections = diff_ids
             .iter()
@@ -8680,6 +8766,23 @@ where
                 .after
                 .map(|id| required_diff_change(&records, id, diff_id))
                 .transpose()?;
+            // A file deletion is represented in tracked history by one descriptor
+            // tombstone shared by its former members. It is absence of the member,
+            // not a different row whose descriptor payload should be replayed.
+            let before_is_file_delete = before.zip(after).is_some_and(|(a, b)| {
+                a.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                    && a.snapshot.is_none()
+                    && b.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY
+                    && a.row_pk.as_single_string_owned().ok().as_deref() == b.file_id.as_deref()
+            });
+            let after_is_file_delete = after.zip(before).is_some_and(|(a, b)| {
+                a.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                    && a.snapshot.is_none()
+                    && b.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY
+                    && a.row_pk.as_single_string_owned().ok().as_deref() == b.file_id.as_deref()
+            });
+            let before = before.filter(|_| !before_is_file_delete);
+            let after = after.filter(|_| !after_is_file_delete);
             let identity = diff_record_identity(before.or(after).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
@@ -8700,9 +8803,11 @@ where
                     "diff command selection contains more than one row for the same row",
                 ));
             }
+            let before_id = sides.before.filter(|_| !before_is_file_delete);
+            let after_id = sides.after.filter(|_| !after_is_file_delete);
             let (expected, target) = match command {
-                DiffCommand::Revert => (sides.after, sides.before),
-                DiffCommand::Apply => (sides.before, sides.after),
+                DiffCommand::Revert => (after_id, before_id),
+                DiffCommand::Apply => (before_id, after_id),
                 DiffCommand::CreateCheckpoint => unreachable!(),
             };
             plans.push((diff_id, identity, expected, target));
@@ -8727,7 +8832,41 @@ where
             .load_visible_exact_hot_state_batch(&request)
             .await?
             .into_rows();
+        // Only engine-owned plugin files need trusted lifecycle restoration.
+        // Plugin archives themselves have no file owner: their install/uninstall
+        // mutations must continue through ordinary plugin lifecycle validation.
+        let plugin_owned_files = records
+            .values()
+            .filter_map(|record| {
+                (record.schema_key == KEY_VALUE_SCHEMA_KEY
+                    && record.row_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY))
+                .then_some(record.file_id.as_ref())
+                .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        // Exact HOT probes can still return physical child rows masked by a
+        // deleted descriptor. Only a source-matching, explicitly selected file
+        // descriptor establishes that those children are logically absent.
+        let hidden_files = plans
+            .iter()
+            .zip(&current)
+            .filter_map(|((_, (schema, pk, _), expected, _), row)| {
+                if schema != FILE_DESCRIPTOR_SCHEMA_KEY {
+                    return None;
+                }
+                let id = pk.as_single_string_owned().ok()?;
+                if !selected_files.contains(&id) || row.as_ref().is_some_and(|row| !row.deleted) {
+                    return None;
+                }
+                let matches = match expected {
+                    Some(expected) => row.as_ref().and_then(|row| row.change_id) == Some(*expected),
+                    None => true,
+                };
+                matches.then_some(id)
+            })
+            .collect::<BTreeSet<_>>();
         let mut target_change_ids = Vec::new();
+        let mut historical_files = BTreeSet::new();
         let mut rows = RawWriteBatch::with_capacity(plans.len());
         for ((diff_id, (schema_key, row_pk, file_id), expected, target), current) in
             plans.into_iter().zip(current)
@@ -8737,7 +8876,11 @@ where
                     .as_ref()
                     .and_then(|row| row.change_id)
                     .is_some_and(|change_id| change_id == expected),
-                None => current.as_ref().is_none_or(|row| row.deleted),
+                None => {
+                    current.as_ref().is_none_or(|row| row.deleted)
+                        || (schema_key != FILE_DESCRIPTOR_SCHEMA_KEY
+                            && file_id.as_ref().is_some_and(|id| hidden_files.contains(id)))
+                }
             };
             if !current_matches {
                 return Err(stale_or_unknown_diff_id().with_details(serde_json::json!({
@@ -8745,6 +8888,19 @@ where
                     "rowRef": crate::row_ref::encode_schema_identity(&schema_key, &row_pk)?
                         .as_str(),
                 })));
+            }
+            if schema_key == FILE_DESCRIPTOR_SCHEMA_KEY {
+                let id = row_pk.as_single_string_owned()?;
+                let target_deleted = target
+                    .map(|id| required_diff_change(&records, id, diff_id))
+                    .transpose()?
+                    .is_none_or(|record| record.snapshot.is_none());
+                if selected_files.contains(&id)
+                    && plugin_owned_files.contains(&id)
+                    && (current.as_ref().is_none_or(|row| row.deleted) || target_deleted)
+                {
+                    historical_files.insert(id);
+                }
             }
             if let Some(target) = target {
                 required_diff_change(&records, target, diff_id)?;
@@ -8824,10 +8980,14 @@ where
             }
         }
         if !rows.is_empty() {
-            self.stage_write(TransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows,
-            })
+            self.stage_write_with_file_history(
+                TransactionWrite::Rows {
+                    mode: TransactionWriteMode::Replace,
+                    rows,
+                },
+                None,
+                historical_files,
+            )
             .await?;
         }
         Ok(crate::sql2::DiffCommandOutcome {
@@ -11864,10 +12024,11 @@ where
 
         let branch_id = rows.schema_scope_branch_id().to_owned();
         let schema_key = rows.schema_key().to_owned();
-        if !rows.is_fileless_typed_sql_rows()
-            && self
-                .visible_plugin_registry_owns_schema(&branch_id, &schema_key)
-                .await?
+        if schema_key == KEY_VALUE_SCHEMA_KEY
+            || (!rows.is_fileless_typed_sql_rows()
+                && self
+                    .visible_plugin_registry_owns_schema(&branch_id, &schema_key)
+                    .await?)
         {
             let mut raw = rows.into_raw()?;
             raw.revoke_certified_preparation();
@@ -11972,9 +12133,10 @@ where
         self.ensure_plugin_generation_read_guard().await;
         let branch_id = rows.schema_scope_branch_id().to_owned();
         let schema_key = rows.schema_key().to_owned();
-        if self
-            .visible_plugin_registry_owns_schema(&branch_id, &schema_key)
-            .await?
+        if schema_key == KEY_VALUE_SCHEMA_KEY
+            || self
+                .visible_plugin_registry_owns_schema(&branch_id, &schema_key)
+                .await?
         {
             let mut raw = rows.into_raw()?;
             raw.revoke_certified_preparation();
@@ -12176,7 +12338,15 @@ where
             .await?;
         let mut outcome = match command {
             DiffCommand::Revert | DiffCommand::Apply => {
-                self.execute_apply_or_revert(command, diff_ids).await
+                // A schema-row selection (including a reserved owner row) must
+                // not acquire file-lifecycle authority through dependency closure.
+                let selected_files = selections
+                    .iter()
+                    .filter(|selection| selection.relation == "lix_file")
+                    .map(|selection| selection.row_pk.as_single_string_owned())
+                    .collect::<Result<BTreeSet<_>, _>>()?;
+                self.execute_apply_or_revert(command, diff_ids, selected_files)
+                    .await
             }
             DiffCommand::CreateCheckpoint => self.execute_checkpoint_selection(diff_ids).await,
         }?;

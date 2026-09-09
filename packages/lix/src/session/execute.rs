@@ -2603,7 +2603,7 @@ where
         statements: &[ExecuteBatchStatement],
         parsed: Vec<datafusion::sql::parser::Statement>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let acknowledge_file_views = parsed.iter().zip(statements).all(|(parsed, statement)| {
+        let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, statement)| {
             is_acknowledgeable_file_content_read(parsed, &statement.params)
                 || late_materialized_lix_file_content_read(parsed).is_some()
         });
@@ -2641,7 +2641,7 @@ where
                         let ctx = SessionSqlExecutionContext {
                             active_branch_id: &active_branch_id,
                             active_account_id: self.active_account_id(),
-                            read_store,
+                            read_store: read_store.clone(),
                             hot_state: Arc::clone(&self.hot_state),
                             binary_cas: Arc::clone(&self.binary_cas),
                             branch_ctx: Arc::clone(&self.branch_ctx),
@@ -2653,9 +2653,19 @@ where
                         };
                         let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
                         let mut results = Vec::with_capacity(statements.len());
+                        let mut file_view_mutations = Vec::new();
                         for (statement_index, (statement, parsed)) in
                             statements.iter().zip(parsed).enumerate()
                         {
+                            let acknowledge_statement =
+                                is_acknowledgeable_file_content_read(&parsed, &statement.params)
+                                    || late_materialized_lix_file_content_read(&parsed).is_some();
+                            // A mixed batch may return file bytes alongside metadata or
+                            // aggregates. Only the exact byte-returning statement may
+                            // update the session's private plugin observation.
+                            if let Some(collector) = &file_view_collector {
+                                collector.clear();
+                            }
                             let telemetry = SqlStatementTelemetry::start(
                                 self.telemetry.as_ref(),
                                 &statement.sql,
@@ -2663,6 +2673,33 @@ where
                                 Some(statement_index),
                             );
                             let operation = async {
+                                if let Some(plan) = late_materialized_lix_file_content_read(&parsed) {
+                                    // Resolve filters and LIMIT on file metadata first. A
+                                    // provider scan may render files absent from the result;
+                                    // only hydrate (and acknowledge) returned paths.
+                                    let (result, mutations, _) = self
+                                        .execute_read_statement_with_store(
+                                            read_store.clone(),
+                                            &statement.sql,
+                                            parsed,
+                                            &statement.params,
+                                            true,
+                                            None,
+                                            None,
+                                            None,
+                                            Some(plan),
+                                            false,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            with_batch_statement_index(
+                                                normalize_sql_surface_error(error, &statement.sql),
+                                                statement_index,
+                                            )
+                                        })?;
+                                    file_view_mutations.extend(mutations);
+                                    return Ok(ExecuteResult::from_session_read_result(result));
+                                }
                                 sql2::execute_read_statement_in_session_from_parsed(
                                     &read_session,
                                     &statement.sql,
@@ -2686,12 +2723,14 @@ where
                                 telemetry.finish(&result);
                             }
                             results.push(result?);
+                            if acknowledge_statement {
+                                if let Some(collector) = &file_view_collector {
+                                    file_view_mutations.extend(collector.plugin_file_mutations());
+                                }
+                            }
                         }
                         drop(read_session);
                         drop(ctx);
-                        let file_view_mutations = file_view_collector
-                            .map(|collector| collector.plugin_file_mutations())
-                            .unwrap_or_default();
                         Ok((results, file_view_mutations))
                     }
                 },
@@ -2784,7 +2823,7 @@ where
                 }
             })
             .collect::<Result<Vec<_>, LixError>>()?;
-        let acknowledge_file_views = parsed.iter().zip(statements).all(|(parsed, (_, params))| {
+        let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, (_, params))| {
             is_acknowledgeable_file_content_read(parsed, params)
                 || late_materialized_lix_file_content_read(parsed).is_some()
         });
@@ -2855,7 +2894,7 @@ where
                         let ctx = SessionSqlExecutionContext {
                             active_branch_id: &active_branch_id,
                             active_account_id: self.active_account_id(),
-                            read_store,
+                            read_store: read_store.clone(),
                             hot_state: Arc::clone(&self.hot_state),
                             binary_cas: Arc::clone(&self.binary_cas),
                             branch_ctx: Arc::clone(&self.branch_ctx),
@@ -2869,9 +2908,19 @@ where
                             sql2::prepare_read_session_at_head(&ctx, active_branch_head, &parsed)
                                 .await?;
                         let mut results = Vec::with_capacity(statements.len());
+                        let mut file_view_mutations = Vec::new();
                         for (statement_index, ((sql, params), statement)) in
                             statements.iter().zip(parsed).enumerate()
                         {
+                            let acknowledge_statement =
+                                is_acknowledgeable_file_content_read(&statement, params)
+                                    || late_materialized_lix_file_content_read(&statement).is_some();
+                            // A mixed batch may return file bytes alongside metadata or
+                            // aggregates. Only the exact byte-returning statement may
+                            // update the session's private plugin observation.
+                            if let Some(collector) = &file_view_collector {
+                                collector.clear();
+                            }
                             let telemetry = SqlStatementTelemetry::start(
                                 self.telemetry.as_ref(),
                                 sql,
@@ -2879,6 +2928,28 @@ where
                                 Some(statement_index),
                             );
                             let operation = async {
+                                if let Some(plan) = late_materialized_lix_file_content_read(&statement) {
+                                    // Resolve filters and LIMIT on file metadata first. A
+                                    // provider scan may render files absent from the result;
+                                    // only hydrate (and acknowledge) returned paths.
+                                    let (result, mutations, _) = self
+                                        .execute_read_statement_with_store(
+                                            read_store.clone(),
+                                            sql,
+                                            statement,
+                                            params,
+                                            true,
+                                            None,
+                                            None,
+                                            None,
+                                            Some(plan),
+                                            false,
+                                        )
+                                        .await
+                                        .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                                    file_view_mutations.extend(mutations);
+                                    return Ok(ExecuteResult::from_session_read_result(result));
+                                }
                                 sql2::execute_read_statement_in_session_from_parsed(
                                     &read_session,
                                     sql,
@@ -2897,12 +2968,14 @@ where
                                 telemetry.finish(&result);
                             }
                             results.push(result?);
+                            if acknowledge_statement {
+                                if let Some(collector) = &file_view_collector {
+                                    file_view_mutations.extend(collector.plugin_file_mutations());
+                                }
+                            }
                         }
                         drop(read_session);
                         drop(ctx);
-                        let file_view_mutations = file_view_collector
-                            .map(|collector| collector.plugin_file_mutations())
-                            .unwrap_or_default();
                         Ok((
                             CoherentReadBatch {
                                 active_branch_id,
