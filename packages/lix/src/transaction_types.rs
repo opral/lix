@@ -412,6 +412,7 @@ struct RawWriteSlot {
 /// nor normalized byte buffers.
 #[derive(Debug, Clone)]
 pub(crate) struct RawWriteBatch {
+    branch_heads: Vec<BranchHeadWrite>,
     slots: Vec<RawWriteSlot>,
     row_pks: Vec<Option<RowPk>>,
     snapshots: Vec<Option<RawSnapshot>>,
@@ -1156,6 +1157,17 @@ pub(crate) struct RawWriteRows<'a> {
 }
 
 impl RawWriteBatch {
+    /// Control intents travel with a write envelope, not through row normalization.
+    /// Transaction consumes them before any row selection or plugin processing.
+    pub(crate) fn push_branch_head(&mut self, head: BranchHeadWrite) {
+        self.certified_preparation = None;
+        self.branch_heads.push(head);
+    }
+
+    pub(crate) fn take_branch_heads(&mut self) -> Vec<BranchHeadWrite> {
+        std::mem::take(&mut self.branch_heads)
+    }
+
     pub(crate) fn new() -> Self {
         Self::with_capacity(0)
     }
@@ -1163,6 +1175,7 @@ impl RawWriteBatch {
     pub(crate) fn with_capacity(row_capacity: usize) -> Self {
         const INLINE_DICTIONARY_LIMIT: usize = 32;
         Self {
+            branch_heads: Vec::new(),
             slots: Vec::with_capacity(row_capacity),
             row_pks: Vec::with_capacity(row_capacity),
             snapshots: Vec::with_capacity(row_capacity),
@@ -1240,6 +1253,7 @@ impl RawWriteBatch {
             flags: if untracked { RAW_WRITE_UNTRACKED } else { 0 },
         };
         Ok(Self {
+            branch_heads: Vec::new(),
             slots: vec![slot; row_count],
             row_pks: row_pks.into_iter().map(Some).collect(),
             snapshots: snapshots
@@ -1275,7 +1289,7 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.slots.is_empty() && self.branch_heads.is_empty()
     }
 
     #[inline(always)]
@@ -1445,6 +1459,7 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn append(&mut self, mut other: Self) {
+        self.branch_heads.append(&mut other.branch_heads);
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_crud_ownership(
             crate::storage_bench::CRUD_OWNERSHIP_RAW_TRANSFER,
@@ -1571,6 +1586,7 @@ impl RawWriteBatch {
             ));
         }
         let RawWriteBatch {
+            branch_heads: _,
             slots,
             row_pks,
             snapshots,
@@ -2224,7 +2240,9 @@ impl<'a> IntoIterator for &'a RawWriteBatch {
 
 impl PartialEq for RawWriteBatch {
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().zip(other).all(|(left, right)| left == right)
+        self.branch_heads == other.branch_heads
+            && self.len() == other.len()
+            && self.iter().zip(other).all(|(left, right)| left == right)
     }
 }
 
@@ -2624,6 +2642,32 @@ pub(crate) struct PluginCheckpointWrite {
     pub(crate) semantic_root: String,
     pub(crate) runtime: crate::Blob,
     pub(crate) authority: crate::Blob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchHeadWrite {
+    pub(crate) branch_id: String,
+    pub(crate) head_commit_id: Option<CommitId>,
+    pub(crate) origin: Option<TransactionWriteOrigin>,
+}
+
+impl BranchHeadWrite {
+    pub(crate) fn new(branch_id: &str, head_commit_id: Option<CommitId>) -> Self {
+        Self {
+            branch_id: branch_id.to_owned(),
+            head_commit_id,
+            origin: None,
+        }
+    }
+}
+
+/// Validated publication intent; branch controls remain the only head authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BranchHeadTarget {
+    pub(crate) head_commit_id: Option<CommitId>,
+    pub(crate) ref_change_id: ChangeId,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
 }
 
 /// One decoded write batch accepted by the transaction boundary.
