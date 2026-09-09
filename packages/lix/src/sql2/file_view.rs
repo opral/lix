@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::plugin::runtime::PluginObservation;
+use crate::plugin::runtime::{PluginActorKey, PluginObservation, PluginPublicationReceipt};
 
 /// One session's private view of plugin-owned files.
 ///
@@ -25,6 +25,14 @@ pub(crate) struct SessionFileViewKey {
 }
 
 impl SessionFileViewKey {
+    pub(crate) fn from_actor_key(key: &PluginActorKey) -> Self {
+        Self::new(&key.branch_id, &key.file_id)
+    }
+
+    pub(crate) fn matches_actor_key(&self, key: &PluginActorKey) -> bool {
+        self.branch_id == key.branch_id && self.file_id == key.file_id
+    }
+
     pub(crate) fn new(branch_id: impl Into<String>, file_id: impl Into<String>) -> Self {
         Self {
             branch_id: branch_id.into(),
@@ -45,6 +53,24 @@ pub(crate) struct SessionPluginFileView {
     /// Exact v2 authority: an O(1) actor/document observation rather than a
     /// materialized semantic-state snapshot.
     pub(crate) observation: Option<PluginObservation>,
+}
+
+impl SessionPluginFileView {
+    pub(crate) fn from_publication(
+        receipt: PluginPublicationReceipt,
+    ) -> (SessionFileViewKey, Self) {
+        let key = SessionFileViewKey::from_actor_key(&receipt.key);
+        (
+            key,
+            Self {
+                path: receipt.key.path,
+                plugin_key: receipt.key.plugin_key,
+                plugin_generation: receipt.key.plugin_generation,
+                owner_change_id: receipt.key.owner_change_id,
+                observation: receipt.observation,
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone)]

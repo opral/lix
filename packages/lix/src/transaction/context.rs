@@ -60,21 +60,25 @@ use crate::hot_state::{
 use crate::plugin::runtime::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
     LiveBatchRowSource, OuterRowJsonOperation, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY,
-    PluginActorCache, PluginActorColdInstall, PluginActorColdOpen, PluginActorKey,
-    PluginActorLease, PluginActorStagedCheckpoint, PluginActorStore, PluginActorStorePermit,
-    PluginArchiveInstallPlan, PluginContentMatcher, PluginFileOwner, PluginObservation,
-    PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRowAuthorities,
-    PluginRowAuthorityRange, PluginRuntimeHost, RowVersionRef, SchemaAllowlist,
-    TypedColumnMergeResult as HostTypedColumnMergeResult, TypedRowVersionRef,
-    ValidatedFileTransition, ValidatedSameLengthOutputSplice, VecRowChangeSource, VecRowSource,
-    WasmCreateContext, build_file_update_splices, drain_file_transition_changes,
-    drain_row_transition_edits, is_plugin_storage_path, is_reservation_key,
-    load_plugin_registry_at_commit, local_mutation_identity, materialize_keyless_creates,
-    plugin_archive_file_id_matches, plugin_install_plan_from_archive_path,
-    plugin_key_from_archive_delete_origin, plugin_state_hot_state_projection, reconcile_row,
-    reconcile_typed_row, require_existing_id_authorities, reservation_tombstone_row,
-    reserve_create_row, transport_splice_preserves_prefix_exclusion,
-    transport_splice_preserves_utf8, validate_create_changes, validate_create_reservation,
+    PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
+    PluginActorStore, PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentMatcher,
+    PluginFileOwner, PluginObservation, PluginRegistry, PluginRegistryEntry,
+    PluginRegistryEntryInput, PluginRowAuthorities, PluginRowAuthorityRange, PluginRuntimeHost,
+    RowVersionRef, SchemaAllowlist, TypedColumnMergeResult as HostTypedColumnMergeResult,
+    TypedRowVersionRef, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
+    VecRowChangeSource, VecRowSource, WasmCreateContext, build_file_update_splices,
+    drain_file_transition_changes, drain_row_transition_edits, is_plugin_storage_path,
+    is_reservation_key, load_plugin_registry_at_commit, local_mutation_identity,
+    materialize_keyless_creates, plugin_archive_file_id_matches,
+    plugin_install_plan_from_archive_path, plugin_key_from_archive_delete_origin,
+    plugin_state_hot_state_projection, reconcile_row, reconcile_typed_row,
+    require_existing_id_authorities, reservation_tombstone_row, reserve_create_row,
+    transport_splice_preserves_prefix_exclusion, transport_splice_preserves_utf8,
+    validate_create_changes, validate_create_reservation,
+};
+use crate::plugin::runtime::{
+    PendingPluginActorPublication, PluginPublicationPolicy, discard_plugin_actor_publications,
+    retire_oldest_completed_actor,
 };
 use crate::row_pk::RowPk;
 use crate::session::{
@@ -132,10 +136,10 @@ use crate::transaction_types::{
 
 use crate::plugin::runtime::{
     WASM_COMPONENT_API_VERSION, WasmChangeEffect, WasmColdFileUpdate, WasmColumnMergeResult,
-    WasmComponentActor, WasmComponentFactory, WasmDocumentCheckpoint, WasmDocumentHandle,
-    WasmFileDescriptor, WasmFileUpdate, WasmHostBytes, WasmHostColumnMerge, WasmHostRow,
-    WasmHostRowChanges, WasmOpenFileInput, WasmOpenRowsInput, WasmPluginSelection, WasmRow,
-    WasmRowChange, WasmRowKey, WasmRowUpdate, WasmTransitionCounters, WasmTransitionLimits,
+    WasmComponentActor, WasmComponentFactory, WasmDocumentHandle, WasmFileDescriptor,
+    WasmFileUpdate, WasmHostBytes, WasmHostColumnMerge, WasmHostRow, WasmHostRowChanges,
+    WasmOpenFileInput, WasmOpenRowsInput, WasmPluginSelection, WasmRow, WasmRowChange, WasmRowKey,
+    WasmRowUpdate, WasmTransitionCounters, WasmTransitionLimits,
 };
 use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::telemetry::TelemetryAttribute;
@@ -1386,7 +1390,7 @@ where
         let (superseded, retained): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.pending_plugin_actor_publications)
                 .into_iter()
-                .partition(|publication| file_ids.contains(&publication.session_key().file_id));
+                .partition(|publication| file_ids.contains(&publication.key().file_id));
         self.pending_plugin_actor_publications = retained;
         discard_plugin_actor_publications(superseded).await;
         let merged_payloads = self.merge_stale_column_inputs(&merge_inputs).await?;
@@ -1817,471 +1821,395 @@ where
         #[cfg(feature = "storage-benches")]
         let _phase =
             crate::storage_bench::enter_crud_phase(crate::storage_bench::CRUD_PHASE_COMMIT);
-        let transaction = &mut self;
-        let commit_boundary = transaction.commit_boundary.clone();
+        let commit_boundary = self.commit_boundary.clone();
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
-        let (
-            writes,
-            write_options,
-            filesystem_delta_rows,
-            previous_filesystem_revision,
-            next_catalog_revision,
-        ) = instrument_lix_result(materialize_span, async {
-            transaction
-                .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
-                .await;
-            let tracked_state_changed = prepared_writes.state_rows.iter().any(|row| !row.untracked)
-                || !prepared_writes.commit_change_refs_by_branch.is_empty()
-                || !prepared_writes.extra_commit_parents_by_branch.is_empty();
-            let has_untracked_state_writes =
-                prepared_writes.state_rows.iter().any(|row| row.untracked)
-                    || !prepared_writes.branch_heads.is_empty();
-            // Untracked rows are mutable current state, but their validation can read
-            // tracked schemas, parents, uniqueness owners, or filesystem state.
-            // Fence that snapshot without rotating the tracked revision: normal
-            // tracked transactions remain independent of untracked-only commits.
-            let requires_tracked_snapshot_fence =
-                tracked_state_changed || has_untracked_state_writes;
-            let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
-            if let Err(error) = check_commit_boundary(commit_boundary.as_ref()) {
-                transaction
-                    .discard_pending_plugin_actor_publications()
-                    .await;
-                return Err(error);
-            }
-            // Validate and materialize from one coherent storage snapshot. The
-            // final write's tracked-state precondition fences the decisions made
-            // here, including plugin-produced prepared rows.
-            let commit_read_storage = transaction.storage.clone();
-            let commit_read = commit_read_storage
-                .begin_read(StorageReadOptions::default())
-                .await?;
-            // SAFETY: `commit_read_storage` is an `Arc` retained through commit,
-            // and the transaction drops this read before its storage field.
-            let commit_read = unsafe { assume_static_storage_read::<StorageImpl>(commit_read) };
-            let mut read = SharedStorageAdapterRead::new(commit_read);
-            // Preserve the original statement snapshot until its SQL decisions
-            // have been fenced; reconciliation below uses the current read.
-            if let Err(error) = transaction.fence_sql_write_snapshot(&read).await {
-                transaction
-                    .discard_pending_plugin_actor_publications()
-                    .await;
-                return Err(error);
-            }
-            // Commit-time reconciliation and validation must all observe this
-            // current coherent snapshot, while user statements above observed the
-            // snapshot retained from transaction open.
-            transaction.opening_read = read.clone();
-            // Plain engines sharing replica storage remain fenced. An admitted
-            // sync engine may commit its durable pending suffix locally.
-            if transaction.sync_role != crate::sync::SyncRole::Replica
-                && crate::sync::has_any_sync_replica_state(&read).await?
-            {
-                transaction
-                    .discard_pending_plugin_actor_publications()
-                    .await;
-                return Err(LixError::new(
-                    "LIX_REPLICA_CACHE_READ_ONLY",
-                    "replica storage can only be changed by an admitted sync engine",
-                ));
-            }
-            if let Err(error) = transaction
-                .reconcile_stale_disjoint_writes(&read, &mut prepared_writes)
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.transaction_reconcile_stale"
-                ))
-                .await
-            {
-                transaction
-                    .discard_pending_plugin_actor_publications()
-                    .await;
-                return Err(error);
-            }
-            let branch_checkpoint_bridges = match transaction
-                .resolve_pending_branch_checkpoint_replacements(&read, &prepared_writes)
-                .await
-            {
-                Ok(branch_checkpoint_bridges) => branch_checkpoint_bridges,
-                Err(error) => {
-                    transaction
-                        .discard_pending_plugin_actor_publications()
-                        .await;
-                    return Err(error);
-                }
-            };
-            let restore_targets = std::mem::take(&mut transaction.pending_restore_targets);
-            let commit_parent_heads = match commit::resolve_prepared_commit_parent_heads(
-                transaction.branch_ctx.as_ref(),
-                &read,
-                &prepared_writes,
-                true,
-            )
-            .await
-            {
-                Ok(commit_parent_heads) => commit_parent_heads,
-                Err(error) => {
-                    transaction
-                        .discard_pending_plugin_actor_publications()
-                        .await;
-                    return Err(error);
-                }
-            };
-            if let Err(error) = Self::attach_checkpoint_branch_parents(
-                &read,
-                &mut prepared_writes,
-                &commit_parent_heads,
-            )
-            .await
-            {
-                transaction
-                    .discard_pending_plugin_actor_publications()
-                    .await;
-                return Err(error);
-            }
-            if let Err(error) = transaction
-                .validate_prepared_writes_by_branch(&read, &mut prepared_writes)
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.transaction_validation"
-                ))
-                .await
-            {
-                transaction
-                    .discard_pending_plugin_actor_publications()
-                    .await;
-                return Err(error);
-            }
-            // The delta itself is projected out of the commit below, once
-            // addressable rows hold their final commit-delta change ids. Only its
-            // *projectability* is decided here, because the revision the cached
-            // views are keyed on has to be read before the commit publishes its
-            // successor.
-            let stages_projectable_filesystem_rows =
-                prepared_writes_stage_filesystem_rows(&prepared_writes)
-                    && !prepared_writes_require_filesystem_index_rebuild(&prepared_writes);
-            // A failed revision read must not collapse into "no revision yet".
-            // `None` is itself a live cache key — the state before the first
-            // filesystem commit — so treating an error as `None` would rekey
-            // entries built at an unknown revision onto this commit's successor and
-            // make a stale index reachable. The outer `Option` is "the read
-            // succeeded"; only that licenses a projection.
-            let loaded_filesystem_revision = if stages_projectable_filesystem_rows {
-                load_path_index_revision(&read).await.ok()
-            } else {
-                None
-            };
-            let filesystem_delta_projectable = loaded_filesystem_revision.is_some();
-            let previous_filesystem_revision = loaded_filesystem_revision.flatten();
-            let mut automatic_sync_writes = transaction.storage.new_write_set();
-            let mut automatic_sync_preconditions = Vec::new();
-            let capture_sync_commits = transaction.sync_role == crate::sync::SyncRole::Authority;
-            if transaction.sync_role == crate::sync::SyncRole::Replica {
-                // The immutable commit and ref are the durable outbox.
-                // `build_sync_push` discovers unpublished local heads; no second
-                // row-pack queue is maintained.
-                transaction.await_durable_commit = true;
-            }
-            if transaction.sync_role == crate::sync::SyncRole::Replica {
-                for publication in &prepared_writes.checkpoint_publications {
-                    let recovery = &publication.recovery_ref;
-                    crate::sync::stage_sync_checkpoint_source(
-                        &mut automatic_sync_writes,
-                        &recovery.branch_id,
-                        recovery.checkpoint_commit_id,
-                        recovery.recovered_head_commit_id,
-                    )?;
-                }
-            }
-            let materialized = match commit::commit_prepared_writes_with_parent_heads(
-                &transaction.binary_cas,
-                &transaction.tracked_state,
-                Some(transaction.sql_schema_snapshot.as_ref()),
-                Some(runtime_functions),
-                &transaction.active_account_id,
-                &commit_parent_heads,
-                &mut read,
-                &branch_checkpoint_bridges,
-                capture_sync_commits,
-                &restore_targets,
-                prepared_writes,
-            )
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.transaction_materialization"
-            ))
-            .await
-            {
-                Ok(commit) => commit,
-                Err(error) => {
-                    transaction
-                        .discard_pending_plugin_actor_publications()
-                        .await;
-                    return Err(error);
-                }
-            };
-            let staged_sync_event = if capture_sync_commits {
-                // Consume the exact controls produced by materialization instead
-                // of predicting checkpoint/restore semantics from prepared rows.
-                // The event still joins the same atomic storage commit below.
-                match crate::sync::stage_repository_transaction_event(
-                    &read,
-                    &mut automatic_sync_writes,
-                    &mut automatic_sync_preconditions,
-                    &materialized.sync_commits,
-                    &materialized.published_branch_controls,
-                )
-                .await
-                {
-                    Ok(event) => event,
-                    Err(error) => {
-                        transaction
-                            .discard_pending_plugin_actor_publications()
-                            .await;
-                        return Err(error);
-                    }
-                }
-            } else {
-                None
-            };
-            if transaction.sync_role == crate::sync::SyncRole::Replica
-                && !restore_targets.is_empty()
-            {
-                let targets = restore_targets
-                    .iter()
-                    .map(|(branch_id, intent)| (branch_id.clone(), intent.target_commit_id))
-                    .collect();
-                let Some(remote_id) = transaction.sync_replica_remote_id.as_deref() else {
-                    transaction
-                        .discard_pending_plugin_actor_publications()
-                        .await;
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "sync replica restore has no active remote identity",
-                    ));
-                };
-                if let Err(error) = crate::sync::stage_sync_restore_intents(
-                    &read,
-                    &mut automatic_sync_writes,
-                    &mut automatic_sync_preconditions,
-                    remote_id,
-                    &targets,
-                )
-                .await
-                {
-                    transaction
-                        .discard_pending_plugin_actor_publications()
-                        .await;
-                    return Err(error);
-                }
-                transaction.await_durable_commit = true;
-            }
-            if staged_sync_event.is_some() {
-                transaction.await_durable_commit = true;
-            }
-            if let Some(staged_sync_event) = &staged_sync_event
-                && let Err(error) = crate::sync::validate_repository_transaction_event_transfer(
-                    staged_sync_event,
-                    &materialized.sync_commits,
-                )
-            {
-                transaction
-                    .discard_pending_plugin_actor_publications()
-                    .await;
-                return Err(error);
-            }
-            let mut writes = materialized.writes;
-            let materialization_preconditions = materialized.preconditions;
-            let filesystem_delta_rows = if filesystem_delta_projectable {
-                materialized.filesystem_delta_rows
-            } else {
-                Vec::new()
-            };
-            let next_catalog_revision = (catalog_revision_changed
-                || materialized.inherited_catalog_changed)
-                .then(|| stage_catalog_revision(&mut writes));
-            if tracked_state_changed {
-                StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
-            }
-            writes.extend(automatic_sync_writes);
-            if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
-                writes.extend(metadata_writes);
-            }
-            let mut write_options = StorageWriteOptions::default();
-            write_options.await_durable = transaction.await_durable_commit;
-            write_options
-                .preconditions
-                .extend(materialization_preconditions);
-            write_options
-                .preconditions
-                .append(&mut automatic_sync_preconditions);
-            write_options
-                .preconditions
-                .append(&mut transaction.atomic_metadata_preconditions);
-            if requires_tracked_snapshot_fence {
-                write_options.preconditions.push(
-                    StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(
-                        transaction.opening_tracked_mutation_revision.clone(),
-                    ),
-                );
-            }
-            if let Some((key, value)) = transaction.idempotency_receipt.take() {
-                writes.put(EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, key.clone(), value);
-                // The mutation and this receipt share one atomic storage commit.
-                // A protocol acknowledgement may replay only from a durable
-                // receipt, so ask the storage to cross its durability boundary
-                // before it reports this commit as successful.
-                write_options.await_durable = true;
-                write_options.idempotency_key = Some(key.0.clone());
-                write_options
-                    .preconditions
-                    .push(StoragePrecondition::KeyAbsent {
-                        space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
-                        key,
-                    });
-            }
-            Ok((
+        let result = async {
+            let transaction = &mut self;
+            let (
                 writes,
                 write_options,
                 filesystem_delta_rows,
                 previous_filesystem_revision,
                 next_catalog_revision,
-            ))
-        })
-        .await?;
-        // Keep the prepared commit's storage borrow independent from the
-        // transaction so deterministic preparation failures can still drain
-        // prospective plugin actor documents before returning.
-        let commit_storage = transaction.storage.clone();
-        #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_crud_write_set_arena(&writes);
-        let storage_span = ActiveTelemetrySpan::start_current(
-            &TRANSACTION_STORAGE,
-            vec![
-                TelemetryAttribute::i64(
-                    "lix.transaction.count",
-                    i64::try_from(transaction_count).unwrap_or(i64::MAX),
-                ),
-                TelemetryAttribute::string("lix.commit_cohort_id", commit_cohort_id.clone()),
-            ],
-        );
-        let storage_stats = instrument_lix_result(storage_span, async {
-            let prepared_commit = match commit_storage
-                .prepare_write_set(writes, write_options)
+            ) = instrument_lix_result(materialize_span, async {
+                transaction
+                    .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
+                    .await;
+                let tracked_state_changed =
+                    prepared_writes.state_rows.iter().any(|row| !row.untracked)
+                        || !prepared_writes.commit_change_refs_by_branch.is_empty()
+                        || !prepared_writes.extra_commit_parents_by_branch.is_empty();
+                let has_untracked_state_writes =
+                    prepared_writes.state_rows.iter().any(|row| row.untracked)
+                        || !prepared_writes.branch_heads.is_empty();
+                // Untracked rows are mutable current state, but their validation can read
+                // tracked schemas, parents, uniqueness owners, or filesystem state.
+                // Fence that snapshot without rotating the tracked revision: normal
+                // tracked transactions remain independent of untracked-only commits.
+                let requires_tracked_snapshot_fence =
+                    tracked_state_changed || has_untracked_state_writes;
+                let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
+                check_commit_boundary(commit_boundary.as_ref())?;
+                // Validate and materialize from one coherent storage snapshot. The
+                // final write's tracked-state precondition fences the decisions made
+                // here, including plugin-produced prepared rows.
+                let commit_read_storage = transaction.storage.clone();
+                let commit_read = commit_read_storage
+                    .begin_read(StorageReadOptions::default())
+                    .await?;
+                // SAFETY: `commit_read_storage` is an `Arc` retained through commit,
+                // and the transaction drops this read before its storage field.
+                let commit_read = unsafe { assume_static_storage_read::<StorageImpl>(commit_read) };
+                let mut read = SharedStorageAdapterRead::new(commit_read);
+                // Preserve the original statement snapshot until its SQL decisions
+                // have been fenced; reconciliation below uses the current read.
+                transaction.fence_sql_write_snapshot(&read).await?;
+                // Commit-time reconciliation and validation must all observe this
+                // current coherent snapshot, while user statements above observed the
+                // snapshot retained from transaction open.
+                transaction.opening_read = read.clone();
+                // Plain engines sharing replica storage remain fenced. An admitted
+                // sync engine may commit its durable pending suffix locally.
+                if transaction.sync_role != crate::sync::SyncRole::Replica
+                    && crate::sync::has_any_sync_replica_state(&read).await?
+                {
+                    return Err(LixError::new(
+                        "LIX_REPLICA_CACHE_READ_ONLY",
+                        "replica storage can only be changed by an admitted sync engine",
+                    ));
+                }
+                transaction
+                    .reconcile_stale_disjoint_writes(&read, &mut prepared_writes)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.transaction_reconcile_stale"
+                    ))
+                    .await?;
+                let branch_checkpoint_bridges = transaction
+                    .resolve_pending_branch_checkpoint_replacements(&read, &prepared_writes)
+                    .await?;
+                let restore_targets = std::mem::take(&mut transaction.pending_restore_targets);
+                let commit_parent_heads = commit::resolve_prepared_commit_parent_heads(
+                    transaction.branch_ctx.as_ref(),
+                    &read,
+                    &prepared_writes,
+                    true,
+                )
+                .await?;
+                Self::attach_checkpoint_branch_parents(
+                    &read,
+                    &mut prepared_writes,
+                    &commit_parent_heads,
+                )
+                .await?;
+                transaction
+                    .validate_prepared_writes_by_branch(&read, &mut prepared_writes)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.transaction_validation"
+                    ))
+                    .await?;
+                // The delta itself is projected out of the commit below, once
+                // addressable rows hold their final commit-delta change ids. Only its
+                // *projectability* is decided here, because the revision the cached
+                // views are keyed on has to be read before the commit publishes its
+                // successor.
+                let stages_projectable_filesystem_rows =
+                    prepared_writes_stage_filesystem_rows(&prepared_writes)
+                        && !prepared_writes_require_filesystem_index_rebuild(&prepared_writes);
+                // A failed revision read must not collapse into "no revision yet".
+                // `None` is itself a live cache key — the state before the first
+                // filesystem commit — so treating an error as `None` would rekey
+                // entries built at an unknown revision onto this commit's successor and
+                // make a stale index reachable. The outer `Option` is "the read
+                // succeeded"; only that licenses a projection.
+                let loaded_filesystem_revision = if stages_projectable_filesystem_rows {
+                    load_path_index_revision(&read).await.ok()
+                } else {
+                    None
+                };
+                let filesystem_delta_projectable = loaded_filesystem_revision.is_some();
+                let previous_filesystem_revision = loaded_filesystem_revision.flatten();
+                let mut automatic_sync_writes = transaction.storage.new_write_set();
+                let mut automatic_sync_preconditions = Vec::new();
+                let capture_sync_commits =
+                    transaction.sync_role == crate::sync::SyncRole::Authority;
+                if transaction.sync_role == crate::sync::SyncRole::Replica {
+                    // The immutable commit and ref are the durable outbox.
+                    // `build_sync_push` discovers unpublished local heads; no second
+                    // row-pack queue is maintained.
+                    transaction.await_durable_commit = true;
+                }
+                if transaction.sync_role == crate::sync::SyncRole::Replica {
+                    for publication in &prepared_writes.checkpoint_publications {
+                        let recovery = &publication.recovery_ref;
+                        crate::sync::stage_sync_checkpoint_source(
+                            &mut automatic_sync_writes,
+                            &recovery.branch_id,
+                            recovery.checkpoint_commit_id,
+                            recovery.recovered_head_commit_id,
+                        )?;
+                    }
+                }
+                let materialized = commit::commit_prepared_writes_with_parent_heads(
+                    &transaction.binary_cas,
+                    &transaction.tracked_state,
+                    Some(transaction.sql_schema_snapshot.as_ref()),
+                    Some(runtime_functions),
+                    &transaction.active_account_id,
+                    &commit_parent_heads,
+                    &mut read,
+                    &branch_checkpoint_bridges,
+                    capture_sync_commits,
+                    &restore_targets,
+                    prepared_writes,
+                )
                 .instrument(tracing::debug_span!(
                     target: "lix_perf",
-                    "lix.perf.transaction_storage_prepare"
+                    "lix.perf.transaction_materialization"
                 ))
-                .await
-            {
-                Ok(prepared_commit) => prepared_commit,
-                Err(error) => {
-                    transaction
-                        .discard_pending_plugin_actor_publications()
-                        .await;
-                    return Err(error.into());
+                .await?;
+                let staged_sync_event = if capture_sync_commits {
+                    // Consume the exact controls produced by materialization instead
+                    // of predicting checkpoint/restore semantics from prepared rows.
+                    // The event still joins the same atomic storage commit below.
+                    crate::sync::stage_repository_transaction_event(
+                        &read,
+                        &mut automatic_sync_writes,
+                        &mut automatic_sync_preconditions,
+                        &materialized.sync_commits,
+                        &materialized.published_branch_controls,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                if transaction.sync_role == crate::sync::SyncRole::Replica
+                    && !restore_targets.is_empty()
+                {
+                    let targets = restore_targets
+                        .iter()
+                        .map(|(branch_id, intent)| (branch_id.clone(), intent.target_commit_id))
+                        .collect();
+                    let Some(remote_id) = transaction.sync_replica_remote_id.as_deref() else {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "sync replica restore has no active remote identity",
+                        ));
+                    };
+                    crate::sync::stage_sync_restore_intents(
+                        &read,
+                        &mut automatic_sync_writes,
+                        &mut automatic_sync_preconditions,
+                        remote_id,
+                        &targets,
+                    )
+                    .await?;
+                    transaction.await_durable_commit = true;
                 }
-            };
-            let storage_stats = commit_at_boundary(commit_boundary.as_ref(), || async move {
-                let (_commit, stats) = prepared_commit.commit().await?;
-                #[cfg(feature = "storage-benches")]
-                crate::storage_bench::record_crud_ownership(
-                    crate::storage_bench::CRUD_OWNERSHIP_ADAPTER,
-                    stats.staged_puts.saturating_add(stats.staged_deletes) as usize,
-                    0,
-                    stats.written_bytes as usize,
-                    stats.put_batches.saturating_add(stats.delete_batches) as usize,
-                    stats.storage_calls as usize,
-                    stats.touched_spaces as usize,
-                );
-                Ok(stats)
-            })
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.transaction_storage_commit"
-            ))
-            .await?;
-            let post_commit_read_storage = transaction.storage.clone();
-            if let Some(next_catalog_revision) = next_catalog_revision.as_ref()
-                && let Ok(next_read) = post_commit_read_storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-            {
-                let next_read = SharedStorageAdapterRead::new(next_read);
-                // A concurrent schema commit may already have advanced this fresh
-                // read beyond the revision we published. Never index that newer
-                // catalog under our older revision key.
-                if catalog_revision_is_current(
-                    load_catalog_revision(&next_read)
-                        .await
-                        .ok()
-                        .flatten()
-                        .as_ref(),
-                    next_catalog_revision,
-                ) {
-                    let visible_hot_state = transaction.hot_state.reader(&next_read);
-                    // Cache warming is derived state. Once the durable commit
-                    // succeeds, a warming failure must not turn success into an
-                    // ambiguous error; the next transaction safely compiles on demand.
-                    let _ = transaction
-                        .schema_resolver
-                        .warm_committed_catalogs(
-                            &visible_hot_state,
-                            &transaction.active_branch_id,
-                            next_catalog_revision,
-                        )
-                        .instrument(tracing::debug_span!(
-                            target: "lix_perf",
-                            "lix.perf.catalog.post_commit_warm"
-                        ))
-                        .await;
+                if staged_sync_event.is_some() {
+                    transaction.await_durable_commit = true;
                 }
-            }
-            if !filesystem_delta_rows.is_empty()
-                && incremental_filesystem_index_enabled()
-                && let Ok(next_read) = post_commit_read_storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-            {
-                let next_read = SharedStorageAdapterRead::new(next_read);
-                if let Ok(next_revision) = load_path_index_revision(&next_read).await {
-                    transaction.hot_state.advance_filesystem_path_indexes(
-                        previous_filesystem_revision.as_deref(),
-                        next_revision.as_deref(),
-                        &filesystem_delta_rows,
+                if let Some(staged_sync_event) = &staged_sync_event
+                    && let Err(error) = crate::sync::validate_repository_transaction_event_transfer(
+                        staged_sync_event,
+                        &materialized.sync_commits,
+                    )
+                {
+                    return Err(error);
+                }
+                let mut writes = materialized.writes;
+                let materialization_preconditions = materialized.preconditions;
+                let filesystem_delta_rows = if filesystem_delta_projectable {
+                    materialized.filesystem_delta_rows
+                } else {
+                    Vec::new()
+                };
+                let next_catalog_revision = (catalog_revision_changed
+                    || materialized.inherited_catalog_changed)
+                    .then(|| stage_catalog_revision(&mut writes));
+                if tracked_state_changed {
+                    StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
+                }
+                writes.extend(automatic_sync_writes);
+                if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
+                    writes.extend(metadata_writes);
+                }
+                let mut write_options = StorageWriteOptions::default();
+                write_options.await_durable = transaction.await_durable_commit;
+                write_options
+                    .preconditions
+                    .extend(materialization_preconditions);
+                write_options
+                    .preconditions
+                    .append(&mut automatic_sync_preconditions);
+                write_options
+                    .preconditions
+                    .append(&mut transaction.atomic_metadata_preconditions);
+                if requires_tracked_snapshot_fence {
+                    write_options.preconditions.push(
+                        StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(
+                            transaction.opening_tracked_mutation_revision.clone(),
+                        ),
                     );
                 }
-            }
-            for publication in std::mem::take(&mut transaction.pending_plugin_actor_publications) {
-                let session_key = publication.session_key().clone();
-                match publication.publish().await {
-                    Ok((key, view)) => {
-                        transaction
-                            .pending_file_view_mutations
-                            .insert(key.clone(), SessionFileViewMutation::Set { key, view });
+                if let Some((key, value)) = transaction.idempotency_receipt.take() {
+                    writes.put(EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, key.clone(), value);
+                    // The mutation and this receipt share one atomic storage commit.
+                    // A protocol acknowledgement may replay only from a durable
+                    // receipt, so ask the storage to cross its durability boundary
+                    // before it reports this commit as successful.
+                    write_options.await_durable = true;
+                    write_options.idempotency_key = Some(key.0.clone());
+                    write_options
+                        .preconditions
+                        .push(StoragePrecondition::KeyAbsent {
+                            space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
+                            key,
+                        });
+                }
+                Ok((
+                    writes,
+                    write_options,
+                    filesystem_delta_rows,
+                    previous_filesystem_revision,
+                    next_catalog_revision,
+                ))
+            })
+            .await?;
+            // Keep the prepared commit's storage borrow independent from the
+            // transaction so deterministic preparation failures can still drain
+            // prospective plugin actor documents before returning.
+            let commit_storage = transaction.storage.clone();
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_crud_write_set_arena(&writes);
+            let storage_span = ActiveTelemetrySpan::start_current(
+                &TRANSACTION_STORAGE,
+                vec![
+                    TelemetryAttribute::i64(
+                        "lix.transaction.count",
+                        i64::try_from(transaction_count).unwrap_or(i64::MAX),
+                    ),
+                    TelemetryAttribute::string("lix.commit_cohort_id", commit_cohort_id.clone()),
+                ],
+            );
+            let storage_stats = instrument_lix_result(storage_span, async {
+                let prepared_commit = commit_storage
+                    .prepare_write_set(writes, write_options)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.transaction_storage_prepare"
+                    ))
+                    .await?;
+                let storage_stats = commit_at_boundary(commit_boundary.as_ref(), || async move {
+                    let (_commit, stats) = prepared_commit.commit().await?;
+                    #[cfg(feature = "storage-benches")]
+                    crate::storage_bench::record_crud_ownership(
+                        crate::storage_bench::CRUD_OWNERSHIP_ADAPTER,
+                        stats.staged_puts.saturating_add(stats.staged_deletes) as usize,
+                        0,
+                        stats.written_bytes as usize,
+                        stats.put_batches.saturating_add(stats.delete_batches) as usize,
+                        stats.storage_calls as usize,
+                        stats.touched_spaces as usize,
+                    );
+                    Ok(stats)
+                })
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.transaction_storage_commit"
+                ))
+                .await?;
+                let post_commit_read_storage = transaction.storage.clone();
+                if let Some(next_catalog_revision) = next_catalog_revision.as_ref()
+                    && let Ok(next_read) = post_commit_read_storage
+                        .begin_read(StorageReadOptions::default())
+                        .await
+                {
+                    let next_read = SharedStorageAdapterRead::new(next_read);
+                    // A concurrent schema commit may already have advanced this fresh
+                    // read beyond the revision we published. Never index that newer
+                    // catalog under our older revision key.
+                    if catalog_revision_is_current(
+                        load_catalog_revision(&next_read)
+                            .await
+                            .ok()
+                            .flatten()
+                            .as_ref(),
+                        next_catalog_revision,
+                    ) {
+                        let visible_hot_state = transaction.hot_state.reader(&next_read);
+                        // Cache warming is derived state. Once the durable commit
+                        // succeeds, a warming failure must not turn success into an
+                        // ambiguous error; the next transaction safely compiles on demand.
+                        let _ = transaction
+                            .schema_resolver
+                            .warm_committed_catalogs(
+                                &visible_hot_state,
+                                &transaction.active_branch_id,
+                                next_catalog_revision,
+                            )
+                            .instrument(tracing::debug_span!(
+                                target: "lix_perf",
+                                "lix.perf.catalog.post_commit_warm"
+                            ))
+                            .await;
                     }
-                    Err(_) => {
-                        // Actor/materialization publication is derived state. A
-                        // durable commit remains successful; revoke the private
-                        // view so the next exact read cold-opens safely.
-                        transaction.pending_file_view_mutations.insert(
-                            session_key.clone(),
-                            SessionFileViewMutation::Remove { key: session_key },
+                }
+                if !filesystem_delta_rows.is_empty()
+                    && incremental_filesystem_index_enabled()
+                    && let Ok(next_read) = post_commit_read_storage
+                        .begin_read(StorageReadOptions::default())
+                        .await
+                {
+                    let next_read = SharedStorageAdapterRead::new(next_read);
+                    if let Ok(next_revision) = load_path_index_revision(&next_read).await {
+                        transaction.hot_state.advance_filesystem_path_indexes(
+                            previous_filesystem_revision.as_deref(),
+                            next_revision.as_deref(),
+                            &filesystem_delta_rows,
                         );
                     }
                 }
-            }
-            transaction.session_file_views.apply_mutations(
-                std::mem::take(&mut transaction.pending_file_view_mutations).into_values(),
-            );
-            Ok(storage_stats)
-        })
-        .await?;
-        Ok(TransactionCommitOutcome {
-            storage_stats,
-            commit_cohort_id: Some(commit_cohort_id),
-            checkpoint_gc_sequence: transaction.pending_checkpoint_gc_sequence,
-        })
+                for publication in
+                    std::mem::take(&mut transaction.pending_plugin_actor_publications)
+                {
+                    let session_key = SessionFileViewKey::from_actor_key(publication.key());
+                    match publication.publish().await {
+                        Ok(receipt) => {
+                            let (key, view) = SessionPluginFileView::from_publication(receipt);
+                            transaction
+                                .pending_file_view_mutations
+                                .insert(key.clone(), SessionFileViewMutation::Set { key, view });
+                        }
+                        Err(_) => {
+                            // Actor/materialization publication is derived state. A
+                            // durable commit remains successful; revoke the private
+                            // view so the next exact read cold-opens safely.
+                            transaction.pending_file_view_mutations.insert(
+                                session_key.clone(),
+                                SessionFileViewMutation::Remove { key: session_key },
+                            );
+                        }
+                    }
+                }
+                transaction.session_file_views.apply_mutations(
+                    std::mem::take(&mut transaction.pending_file_view_mutations).into_values(),
+                );
+                Ok(storage_stats)
+            })
+            .await?;
+            Ok(TransactionCommitOutcome {
+                storage_stats,
+                commit_cohort_id: Some(commit_cohort_id),
+                checkpoint_gc_sequence: transaction.pending_checkpoint_gc_sequence,
+            })
+        }
+        .await;
+        if result.is_err() {
+            self.discard_pending_plugin_actor_publications().await;
+        }
+        result
     }
 
     /// Large import documents are more valuable as transient parser state than
@@ -2309,7 +2237,7 @@ where
             if self.pending_plugin_actor_publications[index].retains_large_import_actor() {
                 continue;
             }
-            let session_key = self.pending_plugin_actor_publications[index].session_key();
+            let session_key = self.pending_plugin_actor_publications[index].key();
             if !large_files
                 .contains(&(session_key.branch_id.as_str(), session_key.file_id.as_str()))
             {
@@ -2429,7 +2357,7 @@ where
         let publications = std::mem::take(&mut self.pending_plugin_actor_publications);
         let discarded_view_keys = publications
             .iter()
-            .map(|publication| publication.session_key().clone())
+            .map(|publication| SessionFileViewKey::from_actor_key(publication.key()))
             .collect::<Vec<_>>();
         discard_plugin_actor_publications(publications).await;
         for key in discarded_view_keys {
@@ -5312,23 +5240,20 @@ where
                     plugin_key: selected.key().to_string(),
                     plugin_generation: selected.archive_blob_hash().to_string(),
                 };
-                let view = PendingPluginActorView {
-                    session_key: SessionFileViewKey::new(&write.branch_id, &write.file_id),
-                    plugin_key: selected.key().to_string(),
-                    plugin_generation: selected.archive_blob_hash().to_string(),
-                    owner_change_id,
+                let session_key = SessionFileViewKey::new(&write.branch_id, &write.file_id);
+                let view = PluginPublicationPolicy {
                     semantic_chainable: false,
                     // Arena v3 retains only host-owned immutable roots after
                     // import; keeping the actor enables >8 MiB warm successors
                     // without retaining the transient guest parser graph.
                     retain_large_import_actor: retain_large_import_actor(&selected),
                 };
-                if !prepared_session_keys.insert(view.session_key.clone())
+                if !prepared_session_keys.insert(session_key.clone())
                     || self
                         .pending_plugin_actor_publications
                         .iter()
                         .chain(reconciliation.actor_publications.iter())
-                        .any(|publication| publication.session_key() == &view.session_key)
+                        .any(|publication| session_key.matches_actor_key(publication.key()))
                 {
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
@@ -5568,19 +5493,20 @@ where
                     pending.file_key.clone(),
                     pending.materialization_version.clone(),
                 );
+                let checkpoint = actor.checkpoint_document(validated.document).await?;
                 reconciliation
                     .actor_publications
-                    .push(PendingPluginActorPublication::New {
-                        cache: self.plugin_host.actor_cache(),
-                        key: pending.actor_key,
-                        checkpoint: actor.checkpoint_document(validated.document).await?,
-                        store: PluginActorStore::new(actor, pending.store_permit),
-                        document: validated.document,
-                        bytes: pending.submitted_bytes,
-                        semantic_root: Arc::from(pending.materialization_version),
+                    .push(PendingPluginActorPublication::new(
+                        pending.actor_key,
+                        self.plugin_host.actor_cache(),
+                        PluginActorStore::new(actor, pending.store_permit),
+                        validated.document,
+                        checkpoint,
+                        pending.submitted_bytes,
+                        Arc::from(pending.materialization_version),
                         row_authorities,
-                        view: pending.view,
-                    });
+                        pending.view,
+                    ));
                 reconciled_file_keys.insert(pending.file_key);
             }
         }
@@ -5694,11 +5620,7 @@ where
                 plugin_key: selected.key().to_string(),
                 plugin_generation: selected.archive_blob_hash().to_string(),
             };
-            let view = PendingPluginActorView {
-                session_key,
-                plugin_key: selected.key().to_string(),
-                plugin_generation: selected.archive_blob_hash().to_string(),
-                owner_change_id,
+            let view = PluginPublicationPolicy {
                 semantic_chainable: false,
                 retain_large_import_actor: retain_large_import_actor(selected),
             };
@@ -5706,7 +5628,7 @@ where
                 .pending_plugin_actor_publications
                 .iter()
                 .chain(reconciliation.actor_publications.iter())
-                .any(|publication| publication.session_key() == &view.session_key)
+                .any(|publication| session_key.matches_actor_key(publication.key()))
             {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
@@ -5752,7 +5674,7 @@ where
             let (changes, publication, materialized_bytes, create_rows) = if same_plugin_owner {
                 'same_owner: {
                     let acknowledged_view = self.acknowledged_session_plugin_view(
-                        &view.session_key,
+                        &session_key,
                         selected,
                         current_owner_change_id
                             .as_deref()
@@ -5766,9 +5688,7 @@ where
                         Some(_) => acknowledged_observation
                             .is_none_or(|observation| !cache.contains_observation(observation)),
                         None => {
-                            !self
-                                .pending_file_view_mutations
-                                .contains_key(&view.session_key)
+                            !self.pending_file_view_mutations.contains_key(&session_key)
                                 && !self
                                     .session_file_views
                                     .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path)
@@ -6091,21 +6011,20 @@ where
                             verified_same_length_blob_splice = same_length_blob_splice;
                             verified_blob_edit_splice = blob_edit_splice;
                             drop(cold_open_guard);
+                            let checkpoint = actor.checkpoint_document(validated.document).await?;
                             break 'same_owner (
                                 changes,
-                                PendingPluginActorPublication::New {
+                                PendingPluginActorPublication::new(
+                                    actor_key,
                                     cache,
-                                    key: actor_key,
-                                    checkpoint: actor
-                                        .checkpoint_document(validated.document)
-                                        .await?,
-                                    store: PluginActorStore::new(actor, store_permit),
-                                    document: validated.document,
-                                    bytes: submitted_bytes.clone(),
-                                    semantic_root: Arc::from(materialization_version.clone()),
+                                    PluginActorStore::new(actor, store_permit),
+                                    validated.document,
+                                    checkpoint,
+                                    submitted_bytes.clone(),
+                                    Arc::from(materialization_version.clone()),
                                     row_authorities,
                                     view,
-                                },
+                                ),
                                 submitted_bytes.clone(),
                                 create_rows,
                             );
@@ -6127,16 +6046,14 @@ where
                                 .await?
                             }
                         },
-                        None if self
-                            .pending_file_view_mutations
-                            .contains_key(&view.session_key)
+                        None if self.pending_file_view_mutations.contains_key(&session_key)
                             || self
                                 .session_file_views
                                 .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path) =>
                         {
                             let remembered = self
                                 .session_file_views
-                                .unfiltered_plugin_file_view(&view.session_key);
+                                .unfiltered_plugin_file_view(&session_key);
                             return Err(LixError::new(
                             LixError::CODE_PLUGIN_OBSERVATION_STALE,
                             "the session component file view no longer matches this write",
@@ -6157,7 +6074,7 @@ where
                             })),
                             "pending_view_mutation": self
                                 .pending_file_view_mutations
-                                .contains_key(&view.session_key),
+                                .contains_key(&session_key),
                         }))
                         .with_hint("read the exact file bytes again before retrying the edit"));
                         }
@@ -6475,11 +6392,7 @@ where
                     lease.set_successor_row_authorities(successor_row_authorities)?;
                     (
                         changes,
-                        PendingPluginActorPublication::Existing {
-                            lease,
-                            successor_key: actor_key,
-                            view,
-                        },
+                        PendingPluginActorPublication::existing(actor_key, lease, view),
                         materialized_bytes,
                         create_rows,
                     )
@@ -6551,19 +6464,20 @@ where
                 counters.durable_semantic_changes =
                     u64::try_from(changes.row_change_count()).unwrap_or(u64::MAX);
                 self.plugin_host.record_transition_counters(counters);
+                let checkpoint = actor.checkpoint_document(validated.document).await?;
                 (
                     changes,
-                    PendingPluginActorPublication::New {
-                        cache: self.plugin_host.actor_cache(),
-                        key: actor_key,
-                        checkpoint: actor.checkpoint_document(validated.document).await?,
-                        store: PluginActorStore::new(actor, store_permit),
-                        document: validated.document,
-                        bytes: submitted_bytes.clone(),
-                        semantic_root: Arc::from(materialization_version.clone()),
+                    PendingPluginActorPublication::new(
+                        actor_key,
+                        self.plugin_host.actor_cache(),
+                        PluginActorStore::new(actor, store_permit),
+                        validated.document,
+                        checkpoint,
+                        submitted_bytes.clone(),
+                        Arc::from(materialization_version.clone()),
                         row_authorities,
                         view,
-                    },
+                    ),
                     submitted_bytes.clone(),
                     create_rows,
                 )
@@ -6633,7 +6547,7 @@ where
             if reconciliation
                 .actor_publications
                 .iter()
-                .any(|publication| publication.session_key() == &session_key)
+                .any(|publication| session_key.matches_actor_key(publication.key()))
             {
                 discard_plugin_actor_publications(std::mem::take(
                     &mut reconciliation.actor_publications,
@@ -6719,11 +6633,7 @@ where
                     "component semantic write batch must contain at least one row change",
                 ));
             }
-            let view = PendingPluginActorView {
-                session_key: session_key.clone(),
-                plugin_key: group.plugin.key().to_string(),
-                plugin_generation: group.plugin.archive_blob_hash().to_string(),
-                owner_change_id: group.owner_change_id.clone(),
+            let view = PluginPublicationPolicy {
                 semantic_chainable: true,
                 retain_large_import_actor: retain_large_import_actor(&group.plugin),
             };
@@ -6731,26 +6641,16 @@ where
             let prior_index = self
                 .pending_plugin_actor_publications
                 .iter()
-                .position(|publication| publication.session_key() == &session_key);
+                .position(|publication| session_key.matches_actor_key(publication.key()));
             let prior_publication =
                 prior_index.map(|index| self.pending_plugin_actor_publications.remove(index));
             let was_chained = prior_publication.is_some();
             let (lease, successor_key, publication_view) = match prior_publication {
-                Some(PendingPluginActorPublication::Existing {
-                    lease,
-                    successor_key,
-                    view: prior_view,
-                }) if successor_key == actor_key
-                    && prior_view.semantic_chainable
-                    && prior_view.plugin_key == view.plugin_key
-                    && prior_view.plugin_generation == view.plugin_generation
-                    && prior_view.owner_change_id == view.owner_change_id =>
-                {
-                    (lease, successor_key, prior_view)
-                }
-                Some(publication) => {
-                    self.pending_plugin_actor_publications.push(publication);
-                    return Err(LixError::new(
+                Some(publication) => match publication.into_chainable(&actor_key) {
+                    Ok(parts) => parts,
+                    Err(publication) => {
+                        self.pending_plugin_actor_publications.push(publication);
+                        return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         format!(
                             "semantic row writes cannot follow a byte or identity transition for component plugin file '{}' in the same transaction",
@@ -6758,7 +6658,8 @@ where
                         ),
                     )
                     .with_hint("commit the byte transition before editing semantic rows"));
-                }
+                    }
+                },
                 None => {
                     let cache = self.plugin_host.actor_cache().clone();
                     let visible_materialization = self
@@ -6824,11 +6725,11 @@ where
             let visible_materialization = match self.visible_materialization(&file_key).await {
                 Ok(Some(materialization)) => materialization,
                 Ok(None) => {
-                    let publication = PendingPluginActorPublication::Existing {
-                        lease,
+                    let publication = PendingPluginActorPublication::existing(
                         successor_key,
-                        view: publication_view,
-                    };
+                        lease,
+                        publication_view,
+                    );
                     if was_chained {
                         self.pending_plugin_actor_publications.push(publication);
                     } else {
@@ -6843,11 +6744,11 @@ where
                     ));
                 }
                 Err(error) => {
-                    let publication = PendingPluginActorPublication::Existing {
-                        lease,
+                    let publication = PendingPluginActorPublication::existing(
                         successor_key,
-                        view: publication_view,
-                    };
+                        lease,
+                        publication_view,
+                    );
                     if was_chained {
                         self.pending_plugin_actor_publications.push(publication);
                     } else {
@@ -13638,7 +13539,7 @@ struct PreparedFreshPluginOpen {
     selected: PluginRegistryEntry,
     owner_row: TransactionWriteRow,
     actor_key: PluginActorKey,
-    view: PendingPluginActorView,
+    view: PluginPublicationPolicy,
     materialization_version: String,
     submitted_bytes: crate::Blob,
     create_context: BoundCreateContext,
@@ -13655,7 +13556,7 @@ struct PendingFreshPluginOpen {
     selected: PluginRegistryEntry,
     owner_row: TransactionWriteRow,
     actor_key: PluginActorKey,
-    view: PendingPluginActorView,
+    view: PluginPublicationPolicy,
     materialization_version: String,
     submitted_bytes: crate::Blob,
     create_context: BoundCreateContext,
@@ -13679,210 +13580,6 @@ impl PluginWriteReconciliation {
             .take()
             .unwrap_or_else(|| ReconciledRowBatch::raw(raw_rows))
     }
-}
-
-struct PendingPluginActorView {
-    session_key: SessionFileViewKey,
-    plugin_key: String,
-    plugin_generation: String,
-    owner_change_id: String,
-    semantic_chainable: bool,
-    retain_large_import_actor: bool,
-}
-
-enum PendingPluginActorPublication {
-    Existing {
-        lease: PluginActorLease,
-        successor_key: PluginActorKey,
-        view: PendingPluginActorView,
-    },
-    New {
-        cache: PluginActorCache,
-        key: PluginActorKey,
-        store: PluginActorStore,
-        document: WasmDocumentHandle,
-        checkpoint: Option<WasmDocumentCheckpoint>,
-        bytes: crate::Blob,
-        semantic_root: Arc<str>,
-        row_authorities: PluginRowAuthorities,
-        view: PendingPluginActorView,
-    },
-    /// The plugin transition has already produced its durable rows, but the
-    /// bounded working set does not keep its private Wasm Store alive.
-    /// Keeping this marker preserves the normal one-transition-per-file
-    /// validation and gives the session a non-authoritative file view after
-    /// commit, forcing a cold open before any later edit.
-    Uncached {
-        key: PluginActorKey,
-        view: PendingPluginActorView,
-        checkpoint: Option<PluginActorStagedCheckpoint>,
-    },
-}
-
-impl PendingPluginActorPublication {
-    async fn into_uncached(self) -> Self {
-        match self {
-            Self::Existing {
-                lease,
-                successor_key,
-                view,
-            } => {
-                let checkpoint =
-                    lease
-                        .successor_checkpoint()
-                        .and_then(|(cache, semantic_root, checkpoint)| {
-                            cache.stage_checkpoint(successor_key.clone(), semantic_root, checkpoint)
-                        });
-                let _ = lease.discard_successor().await;
-                Self::Uncached {
-                    key: successor_key,
-                    view,
-                    checkpoint,
-                }
-            }
-            Self::New {
-                cache,
-                mut store,
-                key,
-                document,
-                checkpoint,
-                semantic_root,
-                row_authorities: _,
-                view,
-                ..
-            } => {
-                let staged_checkpoint =
-                    cache.stage_checkpoint(key.clone(), Arc::clone(&semantic_root), checkpoint);
-                let _ = store.actor_mut().drop_document(document).await;
-                let _ = store.actor_mut().retire().await;
-                Self::Uncached {
-                    key,
-                    view,
-                    checkpoint: staged_checkpoint,
-                }
-            }
-            publication @ Self::Uncached { .. } => publication,
-        }
-    }
-
-    async fn discard(self) {
-        match self {
-            Self::Existing { lease, .. } => {
-                let _ = lease.discard_successor().await;
-            }
-            Self::New {
-                mut store,
-                document,
-                ..
-            } => {
-                let _ = store.actor_mut().drop_document(document).await;
-                let _ = store.actor_mut().retire().await;
-            }
-            Self::Uncached { .. } => {}
-        }
-    }
-
-    async fn publish(self) -> Result<(SessionFileViewKey, SessionPluginFileView), LixError> {
-        let (observation, view, path) = match self {
-            Self::Existing {
-                lease,
-                successor_key,
-                view,
-            } => {
-                let path = successor_key.path.clone();
-                (
-                    Some(lease.commit_successor_as(successor_key).await?),
-                    view,
-                    path,
-                )
-            }
-            Self::New {
-                cache,
-                key,
-                store,
-                document,
-                checkpoint,
-                bytes,
-                semantic_root,
-                row_authorities,
-                view,
-            } => {
-                let path = key.path.clone();
-                cache.remember_checkpoint(&key, &semantic_root, checkpoint);
-                (
-                    Some(cache.install_with_authorities(
-                        key,
-                        store,
-                        document,
-                        bytes,
-                        semantic_root,
-                        row_authorities,
-                    )),
-                    view,
-                    path,
-                )
-            }
-            Self::Uncached {
-                key,
-                view,
-                checkpoint,
-                ..
-            } => {
-                if let Some(checkpoint) = checkpoint {
-                    checkpoint.publish();
-                }
-                (None, view, key.path)
-            }
-        };
-        Ok((
-            view.session_key,
-            SessionPluginFileView {
-                path,
-                plugin_key: view.plugin_key,
-                plugin_generation: view.plugin_generation,
-                owner_change_id: view.owner_change_id,
-                observation,
-            },
-        ))
-    }
-
-    fn session_key(&self) -> &SessionFileViewKey {
-        match self {
-            Self::Existing { view, .. } | Self::New { view, .. } | Self::Uncached { view, .. } => {
-                &view.session_key
-            }
-        }
-    }
-
-    fn retains_large_import_actor(&self) -> bool {
-        match self {
-            Self::Existing { view, .. } | Self::New { view, .. } | Self::Uncached { view, .. } => {
-                view.retain_large_import_actor
-            }
-        }
-    }
-}
-
-/// Releases the oldest completed Store retained only for post-commit cache
-/// publication. Existing-file successors keep their durable staged rows but
-/// become uncached. Dropping their leases makes the predecessor slot evictable
-/// only when no concurrent transition references it; an active or waiting
-/// same-file lease therefore still preserves serialization.
-async fn retire_oldest_completed_actor(
-    publications: &mut Vec<PendingPluginActorPublication>,
-) -> bool {
-    let Some(index) = publications.iter().position(|publication| {
-        matches!(
-            publication,
-            PendingPluginActorPublication::Existing { .. }
-                | PendingPluginActorPublication::New { .. }
-        )
-    }) else {
-        return false;
-    };
-    let publication = publications.remove(index).into_uncached().await;
-    publications.insert(index, publication);
-    true
 }
 
 /// Builds the blob-backed file write for an accepted semantic renderer
@@ -13923,7 +13620,7 @@ fn semantic_rendered_file_content(
 async fn render_semantic_changes_with_lease(
     mut lease: PluginActorLease,
     successor_key: PluginActorKey,
-    view: PendingPluginActorView,
+    view: PluginPublicationPolicy,
     descriptor: WasmFileDescriptor,
     changes: WasmHostRowChanges,
     visible_root: &str,
@@ -13938,18 +13635,8 @@ async fn render_semantic_changes_with_lease(
     ),
     (LixError, PendingPluginActorPublication),
 > {
-    let publication = |lease| PendingPluginActorPublication::Existing {
-        lease,
-        successor_key: successor_key.clone(),
-        view: PendingPluginActorView {
-            session_key: view.session_key.clone(),
-            plugin_key: view.plugin_key.clone(),
-            plugin_generation: view.plugin_generation.clone(),
-            owner_change_id: view.owner_change_id.clone(),
-            semantic_chainable: view.semantic_chainable,
-            retain_large_import_actor: view.retain_large_import_actor,
-        },
-    };
+    let publication =
+        |lease| PendingPluginActorPublication::existing(successor_key.clone(), lease, view);
     let change_count = u64::try_from(changes.row_change_count()).unwrap_or(u64::MAX);
     let call = match lease.begin_pending_guest_call() {
         Ok(call) => call,
@@ -14059,12 +13746,6 @@ async fn render_semantic_changes_with_lease(
         same_length_output_splice,
         counters,
     ))
-}
-
-async fn discard_plugin_actor_publications(publications: Vec<PendingPluginActorPublication>) {
-    for publication in publications {
-        publication.discard().await;
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -15163,6 +14844,112 @@ mod tests {
         let writes = transaction.staged_writes.drain().unwrap();
         assert!(writes.state_rows.is_empty());
         assert!(writes.branch_heads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_validation_failure_retires_pending_plugin_store() {
+        let storage = Memory::new();
+        let (_, _, _, runtime, mut transaction) = open_test_transaction(&storage).await;
+        let cache = transaction.plugin_host.actor_cache().clone();
+        let (publication, retired) = crate::plugin::runtime::pending_publication_for_test(&cache);
+        transaction
+            .pending_plugin_actor_publications
+            .push(publication);
+        transaction
+            .stage_rows(raw_write_rows(vec![key_value_stage_row(
+                "key", "value", true,
+            )]))
+            .await
+            .unwrap();
+        transaction.active_account_id = "invalid-account-id".to_owned();
+        let error = transaction.commit(&runtime).await.unwrap_err();
+        assert_eq!(error.code, "LIX_INVALID_ACCOUNT_ID");
+        assert!(retired.load(Ordering::Acquire));
+        assert_eq!(cache.live_store_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_publication_failure_preserves_durable_commit_and_revokes_session_view() {
+        let storage = Memory::new();
+        let (_, _, _, runtime, mut transaction) = open_test_transaction(&storage).await;
+        transaction
+            .stage_rows(raw_write_rows(vec![key_value_stage_row(
+                "durable", "value", true,
+            )]))
+            .await
+            .unwrap();
+        let cache = transaction.plugin_host.actor_cache().clone();
+        let publication = crate::plugin::runtime::failing_publication_for_test(&cache).await;
+        let session_key = SessionFileViewKey::from_actor_key(publication.key());
+        let views = transaction.session_file_views.clone();
+        views.remember_plugin_file_view(
+            session_key.clone(),
+            SessionPluginFileView {
+                path: publication.key().path.clone(),
+                plugin_key: publication.key().plugin_key.clone(),
+                plugin_generation: publication.key().plugin_generation.clone(),
+                owner_change_id: publication.key().owner_change_id.clone(),
+                observation: None,
+            },
+        );
+        transaction
+            .pending_plugin_actor_publications
+            .push(publication);
+        transaction
+            .commit(&runtime)
+            .await
+            .expect("derived cache failure must not fail durable storage success");
+        assert!(views.unfiltered_plugin_file_view(&session_key).is_none());
+        let storage = StorageAdapter::new(storage);
+        let row = hot_state_context()
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .unwrap(),
+            )
+            .load_row(&HotStateRowRequest {
+                schema_key: "lix_key_value".to_owned(),
+                branch_id: GLOBAL_BRANCH_ID.to_owned(),
+                row_pk: RowPk::single("durable"),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await
+            .unwrap();
+        assert!(row.is_some(), "ordinary rows remain durably committed");
+    }
+
+    #[tokio::test]
+    async fn statement_rollback_discards_plugin_publication_but_restores_prior_rows() {
+        let storage = Memory::new();
+        let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+        transaction
+            .stage_rows(raw_write_rows(vec![key_value_stage_row(
+                "before", "value", true,
+            )]))
+            .await
+            .unwrap();
+        let checkpoint = transaction.begin_sql_statement_checkpoint().unwrap();
+        let cache = transaction.plugin_host.actor_cache().clone();
+        let (publication, retired) = crate::plugin::runtime::pending_publication_for_test(&cache);
+        transaction
+            .pending_plugin_actor_publications
+            .push(publication);
+        transaction
+            .stage_rows(raw_write_rows(vec![key_value_stage_row(
+                "after", "value", true,
+            )]))
+            .await
+            .unwrap();
+        transaction
+            .rollback_sql_statement_checkpoint(checkpoint)
+            .await
+            .unwrap();
+        assert!(retired.load(Ordering::Acquire));
+        assert_eq!(cache.live_store_count(), 0);
+        let writes = transaction.staged_writes.drain().unwrap();
+        assert_eq!(writes.state_rows.len(), 1);
+        assert_eq!(writes.state_rows.row(0).row_pk, &RowPk::single("before"));
     }
 
     #[test]

@@ -1398,7 +1398,7 @@ impl PluginActorCache {
     }
 
     #[cfg(test)]
-    fn live_store_count(&self) -> usize {
+    pub(crate) fn live_store_count(&self) -> usize {
         self.capacity
             .get()
             .saturating_sub(self.store_admission.available_permits())
@@ -2023,7 +2023,7 @@ fn stale_observation(message: impl Into<String>) -> LixError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use async_trait::async_trait;
 
     use super::*;
@@ -2217,6 +2217,109 @@ mod tests {
             bytes.into(),
             Arc::<str>::from(root),
         )
+    }
+
+    pub(crate) fn pending_publication_for_test(
+        cache: &PluginActorCache,
+    ) -> (
+        crate::plugin::runtime::PendingPluginActorPublication,
+        Arc<AtomicBool>,
+    ) {
+        let retired = Arc::new(AtomicBool::new(false));
+        let publication = crate::plugin::runtime::PendingPluginActorPublication::new(
+            key("main", "/pending.csv", "g1"),
+            cache.clone(),
+            PluginActorStore::new(
+                Box::new(TestActor {
+                    retirement_probe: Some(retired.clone()),
+                    ..Default::default()
+                }),
+                cache.admit_store().unwrap(),
+            ),
+            WasmDocumentHandle(1),
+            Some(WasmDocumentCheckpoint::new(42_u64, 8)),
+            b"new".as_slice().into(),
+            Arc::from("root-new"),
+            PluginRowAuthorities::empty(),
+            crate::plugin::runtime::PluginPublicationPolicy {
+                semantic_chainable: false,
+                retain_large_import_actor: false,
+            },
+        );
+        (publication, retired)
+    }
+
+    pub(crate) async fn failing_publication_for_test(
+        cache: &PluginActorCache,
+    ) -> crate::plugin::runtime::PendingPluginActorPublication {
+        let actor_key = key("main", "/pending.csv", "g1");
+        let observation = install(cache, actor_key.clone(), 1, b"old", "root-old");
+        let lease = cache.lease(&observation).await.unwrap();
+        // A missing successor injects a derived cache publication failure.
+        crate::plugin::runtime::PendingPluginActorPublication::existing(
+            actor_key,
+            lease,
+            crate::plugin::runtime::PluginPublicationPolicy {
+                semantic_chainable: true,
+                retain_large_import_actor: false,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn publication_uncaches_without_publishing_checkpoint_until_commit() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let (publication, retired) = pending_publication_for_test(&cache);
+        let actor_key = publication.key().clone();
+        let publication = publication.into_uncached().await;
+        assert!(retired.load(Ordering::Acquire));
+        assert_eq!(cache.live_store_count(), 0);
+        assert!(cache.checkpoint(&actor_key, "root-new").is_none());
+        let receipt = publication.publish().await.unwrap();
+        assert_eq!(receipt.key, actor_key);
+        assert!(receipt.observation.is_none());
+        assert!(cache.checkpoint(&actor_key, "root-new").is_some());
+    }
+
+    #[tokio::test]
+    async fn aborting_publication_releases_store_and_discards_checkpoint() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let (publication, retired) = pending_publication_for_test(&cache);
+        let actor_key = publication.key().clone();
+        publication.discard().await;
+        assert!(retired.load(Ordering::Acquire));
+        assert_eq!(cache.live_store_count(), 0);
+        assert!(cache.checkpoint(&actor_key, "root-new").is_none());
+        assert!(cache.observe(&actor_key, "root-new").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_existing_publication_retires_private_successor() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let actor_key = key("main", "/pending.csv", "g1");
+        let observation = install(&cache, actor_key.clone(), 1, b"old", "root-old");
+        let mut lease = cache.lease(&observation).await.unwrap();
+        lease.begin_guest_call().unwrap();
+        lease
+            .complete_guest_call(
+                WasmDocumentHandle(2),
+                None,
+                b"new".as_slice().into(),
+                FileBytesSha256::compute(b"new"),
+                Arc::from("root-new"),
+            )
+            .unwrap();
+        let publication = crate::plugin::runtime::PendingPluginActorPublication::existing(
+            actor_key.clone(),
+            lease,
+            crate::plugin::runtime::PluginPublicationPolicy {
+                semantic_chainable: true,
+                retain_large_import_actor: false,
+            },
+        );
+        drop(publication);
+        assert!(cache.observe(&actor_key, "root-old").await.is_err());
+        assert!(cache.observe(&actor_key, "root-new").await.is_err());
     }
 
     #[test]
