@@ -885,24 +885,30 @@ fn lix_error(error: LixRuntimeError) -> Response {
         LixRuntimeError::MigrationFailed {
             from_version,
             to_version,
+            diagnostic,
         } => protocol_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "LIX_ERROR_LIX_MIGRATION_FAILED",
-            "The lix repository migration failed.",
+            format!(
+                "The lix repository migration failed. {}",
+                diagnostic.message
+            ),
             Some("Contact the service operator to recover the repository.".to_string()),
             Some(json!({
                 "fromVersion": from_version,
                 "toVersion": to_version,
+                "sourceCode": diagnostic.source_code,
                 "operation": "lix_open",
                 "retryable": false,
             })),
         ),
-        LixRuntimeError::UpgradeFailed => protocol_error(
+        LixRuntimeError::UpgradeFailed(diagnostic) => protocol_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "LIX_ERROR_LIX_MIGRATION_FAILED",
-            "The lix repository upgrade failed.",
+            format!("The lix repository upgrade failed. {}", diagnostic.message),
             Some("Contact the service operator to recover the repository.".to_string()),
             Some(json!({
+                "sourceCode": diagnostic.source_code,
                 "operation": "lix_open",
                 "retryable": false,
             })),
@@ -1815,6 +1821,12 @@ mod tests {
     #[tokio::test]
     async fn failed_lix_migration_is_a_terminal_structured_error() {
         let response = lix_error(LixRuntimeError::MigrationFailed {
+            diagnostic: crate::store::MigrationDiagnostic::from_error(&anyhow::Error::new(
+                lix_sdk::LixError::new(
+                    "LIX_ERROR_MIGRATION_FAILED",
+                    "copy target write failed: precondition failed: private-storage-secret",
+                ),
+            )),
             from_version: 68,
             to_version: 71,
         });
@@ -1825,11 +1837,12 @@ mod tests {
             json_body(response).await["error"],
             json!({
                 "code": "LIX_ERROR_LIX_MIGRATION_FAILED",
-                "message": "The lix repository migration failed.",
+                "message": "The lix repository migration failed. The migration could not copy repository data because the destination write precondition failed.",
                 "hint": "Contact the service operator to recover the repository.",
                 "details": {
                     "fromVersion": 68,
                     "toVersion": 71,
+                    "sourceCode": "LIX_ERROR_MIGRATION_FAILED",
                     "operation": "lix_open",
                     "retryable": false,
                 },
@@ -1839,7 +1852,11 @@ mod tests {
 
     #[tokio::test]
     async fn pre_progress_upgrade_failure_is_a_terminal_structured_error() {
-        let response = lix_error(LixRuntimeError::UpgradeFailed);
+        let response = lix_error(LixRuntimeError::UpgradeFailed(
+            crate::store::MigrationDiagnostic::from_error(&anyhow::Error::new(
+                lix_sdk::LixError::new("LIX_ERROR_REPOSITORY_UPGRADE", "private-storage-secret"),
+            )),
+        ));
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!response.headers().contains_key(header::RETRY_AFTER));
@@ -1847,9 +1864,10 @@ mod tests {
             json_body(response).await["error"],
             json!({
                 "code": "LIX_ERROR_LIX_MIGRATION_FAILED",
-                "message": "The lix repository upgrade failed.",
+                "message": "The lix repository upgrade failed. The migration could not complete. The service operator can inspect the server logs for the underlying cause.",
                 "hint": "Contact the service operator to recover the repository.",
                 "details": {
+                    "sourceCode": "LIX_ERROR_REPOSITORY_UPGRADE",
                     "operation": "lix_open",
                     "retryable": false,
                 },
