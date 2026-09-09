@@ -72,6 +72,8 @@ pub(super) struct PreparedRepositorySnapshot {
     pub(super) metadata: SyncRepositoryPullResponse,
     pub(super) commits: Vec<super::SyncCommit>,
     pub(super) commit_headers: Vec<super::SyncCommitHeader>,
+    /// Inventory-only headers have deferred topology as well as deferred state.
+    pub(super) sparse_inventory_commit_ids: BTreeSet<String>,
     pub(super) rows: Vec<super::SyncSnapshotRow>,
     /// Binary payloads reachable from current branch heads or their pinned
     /// working-diff checkpoints. Older history remains deliberately excluded.
@@ -213,7 +215,10 @@ where
     )?;
     // Inventory headers are intentionally sparse. Their states and blobs use
     // ordinary history demand; only serving heads and working bases bootstrap.
+    let mut sparse_inventory_commit_ids =
+        inventory_headers.keys().cloned().collect::<BTreeSet<_>>();
     for header in std::mem::take(&mut history.commit_headers) {
+        sparse_inventory_commit_ids.remove(&header.commit_id);
         if inventory_headers
             .insert(header.commit_id.clone(), header.clone())
             .is_some_and(|existing| existing != header)
@@ -256,6 +261,7 @@ where
         metadata,
         commits: history.commits,
         commit_headers: history.commit_headers,
+        sparse_inventory_commit_ids,
         rows,
         live_blob_ids,
         checkpoint_roots,

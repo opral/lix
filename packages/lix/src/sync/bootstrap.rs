@@ -179,7 +179,7 @@ where
         });
     }
     let install = lix
-        .try_install_initial_sync_snapshot(
+        .try_install_initial_sync_snapshot_with_inventory(
             &server.url,
             prepared.transport.active_account_id(),
             &prepared.snapshot.metadata,
@@ -187,6 +187,7 @@ where
             &prepared.snapshot.commit_headers,
             &prepared.snapshot.rows,
             &prepared.snapshot.checkpoint_roots,
+            &prepared.snapshot.sparse_inventory_commit_ids,
         )
         .await;
     match install {

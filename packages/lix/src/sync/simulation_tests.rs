@@ -255,7 +255,7 @@ impl Replica {
         register_blob_manifests(&lix, &transport, &snapshot.commits, &snapshot.rows)
             .await
             .expect("simulation snapshot blob manifests should register");
-        lix.try_install_initial_sync_snapshot(
+        lix.try_install_initial_sync_snapshot_with_inventory(
             REMOTE_ID,
             transport.active_account_id(),
             &snapshot.metadata,
@@ -263,6 +263,7 @@ impl Replica {
             &snapshot.commit_headers,
             &snapshot.rows,
             &snapshot.checkpoint_roots,
+            &snapshot.sparse_inventory_commit_ids,
         )
         .await
         .expect("simulation snapshot should install");
@@ -2274,4 +2275,123 @@ impl XorShift64 {
         self.0 ^= self.0 << 17;
         self.0
     }
+}
+
+async fn sparse_inventory_jump_bootstrap_and_restore(_sim: Simulation) {
+    let authority = fresh_authority().await;
+    authority.create_checkpoint().await.unwrap();
+    // Restoring an automatic commit makes it the working baseline. A later
+    // checkpoint can therefore jump to unmarked history outside inventory.
+    for generation in 0..32 {
+        authority
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+                &[
+                    Value::Text(format!("sparse-{generation}")),
+                    Value::Text("before".into()),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+    let automatic = authority
+        .execute(
+            "SELECT commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    authority
+        .execute(
+            "UPDATE lix_key_value SET value = 'temporary' WHERE key = 'sparse-0'",
+            &[],
+        )
+        .await
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+            &[Value::Text(automatic)],
+        )
+        .await
+        .unwrap();
+    authority
+        .execute(
+            "UPDATE lix_key_value SET value = 'after' WHERE key = 'sparse-0'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let abandoned = authority.create_checkpoint().await.unwrap().commit_id;
+    let transport = AuthorityTransport::connected(authority.clone());
+    // Move the serving frontier forward without removing the historical
+    // checkpoint from mainline, so restore remains a valid ancestor operation.
+    let mut sparse_fixture = None;
+    for _ in 0..32 {
+        authority.create_checkpoint().await.unwrap();
+        let (snapshot, _, _) = fetch_repository_snapshot(&transport).await.unwrap();
+        let header = snapshot
+            .commit_headers
+            .iter()
+            .find(|h| h.commit_id == abandoned)
+            .unwrap();
+        let jump = header
+            .first_parent_jump_commit_id
+            .as_ref()
+            .expect("checkpoint has jump");
+        if !snapshot.commit_headers.iter().any(|h| &h.commit_id == jump) {
+            sparse_fixture = Some(snapshot);
+            break;
+        }
+    }
+    let snapshot = sparse_fixture.expect("fixture must exercise a missing inventory jump boundary");
+    assert!(snapshot.sparse_inventory_commit_ids.contains(&abandoned));
+    let replica = Replica::bootstrap(transport).await;
+    let query = format!(
+        "SELECT value FROM lix_as_of('lix_key_value', '{abandoned}') WHERE key = 'sparse-0'"
+    );
+    replica.hydrate_and_retry(&query).await;
+    let result = replica.lix.execute(&query, &[]).await.unwrap();
+    assert_eq!(
+        result.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!("after")
+    );
+    replica
+        .lix
+        .execute(
+            "UPDATE lix_key_value SET value = 'temporary' WHERE key = 'sparse-0'",
+            &[],
+        )
+        .await
+        .unwrap();
+    // The deterministic replica has no background worker: explicitly service
+    // the same graph-history demand the live runtime retries automatically.
+    replica
+        .hydrate_and_retry(&format!(
+            "INSERT INTO lix_restore (commit_id) VALUES ('{abandoned}')"
+        ))
+        .await;
+    replica
+        .lix
+        .execute(
+            "UPDATE lix_key_value SET value = 'restored-write' WHERE key = 'sparse-0'",
+            &[],
+        )
+        .await
+        .unwrap();
+    replica.lix.create_checkpoint().await.unwrap();
+}
+
+#[test]
+fn sparse_inventory_jump_bootstrap_and_restore_base() {
+    run_sync_simulation(
+        concat!(
+            module_path!(),
+            "::sparse_inventory_jump_bootstrap_and_restore"
+        ),
+        sparse_inventory_jump_bootstrap_and_restore,
+    );
 }

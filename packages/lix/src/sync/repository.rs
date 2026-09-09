@@ -1986,24 +1986,51 @@ impl ParsedSyncHeader {
 fn validate_sync_header_set(
     headers: &BTreeMap<CommitId, ParsedSyncHeader>,
     context: &str,
+    sparse_inventory_ids: &BTreeSet<CommitId>,
 ) -> Result<(), LixError> {
-    let mut remaining = headers.keys().copied().collect::<BTreeSet<_>>();
-    let mut resolved = BTreeSet::new();
-    while !remaining.is_empty() {
-        let ready = remaining.iter().copied().find(|commit_id| {
-            headers[commit_id]
-                .parent_commit_ids
-                .iter()
-                .all(|parent| !headers.contains_key(parent) || resolved.contains(parent))
-        });
-        let Some(commit_id) = ready else {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                format!("{context} commit header graph contains a cycle"),
-            ));
-        };
-        remaining.remove(&commit_id);
-        resolved.insert(commit_id);
+    if sparse_inventory_ids
+        .iter()
+        .any(|id| !headers.get(id).is_some_and(|h| h.is_checkpoint))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sparse inventory must reference checkpoint headers",
+        ));
+    }
+    // Kahn traversal visits each header and known parent edge once, avoiding
+    // repeated scans of the entire retained inventory for the next ready node.
+    let mut unresolved = BTreeMap::new();
+    let mut children = BTreeMap::<CommitId, Vec<CommitId>>::new();
+    let mut ready = Vec::new();
+    for (id, header) in headers {
+        let mut count = 0usize;
+        for parent in &header.parent_commit_ids {
+            if headers.contains_key(parent) {
+                count += 1;
+                children.entry(*parent).or_default().push(*id);
+            }
+        }
+        unresolved.insert(*id, count);
+        if count == 0 {
+            ready.push(*id);
+        }
+    }
+    let mut resolved = 0usize;
+    while let Some(id) = ready.pop() {
+        resolved += 1;
+        for child in children.get(&id).into_iter().flatten() {
+            let count = unresolved.get_mut(child).expect("known child");
+            *count -= 1;
+            if *count == 0 {
+                ready.push(*child);
+            }
+        }
+    }
+    if resolved != headers.len() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("{context} commit header graph contains a cycle"),
+        ));
     }
 
     for header in headers.values() {
@@ -2061,18 +2088,9 @@ fn validate_sync_header_set(
             }
         }
         if header.first_parent_jump_span > 0 {
-            let jump = headers
-                .get(&header.first_parent_jump_commit_id)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!(
-                            "{context} header '{}' is missing jump boundary '{}'",
-                            header.commit_id, header.first_parent_jump_commit_id
-                        ),
-                    )
-                })?;
-            if header.generation.checked_sub(header.first_parent_jump_span) != Some(jump.generation)
+            let expected_generation = header.generation.checked_sub(header.first_parent_jump_span);
+            if header.first_parent_jump_commit_id == header.commit_id
+                || expected_generation.is_none()
             {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
@@ -2081,6 +2099,30 @@ fn validate_sync_header_set(
                         header.commit_id
                     ),
                 ));
+            }
+            match headers.get(&header.first_parent_jump_commit_id) {
+                Some(jump) if expected_generation != Some(jump.generation) => {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "{context} header '{}' has an invalid jump span",
+                            header.commit_id
+                        ),
+                    ));
+                }
+                None if !sparse_inventory_ids.contains(&header.commit_id) => {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "{context} header '{}' is missing jump boundary '{}'",
+                            header.commit_id, header.first_parent_jump_commit_id
+                        ),
+                    ));
+                }
+                // Only inventory-only checkpoint headers may omit topology.
+                // Graph readers demand the missing history before following it;
+                // ordinary history imports must still supply the full closure.
+                _ => {}
             }
         }
     }
@@ -4331,6 +4373,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn try_install_initial_sync_snapshot(
         &self,
         remote_id: &str,
@@ -4340,6 +4383,30 @@ where
         commit_headers: &[SyncCommitHeader],
         rows: &[SyncSnapshotRow],
         checkpoint_roots: &BTreeMap<String, String>,
+    ) -> Result<InitialSyncSnapshotInstall, LixError> {
+        self.try_install_initial_sync_snapshot_with_inventory(
+            remote_id,
+            active_account_id,
+            metadata,
+            head_commits,
+            commit_headers,
+            rows,
+            checkpoint_roots,
+            &BTreeSet::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn try_install_initial_sync_snapshot_with_inventory(
+        &self,
+        remote_id: &str,
+        active_account_id: &str,
+        metadata: &SyncRepositoryPullResponse,
+        head_commits: &[SyncCommit],
+        commit_headers: &[SyncCommitHeader],
+        rows: &[SyncSnapshotRow],
+        checkpoint_roots: &BTreeMap<String, String>,
+        sparse_inventory_commit_ids: &BTreeSet<String>,
     ) -> Result<InitialSyncSnapshotInstall, LixError> {
         self.set_sync_replica_remote_id(remote_id)?;
         let _collaboration_guard = self.lock_collaboration_writes().await;
@@ -4366,6 +4433,7 @@ where
             commit_headers,
             rows,
             checkpoint_roots,
+            sparse_inventory_commit_ids,
         )
         .await
     }
@@ -4411,6 +4479,7 @@ where
         commit_headers: &[SyncCommitHeader],
         rows: &[SyncSnapshotRow],
         checkpoint_roots: &BTreeMap<String, String>,
+        sparse_inventory_commit_ids: &BTreeSet<String>,
     ) -> Result<InitialSyncSnapshotInstall, LixError> {
         super::validate_sync_remote_id(remote_id)?;
         let mut parsed_heads = BTreeMap::new();
@@ -4529,7 +4598,20 @@ where
                 ));
             }
         }
-        validate_sync_header_set(&header_by_id, "sync snapshot")?;
+        let sparse_inventory_ids = sparse_inventory_commit_ids
+            .iter()
+            .map(|id| CommitId::parse_lix(id, "sparse checkpoint inventory"))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if sparse_inventory_ids
+            .iter()
+            .any(|id| parsed_heads.contains_key(id))
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "materialized snapshot headers cannot use sparse inventory validation",
+            ));
+        }
+        validate_sync_header_set(&header_by_id, "sync snapshot", &sparse_inventory_ids)?;
         let observed = BranchHeadControlContext::new()
             .reader(&read)
             .load_observed(&branch_ids)
@@ -5192,7 +5274,7 @@ where
                 ));
             }
         }
-        validate_sync_header_set(&parsed, "sync history")?;
+        validate_sync_header_set(&parsed, "sync history", &BTreeSet::new())?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
         let mut new_records = Vec::new();
@@ -12165,6 +12247,70 @@ mod tests {
             .expect_err("metadata cannot redefine the tracked repository default");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error.message.contains("canonical tracked row"));
+    }
+
+    fn sparse_checkpoint_header() -> ParsedSyncHeader {
+        ParsedSyncHeader {
+            is_checkpoint: true,
+            commit_id: CommitId::for_test_label("sparse-inventory-checkpoint"),
+            parent_commit_ids: vec![CommitId::for_test_label("sparse-inventory-parent")],
+            base_commit_id: None,
+            account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            created_at: LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
+            global_scope: true,
+            generation: 4,
+            first_parent_jump_commit_id: CommitId::for_test_label("sparse-inventory-jump"),
+            first_parent_jump_span: 3,
+        }
+    }
+
+    #[test]
+    fn sparse_checkpoint_jump_requires_explicit_inventory_permission() {
+        let header = sparse_checkpoint_header();
+        let inventory_ids = BTreeSet::from([header.commit_id]);
+        let headers = BTreeMap::from([(header.commit_id, header)]);
+        let error = validate_sync_header_set(&headers, "test snapshot", &BTreeSet::new())
+            .expect_err("ordinary history must include jump boundaries");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("missing jump boundary"));
+        validate_sync_header_set(&headers, "test snapshot", &inventory_ids)
+            .expect("explicit sparse inventory may defer an absent jump boundary");
+    }
+
+    #[test]
+    fn sparse_checkpoint_jump_rejects_invalid_metadata() {
+        for mutation in ["self jump", "oversized span", "unmarked"] {
+            let mut header = sparse_checkpoint_header();
+            match mutation {
+                "self jump" => header.first_parent_jump_commit_id = header.commit_id,
+                "oversized span" => header.first_parent_jump_span = header.generation + 1,
+                "unmarked" => header.is_checkpoint = false,
+                _ => unreachable!(),
+            }
+            let inventory_ids = BTreeSet::from([header.commit_id]);
+            let headers = BTreeMap::from([(header.commit_id, header)]);
+            let error = validate_sync_header_set(&headers, "test snapshot", &inventory_ids)
+                .expect_err(mutation);
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn sparse_checkpoint_jump_still_validates_present_boundary_generation() {
+        let header = sparse_checkpoint_header();
+        let inventory_ids = BTreeSet::from([header.commit_id]);
+        let mut jump = header.clone();
+        jump.commit_id = header.first_parent_jump_commit_id;
+        jump.is_checkpoint = false;
+        jump.parent_commit_ids.clear();
+        jump.generation = 0;
+        jump.first_parent_jump_commit_id = jump.commit_id;
+        jump.first_parent_jump_span = 0;
+        let headers = BTreeMap::from([(header.commit_id, header), (jump.commit_id, jump)]);
+        let error = validate_sync_header_set(&headers, "test snapshot", &inventory_ids)
+            .expect_err("present jump boundary must match the declared span");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("invalid jump span"));
     }
 
     #[tokio::test]

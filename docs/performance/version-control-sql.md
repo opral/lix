@@ -40,6 +40,9 @@ descriptors, and A be ancestor directory descriptors needed to resolve paths.
 - Sparse bootstrap pages checkpoint headers/flags, while certifying state only
   for serving heads and working baselines. Off-branch historical state hydrates
   on demand; bootstrap must not materialize every checkpoint state.
+- Snapshot header validation uses a topological traversal with O((H + E) log H)
+  time and O(H + E) memory for H headers and E known parent edges. Inventory-only
+  jump boundaries stay deferred; validation does not fetch checkpoint states.
 - Migration rewrites canonical metadata and traverses deduplicated manifest
   dependencies. It must not enumerate every row of every checkpoint merely to
   backfill a boolean.
