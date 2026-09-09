@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::LixError;
 use crate::changelog::ChangeRecord;
 use crate::common::SharedStr;
-use crate::plugin::runtime::WasmTypedRow;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 
 /// Read-boundary view of a changelog change with its native payload projected.
@@ -122,7 +122,7 @@ mod tests {
     fn change(snapshot: &str, metadata: Option<lix_schema::Jsonb>) -> CommitGraphChange {
         let row_pk = RowPk::single("row-1");
         let value = serde_json::from_str(snapshot).expect("test snapshot should parse");
-        let typed = crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(&row_pk, &value)
+        let typed = crate::row_payload::TypedRow::from_test_json_unchecked(&row_pk, &value)
             .expect("test snapshot should type");
         CommitGraphChange {
             id: ChangeId::for_test_label("change-projection"),

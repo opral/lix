@@ -1,3 +1,6 @@
+/// Maximum supported parent traversal for a filesystem directory.
+pub(crate) const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
+
 mod descriptor_path;
 mod keys;
 mod path_index;

@@ -275,7 +275,7 @@ pub(crate) struct SyncCommitMemberRef<'a> {
     pub(crate) row_pk: &'a RowPk,
     pub(crate) deleted: bool,
     pub(crate) snapshot_json: Option<&'a str>,
-    pub(crate) decoded_snapshot: Option<&'a crate::plugin::runtime::WasmTypedRow>,
+    pub(crate) decoded_snapshot: Option<&'a crate::row_payload::TypedRow>,
     pub(crate) metadata_json: Option<&'a str>,
     pub(crate) row_created_at: LixTimestamp,
     pub(crate) row_updated_at: LixTimestamp,
@@ -314,7 +314,7 @@ pub(crate) fn encode_sync_commit_member(
 /// Re-encode the logical typed row so compression and storage caches do not
 /// change immutable wire identity between preflight and later export.
 pub(crate) fn encode_sync_row_payload(
-    row: &crate::plugin::runtime::WasmTypedRow,
+    row: &crate::row_payload::TypedRow,
 ) -> Result<String, LixError> {
     use base64::Engine as _;
     let bytes = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
@@ -344,7 +344,7 @@ pub(crate) fn decode_sync_row_payload(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload)
         .map_err(|error| invalid(format!("invalid sync snapshotPayload: {error}")))?;
-    let row = crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+    let row = crate::row_payload::TypedRow::decode_durable_payload(
         std::sync::Arc::from(bytes.clone()),
         schema_key,
         row_pk,
@@ -352,7 +352,7 @@ pub(crate) fn decode_sync_row_payload(
     .map_err(|error| invalid(format!("invalid sync snapshotPayload: {}", error.message)))?;
     if let Some((_, plan)) = crate::catalog::CatalogSnapshot::builtin().plan_for_key(schema_key) {
         let expected =
-            crate::plugin::runtime::WasmTypedRow::from_normalized_json(plan, row_pk, snapshot)
+            crate::row_payload::TypedRow::from_normalized_json(plan, row_pk, snapshot)
                 .map_err(|error| invalid(format!("invalid sync snapshot: {}", error.message)))?;
         if encode_sync_row_payload(&expected).map_err(|error| invalid(error.message))? != payload {
             return Err(invalid(format!(
@@ -681,8 +681,7 @@ mod tests {
         let (_, plan) = catalog.plan_for_key("custom_sync").unwrap();
         let pk = RowPk::single("one");
         let json = serde_json::json!({"id":"one", "count":42});
-        let row =
-            crate::plugin::runtime::WasmTypedRow::from_normalized_json(plan, &pk, &json).unwrap();
+        let row = crate::row_payload::TypedRow::from_normalized_json(plan, &pk, &json).unwrap();
         let payload = encode_sync_row_payload(&row).unwrap();
         decode_sync_row_payload("custom_sync", &pk, &json, Some(&payload)).unwrap();
         assert!(decode_sync_row_payload("custom_sync", &pk, &json, None).is_err());
