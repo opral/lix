@@ -1,5 +1,6 @@
 #[cfg(feature = "storage-benches")]
 mod bench_support;
+mod branch_heads;
 mod commit;
 mod commit_coordinator;
 mod context;

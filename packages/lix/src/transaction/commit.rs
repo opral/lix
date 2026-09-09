@@ -9,8 +9,8 @@ use crate::NullableKeyFilter;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
-    BranchHeadControlObservation, BranchRefReader, branch_head_control_precondition,
-    stage_branch_head_control, stage_delete_branch_head_control,
+    BranchHeadControlObservation, BranchHeadTarget, BranchRefReader,
+    branch_head_control_precondition, stage_branch_head_control, stage_delete_branch_head_control,
 };
 use crate::changelog::COMMIT_RECORD_FORMAT_VERSION;
 use crate::changelog::{
@@ -147,8 +147,15 @@ pub(crate) async fn commit_prepared_writes(
     branch_ctx: &BranchContext,
     runtime_functions: Option<&FunctionContext>,
     read: &mut impl StorageAdapterRead,
-    prepared_writes: PreparedWriteSet,
+    mut prepared_writes: PreparedWriteSet,
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
+    // Test fixtures construct SQL-shaped rows directly; enter the same typed
+    // control boundary that production transactions use during staging.
+    let direct_heads = super::branch_heads::PreparedBranchHeads::extract(
+        &mut prepared_writes.state_rows,
+        &mut prepared_writes.insert_selection,
+    )?;
+    prepared_writes.branch_heads.append(direct_heads);
     let tracked_state = TrackedStateContext::new();
     let commit_parent_heads =
         resolve_prepared_commit_parent_heads(branch_ctx, &*read, &prepared_writes, false).await?;
@@ -252,39 +259,38 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         })
         .collect::<BTreeMap<_, _>>();
 
-    let filesystem_view_changed = prepared_writes.state_rows.iter().any(|row| {
-        matches!(
-            row.schema_key.as_str(),
-            "lix_file_descriptor"
-                | "lix_directory_descriptor"
-                | "lix_binary_blob_ref"
-                | BRANCH_REF_SCHEMA_KEY
-        )
-    }) || prepared_writes
-        .commit_change_refs_by_branch
-        .values()
-        .flat_map(StagedCommitChangeRefs::selected_changes)
-        .any(|change_ref| {
+    let filesystem_view_changed = !prepared_writes.branch_heads.is_empty()
+        || prepared_writes.state_rows.iter().any(|row| {
             matches!(
-                change_ref.schema_key(),
+                row.schema_key.as_str(),
                 "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
             )
-        });
+        })
+        || prepared_writes
+            .commit_change_refs_by_branch
+            .values()
+            .flat_map(StagedCommitChangeRefs::selected_changes)
+            .any(|change_ref| {
+                matches!(
+                    change_ref.schema_key(),
+                    "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
+                )
+            });
     // Which account rows are visible changes when an account row is written
     // and when a branch ref moves (the account rows live in the global
     // branch's tracked state, so a head move can change the view without any
     // account row in this commit). Both cases rotate the token; ordinary CRUD
     // does not, which is the whole point.
-    let account_view_changed = prepared_writes.state_rows.iter().any(|row| {
-        matches!(
-            row.schema_key.as_str(),
-            ACCOUNT_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY
-        )
-    }) || prepared_writes
-        .commit_change_refs_by_branch
-        .values()
-        .flat_map(StagedCommitChangeRefs::selected_changes)
-        .any(|change_ref| change_ref.schema_key() == ACCOUNT_SCHEMA_KEY);
+    let account_view_changed = !prepared_writes.branch_heads.is_empty()
+        || prepared_writes
+            .state_rows
+            .iter()
+            .any(|row| matches!(row.schema_key.as_str(), ACCOUNT_SCHEMA_KEY))
+        || prepared_writes
+            .commit_change_refs_by_branch
+            .values()
+            .flat_map(StagedCommitChangeRefs::selected_changes)
+            .any(|change_ref| change_ref.schema_key() == ACCOUNT_SCHEMA_KEY);
     let staged_creation_parents = staged_branch_creation_parent_heads(&prepared_writes)?;
     let authored_branch_ids = prepared_writes
         .commit_change_refs_by_branch
@@ -298,11 +304,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
     #[cfg(feature = "storage-benches")]
     state_rows.record_ownership(crate::storage_bench::CRUD_OWNERSHIP_AUTHORITY);
-    // Explicit branch publications are the final commit-planning consumer of
-    // decoded JSON. Project them into one typed batch map before dropping the
-    // shared parsed column; every later materialization stage consumes this
-    // map plus canonical arena slices.
-    let mut explicit_branch_targets = explicit_branch_head_targets(&state_rows)?;
+    let mut explicit_branch_targets = prepared_writes.branch_heads.targets.clone();
     // Creating a branch and authoring its first commit is one publication. Its
     // initial ref supplies ancestry, while the normal commit publishes the head.
     // Existing branches still reject explicit ref + normal commit combinations.
@@ -405,21 +407,19 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     // row for a normal branch-head advance, but `lix_change` remains an
     // unscoped public ledger. Retain one tiny direct change fact per
     // published control.
-    let branch_head_changes = tracked_roots
+    let mut branch_head_changes = tracked_roots
         .iter()
         .filter(|root| root.publish_head)
         .map(|root| branch_ref_change_record(root, active_account_id))
         .collect::<Result<Vec<_>, _>>()?;
+    branch_head_changes.extend(prepared_writes.branch_heads.changes(active_account_id));
     // Every commit publishes an immutable, structurally shared tracked-state
     // root. Historical diff, merge, and point reads can therefore traverse
     // endpoint trees instead of replaying the first-parent changelog.
     // The current-state protocol publishes automatic tracked heads through
     // one direct control record.
-    // Do not also synthesize a mutable `lix_branch_ref` current row for every
-    // normal commit: `branch_head_changes` above preserves the immutable
-    // public `lix_change` ledger fact. Explicit branch-management writes
-    // retain their legacy row lowering below while control records are the
-    // sole authority readers consult.
+    // Both ordinary advances and explicit lifecycle intents publish controls
+    // directly. The immutable public ledger is their only row projection.
     let mut engine_rows = Vec::new();
     if let Some((highest_seen, timestamp, change_id)) =
         runtime_functions.and_then(FunctionContext::deterministic_sequence_checkpoint)
@@ -465,6 +465,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
 
     if state_rows.is_empty()
+        && explicit_branch_targets.is_empty()
         && commit_rows.is_empty()
         && engine_rows.is_empty()
         && writes.is_empty()
@@ -565,8 +566,14 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
 
     let selected_change_payloads = materialize_selected_change_payloads(&selected_change_records)?;
 
-    let branch_control_observations =
-        observe_branch_head_controls(read, &tracked_roots, &state_rows, &engine_rows).await?;
+    let branch_control_observations = observe_branch_head_controls(
+        read,
+        &tracked_roots,
+        &state_rows,
+        &engine_rows,
+        &explicit_branch_targets,
+    )
+    .await?;
 
     validate_restore_observed_heads(restore_targets, &branch_control_observations)?;
 
@@ -1297,22 +1304,10 @@ async fn stage_changelog_commits(
             "staged commit graph contains a parent cycle",
         ));
     }
-    let changes = state_rows
+    let changes = branch_head_changes
         .iter()
-        // Ordinary untracked members are intentionally current-state only in
-        // V16. `lix_branch_ref` is the one control-plane exception: its
-        // published control retains a public ref_change_id, so that immutable
-        // ledger fact must remain available to `lix_change` and GC even
-        // though it is not a commit member.
-        .filter(|row| row.untracked && row.schema_key == BRANCH_REF_SCHEMA_KEY)
-        .map(|row| transaction_change_record_from_state_row(row, active_account_id))
-        .chain(
-            branch_head_changes
-                .iter()
-                .map(|change| Ok(TransactionChangeRecordRef::from(change))),
-        )
-        // Engine-owned untracked state follows the same current-only rule.
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(TransactionChangeRecordRef::from)
+        .collect::<Vec<_>>();
     let mut staged = BTreeMap::<CommitId, StagedChangelogCommit>::new();
     for commit_row in commit_rows {
         let generation = generations[&commit_row.commit_id];
@@ -1424,30 +1419,6 @@ fn validate_selected_change_refs(
         }
     }
     Ok(())
-}
-
-fn transaction_change_record_from_state_row<'a>(
-    row: PreparedStateRowRef<'a>,
-    active_account_id: &'a str,
-) -> Result<TransactionChangeRecordRef<'a>, LixError> {
-    let Some(change_id) = row.change_id.as_ref() else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "staged row is missing change_id before changelog change construction",
-        ));
-    };
-    Ok(TransactionChangeRecordRef {
-        format_version: 2,
-        change_id: *change_id,
-        account_id: active_account_id,
-        row_pk: row.row_pk,
-        schema_key: row.schema_key,
-        file_id: row.file_id.map(crate::common::SharedStr::as_str),
-        metadata: row.metadata,
-        snapshot: row.snapshot,
-        created_at: row.updated_at,
-        origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
-    })
 }
 
 #[derive(Clone, Debug)]
@@ -2963,7 +2934,7 @@ struct CheckpointEpochBinding {
 fn lifecycle_snapshot_commit_ids(
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
-    explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
+    explicit_branch_targets: &BTreeMap<String, BranchHeadTarget>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CheckpointEpochBinding>,
 ) -> Result<BTreeSet<CommitId>, LixError> {
@@ -3672,7 +3643,7 @@ async fn stage_tracked_head(
     >,
     insert_selection: &PreparedInsertSelection,
     certified_fresh_plugin_file_id: Option<&str>,
-    explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
+    explicit_branch_targets: &BTreeMap<String, BranchHeadTarget>,
     staged_creation_parents: &BTreeMap<String, CommitId>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CheckpointEpochBinding>,
@@ -4062,11 +4033,7 @@ async fn stage_tracked_head(
         } else {
             state_rows
                 .iter()
-                .filter(|row| {
-                    row.untracked
-                        && row.branch_id.as_str() == root.branch_id
-                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                })
+                .filter(|row| row.untracked && row.branch_id.as_str() == root.branch_id)
                 .map(current_state_delta_from_state_row)
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -4096,7 +4063,6 @@ async fn stage_tracked_head(
                         && !row.untracked
                         && row.has_payload()
                         && row.file_id.is_none()
-                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
                         && row.schema_key
                             != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
                         && row.commit_id == Some(root.commit_id)
@@ -4130,7 +4096,6 @@ async fn stage_tracked_head(
                         && row.has_payload()
                         && row.metadata.is_none()
                         && row.file_id.is_none()
-                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
                         && row.schema_key
                             != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
                         && row.commit_id == Some(root.commit_id)
@@ -4938,7 +4903,7 @@ async fn stage_tracked_head(
     } else {
         state_rows
             .iter()
-            .filter(|row| row.untracked && row.schema_key != BRANCH_REF_SCHEMA_KEY)
+            .filter(|row| row.untracked)
             .map(|row| row.branch_id.as_str())
             .chain(engine_rows.iter().map(|row| row.branch_id.as_str()))
             .filter(|branch_id| {
@@ -4960,11 +4925,7 @@ async fn stage_tracked_head(
             })?;
         let mut deltas = state_rows
             .iter()
-            .filter(|row| {
-                row.untracked
-                    && row.branch_id == branch_id
-                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-            })
+            .filter(|row| row.untracked && row.branch_id == branch_id)
             .map(current_state_delta_from_state_row)
             .collect::<Result<Vec<_>, _>>()?;
         deltas.extend(
@@ -5056,7 +5017,6 @@ fn tracked_head_absence_guards<'a>(
         .filter(|(row_index, row)| {
             insert_selection.contains(*row_index)
                 && row.branch_id == branch_id
-                && row.schema_key != BRANCH_REF_SCHEMA_KEY
                 && row.has_payload()
                 && !certified_fresh_plugin_file_id.is_some_and(|file_id| {
                     row.file_id.map(crate::common::SharedStr::as_str) == Some(file_id)
@@ -5196,9 +5156,10 @@ fn apply_pending_untracked_identities(
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
 ) {
-    for row in state_rows.iter().filter(|row| {
-        row.untracked && row.branch_id == branch_id && row.schema_key != BRANCH_REF_SCHEMA_KEY
-    }) {
+    for row in state_rows
+        .iter()
+        .filter(|row| row.untracked && row.branch_id == branch_id)
+    {
         let identity = TrackedStateKey {
             schema_key: row.schema_key.to_string(),
             file_id: row.file_id.map(ToString::to_string),
@@ -5354,7 +5315,7 @@ fn insert_direct_branch_control(
 
 fn bind_branch_checkpoint_bridge(
     branch_id: &str,
-    target: &ExplicitBranchHeadTarget,
+    target: &BranchHeadTarget,
     existing: Option<BranchHeadControl>,
     control: &mut BranchHeadControl,
     bridge: &crate::gc::CheckpointRecoveryRef,
@@ -5393,19 +5354,14 @@ fn bind_branch_checkpoint_bridge(
 
 /// Publishes every current-state branch control under an exact-byte CAS token.
 ///
-/// Normal tracked commits arrive as `normal_controls`, built from the same
-/// parent/generation decision that wrote the current-state hot rows. Explicit branch
-/// management still enters the prepared-row pipeline for validation and
-/// changelog compatibility, but its authoritative moving head is lowered
-/// here as well. This deliberately keeps the rare lifecycle lane compatible
-/// while removing automatic `lix_branch_ref` materialization from normal
-/// CRUD commits.
+/// Normal advances and explicit typed lifecycle intents share this publisher.
+/// SQL constraint and immutable ledger projections never enter mutable state.
 async fn stage_root_backed_branch_publication(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     branch_id: &str,
     head_commit_id: CommitId,
-    target: &ExplicitBranchHeadTarget,
+    target: &BranchHeadTarget,
     previous_control: Option<BranchHeadControl>,
     restore: bool,
     stage_initial_working_diff_epoch: bool,
@@ -5416,11 +5372,7 @@ async fn stage_root_backed_branch_publication(
     let tracked_head = TrackedHeadContext::new();
     let untracked_deltas = state_rows
         .iter()
-        .filter(|row| {
-            row.untracked
-                && row.branch_id.as_str() == branch_id
-                && row.schema_key != BRANCH_REF_SCHEMA_KEY
-        })
+        .filter(|row| row.untracked && row.branch_id.as_str() == branch_id)
         .map(current_state_delta_from_state_row)
         .chain(
             engine_rows
@@ -5438,7 +5390,6 @@ async fn stage_root_backed_branch_publication(
             .filter(|(row_index, row)| {
                 row.untracked
                     && row.branch_id.as_str() == branch_id
-                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
                     && row.snapshot.is_some()
                     && insert_selection.contains(*row_index)
             })
@@ -5640,7 +5591,6 @@ async fn stage_root_backed_branch_publication(
                 .filter(|(row_index, row)| {
                     row.untracked
                         && row.branch_id.as_str() == branch_id
-                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
                         && row.has_payload()
                         && insert_selection.contains(*row_index)
                 })
@@ -5677,7 +5627,7 @@ async fn stage_branch_head_control_publications(
     normal_controls: &BTreeMap<String, BranchHeadControl>,
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
-    explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
+    explicit_branch_targets: &BTreeMap<String, BranchHeadTarget>,
     restore_targets: &BTreeMap<String, PendingRestoreIntent>,
     insert_selection: &PreparedInsertSelection,
     checkpoint_publications: &[crate::gc::CheckpointPublication],
@@ -5915,18 +5865,6 @@ fn checkpoint_state_source_bindings(
     Ok(bindings)
 }
 
-/// Returns explicit public branch-ref targets. `None` is a deletion; `Some`
-/// is a validated commit id. The current-state control record remains the
-/// authority, while retaining these rows in generic lifecycle lowering keeps
-/// target-existence checks in force.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ExplicitBranchHeadTarget {
-    head_commit_id: Option<CommitId>,
-    ref_change_id: ChangeId,
-    created_at: LixTimestamp,
-    updated_at: LixTimestamp,
-}
-
 fn release_validated_canonical_value_columns(state_rows: &mut PreparedStateBatch) {
     state_rows.release_validated_canonical_value_columns();
 }
@@ -5985,64 +5923,8 @@ fn prepare_row_columnar_write_sets(
     Ok(crate::hot_state::RowColumnarWriteSets::new())
 }
 
-fn explicit_branch_head_targets(
-    state_rows: &PreparedStateBatch,
-) -> Result<BTreeMap<String, ExplicitBranchHeadTarget>, LixError> {
-    let mut targets = BTreeMap::new();
-    for row in state_rows {
-        if row.schema_key != BRANCH_REF_SCHEMA_KEY || !row.untracked {
-            continue;
-        }
-        let branch_id = row.row_pk.as_single_string_owned()?;
-        let materialized_typed = row.materialize_decoded_snapshot()?;
-        let head_commit_id = if let Some(typed) = materialized_typed.as_deref() {
-            match typed.row.get("commit_id") {
-                Some(lix_schema::Value::Uuid(value)) => Some(CommitId::new(*value)),
-                Some(lix_schema::Value::Text(value)) => Some(CommitId::parse_lix(
-                    value,
-                    "current-state branch-head control target",
-                )?),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if row.has_payload() && head_commit_id.is_none() {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                format!(
-                    "branch ref for branch '{branch_id}' is missing commit_id before current-state publication"
-                ),
-            ));
-        }
-        let ref_change_id = row.change_id.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "explicit branch ref for branch '{branch_id}' is missing its public change id"
-                ),
-            )
-        })?;
-        let target = ExplicitBranchHeadTarget {
-            head_commit_id,
-            ref_change_id,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        };
-        if targets.insert(branch_id.clone(), target).is_some() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "transaction contains multiple explicit branch-ref publications for branch '{branch_id}'"
-                ),
-            ));
-        }
-    }
-    Ok(targets)
-}
-
 fn validate_restore_targets(
-    explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
+    explicit_branch_targets: &BTreeMap<String, BranchHeadTarget>,
     restore_targets: &BTreeMap<String, PendingRestoreIntent>,
 ) -> Result<(), LixError> {
     for (branch_id, intent) in restore_targets {
@@ -6095,7 +5977,7 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
     read: &(impl StorageAdapterRead + ?Sized),
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
-    explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
+    explicit_branch_targets: &BTreeMap<String, BranchHeadTarget>,
     restore_targets: &BTreeMap<String, PendingRestoreIntent>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
 ) -> Result<(), LixError> {
@@ -6177,7 +6059,7 @@ fn branch_ref_with_untracked_rows_error(branch_id: &str, deletion: bool) -> LixE
 /// targets and runs before any branch control is published.
 async fn ensure_explicit_branch_ref_targets_exist(
     read: &(impl StorageAdapterRead + ?Sized),
-    explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
+    explicit_branch_targets: &BTreeMap<String, BranchHeadTarget>,
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
 ) -> Result<(), LixError> {
     let target_ids = explicit_branch_targets
@@ -6217,6 +6099,7 @@ async fn observe_branch_head_controls(
     tracked_roots: &[PendingTrackedRoot],
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
+    explicit_branch_targets: &BTreeMap<String, BranchHeadTarget>,
 ) -> Result<BTreeMap<String, BranchHeadControlObservation>, LixError> {
     let mut branch_ids = tracked_roots
         .iter()
@@ -6224,12 +6107,11 @@ async fn observe_branch_head_controls(
         .map(|root| root.branch_id.clone())
         .collect::<BTreeSet<_>>();
     for row in state_rows {
-        if row.schema_key == BRANCH_REF_SCHEMA_KEY && row.untracked {
-            branch_ids.insert(row.row_pk.as_single_string_owned()?);
-        } else if row.untracked {
+        if row.untracked {
             branch_ids.insert(row.branch_id.to_string());
         }
     }
+    branch_ids.extend(explicit_branch_targets.keys().cloned());
     branch_ids.extend(engine_rows.iter().map(|row| row.branch_id.clone()));
     // Every authored change references a global account. Observing and later
     // fencing this control serializes account deletion/disable with writes on
@@ -7271,6 +7153,9 @@ async fn assign_local_overlay_parents(
 fn staged_branch_creation_parent_heads(
     prepared: &PreparedWriteSet,
 ) -> Result<BTreeMap<String, CommitId>, LixError> {
+    let targets = &prepared.branch_heads.targets;
+    let projected = prepared.branch_heads.validation_projection(prepared);
+    let prepared = &projected;
     let descriptors = prepared
         .state_rows
         .iter()
@@ -7298,11 +7183,11 @@ fn staged_branch_creation_parent_heads(
         })
         .map(|(_, row)| row.row_pk.as_single_string_owned())
         .collect::<Result<BTreeSet<_>, _>>()?;
-    Ok(explicit_branch_head_targets(&prepared.state_rows)?
-        .into_iter()
+    Ok(targets
+        .iter()
         .filter_map(|(branch, target)| {
-            (descriptors.contains(&branch) && inserted_refs.contains(&branch))
-                .then_some((branch, target.head_commit_id?))
+            (descriptors.contains(branch) && inserted_refs.contains(branch))
+                .then_some((branch.clone(), target.head_commit_id?))
         })
         .collect())
 }
@@ -7723,7 +7608,7 @@ mod tests {
         let recovered_head = CommitId::parse_lix(&receipt.initial_commit_id, "fixture main head")
             .expect("fixture main head parses");
         let checkpoint = commit_id("branch-bridge-checkpoint");
-        let target = ExplicitBranchHeadTarget {
+        let target = BranchHeadTarget {
             head_commit_id: Some(recovered_head),
             ref_change_id: change_id("branch-bridge-ref-change"),
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -8031,6 +7916,7 @@ mod tests {
             uncovered_descriptor_insert,
         ];
         let mut writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             insert_selection: PreparedInsertSelection::new(),
             state_rows: PreparedStateBatch::from_test_rows(rows.clone()),
             commit_change_refs_by_branch: BTreeMap::new(),
@@ -8359,6 +8245,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows,
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -8579,6 +8466,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![branch_ref_delete, pending_untracked],
                 commit_change_refs_by_branch: BTreeMap::new(),
@@ -8617,6 +8505,7 @@ mod tests {
             None,
             &mut untracked_read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![persisted_untracked],
                 commit_change_refs_by_branch: BTreeMap::new(),
@@ -8654,6 +8543,7 @@ mod tests {
             None,
             &mut delete_read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![branch_ref_delete],
                 commit_change_refs_by_branch: BTreeMap::new(),
@@ -8692,6 +8582,7 @@ mod tests {
             None,
             &mut cleanup_read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![cleanup_branch_ref_delete, untracked_delete],
                 commit_change_refs_by_branch: BTreeMap::new(),
@@ -8741,6 +8632,7 @@ mod tests {
         let mut tracked_row = tracked_global_row(row_change);
         tracked_row.commit_id = Some(commit_id(target_commit));
         let prepared = PreparedWriteSet {
+            branch_heads: Default::default(),
             insert_selection: PreparedInsertSelection::new(),
             state_rows: prepared_rows![
                 tracked_row,
@@ -9199,6 +9091,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![first],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -9246,6 +9139,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![second],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -9293,6 +9187,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![third],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -9337,6 +9232,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![deleted],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -9498,6 +9394,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![normal],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -9542,6 +9439,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: PreparedStateBatch::new(),
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -9602,6 +9500,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![tracked_global_row("tracked-head-change")],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -9773,6 +9672,7 @@ mod tests {
             None,
             &mut first_read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![first],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -9816,6 +9716,7 @@ mod tests {
             None,
             &mut second_read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![second],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -9868,6 +9769,7 @@ mod tests {
             None,
             &mut first_read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![first],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -9952,6 +9854,7 @@ mod tests {
             None,
             &mut second_read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![second],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -10015,6 +9918,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![global_override, global_fallback],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -10054,6 +9958,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![branch_override],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -10167,6 +10072,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![branch_tombstone],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -10489,6 +10395,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows,
                 commit_change_refs_by_branch: BTreeMap::new(),
@@ -10563,6 +10470,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![untracked_global_row("change-untracked")],
                 commit_change_refs_by_branch: BTreeMap::new(),
@@ -10591,6 +10499,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows,
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -10634,6 +10543,7 @@ mod tests {
                 None,
                 &mut read,
                 PreparedWriteSet {
+                    branch_heads: Default::default(),
                     insert_selection: PreparedInsertSelection::new(),
                     state_rows: prepared_rows![setup_row],
                     commit_change_refs_by_branch: BTreeMap::from([(
@@ -10669,6 +10579,7 @@ mod tests {
                 None,
                 &mut read,
                 PreparedWriteSet {
+                    branch_heads: Default::default(),
                     insert_selection: PreparedInsertSelection::new(),
                     state_rows: prepared_rows![untracked_key_value_row(
                         DETERMINISTIC_MODE_KEY,
@@ -10716,6 +10627,7 @@ mod tests {
             Some(&runtime_functions),
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![tracked_row, untracked_row],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -10866,6 +10778,7 @@ mod tests {
             None,
             &mut read,
             PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows,
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -11061,6 +10974,7 @@ mod tests {
             &branch_ctx,
             &read,
             &PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: prepared_rows![tracked_branch_row("missing-branch", "missing-change")],
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -11093,6 +11007,7 @@ mod tests {
             &branch_ctx,
             &read,
             &PreparedWriteSet {
+                branch_heads: Default::default(),
                 insert_selection: PreparedInsertSelection::new(),
                 state_rows: PreparedStateBatch::new(),
                 commit_change_refs_by_branch: BTreeMap::from([(
@@ -11119,6 +11034,7 @@ mod tests {
         branch_ref_change_label: &str,
     ) -> PreparedWriteSet {
         PreparedWriteSet {
+            branch_heads: Default::default(),
             insert_selection: PreparedInsertSelection::new(),
             state_rows: prepared_rows![direct_branch_ref_row(
                 branch_id,
@@ -11160,6 +11076,7 @@ mod tests {
         branch_ref_change_label: &str,
     ) -> PreparedWriteSet {
         PreparedWriteSet {
+            branch_heads: Default::default(),
             insert_selection: PreparedInsertSelection::new(),
             state_rows: prepared_rows![tracked_global_row(row_change_label)],
             commit_change_refs_by_branch: BTreeMap::from([(
@@ -11195,6 +11112,7 @@ mod tests {
             }),
         ));
         PreparedWriteSet {
+            branch_heads: Default::default(),
             insert_selection: PreparedInsertSelection::new(),
             state_rows: prepared_rows![row],
             commit_change_refs_by_branch: BTreeMap::from([(

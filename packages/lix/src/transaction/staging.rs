@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use smallvec::SmallVec;
 
+use super::branch_heads::PreparedBranchHeads;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BlobBytesBatch, BlobId};
 use crate::catalog::SchemaPlanId;
@@ -57,6 +58,7 @@ pub(crate) const MUTATION_JOURNAL_CHUNK_MAX_ROWS: usize = 4 * 1_024;
 /// transaction prepares it into a stable `PreparedStateBatch`, reads build a
 /// `PreparedStateRowOverlay` over that batch, and commit drains the same owner.
 pub(crate) struct TransactionWriteBuffer {
+    branch_heads: Mutex<PreparedBranchHeads>,
     functions: FunctionProviderHandle,
     rows: Mutex<StagedPreparedRows>,
     ordered_mutations: Mutex<Option<OrderedMutationJournal>>,
@@ -75,6 +77,7 @@ pub(crate) struct TransactionWriteBuffer {
 /// This owns the prepared-row owners and transaction control structures needed
 /// to restore an explicit transaction after a post-stage SQL error.
 pub(crate) struct TransactionWriteBufferCheckpoint {
+    branch_heads: PreparedBranchHeads,
     rows: StagedPreparedRows,
     ordered_mutations: Option<OrderedMutationJournal>,
     commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
@@ -1034,6 +1037,7 @@ impl TrackedStateKey {
 /// Drained prepared transaction writes ready for commit.
 #[derive(Clone)]
 pub(crate) struct PreparedWriteSet {
+    pub(crate) branch_heads: PreparedBranchHeads,
     pub(crate) state_rows: PreparedStateBatch,
     pub(crate) insert_selection: PreparedInsertSelection,
     pub(crate) commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
@@ -1206,7 +1210,7 @@ impl PreparedInsertSelection {
             .reserve(final_words.saturating_sub(self.bits.len()));
     }
 
-    fn resize_rows(&mut self, row_count: usize) {
+    pub(super) fn resize_rows(&mut self, row_count: usize) {
         debug_assert!(row_count >= self.row_count);
         if !self.origins.is_empty() {
             self.origins.resize(row_count, None);
@@ -1221,7 +1225,7 @@ impl PreparedInsertSelection {
         self.row_count = row_count;
     }
 
-    fn mark(
+    pub(super) fn mark(
         &mut self,
         row_index: usize,
         origin: Option<&TransactionWriteOrigin>,
@@ -1584,7 +1588,8 @@ impl PreparedWriteSet {
         branch_id: &str,
         cohort_commit_id: CommitId,
     ) -> Result<(), LixError> {
-        if !other.first_commit_parent_override_by_branch.is_empty()
+        if !other.branch_heads.is_empty()
+            || !other.first_commit_parent_override_by_branch.is_empty()
             || !other.checkpoint_publications.is_empty()
             || !other.extra_commit_parents_by_branch.is_empty()
             || !other.intermediate_commits.is_empty()
@@ -1752,8 +1757,16 @@ impl PreparedWriteSet {
 }
 
 impl TransactionWriteBuffer {
+    pub(crate) fn stage_branch_heads(&self, heads: PreparedBranchHeads) {
+        self.branch_heads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(heads)
+    }
+
     pub(crate) fn new(functions: FunctionProviderHandle) -> Self {
         Self {
+            branch_heads: Mutex::new(PreparedBranchHeads::default()),
             functions,
             rows: Mutex::new(StagedPreparedRows::default()),
             ordered_mutations: Mutex::new(None),
@@ -2081,6 +2094,14 @@ impl TransactionWriteBuffer {
     }
 
     pub(crate) fn is_file_cohort_eligible(&self, branch_id: &str) -> bool {
+        if !self
+            .branch_heads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return false;
+        }
         let rows = self.rows.lock().unwrap_or_else(|error| error.into_inner());
         let rows = match &*rows {
             StagedPreparedRows::AppendOnly { rows, .. }
@@ -2176,6 +2197,11 @@ impl TransactionWriteBuffer {
         })?;
 
         Ok(TransactionWriteBufferCheckpoint {
+            branch_heads: self
+                .branch_heads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             rows: rows.clone(),
             ordered_mutations: ordered_mutations.clone(),
             commit_change_refs_by_branch: commit_change_refs_by_branch.clone(),
@@ -2195,6 +2221,7 @@ impl TransactionWriteBuffer {
         checkpoint: TransactionWriteBufferCheckpoint,
     ) -> Result<(), LixError> {
         let TransactionWriteBufferCheckpoint {
+            branch_heads,
             rows,
             ordered_mutations,
             commit_change_refs_by_branch,
@@ -2204,6 +2231,7 @@ impl TransactionWriteBuffer {
             intermediate_commits,
             file_content_writes,
         } = checkpoint;
+        *self.branch_heads.lock().unwrap_or_else(|e| e.into_inner()) = branch_heads;
         let mut rows_guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -2766,6 +2794,9 @@ impl TransactionWriteBuffer {
             refs.attach_ordered_mutation_journal(Arc::new(journal))?;
         }
         Ok(PreparedWriteSet {
+            branch_heads: std::mem::take(
+                &mut *self.branch_heads.lock().unwrap_or_else(|e| e.into_inner()),
+            ),
             state_rows,
             insert_selection,
             commit_change_refs_by_branch: std::mem::take(&mut *commit_change_refs_guard),
