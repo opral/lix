@@ -2543,13 +2543,132 @@ where
         let rows = self.tree.scan(&self.store, &root, request).await?;
         self.validate_commit_root_coverage(commit_id, request, &rows, &metadata)
             .await?;
+        self.validate_root_tombstone_membership(commit_id, &metadata, &rows)
+            .await?;
+        // Tombstone payload bodies can be reclaimed after a checkpoint. Their
+        // deletion coordinates remain authenticated by the root and delta
+        // index; use the same proof as tree diffs instead of hydrating a
+        // retired mutation body. Live rows still require canonical payloads.
+        let mut tombstones = TrackedStateTreeDiffBatchBuilder::with_row_capacity(0);
+        for (key, value) in &rows {
+            if value.deleted {
+                tombstones.push_shared(
+                    crate::tracked_state::codec::DecodedTrackedStateKeyShared {
+                        schema_key: key.schema_key.clone().into(),
+                        file_id: key.file_id.clone().map(Into::into),
+                        row_pk: key.row_pk.clone(),
+                    },
+                    None,
+                    Some(value.clone()),
+                );
+            }
+        }
+        self.validate_tree_diff_batch_against_delta_index(&tombstones.finish()?)
+            .await?;
         let rows = rows
             .into_iter()
+            .filter(|(_, value)| !value.deleted)
             .map(|(key, value)| TrackedStateDiffRow::from_tree_entry(key, value))
             .collect::<Vec<_>>();
         let row_refs = rows.iter().map(|row| (row, commit_id)).collect::<Vec<_>>();
         self.validate_diff_rows_for_commits_against_changelog(&row_refs)
             .await
+    }
+
+    async fn validate_root_tombstone_membership(
+        &self,
+        commit_id: &str,
+        metadata: &TrackedStateCommitRoot,
+        rows: &[(TrackedStateKey, TrackedStateIndexValue)],
+    ) -> Result<(), LixError> {
+        let tombstones = rows
+            .iter()
+            .filter(|(_, value)| value.deleted)
+            .collect::<Vec<_>>();
+        if tombstones.is_empty() {
+            return Ok(());
+        }
+        let typed_commit_id = CommitId::parse_lix(commit_id, "root tombstone proof")?;
+        let state = storage::load_point_replay_commit_state(&self.store, typed_commit_id).await?;
+        if metadata.complete_state_fence {
+            let published =
+                storage::load_published_commit_state_manifest(&self.store, typed_commit_id).await?;
+            if published
+                .as_ref()
+                .and_then(|manifest| manifest.snapshot_root.as_deref())
+                == Some(metadata)
+            {
+                // The content-addressed complete root authenticates every
+                // coordinate, including sparse snapshots with retired authors.
+                return Ok(());
+            }
+        }
+        let parent_rows = match metadata.parent_roots.first() {
+            Some(parent) => {
+                self.tree
+                    .scan(
+                        &self.store,
+                        &parent.root_id,
+                        &TrackedStateTreeScanRequest::default(),
+                    )
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        let parents = parent_rows.into_iter().collect::<BTreeMap<_, _>>();
+        let state = state.ok_or_else(|| missing_commit_root_error(commit_id))?;
+        for (key, value) in tombstones {
+            let parent = parents.get(key);
+            if parent == Some(value) {
+                continue;
+            }
+            let mut candidates = vec![
+                key.clone(),
+                collection_cascade_payload_key(&key.schema_key, key.file_id.as_deref()),
+            ];
+            if let Some(file_id) = &key.file_id {
+                candidates.push(cascade_payload_key(file_id));
+            }
+            let mut encoded = TrackedStateKeyBatchBuilder::with_row_capacity(candidates.len());
+            for candidate in &candidates {
+                encoded.push(TrackedStateKeyRef {
+                    schema_key: &candidate.schema_key,
+                    file_id: candidate.file_id.as_deref(),
+                    row_pk: &candidate.row_pk,
+                });
+            }
+            let values = self
+                .load_commit_delta_values_for_encoded_queries(&state, encoded.finish())
+                .await?;
+            let valid = values.iter().enumerate().any(|(index, candidate)| {
+                let Some(candidate) = candidate else {
+                    return false;
+                };
+                if candidate.change_id != value.change_id
+                    || candidate.commit_id != value.commit_id
+                    || candidate.updated_at() != value.updated_at()
+                {
+                    return false;
+                }
+                if index == 0 {
+                    candidate.deleted
+                        && value.created_at()
+                            == parent
+                                .map_or(candidate.created_at(), TrackedStateIndexValue::created_at)
+                } else {
+                    parent.is_some_and(|parent| {
+                        !parent.deleted && value.created_at() == parent.created_at()
+                    }) && (index == 1 || candidate.deleted)
+                }
+            });
+            if !valid {
+                return Err(LixError::unknown(format!(
+                    "tracked-state tombstone '{}' is not a current delta or inherited member of root '{commit_id}' for identity {:?}",
+                    value.change_id, key
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn validate_commit_root_coverage(
@@ -7911,6 +8030,68 @@ mod tests {
                 .map(|row| row.change_id.to_string()),
             Some(change_id("change-child"))
         );
+    }
+
+    #[tokio::test]
+    async fn root_tombstone_proof_rejects_foreign_and_missing_author_rows() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row("base", "base-change", "base")],
+        )
+        .await
+        .unwrap();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("base"),
+            &[row("child", "child-change", "child")],
+        )
+        .await
+        .unwrap();
+        let mut deleted = row("foreign", "foreign-delete", "foreign");
+        deleted.deleted = true;
+        deleted.snapshot_content = None;
+        write_root_for_test(&storage, &tracked_state, "foreign", None, &[deleted])
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let metadata = storage::load_snapshot_commit_root(&read, "child")
+            .await
+            .unwrap()
+            .unwrap();
+        let foreign = storage::load_snapshot_commit_root(&read, "foreign")
+            .await
+            .unwrap()
+            .unwrap();
+        let reader = tracked_state.reader(read);
+        let mut rows = reader
+            .tree
+            .scan(
+                &reader.store,
+                &foreign.root_id,
+                &TrackedStateTreeScanRequest::default(),
+            )
+            .await
+            .unwrap();
+        reader
+            .validate_root_tombstone_membership("child", &metadata, &rows)
+            .await
+            .expect_err("a valid foreign deletion is not a member of this root");
+        rows[0].1.commit_id = CommitId::for_test_label("missing-author");
+        rows[0].1.change_id = ChangeId::for_test_label("missing-change");
+        reader
+            .validate_root_tombstone_membership("child", &metadata, &rows)
+            .await
+            .expect_err("a missing author cannot authorize an extra tombstone");
     }
 
     #[tokio::test]

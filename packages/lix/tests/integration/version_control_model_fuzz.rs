@@ -192,6 +192,74 @@ impl BranchModel {
 // ---------------------------------------------------------------------------
 
 simulation_test!(
+    rebuilt_root_validates_tombstones_after_checkpoint_gc,
+    |sim| async move {
+        use crate::storage_adapter::{
+            SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+        };
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        // Replay the fixed checkpoint/deletion sequence which originally
+        // failed only when background GC won the race before the next read.
+        for seed in [0, 1, 2] {
+            let prefix = format!("vcm-single-{seed:016x}-");
+            let keys = lane_keys(&prefix, "k");
+            let mut model = BranchModel::default();
+            let mut rng = TinyRng::new(seed);
+            for step in 0..if seed == 2 { 14 } else { STEPS_PER_SEED } {
+                match rng.usize(10) {
+                    0..=5 => {
+                        let key = keys[rng.usize(keys.len())].clone();
+                        let value = random_value(&mut rng);
+                        upsert(&main, &key, &value, "GC fixture").await;
+                        model.upsert(&key, value);
+                    }
+                    6..=7 => {
+                        let key = keys[rng.usize(keys.len())].clone();
+                        delete(&main, &key, "GC fixture").await;
+                        model.delete(&key);
+                    }
+                    _ => {
+                        main.create_checkpoint().await.unwrap();
+                        model.checkpoint();
+                    }
+                }
+                if seed == 2 && step == 12 {
+                    let storage = engine.storage();
+                    let read = SharedStorageAdapterRead::new(
+                        storage
+                            .begin_read(StorageReadOptions::default())
+                            .await
+                            .unwrap(),
+                    );
+                    let mut writes = StorageWriteSet::new();
+                    let mut preconditions = Vec::new();
+                    crate::gc::stage_repository_gc_with_preconditions(
+                        read,
+                        &mut writes,
+                        &mut preconditions,
+                    )
+                    .await
+                    .unwrap();
+                    storage
+                        .commit_write_set(
+                            writes,
+                            StorageWriteOptions {
+                                preconditions,
+                                ..StorageWriteOptions::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                assert_state(&main, &prefix, &model.state, "GC fixture").await;
+            }
+            main.create_checkpoint().await.unwrap();
+        }
+    }
+);
+
+simulation_test!(
     vc_model_single_branch_state_diff_and_history_match_the_model,
     |sim| async move {
         let fault = InjectedFault::from_env();
